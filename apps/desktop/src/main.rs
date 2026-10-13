@@ -8,8 +8,9 @@
 
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::text::TextView;
+use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::time::Duration;
 
@@ -17,8 +18,6 @@ use std::time::Duration;
 const PAPER: u32 = 0xFAF9F5;
 const SAND: u32 = 0xF0EEE6;
 const CORAL: u32 = 0xD97757;
-const CORAL_DEEP: u32 = 0xBF6449;
-const CORAL_TINT: u32 = 0xFBEFE9;
 const SAND_ACTIVE: u32 = 0xE8E3D6;
 const INK: u32 = 0x3D3929;
 const INK_SOFT: u32 = 0x87847C;
@@ -28,7 +27,15 @@ const CARD: u32 = 0xFFFFFF;
 const GREEN: u32 = 0x7A9A65;
 const BLUE: u32 = 0x5B6FA8;
 const BLUE_TINT: u32 = 0xE9EEF7;
-const MONO: &str = "Consolas";
+// 字体：官方是自家的 Sans / Serif / Mono，无法分发，取 Windows 自带的近似款。
+const SANS: &str = "Segoe UI Variable Text";
+const MONO: &str = "Cascadia Mono";
+const DIFF_ADD_BG: u32 = 0xE4F3DE;
+const DIFF_ADD_FG: u32 = 0x3C6B2E;
+const DIFF_DEL_BG: u32 = 0xFBE3DF;
+const DIFF_DEL_FG: u32 = 0xA4443A;
+// Claude 的标题使用衬线体；Windows 自带 Georgia 作近似，中文回退到系统衬线。
+const SERIF: &str = "Georgia";
 
 // ---------- 数据模型 ----------
 #[derive(Clone, Copy, PartialEq)]
@@ -37,12 +44,16 @@ enum ToolPhase {
     Done,
 }
 
+/// 工具调用：`● Name arg` + `└ result`（Claude Code 的紧凑样式）
 struct ToolCard {
-    icon: IconAll,
-    title: &'static str,
-    detail: SharedString,
+    name: &'static str,
+    arg: SharedString,
+    result: SharedString,
     phase: ToolPhase,
 }
+
+/// diff 行：(' ' 上下文 / '+' 新增 / '-' 删除, 文本)
+type DiffRows = &'static [(char, &'static str)];
 
 struct PlanRow {
     text: &'static str,
@@ -57,6 +68,10 @@ enum ChatItem {
         open: bool,
     },
     Tool(ToolCard),
+    Diff {
+        path: &'static str,
+        rows: DiffRows,
+    },
     Plan(Vec<PlanRow>),
     Agent(String),
     Note(SharedString),
@@ -83,8 +98,9 @@ enum MockAction {
     BeginThinking,
     ThinkChunk(&'static str),
     EndThinking,
-    BeginTool(IconAll, &'static str, &'static str),
+    BeginTool(&'static str, &'static str),
     ToolDone(&'static str),
+    Diff(&'static str, DiffRows),
     BeginPlan,
     PlanRowAdd(&'static str),
     PlanRowDone(usize),
@@ -118,6 +134,14 @@ fn stream_steps(
     out
 }
 
+const DEMO_DIFF: DiffRows = &[
+    (' ', "pub trait Kernel: Send {"),
+    ('-', "    fn send(&mut self, text: String);"),
+    ('+', "    fn send(&mut self, text: String) -> Result<()>;"),
+    ('+', "    fn cancel(&mut self);"),
+    (' ', "}"),
+];
+
 fn build_demo_script() -> Vec<MockStep> {
     let mut s = Vec::new();
 
@@ -131,35 +155,41 @@ fn build_demo_script() -> Vec<MockStep> {
     ));
     s.push(MockStep(200, MockAction::EndThinking));
 
-    // 2) 工具卡：读文件
+    // 2) 读文件
     s.push(MockStep(
         450,
-        MockAction::BeginTool(
-            IconAll::FileText,
-            "Read  crates/core/src/lib.rs",
-            "读取内核抽象定义",
-        ),
+        MockAction::BeginTool("Read", "crates/core/src/lib.rs"),
     ));
     s.push(MockStep(
-        850,
-        MockAction::ToolDone("128 行 · Kernel trait 与 KernelEvent 事件模型"),
+        700,
+        MockAction::ToolDone("Read 128 lines · Kernel trait 与 KernelEvent 事件模型"),
     ));
 
-    // 3) 工具卡：构建
+    // 3) 改文件 + diff
+    s.push(MockStep(
+        450,
+        MockAction::BeginTool("Edit", "crates/core/src/lib.rs"),
+    ));
+    s.push(MockStep(
+        700,
+        MockAction::ToolDone("Added 2 lines, removed 1 line"),
+    ));
+    s.push(MockStep(
+        150,
+        MockAction::Diff("crates/core/src/lib.rs", DEMO_DIFF),
+    ));
+
+    // 4) 跑构建
     s.push(MockStep(
         500,
-        MockAction::BeginTool(
-            IconAll::SquareTerminal,
-            "$ cargo build -p claudesktop",
-            "增量编译桌面应用",
-        ),
+        MockAction::BeginTool("Bash", "cargo build -p claudesktop"),
     ));
     s.push(MockStep(
         950,
-        MockAction::ToolDone("Finished in 1.8s · 0 错误 0 警告"),
+        MockAction::ToolDone("Finished `dev` profile in 1.8s · 0 errors, 0 warnings"),
     ));
 
-    // 4) 计划卡
+    // 5) 计划卡
     s.push(MockStep(400, MockAction::BeginPlan));
     for row in [
         "UI 外壳验收（布局 / 消息类型 / IME）",
@@ -173,7 +203,7 @@ fn build_demo_script() -> Vec<MockStep> {
         s.push(MockStep(300, MockAction::PlanRowDone(i)));
     }
 
-    // 5) 流式 Markdown 正文
+    // 6) 流式 Markdown 正文
     s.push(MockStep(350, MockAction::BeginAgent));
     s.extend(stream_steps(
         "## UI 外壳验收清单\n\n这轮回复来自**内置演示回放**——UI 已就位，内核按计划下一步接入 ACP。\n\n你在上面看到的消息类型：\n\n- **思考块**：可折叠，流式追加\n- **工具卡片**：读文件 / 跑构建，带「运行中 → 完成」状态\n- **计划**：左缘赤陶色标记的清单，逐项点亮\n- **Markdown 正文**：就是本块，`stream_fade` 流式渲染\n\n接入后，这里的事件流将直接映射自 ACP 的 `session/update` 通知，UI 不再需要任何演示脚本。\n\n> 布局 / 配色 / 交互有任何不顺眼的地方，现在改最便宜。",
@@ -183,13 +213,21 @@ fn build_demo_script() -> Vec<MockStep> {
     ));
     s.push(MockStep(250, MockAction::EndAgent));
 
-    // 6) 回合小结
+    // 7) 回合小结
     s.push(MockStep(
         400,
         MockAction::Note("演示回合结束 · 内核未连接 · 下一步：ACP 接入"),
     ));
     s
 }
+
+/// 权限模式（名称沿用官方桌面版）：(名称, 说明, 图标)
+const PERMISSION_MODES: [(&str, &str, IconAll); 4] = [
+    ("Manual", "每次编辑和命令都先询问", IconAll::ShieldCheck),
+    ("Accept edits", "自动接受文件编辑，命令仍询问", IconAll::SquarePen),
+    ("Plan", "只出计划，不改动文件", IconAll::ListTodo),
+    ("Auto", "由分类器判断，少打扰", IconAll::Zap),
+];
 
 // ---------- 应用状态 ----------
 pub struct ChatApp {
@@ -204,6 +242,9 @@ pub struct ChatApp {
     follow_scroll: bool,
     overview_tab: usize, // 0 概览 / 1 模型
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
+    sidebar_open: bool,
+    mode_menu_open: bool,
+    permission_mode: usize, // PERMISSION_MODES 下标
 }
 
 impl ChatApp {
@@ -269,6 +310,9 @@ impl ChatApp {
             follow_scroll: true,
             overview_tab: 0,
             overview_range: 0,
+            sidebar_open: true,
+            mode_menu_open: false,
+            permission_mode: 0,
         }
     }
 
@@ -278,11 +322,8 @@ impl ChatApp {
         if std::env::var("CLAUDESKTOP_AUTODEMO").ok().as_deref() != Some("1") {
             return;
         }
-        if let Some(first) = self.workspaces.first() {
-            if let Some(s) = first.sessions.first() {
-                self.transcript.push(ChatItem::User(s.title.clone()));
-            }
-        }
+        self.transcript
+            .push(ChatItem::User("帮我配置一个有图形界面的动态壁纸软件".into()));
         self.selected = Some(0);
         self.busy = true;
         self.follow_scroll = true;
@@ -372,19 +413,22 @@ impl ChatApp {
                     *open = false;
                 }
             }
-            MockAction::BeginTool(icon, title, detail) => {
+            MockAction::BeginTool(name, arg) => {
                 self.transcript.push(ChatItem::Tool(ToolCard {
-                    icon: *icon,
-                    title,
-                    detail: (*detail).into(),
+                    name,
+                    arg: (*arg).into(),
+                    result: SharedString::default(),
                     phase: ToolPhase::Running,
                 }));
             }
-            MockAction::ToolDone(detail) => {
+            MockAction::ToolDone(result) => {
                 if let Some(ChatItem::Tool(card)) = self.transcript.last_mut() {
-                    card.detail = (*detail).into();
+                    card.result = (*result).into();
                     card.phase = ToolPhase::Done;
                 }
+            }
+            MockAction::Diff(path, rows) => {
+                self.transcript.push(ChatItem::Diff { path, rows });
             }
             MockAction::BeginPlan => {
                 self.transcript.push(ChatItem::Plan(Vec::new()));
@@ -420,22 +464,6 @@ impl ChatApp {
     }
 
     // ---------- 小组件 ----------
-    fn avatar_mark() -> Div {
-        div()
-            .size(px(22.))
-            .flex_shrink_0()
-            .rounded_full()
-            .bg(rgb(CORAL))
-            .flex()
-            .justify_center()
-            .items_center()
-            .child(
-                Icon::new(IconAll::Sparkles)
-                    .size(px(11.))
-                    .text_color(rgb(0xFFFFFF)),
-            )
-    }
-
     fn chip(icon: IconAll, label: impl Into<SharedString>) -> Div {
         div()
             .h_flex()
@@ -453,10 +481,22 @@ impl ChatApp {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(rgb(INK))
                     .child(label.into()),
             )
+    }
+
+    /// 标题栏中间的 Chat / Cowork / Code 分段切换。
+    fn top_tab(text: &'static str, active: bool) -> Div {
+        div()
+            .px_3p5()
+            .py_1()
+            .rounded_md()
+            .text_size(px(14.))
+            .bg(if active { rgb(CARD) } else { rgba(0x00000000) })
+            .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
+            .child(text)
     }
 
     fn seg(text: &'static str, active: bool) -> Div {
@@ -464,7 +504,7 @@ impl ChatApp {
             .px_3()
             .py_1()
             .rounded_md()
-            .text_size(px(12.))
+            .text_size(px(13.))
             .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) })
             .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
             .child(text)
@@ -496,7 +536,7 @@ impl ChatApp {
                     .text_color(rgb(INK_SOFT)),
             )
             .child(
-                div().text_size(px(11.5)).text_color(rgb(INK_SOFT)).child(if streaming {
+                div().text_size(px(12.5)).text_color(rgb(INK_SOFT)).child(if streaming {
                     SharedString::from("思考中…")
                 } else {
                     SharedString::from("已思考")
@@ -516,7 +556,7 @@ impl ChatApp {
         if open {
             col = col.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(rgb(INK_SOFT))
                     .line_height(relative(1.6))
                     .child(format!("{text}{caret}")),
@@ -526,66 +566,156 @@ impl ChatApp {
     }
 
     fn render_tool(card: &ToolCard) -> Div {
-        let (status_icon, status_text, status_color) = match card.phase {
-            ToolPhase::Running => (IconAll::LoaderCircle, "运行中", INK_SOFT),
-            ToolPhase::Done => (IconAll::Check, "完成", GREEN),
+        let dot = match card.phase {
+            ToolPhase::Running => CORAL,
+            ToolPhase::Done => GREEN,
         };
-        div()
-            .h_flex()
-            .gap_2p5()
-            .p_2p5()
-            .rounded_lg()
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(LINE))
-            .child(
+        let mut col = div().v_flex().gap(px(2.)).child(
+            div()
+                .h_flex()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .size(px(7.))
+                        .mt(px(7.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(rgb(dot)),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(INK))
+                        .child(card.name),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.5))
+                        .font_family(MONO)
+                        .text_color(rgb(INK_SOFT))
+                        .line_height(relative(1.7))
+                        .child(card.arg.clone()),
+                ),
+        );
+        if !card.result.is_empty() {
+            col = col.child(
                 div()
-                    .size(px(28.))
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .bg(rgb(CORAL_TINT))
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .child(Icon::new(card.icon).size_4().text_color(rgb(CORAL))),
-            )
-            .child(
-                div()
-                    .v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(2.))
+                    .h_flex()
+                    .items_start()
+                    .gap_2()
+                    .pl_3()
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .text_color(rgb(INK))
+                            .text_size(px(13.5))
                             .font_family(MONO)
-                            .child(card.title),
+                            .text_color(rgb(INK_FAINT))
+                            .child("└"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(13.5))
+                            .font_family(MONO)
                             .text_color(rgb(INK_SOFT))
-                            .child(card.detail.clone()),
+                            .child(card.result.clone()),
                     ),
-            )
+            );
+        }
+        col
+    }
+
+    fn render_diff(path: &'static str, rows: DiffRows) -> Div {
+        let mut old_no = 1usize;
+        let mut new_no = 1usize;
+        let mut body = div().v_flex();
+        for (kind, text) in rows {
+            let (bg, fg, no) = match kind {
+                '+' => {
+                    let n = new_no;
+                    new_no += 1;
+                    (Some(DIFF_ADD_BG), DIFF_ADD_FG, n)
+                }
+                '-' => {
+                    let n = old_no;
+                    old_no += 1;
+                    (Some(DIFF_DEL_BG), DIFF_DEL_FG, n)
+                }
+                _ => {
+                    let n = new_no;
+                    old_no += 1;
+                    new_no += 1;
+                    (None, INK_SOFT, n)
+                }
+            };
+            body = body.child(
+                div()
+                    .h_flex()
+                    .items_start()
+                    .when_some(bg, |d, c| d.bg(rgb(c)))
+                    .font_family(MONO)
+                    .text_size(px(13.5))
+                    .line_height(relative(1.6))
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .flex_shrink_0()
+                            .pr_2()
+                            .flex()
+                            .justify_end()
+                            .text_color(rgb(INK_FAINT))
+                            .child(format!("{no}")),
+                    )
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_shrink_0()
+                            .text_color(rgb(fg))
+                            .child(kind.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(rgb(if bg.is_some() { fg } else { INK }))
+                            .child(*text),
+                    ),
+            );
+        }
+        div()
+            .v_flex()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CARD))
+            .overflow_hidden()
             .child(
                 div()
                     .h_flex()
-                    .gap_1()
-                    .flex_shrink_0()
+                    .gap_1p5()
+                    .px_3()
+                    .py_1p5()
+                    .bg(rgb(SAND))
+                    .border_b_1()
+                    .border_color(rgb(LINE))
                     .child(
-                        Icon::new(status_icon)
+                        Icon::new(IconAll::FileText)
                             .size_3p5()
-                            .text_color(rgb(status_color)),
+                            .text_color(rgb(INK_SOFT)),
                     )
                     .child(
                         div()
-                            .text_size(px(11.5))
-                            .text_color(rgb(status_color))
-                            .child(status_text),
+                            .text_size(px(13.))
+                            .font_family(MONO)
+                            .text_color(rgb(INK_SOFT))
+                            .child(path),
                     ),
             )
+            .child(body)
     }
 
     fn render_plan(rows: &[PlanRow]) -> Div {
@@ -606,7 +736,7 @@ impl ChatApp {
                             .size_4()
                             .text_color(rgb(CORAL)),
                     )
-                    .child(div().text_size(px(13.)).text_color(rgb(INK)).child("计划")),
+                    .child(div().text_size(px(14.)).text_color(rgb(INK)).child("计划")),
             )
             .children(rows.iter().enumerate().map(|(i, row)| {
                 let marker = if row.done {
@@ -637,7 +767,7 @@ impl ChatApp {
                     .child(marker)
                     .child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(px(13.5))
                             .text_color(if row.done {
                                 rgb(INK_SOFT)
                             } else {
@@ -648,45 +778,51 @@ impl ChatApp {
             }))
     }
 
-    /// 助手回合行：左侧头像轨道 + 内容。
+    /// 助手回合行：官方界面没有头像轨道，内容直接顶格。
     fn railed(content: impl IntoElement) -> Div {
-        div()
-            .h_flex()
-            .items_start()
-            .gap_3()
-            .child(Self::avatar_mark())
-            .child(div().flex_1().min_w_0().child(content))
+        div().min_w_0().child(content)
     }
 
     fn render_item(&self, idx: usize, item: &ChatItem, cx: &mut Context<Self>) -> Div {
         match item {
-            ChatItem::User(text) => div().h_flex().justify_end().child(
-                div()
-                    .max_w(relative(0.78))
-                    .bg(rgb(SAND_ACTIVE))
-                    .text_color(rgb(INK))
-                    .rounded(px(12.))
-                    .px_3p5()
-                    .py_2()
-                    .text_size(px(14.))
-                    .line_height(relative(1.55))
-                    .child(text.clone()),
-            ),
+            ChatItem::User(text) => div()
+                .w_full()
+                .bg(rgb(SAND))
+                .text_color(rgb(INK))
+                .rounded(px(12.))
+                .px_4()
+                .py_3()
+                .text_size(px(15.))
+                .line_height(relative(1.6))
+                .child(text.clone()),
             ChatItem::Thinking {
                 text,
                 streaming,
                 open,
             } => Self::railed(Self::render_thinking(idx, text, *streaming, *open, cx)),
             ChatItem::Tool(card) => Self::railed(Self::render_tool(card)),
+            ChatItem::Diff { path, rows } => Self::railed(Self::render_diff(path, rows)),
             ChatItem::Plan(rows) => Self::railed(Self::render_plan(rows)),
             ChatItem::Agent(text) => Self::railed(
-                TextView::markdown(("agent", idx), SharedString::from(text.clone()))
-                    .stream_fade(true),
+                div().text_size(px(15.5)).line_height(relative(1.7)).child(
+                    TextView::markdown(("agent", idx), SharedString::from(text.clone()))
+                        .style(
+                            TextViewStyle::default()
+                                .paragraph_gap(rems(0.9))
+                                .heading_font_size(|level, _| match level {
+                                    1 => px(22.),
+                                    2 => px(19.),
+                                    3 => px(17.),
+                                    _ => px(15.5),
+                                }),
+                        )
+                        .stream_fade(true),
+                ),
             ),
             ChatItem::Note(text) => {
                 div().h_flex().justify_center().pt_1().child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(rgb(INK_FAINT))
                         .child(text.clone()),
                 )
@@ -778,8 +914,8 @@ impl ChatApp {
                     )
                     .child(
                         div()
-                            .text_size(px(22.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_family(SERIF)
+                            .text_size(px(34.))
                             .text_color(rgb(INK))
                             .child("What's up next, WYT?"),
                     ),
@@ -877,7 +1013,7 @@ impl ChatApp {
                                             .bg(rgb(CARD))
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(px(12.5))
                                                     .text_color(rgb(INK_SOFT))
                                                     .child(c.label),
                                             )
@@ -904,7 +1040,7 @@ impl ChatApp {
                                             .bg(rgb(CARD))
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(px(12.5))
                                                     .text_color(rgb(INK_SOFT))
                                                     .child(c.label),
                                             )
@@ -922,7 +1058,7 @@ impl ChatApp {
                     .child(
                         div()
                             .pt_1()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(rgb(INK_SOFT))
                             .child("你的 Token 用量相当于 3,333 本《善恶的彼岸》。"),
                     ),
@@ -944,7 +1080,7 @@ impl ChatApp {
                 .pb_1()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(rgb(INK_SOFT))
                         .child("工作区"),
                 )
@@ -970,7 +1106,7 @@ impl ChatApp {
                     .px_3()
                     .pt_3()
                     .pb_1()
-                    .text_size(px(12.5))
+                    .text_size(px(13.5))
                     .text_color(rgb(INK))
                     .child(ws.name.clone()),
             );
@@ -1006,7 +1142,7 @@ impl ChatApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(13.))
+                            .text_size(px(14.))
                             .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
                             .child(s.title.clone()),
                     );
@@ -1014,7 +1150,7 @@ impl ChatApp {
                     row = row.child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(rgb(INK_FAINT))
                             .child(s.age.clone()),
                     );
@@ -1030,7 +1166,7 @@ impl ChatApp {
                 .px_3()
                 .pt_4()
                 .pb_1()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(rgb(INK_SOFT))
                 .child("任务"),
         );
@@ -1063,14 +1199,14 @@ impl ChatApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(13.))
+                            .text_size(px(14.))
                             .text_color(rgb(INK_SOFT))
                             .child(SharedString::from(*title)),
                     )
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(rgb(INK_FAINT))
                             .child(SharedString::from(*age)),
                     ),
@@ -1100,11 +1236,13 @@ impl ChatApp {
                     )
                     .child(
                         div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_family(SERIF)
+                            .text_size(px(18.))
                             .text_color(rgb(INK))
                             .child("Claude"),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .child(self.sidebar_toggle("sidebar-toggle", cx)),
             )
             .child(
                 div()
@@ -1127,7 +1265,7 @@ impl ChatApp {
                             .size_3p5()
                             .text_color(rgb(INK)),
                     )
-                    .child(div().text_size(px(13.)).text_color(rgb(INK)).child("新会话")),
+                    .child(div().text_size(px(14.)).text_color(rgb(INK)).child("新会话")),
             )
             .child(
                 div()
@@ -1144,7 +1282,7 @@ impl ChatApp {
                             .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     )
-                    .child(div().text_size(px(13.)).text_color(rgb(INK_SOFT)).child("插件")),
+                    .child(div().text_size(px(14.)).text_color(rgb(INK_SOFT)).child("插件")),
             )
             .child(div().flex_1().min_h_0().child(body))
             .child(
@@ -1165,7 +1303,7 @@ impl ChatApp {
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.5))
+                                    .text_size(px(13.5))
                                     .text_color(rgb(INK_SOFT))
                                     .child("更多"),
                             ),
@@ -1180,7 +1318,7 @@ impl ChatApp {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(rgb(INK_SOFT))
                                     .child("演示回放（未连接内核）"),
                             ),
@@ -1213,14 +1351,14 @@ impl ChatApp {
                             .items_center()
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(11.))
                                     .text_color(rgb(0xFFFFFF))
                                     .child("甲"),
                             ),
                     )
                     .child(
                         div()
-                            .text_size(px(13.5))
+                            .text_size(px(14.5))
                             .text_color(rgb(INK))
                             .child("帮我配置一个有图形界面的动态壁纸软件"),
                     ),
@@ -1241,7 +1379,7 @@ impl ChatApp {
                     )
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(px(12.5))
                             .text_color(rgb(BLUE))
                             .child("claudesktop"),
                     ),
@@ -1263,7 +1401,7 @@ impl ChatApp {
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(rgb(INK))
                             .child("GLM-5.3"),
                     )
@@ -1286,7 +1424,7 @@ impl ChatApp {
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(rgb(INK_SOFT))
                             .child("分享"),
                     ),
@@ -1294,48 +1432,180 @@ impl ChatApp {
     }
 
     // ---------- 输入区 ----------
-    fn render_composer(&self, cx: &mut Context<Self>) -> Div {
+    /// 侧栏开关。Windows 上标题栏整条是系统拖拽区，里面的按钮收不到点击，
+    /// 所以开关放在侧栏头部（展开）和左侧窄栏（收起）。
+    fn sidebar_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
+            .id(id)
+            .size(px(28.))
+            .flex_shrink_0()
+            .rounded_md()
+            .flex()
+            .justify_center()
+            .items_center()
+            .cursor_pointer()
+            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .child(Icon::new(IconAll::PanelLeft).size_4().text_color(rgb(INK_SOFT)))
+    }
+
+    /// 权限模式弹层：锚在输入卡片左下，向上展开。
+    fn render_mode_menu(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut menu = div()
+            .id("mode-menu")
+            .occlude()
+            .absolute()
+            .left(px(44.))
+            .bottom(px(104.))
+            .w(px(300.))
             .v_flex()
-            .max_w(px(760.))
-            .mx_auto()
+            .p_1()
+            .gap_0p5()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(LINE))
+            .rounded_lg()
+            .shadow_md();
+        for (i, (name, desc, icon)) in PERMISSION_MODES.iter().enumerate() {
+            let active = self.permission_mode == i;
+            menu = menu.child(
+                div()
+                    .id(("mode-item", i))
+                    .h_flex()
+                    .items_center()
+                    .gap_2p5()
+                    .px_2p5()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(SAND)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.permission_mode = i;
+                        this.mode_menu_open = false;
+                        cx.notify();
+                    }))
+                    .child(Icon::new(*icon).size_4().text_color(rgb(INK_SOFT)))
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .text_color(rgb(INK))
+                                    .child(*name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(*desc),
+                            ),
+                    )
+                    .when(active, |d| {
+                        d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
+                    }),
+            );
+        }
+        menu
+    }
+
+    fn render_composer(&self, cx: &mut Context<Self>) -> Div {
+        let send_bg = if self.busy { rgb(INK_SOFT) } else { rgb(CORAL) };
+        let (mode_name, _, mode_icon) = PERMISSION_MODES[self.permission_mode];
+        let card = div()
+            .id("composer")
+            .relative()
+            .v_flex()
             .w_full()
             .gap_2()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(LINE))
+            .rounded(px(22.))
+            .shadow_sm()
+            .px_4()
+            .pt_3()
+            .pb_3()
+            .child(Input::new(&self.input).appearance(false).bordered(false))
             .child(
-                // chips 行
                 div()
-                    .h_flex()
-                    .gap_2()
-                    .child(Self::chip(IconAll::Folder, "claudesktop"))
-                    .child(Self::chip(IconAll::Gauge, "标准模式")),
-            )
-            .child(
-                // 输入条
-                div()
-                    .id("composer")
-                    .w_full()
                     .h_flex()
                     .items_center()
                     .gap_2()
-                    .bg(rgb(CARD))
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded(px(16.))
-                    .px_4()
-                    .py_2()
                     .child(
-                        Icon::new(IconAll::MessageSquare)
-                            .size_4()
-                            .text_color(rgb(INK_SOFT)),
+                        div()
+                            .size(px(30.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .child(Icon::new(IconAll::Plus).size_4().text_color(rgb(INK_SOFT))),
                     )
-                    .child(Input::new(&self.input).appearance(false).bordered(false))
+                    .child(
+                        div()
+                            .id("mode-chip")
+                            .h_flex()
+                            .gap_1p5()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(self.mode_menu_open, |d| d.bg(rgb(SAND)))
+                            .hover(|d| d.bg(rgb(SAND)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mode_menu_open = !this.mode_menu_open;
+                                cx.notify();
+                            }))
+                            .child(
+                                Icon::new(mode_icon)
+                                    .size_3p5()
+                                    .text_color(rgb(INK_SOFT)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(mode_name),
+                            )
+                            .child(
+                                Icon::new(IconAll::ChevronDown)
+                                    .size_3()
+                                    .text_color(rgb(INK_SOFT)),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .text_color(rgb(INK_SOFT))
+                                    .child("GLM-5.3"),
+                            )
+                            .child(
+                                Icon::new(IconAll::ChevronDown)
+                                    .size_3()
+                                    .text_color(rgb(INK_SOFT)),
+                            ),
+                    )
                     .child(
                         div()
                             .id("send")
-                            .size(px(26.))
+                            .size(px(32.))
                             .flex_shrink_0()
                             .rounded_full()
-                            .bg(if self.busy { rgb(INK_SOFT) } else { rgb(CORAL) })
+                            .bg(send_bg)
                             .flex()
                             .justify_center()
                             .items_center()
@@ -1346,7 +1616,7 @@ impl ChatApp {
                                 } else {
                                     IconAll::ArrowUp
                                 })
-                                .size_3p5()
+                                .size_4()
                                 .text_color(rgb(0xFFFFFF)),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1358,52 +1628,22 @@ impl ChatApp {
                             })),
                     ),
             )
+            .when(self.mode_menu_open, |d| d.child(self.render_mode_menu(cx)));
+
+        div()
+            .v_flex()
+            .max_w(px(760.))
+            .mx_auto()
+            .w_full()
+            .gap_2p5()
+            .child(card)
             .child(
-                // 权限模式行
+                // 卡片下方：环境 + 项目
                 div()
                     .h_flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(INK_SOFT))
-                            .child("Read"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(INK_SOFT))
-                            .child("Edit"),
-                    )
-                    .child(
-                        div()
-                            .px_2p5()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(CORAL_TINT))
-                            .text_size(px(12.))
-                            .text_color(rgb(CORAL_DEEP))
-                            .child("Yolo"),
-                    )
-                    .child(
-                        Icon::new(IconAll::Plus)
-                            .size_3p5()
-                            .text_color(rgb(INK_SOFT)),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(INK_SOFT))
-                            .child("GLM-5.3"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(INK_FAINT))
-                            .child("Default"),
-                    ),
+                    .gap_2()
+                    .child(Self::chip(IconAll::Monitor, "Local"))
+                    .child(Self::chip(IconAll::Folder, "claudesktop")),
             )
     }
 }
@@ -1416,15 +1656,11 @@ impl Render for ChatApp {
                 div()
                     .h_flex()
                     .ml_2()
-                    .gap_1p5()
+                    .gap_3()
                     .items_center()
-                    .child(div().size(px(9.)).rounded_full().bg(rgb(CORAL)))
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .text_color(rgb(INK))
-                            .child("claudesktop"),
-                    ),
+                    .child(Icon::new(IconAll::PanelLeft).size_4().text_color(rgb(INK_SOFT)))
+                    .child(Icon::new(IconAll::ArrowLeft).size_4().text_color(rgb(INK_FAINT)))
+                    .child(Icon::new(IconAll::ArrowRight).size_4().text_color(rgb(INK_FAINT))),
             )
             .child(
                 div()
@@ -1433,9 +1669,14 @@ impl Render for ChatApp {
                     .justify_center()
                     .child(
                         div()
-                            .text_size(px(11.5))
-                            .text_color(rgb(INK_SOFT))
-                            .child("M1 · UI 外壳预览（未接内核）"),
+                            .h_flex()
+                            .gap_0p5()
+                            .p(px(3.))
+                            .rounded_lg()
+                            .bg(rgb(SAND_ACTIVE))
+                            .child(Self::top_tab("Chat", false))
+                            .child(Self::top_tab("Cowork", false))
+                            .child(Self::top_tab("Code", true)),
                     ),
             );
 
@@ -1444,7 +1685,20 @@ impl Render for ChatApp {
             self.scroll.scroll_to_bottom();
         }
 
-        let sidebar = self.render_sidebar(cx);
+        let sidebar = if self.sidebar_open {
+            self.render_sidebar(cx)
+        } else {
+            v_flex()
+                .w(px(48.))
+                .flex_shrink_0()
+                .h_full()
+                .items_center()
+                .pt_3()
+                .bg(rgb(SAND))
+                .border_r_1()
+                .border_color(rgb(LINE))
+                .child(self.sidebar_toggle("sidebar-toggle-collapsed", cx))
+        };
         let composer_area = div().px_6().pb_4().pt_1().child(self.render_composer(cx));
 
         let main = if self.selected.is_none() {
@@ -1492,10 +1746,18 @@ impl Render for ChatApp {
         div()
             .v_flex()
             .size_full()
+            .font_family(SANS)
+            .text_size(px(15.))
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
             .child(title_bar)
-            .child(h_flex().flex_1().min_h_0().child(sidebar).child(main.h_full()))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(sidebar)
+                    .child(main.h_full()),
+            )
     }
 }
 
