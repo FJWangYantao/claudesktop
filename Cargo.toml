@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["apps/desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+gpui-kit = "0.7.3"
+
+# 内核边界（M1 引入，先占位注释）：
+# agent-client-protocol = "3"

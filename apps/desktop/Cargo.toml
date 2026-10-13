@@ -1,0 +1,13 @@
+[package]
+name = "claudesktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Claude-style desktop harness with swappable agent kernels (GPUI)"
+
+[[bin]]
+name = "claudesktop"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = { workspace = true }
