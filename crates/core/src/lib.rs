@@ -29,6 +29,16 @@ pub struct PlanEntryView {
     pub status: String,
 }
 
+/// agent 上报的会话模式（ACP `modes`）。含义由 agent 决定：
+/// Claude 适配器是权限模式（default / acceptEdits / plan …），
+/// pi 适配器是思考强度（off / low / medium / high …）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeView {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
 /// 权限请求里的一个可选项（协议无关的 UI 投影）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionOptionView {
@@ -55,6 +65,12 @@ pub enum KernelEvent {
         agent_name: String,
         /// 会话 ID
         session_id: String,
+        /// 当前模型（`config_options` 里 category = model 的当前值）
+        model: Option<String>,
+        /// agent 上报的可用模式；空 = agent 不支持 `session/set_mode`
+        modes: Vec<ModeView>,
+        /// 当前模式 ID
+        current_mode: Option<String>,
     },
     /// agent 回复的流式文本块（追加渲染）
     AgentMessageChunk { text: String },
@@ -70,13 +86,15 @@ pub enum KernelEvent {
         title: String,
         /// 初始状态（pending / in_progress / …）
         status: String,
+        /// 工具种类（read / edit / execute / search / fetch / other …）
+        kind: String,
     },
     /// 工具调用更新（状态推进、原始输出）
     ToolCallUpdated {
         id: String,
         title: Option<String>,
         status: Option<String>,
-        /// 原始输出（JSON 文本，已截断）
+        /// 输出摘要：能从结构化输出里取到文本就取文本，否则是 JSON 文本；已截断
         raw_output: Option<String>,
     },
     /// 计划整体替换（ACP 语义：每次都是全量列表）

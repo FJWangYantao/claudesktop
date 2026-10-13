@@ -37,7 +37,7 @@ use futures::channel::oneshot;
 use futures::StreamExt;
 
 use crate::{
-    EventSink, Kernel, KernelCommand, KernelEvent, PermissionOptionView, PlanEntryView,
+    EventSink, Kernel, KernelCommand, KernelEvent, ModeView, PermissionOptionView, PlanEntryView,
 };
 
 /// 等待 UI 应答的权限请求：请求 ID → 唤醒发送端（`None` = 取消）。
@@ -351,10 +351,29 @@ fn run_kernel(
                     .send_request(NewSessionRequest::new(cwd))
                     .block_task()
                     .await?;
+                let model = current_model(&session.config_options);
+                let (modes, current_mode) = match &session.modes {
+                    Some(state) => (
+                        state
+                            .available_modes
+                            .iter()
+                            .map(|m| ModeView {
+                                id: m.id.to_string(),
+                                name: m.name.clone(),
+                                description: m.description.clone(),
+                            })
+                            .collect(),
+                        Some(state.current_mode_id.to_string()),
+                    ),
+                    None => (Vec::new(), None),
+                };
                 let session_id = session.session_id;
                 sink(KernelEvent::Started {
                     agent_name,
                     session_id: session_id.to_string(),
+                    model,
+                    modes,
+                    current_mode,
                 });
 
                 // ---- 指令循环 --------------------------------------------
@@ -429,6 +448,7 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
             id: call.tool_call_id.to_string(),
             title: call.title.clone(),
             status: wire_name(&call.status),
+            kind: wire_name(&call.kind),
         }),
         SessionUpdate::ToolCallUpdate(update) => Some(KernelEvent::ToolCallUpdated {
             id: update.tool_call_id.to_string(),
@@ -438,7 +458,7 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
                 .fields
                 .raw_output
                 .as_ref()
-                .map(|v| truncate(&v.to_string(), 2000)),
+                .map(|v| truncate(&output_text(v), 2000)),
         }),
         SessionUpdate::Plan(plan) => Some(KernelEvent::PlanReplaced {
             entries: plan
@@ -456,6 +476,62 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
     };
     if let Some(event) = event {
         sink(event);
+    }
+}
+
+/// 从 `session/new` 的 `config_options` 里取当前模型（协议类型走 serde 取值，
+/// 避免绑死 Select/Boolean 等变体的具体结构）。
+fn current_model(options: &impl serde::Serialize) -> Option<String> {
+    let value = serde_json::to_value(options).ok()?;
+    value.as_array()?.iter().find_map(|opt| {
+        let is_model = opt.get("category").and_then(|v| v.as_str()) == Some("model")
+            || opt.get("id").and_then(|v| v.as_str()) == Some("model");
+        if !is_model {
+            return None;
+        }
+        opt.get("currentValue")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    })
+}
+
+/// 工具输出 → 给人看的文本。agent 的输出常是 `{"content":[{"type":"text",
+/// "text":"…"}]}` 这类结构，直接取文本；取不到再退回 JSON 文本。
+fn output_text(value: &serde_json::Value) -> String {
+    fn extract(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(items) => {
+                let parts: Vec<String> = items.iter().filter_map(extract).collect();
+                (!parts.is_empty()).then(|| parts.join("\n"))
+            }
+            serde_json::Value::Object(map) => ["text", "content", "stdout", "output", "result"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(extract)),
+            _ => None,
+        }
+    }
+    extract(value).unwrap_or_else(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn output_text_extracts_nested_text() {
+        let v = json!({"content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]});
+        assert_eq!(output_text(&v), "hello\nworld");
+        assert_eq!(output_text(&json!("plain")), "plain");
+        assert_eq!(output_text(&json!({"stdout": "ok", "code": 0})), "ok");
+    }
+
+    #[test]
+    fn output_text_falls_back_to_json() {
+        let v = json!({"granted": true, "lines": 148});
+        let out = output_text(&v);
+        assert!(out.contains("granted") && out.contains("148"), "{out}");
     }
 }
 

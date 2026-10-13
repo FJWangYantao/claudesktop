@@ -55,6 +55,8 @@ enum ToolPhase {
 struct ToolCard {
     /// 内核侧的 tool_call_id（演示脚本为 None）
     id: Option<String>,
+    /// 工具种类（read / execute / …），标题里没有工具名时据此命名
+    kind: String,
     name: SharedString,
     arg: SharedString,
     result: SharedString,
@@ -74,6 +76,11 @@ enum ChatItem {
     Thinking {
         text: String,
         streaming: bool,
+        open: bool,
+    },
+    /// agent 在首条提示之前推送的启动信息（如 pi 的 Skills / Extensions 列表），默认折叠
+    Info {
+        text: String,
         open: bool,
     },
     Tool(ToolCard),
@@ -245,6 +252,38 @@ const PERMISSION_MODES: [(&str, &str, IconAll, &str); 4] = [
     ("Auto", "由分类器判断，少打扰", IconAll::Zap, "auto"),
 ];
 
+/// 下拉里的一项模式：mock / 演示用上面的静态表；连上真实 agent 后改用
+/// agent 自己上报的（Claude = 权限模式，pi = 思考强度）。
+struct ModeEntry {
+    id: String,
+    name: SharedString,
+    desc: SharedString,
+    icon: IconAll,
+}
+
+fn default_modes() -> Vec<ModeEntry> {
+    PERMISSION_MODES
+        .iter()
+        .map(|(name, desc, icon, id)| ModeEntry {
+            id: (*id).to_string(),
+            name: (*name).into(),
+            desc: (*desc).into(),
+            icon: *icon,
+        })
+        .collect()
+}
+
+fn mode_icon(id: &str) -> IconAll {
+    match id {
+        "default" => IconAll::ShieldCheck,
+        "acceptEdits" => IconAll::SquarePen,
+        "plan" => IconAll::ListTodo,
+        "auto" => IconAll::Zap,
+        "bypassPermissions" => IconAll::ShieldOff,
+        _ => IconAll::Brain,
+    }
+}
+
 // ---------- 应用状态 ----------
 pub struct ChatApp {
     input: Entity<InputState>,
@@ -260,7 +299,10 @@ pub struct ChatApp {
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
     sidebar_open: bool,
     mode_menu_open: bool,
-    permission_mode: usize, // PERMISSION_MODES 下标
+    /// 当前可选模式（默认静态表，握手后换成 agent 上报的）
+    modes: Vec<ModeEntry>,
+    permission_mode: usize, // modes 下标
+    model_label: SharedString,
     /// 当前内核；None = 纯演示回放（CLAUDESKTOP_KERNEL=demo 或启动失败）
     kernel: Option<Arc<dyn Kernel>>,
     kernel_ready: bool,
@@ -298,6 +340,33 @@ fn split_tool_title(title: &str) -> (SharedString, SharedString) {
         return (t.to_string().into(), SharedString::default());
     }
     ("Tool".into(), t.to_string().into())
+}
+
+/// 工具行的「名称 + 参数」：标题自带工具名（`Read /a/b`）就直接拆；
+/// 否则（如 pi：标题是命令 `ls -la` 或小写工具名 `read`）按工具种类命名。
+fn tool_label(kind: &str, title: &str) -> (SharedString, SharedString) {
+    let (name, arg) = split_tool_title(title);
+    if name.as_ref() != "Tool" {
+        return (name, arg);
+    }
+    let by_kind = match kind {
+        "execute" => "Bash",
+        "read" => "Read",
+        "edit" => "Edit",
+        "delete" => "Delete",
+        "move" => "Move",
+        "search" => "Search",
+        "fetch" => "Fetch",
+        "think" => "Think",
+        _ => return (name, arg),
+    };
+    let t = title.trim();
+    let arg = if t.eq_ignore_ascii_case(by_kind) || t.eq_ignore_ascii_case(kind) {
+        SharedString::default()
+    } else {
+        t.to_string().into()
+    };
+    (by_kind.into(), arg)
 }
 
 fn tool_phase(status: &str) -> ToolPhase {
@@ -411,7 +480,9 @@ impl ChatApp {
             overview_range: 0,
             sidebar_open: true,
             mode_menu_open: false,
+            modes: default_modes(),
             permission_mode: 0,
+            model_label: "GLM-5.3".into(),
             kernel,
             kernel_ready: false,
             kernel_error: false,
@@ -426,7 +497,15 @@ impl ChatApp {
         if std::env::var("CLAUDESKTOP_AUTODEMO").ok().as_deref() != Some("1") {
             return;
         }
-        let text = "帮我配置一个有图形界面的动态壁纸软件".to_string();
+        // CLAUDESKTOP_AUTOPROMPT 指定提示词；未指定时只在不连真实 agent
+        // （ACP_AGENT 未设置）时发默认演示词，避免对真实 agent 误发写文件任务。
+        let text = match std::env::var("CLAUDESKTOP_AUTOPROMPT") {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ if std::env::var_os("ACP_AGENT").is_none() => {
+                "帮我配置一个有图形界面的动态壁纸软件".to_string()
+            }
+            _ => return,
+        };
         self.selected = Some(0);
         if self.kernel.is_some() && !self.kernel_ready {
             self.autoprompt = Some(text);
@@ -548,9 +627,33 @@ impl ChatApp {
     fn on_kernel_event(&mut self, event: KernelEvent, cx: &mut Context<Self>) {
         match event {
             KernelEvent::Status(_) => {}
-            KernelEvent::Started { agent_name, .. } => {
+            KernelEvent::Started {
+                agent_name,
+                model,
+                modes,
+                current_mode,
+                ..
+            } => {
                 self.kernel_ready = true;
                 self.kernel_error = false;
+                if let Some(model) = model {
+                    // provider/family/name → 只留最后一段，顶栏空间有限
+                    self.model_label = model.rsplit('/').next().unwrap_or(&model).to_string().into();
+                }
+                if !modes.is_empty() {
+                    self.modes = modes
+                        .into_iter()
+                        .map(|m| ModeEntry {
+                            icon: mode_icon(&m.id),
+                            desc: m.description.unwrap_or_default().into(),
+                            name: m.name.into(),
+                            id: m.id,
+                        })
+                        .collect();
+                    self.permission_mode = current_mode
+                        .and_then(|id| self.modes.iter().position(|m| m.id == id))
+                        .unwrap_or(0);
+                }
                 // 去掉 npm 作用域前缀（@scope/name → name），底栏空间有限
                 let short = agent_name.rsplit('/').next().unwrap_or(&agent_name);
                 self.kernel_status = format!("{short} · 已连接").into();
@@ -560,8 +663,20 @@ impl ChatApp {
             }
             KernelEvent::AgentMessageChunk { text } => {
                 self.finish_thinking();
+                // 首条提示之前到达的文本是 agent 的启动信息，折叠显示
+                let before_first_prompt = !self
+                    .transcript
+                    .iter()
+                    .any(|i| matches!(i, ChatItem::User(_)));
                 match self.transcript.last_mut() {
+                    Some(ChatItem::Info { text: buf, .. }) if before_first_prompt => {
+                        buf.push_str(&text)
+                    }
                     Some(ChatItem::Agent(buf)) => buf.push_str(&text),
+                    _ if before_first_prompt => self.transcript.push(ChatItem::Info {
+                        text,
+                        open: false,
+                    }),
                     _ => self.transcript.push(ChatItem::Agent(text)),
                 }
             }
@@ -578,11 +693,17 @@ impl ChatApp {
                 }),
             },
             KernelEvent::UserMessageChunk { .. } => {}
-            KernelEvent::ToolCallStarted { id, title, status } => {
+            KernelEvent::ToolCallStarted {
+                id,
+                title,
+                status,
+                kind,
+            } => {
                 self.finish_thinking();
-                let (name, arg) = split_tool_title(&title);
+                let (name, arg) = tool_label(&kind, &title);
                 self.transcript.push(ChatItem::Tool(ToolCard {
                     id: Some(id),
+                    kind,
                     name,
                     arg,
                     result: SharedString::default(),
@@ -601,7 +722,7 @@ impl ChatApp {
                 });
                 if let Some(card) = card {
                     if let Some(title) = title {
-                        let (name, arg) = split_tool_title(&title);
+                        let (name, arg) = tool_label(&card.kind, &title);
                         card.name = name;
                         card.arg = arg;
                     }
@@ -734,6 +855,7 @@ impl ChatApp {
             MockAction::BeginTool(name, arg) => {
                 self.transcript.push(ChatItem::Tool(ToolCard {
                     id: None,
+                    kind: String::new(),
                     name: (*name).into(),
                     arg: (*arg).into(),
                     result: SharedString::default(),
@@ -879,6 +1001,48 @@ impl ChatApp {
                     .text_color(rgb(INK_SOFT))
                     .line_height(relative(1.6))
                     .child(format!("{text}{caret}")),
+            );
+        }
+        col
+    }
+
+    fn render_info(idx: usize, text: &str, open: bool, cx: &mut Context<Self>) -> Div {
+        let header = div()
+            .id(("info-toggle", idx))
+            .h_flex()
+            .gap_1p5()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(ChatItem::Info { open, .. }) = this.transcript.get_mut(idx) {
+                    *open = !*open;
+                    cx.notify();
+                }
+            }))
+            .child(Icon::new(IconAll::Info).size_3p5().text_color(rgb(INK_SOFT)))
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(INK_SOFT))
+                    .child("启动信息"),
+            )
+            .child(
+                Icon::new(if open {
+                    IconAll::ChevronDown
+                } else {
+                    IconAll::ChevronRight
+                })
+                .size_3()
+                .text_color(rgb(INK_SOFT)),
+            );
+        let mut col = div().v_flex().gap_1().child(header);
+        if open {
+            col = col.child(
+                div()
+                    .text_size(px(13.))
+                    .font_family(MONO)
+                    .text_color(rgb(INK_SOFT))
+                    .line_height(relative(1.6))
+                    .child(text.to_string()),
             );
         }
         col
@@ -1205,6 +1369,7 @@ impl ChatApp {
                 streaming,
                 open,
             } => Self::railed(Self::render_thinking(idx, text, *streaming, *open, cx)),
+            ChatItem::Info { text, open } => Self::railed(Self::render_info(idx, text, *open, cx)),
             ChatItem::Tool(card) => Self::railed(Self::render_tool(card)),
             ChatItem::Diff { path, rows } => Self::railed(Self::render_diff(path, rows)),
             ChatItem::Permission {
@@ -1825,7 +1990,7 @@ impl ChatApp {
                         div()
                             .text_size(px(13.))
                             .text_color(rgb(INK))
-                            .child("GLM-5.3"),
+                            .child(self.model_label.clone()),
                     )
                     .child(
                         Icon::new(IconAll::ChevronDown)
@@ -1891,8 +2056,9 @@ impl ChatApp {
             .border_color(rgb(LINE))
             .rounded_lg()
             .shadow_md();
-        for (i, (name, desc, icon, _)) in PERMISSION_MODES.iter().enumerate() {
+        for (i, mode) in self.modes.iter().enumerate() {
             let active = self.permission_mode == i;
+            let has_desc = !mode.desc.is_empty();
             menu = menu.child(
                 div()
                     .id(("mode-item", i))
@@ -1909,13 +2075,15 @@ impl ChatApp {
                         this.mode_menu_open = false;
                         // 已连接内核时同步到会话（ACP session/set_mode）
                         if this.kernel_ready {
-                            if let Some(kernel) = &this.kernel {
-                                let _ = kernel.set_mode(PERMISSION_MODES[i].3);
+                            if let (Some(kernel), Some(mode)) =
+                                (&this.kernel, this.modes.get(i))
+                            {
+                                let _ = kernel.set_mode(&mode.id);
                             }
                         }
                         cx.notify();
                     }))
-                    .child(Icon::new(*icon).size_4().text_color(rgb(INK_SOFT)))
+                    .child(Icon::new(mode.icon).size_4().text_color(rgb(INK_SOFT)))
                     .child(
                         div()
                             .v_flex()
@@ -1924,14 +2092,16 @@ impl ChatApp {
                                 div()
                                     .text_size(px(14.))
                                     .text_color(rgb(INK))
-                                    .child(*name),
+                                    .child(mode.name.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(12.5))
-                                    .text_color(rgb(INK_SOFT))
-                                    .child(*desc),
-                            ),
+                            .when(has_desc, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(rgb(INK_SOFT))
+                                        .child(mode.desc.clone()),
+                                )
+                            }),
                     )
                     .when(active, |d| {
                         d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
@@ -1943,7 +2113,11 @@ impl ChatApp {
 
     fn render_composer(&self, cx: &mut Context<Self>) -> Div {
         let send_bg = if self.busy { rgb(INK_SOFT) } else { rgb(CORAL) };
-        let (mode_name, _, mode_icon, _) = PERMISSION_MODES[self.permission_mode];
+        let (mode_name, mode_icon): (SharedString, IconAll) = self
+            .modes
+            .get(self.permission_mode)
+            .map(|m| (m.name.clone(), m.icon))
+            .unwrap_or_else(|| ("—".into(), IconAll::Gauge));
         let card = div()
             .id("composer")
             .relative()
@@ -2019,7 +2193,7 @@ impl ChatApp {
                                 div()
                                     .text_size(px(13.5))
                                     .text_color(rgb(INK_SOFT))
-                                    .child("GLM-5.3"),
+                                    .child(self.model_label.clone()),
                             )
                             .child(
                                 Icon::new(IconAll::ChevronDown)
@@ -2238,6 +2412,19 @@ mod tests {
         assert_eq!((n.as_ref(), a.as_ref()), ("Edit", ""));
         let (n, a) = split_tool_title("读取 file.mjs");
         assert_eq!((n.as_ref(), a.as_ref()), ("Tool", "读取 file.mjs"));
+    }
+
+    #[core::prelude::v1::test]
+    fn tool_label_by_kind() {
+        let (n, a) = tool_label("execute", "ls -la");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Bash", "ls -la"));
+        let (n, a) = tool_label("read", "read");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Read", ""));
+        // 标题自带工具名时不被 kind 覆盖
+        let (n, a) = tool_label("read", "Read /a/b.rs");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Read", "/a/b.rs"));
+        let (n, a) = tool_label("other", "something");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Tool", "something"));
     }
 
     #[core::prelude::v1::test]

@@ -66,7 +66,7 @@ fn mock_agent_full_event_chain() {
     let started = events
         .iter()
         .find_map(|e| match e {
-            KernelEvent::Started { agent_name, session_id } => Some((agent_name, session_id)),
+            KernelEvent::Started { agent_name, session_id, .. } => Some((agent_name, session_id)),
             _ => None,
         })
         .expect("Started event");
