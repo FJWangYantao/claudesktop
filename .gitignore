@@ -1,3 +1,6 @@
 /target
 *.log
 .DS_Store
+
+# Debug screenshots captured while probing layout (not source)
+tools/*.png

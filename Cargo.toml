@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/desktop"]
+members = ["apps/desktop", "crates/core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,9 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 gpui-kit = "0.7.3"
-
-# 内核边界（M1 引入，先占位注释）：
-# agent-client-protocol = "3"
+agent-client-protocol = "3"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+smol = "2"

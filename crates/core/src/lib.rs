@@ -1,0 +1,135 @@
+//! # claudesktop-core
+//!
+//! 内核边界层：Claude 风格桌面 harness 的「可更换内核」抽象。
+//!
+//! M1 范围：
+//! - [`Kernel`] trait：UI 唯一依赖的内核接口（发送 / 取消 / 关闭）。
+//! - [`KernelEvent`]：内核 → UI 的单向事件流，覆盖 ACP `session/update`
+//!   全部对 UI 有意义的变体（流式文本 / 思考 / 工具调用 / 计划 / 权限 / fs）。
+//! - [`AcpKernel`]：通过 Agent Client Protocol（stdio JSON-RPC）驱动任意
+//!   ACP agent 子进程的实现，见 [`acp`] 模块。
+//!
+//! 设计约束：本 crate 不依赖任何 UI 框架；事件经 [`EventSink`] 回调
+//! （内核线程调用），指令经 channel（UI 线程投递）。
+
+mod acp;
+
+pub use acp::{AcpKernel, AcpKernelConfig};
+
+use std::sync::Arc;
+
+/// 计划条目的 UI 投影（协议无关）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanEntryView {
+    /// 条目内容（人类可读）
+    pub content: String,
+    /// 优先级（high / medium / low）
+    pub priority: String,
+    /// 状态（pending / in_progress / completed）
+    pub status: String,
+}
+
+/// 内核 → UI 的事件流。
+///
+/// 这是「agent UI 事件总线」的第一个版本：类型集合直接对齐
+/// ACP v1 `SessionUpdate` 中 UI 真正要渲染的内容，未来内核
+/// （自研引擎、其他协议）都映射到这组事件上。
+#[derive(Debug, Clone, PartialEq)]
+pub enum KernelEvent {
+    /// 生命周期 / 诊断文本（连接建立、协议协商结果等）
+    Status(String),
+    /// `initialize` + `session/new` 完成，内核就绪
+    Started {
+        /// agent 自报的名称（`agentInfo.name`）
+        agent_name: String,
+        /// 会话 ID
+        session_id: String,
+    },
+    /// agent 回复的流式文本块（追加渲染）
+    AgentMessageChunk { text: String },
+    /// agent 思考过程的流式文本块
+    AgentThoughtChunk { text: String },
+    /// 用户消息回显块（部分 agent 会流式回显用户输入）
+    UserMessageChunk { text: String },
+    /// 新工具调用开始
+    ToolCallStarted {
+        /// 工具调用 ID（后续 update 按此关联）
+        id: String,
+        /// 人类可读标题
+        title: String,
+        /// 初始状态（pending / in_progress / …）
+        status: String,
+    },
+    /// 工具调用更新（状态推进、原始输出）
+    ToolCallUpdated {
+        id: String,
+        title: Option<String>,
+        status: Option<String>,
+        /// 原始输出（JSON 文本，已截断）
+        raw_output: Option<String>,
+    },
+    /// 计划整体替换（ACP 语义：每次都是全量列表）
+    PlanReplaced { entries: Vec<PlanEntryView> },
+    /// 权限请求已按策略自动应答（M1 策略：allow_once 优先）
+    PermissionAuto { title: String, chosen: String },
+    /// 客户端代执行的 fs 读请求结果
+    FsRead { path: String, ok: bool },
+    /// 客户端代执行的 fs 写请求结果
+    FsWrite { path: String, ok: bool },
+    /// 一轮对话结束（`session/prompt` 响应到达）
+    TurnEnded { stop_reason: String },
+    /// 内核致命错误（连接断开、初始化失败等，内核不再可用）
+    Fatal(String),
+}
+
+impl KernelEvent {
+    /// 事件的简短标签（日志 / 冒烟测试输出用）。
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Status(_) => "status",
+            Self::Started { .. } => "started",
+            Self::AgentMessageChunk { .. } => "agent_message_chunk",
+            Self::AgentThoughtChunk { .. } => "agent_thought_chunk",
+            Self::UserMessageChunk { .. } => "user_message_chunk",
+            Self::ToolCallStarted { .. } => "tool_call_started",
+            Self::ToolCallUpdated { .. } => "tool_call_updated",
+            Self::PlanReplaced { .. } => "plan_replaced",
+            Self::PermissionAuto { .. } => "permission_auto",
+            Self::FsRead { .. } => "fs_read",
+            Self::FsWrite { .. } => "fs_write",
+            Self::TurnEnded { .. } => "turn_ended",
+            Self::Fatal(_) => "fatal",
+        }
+    }
+}
+
+/// 事件接收端：内核线程内直接调用，实现方负责跨线程投递。
+pub type EventSink = Arc<dyn Fn(KernelEvent) + Send + Sync + 'static>;
+
+/// UI → 内核的指令。
+#[derive(Debug, Clone)]
+pub enum KernelCommand {
+    /// 发送一轮用户消息
+    Prompt(String),
+    /// 请求取消当前轮
+    Cancel,
+    /// 关闭内核（断开连接、终止子进程）
+    Shutdown,
+}
+
+/// 可更换内核的统一抽象。
+///
+/// 实现方负责把指令转发到自己的运行时；事件一律经
+/// [`AcpKernel::spawn`] 注入的 [`EventSink`] 异步回报。
+pub trait Kernel: Send + Sync {
+    /// 内核种类标识（"acp"、"builtin"…，用于 UI 显示与日志）。
+    fn kind(&self) -> &'static str;
+    /// 展示名（如 agent 自报名称）。
+    fn label(&self) -> String;
+    /// 发送一轮用户消息；返回仅代表「已投递」。
+    fn send_prompt(&self, text: String) -> anyhow::Result<()>;
+    /// 请求取消当前轮（尽力而为）。
+    fn cancel(&self) -> anyhow::Result<()>;
+    /// 关闭内核。
+    fn shutdown(&self);
+}
