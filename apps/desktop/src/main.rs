@@ -439,16 +439,16 @@ impl ChatApp {
     fn chip(icon: IconAll, label: impl Into<SharedString>) -> Div {
         div()
             .h_flex()
-            .gap_1_5()
-            .px_2_5()
-            .py_1_5()
+            .gap_1p5()
+            .px_2p5()
+            .py_1p5()
             .rounded_md()
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
             .child(
                 Icon::new(icon)
-                    .size_3_5()
+                    .size_3p5()
                     .text_color(rgb(INK_SOFT)),
             )
             .child(
@@ -482,7 +482,7 @@ impl ChatApp {
         let header = div()
             .id(("think-toggle", idx))
             .h_flex()
-            .gap_1_5()
+            .gap_1p5()
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(ChatItem::Thinking { open, .. }) = this.transcript.get_mut(idx) {
@@ -492,7 +492,7 @@ impl ChatApp {
             }))
             .child(
                 Icon::new(IconAll::Brain)
-                    .size_3_5()
+                    .size_3p5()
                     .text_color(rgb(INK_SOFT)),
             )
             .child(
@@ -532,8 +532,8 @@ impl ChatApp {
         };
         div()
             .h_flex()
-            .gap_2_5()
-            .p_2_5()
+            .gap_2p5()
+            .p_2p5()
             .rounded_lg()
             .bg(rgb(CARD))
             .border_1()
@@ -576,7 +576,7 @@ impl ChatApp {
                     .flex_shrink_0()
                     .child(
                         Icon::new(status_icon)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(status_color)),
                     )
                     .child(
@@ -591,7 +591,7 @@ impl ChatApp {
     fn render_plan(rows: &[PlanRow]) -> Div {
         div()
             .v_flex()
-            .gap_1_5()
+            .gap_1p5()
             .p_3()
             .rounded_lg()
             .bg(rgb(CARD))
@@ -600,7 +600,7 @@ impl ChatApp {
             .child(
                 div()
                     .h_flex()
-                    .gap_1_5()
+                    .gap_1p5()
                     .child(
                         Icon::new(IconAll::ListTodo)
                             .size_4()
@@ -666,7 +666,7 @@ impl ChatApp {
                     .bg(rgb(SAND_ACTIVE))
                     .text_color(rgb(INK))
                     .rounded(px(12.))
-                    .px_3_5()
+                    .px_3p5()
                     .py_2()
                     .text_size(px(14.))
                     .line_height(relative(1.55))
@@ -769,7 +769,7 @@ impl ChatApp {
                 // 问候语
                 div()
                     .h_flex()
-                    .gap_2_5()
+                    .gap_2p5()
                     .items_center()
                     .child(
                         Icon::new(IconAll::Sparkles)
@@ -951,13 +951,13 @@ impl ChatApp {
                 .child(div().flex_1())
                 .child(
                     Icon::new(IconAll::ArrowUpDown)
-                        .size_3_5()
+                        .size_3p5()
                         .text_color(rgb(INK_SOFT)),
                 )
                 .child(
                     div().pl_2().child(
                         Icon::new(IconAll::ExternalLink)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     ),
                 ),
@@ -1114,7 +1114,7 @@ impl ChatApp {
                     .mx_2()
                     .mt_2()
                     .px_2()
-                    .py_1_5()
+                    .py_1p5()
                     .rounded_md()
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1124,7 +1124,7 @@ impl ChatApp {
                     }))
                     .child(
                         Icon::new(IconAll::SquarePen)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(INK)),
                     )
                     .child(div().text_size(px(13.)).text_color(rgb(INK)).child("新会话")),
@@ -1136,12 +1136,12 @@ impl ChatApp {
                     .gap_2()
                     .mx_2()
                     .px_2()
-                    .py_1_5()
+                    .py_1p5()
                     .rounded_md()
                     .cursor_pointer()
                     .child(
                         Icon::new(IconAll::Blocks)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     )
                     .child(div().text_size(px(13.)).text_color(rgb(INK_SOFT)).child("插件")),
@@ -1160,7 +1160,7 @@ impl ChatApp {
                             .items_center()
                             .child(
                                 Icon::new(IconAll::Ellipsis)
-                                    .size_3_5()
+                                    .size_3p5()
                                     .text_color(rgb(INK_SOFT)),
                             )
                             .child(
@@ -1173,7 +1173,7 @@ impl ChatApp {
                     .child(
                         div()
                             .h_flex()
-                            .gap_1_5()
+                            .gap_1p5()
                             .items_center()
                             .child(
                                 div().size(px(6.)).rounded_full().bg(rgb(CORAL)),
@@ -1193,9 +1193,9 @@ impl ChatApp {
         div()
             .h_flex()
             .items_center()
-            .gap_2_5()
+            .gap_2p5()
             .px_5()
-            .py_2_5()
+            .py_2p5()
             .border_b_1()
             .border_color(rgb(LINE))
             .child(
@@ -1229,14 +1229,14 @@ impl ChatApp {
             .child(
                 div()
                     .h_flex()
-                    .gap_1_5()
-                    .px_2_5()
+                    .gap_1p5()
+                    .px_2p5()
                     .py_1()
                     .rounded_full()
                     .bg(rgb(BLUE_TINT))
                     .child(
                         Icon::new(IconAll::Folder)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(BLUE)),
                     )
                     .child(
@@ -1250,7 +1250,7 @@ impl ChatApp {
                 div()
                     .h_flex()
                     .gap_1()
-                    .px_2_5()
+                    .px_2p5()
                     .py_1()
                     .rounded_md()
                     .border_1()
@@ -1258,7 +1258,7 @@ impl ChatApp {
                     .bg(rgb(CARD))
                     .child(
                         Icon::new(IconAll::Bot)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     )
                     .child(
@@ -1276,12 +1276,12 @@ impl ChatApp {
             .child(
                 div()
                     .h_flex()
-                    .gap_1_5()
-                    .px_2_5()
+                    .gap_1p5()
+                    .px_2p5()
                     .py_1()
                     .child(
                         Icon::new(IconAll::Share)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     )
                     .child(
@@ -1346,7 +1346,7 @@ impl ChatApp {
                                 } else {
                                     IconAll::ArrowUp
                                 })
-                                .size_3_5()
+                                .size_3p5()
                                 .text_color(rgb(0xFFFFFF)),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1378,7 +1378,7 @@ impl ChatApp {
                     )
                     .child(
                         div()
-                            .px_2_5()
+                            .px_2p5()
                             .py_1()
                             .rounded_md()
                             .bg(rgb(CORAL_TINT))
@@ -1388,7 +1388,7 @@ impl ChatApp {
                     )
                     .child(
                         Icon::new(IconAll::Plus)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     )
                     .child(div().flex_1())
@@ -1416,7 +1416,7 @@ impl Render for ChatApp {
                 div()
                     .h_flex()
                     .ml_2()
-                    .gap_1_5()
+                    .gap_1p5()
                     .items_center()
                     .child(div().size(px(9.)).rounded_full().bg(rgb(CORAL)))
                     .child(
@@ -1495,13 +1495,13 @@ impl Render for ChatApp {
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
             .child(title_bar)
-            .child(h_flex().flex_1().min_h_0().child(sidebar).child(main))
+            .child(h_flex().flex_1().min_h_0().child(sidebar).child(main.h_full()))
     }
 }
 
 fn main() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
 

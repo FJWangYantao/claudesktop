@@ -19,9 +19,9 @@ impl Probe {
         div()
             .h_flex()
             .items_center()
-            .gap_2_5()
+            .gap_2p5()
             .px_5()
-            .py_2_5()
+            .py_2p5()
             .border_b_1()
             .border_color(rgb(LINE))
             .child(
@@ -55,14 +55,14 @@ impl Probe {
             .child(
                 div()
                     .h_flex()
-                    .gap_1_5()
-                    .px_2_5()
+                    .gap_1p5()
+                    .px_2p5()
                     .py_1()
                     .rounded_full()
                     .bg(rgb(BLUE_TINT))
                     .child(
                         Icon::new(IconAll::Folder)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(BLUE)),
                     )
                     .child(
@@ -76,7 +76,7 @@ impl Probe {
                 div()
                     .h_flex()
                     .gap_1()
-                    .px_2_5()
+                    .px_2p5()
                     .py_1()
                     .rounded_md()
                     .border_1()
@@ -84,7 +84,7 @@ impl Probe {
                     .bg(rgb(CARD))
                     .child(
                         Icon::new(IconAll::Bot)
-                            .size_3_5()
+                            .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     )
                     .child(
@@ -122,7 +122,7 @@ impl Render for Probe {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .px_2_5()
+                            .px_2p5()
                             .py_1()
                             .rounded_md()
                             .border_1()
