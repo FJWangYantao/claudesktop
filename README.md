@@ -7,7 +7,8 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
 
 ## 里程碑
 
-- [ ] **M0** 走通框架：窗口 + 中文 IME 双测（微软拼音/搜狗）+ 高 DPI
+- [x] **M0（核心已过）** 走通框架：窗口 + 中文渲染 + IME（微软拼音全绿：候选框跟随/组词 Enter·Backspace 正常/无豆腐块；进程内存 ~103MB）
+  - [ ] 开放项：搜狗拼音实测（报告预判存疑，不影响推进）；1 万条虚拟列表滚动压测；高 DPI/多显示器
 - [ ] **M1** Kernel trait + KernelEvent（复用 ACP 类型）+ AcpKernel 驱动真实 agent
 - [ ] **M2** 自研内核（OpenAI 兼容 provider → Anthropic SSE）
 - [ ] **M3** 双内核收口：同一 UI、同一任务、两个内核
