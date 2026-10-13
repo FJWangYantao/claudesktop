@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use claudesktop_core::{AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent};
+use claudesktop_core::{AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent};
 
 fn mock_command() -> String {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -32,7 +32,8 @@ fn mock_agent_full_event_chain() {
     let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink: EventSink = {
         let events = events.clone();
-        Arc::new(move |event| {
+        Arc::new(move |routed: RoutedEvent| {
+            let event = routed.event;
             println!("[event] {} {:?}", event.tag(), event);
             events.lock().unwrap().push(event);
         })
@@ -49,10 +50,8 @@ fn mock_agent_full_event_chain() {
     )
     .expect("spawn kernel");
 
-    // 等待 Started
-    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
-
-    kernel.send_prompt("你好 mock".into()).expect("send prompt");
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, "你好 mock".into()).expect("send prompt");
 
     // 等待 TurnEnded
     wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
@@ -147,12 +146,120 @@ fn mock_agent_full_event_chain() {
     assert!(!tags.contains(&"fatal"), "unexpected fatal: {events:?}");
 }
 
+/// 等连接就绪 → 创建一个会话 → 返回它的 sessionId。
+fn start_session(kernel: &AcpKernel, events: &Arc<Mutex<Vec<KernelEvent>>>) -> String {
+    wait_for(events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
+    kernel.new_session(1, None).expect("new session");
+    wait_for(events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
+    let sid = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::Started { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("started");
+    sid
+}
+
+/// 一条连接上两个会话并发：事件按 sessionId 归属，互不串线。
+#[test]
+fn two_sessions_are_isolated() {
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed| events.lock().unwrap().push(routed))
+    };
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: mock_command(),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+        },
+        sink,
+    )
+    .expect("spawn kernel");
+
+    let poll = |what: &str, pred: &dyn Fn(&[RoutedEvent]) -> bool| {
+        let deadline = Instant::now() + Duration::from_millis(20_000);
+        loop {
+            if pred(&events.lock().unwrap()) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timeout waiting for {what}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+
+    poll("connected", &|evs| {
+        evs.iter().any(|r| matches!(r.event, KernelEvent::Connected { .. }))
+    });
+    kernel.new_session(11, None).expect("new session 1");
+    kernel.new_session(22, None).expect("new session 2");
+    poll("two sessions", &|evs| {
+        evs.iter()
+            .filter(|r| matches!(r.event, KernelEvent::Started { .. }))
+            .count()
+            == 2
+    });
+
+    let session_of = |token: u64| -> String {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|r| match &r.event {
+                KernelEvent::Started { token: t, session_id, .. } if *t == token => {
+                    Some(session_id.clone())
+                }
+                _ => None,
+            })
+            .expect("session for token")
+    };
+    let (s1, s2) = (session_of(11), session_of(22));
+    assert_ne!(s1, s2);
+
+    kernel.send_prompt(&s1, "甲甲甲".into()).unwrap();
+    kernel.send_prompt(&s2, "乙乙乙".into()).unwrap();
+    poll("both turns end", &|evs| {
+        evs.iter()
+            .filter(|r| matches!(r.event, KernelEvent::TurnEnded { .. }))
+            .count()
+            == 2
+    });
+    kernel.shutdown();
+
+    let evs = events.lock().unwrap();
+    let thought_of = |sid: &str| -> String {
+        evs.iter()
+            .filter(|r| r.session.as_deref() == Some(sid))
+            .filter_map(|r| match &r.event {
+                KernelEvent::AgentThoughtChunk { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (t1, t2) = (thought_of(&s1), thought_of(&s2));
+    assert!(t1.contains("甲甲甲") && !t1.contains("乙乙乙"), "s1 thought: {t1}");
+    assert!(t2.contains("乙乙乙") && !t2.contains("甲甲甲"), "s2 thought: {t2}");
+    for sid in [&s1, &s2] {
+        let ended = evs
+            .iter()
+            .filter(|r| r.session.as_deref() == Some(sid.as_str()))
+            .filter(|r| matches!(r.event, KernelEvent::TurnEnded { .. }))
+            .count();
+        assert_eq!(ended, 1, "each session ends exactly one turn");
+    }
+}
+
 /// 交互审批：内核发出 PermissionRequest 并挂起，UI 应答后工具才继续。
 fn run_interactive(choose: &str) -> Vec<KernelEvent> {
     let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink: EventSink = {
         let events = events.clone();
-        Arc::new(move |event| events.lock().unwrap().push(event))
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
     };
     let kernel = AcpKernel::spawn(
         AcpKernelConfig {
@@ -164,8 +271,8 @@ fn run_interactive(choose: &str) -> Vec<KernelEvent> {
         sink,
     )
     .expect("spawn kernel");
-    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
-    kernel.send_prompt("审批测试".into()).expect("send prompt");
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, "审批测试".into()).expect("send prompt");
 
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::PermissionRequest { .. }));
     // 请求挂起期间：本轮尚未结束，也没有任何自动应答

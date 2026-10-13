@@ -16,6 +16,7 @@ mod acp;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// 计划条目的 UI 投影（协议无关）。
@@ -59,8 +60,15 @@ pub struct PermissionOptionView {
 pub enum KernelEvent {
     /// 生命周期 / 诊断文本（连接建立、协议协商结果等）
     Status(String),
-    /// `initialize` + `session/new` 完成，内核就绪
+    /// 与 agent 的连接已建立（`initialize` 完成），可以开始创建会话
+    Connected {
+        /// agent 自报的名称（`agentInfo.name`）
+        agent_name: String,
+    },
+    /// 一个会话创建完成（`session/new` 响应到达）；事件的 `session` 即其 ID
     Started {
+        /// 创建会话时调用方给的令牌，用来把响应对回发起方
+        token: u64,
         /// agent 自报的名称（`agentInfo.name`）
         agent_name: String,
         /// 会话 ID
@@ -115,6 +123,8 @@ pub enum KernelEvent {
     FsWrite { path: String, ok: bool },
     /// 一轮对话结束（`session/prompt` 响应到达）
     TurnEnded { stop_reason: String },
+    /// 创建会话失败（`session/new` 报错）；连接仍然可用
+    SessionFailed { token: u64, message: String },
     /// 本轮提示失败（如未登录、模型报错）；连接仍然可用
     PromptFailed { message: String },
     /// 内核致命错误（连接断开、初始化失败等，内核不再可用）
@@ -126,6 +136,7 @@ impl KernelEvent {
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Status(_) => "status",
+            Self::Connected { .. } => "connected",
             Self::Started { .. } => "started",
             Self::AgentMessageChunk { .. } => "agent_message_chunk",
             Self::AgentThoughtChunk { .. } => "agent_thought_chunk",
@@ -138,24 +149,37 @@ impl KernelEvent {
             Self::FsRead { .. } => "fs_read",
             Self::FsWrite { .. } => "fs_write",
             Self::TurnEnded { .. } => "turn_ended",
+            Self::SessionFailed { .. } => "session_failed",
             Self::PromptFailed { .. } => "prompt_failed",
             Self::Fatal(_) => "fatal",
         }
     }
 }
 
+/// 带会话归属的事件：一条连接上可以同时有多个会话。
+///
+/// `session` 为 ACP 的 sessionId；连接级事件（`Connected` / `Status` /
+/// `Fatal` / `SessionFailed`）为 `None`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutedEvent {
+    pub session: Option<String>,
+    pub event: KernelEvent,
+}
+
 /// 事件接收端：内核线程内直接调用，实现方负责跨线程投递。
-pub type EventSink = Arc<dyn Fn(KernelEvent) + Send + Sync + 'static>;
+pub type EventSink = Arc<dyn Fn(RoutedEvent) + Send + Sync + 'static>;
 
 /// UI → 内核的指令。
 #[derive(Debug, Clone)]
 pub enum KernelCommand {
-    /// 发送一轮用户消息
-    Prompt(String),
-    /// 请求取消当前轮
-    Cancel,
-    /// 切换会话权限模式（ACP `session/set_mode`，如 `default` / `plan`）
-    SetMode(String),
+    /// 创建会话；`cwd` 为空用内核的默认工作目录
+    NewSession { token: u64, cwd: Option<PathBuf> },
+    /// 向某会话发送一轮用户消息
+    Prompt { session: String, text: String },
+    /// 请求取消某会话的当前轮
+    Cancel { session: String },
+    /// 切换某会话的权限模式（ACP `session/set_mode`，如 `default` / `plan`）
+    SetMode { session: String, mode_id: String },
     /// 关闭内核（断开连接、终止子进程）
     Shutdown,
 }
@@ -169,15 +193,18 @@ pub trait Kernel: Send + Sync {
     fn kind(&self) -> &'static str;
     /// 展示名（如 agent 自报名称）。
     fn label(&self) -> String;
-    /// 发送一轮用户消息；返回仅代表「已投递」。
-    fn send_prompt(&self, text: String) -> anyhow::Result<()>;
-    /// 请求取消当前轮（尽力而为）。
-    fn cancel(&self) -> anyhow::Result<()>;
+    /// 创建一个会话；结果经 `Started` / `SessionFailed` 事件异步回报，
+    /// 事件里带回同一个 `token`。
+    fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()>;
+    /// 向某会话发送一轮用户消息；返回仅代表「已投递」。
+    fn send_prompt(&self, session: &str, text: String) -> anyhow::Result<()>;
+    /// 请求取消某会话的当前轮（尽力而为）。
+    fn cancel(&self, session: &str) -> anyhow::Result<()>;
     /// 应答一个 [`KernelEvent::PermissionRequest`]：`Some(选项 ID)` 选择，
     /// `None` 表示取消（等同拒绝且不再追问）。
     fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()>;
     /// 切换权限模式；结果经 `Status` 事件回报，不支持的 agent 会被忽略。
-    fn set_mode(&self, mode_id: &str) -> anyhow::Result<()>;
+    fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()>;
     /// 关闭内核。
     fn shutdown(&self);
 }

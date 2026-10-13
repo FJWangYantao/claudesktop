@@ -13,7 +13,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use claudesktop_core::{
-    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PermissionOptionView,
+    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PermissionOptionView, RoutedEvent,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -285,31 +285,379 @@ fn mode_icon(id: &str) -> IconAll {
 }
 
 // ---------- 应用状态 ----------
-pub struct ChatApp {
-    input: Entity<InputState>,
+/// 一个对话会话：自己的对话记录、忙闲、模式、模型。一条内核连接上可以同时有多个。
+struct Session {
+    title: SharedString,
+    /// 创建时的令牌，用来把内核回的 Started / SessionFailed 对回这个会话
+    token: u64,
+    /// ACP sessionId（Started 之后才有；演示回放模式为 None）
+    acp_id: Option<String>,
+    /// 已向内核发出 session/new
+    requested: bool,
+    /// 可以发提示词：Started 已到，或演示回放模式
+    ready: bool,
     transcript: Vec<ChatItem>,
-    workspaces: Vec<Workspace>,
-    /// None = 首页（用量概览）；Some(i) = 打开第 i 个会话
-    selected: Option<usize>,
     busy: bool,
+    /// 演示回放用：递增即取消正在播放的脚本
     cancel_token: u64,
     scroll: ScrollHandle,
     follow_scroll: bool,
+    /// 当前可选模式（默认静态表，Started 后换成 agent 上报的）
+    modes: Vec<ModeEntry>,
+    permission_mode: usize, // modes 下标
+    model_label: SharedString,
+    /// 自动演示：会话就绪后发送的提示词
+    autoprompt: Option<String>,
+}
+
+impl Session {
+    fn new(token: u64, ready: bool) -> Self {
+        Self {
+            title: "新会话".into(),
+            token,
+            acp_id: None,
+            requested: false,
+            ready,
+            transcript: Vec::new(),
+            busy: false,
+            cancel_token: 0,
+            scroll: ScrollHandle::new(),
+            follow_scroll: true,
+            modes: default_modes(),
+            permission_mode: 0,
+            model_label: "GLM-5.3".into(),
+            autoprompt: None,
+        }
+    }
+
+    fn has_user_message(&self) -> bool {
+        self.transcript
+            .iter()
+            .any(|i| matches!(i, ChatItem::User(_)))
+    }
+
+    fn note(&mut self, text: impl Into<SharedString>) {
+        self.transcript.push(ChatItem::Note(text.into()));
+    }
+
+    fn finish_thinking(&mut self) {
+        if let Some(ChatItem::Thinking { streaming, open, .. }) = self.transcript.last_mut() {
+            *streaming = false;
+            *open = false;
+        }
+    }
+
+    /// 应答某条权限请求：`Some((选项 ID, 展示名))` 选择，`None` 取消。
+    fn resolve_permission(
+        &mut self,
+        idx: usize,
+        choice: Option<(String, String)>,
+        kernel: Option<&Arc<dyn Kernel>>,
+    ) {
+        let Some(kernel) = kernel else {
+            return;
+        };
+        if let Some(ChatItem::Permission { id, resolved, .. }) = self.transcript.get_mut(idx) {
+            if resolved.is_some() {
+                return;
+            }
+            let label: SharedString = match &choice {
+                Some((_, name)) => name.clone().into(),
+                None => "已取消".into(),
+            };
+            *resolved = Some(match kernel.resolve_permission(*id, choice.map(|(i, _)| i)) {
+                Ok(()) => label,
+                Err(err) => format!("应答失败：{err}").into(),
+            });
+        }
+    }
+
+    /// 本轮结束 / 停止 / 内核出错时，仍在等待的请求一律按「取消」收尾。
+    fn cancel_pending_permissions(&mut self, kernel: Option<&Arc<dyn Kernel>>) {
+        let Some(kernel) = kernel else {
+            return;
+        };
+        for item in &mut self.transcript {
+            if let ChatItem::Permission { id, resolved, .. } = item {
+                if resolved.is_none() {
+                    let _ = kernel.resolve_permission(*id, None);
+                    *resolved = Some("已取消".into());
+                }
+            }
+        }
+    }
+
+    /// 内核致命错误：这个会话不再可用。
+    fn on_fatal(&mut self, message: &str, kernel: Option<&Arc<dyn Kernel>>) {
+        self.busy = false;
+        self.ready = false;
+        self.cancel_pending_permissions(kernel);
+        self.note(format!("内核错误：{message}"));
+    }
+
+    /// 内核事件 → 本会话的界面内容（ACP `session/update` 的 UI 投影）。
+    /// 返回值：会话刚就绪且有待发的自动提示词时，交给调用方发送。
+    fn apply_event(
+        &mut self,
+        event: KernelEvent,
+        kernel: Option<&Arc<dyn Kernel>>,
+    ) -> Option<String> {
+        match event {
+            KernelEvent::Started {
+                session_id,
+                model,
+                modes,
+                current_mode,
+                ..
+            } => {
+                self.acp_id = Some(session_id);
+                self.ready = true;
+                if let Some(model) = model {
+                    // provider/family/name → 只留最后一段，顶栏空间有限
+                    self.model_label =
+                        model.rsplit('/').next().unwrap_or(&model).to_string().into();
+                }
+                if !modes.is_empty() {
+                    self.modes = modes
+                        .into_iter()
+                        .map(|m| ModeEntry {
+                            icon: mode_icon(&m.id),
+                            desc: m.description.unwrap_or_default().into(),
+                            name: m.name.into(),
+                            id: m.id,
+                        })
+                        .collect();
+                    self.permission_mode = current_mode
+                        .and_then(|id| self.modes.iter().position(|m| m.id == id))
+                        .unwrap_or(0);
+                }
+                return self.autoprompt.take();
+            }
+            KernelEvent::AgentMessageChunk { text } => {
+                self.finish_thinking();
+                // 首条提示之前到达的文本是 agent 的启动信息，折叠显示
+                let before_first_prompt = !self.has_user_message();
+                match self.transcript.last_mut() {
+                    Some(ChatItem::Info { text: buf, .. }) if before_first_prompt => {
+                        buf.push_str(&text)
+                    }
+                    Some(ChatItem::Agent(buf)) => buf.push_str(&text),
+                    _ if before_first_prompt => self.transcript.push(ChatItem::Info {
+                        text,
+                        open: false,
+                    }),
+                    _ => self.transcript.push(ChatItem::Agent(text)),
+                }
+            }
+            KernelEvent::AgentThoughtChunk { text } => match self.transcript.last_mut() {
+                Some(ChatItem::Thinking {
+                    text: buf,
+                    streaming: true,
+                    ..
+                }) => buf.push_str(&text),
+                _ => self.transcript.push(ChatItem::Thinking {
+                    text,
+                    streaming: true,
+                    open: true,
+                }),
+            },
+            KernelEvent::ToolCallStarted {
+                id,
+                title,
+                status,
+                kind,
+            } => {
+                self.finish_thinking();
+                let (name, arg) = tool_label(&kind, &title);
+                self.transcript.push(ChatItem::Tool(ToolCard {
+                    id: Some(id),
+                    kind,
+                    name,
+                    arg,
+                    result: SharedString::default(),
+                    phase: tool_phase(&status),
+                }));
+            }
+            KernelEvent::ToolCallUpdated {
+                id,
+                title,
+                status,
+                raw_output,
+            } => {
+                let card = self.transcript.iter_mut().rev().find_map(|item| match item {
+                    ChatItem::Tool(card) if card.id.as_deref() == Some(id.as_str()) => Some(card),
+                    _ => None,
+                });
+                if let Some(card) = card {
+                    if let Some(title) = title {
+                        let (name, arg) = tool_label(&card.kind, &title);
+                        card.name = name;
+                        card.arg = arg;
+                    }
+                    if let Some(status) = status {
+                        card.phase = tool_phase(&status);
+                    }
+                    if let Some(raw) = raw_output {
+                        card.result = summarize_output(&raw).into();
+                    }
+                }
+            }
+            KernelEvent::PlanReplaced { entries } => {
+                self.finish_thinking();
+                let rows: Vec<PlanRow> = entries
+                    .into_iter()
+                    .map(|e| PlanRow {
+                        done: e.status == "completed",
+                        text: e.content.into(),
+                    })
+                    .collect();
+                let turn_start = self
+                    .transcript
+                    .iter()
+                    .rposition(|i| matches!(i, ChatItem::User(_)))
+                    .map_or(0, |i| i + 1);
+                let existing = self.transcript[turn_start..]
+                    .iter()
+                    .rposition(|i| matches!(i, ChatItem::Plan(_)))
+                    .map(|i| i + turn_start);
+                match existing {
+                    Some(i) => self.transcript[i] = ChatItem::Plan(rows),
+                    None => self.transcript.push(ChatItem::Plan(rows)),
+                }
+            }
+            KernelEvent::PermissionAuto { title, chosen } => {
+                self.note(format!("已自动批准：{title} · {chosen}"));
+            }
+            KernelEvent::PermissionRequest { id, title, options } => {
+                self.finish_thinking();
+                self.transcript.push(ChatItem::Permission {
+                    id,
+                    title: title.into(),
+                    options,
+                    resolved: None,
+                });
+            }
+            KernelEvent::PromptFailed { message } => {
+                self.finish_thinking();
+                self.busy = false;
+                self.cancel_pending_permissions(kernel);
+                self.note(format!("本轮失败：{message}"));
+            }
+            KernelEvent::TurnEnded { stop_reason } => {
+                self.finish_thinking();
+                self.busy = false;
+                self.cancel_pending_permissions(kernel);
+                if stop_reason != "end_turn" {
+                    self.note(format!("本轮结束：{stop_reason}"));
+                }
+            }
+            // 连接级事件由 ChatApp 处理；其余（状态、fs、回显）界面不展示
+            KernelEvent::Connected { .. }
+            | KernelEvent::SessionFailed { .. }
+            | KernelEvent::Fatal(_)
+            | KernelEvent::Status(_)
+            | KernelEvent::UserMessageChunk { .. }
+            | KernelEvent::FsRead { .. }
+            | KernelEvent::FsWrite { .. } => {}
+        }
+        None
+    }
+
+    fn apply_mock(&mut self, action: &MockAction) {
+        match action {
+            MockAction::BeginThinking => {
+                self.transcript.push(ChatItem::Thinking {
+                    text: String::new(),
+                    streaming: true,
+                    open: true,
+                });
+            }
+            MockAction::ThinkChunk(chunk) => {
+                if let Some(ChatItem::Thinking { text, .. }) = self.transcript.last_mut() {
+                    text.push_str(chunk);
+                }
+            }
+            MockAction::EndThinking => {
+                if let Some(ChatItem::Thinking { streaming, open, .. }) =
+                    self.transcript.last_mut()
+                {
+                    *streaming = false;
+                    *open = false;
+                }
+            }
+            MockAction::BeginTool(name, arg) => {
+                self.transcript.push(ChatItem::Tool(ToolCard {
+                    id: None,
+                    kind: String::new(),
+                    name: (*name).into(),
+                    arg: (*arg).into(),
+                    result: SharedString::default(),
+                    phase: ToolPhase::Running,
+                }));
+            }
+            MockAction::ToolDone(result) => {
+                if let Some(ChatItem::Tool(card)) = self.transcript.last_mut() {
+                    card.result = (*result).into();
+                    card.phase = ToolPhase::Done;
+                }
+            }
+            MockAction::Diff(path, rows) => {
+                self.transcript.push(ChatItem::Diff { path, rows });
+            }
+            MockAction::BeginPlan => {
+                self.transcript.push(ChatItem::Plan(Vec::new()));
+            }
+            MockAction::PlanRowAdd(row) => {
+                if let Some(ChatItem::Plan(rows)) = self.transcript.last_mut() {
+                    rows.push(PlanRow {
+                        text: (*row).into(),
+                        done: false,
+                    });
+                }
+            }
+            MockAction::PlanRowDone(i) => {
+                if let Some(ChatItem::Plan(rows)) = self.transcript.last_mut() {
+                    if let Some(row) = rows.get_mut(*i) {
+                        row.done = true;
+                    }
+                }
+            }
+            MockAction::BeginAgent => {
+                self.transcript.push(ChatItem::Agent(String::new()));
+            }
+            MockAction::AgentChunk(chunk) => {
+                if let Some(ChatItem::Agent(text)) = self.transcript.last_mut() {
+                    text.push_str(chunk);
+                }
+            }
+            MockAction::EndAgent => {}
+            MockAction::Note(text) => {
+                self.transcript.push(ChatItem::Note((*text).into()));
+            }
+        }
+    }
+}
+
+pub struct ChatApp {
+    input: Entity<InputState>,
+    /// 内核会话（可多个）；至少有一个，`active` 始终有效
+    sessions: Vec<Session>,
+    active: usize,
+    next_token: u64,
+    /// 侧栏里除当前项目外的示意分组（仅装饰）
+    workspaces: Vec<Workspace>,
+    /// 当前项目名（取工作目录名），侧栏分组名与输入框标签用
+    project_name: SharedString,
     overview_tab: usize, // 0 概览 / 1 模型
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
     sidebar_open: bool,
     mode_menu_open: bool,
-    /// 当前可选模式（默认静态表，握手后换成 agent 上报的）
-    modes: Vec<ModeEntry>,
-    permission_mode: usize, // modes 下标
-    model_label: SharedString,
     /// 当前内核；None = 纯演示回放（CLAUDESKTOP_KERNEL=demo 或启动失败）
     kernel: Option<Arc<dyn Kernel>>,
+    /// 与 agent 的连接已建立（可以创建会话）
     kernel_ready: bool,
     kernel_error: bool,
     kernel_status: SharedString,
-    /// 自动演示：内核就绪后发送的提示词
-    autoprompt: Option<String>,
 }
 
 impl Drop for ChatApp {
@@ -411,13 +759,6 @@ impl ChatApp {
 
         let workspaces = vec![
             Workspace {
-                name: "claudesktop".into(),
-                sessions: vec![
-                    SessionEntry { title: "新会话".into(), age: "".into(), dot: None },
-                    SessionEntry { title: "gpui 高性能 Claude 风格桌…".into(), age: "28 分钟".into(), dot: None },
-                ],
-            },
-            Workspace {
                 name: "ubuntu".into(),
                 sessions: vec![
                     SessionEntry { title: "服务器能否调用 deepseek 搜索…".into(), age: "1 天".into(), dot: Some(GREEN) },
@@ -442,15 +783,22 @@ impl ChatApp {
 
         // 内核：默认 ACP（ACP_AGENT 未设置时用仓库内 mock agent）；
         // CLAUDESKTOP_KERNEL=demo 退回纯演示回放。
+        let config = AcpKernelConfig::from_env();
+        let project_name: SharedString = config
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "claudesktop".into())
+            .into();
         let demo_only = std::env::var("CLAUDESKTOP_KERNEL").ok().as_deref() == Some("demo");
-        let (ev_tx, mut ev_rx) = futures::channel::mpsc::unbounded::<KernelEvent>();
+        let (ev_tx, mut ev_rx) = futures::channel::mpsc::unbounded::<RoutedEvent>();
         let (kernel, kernel_status): (Option<Arc<dyn Kernel>>, SharedString) = if demo_only {
             (None, "演示回放（未连接内核）".into())
         } else {
             let sink: EventSink = Arc::new(move |event| {
                 let _ = ev_tx.unbounded_send(event);
             });
-            match AcpKernel::spawn(AcpKernelConfig::from_env(), sink) {
+            match AcpKernel::spawn(config, sink) {
                 Ok(k) => (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into()),
                 Err(err) => (None, format!("内核启动失败：{err}").into()),
             }
@@ -467,32 +815,61 @@ impl ChatApp {
         })
         .detach();
 
+        let ready = kernel.is_none();
         Self {
             input,
-            transcript: Vec::new(),
+            // 第一个会话：连接就绪（Connected）后统一补发 session/new
+            sessions: vec![Session::new(1, ready)],
+            active: 0,
+            next_token: 2,
             workspaces,
-            selected: Some(0),
-            busy: false,
-            cancel_token: 0,
-            scroll: ScrollHandle::new(),
-            follow_scroll: true,
+            project_name,
             overview_tab: 0,
             overview_range: 0,
             sidebar_open: true,
             mode_menu_open: false,
-            modes: default_modes(),
-            permission_mode: 0,
-            model_label: "GLM-5.3".into(),
             kernel,
             kernel_ready: false,
             kernel_error: false,
             kernel_status,
-            autoprompt: None,
+        }
+    }
+
+    fn session(&self) -> &Session {
+        &self.sessions[self.active]
+    }
+
+    /// 新建一个会话并切过去；连接已就绪就立刻向内核要，否则等 Connected 时补发。
+    fn add_session(&mut self, cx: &mut Context<Self>) {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.sessions.push(Session::new(token, self.kernel.is_none()));
+        self.active = self.sessions.len() - 1;
+        self.request_pending_sessions();
+        cx.notify();
+    }
+
+    /// 向内核要还没要过的会话（`session/new`）。连接未就绪时什么也不做。
+    fn request_pending_sessions(&mut self) {
+        if !self.kernel_ready {
+            return;
+        }
+        let Some(kernel) = self.kernel.clone() else {
+            return;
+        };
+        for s in &mut self.sessions {
+            if !s.requested && s.acp_id.is_none() {
+                s.requested = true;
+                if let Err(err) = kernel.new_session(s.token, None) {
+                    s.requested = false;
+                    s.note(format!("创建会话失败：{err}"));
+                }
+            }
         }
     }
 
     /// 调试钩子：CLAUDESKTOP_AUTODEMO=1 时自动发一条提示词
-    /// （有内核则等内核就绪后经内核发送，否则播放演示脚本）。
+    /// （有内核则等会话就绪后经内核发送，否则播放演示脚本）。
     fn autodemo_hook(&mut self, cx: &mut Context<Self>) {
         if std::env::var("CLAUDESKTOP_AUTODEMO").ok().as_deref() != Some("1") {
             return;
@@ -506,304 +883,154 @@ impl ChatApp {
             }
             _ => return,
         };
-        self.selected = Some(0);
-        if self.kernel.is_some() && !self.kernel_ready {
-            self.autoprompt = Some(text);
+        self.active = 0;
+        if self.sessions[0].ready {
+            self.submit_to(0, text, cx);
         } else {
-            self.submit(text, cx);
+            self.sessions[0].autoprompt = Some(text);
         }
         cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.session().busy {
             return;
         }
         let text = self.input.read(cx).value().to_string();
         if text.trim().is_empty() {
             return;
         }
-        // 从首页发消息 → 自动进入会话视图
-        if self.selected.is_none() {
-            self.selected = Some(0);
-        }
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.submit(text, cx);
+        self.submit_to(self.active, text, cx);
     }
 
-    /// 发送一轮用户消息：有内核走内核，否则播放演示脚本。
-    fn submit(&mut self, text: String, cx: &mut Context<Self>) {
-        if let Some(kernel) = self.kernel.clone() {
-            if !self.kernel_ready {
-                self.transcript
-                    .push(ChatItem::Note("内核尚未就绪，请稍候再发送".into()));
+    /// 向第 `idx` 个会话发一轮用户消息：有内核走内核，否则播放演示脚本。
+    fn submit_to(&mut self, idx: usize, text: String, cx: &mut Context<Self>) {
+        let kernel = self.kernel.clone();
+        let mut start_demo_token = None;
+        {
+            let s = &mut self.sessions[idx];
+            if s.busy {
+                return;
+            }
+            if kernel.is_some() && !s.ready {
+                s.note("会话尚未就绪，请稍候再发送");
                 cx.notify();
                 return;
             }
-            self.transcript
-                .push(ChatItem::User(SharedString::from(text.clone())));
-            self.busy = true;
-            self.follow_scroll = true;
-            if let Err(err) = kernel.send_prompt(text) {
-                self.busy = false;
-                self.transcript
-                    .push(ChatItem::Note(format!("发送失败：{err}").into()));
+            if !s.has_user_message() {
+                // 会话标题取首条消息的前 18 个字符
+                let title: String = text.chars().take(18).collect();
+                s.title = title.into();
             }
-        } else {
-            self.transcript.push(ChatItem::User(SharedString::from(text)));
-            self.busy = true;
-            self.follow_scroll = true;
-            self.cancel_token += 1;
-            self.start_demo(cx);
+            s.transcript
+                .push(ChatItem::User(SharedString::from(text.clone())));
+            s.busy = true;
+            s.follow_scroll = true;
+            match (&kernel, s.acp_id.clone()) {
+                (Some(kernel), Some(id)) => {
+                    if let Err(err) = kernel.send_prompt(&id, text) {
+                        s.busy = false;
+                        s.note(format!("发送失败：{err}"));
+                    }
+                }
+                (Some(_), None) => {
+                    s.busy = false;
+                    s.note("会话尚未就绪，请稍候再发送");
+                }
+                (None, _) => {
+                    s.cancel_token += 1;
+                    start_demo_token = Some(s.cancel_token);
+                }
+            }
+        }
+        if let Some(token) = start_demo_token {
+            self.start_demo(idx, token, cx);
         }
         cx.notify();
     }
 
-    /// 应答某条权限请求：`Some((选项 ID, 展示名))` 选择，`None` 取消。
+    /// 应答当前会话里的某条权限请求。
     fn resolve_permission(
         &mut self,
-        idx: usize,
+        item_idx: usize,
         choice: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
-        let Some(kernel) = self.kernel.clone() else {
-            return;
-        };
-        if let Some(ChatItem::Permission { id, resolved, .. }) = self.transcript.get_mut(idx) {
-            if resolved.is_some() {
-                return;
-            }
-            let label: SharedString = match &choice {
-                Some((_, name)) => name.clone().into(),
-                None => "已取消".into(),
-            };
-            *resolved = Some(match kernel.resolve_permission(*id, choice.map(|(i, _)| i)) {
-                Ok(()) => label,
-                Err(err) => format!("应答失败：{err}").into(),
-            });
-        }
+        let kernel = self.kernel.clone();
+        let active = self.active;
+        self.sessions[active].resolve_permission(item_idx, choice, kernel.as_ref());
         cx.notify();
-    }
-
-    /// 本轮结束 / 停止 / 内核出错时，仍在等待的请求一律按「取消」收尾。
-    fn cancel_pending_permissions(&mut self) {
-        let Some(kernel) = self.kernel.clone() else {
-            return;
-        };
-        for item in &mut self.transcript {
-            if let ChatItem::Permission { id, resolved, .. } = item {
-                if resolved.is_none() {
-                    let _ = kernel.resolve_permission(*id, None);
-                    *resolved = Some("已取消".into());
-                }
-            }
-        }
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
-        self.cancel_token += 1;
-        self.busy = false;
-        self.cancel_pending_permissions();
-        let note = match &self.kernel {
-            Some(kernel) => {
-                let _ = kernel.cancel();
-                "已请求停止"
+        let kernel = self.kernel.clone();
+        let s = &mut self.sessions[self.active];
+        s.cancel_token += 1;
+        s.busy = false;
+        s.cancel_pending_permissions(kernel.as_ref());
+        match (&kernel, s.acp_id.clone()) {
+            (Some(kernel), Some(id)) => {
+                let _ = kernel.cancel(&id);
+                s.note("已请求停止");
             }
-            None => "已停止（演示回放）",
-        };
-        self.transcript.push(ChatItem::Note(note.into()));
+            _ => s.note("已停止（演示回放）"),
+        }
         cx.notify();
     }
 
-    fn finish_thinking(&mut self) {
-        if let Some(ChatItem::Thinking { streaming, open, .. }) = self.transcript.last_mut() {
-            *streaming = false;
-            *open = false;
-        }
-    }
-
-    /// 内核事件 → 界面消息（ACP `session/update` 的 UI 投影）。
-    fn on_kernel_event(&mut self, event: KernelEvent, cx: &mut Context<Self>) {
+    /// 内核事件分发：连接级事件自己处理，会话级事件按 sessionId / token 找到会话。
+    fn on_kernel_event(&mut self, routed: RoutedEvent, cx: &mut Context<Self>) {
+        let RoutedEvent { session, event } = routed;
+        let kernel = self.kernel.clone();
         match event {
-            KernelEvent::Status(_) => {}
-            KernelEvent::Started {
-                agent_name,
-                model,
-                modes,
-                current_mode,
-                ..
-            } => {
+            KernelEvent::Connected { agent_name } => {
                 self.kernel_ready = true;
                 self.kernel_error = false;
-                if let Some(model) = model {
-                    // provider/family/name → 只留最后一段，顶栏空间有限
-                    self.model_label = model.rsplit('/').next().unwrap_or(&model).to_string().into();
-                }
-                if !modes.is_empty() {
-                    self.modes = modes
-                        .into_iter()
-                        .map(|m| ModeEntry {
-                            icon: mode_icon(&m.id),
-                            desc: m.description.unwrap_or_default().into(),
-                            name: m.name.into(),
-                            id: m.id,
-                        })
-                        .collect();
-                    self.permission_mode = current_mode
-                        .and_then(|id| self.modes.iter().position(|m| m.id == id))
-                        .unwrap_or(0);
-                }
                 // 去掉 npm 作用域前缀（@scope/name → name），底栏空间有限
                 let short = agent_name.rsplit('/').next().unwrap_or(&agent_name);
                 self.kernel_status = format!("{short} · 已连接").into();
-                if let Some(text) = self.autoprompt.take() {
-                    self.submit(text, cx);
-                }
+                self.request_pending_sessions();
             }
-            KernelEvent::AgentMessageChunk { text } => {
-                self.finish_thinking();
-                // 首条提示之前到达的文本是 agent 的启动信息，折叠显示
-                let before_first_prompt = !self
-                    .transcript
-                    .iter()
-                    .any(|i| matches!(i, ChatItem::User(_)));
-                match self.transcript.last_mut() {
-                    Some(ChatItem::Info { text: buf, .. }) if before_first_prompt => {
-                        buf.push_str(&text)
-                    }
-                    Some(ChatItem::Agent(buf)) => buf.push_str(&text),
-                    _ if before_first_prompt => self.transcript.push(ChatItem::Info {
-                        text,
-                        open: false,
-                    }),
-                    _ => self.transcript.push(ChatItem::Agent(text)),
-                }
-            }
-            KernelEvent::AgentThoughtChunk { text } => match self.transcript.last_mut() {
-                Some(ChatItem::Thinking {
-                    text: buf,
-                    streaming: true,
-                    ..
-                }) => buf.push_str(&text),
-                _ => self.transcript.push(ChatItem::Thinking {
-                    text,
-                    streaming: true,
-                    open: true,
-                }),
-            },
-            KernelEvent::UserMessageChunk { .. } => {}
-            KernelEvent::ToolCallStarted {
-                id,
-                title,
-                status,
-                kind,
-            } => {
-                self.finish_thinking();
-                let (name, arg) = tool_label(&kind, &title);
-                self.transcript.push(ChatItem::Tool(ToolCard {
-                    id: Some(id),
-                    kind,
-                    name,
-                    arg,
-                    result: SharedString::default(),
-                    phase: tool_phase(&status),
-                }));
-            }
-            KernelEvent::ToolCallUpdated {
-                id,
-                title,
-                status,
-                raw_output,
-            } => {
-                let card = self.transcript.iter_mut().rev().find_map(|item| match item {
-                    ChatItem::Tool(card) if card.id.as_deref() == Some(id.as_str()) => Some(card),
-                    _ => None,
-                });
-                if let Some(card) = card {
-                    if let Some(title) = title {
-                        let (name, arg) = tool_label(&card.kind, &title);
-                        card.name = name;
-                        card.arg = arg;
-                    }
-                    if let Some(status) = status {
-                        card.phase = tool_phase(&status);
-                    }
-                    if let Some(raw) = raw_output {
-                        card.result = summarize_output(&raw).into();
-                    }
-                }
-            }
-            KernelEvent::PlanReplaced { entries } => {
-                self.finish_thinking();
-                let rows: Vec<PlanRow> = entries
-                    .into_iter()
-                    .map(|e| PlanRow {
-                        done: e.status == "completed",
-                        text: e.content.into(),
-                    })
-                    .collect();
-                let turn_start = self
-                    .transcript
-                    .iter()
-                    .rposition(|i| matches!(i, ChatItem::User(_)))
-                    .map_or(0, |i| i + 1);
-                let existing = self.transcript[turn_start..]
-                    .iter()
-                    .rposition(|i| matches!(i, ChatItem::Plan(_)))
-                    .map(|i| i + turn_start);
-                match existing {
-                    Some(i) => self.transcript[i] = ChatItem::Plan(rows),
-                    None => self.transcript.push(ChatItem::Plan(rows)),
-                }
-            }
-            KernelEvent::PermissionAuto { title, chosen } => {
-                self.transcript.push(ChatItem::Note(
-                    format!("已自动批准：{title} · {chosen}").into(),
-                ));
-            }
-            KernelEvent::PermissionRequest { id, title, options } => {
-                self.finish_thinking();
-                self.transcript.push(ChatItem::Permission {
-                    id,
-                    title: title.into(),
-                    options,
-                    resolved: None,
-                });
-            }
-            KernelEvent::FsRead { .. } | KernelEvent::FsWrite { .. } => {}
-            KernelEvent::PromptFailed { message } => {
-                self.finish_thinking();
-                self.busy = false;
-                self.cancel_pending_permissions();
-                self.transcript
-                    .push(ChatItem::Note(format!("本轮失败：{message}").into()));
-            }
-            KernelEvent::TurnEnded { stop_reason } => {
-                self.finish_thinking();
-                self.busy = false;
-                self.cancel_pending_permissions();
-                if stop_reason != "end_turn" {
-                    self.transcript
-                        .push(ChatItem::Note(format!("本轮结束：{stop_reason}").into()));
+            KernelEvent::SessionFailed { token, message } => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.token == token) {
+                    s.requested = false;
+                    s.note(format!("创建会话失败：{message}"));
                 }
             }
             KernelEvent::Fatal(message) => {
-                self.busy = false;
-                self.cancel_pending_permissions();
                 self.kernel_ready = false;
                 self.kernel_error = true;
                 self.kernel_status = "内核错误".into();
-                self.transcript
-                    .push(ChatItem::Note(format!("内核错误：{message}").into()));
+                for s in &mut self.sessions {
+                    s.on_fatal(&message, kernel.as_ref());
+                }
+            }
+            event => {
+                // 会话级事件：Started 按令牌认领，其余按 sessionId
+                let idx = match &event {
+                    KernelEvent::Started { token, .. } => {
+                        self.sessions.iter().position(|s| s.token == *token)
+                    }
+                    _ => session.as_deref().and_then(|id| {
+                        self.sessions
+                            .iter()
+                            .position(|s| s.acp_id.as_deref() == Some(id))
+                    }),
+                };
+                if let Some(idx) = idx {
+                    if let Some(text) = self.sessions[idx].apply_event(event, kernel.as_ref()) {
+                        self.submit_to(idx, text, cx);
+                    }
+                }
             }
         }
         cx.notify();
     }
 
-    fn start_demo(&mut self, cx: &mut Context<Self>) {
+    fn start_demo(&mut self, idx: usize, token: u64, cx: &mut Context<Self>) {
         let script = build_demo_script();
-        let token = self.cancel_token;
         cx.spawn(async move |this, cx| {
             for step in script {
                 cx.background_executor()
@@ -811,11 +1038,13 @@ impl ChatApp {
                     .await;
                 let mut cancelled = false;
                 let _ = this.update(cx, |app, cx| {
-                    if app.cancel_token != token {
-                        cancelled = true;
-                        return;
+                    match app.sessions.get_mut(idx) {
+                        Some(s) if s.cancel_token == token => s.apply_mock(&step.1),
+                        _ => {
+                            cancelled = true;
+                            return;
+                        }
                     }
-                    app.apply_mock(&step.1);
                     cx.notify();
                 });
                 if cancelled {
@@ -823,85 +1052,13 @@ impl ChatApp {
                 }
             }
             let _ = this.update(cx, |app, cx| {
-                app.busy = false;
+                if let Some(s) = app.sessions.get_mut(idx) {
+                    s.busy = false;
+                }
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    fn apply_mock(&mut self, action: &MockAction) {
-        match action {
-            MockAction::BeginThinking => {
-                self.transcript.push(ChatItem::Thinking {
-                    text: String::new(),
-                    streaming: true,
-                    open: true,
-                });
-            }
-            MockAction::ThinkChunk(chunk) => {
-                if let Some(ChatItem::Thinking { text, .. }) = self.transcript.last_mut() {
-                    text.push_str(chunk);
-                }
-            }
-            MockAction::EndThinking => {
-                if let Some(ChatItem::Thinking { streaming, open, .. }) =
-                    self.transcript.last_mut()
-                {
-                    *streaming = false;
-                    *open = false;
-                }
-            }
-            MockAction::BeginTool(name, arg) => {
-                self.transcript.push(ChatItem::Tool(ToolCard {
-                    id: None,
-                    kind: String::new(),
-                    name: (*name).into(),
-                    arg: (*arg).into(),
-                    result: SharedString::default(),
-                    phase: ToolPhase::Running,
-                }));
-            }
-            MockAction::ToolDone(result) => {
-                if let Some(ChatItem::Tool(card)) = self.transcript.last_mut() {
-                    card.result = (*result).into();
-                    card.phase = ToolPhase::Done;
-                }
-            }
-            MockAction::Diff(path, rows) => {
-                self.transcript.push(ChatItem::Diff { path, rows });
-            }
-            MockAction::BeginPlan => {
-                self.transcript.push(ChatItem::Plan(Vec::new()));
-            }
-            MockAction::PlanRowAdd(row) => {
-                if let Some(ChatItem::Plan(rows)) = self.transcript.last_mut() {
-                    rows.push(PlanRow {
-                        text: (*row).into(),
-                        done: false,
-                    });
-                }
-            }
-            MockAction::PlanRowDone(i) => {
-                if let Some(ChatItem::Plan(rows)) = self.transcript.last_mut() {
-                    if let Some(row) = rows.get_mut(*i) {
-                        row.done = true;
-                    }
-                }
-            }
-            MockAction::BeginAgent => {
-                self.transcript.push(ChatItem::Agent(String::new()));
-            }
-            MockAction::AgentChunk(chunk) => {
-                if let Some(ChatItem::Agent(text)) = self.transcript.last_mut() {
-                    text.push_str(chunk);
-                }
-            }
-            MockAction::EndAgent => {}
-            MockAction::Note(text) => {
-                self.transcript.push(ChatItem::Note((*text).into()));
-            }
-        }
     }
 
     // ---------- 小组件 ----------
@@ -966,7 +1123,7 @@ impl ChatApp {
             .gap_1p5()
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(ChatItem::Thinking { open, .. }) = this.transcript.get_mut(idx) {
+                if let Some(ChatItem::Thinking { open, .. }) = this.sessions[this.active].transcript.get_mut(idx) {
                     *open = !*open;
                     cx.notify();
                 }
@@ -1013,7 +1170,7 @@ impl ChatApp {
             .gap_1p5()
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(ChatItem::Info { open, .. }) = this.transcript.get_mut(idx) {
+                if let Some(ChatItem::Info { open, .. }) = this.sessions[this.active].transcript.get_mut(idx) {
                     *open = !*open;
                     cx.notify();
                 }
@@ -1644,7 +1801,6 @@ impl ChatApp {
     // ---------- 侧栏 ----------
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let mut body = v_flex().gap_0().flex_1().min_h_0().overflow_hidden();
-        let mut flat_idx = 0usize;
 
         // 工作区头部行
         body = body.child(
@@ -1675,22 +1831,28 @@ impl ChatApp {
                 ),
         );
 
-        for ws in &self.workspaces {
-            // 工作区名
+        // 当前项目：真实会话，可点击切换
+        body = body.child(
+            div()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .text_size(px(13.5))
+                .text_color(rgb(INK))
+                .child(self.project_name.clone()),
+        );
+        for (i, s) in self.sessions.iter().enumerate() {
+            let active = self.active == i;
+            let dot = if s.busy {
+                CORAL
+            } else if s.ready {
+                GREEN
+            } else {
+                LINE
+            };
             body = body.child(
                 div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .text_size(px(13.5))
-                    .text_color(rgb(INK))
-                    .child(ws.name.clone()),
-            );
-            for s in &ws.sessions {
-                let active = self.selected == Some(flat_idx);
-                let this_idx = flat_idx;
-                let mut row = div()
-                    .id(("session", flat_idx))
+                    .id(("session", i))
                     .h_flex()
                     .items_center()
                     .gap_2()
@@ -1701,9 +1863,45 @@ impl ChatApp {
                     .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) })
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = Some(this_idx);
+                        this.active = i;
+                        this.mode_menu_open = false;
                         cx.notify();
                     }))
+                    .child(div().size(px(5.)).flex_shrink_0().rounded_full().bg(rgb(dot)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(14.))
+                            .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
+                            .child(s.title.clone()),
+                    ),
+            );
+        }
+
+        // 其余分组：示意数据，不可点击
+        for ws in &self.workspaces {
+            body = body.child(
+                div()
+                    .px_3()
+                    .pt_3()
+                    .pb_1()
+                    .text_size(px(13.5))
+                    .text_color(rgb(INK))
+                    .child(ws.name.clone()),
+            );
+            for s in &ws.sessions {
+                let mut row = div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .mx_2()
+                    .px_2()
+                    .py(px(5.))
+                    .rounded_md()
                     .child(
                         div()
                             .size(px(5.))
@@ -1719,7 +1917,7 @@ impl ChatApp {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(px(14.))
-                            .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
+                            .text_color(rgb(INK_SOFT))
                             .child(s.title.clone()),
                     );
                 if !s.age.is_empty() {
@@ -1732,7 +1930,6 @@ impl ChatApp {
                     );
                 }
                 body = body.child(row);
-                flat_idx += 1;
             }
         }
 
@@ -1832,9 +2029,7 @@ impl ChatApp {
                     .rounded_md()
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.selected = None;
-                        this.transcript.clear();
-                        cx.notify();
+                        this.add_session(cx);
                     }))
                     .child(
                         Icon::new(IconAll::SquarePen)
@@ -1947,7 +2142,7 @@ impl ChatApp {
                         div()
                             .text_size(px(14.5))
                             .text_color(rgb(INK))
-                            .child("帮我配置一个有图形界面的动态壁纸软件"),
+                            .child(self.session().title.clone()),
                     ),
             )
             .child(div().flex_1())
@@ -1990,7 +2185,7 @@ impl ChatApp {
                         div()
                             .text_size(px(13.))
                             .text_color(rgb(INK))
-                            .child(self.model_label.clone()),
+                            .child(self.session().model_label.clone()),
                     )
                     .child(
                         Icon::new(IconAll::ChevronDown)
@@ -2056,8 +2251,9 @@ impl ChatApp {
             .border_color(rgb(LINE))
             .rounded_lg()
             .shadow_md();
-        for (i, mode) in self.modes.iter().enumerate() {
-            let active = self.permission_mode == i;
+        let session = self.session();
+        for (i, mode) in session.modes.iter().enumerate() {
+            let active = session.permission_mode == i;
             let has_desc = !mode.desc.is_empty();
             menu = menu.child(
                 div()
@@ -2071,15 +2267,15 @@ impl ChatApp {
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(SAND)))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.permission_mode = i;
                         this.mode_menu_open = false;
-                        // 已连接内核时同步到会话（ACP session/set_mode）
-                        if this.kernel_ready {
-                            if let (Some(kernel), Some(mode)) =
-                                (&this.kernel, this.modes.get(i))
-                            {
-                                let _ = kernel.set_mode(&mode.id);
-                            }
+                        let kernel = this.kernel.clone();
+                        let s = &mut this.sessions[this.active];
+                        s.permission_mode = i;
+                        // 会话已建立时同步到 agent（ACP session/set_mode）
+                        if let (Some(kernel), Some(id), Some(mode)) =
+                            (kernel, s.acp_id.clone(), s.modes.get(i))
+                        {
+                            let _ = kernel.set_mode(&id, &mode.id);
                         }
                         cx.notify();
                     }))
@@ -2112,10 +2308,12 @@ impl ChatApp {
     }
 
     fn render_composer(&self, cx: &mut Context<Self>) -> Div {
-        let send_bg = if self.busy { rgb(INK_SOFT) } else { rgb(CORAL) };
+        let busy = self.session().busy;
+        let send_bg = if busy { rgb(INK_SOFT) } else { rgb(CORAL) };
         let (mode_name, mode_icon): (SharedString, IconAll) = self
+            .session()
             .modes
-            .get(self.permission_mode)
+            .get(self.session().permission_mode)
             .map(|m| (m.name.clone(), m.icon))
             .unwrap_or_else(|| ("—".into(), IconAll::Gauge));
         let card = div()
@@ -2193,7 +2391,7 @@ impl ChatApp {
                                 div()
                                     .text_size(px(13.5))
                                     .text_color(rgb(INK_SOFT))
-                                    .child(self.model_label.clone()),
+                                    .child(self.session().model_label.clone()),
                             )
                             .child(
                                 Icon::new(IconAll::ChevronDown)
@@ -2213,7 +2411,7 @@ impl ChatApp {
                             .items_center()
                             .cursor_pointer()
                             .child(
-                                Icon::new(if self.busy {
+                                Icon::new(if busy {
                                     IconAll::CircleStop
                                 } else {
                                     IconAll::ArrowUp
@@ -2222,7 +2420,7 @@ impl ChatApp {
                                 .text_color(rgb(0xFFFFFF)),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if this.busy {
+                                if this.session().busy {
                                     this.stop(cx);
                                 } else {
                                     this.send(window, cx);
@@ -2245,7 +2443,7 @@ impl ChatApp {
                     .h_flex()
                     .gap_2()
                     .child(Self::chip(IconAll::Monitor, "Local"))
-                    .child(Self::chip(IconAll::Folder, "claudesktop")),
+                    .child(Self::chip(IconAll::Folder, self.project_name.clone())),
             )
     }
 }
@@ -2283,9 +2481,12 @@ impl Render for ChatApp {
             );
 
         // 自动跟随滚动：在渲染后把滚动钉到底部
-        if self.follow_scroll {
-            self.scroll.scroll_to_bottom();
+        let active = self.active;
+        if self.sessions[active].follow_scroll {
+            self.sessions[active].scroll.scroll_to_bottom();
         }
+        // 还没发过消息的会话显示首页（问候 + 概览）
+        let home = !self.sessions[active].has_user_message();
 
         let sidebar = if self.sidebar_open {
             self.render_sidebar(cx)
@@ -2303,7 +2504,7 @@ impl Render for ChatApp {
         };
         let composer_area = div().px_6().pb_4().pt_1().child(self.render_composer(cx));
 
-        let main = if self.selected.is_none() {
+        let main = if home {
             // 首页：问候 + 用量概览
             v_flex()
                 .flex_1()
@@ -2325,7 +2526,7 @@ impl Render for ChatApp {
                 .py_6()
                 .px_6()
                 .gap_4();
-            for (idx, item) in self.transcript.iter().enumerate() {
+            for (idx, item) in self.sessions[active].transcript.iter().enumerate() {
                 list = list.child(self.render_item(idx, item, cx));
             }
 
@@ -2334,7 +2535,7 @@ impl Render for ChatApp {
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .track_scroll(&self.scroll)
+                .track_scroll(&self.sessions[active].scroll)
                 .child(list);
 
             v_flex()

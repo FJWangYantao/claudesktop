@@ -6,7 +6,7 @@
 //! UI 线程                        内核线程（smol runtime）
 //!   │ send_prompt/cancel            │
 //!   ├─ futures mpsc ──────────────►│ command loop
-//!   │                              │   initialize → session/new → prompts
+//!   │                              │   initialize → (session/new → prompts) × N
 //!   │                              │ handlers: session/update, request_permission,
 //!  EventSink(回调) ◄──────────────┤           fs/read_text_file, fs/write_text_file
 //!   └─（投递回 UI 的通道由宿主决定）  │ AcpAgent 子进程（stdio JSON-RPC）
@@ -38,7 +38,13 @@ use futures::StreamExt;
 
 use crate::{
     EventSink, Kernel, KernelCommand, KernelEvent, ModeView, PermissionOptionView, PlanEntryView,
+    RoutedEvent,
 };
+
+/// 发出一个事件；`session` 为空表示连接级事件。
+fn emit(sink: &EventSink, session: Option<String>, event: KernelEvent) {
+    sink(RoutedEvent { session, event });
+}
 
 /// 等待 UI 应答的权限请求：请求 ID → 唤醒发送端（`None` = 取消）。
 type PendingPermissions = Arc<Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>>;
@@ -51,7 +57,7 @@ pub struct AcpKernelConfig {
     /// 例：`node C:/path/to/mock-acp-agent.mjs`、
     /// `cmd /c npx -y @zed-industries/claude-code-acp`
     pub command: String,
-    /// 会话工作目录（传给 `session/new`，须为绝对路径）
+    /// 新会话的默认工作目录（传给 `session/new`，须为绝对路径）
     pub cwd: PathBuf,
     /// 是否打印 wire 级日志（stderr，按行）
     pub debug_wire: bool,
@@ -106,6 +112,9 @@ fn default_agent_command() -> String {
 }
 
 /// ACP 内核句柄（克隆廉价：仅持 channel 发送端）。
+///
+/// 一个句柄 = 一条到 agent 子进程的连接；连接上可以开任意多个会话，
+/// 各会话的事件靠 [`RoutedEvent::session`] 区分。
 #[derive(Clone)]
 pub struct AcpKernel {
     command_tx: UnboundedSender<KernelCommand>,
@@ -115,17 +124,17 @@ pub struct AcpKernel {
 impl AcpKernel {
     /// 启动内核：spawn agent 子进程 + 完成握手 + 进入指令循环。
     ///
-    /// 返回的句柄立即可用；`Started` 事件经 sink 异步到达
-    /// （握手完成时）。
+    /// 返回的句柄立即可用；握手完成时经 sink 收到 `Connected`，
+    /// 之后用 [`Kernel::new_session`] 创建会话。
     pub fn spawn(config: AcpKernelConfig, sink: EventSink) -> anyhow::Result<Self> {
         let (tx, rx) = unbounded::<KernelCommand>();
         let pending: PendingPermissions = Arc::default();
         let pending_for_thread = pending.clone();
-        let sink_status = sink.clone();
-        sink_status(KernelEvent::Status(format!(
-            "启动 ACP 内核: {}",
-            config.command
-        )));
+        emit(
+            &sink,
+            None,
+            KernelEvent::Status(format!("启动 ACP 内核: {}", config.command)),
+        );
 
         let _handle: JoinHandle<()> = std::thread::Builder::new()
             .name("acp-kernel".into())
@@ -136,6 +145,12 @@ impl AcpKernel {
             command_tx: tx,
             pending,
         })
+    }
+
+    fn send_command(&self, command: KernelCommand) -> anyhow::Result<()> {
+        self.command_tx
+            .unbounded_send(command)
+            .map_err(|_| anyhow::anyhow!("acp kernel already closed"))
     }
 }
 
@@ -148,16 +163,21 @@ impl Kernel for AcpKernel {
         "ACP agent".into()
     }
 
-    fn send_prompt(&self, text: String) -> anyhow::Result<()> {
-        self.command_tx
-            .unbounded_send(KernelCommand::Prompt(text))
-            .map_err(|_| anyhow::anyhow!("acp kernel already closed"))
+    fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()> {
+        self.send_command(KernelCommand::NewSession { token, cwd })
     }
 
-    fn cancel(&self) -> anyhow::Result<()> {
-        self.command_tx
-            .unbounded_send(KernelCommand::Cancel)
-            .map_err(|_| anyhow::anyhow!("acp kernel already closed"))
+    fn send_prompt(&self, session: &str, text: String) -> anyhow::Result<()> {
+        self.send_command(KernelCommand::Prompt {
+            session: session.to_string(),
+            text,
+        })
+    }
+
+    fn cancel(&self, session: &str) -> anyhow::Result<()> {
+        self.send_command(KernelCommand::Cancel {
+            session: session.to_string(),
+        })
     }
 
     fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()> {
@@ -170,10 +190,11 @@ impl Kernel for AcpKernel {
         }
     }
 
-    fn set_mode(&self, mode_id: &str) -> anyhow::Result<()> {
-        self.command_tx
-            .unbounded_send(KernelCommand::SetMode(mode_id.to_string()))
-            .map_err(|_| anyhow::anyhow!("acp kernel already closed"))
+    fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()> {
+        self.send_command(KernelCommand::SetMode {
+            session: session.to_string(),
+            mode_id: mode_id.to_string(),
+        })
     }
 
     fn shutdown(&self) {
@@ -203,7 +224,7 @@ fn run_kernel(
         let sink_fs_read = sink.clone();
         let sink_fs_write = sink.clone();
 
-        let cwd = config.cwd.clone();
+        let default_cwd = config.cwd.clone();
         let auto_approve = config.auto_approve;
         let next_request_id = Arc::new(AtomicU64::new(1));
 
@@ -218,6 +239,7 @@ fn run_kernel(
             )
             .on_receive_request(
                 async move |request: RequestPermissionRequest, responder, connection| {
+                    let session = request.session_id.to_string();
                     let title = request
                         .tool_call
                         .fields
@@ -240,7 +262,11 @@ fn run_kernel(
                                 kind: wire_name(&o.kind),
                             })
                             .collect();
-                        sink_permission(KernelEvent::PermissionRequest { id, title, options });
+                        emit(
+                            &sink_permission,
+                            Some(session),
+                            KernelEvent::PermissionRequest { id, title, options },
+                        );
                         return connection.spawn(async move {
                             let outcome = match rx.await.ok().flatten() {
                                 Some(option_id) => RequestPermissionOutcome::Selected(
@@ -266,10 +292,14 @@ fn run_kernel(
                         .or_else(|| request.options.first());
                     match chosen {
                         Some(option) => {
-                            sink_permission(KernelEvent::PermissionAuto {
-                                chosen: option.name.clone(),
-                                title,
-                            });
+                            emit(
+                                &sink_permission,
+                                Some(session),
+                                KernelEvent::PermissionAuto {
+                                    chosen: option.name.clone(),
+                                    title,
+                                },
+                            );
                             responder.respond(RequestPermissionResponse::new(
                                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                                     option.option_id.clone(),
@@ -277,10 +307,14 @@ fn run_kernel(
                             ))
                         }
                         None => {
-                            sink_permission(KernelEvent::PermissionAuto {
-                                chosen: "(已取消：无选项)".into(),
-                                title,
-                            });
+                            emit(
+                                &sink_permission,
+                                Some(session),
+                                KernelEvent::PermissionAuto {
+                                    chosen: "(已取消：无选项)".into(),
+                                    title,
+                                },
+                            );
                             responder.respond(RequestPermissionResponse::new(
                                 RequestPermissionOutcome::Cancelled,
                             ))
@@ -291,18 +325,27 @@ fn run_kernel(
             )
             .on_receive_request(
                 async move |request: ReadTextFileRequest, responder, _connection| {
+                    let session = request.session_id.to_string();
                     let path = request.path.to_string_lossy().into_owned();
                     // M1：忽略 line/limit；失败以空内容应答并上报事件
                     let content = match std::fs::read_to_string(&request.path) {
                         Ok(content) => {
-                            sink_fs_read(KernelEvent::FsRead { path, ok: true });
+                            emit(
+                                &sink_fs_read,
+                                Some(session),
+                                KernelEvent::FsRead { path, ok: true },
+                            );
                             content
                         }
                         Err(err) => {
-                            sink_fs_read(KernelEvent::FsRead {
-                                path: format!("{path} ({err})"),
-                                ok: false,
-                            });
+                            emit(
+                                &sink_fs_read,
+                                Some(session),
+                                KernelEvent::FsRead {
+                                    path: format!("{path} ({err})"),
+                                    ok: false,
+                                },
+                            );
                             String::new()
                         }
                     };
@@ -312,9 +355,14 @@ fn run_kernel(
             )
             .on_receive_request(
                 async move |request: WriteTextFileRequest, responder, _connection| {
+                    let session = request.session_id.to_string();
                     let path = request.path.to_string_lossy().into_owned();
                     let ok = std::fs::write(&request.path, &request.content).is_ok();
-                    sink_fs_write(KernelEvent::FsWrite { path, ok });
+                    emit(
+                        &sink_fs_write,
+                        Some(session),
+                        KernelEvent::FsWrite { path, ok },
+                    );
                     responder.respond(WriteTextFileResponse::new())
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -342,96 +390,130 @@ fn run_kernel(
                     .agent_info
                     .map(|info| info.name)
                     .unwrap_or_else(|| "unknown-agent".into());
-                sink(KernelEvent::Status(format!(
-                    "协议握手成功: v{} / {agent_name}",
-                    init.protocol_version.as_u16()
-                )));
-
-                let session = connection
-                    .send_request(NewSessionRequest::new(cwd))
-                    .block_task()
-                    .await?;
-                let model = current_model(&session.config_options);
-                let (modes, current_mode) = match &session.modes {
-                    Some(state) => (
-                        state
-                            .available_modes
-                            .iter()
-                            .map(|m| ModeView {
-                                id: m.id.to_string(),
-                                name: m.name.clone(),
-                                description: m.description.clone(),
-                            })
-                            .collect(),
-                        Some(state.current_mode_id.to_string()),
-                    ),
-                    None => (Vec::new(), None),
-                };
-                let session_id = session.session_id;
-                sink(KernelEvent::Started {
-                    agent_name,
-                    session_id: session_id.to_string(),
-                    model,
-                    modes,
-                    current_mode,
-                });
+                emit(
+                    &sink,
+                    None,
+                    KernelEvent::Status(format!(
+                        "协议握手成功: v{} / {agent_name}",
+                        init.protocol_version.as_u16()
+                    )),
+                );
+                emit(
+                    &sink,
+                    None,
+                    KernelEvent::Connected {
+                        agent_name: agent_name.clone(),
+                    },
+                );
 
                 // ---- 指令循环 --------------------------------------------
                 while let Some(command) = cmd_rx.next().await {
                     match command {
-                        KernelCommand::Prompt(text) => {
+                        KernelCommand::NewSession { token, cwd } => {
+                            let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
+                            let created = connection
+                                .send_request(NewSessionRequest::new(cwd))
+                                .block_task()
+                                .await;
+                            match created {
+                                Ok(session) => {
+                                    let model = current_model(&session.config_options);
+                                    let (modes, current_mode) = match &session.modes {
+                                        Some(state) => (
+                                            state
+                                                .available_modes
+                                                .iter()
+                                                .map(|m| ModeView {
+                                                    id: m.id.to_string(),
+                                                    name: m.name.clone(),
+                                                    description: m.description.clone(),
+                                                })
+                                                .collect(),
+                                            Some(state.current_mode_id.to_string()),
+                                        ),
+                                        None => (Vec::new(), None),
+                                    };
+                                    let session_id = session.session_id.to_string();
+                                    emit(
+                                        &sink,
+                                        Some(session_id.clone()),
+                                        KernelEvent::Started {
+                                            token,
+                                            agent_name: agent_name.clone(),
+                                            session_id,
+                                            model,
+                                            modes,
+                                            current_mode,
+                                        },
+                                    );
+                                }
+                                Err(err) => emit(
+                                    &sink,
+                                    None,
+                                    KernelEvent::SessionFailed {
+                                        token,
+                                        message: format!("{err}"),
+                                    },
+                                ),
+                            }
+                        }
+                        KernelCommand::Prompt { session, text } => {
                             // 在独立任务里等本轮结束：指令循环必须保持空闲，
-                            // 否则一轮进行中的 Cancel / SetMode 要等到轮末才处理。
+                            // 否则一轮进行中的 Cancel / SetMode / 其他会话的提示
+                            // 都要等到轮末才处理。
                             let sink_turn = sink.clone();
                             let conn = connection.clone();
-                            let sid = session_id.clone();
                             connection.spawn(async move {
                                 let response = conn
                                     .send_request(PromptRequest::new(
-                                        sid,
+                                        session.clone(),
                                         vec![ContentBlock::Text(TextContent::new(text))],
                                     ))
                                     .block_task()
                                     .await;
-                                match response {
-                                    Ok(r) => sink_turn(KernelEvent::TurnEnded {
+                                let event = match response {
+                                    Ok(r) => KernelEvent::TurnEnded {
                                         stop_reason: wire_name(&r.stop_reason),
-                                    }),
-                                    Err(err) => sink_turn(KernelEvent::PromptFailed {
+                                    },
+                                    Err(err) => KernelEvent::PromptFailed {
                                         message: format!("{err}"),
-                                    }),
-                                }
+                                    },
+                                };
+                                emit(&sink_turn, Some(session), event);
                                 Ok(())
                             })?;
                         }
-                        KernelCommand::Cancel => {
-                            let _ = connection
-                                .send_notification(CancelNotification::new(session_id.clone()));
+                        KernelCommand::Cancel { session } => {
+                            let _ = connection.send_notification(CancelNotification::new(session));
                         }
-                        KernelCommand::SetMode(mode_id) => {
+                        KernelCommand::SetMode { session, mode_id } => {
                             let result = connection
                                 .send_request(SetSessionModeRequest::new(
-                                    session_id.clone(),
+                                    session.clone(),
                                     mode_id.clone(),
                                 ))
                                 .block_task()
                                 .await;
-                            sink(KernelEvent::Status(match result {
-                                Ok(_) => format!("权限模式已切换: {mode_id}"),
-                                Err(err) => format!("切换权限模式失败（{mode_id}）: {err}"),
-                            }));
+                            emit(
+                                &sink,
+                                Some(session),
+                                KernelEvent::Status(match result {
+                                    Ok(_) => format!("权限模式已切换: {mode_id}"),
+                                    Err(err) => format!("切换权限模式失败（{mode_id}）: {err}"),
+                                }),
+                            );
                         }
                         KernelCommand::Shutdown => break,
                     }
                 }
-                sink(KernelEvent::Status("内核连接关闭".into()));
+                emit(&sink, None, KernelEvent::Status("内核连接关闭".into()));
                 Ok(())
             })
             .await
     });
 
     if let Err(err) = result {
-        sink_fatal(KernelEvent::Fatal(format!("{err:#}")));
+        emit(&sink_fatal, None, KernelEvent::Fatal(format!("{err:#}")));
     }
 }
 
@@ -475,7 +557,7 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
         other => Some(KernelEvent::Status(format!("update: {other:?}"))),
     };
     if let Some(event) = event {
-        sink(event);
+        emit(sink, Some(notification.session_id.to_string()), event);
     }
 }
 

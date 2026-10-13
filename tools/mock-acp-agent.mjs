@@ -13,15 +13,15 @@ import { fileURLToPath } from 'node:url';
 const SELF_PATH = fileURLToPath(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** @type {string|null} */
-let sessionId = null;
+// 一条连接上可有多个会话：每个会话各自一个 sessionId，事件按它路由。
+let sessionCount = 0;
 let nextId = 0;
 /** @type {Map<number, (result: any) => void>} */
 const pending = new Map();
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\n');
 const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
-const update = (u) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update: u } });
+const update = (sid, u) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: u } });
 
 /** 向客户端发起一个请求并等待响应。 */
 function request(method, params) {
@@ -32,15 +32,15 @@ function request(method, params) {
   });
 }
 
-async function runTurn(promptId, text) {
+async function runTurn(promptId, sid, text) {
   await sleep(40);
-  update({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `思考：用户说了「${text}」，我演示一轮完整的协议交互。` } });
+  update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `思考：用户说了「${text}」，我演示一轮完整的协议交互。` } });
   await sleep(40);
   for (const part of ['你好，', '我是 mock 内核，', '正在演示流式回复。']) {
-    update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: part }, messageId: 'm1' });
+    update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: part }, messageId: 'm1' });
     await sleep(40);
   }
-  update({
+  update(sid, {
     sessionUpdate: 'plan',
     entries: [
       { content: '分析请求', priority: 'high', status: 'completed' },
@@ -49,8 +49,8 @@ async function runTurn(promptId, text) {
     ],
   });
 
-  const toolCallId = `tool-${Date.now()}`;
-  update({
+  const toolCallId = `tool-${sid}-${Date.now()}`;
+  update(sid, {
     sessionUpdate: 'tool_call',
     toolCallId,
     title: '读取 mock-acp-agent.mjs',
@@ -62,7 +62,7 @@ async function runTurn(promptId, text) {
   // 权限请求 → 客户端自动应答
   // 响应结构（ACP 官方 schema）：{ outcome: { outcome: 'selected', optionId } | { outcome: 'cancelled' } }
   const permission = await request('session/request_permission', {
-    sessionId,
+    sessionId: sid,
     toolCall: { toolCallId, title: '读取 mock-acp-agent.mjs', status: 'pending' },
     options: [
       { optionId: 'allow_once', name: '允许一次', kind: 'allow_once' },
@@ -74,18 +74,18 @@ async function runTurn(promptId, text) {
 
   // fs 读请求（客户端已声明 fs.readTextFile 能力）
   let lines = -1;
-  const fsResult = await request('fs/read_text_file', { sessionId, path: SELF_PATH });
+  const fsResult = await request('fs/read_text_file', { sessionId: sid, path: SELF_PATH });
   if (typeof fsResult?.content === 'string') {
     lines = fsResult.content.split('\n').length;
   }
 
-  update({
+  update(sid, {
     sessionUpdate: 'tool_call_update',
     toolCallId,
     status: granted && lines > 0 ? 'completed' : 'failed',
     rawOutput: { granted, lines },
   });
-  update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `（工具完成：授权=${granted}，读到 ${lines} 行）` }, messageId: 'm1' });
+  update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `（工具完成：授权=${granted}，读到 ${lines} 行）` }, messageId: 'm1' });
   reply(promptId, { stopReason: 'end_turn' });
 }
 
@@ -123,15 +123,14 @@ rl.on('line', (line) => {
       reply(id, {});
       break;
     case 'session/new':
-      sessionId = `mock-session-${Date.now()}`;
-      reply(id, { sessionId });
+      reply(id, { sessionId: `mock-session-${Date.now()}-${++sessionCount}` });
       break;
     case 'session/prompt': {
       const text = (params?.prompt ?? [])
         .filter((b) => b?.type === 'text')
         .map((b) => b.text)
         .join('');
-      runTurn(id, text).catch((err) => {
+      runTurn(id, params?.sessionId, text).catch((err) => {
         console.error('[mock] turn failed:', err);
         send({ jsonrpc: '2.0', id, error: { code: -32603, message: String(err) } });
       });
