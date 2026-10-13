@@ -43,6 +43,7 @@ fn mock_agent_full_event_chain() {
             command: mock_command(),
             cwd: workspace_root(),
             debug_wire: true,
+            auto_approve: true,
         },
         sink,
     )
@@ -144,6 +145,90 @@ fn mock_agent_full_event_chain() {
     assert_eq!(turn, "end_turn");
 
     assert!(!tags.contains(&"fatal"), "unexpected fatal: {events:?}");
+}
+
+/// 交互审批：内核发出 PermissionRequest 并挂起，UI 应答后工具才继续。
+fn run_interactive(choose: &str) -> Vec<KernelEvent> {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |event| events.lock().unwrap().push(event))
+    };
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: mock_command(),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: false,
+        },
+        sink,
+    )
+    .expect("spawn kernel");
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
+    kernel.send_prompt("审批测试".into()).expect("send prompt");
+
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::PermissionRequest { .. }));
+    // 请求挂起期间：本轮尚未结束，也没有任何自动应答
+    {
+        let evs = events.lock().unwrap();
+        assert!(!evs.iter().any(|e| matches!(e, KernelEvent::TurnEnded { .. })));
+        assert!(!evs.iter().any(|e| matches!(e, KernelEvent::PermissionAuto { .. })));
+    }
+    let (id, option_ids) = {
+        let evs = events.lock().unwrap();
+        evs.iter()
+            .find_map(|e| match e {
+                KernelEvent::PermissionRequest { id, options, .. } => {
+                    Some((*id, options.iter().map(|o| o.id.clone()).collect::<Vec<_>>()))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert!(option_ids.contains(&"allow_once".to_string()));
+    assert!(option_ids.contains(&"reject_once".to_string()));
+    kernel
+        .resolve_permission(id, Some(choose.to_string()))
+        .expect("resolve permission");
+    // 同一请求不能应答两次
+    assert!(kernel.resolve_permission(id, None).is_err());
+
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let out = events.lock().unwrap().clone();
+    out
+}
+
+fn assistant_text(events: &[KernelEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::AgentMessageChunk { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn interactive_permission_allow() {
+    let events = run_interactive("allow_once");
+    assert!(assistant_text(&events).contains("授权=true"), "{events:?}");
+    let status = events.iter().find_map(|e| match e {
+        KernelEvent::ToolCallUpdated { status, .. } => status.clone(),
+        _ => None,
+    });
+    assert_eq!(status.as_deref(), Some("completed"));
+}
+
+#[test]
+fn interactive_permission_reject() {
+    let events = run_interactive("reject_once");
+    assert!(assistant_text(&events).contains("授权=false"), "{events:?}");
+    let status = events.iter().find_map(|e| match e {
+        KernelEvent::ToolCallUpdated { status, .. } => status.clone(),
+        _ => None,
+    });
+    assert_eq!(status.as_deref(), Some("failed"));
 }
 
 /// 轮询等待直到谓词命中或超时（毫秒）。

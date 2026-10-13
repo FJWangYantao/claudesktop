@@ -29,6 +29,17 @@ pub struct PlanEntryView {
     pub status: String,
 }
 
+/// 权限请求里的一个可选项（协议无关的 UI 投影）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOptionView {
+    /// 选项 ID（回传给内核）
+    pub id: String,
+    /// 展示名（如「允许一次」）
+    pub name: String,
+    /// 种类：allow_once / allow_always / reject_once / reject_always
+    pub kind: String,
+}
+
 /// 内核 → UI 的事件流。
 ///
 /// 这是「agent UI 事件总线」的第一个版本：类型集合直接对齐
@@ -70,14 +81,24 @@ pub enum KernelEvent {
     },
     /// 计划整体替换（ACP 语义：每次都是全量列表）
     PlanReplaced { entries: Vec<PlanEntryView> },
-    /// 权限请求已按策略自动应答（M1 策略：allow_once 优先）
+    /// 权限请求已按策略自动应答（`auto_approve` 开启时：allow_once 优先）
     PermissionAuto { title: String, chosen: String },
+    /// agent 请求权限，等待 UI 经 [`Kernel::resolve_permission`] 应答
+    PermissionRequest {
+        /// 请求 ID（应答时回传）
+        id: u64,
+        /// 触发请求的工具调用标题
+        title: String,
+        options: Vec<PermissionOptionView>,
+    },
     /// 客户端代执行的 fs 读请求结果
     FsRead { path: String, ok: bool },
     /// 客户端代执行的 fs 写请求结果
     FsWrite { path: String, ok: bool },
     /// 一轮对话结束（`session/prompt` 响应到达）
     TurnEnded { stop_reason: String },
+    /// 本轮提示失败（如未登录、模型报错）；连接仍然可用
+    PromptFailed { message: String },
     /// 内核致命错误（连接断开、初始化失败等，内核不再可用）
     Fatal(String),
 }
@@ -95,9 +116,11 @@ impl KernelEvent {
             Self::ToolCallUpdated { .. } => "tool_call_updated",
             Self::PlanReplaced { .. } => "plan_replaced",
             Self::PermissionAuto { .. } => "permission_auto",
+            Self::PermissionRequest { .. } => "permission_request",
             Self::FsRead { .. } => "fs_read",
             Self::FsWrite { .. } => "fs_write",
             Self::TurnEnded { .. } => "turn_ended",
+            Self::PromptFailed { .. } => "prompt_failed",
             Self::Fatal(_) => "fatal",
         }
     }
@@ -113,6 +136,8 @@ pub enum KernelCommand {
     Prompt(String),
     /// 请求取消当前轮
     Cancel,
+    /// 切换会话权限模式（ACP `session/set_mode`，如 `default` / `plan`）
+    SetMode(String),
     /// 关闭内核（断开连接、终止子进程）
     Shutdown,
 }
@@ -130,6 +155,11 @@ pub trait Kernel: Send + Sync {
     fn send_prompt(&self, text: String) -> anyhow::Result<()>;
     /// 请求取消当前轮（尽力而为）。
     fn cancel(&self) -> anyhow::Result<()>;
+    /// 应答一个 [`KernelEvent::PermissionRequest`]：`Some(选项 ID)` 选择，
+    /// `None` 表示取消（等同拒绝且不再追问）。
+    fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()>;
+    /// 切换权限模式；结果经 `Status` 事件回报，不支持的 agent 会被忽略。
+    fn set_mode(&self, mode_id: &str) -> anyhow::Result<()>;
     /// 关闭内核。
     fn shutdown(&self);
 }

@@ -15,8 +15,11 @@
 //! 本实现完全复用 `agent-client-protocol` crate 的类型系统与连接层，
 //! 不手写 JSON-RPC——协议升级时跟随 crate 版本即可。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use agent_client_protocol::schema::v1::SessionUpdate;
@@ -24,15 +27,21 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation,
     InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, TextContent,
-    WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification,
+    SetSessionModeRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
 use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::channel::oneshot;
 use futures::StreamExt;
 
-use crate::{EventSink, Kernel, KernelCommand, KernelEvent, PlanEntryView};
+use crate::{
+    EventSink, Kernel, KernelCommand, KernelEvent, PermissionOptionView, PlanEntryView,
+};
+
+/// 等待 UI 应答的权限请求：请求 ID → 唤醒发送端（`None` = 取消）。
+type PendingPermissions = Arc<Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>>;
 
 /// ACP 内核配置。
 #[derive(Debug, Clone)]
@@ -46,6 +55,9 @@ pub struct AcpKernelConfig {
     pub cwd: PathBuf,
     /// 是否打印 wire 级日志（stderr，按行）
     pub debug_wire: bool,
+    /// true = 权限请求由内核按策略自动批准（无人值守 / 测试）；
+    /// false = 发出 [`KernelEvent::PermissionRequest`] 交给 UI 决定。
+    pub auto_approve: bool,
 }
 
 impl AcpKernelConfig {
@@ -53,6 +65,7 @@ impl AcpKernelConfig {
     /// - `ACP_AGENT`：agent 启动命令；缺省用本地 mock agent
     /// - `ACP_CWD`：会话工作目录；缺省用当前目录
     /// - `ACP_DEBUG_WIRE=1`：打开 wire 日志
+    /// - `ACP_AUTO_APPROVE=1`：权限请求自动批准（缺省交给 UI 审批）
     pub fn from_env() -> Self {
         let cwd = std::env::var("ACP_CWD")
             .map(PathBuf::from)
@@ -64,7 +77,14 @@ impl AcpKernelConfig {
             command,
             cwd,
             debug_wire: std::env::var("ACP_DEBUG_WIRE").is_ok_and(|v| v == "1"),
+            auto_approve: std::env::var("ACP_AUTO_APPROVE").is_ok_and(|v| v == "1"),
         }
+    }
+
+    /// 自动批准开关（编程覆盖）。
+    pub fn with_auto_approve(mut self, on: bool) -> Self {
+        self.auto_approve = on;
+        self
     }
 
     /// wire 日志开关（编程覆盖）。
@@ -89,6 +109,7 @@ fn default_agent_command() -> String {
 #[derive(Clone)]
 pub struct AcpKernel {
     command_tx: UnboundedSender<KernelCommand>,
+    pending: PendingPermissions,
 }
 
 impl AcpKernel {
@@ -98,6 +119,8 @@ impl AcpKernel {
     /// （握手完成时）。
     pub fn spawn(config: AcpKernelConfig, sink: EventSink) -> anyhow::Result<Self> {
         let (tx, rx) = unbounded::<KernelCommand>();
+        let pending: PendingPermissions = Arc::default();
+        let pending_for_thread = pending.clone();
         let sink_status = sink.clone();
         sink_status(KernelEvent::Status(format!(
             "启动 ACP 内核: {}",
@@ -106,10 +129,13 @@ impl AcpKernel {
 
         let _handle: JoinHandle<()> = std::thread::Builder::new()
             .name("acp-kernel".into())
-            .spawn(move || run_kernel(config, rx, sink))
+            .spawn(move || run_kernel(config, rx, sink, pending_for_thread))
             .map_err(|e| anyhow::anyhow!("spawn acp-kernel thread: {e}"))?;
 
-        Ok(Self { command_tx: tx })
+        Ok(Self {
+            command_tx: tx,
+            pending,
+        })
     }
 }
 
@@ -134,13 +160,34 @@ impl Kernel for AcpKernel {
             .map_err(|_| anyhow::anyhow!("acp kernel already closed"))
     }
 
+    fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()> {
+        let sender = self.pending.lock().unwrap().remove(&request_id);
+        match sender {
+            Some(tx) => tx
+                .send(option_id)
+                .map_err(|_| anyhow::anyhow!("permission request {request_id} already closed")),
+            None => Err(anyhow::anyhow!("unknown permission request {request_id}")),
+        }
+    }
+
+    fn set_mode(&self, mode_id: &str) -> anyhow::Result<()> {
+        self.command_tx
+            .unbounded_send(KernelCommand::SetMode(mode_id.to_string()))
+            .map_err(|_| anyhow::anyhow!("acp kernel already closed"))
+    }
+
     fn shutdown(&self) {
         let _ = self.command_tx.unbounded_send(KernelCommand::Shutdown);
     }
 }
 
 /// 内核线程主体。
-fn run_kernel(config: AcpKernelConfig, mut cmd_rx: futures::channel::mpsc::UnboundedReceiver<KernelCommand>, sink: EventSink) {
+fn run_kernel(
+    config: AcpKernelConfig,
+    mut cmd_rx: futures::channel::mpsc::UnboundedReceiver<KernelCommand>,
+    sink: EventSink,
+    pending: PendingPermissions,
+) {
     let sink_fatal = sink.clone();
     let result = smol::block_on(async move {
         let mut agent = AcpAgent::from_str(&config.command)
@@ -157,6 +204,8 @@ fn run_kernel(config: AcpKernelConfig, mut cmd_rx: futures::channel::mpsc::Unbou
         let sink_fs_write = sink.clone();
 
         let cwd = config.cwd.clone();
+        let auto_approve = config.auto_approve;
+        let next_request_id = Arc::new(AtomicU64::new(1));
 
         Client
             .builder()
@@ -168,14 +217,42 @@ fn run_kernel(config: AcpKernelConfig, mut cmd_rx: futures::channel::mpsc::Unbou
                 agent_client_protocol::on_receive_notification!(),
             )
             .on_receive_request(
-                async move |request: RequestPermissionRequest, responder, _connection| {
+                async move |request: RequestPermissionRequest, responder, connection| {
                     let title = request
                         .tool_call
                         .fields
                         .title
                         .clone()
                         .unwrap_or_else(|| request.tool_call.tool_call_id.to_string());
-                    // M1 策略：allow_once > allow_always > 首个选项
+
+                    if !auto_approve {
+                        // 交互审批：事件交给 UI，应答挂在独立任务里等待——
+                        // 不能阻塞协议库的事件循环（否则 session/update 也会卡住）。
+                        let id = next_request_id.fetch_add(1, Ordering::Relaxed);
+                        let (tx, rx) = oneshot::channel::<Option<String>>();
+                        pending.lock().unwrap().insert(id, tx);
+                        let options = request
+                            .options
+                            .iter()
+                            .map(|o| PermissionOptionView {
+                                id: o.option_id.to_string(),
+                                name: o.name.clone(),
+                                kind: wire_name(&o.kind),
+                            })
+                            .collect();
+                        sink_permission(KernelEvent::PermissionRequest { id, title, options });
+                        return connection.spawn(async move {
+                            let outcome = match rx.await.ok().flatten() {
+                                Some(option_id) => RequestPermissionOutcome::Selected(
+                                    SelectedPermissionOutcome::new(option_id),
+                                ),
+                                None => RequestPermissionOutcome::Cancelled,
+                            };
+                            responder.respond(RequestPermissionResponse::new(outcome))
+                        });
+                    }
+
+                    // 自动批准策略：allow_once > allow_always > 首个选项
                     let chosen = request
                         .options
                         .iter()
@@ -284,27 +361,46 @@ fn run_kernel(config: AcpKernelConfig, mut cmd_rx: futures::channel::mpsc::Unbou
                 while let Some(command) = cmd_rx.next().await {
                     match command {
                         KernelCommand::Prompt(text) => {
-                            let response = connection
-                                .send_request(PromptRequest::new(
-                                    session_id.clone(),
-                                    vec![ContentBlock::Text(TextContent::new(text))],
-                                ))
-                                .block_task()
-                                .await;
-                            match response {
-                                Ok(r) => {
-                                    sink(KernelEvent::TurnEnded {
+                            // 在独立任务里等本轮结束：指令循环必须保持空闲，
+                            // 否则一轮进行中的 Cancel / SetMode 要等到轮末才处理。
+                            let sink_turn = sink.clone();
+                            let conn = connection.clone();
+                            let sid = session_id.clone();
+                            connection.spawn(async move {
+                                let response = conn
+                                    .send_request(PromptRequest::new(
+                                        sid,
+                                        vec![ContentBlock::Text(TextContent::new(text))],
+                                    ))
+                                    .block_task()
+                                    .await;
+                                match response {
+                                    Ok(r) => sink_turn(KernelEvent::TurnEnded {
                                         stop_reason: wire_name(&r.stop_reason),
-                                    });
+                                    }),
+                                    Err(err) => sink_turn(KernelEvent::PromptFailed {
+                                        message: format!("{err}"),
+                                    }),
                                 }
-                                Err(err) => {
-                                    sink(KernelEvent::Fatal(format!("prompt failed: {err}")));
-                                }
-                            }
+                                Ok(())
+                            })?;
                         }
                         KernelCommand::Cancel => {
                             let _ = connection
                                 .send_notification(CancelNotification::new(session_id.clone()));
+                        }
+                        KernelCommand::SetMode(mode_id) => {
+                            let result = connection
+                                .send_request(SetSessionModeRequest::new(
+                                    session_id.clone(),
+                                    mode_id.clone(),
+                                ))
+                                .block_task()
+                                .await;
+                            sink(KernelEvent::Status(match result {
+                                Ok(_) => format!("权限模式已切换: {mode_id}"),
+                                Err(err) => format!("切换权限模式失败（{mode_id}）: {err}"),
+                            }));
                         }
                         KernelCommand::Shutdown => break,
                     }

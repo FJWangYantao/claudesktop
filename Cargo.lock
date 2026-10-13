@@ -888,6 +888,8 @@ dependencies = [
 name = "claudesktop"
 version = "0.1.0"
 dependencies = [
+ "claudesktop-core",
+ "futures",
  "gpui-kit",
 ]
 

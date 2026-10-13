@@ -12,6 +12,11 @@ use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use claudesktop_core::{
+    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PermissionOptionView,
+};
+use futures::StreamExt;
+use std::sync::Arc;
 use std::time::Duration;
 
 // ---------- 色板（Claude 品牌基准：暖纸底 + 赤陶橙） ----------
@@ -25,6 +30,7 @@ const INK_FAINT: u32 = 0xB5B0A4;
 const LINE: u32 = 0xE5E1D5;
 const CARD: u32 = 0xFFFFFF;
 const GREEN: u32 = 0x7A9A65;
+const RED: u32 = 0xC0504D;
 const BLUE: u32 = 0x5B6FA8;
 const BLUE_TINT: u32 = 0xE9EEF7;
 // 字体：官方是自家的 Sans / Serif / Mono，无法分发，取 Windows 自带的近似款。
@@ -42,11 +48,14 @@ const SERIF: &str = "Georgia";
 enum ToolPhase {
     Running,
     Done,
+    Failed,
 }
 
 /// 工具调用：`● Name arg` + `└ result`（Claude Code 的紧凑样式）
 struct ToolCard {
-    name: &'static str,
+    /// 内核侧的 tool_call_id（演示脚本为 None）
+    id: Option<String>,
+    name: SharedString,
     arg: SharedString,
     result: SharedString,
     phase: ToolPhase,
@@ -56,7 +65,7 @@ struct ToolCard {
 type DiffRows = &'static [(char, &'static str)];
 
 struct PlanRow {
-    text: &'static str,
+    text: SharedString,
     done: bool,
 }
 
@@ -68,6 +77,13 @@ enum ChatItem {
         open: bool,
     },
     Tool(ToolCard),
+    /// agent 的权限请求；`resolved` 有值后按钮消失，显示所选结果
+    Permission {
+        id: u64,
+        title: SharedString,
+        options: Vec<PermissionOptionView>,
+        resolved: Option<SharedString>,
+    },
     Diff {
         path: &'static str,
         rows: DiffRows,
@@ -221,12 +237,12 @@ fn build_demo_script() -> Vec<MockStep> {
     s
 }
 
-/// 权限模式（名称沿用官方桌面版）：(名称, 说明, 图标)
-const PERMISSION_MODES: [(&str, &str, IconAll); 4] = [
-    ("Manual", "每次编辑和命令都先询问", IconAll::ShieldCheck),
-    ("Accept edits", "自动接受文件编辑，命令仍询问", IconAll::SquarePen),
-    ("Plan", "只出计划，不改动文件", IconAll::ListTodo),
-    ("Auto", "由分类器判断，少打扰", IconAll::Zap),
+/// 权限模式（名称沿用官方桌面版）：(名称, 说明, 图标, ACP mode id)
+const PERMISSION_MODES: [(&str, &str, IconAll, &str); 4] = [
+    ("Manual", "每次编辑和命令都先询问", IconAll::ShieldCheck, "default"),
+    ("Accept edits", "自动接受文件编辑，命令仍询问", IconAll::SquarePen, "acceptEdits"),
+    ("Plan", "只出计划，不改动文件", IconAll::ListTodo, "plan"),
+    ("Auto", "由分类器判断，少打扰", IconAll::Zap, "auto"),
 ];
 
 // ---------- 应用状态 ----------
@@ -245,6 +261,62 @@ pub struct ChatApp {
     sidebar_open: bool,
     mode_menu_open: bool,
     permission_mode: usize, // PERMISSION_MODES 下标
+    /// 当前内核；None = 纯演示回放（CLAUDESKTOP_KERNEL=demo 或启动失败）
+    kernel: Option<Arc<dyn Kernel>>,
+    kernel_ready: bool,
+    kernel_error: bool,
+    kernel_status: SharedString,
+    /// 自动演示：内核就绪后发送的提示词
+    autoprompt: Option<String>,
+}
+
+impl Drop for ChatApp {
+    fn drop(&mut self) {
+        if let Some(kernel) = &self.kernel {
+            kernel.shutdown();
+        }
+    }
+}
+
+/// 把 ACP 的工具标题拆成「名称 + 参数」：`Read /a/b` → (Read, /a/b)，
+/// `` `ls -la` `` → (Bash, ls -la)，其余 → (Tool, 原标题)。
+fn split_tool_title(title: &str) -> (SharedString, SharedString) {
+    let t = title.trim();
+    let is_name = |w: &str| {
+        w.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && w.chars().all(|c| c.is_ascii_alphanumeric())
+    };
+    if t.starts_with('`') {
+        return ("Bash".into(), t.trim_matches('`').to_string().into());
+    }
+    if let Some((head, rest)) = t.split_once(' ') {
+        if is_name(head) {
+            return (head.to_string().into(), rest.trim().to_string().into());
+        }
+    }
+    if is_name(t) {
+        return (t.to_string().into(), SharedString::default());
+    }
+    ("Tool".into(), t.to_string().into())
+}
+
+fn tool_phase(status: &str) -> ToolPhase {
+    match status {
+        "completed" => ToolPhase::Done,
+        "failed" => ToolPhase::Failed,
+        _ => ToolPhase::Running,
+    }
+}
+
+/// 工具原始输出 → 一行摘要（去引号/换行，截断）。
+fn summarize_output(raw: &str) -> String {
+    let t = raw.trim().trim_matches('"').replace("\\n", " ").replace("\\\"", "\"");
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() > 140 {
+        format!("{}…", t.chars().take(140).collect::<String>())
+    } else {
+        t
+    }
 }
 
 impl ChatApp {
@@ -299,6 +371,33 @@ impl ChatApp {
             },
         ];
 
+        // 内核：默认 ACP（ACP_AGENT 未设置时用仓库内 mock agent）；
+        // CLAUDESKTOP_KERNEL=demo 退回纯演示回放。
+        let demo_only = std::env::var("CLAUDESKTOP_KERNEL").ok().as_deref() == Some("demo");
+        let (ev_tx, mut ev_rx) = futures::channel::mpsc::unbounded::<KernelEvent>();
+        let (kernel, kernel_status): (Option<Arc<dyn Kernel>>, SharedString) = if demo_only {
+            (None, "演示回放（未连接内核）".into())
+        } else {
+            let sink: EventSink = Arc::new(move |event| {
+                let _ = ev_tx.unbounded_send(event);
+            });
+            match AcpKernel::spawn(AcpKernelConfig::from_env(), sink) {
+                Ok(k) => (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into()),
+                Err(err) => (None, format!("内核启动失败：{err}").into()),
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = ev_rx.next().await {
+                if this
+                    .update(cx, |app, cx| app.on_kernel_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             input,
             transcript: Vec::new(),
@@ -313,22 +412,27 @@ impl ChatApp {
             sidebar_open: true,
             mode_menu_open: false,
             permission_mode: 0,
+            kernel,
+            kernel_ready: false,
+            kernel_error: false,
+            kernel_status,
+            autoprompt: None,
         }
     }
 
-    /// 调试钩子：CLAUDESKTOP_AUTODEMO=1 时自动触发一次演示回放，
-    /// 用于无人工交互地复现回放链路的崩溃。
+    /// 调试钩子：CLAUDESKTOP_AUTODEMO=1 时自动发一条提示词
+    /// （有内核则等内核就绪后经内核发送，否则播放演示脚本）。
     fn autodemo_hook(&mut self, cx: &mut Context<Self>) {
         if std::env::var("CLAUDESKTOP_AUTODEMO").ok().as_deref() != Some("1") {
             return;
         }
-        self.transcript
-            .push(ChatItem::User("帮我配置一个有图形界面的动态壁纸软件".into()));
+        let text = "帮我配置一个有图形界面的动态壁纸软件".to_string();
         self.selected = Some(0);
-        self.busy = true;
-        self.follow_scroll = true;
-        self.cancel_token += 1;
-        self.start_demo(cx);
+        if self.kernel.is_some() && !self.kernel_ready {
+            self.autoprompt = Some(text);
+        } else {
+            self.submit(text, cx);
+        }
         cx.notify();
     }
 
@@ -344,21 +448,235 @@ impl ChatApp {
         if self.selected.is_none() {
             self.selected = Some(0);
         }
-        self.transcript.push(ChatItem::User(SharedString::from(text)));
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.busy = true;
-        self.follow_scroll = true;
-        self.cancel_token += 1;
-        self.start_demo(cx);
+        self.submit(text, cx);
+    }
+
+    /// 发送一轮用户消息：有内核走内核，否则播放演示脚本。
+    fn submit(&mut self, text: String, cx: &mut Context<Self>) {
+        if let Some(kernel) = self.kernel.clone() {
+            if !self.kernel_ready {
+                self.transcript
+                    .push(ChatItem::Note("内核尚未就绪，请稍候再发送".into()));
+                cx.notify();
+                return;
+            }
+            self.transcript
+                .push(ChatItem::User(SharedString::from(text.clone())));
+            self.busy = true;
+            self.follow_scroll = true;
+            if let Err(err) = kernel.send_prompt(text) {
+                self.busy = false;
+                self.transcript
+                    .push(ChatItem::Note(format!("发送失败：{err}").into()));
+            }
+        } else {
+            self.transcript.push(ChatItem::User(SharedString::from(text)));
+            self.busy = true;
+            self.follow_scroll = true;
+            self.cancel_token += 1;
+            self.start_demo(cx);
+        }
         cx.notify();
+    }
+
+    /// 应答某条权限请求：`Some((选项 ID, 展示名))` 选择，`None` 取消。
+    fn resolve_permission(
+        &mut self,
+        idx: usize,
+        choice: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kernel) = self.kernel.clone() else {
+            return;
+        };
+        if let Some(ChatItem::Permission { id, resolved, .. }) = self.transcript.get_mut(idx) {
+            if resolved.is_some() {
+                return;
+            }
+            let label: SharedString = match &choice {
+                Some((_, name)) => name.clone().into(),
+                None => "已取消".into(),
+            };
+            *resolved = Some(match kernel.resolve_permission(*id, choice.map(|(i, _)| i)) {
+                Ok(()) => label,
+                Err(err) => format!("应答失败：{err}").into(),
+            });
+        }
+        cx.notify();
+    }
+
+    /// 本轮结束 / 停止 / 内核出错时，仍在等待的请求一律按「取消」收尾。
+    fn cancel_pending_permissions(&mut self) {
+        let Some(kernel) = self.kernel.clone() else {
+            return;
+        };
+        for item in &mut self.transcript {
+            if let ChatItem::Permission { id, resolved, .. } = item {
+                if resolved.is_none() {
+                    let _ = kernel.resolve_permission(*id, None);
+                    *resolved = Some("已取消".into());
+                }
+            }
+        }
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
         self.cancel_token += 1;
         self.busy = false;
-        self.transcript
-            .push(ChatItem::Note("已停止（演示回放）".into()));
+        self.cancel_pending_permissions();
+        let note = match &self.kernel {
+            Some(kernel) => {
+                let _ = kernel.cancel();
+                "已请求停止"
+            }
+            None => "已停止（演示回放）",
+        };
+        self.transcript.push(ChatItem::Note(note.into()));
+        cx.notify();
+    }
+
+    fn finish_thinking(&mut self) {
+        if let Some(ChatItem::Thinking { streaming, open, .. }) = self.transcript.last_mut() {
+            *streaming = false;
+            *open = false;
+        }
+    }
+
+    /// 内核事件 → 界面消息（ACP `session/update` 的 UI 投影）。
+    fn on_kernel_event(&mut self, event: KernelEvent, cx: &mut Context<Self>) {
+        match event {
+            KernelEvent::Status(_) => {}
+            KernelEvent::Started { agent_name, .. } => {
+                self.kernel_ready = true;
+                self.kernel_error = false;
+                // 去掉 npm 作用域前缀（@scope/name → name），底栏空间有限
+                let short = agent_name.rsplit('/').next().unwrap_or(&agent_name);
+                self.kernel_status = format!("{short} · 已连接").into();
+                if let Some(text) = self.autoprompt.take() {
+                    self.submit(text, cx);
+                }
+            }
+            KernelEvent::AgentMessageChunk { text } => {
+                self.finish_thinking();
+                match self.transcript.last_mut() {
+                    Some(ChatItem::Agent(buf)) => buf.push_str(&text),
+                    _ => self.transcript.push(ChatItem::Agent(text)),
+                }
+            }
+            KernelEvent::AgentThoughtChunk { text } => match self.transcript.last_mut() {
+                Some(ChatItem::Thinking {
+                    text: buf,
+                    streaming: true,
+                    ..
+                }) => buf.push_str(&text),
+                _ => self.transcript.push(ChatItem::Thinking {
+                    text,
+                    streaming: true,
+                    open: true,
+                }),
+            },
+            KernelEvent::UserMessageChunk { .. } => {}
+            KernelEvent::ToolCallStarted { id, title, status } => {
+                self.finish_thinking();
+                let (name, arg) = split_tool_title(&title);
+                self.transcript.push(ChatItem::Tool(ToolCard {
+                    id: Some(id),
+                    name,
+                    arg,
+                    result: SharedString::default(),
+                    phase: tool_phase(&status),
+                }));
+            }
+            KernelEvent::ToolCallUpdated {
+                id,
+                title,
+                status,
+                raw_output,
+            } => {
+                let card = self.transcript.iter_mut().rev().find_map(|item| match item {
+                    ChatItem::Tool(card) if card.id.as_deref() == Some(id.as_str()) => Some(card),
+                    _ => None,
+                });
+                if let Some(card) = card {
+                    if let Some(title) = title {
+                        let (name, arg) = split_tool_title(&title);
+                        card.name = name;
+                        card.arg = arg;
+                    }
+                    if let Some(status) = status {
+                        card.phase = tool_phase(&status);
+                    }
+                    if let Some(raw) = raw_output {
+                        card.result = summarize_output(&raw).into();
+                    }
+                }
+            }
+            KernelEvent::PlanReplaced { entries } => {
+                self.finish_thinking();
+                let rows: Vec<PlanRow> = entries
+                    .into_iter()
+                    .map(|e| PlanRow {
+                        done: e.status == "completed",
+                        text: e.content.into(),
+                    })
+                    .collect();
+                let turn_start = self
+                    .transcript
+                    .iter()
+                    .rposition(|i| matches!(i, ChatItem::User(_)))
+                    .map_or(0, |i| i + 1);
+                let existing = self.transcript[turn_start..]
+                    .iter()
+                    .rposition(|i| matches!(i, ChatItem::Plan(_)))
+                    .map(|i| i + turn_start);
+                match existing {
+                    Some(i) => self.transcript[i] = ChatItem::Plan(rows),
+                    None => self.transcript.push(ChatItem::Plan(rows)),
+                }
+            }
+            KernelEvent::PermissionAuto { title, chosen } => {
+                self.transcript.push(ChatItem::Note(
+                    format!("已自动批准：{title} · {chosen}").into(),
+                ));
+            }
+            KernelEvent::PermissionRequest { id, title, options } => {
+                self.finish_thinking();
+                self.transcript.push(ChatItem::Permission {
+                    id,
+                    title: title.into(),
+                    options,
+                    resolved: None,
+                });
+            }
+            KernelEvent::FsRead { .. } | KernelEvent::FsWrite { .. } => {}
+            KernelEvent::PromptFailed { message } => {
+                self.finish_thinking();
+                self.busy = false;
+                self.cancel_pending_permissions();
+                self.transcript
+                    .push(ChatItem::Note(format!("本轮失败：{message}").into()));
+            }
+            KernelEvent::TurnEnded { stop_reason } => {
+                self.finish_thinking();
+                self.busy = false;
+                self.cancel_pending_permissions();
+                if stop_reason != "end_turn" {
+                    self.transcript
+                        .push(ChatItem::Note(format!("本轮结束：{stop_reason}").into()));
+                }
+            }
+            KernelEvent::Fatal(message) => {
+                self.busy = false;
+                self.cancel_pending_permissions();
+                self.kernel_ready = false;
+                self.kernel_error = true;
+                self.kernel_status = "内核错误".into();
+                self.transcript
+                    .push(ChatItem::Note(format!("内核错误：{message}").into()));
+            }
+        }
         cx.notify();
     }
 
@@ -415,7 +733,8 @@ impl ChatApp {
             }
             MockAction::BeginTool(name, arg) => {
                 self.transcript.push(ChatItem::Tool(ToolCard {
-                    name,
+                    id: None,
+                    name: (*name).into(),
                     arg: (*arg).into(),
                     result: SharedString::default(),
                     phase: ToolPhase::Running,
@@ -436,7 +755,7 @@ impl ChatApp {
             MockAction::PlanRowAdd(row) => {
                 if let Some(ChatItem::Plan(rows)) = self.transcript.last_mut() {
                     rows.push(PlanRow {
-                        text: row,
+                        text: (*row).into(),
                         done: false,
                     });
                 }
@@ -569,6 +888,7 @@ impl ChatApp {
         let dot = match card.phase {
             ToolPhase::Running => CORAL,
             ToolPhase::Done => GREEN,
+            ToolPhase::Failed => RED,
         };
         let mut col = div().v_flex().gap(px(2.)).child(
             div()
@@ -588,7 +908,7 @@ impl ChatApp {
                         .text_size(px(14.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(INK))
-                        .child(card.name),
+                        .child(card.name.clone()),
                 )
                 .child(
                     div()
@@ -627,6 +947,91 @@ impl ChatApp {
             );
         }
         col
+    }
+
+    fn render_permission(
+        idx: usize,
+        title: &SharedString,
+        options: &[PermissionOptionView],
+        resolved: &Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let header = div()
+            .h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Icon::new(IconAll::ShieldAlert)
+                    .size_4()
+                    .text_color(rgb(CORAL)),
+            )
+            .child(
+                div()
+                    .text_size(px(14.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("请求权限"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.5))
+                    .font_family(MONO)
+                    .text_color(rgb(INK_SOFT))
+                    .child(title.clone()),
+            );
+
+        let footer = match resolved {
+            Some(label) => div()
+                .text_size(px(13.5))
+                .text_color(rgb(INK_SOFT))
+                .child(format!("已选择：{label}")),
+            None => {
+                let mut row = div().h_flex().gap_2();
+                for (n, opt) in options.iter().enumerate() {
+                    let allow = opt.kind.starts_with("allow");
+                    let primary = opt.kind == "allow_once";
+                    let (id, name) = (opt.id.clone(), opt.name.clone());
+                    row = row.child(
+                        div()
+                            .id(("perm", idx * 16 + n))
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(13.5))
+                            .when(primary, |d| d.bg(rgb(CORAL)).text_color(rgb(0xFFFFFF)))
+                            .when(!primary, |d| {
+                                d.border_1()
+                                    .border_color(rgb(LINE))
+                                    .bg(rgb(CARD))
+                                    .hover(|d| d.bg(rgb(SAND)))
+                                    .text_color(rgb(if allow { INK } else { RED }))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resolve_permission(
+                                    idx,
+                                    Some((id.clone(), name.clone())),
+                                    cx,
+                                );
+                            }))
+                            .child(opt.name.clone()),
+                    );
+                }
+                row
+            }
+        };
+
+        div()
+            .v_flex()
+            .gap_2p5()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(CORAL))
+            .bg(rgb(CARD))
+            .child(header)
+            .child(footer)
     }
 
     fn render_diff(path: &'static str, rows: DiffRows) -> Div {
@@ -773,7 +1178,7 @@ impl ChatApp {
                             } else {
                                 rgb(INK)
                             })
-                            .child(row.text),
+                            .child(row.text.clone()),
                     )
             }))
     }
@@ -802,6 +1207,12 @@ impl ChatApp {
             } => Self::railed(Self::render_thinking(idx, text, *streaming, *open, cx)),
             ChatItem::Tool(card) => Self::railed(Self::render_tool(card)),
             ChatItem::Diff { path, rows } => Self::railed(Self::render_diff(path, rows)),
+            ChatItem::Permission {
+                title,
+                options,
+                resolved,
+                ..
+            } => Self::railed(Self::render_permission(idx, title, options, resolved, cx)),
             ChatItem::Plan(rows) => Self::railed(Self::render_plan(rows)),
             ChatItem::Agent(text) => Self::railed(
                 div().text_size(px(15.5)).line_height(relative(1.7)).child(
@@ -1313,14 +1724,25 @@ impl ChatApp {
                             .h_flex()
                             .gap_1p5()
                             .items_center()
-                            .child(
-                                div().size(px(6.)).rounded_full().bg(rgb(CORAL)),
-                            )
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(
+                                if self.kernel_error {
+                                    RED
+                                } else if self.kernel_ready {
+                                    GREEN
+                                } else {
+                                    CORAL
+                                },
+                            )))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
                                     .text_size(px(12.))
                                     .text_color(rgb(INK_SOFT))
-                                    .child("演示回放（未连接内核）"),
+                                    .child(self.kernel_status.clone()),
                             ),
                     ),
             )
@@ -1469,7 +1891,7 @@ impl ChatApp {
             .border_color(rgb(LINE))
             .rounded_lg()
             .shadow_md();
-        for (i, (name, desc, icon)) in PERMISSION_MODES.iter().enumerate() {
+        for (i, (name, desc, icon, _)) in PERMISSION_MODES.iter().enumerate() {
             let active = self.permission_mode == i;
             menu = menu.child(
                 div()
@@ -1485,6 +1907,12 @@ impl ChatApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.permission_mode = i;
                         this.mode_menu_open = false;
+                        // 已连接内核时同步到会话（ACP session/set_mode）
+                        if this.kernel_ready {
+                            if let Some(kernel) = &this.kernel {
+                                let _ = kernel.set_mode(PERMISSION_MODES[i].3);
+                            }
+                        }
                         cx.notify();
                     }))
                     .child(Icon::new(*icon).size_4().text_color(rgb(INK_SOFT)))
@@ -1515,7 +1943,7 @@ impl ChatApp {
 
     fn render_composer(&self, cx: &mut Context<Self>) -> Div {
         let send_bg = if self.busy { rgb(INK_SOFT) } else { rgb(CORAL) };
-        let (mode_name, _, mode_icon) = PERMISSION_MODES[self.permission_mode];
+        let (mode_name, _, mode_icon, _) = PERMISSION_MODES[self.permission_mode];
         let card = div()
             .id("composer")
             .relative()
@@ -1794,4 +2222,37 @@ fn main() {
             .expect("Failed to open window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn tool_title_split() {
+        let (n, a) = split_tool_title("Read /a/b.rs");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Read", "/a/b.rs"));
+        let (n, a) = split_tool_title("`cargo build -p x`");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Bash", "cargo build -p x"));
+        let (n, a) = split_tool_title("Edit");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Edit", ""));
+        let (n, a) = split_tool_title("读取 file.mjs");
+        assert_eq!((n.as_ref(), a.as_ref()), ("Tool", "读取 file.mjs"));
+    }
+
+    #[core::prelude::v1::test]
+    fn output_summary() {
+        assert_eq!(summarize_output("\"a\nb  c\""), "a b c");
+        let long = "x".repeat(300);
+        let out = summarize_output(&long);
+        assert_eq!(out.chars().count(), 141);
+        assert!(out.ends_with('…'));
+    }
+
+    #[core::prelude::v1::test]
+    fn tool_phase_mapping() {
+        assert!(tool_phase("completed") == ToolPhase::Done);
+        assert!(tool_phase("failed") == ToolPhase::Failed);
+        assert!(tool_phase("in_progress") == ToolPhase::Running);
+    }
 }
