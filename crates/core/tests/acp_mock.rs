@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use claudesktop_core::{AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent};
+use claudesktop_core::{
+    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent, UserPrompt,
+};
 
 fn mock_command() -> String {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -51,7 +53,7 @@ fn mock_agent_full_event_chain() {
     .expect("spawn kernel");
 
     let sid = start_session(&kernel, &events);
-    kernel.send_prompt(&sid, "你好 mock".into()).expect("send prompt");
+    kernel.send_prompt(&sid, UserPrompt::text("你好 mock")).expect("send prompt");
 
     // 等待 TurnEnded
     wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
@@ -221,8 +223,8 @@ fn two_sessions_are_isolated() {
     let (s1, s2) = (session_of(11), session_of(22));
     assert_ne!(s1, s2);
 
-    kernel.send_prompt(&s1, "甲甲甲".into()).unwrap();
-    kernel.send_prompt(&s2, "乙乙乙".into()).unwrap();
+    kernel.send_prompt(&s1, UserPrompt::text("甲甲甲")).unwrap();
+    kernel.send_prompt(&s2, UserPrompt::text("乙乙乙")).unwrap();
     poll("both turns end", &|evs| {
         evs.iter()
             .filter(|r| matches!(r.event, KernelEvent::TurnEnded { .. }))
@@ -272,7 +274,7 @@ fn run_interactive(choose: &str) -> Vec<KernelEvent> {
     )
     .expect("spawn kernel");
     let sid = start_session(&kernel, &events);
-    kernel.send_prompt(&sid, "审批测试".into()).expect("send prompt");
+    kernel.send_prompt(&sid, UserPrompt::text("审批测试")).expect("send prompt");
 
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::PermissionRequest { .. }));
     // 请求挂起期间：本轮尚未结束，也没有任何自动应答
@@ -395,7 +397,7 @@ fn run_resume(mock_flag: &str) -> (String, bool, String) {
             _ => None,
         })
         .expect("started");
-    kernel.send_prompt(&sid, "继续".into()).expect("send prompt");
+    kernel.send_prompt(&sid, UserPrompt::text("继续")).expect("send prompt");
     wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
     kernel.shutdown();
     let text = assistant_text(&events.lock().unwrap());

@@ -25,12 +25,11 @@ use std::thread::JoinHandle;
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation,
-    InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionModeState,
-    SessionNotification,
-    SetSessionModeRequest, TextContent, ToolCallContent, WriteTextFileRequest,
-    WriteTextFileResponse,
+    ImageContent, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
+    PromptRequest, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionModeState, SessionNotification, SetSessionModeRequest,
+    TextContent, ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
@@ -184,10 +183,10 @@ impl Kernel for AcpKernel {
         })
     }
 
-    fn send_prompt(&self, session: &str, text: String) -> anyhow::Result<()> {
+    fn send_prompt(&self, session: &str, prompt: crate::UserPrompt) -> anyhow::Result<()> {
         self.send_command(KernelCommand::Prompt {
             session: session.to_string(),
-            text,
+            prompt,
         })
     }
 
@@ -502,7 +501,7 @@ fn run_kernel(
                                 }
                             }
                         }
-                        KernelCommand::Prompt { session, text } => {
+                        KernelCommand::Prompt { session, prompt } => {
                             replaying.lock().unwrap().remove(&session);
                             // 在独立任务里等本轮结束：指令循环必须保持空闲，
                             // 否则一轮进行中的 Cancel / SetMode / 其他会话的提示
@@ -510,11 +509,17 @@ fn run_kernel(
                             let sink_turn = sink.clone();
                             let conn = connection.clone();
                             connection.spawn(async move {
+                                // 文本 + 图片附件 → ACP 内容块
+                                let mut blocks =
+                                    vec![ContentBlock::Text(TextContent::new(prompt.text))];
+                                for image in &prompt.images {
+                                    blocks.push(ContentBlock::Image(ImageContent::new(
+                                        image.data.clone(),
+                                        image.media_type.clone(),
+                                    )));
+                                }
                                 let response = conn
-                                    .send_request(PromptRequest::new(
-                                        session.clone(),
-                                        vec![ContentBlock::Text(TextContent::new(text))],
-                                    ))
+                                    .send_request(PromptRequest::new(session.clone(), blocks))
                                     .block_task()
                                     .await;
                                 let event = match response {

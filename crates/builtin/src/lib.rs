@@ -12,21 +12,33 @@
 //! 线程模型：每轮对话一个线程（阻塞读 SSE 流、执行工具、等权限应答）；
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
 
+mod anthropic;
 mod history;
 mod openai;
+mod provider;
 mod permissions;
 mod sse;
 mod tools;
 
-pub use openai::{
-    ChatMessage, FunctionCall, OpenAiProvider, ProviderConfig, StreamEvent, StreamOutcome,
-    ToolCall, Usage,
-};
+pub use anthropic::AnthropicProvider;
+pub use openai::OpenAiProvider;
 pub use permissions::{PermissionRules, default_rules_path};
+pub use provider::{
+    ChatMessage, ChatProvider, ContentPart, FunctionCall, Protocol, ProviderConfig, RequestParams,
+    StreamEvent, StreamOutcome, ToolCall, Usage,
+};
 
 /// 列出端点提供的模型（阻塞，设置页在后台线程调用）。
 pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<String>> {
-    OpenAiProvider::new(config).list_models()
+    make_provider(&config).list_models()
+}
+
+/// 按配置里的协议构造 provider。
+fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
+    match config.protocol {
+        Protocol::OpenAiCompat => std::sync::Arc::new(OpenAiProvider::new(config.clone())),
+        Protocol::Anthropic => std::sync::Arc::new(AnthropicProvider::new(config.clone())),
+    }
 }
 
 use claudesktop_core::{
@@ -67,28 +79,35 @@ impl BuiltinConfig {
     }
 
     /// 从环境变量读取：
-    /// - `CLAUDESKTOP_BASE_URL`（必填）：OpenAI 兼容端点，如 `http://127.0.0.1:8045/v1`
+    /// - `CLAUDESKTOP_BASE_URL`（必填）：端点，如 `http://127.0.0.1:8045/v1`
     /// - `CLAUDESKTOP_MODEL`（必填）：模型 ID
     /// - `CLAUDESKTOP_API_KEY`（可选，其次 `OPENAI_API_KEY`）
+    /// - `CLAUDEDESKTOP_PROTOCOL`（可选，`anthropic` = Anthropic 原生协议）
     pub fn from_env() -> anyhow::Result<Self> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         let base_url = var("CLAUDESKTOP_BASE_URL")
             .ok_or_else(|| anyhow::anyhow!("未设置 CLAUDESKTOP_BASE_URL（OpenAI 兼容端点）"))?;
         let model =
             var("CLAUDESKTOP_MODEL").ok_or_else(|| anyhow::anyhow!("未设置 CLAUDESKTOP_MODEL"))?;
+        let protocol = match var("CLAUDEDESKTOP_PROTOCOL").as_deref() {
+            Some("anthropic") => Protocol::Anthropic,
+            _ => Protocol::OpenAiCompat,
+        };
         Ok(Self::new(
             ProviderConfig {
+                protocol,
                 base_url,
                 api_key: var("CLAUDESKTOP_API_KEY").or_else(|| var("OPENAI_API_KEY")),
                 model,
+                params: RequestParams::default(),
             },
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         ))
     }
 
-    /// 写进会话元信息的内核标识：同一端点 + 模型才算同一个「agent」。
+    /// 写进会话元信息的内核标识（见 [`ProviderConfig::identity`]）。
     pub fn identity(&self) -> String {
-        format!("builtin:{}#{}", self.provider.base_url, self.provider.model)
+        self.provider.identity()
     }
 }
 
@@ -120,7 +139,7 @@ struct SessionState {
 }
 
 struct Inner {
-    provider: OpenAiProvider,
+    provider: Arc<dyn ChatProvider>,
     /// 新会话的默认模型（最近一次 `set_model` 选的，初始为配置里的）
     default_model: Mutex<String>,
     sink: EventSink,
@@ -371,7 +390,7 @@ impl BuiltinKernel {
     pub fn spawn(config: BuiltinConfig, sink: EventSink) -> anyhow::Result<Self> {
         let agent_name = format!("builtin · {}", config.provider.model);
         let inner = Arc::new(Inner {
-            provider: OpenAiProvider::new(config.provider.clone()),
+            provider: make_provider(&config.provider),
             default_model: Mutex::new(config.provider.model.clone()),
             sink,
             agent_name: agent_name.clone(),
@@ -586,7 +605,7 @@ impl Kernel for BuiltinKernel {
         Ok(())
     }
 
-    fn send_prompt(&self, session: &str, text: String) -> anyhow::Result<()> {
+    fn send_prompt(&self, session: &str, prompt: claudesktop_core::UserPrompt) -> anyhow::Result<()> {
         let flag = {
             let mut sessions = self.inner.sessions.lock().unwrap();
             let state = sessions
@@ -595,7 +614,15 @@ impl Kernel for BuiltinKernel {
             if state.turn.is_some() {
                 anyhow::bail!("上一轮还没结束");
             }
-            state.history.push(ChatMessage::new("user", text));
+            // 文本 + 图片附件合成一条多段用户消息
+            let mut parts = vec![ContentPart::Text(prompt.text)];
+            for image in prompt.images {
+                parts.push(ContentPart::Image {
+                    media_type: image.media_type,
+                    data: image.data,
+                });
+            }
+            state.history.push(ChatMessage::with_parts("user", parts));
             let flag = Arc::new(AtomicBool::new(false));
             state.turn = Some(flag.clone());
             flag

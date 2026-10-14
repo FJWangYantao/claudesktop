@@ -5,150 +5,47 @@
 //! （DeepSeek / 多数网关）与 `reasoning`（OpenRouter）两种字段；
 //! 工具调用按 `delta.tool_calls[]` 流式拼接。
 
-use crate::sse::{self, SseEvent};
-use serde::Serialize;
+use crate::provider::{
+    ChatMessage, ChatProvider, RequestParams, StreamEvent, StreamOutcome, ToolCall, Usage,
+    debug_http, error_message, post_sse_with_retry, read_sse,
+};
 use serde_json::Value;
-use std::io::BufReader;
-use std::time::Duration;
 
-/// 还没收到任何输出时，这些状态码按瞬态错误退避重试。
-const RETRYABLE: [u16; 5] = [429, 500, 502, 503, 504];
-/// 重试等待（毫秒）；长度即最大重试次数。
-const BACKOFF_MS: [u64; 2] = [1_000, 3_000];
-
-#[derive(Debug, Clone)]
-pub struct ProviderConfig {
-    /// 如 `http://127.0.0.1:8045/v1`（不含 `/chat/completions`）
-    pub base_url: String,
-    pub api_key: Option<String>,
-    pub model: String,
-}
-
-/// 发给 provider 的一条消息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ChatMessage {
-    pub role: String,
-    /// 只有工具调用的 assistant 消息为 null
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCall>,
-    /// role = tool 时对应的调用 ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-}
-
-impl ChatMessage {
-    pub fn new(role: &str, content: impl Into<String>) -> Self {
-        Self {
-            role: role.to_string(),
-            content: Some(content.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
-    }
-
-    /// 带工具调用的 assistant 消息（`text` 为同一步里模型说的话，可为空）
-    pub fn assistant_tool_calls(text: String, tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: (!text.is_empty()).then_some(text),
-            tool_calls,
-            tool_call_id: None,
-        }
-    }
-
-    pub fn tool_result(call_id: String, content: String) -> Self {
-        Self {
-            role: "tool".into(),
-            content: Some(content),
-            tool_calls: Vec::new(),
-            tool_call_id: Some(call_id),
-        }
-    }
-}
-
-/// 模型发起的一次函数调用（OpenAI `tool_calls[]`）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub function: FunctionCall,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FunctionCall {
-    pub name: String,
-    /// JSON 文本（流式拼接而来）
-    pub arguments: String,
-}
-
-/// 流式过程中交给调用方的事件。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamEvent {
-    Text(String),
-    Reasoning(String),
-    /// 即将重试（第 `attempt` 次，等待 `delay_ms`），`reason` 为上一次的错误
-    Retrying {
-        attempt: usize,
-        delay_ms: u64,
-        reason: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_tokens: u64,
-}
-
-impl Usage {
-    pub fn add(&mut self, other: Usage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StreamOutcome {
-    /// provider 的 `finish_reason`（stop / length / tool_calls …）
-    pub finish_reason: Option<String>,
-    pub usage: Option<Usage>,
-    /// false = 被 `should_stop` 叫停
-    pub completed: bool,
-    /// 本步模型请求的工具调用（按 index 顺序）
-    pub tool_calls: Vec<ToolCall>,
-}
-
+/// OpenAI 兼容端点的 provider（协议细节见模块文档）。
 pub struct OpenAiProvider {
-    config: ProviderConfig,
+    config: crate::provider::ProviderConfig,
     agent: ureq::Agent,
 }
 
 impl OpenAiProvider {
-    pub fn new(config: ProviderConfig) -> Self {
+    pub fn new(config: crate::provider::ProviderConfig) -> Self {
         let agent = ureq::Agent::config_builder()
             // 非 2xx 也要读响应体拿错误信息
             .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
             .build()
             .new_agent();
         Self { config, agent }
     }
 
-    /// 配置里的默认模型
-    pub fn model(&self) -> &str {
-        &self.config.model
+    fn auth_header(&self) -> Option<(&'static str, String)> {
+        self.config
+            .api_key
+            .as_ref()
+            .map(|key| ("Authorization", format!("Bearer {key}")))
     }
 
-    /// 端点提供的模型 ID（`GET /models`），按返回顺序。
-    pub fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{path}", self.config.base_url.trim_end_matches('/'))
+    }
+}
+
+impl ChatProvider for OpenAiProvider {
+    fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.endpoint("/models");
         let mut request = self.agent.get(&url).header("Accept", "application/json");
-        if let Some(key) = &self.config.api_key {
-            request = request.header("Authorization", format!("Bearer {key}"));
+        if let Some((name, value)) = self.auth_header() {
+            request = request.header(name, &value);
         }
         let response = request
             .call()
@@ -161,9 +58,7 @@ impl OpenAiProvider {
         parse_models(&text)
     }
 
-    /// 发起一轮流式补全（`model` 为本次使用的模型 ID）。`tools` 为 OpenAI 工具定义（空 = 不带）；
-    /// `should_stop` 每读一行检查一次；事件经 `on_event` 同步交付（调用线程即读流线程）。
-    pub fn stream_chat(
+    fn stream_chat(
         &self,
         model: &str,
         messages: &[ChatMessage],
@@ -171,10 +66,7 @@ impl OpenAiProvider {
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let url = self.endpoint("/chat/completions");
         let mut body = serde_json::json!({
             "model": model,
             "stream": true,
@@ -184,76 +76,55 @@ impl OpenAiProvider {
         if !tools.is_empty() {
             body["tools"] = Value::from(tools.to_vec());
         }
+        apply_params(&mut body, &self.config.params);
         let body = body.to_string();
 
-        let mut attempt = 0;
-        let response = loop {
-            let mut request = self
-                .agent
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream");
-            if let Some(key) = &self.config.api_key {
-                request = request.header("Authorization", format!("Bearer {key}"));
-            }
-            let response = request
-                .send(&body)
-                .map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
-            let status = response.status().as_u16();
-            if (200..300).contains(&status) {
-                break response;
-            }
-            let text = response
-                .into_body()
-                .read_to_string()
-                .unwrap_or_default();
-            let reason = format!("HTTP {status}: {}", error_message(&text));
-            if !RETRYABLE.contains(&status) || attempt >= BACKOFF_MS.len() || should_stop() {
-                anyhow::bail!(reason);
-            }
-            let delay_ms = BACKOFF_MS[attempt];
-            attempt += 1;
-            on_event(StreamEvent::Retrying {
-                attempt,
-                delay_ms,
-                reason,
-            });
-            std::thread::sleep(Duration::from_millis(delay_ms));
-        };
+        let headers = self.auth_header().into_iter().collect::<Vec<_>>();
+        let reader = post_sse_with_retry(&self.agent, &url, &headers, &body, should_stop, on_event)?;
 
-        let reader = BufReader::new(response.into_body().into_reader());
         let mut outcome = StreamOutcome::default();
         let mut calls = ToolCallAccumulator::default();
-        let mut stream_error = None;
-        let completed = sse::read_events(reader, should_stop, |event| {
-            if let SseEvent::Data(payload) = event {
-                match parse_chunk(&payload) {
-                    Ok(chunk) => {
-                        for e in chunk.events {
-                            on_event(e);
-                        }
-                        for d in chunk.tool_deltas {
-                            calls.push(d);
-                        }
-                        if chunk.finish_reason.is_some() {
-                            outcome.finish_reason = chunk.finish_reason;
-                        }
-                        if chunk.usage.is_some() {
-                            outcome.usage = chunk.usage;
-                        }
+        let completed = read_sse(reader, should_stop, &mut |payload| {
+            match parse_chunk(payload) {
+                Ok(chunk) => {
+                    for event in chunk.events {
+                        on_event(event);
                     }
-                    Err(message) => stream_error = Some(message),
+                    for delta in chunk.tool_deltas {
+                        calls.push(delta);
+                    }
+                    if chunk.finish_reason.is_some() {
+                        outcome.finish_reason = chunk.finish_reason;
+                    }
+                    if chunk.usage.is_some() {
+                        outcome.usage = chunk.usage;
+                    }
+                    Ok(())
+                }
+                Err(message) => {
+                    debug_http(|| format!("✗ {message}"));
+                    Err(message)
                 }
             }
-            Ok(())
-        })
-        .map_err(|e| anyhow::anyhow!("读取流失败: {e}"))?;
-        if let Some(message) = stream_error {
-            anyhow::bail!(message);
-        }
+        })?;
         outcome.completed = completed;
         outcome.tool_calls = calls.finish();
         Ok(outcome)
+    }
+}
+
+/// 把设置里透传的参数合并进请求体（`extra` 最后合入，可覆盖默认键）。
+fn apply_params(body: &mut Value, params: &RequestParams) {
+    if let Some(t) = params.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+    if let Some(n) = params.max_tokens {
+        body["max_tokens"] = serde_json::json!(n);
+    }
+    if let Some(extra) = params.extra.as_object() {
+        for (key, value) in extra {
+            body[key] = value.clone();
+        }
     }
 }
 
@@ -301,7 +172,7 @@ impl ToolCallAccumulator {
                 ToolCall {
                     id: String::new(),
                     kind: "function".into(),
-                    function: FunctionCall {
+                    function: crate::provider::FunctionCall {
                         name: String::new(),
                         arguments: String::new(),
                     },
@@ -398,26 +269,10 @@ pub(crate) fn parse_chunk(payload: &str) -> Result<Chunk, String> {
     Ok(chunk)
 }
 
-/// 从错误响应体里取人类可读的信息（`error.message` 或 `message`），否则原文截断。
-fn error_message(body: &str) -> String {
-    let parsed: Option<Value> = serde_json::from_str(body).ok();
-    let message = parsed.as_ref().and_then(|v| {
-        v.pointer("/error/message")
-            .or_else(|| v.get("message"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    });
-    let text = message.unwrap_or_else(|| body.trim().to_string());
-    if text.chars().count() > 300 {
-        format!("{}…", text.chars().take(300).collect::<String>())
-    } else {
-        text
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::StreamEvent;
 
     #[test]
     fn parses_model_list() {
@@ -493,21 +348,21 @@ mod tests {
     }
 
     #[test]
-    fn serializes_tool_messages() {
-        let call = ToolCall {
-            id: "c1".into(),
-            kind: "function".into(),
-            function: FunctionCall { name: "shell".into(), arguments: "{}".into() },
-        };
-        let m = serde_json::to_value(ChatMessage::assistant_tool_calls(String::new(), vec![call])).unwrap();
-        assert_eq!(m["content"], Value::Null);
-        assert_eq!(m["tool_calls"][0]["type"], "function");
-        assert_eq!(m["tool_calls"][0]["function"]["name"], "shell");
-        let m = serde_json::to_value(ChatMessage::tool_result("c1".into(), "ok".into())).unwrap();
-        assert_eq!(m["role"], "tool");
-        assert_eq!(m["tool_call_id"], "c1");
-        let m = serde_json::to_value(ChatMessage::new("user", "hi")).unwrap();
-        assert!(m.get("tool_calls").is_none() && m.get("tool_call_id").is_none());
+    fn params_are_merged_into_body() {
+        let mut body = serde_json::json!({"model": "m", "messages": []});
+        apply_params(
+            &mut body,
+            &RequestParams {
+                temperature: Some(0.2),
+                max_tokens: Some(4096),
+                extra: serde_json::json!({"top_k": 5, "model": "override"}),
+            },
+        );
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["top_k"], 5);
+        // extra 显式覆盖默认键
+        assert_eq!(body["model"], "override");
     }
 
     #[test]

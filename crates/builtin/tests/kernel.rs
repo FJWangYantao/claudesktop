@@ -3,8 +3,8 @@
 //! 真实端点测试默认忽略：
 //! `CLAUDESKTOP_BASE_URL=… CLAUDESKTOP_MODEL=… CLAUDESKTOP_API_KEY=… cargo test -p claudesktop-builtin -- --ignored`
 
-use claudesktop_builtin::{BuiltinConfig, BuiltinKernel, ProviderConfig};
-use claudesktop_core::{EventSink, Kernel, KernelEvent, RoutedEvent};
+use claudesktop_builtin::{BuiltinConfig, BuiltinKernel, Protocol, ProviderConfig};
+use claudesktop_core::{EventSink, Kernel, KernelEvent, RoutedEvent, UserPrompt};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -115,6 +115,19 @@ impl Harness {
     }
 
     fn with_cwd(base_url: String, cwd: PathBuf) -> Self {
+        Self::with_config(
+            ProviderConfig {
+                base_url,
+                api_key: Some("test-key".into()),
+                model: "mock-model".into(),
+                ..Default::default()
+            },
+            cwd,
+        )
+    }
+
+    /// 指定协议的端点（Anthropic 原生等）。
+    fn with_config(provider: ProviderConfig, cwd: PathBuf) -> Self {
         let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
         let sink: EventSink = {
             let events = events.clone();
@@ -122,11 +135,7 @@ impl Harness {
         };
         let kernel = BuiltinKernel::spawn(
             BuiltinConfig {
-                provider: ProviderConfig {
-                    base_url,
-                    api_key: Some("test-key".into()),
-                    model: "mock-model".into(),
-                },
+                provider,
                 cwd,
                 rules_path: None,
             },
@@ -180,7 +189,7 @@ fn streams_reasoning_text_usage_and_ends_turn() {
     let (base, bodies) = serve(vec![happy_stream("你好！")]);
     let h = Harness::new(base);
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "打个招呼".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("打个招呼")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
 
     assert_eq!(h.text(true), "先想一下");
@@ -213,9 +222,9 @@ fn history_carries_into_next_turn() {
     let (base, bodies) = serve(vec![happy_stream("第一答"), happy_stream("第二答")]);
     let h = Harness::new(base);
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "第一问".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
     h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    h.kernel.send_prompt(&sid, "第二问".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第二问")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while h.count(|e| matches!(e, KernelEvent::TurnEnded { .. })) < 2 {
         assert!(Instant::now() < deadline, "turn 2 timeout");
@@ -239,7 +248,7 @@ fn retries_transient_errors_then_succeeds() {
     ]);
     let h = Harness::new(base);
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "x".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("x")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.text(false), "重试后成功");
     assert_eq!(
@@ -253,7 +262,7 @@ fn non_retryable_error_fails_the_turn() {
     let (base, _) = serve(vec![Reply::Status(401, r#"{"error":{"message":"invalid api key"}}"#)]);
     let h = Harness::new(base);
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "x".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("x")).unwrap();
     h.wait("prompt failed", |e| {
         matches!(e, KernelEvent::PromptFailed { message } if message.contains("401") && message.contains("invalid api key"))
     });
@@ -267,7 +276,7 @@ fn cancel_stops_events_immediately() {
     let (base, _) = serve(vec![Reply::Sse { lines, gap_ms: 20 }]);
     let h = Harness::new(base);
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "长回答".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("长回答")).unwrap();
     h.wait("some text", |e| matches!(e, KernelEvent::AgentMessageChunk { .. }));
     h.kernel.cancel(&sid).unwrap();
     let after_cancel = h.count(|_| true);
@@ -278,7 +287,7 @@ fn cancel_stops_events_immediately() {
         1
     );
     // 取消后立即可以开始新的一轮（不会报「上一轮还没结束」）
-    assert!(h.kernel.send_prompt(&sid, "再来".into()).is_ok());
+    assert!(h.kernel.send_prompt(&sid, UserPrompt::text("再来")).is_ok());
 }
 
 // ---------- 工具循环 ----------
@@ -357,7 +366,7 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
     ]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "秘密是什么".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("秘密是什么")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
 
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
@@ -395,7 +404,7 @@ fn write_asks_permission_and_allow_always_is_remembered() {
     ]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "写 a".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("写 a")).unwrap();
     let (req, options) = h.permission(1);
     assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
     // 应答前不执行
@@ -406,7 +415,7 @@ fn write_asks_permission_and_allow_always_is_remembered() {
     assert_eq!(h.tool_status("w1").as_deref(), Some("completed"));
 
     // 第二轮：规则已生效，不再询问
-    h.kernel.send_prompt(&sid, "写 b".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("写 b")).unwrap();
     h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 1);
     assert_eq!(std::fs::read_to_string(dir.join("out/b.txt")).unwrap(), "B");
@@ -419,12 +428,12 @@ fn set_model_switches_the_session_and_new_sessions() {
     let (base, bodies) = serve(vec![happy_stream("一"), happy_stream("二"), happy_stream("三")]);
     let h = Harness::new(base);
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "a".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("a")).unwrap();
     h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert!(h.kernel.set_model(&sid, "  ").is_err());
     assert!(h.kernel.set_model("nope", "m2").is_err());
     h.kernel.set_model(&sid, "m2").unwrap();
-    h.kernel.send_prompt(&sid, "b".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("b")).unwrap();
     h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(body(&bodies, 0)["model"], "mock-model");
     assert_eq!(body(&bodies, 1)["model"], "m2");
@@ -454,7 +463,7 @@ fn edit_previews_diff_before_asking() {
     ]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "改一下".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("改一下")).unwrap();
     let (req, _) = h.permission(1);
     {
         let events = h.events.lock().unwrap();
@@ -483,7 +492,7 @@ fn rejected_call_is_reported_to_the_model() {
     ]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "跑个命令".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("跑个命令")).unwrap();
     let (req, options) = h.permission(1);
     assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
     h.kernel.resolve_permission(req, Some("reject_once".into())).unwrap();
@@ -509,7 +518,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
     let sid = h.start();
     h.kernel.set_mode(&sid, "plan").unwrap();
     assert!(h.kernel.set_mode(&sid, "nope").is_err());
-    h.kernel.send_prompt(&sid, "改一下".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("改一下")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
     assert_eq!(h.tool_status("p1").as_deref(), Some("failed"));
@@ -527,7 +536,7 @@ fn cancel_while_waiting_for_permission() {
     let (base, _) = serve(vec![tool_call("c1", "write_file", serde_json::json!({ "path": "x.txt", "content": "x" }))]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "写".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("写")).unwrap();
     let (req, _) = h.permission(1);
     h.kernel.cancel(&sid).unwrap();
     let after_cancel = h.count(|_| true);
@@ -547,7 +556,7 @@ fn bad_arguments_fail_the_call_not_the_turn() {
     ]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
-    h.kernel.send_prompt(&sid, "读".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("读")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn"));
     assert_eq!(h.tool_status("b1").as_deref(), Some("failed"));
     let second = body(&bodies, 1);
@@ -572,7 +581,7 @@ fn live_endpoint_streams_a_reply() {
     };
     let sid = h.start();
     h.kernel
-        .send_prompt(&sid, "用一句话介绍你自己，不超过 30 个字。".into())
+        .send_prompt(&sid, UserPrompt::text("用一句话介绍你自己，不超过 30 个字。"))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
@@ -616,7 +625,7 @@ fn live_endpoint_tool_loop() {
     h.kernel
         .send_prompt(
             &sid,
-            "读一下 notes.txt，把里面的秘密数字写进 answer.txt（只写数字），然后用一句话告诉我你做了什么。".into(),
+            UserPrompt::text("读一下 notes.txt，把里面的秘密数字写进 answer.txt（只写数字），然后用一句话告诉我你做了什么。"),
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -662,7 +671,7 @@ fn resume_rebuilds_context_from_log() {
     let (base, bodies) = serve(vec![happy_stream("记得，是 42。")]);
     let h = Harness::new(base);
     let log = vec![
-        Record::User { text: "秘密是 42，记住".into() },
+        Record::User { text: "秘密是 42，记住".into(), images: Vec::new() },
         Record::Event { event: KernelEvent::AgentMessageChunk { text: "好的，记住了。".into() } },
         Record::Event { event: KernelEvent::TurnEnded { stop_reason: "end_turn".into() } },
     ];
@@ -677,7 +686,7 @@ fn resume_rebuilds_context_from_log() {
             _ => None,
         })
         .expect("resumed start");
-    h.kernel.send_prompt(&sid, "秘密是多少".into()).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("秘密是多少")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     let first = body(&bodies, 0);
     let msgs: Vec<_> = first["messages"]
@@ -694,5 +703,114 @@ fn resume_rebuilds_context_from_log() {
     assert_eq!(
         h.count(|e| matches!(e, KernelEvent::Started { token: 2, resumed: false, .. })),
         1
+    );
+}
+
+/// Anthropic 原生协议：思考 / 正文 / 用量 / stop_reason 映射 + 工具调用整圈。
+#[test]
+fn anthropic_protocol_streams_and_runs_tools() {
+    fn acme(payload: &str) -> String {
+        format!("data: {payload}")
+    }
+    // 第一轮：思考 + tool_use(read_file)；第二轮：正文回答
+    let first = Reply::Sse {
+        lines: vec![
+            acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#),
+            acme(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#),
+            acme(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想想"}}"#),
+            acme(r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#),
+            acme(r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"notes"}}"#),
+            acme(r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":".txt\"}"}}"#),
+            acme(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}"#),
+            acme(r#"{"type":"message_stop"}"#),
+        ],
+        gap_ms: 5,
+    };
+    let second = Reply::Sse {
+        lines: vec![
+            acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":30}}}"#),
+            acme(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
+            acme(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"文件里是 77。"}}"#),
+            acme(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#),
+            acme(r#"{"type":"message_stop"}"#),
+        ],
+        gap_ms: 5,
+    };
+    let (base, bodies) = serve(vec![first, second]);
+    let dir = workdir("anthropic");
+    let work = dir.clone();
+    std::fs::write(work.join("notes.txt"), "magic 77\n").unwrap();
+    let h = Harness::with_config(
+        ProviderConfig {
+            protocol: Protocol::Anthropic,
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "claude-mock".into(),
+            ..Default::default()
+        },
+        work,
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("读 notes.txt")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    assert_eq!(h.text(true), "想想");
+    assert_eq!(h.text(false), "文件里是 77。");
+    assert_eq!(
+        h.count(|e| matches!(
+            e,
+            KernelEvent::UsageUpdated { input_tokens: 39, output_tokens: 17, reasoning_tokens: 0 }
+        )),
+        1
+    );
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn")),
+        1
+    );
+    // 请求体：system 顶层抽出 + max_tokens 必填 + 工具结果合并进 user 轮
+    let first = body(&bodies, 0);
+    assert_eq!(first["model"], "claude-mock");
+    assert_eq!(first["max_tokens"], 16384);
+    assert!(first["system"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("coding agent"));
+    assert_eq!(first["messages"][0]["role"], "user");
+    assert_eq!(first["messages"][0]["content"][0]["type"], "text");
+    assert_eq!(first["messages"][0]["content"][0]["text"], "读 notes.txt");
+    let second = body(&bodies, 1);
+    let results = &second["messages"][2];
+    assert_eq!(results["role"], "user");
+    assert_eq!(results["content"][0]["type"], "tool_result");
+    assert_eq!(results["content"][0]["tool_use_id"], "toolu_1");
+    assert!(results["content"][0]["content"].as_str().unwrap().contains("magic 77"));
+    // 工具结果轮后面跟着带 tool_use 的 assistant 轮
+    assert_eq!(second["messages"][1]["content"][0]["type"], "tool_use");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 图片附件：OpenAI 兼容协议上线时带 data URL 的分段 content。
+#[test]
+fn image_prompt_reaches_wire() {
+    let (base, bodies) = serve(vec![happy_stream("看到图了")]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    let prompt = claudesktop_core::UserPrompt {
+        text: "看图".into(),
+        images: vec![claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        }],
+    };
+    h.kernel.send_prompt(&sid, prompt).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = body(&bodies, 0);
+    let content = first["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "看图");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,QUJD"
     );
 }

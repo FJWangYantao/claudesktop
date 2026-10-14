@@ -188,6 +188,36 @@ pub struct RoutedEvent {
     pub event: KernelEvent,
 }
 
+/// 用户消息里的一张图片附件（base64）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptImage {
+    /// MIME 类型，如 `image/png`
+    pub media_type: String,
+    /// 图片字节（base64 编码）
+    pub data: String,
+}
+
+/// 一条用户提示词：文本 + 可选图片附件。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserPrompt {
+    pub text: String,
+    pub images: Vec<PromptImage>,
+}
+
+impl UserPrompt {
+    /// 纯文本提示词。
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+}
+
 /// 事件接收端：内核线程内直接调用，实现方负责跨线程投递。
 pub type EventSink = Arc<dyn Fn(RoutedEvent) + Send + Sync + 'static>;
 
@@ -204,7 +234,10 @@ pub enum KernelCommand {
         cwd: Option<PathBuf>,
     },
     /// 向某会话发送一轮用户消息
-    Prompt { session: String, text: String },
+    Prompt {
+        session: String,
+        prompt: UserPrompt,
+    },
     /// 请求取消某会话的当前轮
     Cancel { session: String },
     /// 切换某会话的权限模式（ACP `session/set_mode`，如 `default` / `plan`）
@@ -239,8 +272,8 @@ pub trait Kernel: Send + Sync {
         let _ = (session_id, history);
         self.new_session(token, cwd)
     }
-    /// 向某会话发送一轮用户消息；返回仅代表「已投递」。
-    fn send_prompt(&self, session: &str, text: String) -> anyhow::Result<()>;
+    /// 向某会话发送一轮用户消息（文本 + 可选图片）；返回仅代表「已投递」。
+    fn send_prompt(&self, session: &str, prompt: UserPrompt) -> anyhow::Result<()>;
     /// 请求取消某会话的当前轮（尽力而为）。
     fn cancel(&self, session: &str) -> anyhow::Result<()>;
     /// 应答一个 [`KernelEvent::PermissionRequest`]：`Some(选项 ID)` 选择，

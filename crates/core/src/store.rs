@@ -40,8 +40,12 @@ pub struct SessionMeta {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Record {
-    /// 用户发出的一轮消息
-    User { text: String },
+    /// 用户发出的一轮消息；`images` 为图片附件的绝对路径（资产目录里）
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+    },
     /// 内核事件（只记对话内容相关的，见 [`Record::worth_keeping`]）
     Event { event: KernelEvent },
     /// 用户对某条权限请求的应答（展示名，如「Yes」「已取消」）
@@ -168,7 +172,23 @@ impl SessionStore {
 
     pub fn delete(&self, id: &str) -> io::Result<()> {
         let _ = fs::remove_file(self.log_path(id));
+        // 图片附件目录一并清掉（没有附件时目录不存在，忽略）
+        let _ = fs::remove_dir_all(self.assets_dir(id));
         fs::remove_file(self.meta_path(id))
+    }
+
+    /// 会话的图片附件目录：`<dir>/<id>.assets/`
+    fn assets_dir(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.assets"))
+    }
+
+    /// 保存一张图片附件（`ext` 为扩展名，如 `png`），返回文件绝对路径。
+    pub fn save_image(&self, id: &str, ext: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        let dir = self.assets_dir(id);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.{ext}", new_id(now_ms())));
+        fs::write(&path, bytes)?;
+        Ok(path)
     }
 
     fn meta_path(&self, id: &str) -> PathBuf {
@@ -297,7 +317,7 @@ mod tests {
     fn roundtrip_and_coalesce() {
         let store = temp_store("roundtrip");
         let (meta, mut log) = store.create("标题", "C:/proj".into(), "mock").unwrap();
-        log.append(Record::User { text: "你好".into() }).unwrap();
+        log.append(Record::User { text: "你好".into(), images: Vec::new() }).unwrap();
         for piece in ["你", "好", "！"] {
             log.append(chunk(piece)).unwrap();
         }
@@ -317,7 +337,7 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                Record::User { text: "你好".into() },
+                Record::User { text: "你好".into(), images: Vec::new() },
                 chunk("你好！"),
                 Record::Event {
                     event: KernelEvent::AgentThoughtChunk { text: "想".into() }
@@ -343,7 +363,7 @@ mod tests {
         fs::write(store.dir().join("broken.json"), b"{not json").unwrap();
         // 末尾半行：应被跳过而不是让整个会话读不出来
         let mut log = store.append_log(&b.id).unwrap();
-        log.append(Record::User { text: "x".into() }).unwrap();
+        log.append(Record::User { text: "x".into(), images: Vec::new() }).unwrap();
         drop(log);
         OpenOptions::new()
             .append(true)
@@ -381,5 +401,31 @@ mod tests {
             path: "a".into(),
             ok: true
         }));
+    }
+
+    #[test]
+    fn saves_images_and_parses_legacy_user_records() {
+        let store = temp_store("images");
+        let (meta, _) = store.create("图", "C:/x".into(), "mock").unwrap();
+        let path = store.save_image(&meta.id, "png", b"png-bytes").unwrap();
+        assert!(path.is_absolute());
+        assert!(path.to_string_lossy().ends_with(".png"));
+        // 旧日志没有 images 字段：能解析，默认为空
+        let legacy = r#"{"t":"user","text":"旧记录"}"#;
+        assert_eq!(
+            serde_json::from_str::<Record>(legacy).unwrap(),
+            Record::User { text: "旧记录".into(), images: Vec::new() }
+        );
+        // 新记录带附件路径，可往返
+        let record = Record::User {
+            text: "看图".into(),
+            images: vec![path.to_string_lossy().into_owned()],
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), record);
+        // 没有附件时不写 images 键（日志不膨胀）
+        let plain = serde_json::to_string(&Record::User { text: "纯文本".into(), images: Vec::new() }).unwrap();
+        assert!(!plain.contains("images"));
+        let _ = fs::remove_dir_all(store.dir());
     }
 }

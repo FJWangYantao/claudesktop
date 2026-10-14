@@ -6,6 +6,7 @@
 //! 这些是摘要，需要细节就重新读。
 
 use crate::ChatMessage;
+use crate::provider::ContentPart;
 use claudesktop_core::{KernelEvent, Record};
 
 /// 重建历史的总字符上限：超出时从最早的轮次开始丢
@@ -85,9 +86,9 @@ pub fn rebuild(records: &[Record]) -> Vec<ChatMessage> {
     let mut assistant = Assistant::default();
     for record in records {
         match record {
-            Record::User { text } => {
+            Record::User { text, images } => {
                 messages.extend(assistant.take());
-                messages.push(ChatMessage::new("user", text.clone()));
+                messages.push(user_message(text, images));
             }
             Record::Event { event } => match event {
                 KernelEvent::AgentMessageChunk { text } => assistant.text(text),
@@ -135,7 +136,7 @@ pub fn rebuild(records: &[Record]) -> Vec<ChatMessage> {
 
 /// 超出上限时从最早的轮次丢，并保证从一条用户消息开始。
 fn trim(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let len = |m: &ChatMessage| m.content.as_deref().map_or(0, str::len);
+    let len = |m: &ChatMessage| m.text().as_deref().map_or(0, str::len);
     let mut total: usize = messages.iter().map(len).sum();
     let mut start = 0;
     while total > HISTORY_MAX_CHARS && start < messages.len() {
@@ -149,6 +150,34 @@ fn trim(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     messages
 }
 
+/// 用户记录 → 消息：图片附件从磁盘读回 base64（文件丢了就跳过，对话还能续）。
+fn user_message(text: &str, images: &[String]) -> ChatMessage {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut parts = vec![ContentPart::Text(text.to_string())];
+    for path in images {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        parts.push(ContentPart::Image {
+            media_type: mime_type(path),
+            data: engine.encode(bytes),
+        });
+    }
+    ChatMessage::with_parts("user", parts)
+}
+
+/// 附件扩展名 → MIME 类型（存的时候就是按扩展名写的）。
+fn mime_type(path: &str) -> String {
+    match path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    }
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +189,7 @@ mod tests {
     #[test]
     fn rebuilds_turns_with_tool_summaries() {
         let records = vec![
-            Record::User { text: "读一下 notes".into() },
+            Record::User { text: "读一下 notes".into(), images: Vec::new() },
             ev(KernelEvent::AgentThoughtChunk { text: "想想".into() }),
             ev(KernelEvent::AgentMessageChunk { text: "我先".into() }),
             ev(KernelEvent::AgentMessageChunk { text: "看看。".into() }),
@@ -178,7 +207,7 @@ mod tests {
             }),
             ev(KernelEvent::AgentMessageChunk { text: "秘密是 42。".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
-            Record::User { text: "再写进文件".into() },
+            Record::User { text: "再写进文件".into(), images: Vec::new() },
             ev(KernelEvent::ToolCallStarted {
                 id: "c2".into(),
                 title: "Write a.txt".into(),
@@ -186,12 +215,12 @@ mod tests {
                 kind: "edit".into(),
             }),
             ev(KernelEvent::TurnEnded { stop_reason: "cancelled".into() }),
-            Record::User { text: "算了".into() },
+            Record::User { text: "算了".into(), images: Vec::new() },
         ];
         let msgs = rebuild(&records);
         let got: Vec<_> = msgs
             .iter()
-            .map(|m| format!("{}:{}", m.role, m.content.as_deref().unwrap()))
+            .map(|m| format!("{}:{}", m.role, m.text().unwrap()))
             .collect();
         assert_eq!(
             got,
@@ -209,13 +238,13 @@ mod tests {
     fn trims_oldest_turns_and_starts_with_user() {
         let big = "x".repeat(HISTORY_MAX_CHARS / 2 + 10);
         let records = vec![
-            Record::User { text: big.clone() },
+            Record::User { text: big.clone(), images: Vec::new() },
             ev(KernelEvent::AgentMessageChunk { text: big.clone() }),
-            Record::User { text: "新问题".into() },
+            Record::User { text: "新问题".into(), images: Vec::new() },
             ev(KernelEvent::AgentMessageChunk { text: "新回答".into() }),
         ];
         let msgs = rebuild(&records);
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].content.as_deref(), Some("新问题"));
+        assert_eq!(msgs[0].text().as_deref(), Some("新问题"));
     }
 }
