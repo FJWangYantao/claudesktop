@@ -332,8 +332,10 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(crate) fn toggle_model_menu(&mut self, cx: &mut Context<Self>) {
-        self.model_menu_open = !self.model_menu_open;
+    /// 打开 / 关闭模型下拉；`top` = 从顶栏打开。从另一处点时直接换位置。
+    pub(crate) fn toggle_model_menu(&mut self, top: bool, cx: &mut Context<Self>) {
+        self.model_menu_open = !(self.model_menu_open && self.model_menu_top == top);
+        self.model_menu_top = top;
         self.mode_menu_open = false;
         self.kernel_menu_open = false;
         let builtin = self.session().kernel == KernelChoice::Builtin;
@@ -348,8 +350,6 @@ impl ChatApp {
             .id("model-menu")
             .occlude()
             .absolute()
-            .right(px(52.))
-            .bottom(px(104.))
             .w(px(280.))
             .max_h(px(380.))
             .overflow_y_scroll()

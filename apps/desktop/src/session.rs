@@ -50,6 +50,8 @@ pub struct Session {
     pub pending_model: Option<String>,
     /// 本轮累计的 token（输入, 输出），一轮结束时写进日志后清零
     pub turn_usage: (u64, u64),
+    /// 用户手动改过标题（首条消息不再覆盖）
+    pub renamed: bool,
 }
 
 impl Session {
@@ -79,6 +81,7 @@ impl Session {
             resuming: false,
             pending_model: None,
             turn_usage: (0, 0),
+            renamed: false,
         }
     }
 

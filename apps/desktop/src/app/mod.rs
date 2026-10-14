@@ -24,6 +24,7 @@ use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +50,16 @@ pub struct ChatApp {
     sidebar_open: bool,
     mode_menu_open: bool,
     model_menu_open: bool,
+    /// 模型下拉从顶栏打开（否则锚在输入框）
+    model_menu_top: bool,
     kernel_menu_open: bool,
+    /// 侧栏里正在重命名的会话（令牌）
+    renaming: Option<u64>,
+    rename_input: Entity<InputState>,
+    /// 重命名框真正拿到过焦点（之后失焦才算提交；刚打开时的失焦事件不算）
+    rename_focused: bool,
+    /// 侧栏里等待确认删除的会话（令牌）
+    confirm_delete: Option<u64>,
     /// 内核槽，按 [`KernelChoice::index`]：用到时才启动，可以同时在线，会话各自绑定一个
     kernels: [KernelSlot; 3],
     ev_tx: UnboundedSender<(KernelChoice, u64, RoutedEvent)>,
@@ -146,6 +156,22 @@ impl ChatApp {
         })
         .detach();
 
+        // 侧栏重命名框：回车或失焦即提交
+        let rename_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe_in(
+            &rename_input,
+            window,
+            |this: &mut ChatApp, _: &Entity<InputState>, event: &InputEvent, _, cx| {
+                match event {
+                    InputEvent::Focus => this.rename_focused = true,
+                    InputEvent::PressEnter { .. } => this.commit_rename(cx),
+                    InputEvent::Blur if this.rename_focused => this.commit_rename(cx),
+                    _ => {}
+                }
+            },
+        )
+        .detach();
+
         let settings_form = SettingsForm::new(window, cx);
         let mut app = Self {
             input,
@@ -160,7 +186,12 @@ impl ChatApp {
             sidebar_open: true,
             mode_menu_open: false,
             model_menu_open: false,
+            model_menu_top: false,
             kernel_menu_open: false,
+            renaming: None,
+            rename_input,
+            rename_focused: false,
+            confirm_delete: None,
             kernels: Default::default(),
             ev_tx,
             acp_base,
@@ -492,7 +523,7 @@ impl ChatApp {
                 cx.notify();
                 return;
             }
-            if !s.has_user_message() {
+            if !s.has_user_message() && !s.renamed {
                 // 会话标题取首条消息的前 18 个字符
                 let title: String = text.chars().take(18).collect();
                 s.title = title.into();
@@ -724,6 +755,8 @@ impl ChatApp {
 
     pub(crate) fn start_demo(&mut self, idx: usize, token: u64, cx: &mut Context<Self>) {
         let script = build_demo_script();
+        // 按会话令牌找（中途删了别的会话，下标会变）
+        let session = self.sessions[idx].token;
         cx.spawn(async move |this, cx| {
             for step in script {
                 cx.background_executor()
@@ -731,7 +764,7 @@ impl ChatApp {
                     .await;
                 let mut cancelled = false;
                 let _ = this.update(cx, |app, cx| {
-                    match app.sessions.get_mut(idx) {
+                    match app.sessions.iter_mut().find(|s| s.token == session) {
                         Some(s) if s.cancel_token == token => s.apply_mock(&step.1),
                         _ => {
                             cancelled = true;
@@ -745,7 +778,7 @@ impl ChatApp {
                 }
             }
             let _ = this.update(cx, |app, cx| {
-                if let Some(s) = app.sessions.get_mut(idx) {
+                if let Some(s) = app.sessions.iter_mut().find(|s| s.token == session) {
                     s.busy = false;
                 }
                 cx.notify();
@@ -853,9 +886,14 @@ impl Render for ChatApp {
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(self.render_top_bar())
+                .relative()
+                .child(self.render_top_bar(cx))
                 .child(scroll)
                 .child(composer_area)
+                // 顶栏打开的模型下拉放在最后画，盖在对话上面
+                .when(self.model_menu_open && self.model_menu_top, |d| {
+                    d.child(self.render_model_menu(cx).top(px(50.)).right(px(100.)))
+                })
         };
 
         div()

@@ -4,6 +4,7 @@ use super::ChatApp;
 use crate::settings::KernelChoice;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::input::Input;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -304,6 +305,71 @@ impl ChatApp {
     fn render_session_row(&self, i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         let s = &self.sessions[i];
         let active = self.active == i;
+        let row = div()
+            .id(("session", i))
+            .relative()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .mx_2()
+            .px_2()
+            .py(px(5.))
+            .rounded_md()
+            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) });
+
+        // 重命名中：标题换成输入框
+        if self.renaming == Some(s.token) {
+            return row.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(CORAL))
+                    .bg(rgb(CARD))
+                    .text_size(px(14.))
+                    .child(Input::new(&self.rename_input).appearance(false).bordered(false).small()),
+            );
+        }
+        // 删除确认
+        if self.confirm_delete == Some(s.token) {
+            let small_button = |id: &'static str, label: &'static str, danger: bool| {
+                div()
+                    .id((id, i))
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(12.5))
+                    .text_color(rgb(if danger { 0xFFFFFF } else { INK_SOFT }))
+                    .bg(rgb(if danger { RED } else { CARD }))
+                    .child(label)
+            };
+            return row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(13.))
+                        .text_color(rgb(RED))
+                        .child(format!("删除「{}」？", s.title)),
+                )
+                .child(
+                    small_button("delete-yes", "删除", true)
+                        .on_click(cx.listener(move |this, _, _, cx| this.delete_session(i, cx))),
+                )
+                .child(small_button("delete-no", "取消", false).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.confirm_delete = None;
+                        cx.notify();
+                    },
+                )));
+        }
+
         let dot = if s.busy {
             CORAL
         } else if s.ready {
@@ -312,16 +378,17 @@ impl ChatApp {
             LINE
         };
         let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
-        div()
-            .id(("session", i))
-            .h_flex()
-            .items_center()
-            .gap_2()
-            .mx_2()
-            .px_2()
-            .py(px(5.))
-            .rounded_md()
-            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) })
+        let group: SharedString = format!("session-row-{i}").into();
+        let icon_button = |id: &'static str, icon: IconAll| {
+            div()
+                .id((id, i))
+                .p(px(3.))
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(LINE)))
+                .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
+        };
+        row.group(group.clone())
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = i;
@@ -359,6 +426,118 @@ impl ChatApp {
                         .child(age),
                 )
             })
+            // 悬停时盖在右侧标签上的操作按钮
+            .child(
+                div()
+                    .absolute()
+                    .right(px(4.))
+                    .top_0()
+                    .bottom_0()
+                    .h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .pl_2()
+                    .rounded_md()
+                    .bg(rgb(if active { SAND_ACTIVE } else { SAND }))
+                    .opacity(0.)
+                    .group_hover(group, |d| d.opacity(1.))
+                    .child(icon_button("session-rename", IconAll::SquarePen).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.start_rename(i, window, cx);
+                        },
+                    )))
+                    .child(icon_button("session-delete", IconAll::X).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.renaming = None;
+                            this.confirm_delete = Some(this.sessions[i].token);
+                            cx.notify();
+                        },
+                    ))),
+            )
+    }
+
+    pub(crate) fn start_rename(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let s = &self.sessions[idx];
+        self.renaming = Some(s.token);
+        self.rename_focused = false;
+        self.confirm_delete = None;
+        let title = s.title.to_string();
+        self.rename_input.update(cx, |state, cx| {
+            state.set_value(title, window, cx);
+            state.focus(window, cx);
+            state.select_all(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// 提交重命名：空标题不改；已落盘的会话同步写元信息。
+    pub(super) fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.renaming.take() else {
+            return;
+        };
+        let text = self.rename_input.read(cx).value().trim().to_string();
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.token == token) {
+            if !text.is_empty() && text != s.title.as_ref() {
+                s.title = text.clone().into();
+                s.renamed = true;
+                if let (Some(store), Some(meta)) = (&self.store, &mut s.meta) {
+                    meta.title = text;
+                    let _ = store.save_meta(meta);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 删除会话：停掉进行中的一轮，删日志和元信息，用量统计里也去掉。
+    /// 删到一个不剩时补一个新会话。
+    /// 调试钩子：让第 `idx` 个会话进入删除确认。
+    pub(crate) fn ask_delete(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.confirm_delete = self.sessions.get(idx).map(|s| s.token);
+        cx.notify();
+    }
+
+    pub(crate) fn delete_session(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
+        if idx >= self.sessions.len() {
+            return;
+        }
+        let kernel = self.session_kernel(idx);
+        let s = &mut self.sessions[idx];
+        s.cancel_pending_permissions(kernel.as_ref());
+        s.cancel_token += 1;
+        if let (true, Some(kernel), Some(id)) = (s.busy, &kernel, s.acp_id.clone()) {
+            let _ = kernel.cancel(&id);
+        }
+        let removed = self.sessions.remove(idx);
+        let id = removed.meta.as_ref().map(|m| m.id.clone());
+        // 先关掉日志文件再删
+        drop(removed);
+        if let Some(id) = id {
+            self.usage.retain(|t| t.session != id);
+            if let Some(store) = &self.store {
+                if let Err(err) = store.delete(&id) {
+                    log_note(&mut self.sessions, format!("删除会话文件失败：{err}"));
+                }
+            }
+        }
+        if self.sessions.is_empty() {
+            let cwd = self.cwd.clone();
+            self.open_session(self.settings.kernel(), cwd);
+            self.active = 0;
+        } else if idx < self.active || self.active >= self.sessions.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        cx.notify();
+    }
+}
+
+/// 删除失败之类的提示：放进第一个会话（总是存在）。
+fn log_note(sessions: &mut [crate::session::Session], text: String) {
+    if let Some(s) = sessions.first_mut() {
+        s.note(text);
     }
 }
 

@@ -53,14 +53,20 @@ fn main() {
                             .await;
                         let _ = this.update_in(cx, |app, window, cx| {
                             // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
-                            // / models（打开模型下拉）/ kernels（打开内核弹层）/ restart（重启内核）
+                            // / models、top-models（输入框旁 / 顶栏的模型下拉）/ kernels（打开内核弹层）/ restart（重启内核）
+                            // / rename、ask-delete、delete（对侧栏第 2 个会话）
                             match std::env::var("CLAUDESKTOP_OPEN").as_deref() {
                                 Ok("settings") => app.open_settings(window, cx),
                                 Ok("fetch") => {
                                     app.open_settings(window, cx);
                                     app.fetch_models(true, cx);
                                 }
-                                Ok("models") => app.toggle_model_menu(cx),
+                                Ok("models") => app.toggle_model_menu(false, cx),
+                                Ok("top-models") => app.toggle_model_menu(true, cx),
+                                // 侧栏第 2 行（第一个历史会话）：重命名 / 删除确认 / 直接删除
+                                Ok("rename") => app.start_rename(1, window, cx),
+                                Ok("ask-delete") => app.ask_delete(1, cx),
+                                Ok("delete") => app.delete_session(1, cx),
                                 Ok("kernels") => app.open_kernel_menu(cx),
                                 Ok("restart") => {
                                     let kind = app.session().kernel;

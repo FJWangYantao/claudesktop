@@ -11,7 +11,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 impl ChatApp {
-    pub(super) fn render_top_bar(&self) -> Div {
+    pub(super) fn render_top_bar(&self, cx: &mut Context<Self>) -> Div {
         div()
             .h_flex()
             .items_center()
@@ -70,6 +70,7 @@ impl ChatApp {
             )
             .child(
                 div()
+                    .id("top-model-chip")
                     .h_flex()
                     .gap_1()
                     .px_2p5()
@@ -77,7 +78,10 @@ impl ChatApp {
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(LINE))
-                    .bg(rgb(CARD))
+                    .bg(rgb(if self.model_menu_open && self.model_menu_top { SAND } else { CARD }))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(SAND)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(true, cx)))
                     .child(
                         Icon::new(IconAll::Bot)
                             .size_3p5()
@@ -436,9 +440,9 @@ impl ChatApp {
                             .py_1()
                             .rounded_md()
                             .cursor_pointer()
-                            .when(self.model_menu_open, |d| d.bg(rgb(SAND)))
+                            .when(self.model_menu_open && !self.model_menu_top, |d| d.bg(rgb(SAND)))
                             .hover(|d| d.bg(rgb(SAND)))
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(cx)))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(false, cx)))
                             .child(
                                 div()
                                     .text_size(px(13.5))
@@ -481,7 +485,9 @@ impl ChatApp {
                     ),
             )
             .when(self.mode_menu_open, |d| d.child(self.render_mode_menu(cx)))
-            .when(self.model_menu_open, |d| d.child(self.render_model_menu(cx)))
+            .when(self.model_menu_open && !self.model_menu_top, |d| {
+                d.child(self.render_model_menu(cx).right(px(52.)).bottom(px(104.)))
+            })
             .when(self.kernel_menu_open, |d| d.child(self.render_kernel_menu(cx)));
 
         div()
