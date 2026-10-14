@@ -14,15 +14,18 @@
 
 mod acp;
 mod process_guard;
+mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
 pub use process_guard::kill_children_on_exit;
+pub use store::{Record, SessionLog, SessionMeta, SessionStore};
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// 计划条目的 UI 投影（协议无关）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanEntryView {
     /// 条目内容（人类可读）
     pub content: String,
@@ -35,7 +38,7 @@ pub struct PlanEntryView {
 /// agent 上报的会话模式（ACP `modes`）。含义由 agent 决定：
 /// Claude 适配器是权限模式（default / acceptEdits / plan …），
 /// pi 适配器是思考强度（off / low / medium / high …）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModeView {
     pub id: String,
     pub name: String,
@@ -43,7 +46,7 @@ pub struct ModeView {
 }
 
 /// 权限请求里的一个可选项（协议无关的 UI 投影）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionOptionView {
     /// 选项 ID（回传给内核）
     pub id: String,
@@ -58,7 +61,8 @@ pub struct PermissionOptionView {
 /// 这是「agent UI 事件总线」的第一个版本：类型集合直接对齐
 /// ACP v1 `SessionUpdate` 中 UI 真正要渲染的内容，未来内核
 /// （自研引擎、其他协议）都映射到这组事件上。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum KernelEvent {
     /// 生命周期 / 诊断文本（连接建立、协议协商结果等）
     Status(String),

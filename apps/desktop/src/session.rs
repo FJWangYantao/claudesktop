@@ -2,8 +2,9 @@
 
 use crate::demo::*;
 use crate::model::*;
-use claudesktop_core::{Kernel, KernelEvent};
+use claudesktop_core::{Kernel, KernelEvent, Record, SessionLog, SessionMeta};
 use gpui_kit::*;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// 一个对话会话：自己的对话记录、忙闲、模式、模型。一条内核连接上可以同时有多个。
@@ -29,10 +30,18 @@ pub struct Session {
     pub model_label: SharedString,
     /// 自动演示：会话就绪后发送的提示词
     pub autoprompt: Option<String>,
+    /// 会话工作目录（侧栏按它分组；session/new 用它）
+    pub cwd: PathBuf,
+    /// 持久化元信息：首条消息发出后才建档（空会话不落盘）
+    pub meta: Option<SessionMeta>,
+    /// 追加式日志；恢复的会话在第一次写入时才打开
+    pub log: Option<SessionLog>,
+    /// 从磁盘恢复、还没接上内核会话的历史会话（不自动 session/new）
+    pub restored: bool,
 }
 
 impl Session {
-    pub fn new(token: u64, ready: bool) -> Self {
+    pub fn new(token: u64, ready: bool, cwd: PathBuf) -> Self {
         Self {
             title: "新会话".into(),
             token,
@@ -48,7 +57,44 @@ impl Session {
             permission_mode: 0,
             model_label: "GLM-5.3".into(),
             autoprompt: None,
+            cwd,
+            meta: None,
+            log: None,
+            restored: false,
         }
+    }
+
+    /// 从持久化记录重放出一个历史会话：事件走与实时完全相同的映射。
+    pub fn from_records(token: u64, meta: SessionMeta, records: Vec<Record>) -> Self {
+        let mut s = Self::new(token, false, meta.cwd.clone());
+        s.title = meta.title.clone().into();
+        s.restored = true;
+        for record in records {
+            match record {
+                Record::User { text } => s.transcript.push(ChatItem::User(text.into())),
+                Record::Event { event } => {
+                    s.apply_event(event, None);
+                }
+                Record::PermissionResolved { id, label } => {
+                    let item = s.transcript.iter_mut().rev().find(|i| {
+                        matches!(i, ChatItem::Permission { id: pid, resolved: None, .. } if *pid == id)
+                    });
+                    if let Some(ChatItem::Permission { resolved, .. }) = item {
+                        *resolved = Some(label.into());
+                    }
+                }
+            }
+        }
+        // 上次退出时还在进行的东西一律收尾
+        s.finish_thinking();
+        for item in &mut s.transcript {
+            if let ChatItem::Permission { resolved: r @ None, .. } = item {
+                *r = Some("已取消".into());
+            }
+        }
+        s.busy = false;
+        s.meta = Some(meta);
+        s
     }
 
     pub fn has_user_message(&self) -> bool {
@@ -356,5 +402,98 @@ impl Session {
                 self.transcript.push(ChatItem::Note((*text).into()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claudesktop_core::PermissionOptionView;
+
+    fn meta() -> SessionMeta {
+        SessionMeta {
+            id: "s1".into(),
+            title: "读 README".into(),
+            cwd: "C:/proj".into(),
+            agent: "mock".into(),
+            kernel_session_id: Some("acp-1".into()),
+            created_ms: 0,
+            updated_ms: 0,
+        }
+    }
+
+    fn ev(event: KernelEvent) -> Record {
+        Record::Event { event }
+    }
+
+    fn permission(id: u64) -> Record {
+        ev(KernelEvent::PermissionRequest {
+            id,
+            title: "Write a.txt".into(),
+            options: vec![PermissionOptionView {
+                id: "allow".into(),
+                name: "Yes".into(),
+                kind: "allow_once".into(),
+            }],
+        })
+    }
+
+    #[core::prelude::v1::test]
+    fn replay_rebuilds_transcript() {
+        let records = vec![
+            Record::User { text: "读 README".into() },
+            ev(KernelEvent::AgentThoughtChunk { text: "想一想".into() }),
+            ev(KernelEvent::ToolCallStarted {
+                id: "t1".into(),
+                title: "Read README.md".into(),
+                status: "in_progress".into(),
+                kind: "read".into(),
+            }),
+            ev(KernelEvent::ToolCallUpdated {
+                id: "t1".into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: Some("# claudesktop".into()),
+            }),
+            permission(1),
+            Record::PermissionResolved { id: 1, label: "Yes".into() },
+            ev(KernelEvent::AgentMessageChunk { text: "总结完毕".into() }),
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+            // 上次退出时没应答的请求
+            Record::User { text: "再写个文件".into() },
+            permission(2),
+        ];
+        let s = Session::from_records(7, meta(), records);
+
+        assert!(s.restored && !s.ready && !s.busy);
+        assert_eq!(s.title.as_ref(), "读 README");
+        assert_eq!(s.cwd, PathBuf::from("C:/proj"));
+        let kinds: Vec<&str> = s
+            .transcript
+            .iter()
+            .map(|i| match i {
+                ChatItem::User(_) => "user",
+                ChatItem::Thinking { .. } => "thinking",
+                ChatItem::Tool(_) => "tool",
+                ChatItem::Permission { .. } => "permission",
+                ChatItem::Agent(_) => "agent",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["user", "thinking", "tool", "permission", "agent", "user", "permission"]
+        );
+        assert!(matches!(&s.transcript[1], ChatItem::Thinking { streaming: false, .. }));
+        assert!(matches!(&s.transcript[2], ChatItem::Tool(c) if c.phase == ToolPhase::Done));
+        let labels: Vec<_> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                ChatItem::Permission { resolved, .. } => resolved.as_ref().map(|r| r.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Yes", "已取消"]);
     }
 }

@@ -12,15 +12,19 @@ use crate::model::*;
 use crate::session::*;
 use crate::theme::*;
 use claudesktop_core::{
-    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent,
+    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, Record, RoutedEvent, SessionStore,
 };
 use futures::StreamExt;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
 use gpui_kit::*;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// 启动时最多恢复的历史会话数（最近更新的优先）。
+const MAX_RESTORED: usize = 100;
 
 pub struct ChatApp {
     input: Entity<InputState>,
@@ -28,8 +32,12 @@ pub struct ChatApp {
     sessions: Vec<Session>,
     active: usize,
     next_token: u64,
-    /// 侧栏里除当前项目外的示意分组（仅装饰）
-    workspaces: Vec<Workspace>,
+    /// 会话持久化；None = 不落盘（演示回放模式或数据目录不可用）
+    store: Option<SessionStore>,
+    /// 内核启动命令（写进会话元信息）
+    agent_cmd: String,
+    /// 默认工作目录（新会话用）
+    cwd: PathBuf,
     /// 当前项目名（取工作目录名），侧栏分组名与输入框标签用
     project_name: SharedString,
     overview_tab: usize, // 0 概览 / 1 模型
@@ -73,33 +81,12 @@ impl ChatApp {
         )
         .detach();
 
-        let workspaces = vec![
-            Workspace {
-                name: "ubuntu".into(),
-                sessions: vec![
-                    SessionEntry { title: "服务器能否调用 deepseek 搜索…".into(), age: "1 天".into(), dot: Some(GREEN) },
-                    SessionEntry { title: "将 Clash for Windows 订阅导入…".into(), age: "1 天".into(), dot: Some(GREEN) },
-                    SessionEntry { title: "探查当前目录".into(), age: "2 天".into(), dot: Some(GREEN) },
-                ],
-            },
-            Workspace {
-                name: "news_collector_integration".into(),
-                sessions: vec![
-                    SessionEntry { title: "帮我搜索 dsh 插件，能够不在工…".into(), age: "3 天".into(), dot: None },
-                ],
-            },
-            Workspace {
-                name: "work_station".into(),
-                sessions: vec![
-                    SessionEntry { title: "看一下我电脑上 antigravity 安装…".into(), age: "9 分钟".into(), dot: None },
-                    SessionEntry { title: "Investigating zcode codingplan…".into(), age: "1 天".into(), dot: None },
-                ],
-            },
-        ];
 
         // 内核：默认 ACP（ACP_AGENT 未设置时用仓库内 mock agent）；
         // CLAUDESKTOP_KERNEL=demo 退回纯演示回放。
         let config = AcpKernelConfig::from_env();
+        let agent_cmd = config.command.clone();
+        let cwd = config.cwd.clone();
         let project_name: SharedString = config
             .cwd
             .file_name()
@@ -132,13 +119,33 @@ impl ChatApp {
         .detach();
 
         let ready = kernel.is_none();
+        // 第一个会话：连接就绪（Connected）后统一补发 session/new
+        let mut sessions = vec![Session::new(1, ready, cwd.clone())];
+        let mut next_token = 2;
+        // 演示回放不落盘；有内核时从磁盘恢复历史会话
+        let store = match (&kernel, SessionStore::open_default()) {
+            (Some(_), Ok(store)) => Some(store),
+            (Some(_), Err(err)) => {
+                sessions[0].note(format!("会话历史不可用：{err}"));
+                None
+            }
+            (None, _) => None,
+        };
+        if let Some(store) = &store {
+            for meta in store.list().into_iter().take(MAX_RESTORED) {
+                let records = store.load(&meta.id).unwrap_or_default();
+                sessions.push(Session::from_records(next_token, meta, records));
+                next_token += 1;
+            }
+        }
         Self {
             input,
-            // 第一个会话：连接就绪（Connected）后统一补发 session/new
-            sessions: vec![Session::new(1, ready)],
+            sessions,
             active: 0,
-            next_token: 2,
-            workspaces,
+            next_token,
+            store,
+            agent_cmd,
+            cwd,
             project_name,
             overview_tab: 0,
             overview_range: 0,
@@ -159,7 +166,8 @@ impl ChatApp {
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
         let token = self.next_token;
         self.next_token += 1;
-        self.sessions.push(Session::new(token, self.kernel.is_none()));
+        self.sessions
+            .push(Session::new(token, self.kernel.is_none(), self.cwd.clone()));
         self.active = self.sessions.len() - 1;
         self.request_pending_sessions();
         cx.notify();
@@ -174,9 +182,9 @@ impl ChatApp {
             return;
         };
         for s in &mut self.sessions {
-            if !s.requested && s.acp_id.is_none() {
+            if !s.requested && !s.restored && s.acp_id.is_none() {
                 s.requested = true;
-                if let Err(err) = kernel.new_session(s.token, None) {
+                if let Err(err) = kernel.new_session(s.token, Some(s.cwd.clone())) {
                     s.requested = false;
                     s.note(format!("创建会话失败：{err}"));
                 }
@@ -230,6 +238,15 @@ impl ChatApp {
             if s.busy {
                 return;
             }
+            if kernel.is_some() && s.restored {
+                // 历史会话：先开一个新的内核会话，就绪后再发这条消息
+                s.restored = false;
+                s.autoprompt = Some(text);
+                s.note("已恢复的历史会话：新开内核会话继续，agent 看不到之前的上下文");
+                self.request_pending_sessions();
+                cx.notify();
+                return;
+            }
             if kernel.is_some() && !s.ready {
                 s.note("会话尚未就绪，请稍候再发送");
                 cx.notify();
@@ -242,6 +259,10 @@ impl ChatApp {
             }
             s.transcript
                 .push(ChatItem::User(SharedString::from(text.clone())));
+            if kernel.is_some() {
+                self.persist(idx, Record::User { text: text.clone() });
+            }
+            let s = &mut self.sessions[idx];
             s.busy = true;
             s.follow_scroll = true;
             match (&kernel, s.acp_id.clone()) {
@@ -277,6 +298,18 @@ impl ChatApp {
         let kernel = self.kernel.clone();
         let active = self.active;
         self.sessions[active].resolve_permission(item_idx, choice, kernel.as_ref());
+        if let Some(ChatItem::Permission {
+            id,
+            resolved: Some(label),
+            ..
+        }) = self.sessions[active].transcript.get(item_idx)
+        {
+            let record = Record::PermissionResolved {
+                id: *id,
+                label: label.to_string(),
+            };
+            self.persist(active, record);
+        }
         cx.notify();
     }
 
@@ -336,6 +369,16 @@ impl ChatApp {
                     }),
                 };
                 if let Some(idx) = idx {
+                    let turn_over = matches!(
+                        event,
+                        KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. }
+                    );
+                    if Record::worth_keeping(&event) {
+                        self.persist(idx, Record::Event { event: event.clone() });
+                    }
+                    if turn_over {
+                        self.touch_meta(idx);
+                    }
                     if let Some(text) = self.sessions[idx].apply_event(event, kernel.as_ref()) {
                         self.submit_to(idx, text, cx);
                     }
@@ -343,6 +386,56 @@ impl ChatApp {
             }
         }
         cx.notify();
+    }
+
+    /// 往第 `idx` 个会话的日志追加一条记录；首次写入时建档。
+    /// 写盘失败只提示一次，不影响对话本身。
+    fn persist(&mut self, idx: usize, record: Record) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let s = &mut self.sessions[idx];
+        if s.log.is_none() {
+            let opened = match &s.meta {
+                Some(meta) => store.append_log(&meta.id),
+                None => store
+                    .create(&s.title, s.cwd.clone(), &self.agent_cmd)
+                    .map(|(mut meta, log)| {
+                        meta.kernel_session_id = s.acp_id.clone();
+                        let _ = store.save_meta(&meta);
+                        s.meta = Some(meta);
+                        log
+                    }),
+            };
+            match opened {
+                Ok(log) => s.log = Some(log),
+                Err(err) => {
+                    s.note(format!("会话未能保存：{err}"));
+                    self.store = None;
+                    return;
+                }
+            }
+        }
+        if let Some(log) = &mut s.log {
+            let _ = log.append(record);
+        }
+    }
+
+    /// 一轮结束：刷新日志，更新元信息（标题 / 内核会话 ID / 更新时间）。
+    fn touch_meta(&mut self, idx: usize) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let s = &mut self.sessions[idx];
+        if let Some(log) = &mut s.log {
+            let _ = log.flush();
+        }
+        if let Some(meta) = &mut s.meta {
+            meta.title = s.title.to_string();
+            meta.kernel_session_id = s.acp_id.clone();
+            meta.updated_ms = now_ms();
+            let _ = store.save_meta(meta);
+        }
     }
 
     pub(crate) fn start_demo(&mut self, idx: usize, token: u64, cx: &mut Context<Self>) {
@@ -492,4 +585,10 @@ impl Render for ChatApp {
                     .child(main.h_full()),
             )
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }

@@ -60,17 +60,6 @@ pub enum ChatItem {
     Note(SharedString),
 }
 
-pub struct SessionEntry {
-    pub title: SharedString,
-    pub age: SharedString,
-    pub dot: Option<u32>, // 部分会话带在线小圆点
-}
-
-pub struct Workspace {
-    pub name: SharedString,
-    pub sessions: Vec<SessionEntry>,
-}
-
 pub struct StatCard {
     pub label: &'static str,
     pub value: SharedString,
