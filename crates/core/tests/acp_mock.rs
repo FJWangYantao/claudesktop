@@ -378,7 +378,7 @@ fn run_resume(mock_flag: &str) -> (String, bool, String) {
 
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
     kernel
-        .resume_session(5, "old-session-42", None)
+        .resume_session(5, "old-session-42", None, &[])
         .expect("resume session");
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
     let (sid, resumed) = events

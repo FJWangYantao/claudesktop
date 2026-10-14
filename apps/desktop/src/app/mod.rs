@@ -259,19 +259,33 @@ impl ChatApp {
                 return;
             }
             if let (Some(kernel), true) = (&kernel, s.restored) {
-                // 历史会话：先续接内核会话（同一个 agent 才尝试），就绪后再发这条消息
+                // 历史会话：先续接内核会话，就绪后再发这条消息。同一个 ACP agent 才尝试；
+                // 自研内核用本地日志重建上下文，换了端点 / 模型也能续接
                 s.restored = false;
                 s.requested = true;
                 s.resuming = true;
                 s.autoprompt = Some(text);
-                let previous = s
-                    .meta
-                    .as_ref()
-                    .filter(|m| m.agent == self.agent_cmd)
-                    .and_then(|m| m.kernel_session_id.clone());
+                let agent_cmd = &self.agent_cmd;
+                let builtin = kernel.kind() == "builtin";
+                let resumable = s.meta.as_ref().filter(|m| {
+                    if builtin {
+                        m.agent.starts_with("builtin:")
+                    } else {
+                        m.agent == *agent_cmd && m.kernel_session_id.is_some()
+                    }
+                });
                 let cwd = Some(s.cwd.clone());
-                let sent = match &previous {
-                    Some(id) => kernel.resume_session(s.token, id, cwd),
+                let sent = match resumable {
+                    Some(meta) => {
+                        let history = match &self.store {
+                            Some(store) if builtin => {
+                                store.load(&meta.id).unwrap_or_default()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let previous = meta.kernel_session_id.clone().unwrap_or_default();
+                        kernel.resume_session(s.token, &previous, cwd, &history)
+                    }
                     None => kernel.new_session(s.token, cwd),
                 };
                 if let Err(err) = sent {
@@ -469,6 +483,8 @@ impl ChatApp {
             let _ = log.flush();
         }
         if let Some(meta) = &mut s.meta {
+            // 续接到别的 agent 后，会话就归新的 agent 了
+            meta.agent = self.agent_cmd.clone();
             meta.title = s.title.to_string();
             meta.kernel_session_id = s.acp_id.clone();
             meta.updated_ms = now_ms();

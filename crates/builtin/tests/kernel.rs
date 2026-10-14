@@ -595,3 +595,44 @@ fn live_endpoint_tool_loop() {
     assert_eq!(std::fs::read_to_string(dir.join("answer.txt")).unwrap().trim(), "4217");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn resume_rebuilds_context_from_log() {
+    use claudesktop_core::Record;
+    let (base, bodies) = serve(vec![happy_stream("记得，是 42。")]);
+    let h = Harness::new(base);
+    let log = vec![
+        Record::User { text: "秘密是 42，记住".into() },
+        Record::Event { event: KernelEvent::AgentMessageChunk { text: "好的，记住了。".into() } },
+        Record::Event { event: KernelEvent::TurnEnded { stop_reason: "end_turn".into() } },
+    ];
+    h.kernel.resume_session(1, "builtin-old-1", None, &log).unwrap();
+    let sid = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|r| match &r.event {
+            KernelEvent::Started { session_id, resumed: true, .. } => Some(session_id.clone()),
+            _ => None,
+        })
+        .expect("resumed start");
+    h.kernel.send_prompt(&sid, "秘密是多少".into()).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = body(&bodies, 0);
+    let msgs: Vec<_> = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| format!("{}:{}", m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+        .collect();
+    assert!(msgs[0].contains("restored from a saved log"));
+    assert_eq!(msgs[1..], ["user:秘密是 42，记住", "assistant:好的，记住了。", "user:秘密是多少"]);
+
+    // 空日志 = 普通新会话
+    h.kernel.resume_session(2, "x", None, &[]).unwrap();
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::Started { token: 2, resumed: false, .. })),
+        1
+    );
+}

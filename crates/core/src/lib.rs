@@ -221,14 +221,17 @@ pub trait Kernel: Send + Sync {
     /// 事件里带回同一个 `token`。
     fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()>;
     /// 续接之前的会话（`session_id` 为内核侧 ID）；结果经 `Started` 回报，
-    /// 其 `resumed` 表示上下文是否得以延续。默认实现：不支持续接，直接新建。
+    /// 其 `resumed` 表示上下文是否得以延续。`history` 是该会话的本地日志：
+    /// 自己保有上下文的内核（ACP agent）忽略它，进程内内核用它重建上下文。
+    /// 默认实现：不支持续接，直接新建。
     fn resume_session(
         &self,
         token: u64,
         session_id: &str,
         cwd: Option<PathBuf>,
+        history: &[Record],
     ) -> anyhow::Result<()> {
-        let _ = session_id;
+        let _ = (session_id, history);
         self.new_session(token, cwd)
     }
     /// 向某会话发送一轮用户消息；返回仅代表「已投递」。

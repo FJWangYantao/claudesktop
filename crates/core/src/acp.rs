@@ -173,7 +173,9 @@ impl Kernel for AcpKernel {
         token: u64,
         session_id: &str,
         cwd: Option<PathBuf>,
+        _history: &[crate::Record],
     ) -> anyhow::Result<()> {
+        // agent 自己保有上下文（session/resume 或 session/load），本地日志用不上
         self.send_command(KernelCommand::ResumeSession {
             token,
             session_id: session_id.to_string(),

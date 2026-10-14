@@ -7,10 +7,12 @@
 //! - 工具循环：模型请求工具 → 按模式与规则判断权限（必要时发 `PermissionRequest`
 //!   等 UI 应答）→ 执行 → 结果回给模型，直到模型不再调用工具
 //! - 模式：Manual / Accept edits / Plan（只读）/ Bypass；「总是允许」规则按项目落盘
+//! - 续接：用本地会话日志重建上下文（见 `history` 模块）
 //!
 //! 线程模型：每轮对话一个线程（阻塞读 SSE 流、执行工具、等权限应答）；
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
 
+mod history;
 mod openai;
 mod permissions;
 mod sse;
@@ -22,7 +24,9 @@ pub use openai::{
 };
 pub use permissions::PermissionRules;
 
-use claudesktop_core::{EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, RoutedEvent};
+use claudesktop_core::{
+    EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, Record, RoutedEvent,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -96,6 +100,8 @@ struct SessionState {
     /// 不含系统提示词的对话历史
     history: Vec<ChatMessage>,
     mode: String,
+    /// 历史是从本地日志重建的（工具调用只剩摘要）
+    restored: bool,
     /// 进行中的一轮的取消标志
     turn: Option<Arc<AtomicBool>>,
 }
@@ -134,7 +140,7 @@ impl Inner {
         let state = sessions.get(session)?;
         let mut messages = vec![ChatMessage::new(
             "system",
-            system_prompt(&state.cwd, &state.mode),
+            system_prompt(&state.cwd, &state.mode, state.restored),
         )];
         messages.extend(state.history.iter().cloned());
         Some((messages, state.mode.clone(), state.cwd.clone()))
@@ -357,9 +363,39 @@ impl BuiltinKernel {
         inner.emit(None, KernelEvent::Connected { agent_name });
         Ok(Self { inner })
     }
+
+    /// 新建会话（`history` 非空 = 续接），报告 `Started`。
+    fn open_session(&self, token: u64, cwd: Option<PathBuf>, history: Vec<ChatMessage>) {
+        let n = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
+        let session_id = format!("builtin-{}-{n}", std::process::id());
+        let cwd = cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
+        let resumed = !history.is_empty();
+        self.inner.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionState {
+                cwd,
+                history,
+                mode: MODE_DEFAULT.into(),
+                restored: resumed,
+                turn: None,
+            },
+        );
+        self.inner.emit(
+            Some(&session_id),
+            KernelEvent::Started {
+                token,
+                agent_name: self.inner.agent_name.clone(),
+                session_id: session_id.clone(),
+                model: Some(self.inner.provider.model().to_string()),
+                modes: modes(),
+                current_mode: Some(MODE_DEFAULT.into()),
+                resumed,
+            },
+        );
+    }
 }
 
-fn system_prompt(cwd: &Path, mode: &str) -> String {
+fn system_prompt(cwd: &Path, mode: &str, restored: bool) -> String {
     let mut prompt = format!(
         "You are a coding agent running inside claudesktop, a desktop agent harness, \
          working on the user's machine.\n\
@@ -373,6 +409,13 @@ fn system_prompt(cwd: &Path, mode: &str) -> String {
         cwd.display(),
         std::env::consts::OS,
     );
+    if restored {
+        prompt.push_str(
+            "
+
+This conversation was restored from a saved log. Earlier tool calls appear as              `[tool] <title> → <status>: <summary>` lines; their full inputs and outputs are not              available, so re-read files if you need details. Never write such lines yourself.",
+        );
+    }
     if mode == MODE_PLAN {
         prompt.push_str(
             "\n\nPlan mode is active: only read-only tools are available. \
@@ -498,30 +541,19 @@ impl Kernel for BuiltinKernel {
     }
 
     fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()> {
-        let n = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
-        let session_id = format!("builtin-{}-{n}", std::process::id());
-        let cwd = cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
-        self.inner.sessions.lock().unwrap().insert(
-            session_id.clone(),
-            SessionState {
-                cwd,
-                history: Vec::new(),
-                mode: MODE_DEFAULT.into(),
-                turn: None,
-            },
-        );
-        self.inner.emit(
-            Some(&session_id),
-            KernelEvent::Started {
-                token,
-                agent_name: self.inner.agent_name.clone(),
-                session_id: session_id.clone(),
-                model: Some(self.inner.provider.model().to_string()),
-                modes: modes(),
-                current_mode: Some(MODE_DEFAULT.into()),
-                resumed: false,
-            },
-        );
+        self.open_session(token, cwd, Vec::new());
+        Ok(())
+    }
+
+    /// 进程内的会话不跨进程存活：`session_id` 无用，上下文从本地日志重建。
+    fn resume_session(
+        &self,
+        token: u64,
+        _session_id: &str,
+        cwd: Option<PathBuf>,
+        history: &[Record],
+    ) -> anyhow::Result<()> {
+        self.open_session(token, cwd, history::rebuild(history));
         Ok(())
     }
 

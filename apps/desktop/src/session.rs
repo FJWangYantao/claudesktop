@@ -91,8 +91,15 @@ impl Session {
         // 上次退出时还在进行的东西一律收尾
         s.finish_thinking();
         for item in &mut s.transcript {
-            if let ChatItem::Permission { resolved: r @ None, .. } = item {
-                *r = Some("已取消".into());
+            match item {
+                ChatItem::Permission { resolved: r @ None, .. } => *r = Some("已取消".into()),
+                ChatItem::Tool(card) if card.phase == ToolPhase::Running => {
+                    card.phase = ToolPhase::Failed;
+                    if card.result.is_empty() {
+                        card.result = "已中断".into();
+                    }
+                }
+                _ => {}
             }
         }
         s.busy = false;
@@ -185,7 +192,7 @@ impl Session {
                 self.ready = true;
                 if std::mem::take(&mut self.resuming) {
                     self.note(if resumed {
-                        "已续接之前的会话，agent 保有上下文"
+                        "已续接之前的会话，上下文已恢复"
                     } else {
                         "agent 不支持续接：已新开会话，agent 看不到之前的上下文"
                     });
