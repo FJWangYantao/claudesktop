@@ -8,6 +8,7 @@
 
 mod app;
 mod demo;
+mod fonts;
 mod model;
 mod session;
 mod theme;
@@ -27,6 +28,7 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            fonts::register(cx);
 
             let mut options = TitleBar::window_options();
             options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(

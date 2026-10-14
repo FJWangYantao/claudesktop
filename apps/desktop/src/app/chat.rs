@@ -439,16 +439,20 @@ impl ChatApp {
             } => Self::railed(Self::render_permission(idx, title, options, resolved, cx)),
             ChatItem::Plan(rows) => Self::railed(Self::render_plan(rows)),
             ChatItem::Agent(text) => Self::railed(
-                div().text_size(px(15.5)).line_height(relative(1.7)).child(
+                div()
+                    .font_family(SERIF)
+                    .text_size(px(17.))
+                    .line_height(relative(1.75))
+                    .child(
                     TextView::markdown(("agent", idx), SharedString::from(text.clone()))
                         .style(
                             TextViewStyle::default()
                                 .paragraph_gap(rems(0.9))
                                 .heading_font_size(|level, _| match level {
-                                    1 => px(22.),
-                                    2 => px(19.),
-                                    3 => px(17.),
-                                    _ => px(15.5),
+                                    1 => px(24.),
+                                    2 => px(21.),
+                                    3 => px(18.5),
+                                    _ => px(17.),
                                 }),
                         )
                         .stream_fade(true),
