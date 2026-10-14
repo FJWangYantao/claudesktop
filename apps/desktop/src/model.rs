@@ -76,11 +76,10 @@ pub enum ChatItem {
 
 /// 输入框里待发送的一张图片附件（已编好 base64，预览用 gpui Image）。
 pub struct PendingImage {
+    /// 原始文件名（悬停提示用）
     pub name: SharedString,
     /// 如 `image/png`
     pub media_type: String,
-    /// 存盘扩展名（如 `png`）
-    pub ext: String,
     /// 图片字节（base64 编码；发送与落盘共用）
     pub data: String,
     /// 输入框上方的预览
@@ -94,7 +93,6 @@ impl PendingImage {
         Self {
             name,
             media_type: format.mime_type().to_string(),
-            ext: format.extension().to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&bytes),
             preview: gpui_kit::Image::from_bytes(format, bytes),
         }

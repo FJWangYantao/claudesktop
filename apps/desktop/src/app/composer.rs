@@ -132,8 +132,9 @@ impl ChatApp {
     }
 
     /// 输入框上方的一张待发送图片缩略图（右上角 × 撤掉）。
-    fn pending_image_thumb(&self, i: usize, cx: &mut Context<Self>) -> Div {
+    fn pending_image_thumb(&self, i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
+            .id(("pending-image", i))
             .relative()
             .size(px(56.))
             .flex_shrink_0()
@@ -141,6 +142,10 @@ impl ChatApp {
             .overflow_hidden()
             .border_1()
             .border_color(rgb(LINE))
+            .tooltip({
+                let name = self.pending[i].name.clone();
+                move |window, cx| Tooltip::new(name.clone()).build(window, cx)
+            })
             .child(
                 img(Arc::new(self.pending[i].preview.clone()))
                     .size_full()

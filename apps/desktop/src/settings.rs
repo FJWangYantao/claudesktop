@@ -148,7 +148,7 @@ impl<'de> Deserialize<'de> for BuiltinSettings {
 
 /// 常用服务的预设档案（设置页一键添加，key 和模型仍需自己填）。
 pub fn preset_profiles() -> Vec<ProviderProfile> {
-    let mut make = |name: &str, protocol: Protocol, base_url: &str, model: &str| ProviderProfile {
+    let make = |name: &str, protocol: Protocol, base_url: &str, model: &str| ProviderProfile {
         name: name.into(),
         protocol,
         base_url: base_url.into(),
