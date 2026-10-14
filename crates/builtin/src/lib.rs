@@ -22,7 +22,7 @@ pub use openai::{
     ChatMessage, FunctionCall, OpenAiProvider, ProviderConfig, StreamEvent, StreamOutcome,
     ToolCall, Usage,
 };
-pub use permissions::PermissionRules;
+pub use permissions::{PermissionRules, default_rules_path};
 
 /// 列出端点提供的模型（阻塞，设置页在后台线程调用）。
 pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<String>> {
@@ -62,9 +62,7 @@ impl BuiltinConfig {
         Self {
             provider,
             cwd,
-            rules_path: claudesktop_core::default_data_dir()
-                .ok()
-                .map(|d| d.join("permissions.json")),
+            rules_path: default_rules_path(),
         }
     }
 

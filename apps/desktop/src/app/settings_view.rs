@@ -3,7 +3,7 @@
 use super::ChatApp;
 use crate::settings::*;
 use crate::theme::*;
-use claudesktop_builtin::ProviderConfig;
+use claudesktop_builtin::{PermissionRules, ProviderConfig, default_rules_path};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
@@ -21,6 +21,8 @@ pub struct SettingsForm {
     models: Vec<String>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
+    /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
+    rules: Vec<(String, Vec<String>)>,
 }
 
 impl SettingsForm {
@@ -36,6 +38,7 @@ impl SettingsForm {
             acp_command: input("留空 = 内置 mock agent", false, window, cx),
             models: Vec::new(),
             message: None,
+            rules: Vec::new(),
         }
     }
 }
@@ -51,6 +54,7 @@ impl ChatApp {
         f.kernel = s.kernel();
         f.models = s.builtin.models.clone();
         f.message = None;
+        f.rules = PermissionRules::load(default_rules_path()).list();
         for (input, text) in [
             (&f.base_url, s.builtin.base_url),
             (&f.api_key, s.builtin.api_key),
@@ -188,6 +192,111 @@ impl ChatApp {
             });
         })
         .detach();
+    }
+
+    /// 删一条「总是允许」规则。内核每次判断前都重读规则文件，所以立即生效。
+    fn remove_rule(&mut self, project: String, rule: String, cx: &mut Context<Self>) {
+        let mut rules = PermissionRules::load(default_rules_path());
+        if let Err(err) = rules.remove(&project, &rule) {
+            self.settings_form.message = Some((true, format!("删除规则失败：{err}").into()));
+        }
+        self.settings_form.rules = rules.list();
+        cx.notify();
+    }
+
+    fn render_rules(&self, cx: &mut Context<Self>) -> Div {
+        let mut section = div()
+            .v_flex()
+            .gap_2()
+            .pt_4()
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .child(
+                div()
+                    .text_size(px(13.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("已保存的权限规则"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(INK_SOFT))
+                    .child("自研内核里在权限卡片上选「总是允许」时记下的，按项目生效；删除后立即生效。"),
+            );
+        let rules = &self.settings_form.rules;
+        if rules.is_empty() {
+            return section.child(
+                div()
+                    .py_2()
+                    .text_size(px(13.))
+                    .text_color(rgb(INK_FAINT))
+                    .child("还没有规则"),
+            );
+        }
+        let mut n = 0usize;
+        for (project, list) in rules {
+            let mut card = div()
+                .v_flex()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(CARD))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(rgb(LINE))
+                        .child(Icon::new(IconAll::Folder).size_3p5().text_color(rgb(INK_SOFT)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .font_family(MONO)
+                                .text_size(px(12.5))
+                                .text_color(rgb(INK))
+                                .child(project.clone()),
+                        ),
+                );
+            for rule in list {
+                let (p, r) = (project.clone(), rule.clone());
+                card = card.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .px_3()
+                        .py_1p5()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(13.))
+                                .text_color(rgb(INK))
+                                .child(rule_label(rule)),
+                        )
+                        .child(
+                            div()
+                                .id(("rule-remove", n))
+                                .p_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgb(SAND)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_rule(p.clone(), r.clone(), cx)
+                                }))
+                                .child(Icon::new(IconAll::X).size_3p5().text_color(rgb(INK_SOFT))),
+                        ),
+                );
+                n += 1;
+            }
+            section = section.child(card);
+        }
+        section
     }
 
     fn import_antigravity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -555,7 +664,7 @@ impl ChatApp {
                     .text_size(px(12.))
                     .text_color(rgb(INK_FAINT))
                     .child(format!(
-                        "保存在 {path}（API Key 为明文）。启动时环境变量优先于这里的设置。切换内核后，进行中的对话会中断，下次发消息时自动续接。"
+                        "保存在 {path}（API Key 为明文）。启动时环境变量优先于这里的设置。只重启配置变了的内核，它上面进行中的对话会中断，下次发消息时自动续接。"
                     )),
             );
 
@@ -599,7 +708,17 @@ impl ChatApp {
                                     .child(Icon::new(IconAll::X).size_4().text_color(rgb(INK_SOFT))),
                             ),
                     )
-                    .child(body),
+                    .child(body)
+                    .child(self.render_rules(cx)),
             )
+    }
+}
+
+/// 规则 → 给人看的说明
+fn rule_label(rule: &str) -> String {
+    match rule.strip_prefix("shell:") {
+        Some(prefix) => format!("运行以「{prefix}」开头的命令"),
+        None if rule == "edit" => "编辑项目内的文件".into(),
+        None => rule.to_string(),
     }
 }
