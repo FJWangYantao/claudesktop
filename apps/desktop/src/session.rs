@@ -8,6 +8,9 @@ use gpui_kit::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// 内核没上报模型时显示的模型名（统计时当作「未知模型」）
+pub const UNKNOWN_MODEL: &str = "默认模型";
+
 /// 一个对话会话：自己的对话记录、忙闲、模式、模型。一条内核连接上可以同时有多个。
 pub struct Session {
     pub title: SharedString,
@@ -45,6 +48,8 @@ pub struct Session {
     pub resuming: bool,
     /// 内核会话建立前选的模型：Started 之后再告诉内核
     pub pending_model: Option<String>,
+    /// 本轮累计的 token（输入, 输出），一轮结束时写进日志后清零
+    pub turn_usage: (u64, u64),
 }
 
 impl Session {
@@ -65,7 +70,7 @@ impl Session {
             modes: default_modes(),
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
-            model_label: if kernel == KernelChoice::Demo { "GLM-5.3" } else { "默认模型" }.into(),
+            model_label: if kernel == KernelChoice::Demo { "GLM-5.3" } else { UNKNOWN_MODEL }.into(),
             autoprompt: None,
             cwd,
             meta: None,
@@ -73,6 +78,7 @@ impl Session {
             restored: false,
             resuming: false,
             pending_model: None,
+            turn_usage: (0, 0),
         }
     }
 
@@ -88,6 +94,7 @@ impl Session {
                 Record::Event { event } => {
                     s.apply_event(event, None);
                 }
+                Record::Turn { .. } => {}
                 Record::PermissionResolved { id, label } => {
                     let item = s.transcript.iter_mut().rev().find(|i| {
                         matches!(i, ChatItem::Permission { id: pid, resolved: None, .. } if *pid == id)
@@ -393,8 +400,15 @@ impl Session {
             | KernelEvent::Status(_)
             | KernelEvent::UserMessageChunk { .. }
             | KernelEvent::FsRead { .. }
-            | KernelEvent::FsWrite { .. }
-            | KernelEvent::UsageUpdated { .. } => {}
+            | KernelEvent::FsWrite { .. } => {}
+            KernelEvent::UsageUpdated {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                self.turn_usage.0 += input_tokens;
+                self.turn_usage.1 += output_tokens;
+            }
         }
         None
     }

@@ -126,7 +126,7 @@ pub fn rebuild(records: &[Record]) -> Vec<ChatMessage> {
                 // 思考、计划、权限请求不进上下文
                 _ => {}
             },
-            Record::PermissionResolved { .. } => {}
+            Record::PermissionResolved { .. } | Record::Turn { .. } => {}
         }
     }
     messages.extend(assistant.take());

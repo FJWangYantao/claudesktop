@@ -46,6 +46,17 @@ pub enum Record {
     Event { event: KernelEvent },
     /// 用户对某条权限请求的应答（展示名，如「Yes」「已取消」）
     PermissionResolved { id: u64, label: String },
+    /// 一轮结束时的统计：时间、模型、token 用量（首页用量概览用，重放时忽略）。
+    /// 内核没报告模型 / 用量时对应字段为空 / 0
+    Turn {
+        at_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: u64,
+    },
 }
 
 impl Record {
@@ -344,6 +355,16 @@ mod tests {
         let titles: Vec<_> = store.list().into_iter().map(|m| m.title).collect();
         assert_eq!(titles, vec!["a2", "b"]);
         assert_eq!(store.load(&b.id).unwrap().len(), 1);
+        // 统计记录可以往返
+        let turn = Record::Turn {
+            at_ms: 5,
+            model: None,
+            input_tokens: 1,
+            output_tokens: 2,
+        };
+        let line = serde_json::to_string(&turn).unwrap();
+        assert_eq!(line, r#"{"t":"turn","at_ms":5,"input_tokens":1,"output_tokens":2}"#);
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), turn);
 
         store.delete(&a.id).unwrap();
         assert_eq!(store.list().len(), 1);

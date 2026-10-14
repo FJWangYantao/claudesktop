@@ -13,6 +13,7 @@ mod model;
 mod session;
 mod settings;
 mod theme;
+mod usage;
 
 use app::ChatApp;
 use settings::KernelChoice;

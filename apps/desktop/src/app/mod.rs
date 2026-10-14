@@ -14,6 +14,7 @@ use crate::model::*;
 use crate::session::*;
 use crate::settings::*;
 use crate::theme::*;
+use crate::usage::{self, TurnStat};
 use claudesktop_core::{
     AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, Record, RoutedEvent, SessionStore,
 };
@@ -61,6 +62,8 @@ pub struct ChatApp {
     settings_form: SettingsForm,
     /// 正在后台获取模型列表
     fetching_models: bool,
+    /// 所有会话的每轮统计（首页用量概览）
+    usage: Vec<TurnStat>,
 }
 
 /// 一种内核的运行状态。
@@ -166,6 +169,7 @@ impl ChatApp {
             settings_open: false,
             settings_form,
             fetching_models: false,
+            usage: Vec::new(),
         };
         // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
@@ -177,10 +181,14 @@ impl ChatApp {
         // 从磁盘恢复历史会话（演示回放模式下新会话不落盘，但历史照常显示）
         match SessionStore::open_default() {
             Ok(store) => {
-                for meta in store.list().into_iter().take(MAX_RESTORED) {
+                // 最近的进侧栏；更早的只读进用量统计
+                for (i, meta) in store.list().into_iter().enumerate() {
                     let records = store.load(&meta.id).unwrap_or_default();
-                    app.sessions.push(Session::from_records(app.next_token, meta, records));
-                    app.next_token += 1;
+                    app.usage.extend(usage::collect(&meta, &records));
+                    if i < MAX_RESTORED {
+                        app.sessions.push(Session::from_records(app.next_token, meta, records));
+                        app.next_token += 1;
+                    }
                 }
                 app.store = Some(store);
             }
@@ -621,6 +629,7 @@ impl ChatApp {
                         self.persist(idx, Record::Event { event: event.clone() });
                     }
                     if turn_over {
+                        self.record_turn(idx);
                         self.touch_meta(idx);
                     }
                     if let Some(text) = self.sessions[idx].apply_event(event, kernel.as_ref()) {
@@ -664,6 +673,34 @@ impl ChatApp {
         if let Some(log) = &mut s.log {
             let _ = log.append(record);
         }
+    }
+
+    /// 一轮结束：把时间、模型、token 记进日志和用量统计。
+    fn record_turn(&mut self, idx: usize) {
+        let s = &mut self.sessions[idx];
+        let (input_tokens, output_tokens) = std::mem::take(&mut s.turn_usage);
+        let model = Some(s.model_label.to_string()).filter(|m| m != UNKNOWN_MODEL);
+        let at_ms = now_ms();
+        self.persist(
+            idx,
+            Record::Turn {
+                at_ms,
+                model: model.clone(),
+                input_tokens,
+                output_tokens,
+            },
+        );
+        let s = &self.sessions[idx];
+        let session = s
+            .meta
+            .as_ref()
+            .map_or_else(|| format!("live-{}", s.token), |m| m.id.clone());
+        self.usage.push(TurnStat {
+            session,
+            at_ms,
+            model,
+            tokens: input_tokens + output_tokens,
+        });
     }
 
     /// 一轮结束：刷新日志，更新元信息（标题 / 内核会话 ID / 更新时间）。

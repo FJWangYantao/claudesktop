@@ -1,11 +1,13 @@
-//! 空会话首页：问候语 + 用量概览。
+//! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs）。
 
 use super::ChatApp;
 use crate::model::*;
 use crate::theme::*;
+use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
 use gpui_kit::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 impl ChatApp {
     pub(super) fn heat_color(v: u8) -> u32 {
@@ -18,58 +20,171 @@ impl ChatApp {
         }
     }
 
-    pub(super) fn render_overview(&self, cx: &mut Context<Self>) -> Div {
-        // 热力图假数据：6 行 × 26 列，0..=4 强度
-        let mut heat: Vec<u8> = Vec::with_capacity(6 * 26);
-        let mut seed: u32 = 0x9E3779B9;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            (seed % 100) as u8
-        };
-        for i in 0..(6 * 26) {
-            let r = next();
-            // 稀疏分布：大多数为 0
-            let v = if r < 78 {
-                0
-            } else if r < 88 {
-                1
-            } else if r < 94 {
-                2
-            } else if r < 98 {
-                3
-            } else {
-                4
-            };
-            // 末尾几天制造最近活跃
-            let v = if i >= 6 * 26 - 3 && v == 0 { (i % 3 + 2) as u8 } else { v };
-            heat.push(v);
-        }
+    fn stat_card(c: &StatCard) -> Div {
+        div()
+            .v_flex()
+            .gap_1()
+            .w(px(220.))
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgb(INK_SOFT))
+                    .child(c.label),
+            )
+            .child(
+                div()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(17.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(INK))
+                    .child(c.value.clone()),
+            )
+    }
 
+    /// 概览页签：6 张统计卡 + 最近 26 周热力图
+    fn render_usage_cards(o: &Overview) -> Div {
+        let dash = || SharedString::from("—");
         let stats = [
-            StatCard { label: "会话数", value: "87".into() },
-            StatCard { label: "消息数", value: "4,194".into() },
-            StatCard { label: "Token 总量", value: "299.4M".into() },
-            StatCard { label: "活跃天数", value: "9".into() },
-            StatCard { label: "高峰时段", value: "下午 12 点".into() },
-            StatCard { label: "最常用模型", value: "GLM-5.3".into() },
+            StatCard { label: "会话数", value: usage::compact(o.sessions as u64).into() },
+            StatCard { label: "消息数", value: usage::compact(o.messages as u64).into() },
+            StatCard { label: "Token 总量", value: usage::compact(o.tokens).into() },
+            StatCard { label: "活跃天数", value: o.active_days.to_string().into() },
+            StatCard {
+                label: "高峰时段",
+                value: o.peak_hour.map_or_else(dash, |h| usage::hour_label(h).into()),
+            },
+            StatCard {
+                label: "最常用模型",
+                value: o.models.first().map_or_else(dash, |m| m.name.clone().into()),
+            },
         ];
 
         let mut grid = div().v_flex().gap(px(3.));
-        for row in 0..6 {
+        for row in 0..HEAT_ROWS {
             let mut line = div().h_flex().gap(px(3.));
-            for col in 0..26 {
-                let v = heat[row * 26 + col];
-                line = line.child(
-                    div()
-                        .size(px(14.))
-                        .rounded(px(3.))
-                        .bg(rgb(Self::heat_color(v))),
-                );
+            for col in 0..HEAT_COLS {
+                let cell = div().size(px(14.)).rounded(px(3.));
+                line = line.child(match o.heat[row * HEAT_COLS + col] {
+                    Some(v) => cell.bg(rgb(Self::heat_color(v))),
+                    None => cell,
+                });
             }
             grid = grid.child(line);
         }
+
+        div()
+            .v_flex()
+            .gap_4()
+            .child(
+                div()
+                    .v_flex()
+                    .gap_3()
+                    .child(div().h_flex().gap_3().children(stats[..3].iter().map(Self::stat_card)))
+                    .child(div().h_flex().gap_3().children(stats[3..].iter().map(Self::stat_card))),
+            )
+            .child(grid)
+    }
+
+    /// 模型页签：每个模型的轮数和 token，条形按轮数
+    fn render_usage_models(o: &Overview) -> Div {
+        let mut list = div().v_flex().gap_2().w(px(684.));
+        if o.models.is_empty() {
+            return list.child(
+                div()
+                    .py_6()
+                    .text_size(px(13.5))
+                    .text_color(rgb(INK_SOFT))
+                    .child("这段时间还没有记录到模型（ACP agent 不上报模型时不计入）"),
+            );
+        }
+        let max = o.models.first().map_or(1, |m| m.turns.max(1));
+        for m in o.models.iter().take(8) {
+            let share = m.turns as f32 / max as f32;
+            list = list.child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_family(MONO)
+                                    .text_size(px(13.5))
+                                    .text_color(rgb(INK))
+                                    .child(m.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(format!(
+                                        "{} 轮 · {} token",
+                                        usage::compact(m.turns as u64),
+                                        usage::compact(m.tokens)
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(6.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(rgb(Self::heat_color(0)))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(share))
+                                    .rounded_full()
+                                    .bg(rgb(Self::heat_color(3))),
+                            ),
+                    ),
+            );
+        }
+        list
+    }
+
+    fn tab(&self, id: &'static str, label: &'static str, active: bool, cx: &mut Context<Self>, set: fn(&mut Self)) -> Stateful<Div> {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                set(this);
+                cx.notify();
+            }))
+            .child(Self::seg(label, active))
+    }
+
+    pub(super) fn render_overview(&self, cx: &mut Context<Self>) -> Div {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let range = match self.overview_range {
+            1 => Some(30),
+            2 => Some(7),
+            _ => None,
+        };
+        let o = usage::overview(&self.usage, now, usage::local_offset_secs(), range);
+        let body = if self.overview_tab == 1 {
+            Self::render_usage_models(&o)
+        } else {
+            Self::render_usage_cards(&o)
+        };
 
         div()
             .v_flex()
@@ -113,131 +228,26 @@ impl ChatApp {
                                 div()
                                     .h_flex()
                                     .gap_1()
-                                    .child(
-                                        div()
-                                            .id("tab-overview")
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.overview_tab = 0;
-                                                cx.notify();
-                                            }))
-                                            .child(Self::seg("概览", self.overview_tab == 0)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("tab-model")
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.overview_tab = 1;
-                                                cx.notify();
-                                            }))
-                                            .child(Self::seg("模型", self.overview_tab == 1)),
-                                    ),
+                                    .child(self.tab("tab-overview", "概览", self.overview_tab == 0, cx, |t| t.overview_tab = 0))
+                                    .child(self.tab("tab-model", "模型", self.overview_tab == 1, cx, |t| t.overview_tab = 1)),
                             )
                             .child(div().flex_1())
                             .child(
                                 div()
                                     .h_flex()
                                     .gap_1()
-                                    .child(
-                                        div()
-                                            .id("range-all")
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.overview_range = 0;
-                                                cx.notify();
-                                            }))
-                                            .child(Self::seg("全部", self.overview_range == 0)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("range-30")
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.overview_range = 1;
-                                                cx.notify();
-                                            }))
-                                            .child(Self::seg("30 天", self.overview_range == 1)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("range-7")
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.overview_range = 2;
-                                                cx.notify();
-                                            }))
-                                            .child(Self::seg("7 天", self.overview_range == 2)),
-                                    ),
+                                    .child(self.tab("range-all", "全部", self.overview_range == 0, cx, |t| t.overview_range = 0))
+                                    .child(self.tab("range-30", "30 天", self.overview_range == 1, cx, |t| t.overview_range = 1))
+                                    .child(self.tab("range-7", "7 天", self.overview_range == 2, cx, |t| t.overview_range = 2)),
                             ),
                     )
-                    .child(
-                        // 统计卡：2 行 × 3 列
-                        div()
-                            .v_flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .gap_3()
-                                    .children(stats[..3].iter().map(|c| {
-                                        div()
-                                            .v_flex()
-                                            .gap_1()
-                                            .w(px(220.))
-                                            .p_3()
-                                            .rounded_lg()
-                                            .bg(rgb(CARD))
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.5))
-                                                    .text_color(rgb(INK_SOFT))
-                                                    .child(c.label),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(17.))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(INK))
-                                                    .child(c.value.clone()),
-                                            )
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .gap_3()
-                                    .children(stats[3..].iter().map(|c| {
-                                        div()
-                                            .v_flex()
-                                            .gap_1()
-                                            .w(px(220.))
-                                            .p_3()
-                                            .rounded_lg()
-                                            .bg(rgb(CARD))
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.5))
-                                                    .text_color(rgb(INK_SOFT))
-                                                    .child(c.label),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(17.))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(INK))
-                                                    .child(c.value.clone()),
-                                            )
-                                    })),
-                            ),
-                    )
-                    .child(grid)
+                    .child(body)
                     .child(
                         div()
                             .pt_1()
                             .text_size(px(13.))
                             .text_color(rgb(INK_SOFT))
-                            .child("你的 Token 用量相当于 3,333 本《善恶的彼岸》。"),
+                            .child(usage::book_line(o.tokens)),
                     ),
             )
     }
