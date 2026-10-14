@@ -326,6 +326,19 @@ impl ChatApp {
                             .child(Icon::new(IconAll::ImagePlus).size_4().text_color(rgb(INK_SOFT))),
                     )
                     .child(div().flex_1())
+                    .when(self.settings.builtin.profiles.len() > 1, |d| {
+                        d.child(menu_popover(
+                            "profile-menu",
+                            Anchor::BottomRight,
+                            px(280.),
+                            &app,
+                            MenuChip::new(
+                                IconAll::Server,
+                                self.settings.builtin.current().display_name(),
+                            ),
+                            profile_menu_items,
+                        ))
+                    })
                     .child(model_menu_popover(
                         &app,
                         "model-menu",
@@ -486,7 +499,7 @@ fn kernel_menu_items(
         }
         let usable = kind != KernelChoice::Builtin || app.settings.builtin.is_configured();
         let detail: SharedString = match kind {
-            KernelChoice::Builtin if usable => app.settings.builtin.model.trim().to_string().into(),
+            KernelChoice::Builtin if usable => app.settings.builtin.model().trim().to_string().into(),
             KernelChoice::Builtin => "还没配置端点和模型（见设置）".into(),
             KernelChoice::Acp => match app.settings.acp.command.trim() {
                 "" => "内置 mock agent".into(),
@@ -581,7 +594,7 @@ fn model_menu_items(
     if !builtin {
         return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
     }
-    let models = &app.settings.builtin.models;
+    let models = app.settings.builtin.models();
     if models.is_empty() {
         menu = menu.child(hint(if app.fetching_models {
             "正在获取模型列表…".into()
@@ -642,5 +655,78 @@ fn model_menu_items(
             })
             .child(Icon::new(IconAll::RefreshCw).size_3p5())
             .child("刷新模型列表"),
+    )
+}
+
+/// provider 档案条目：切档案并重启自研内核（当前项打勾）。
+fn profile_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> Div {
+    let current = app.settings.builtin.active;
+    let mut menu = div().v_flex().gap_0p5();
+    for (i, p) in app.settings.builtin.profiles.iter().enumerate() {
+        let active = i == current;
+        let configured = p.is_configured();
+        let title: SharedString = p.display_name().into();
+        let detail: SharedString = if configured {
+            p.model.trim().to_string().into()
+        } else {
+            "还没填完（见设置）".into()
+        };
+        let (handle, popover) = (handle.clone(), popover.clone());
+        menu = menu.child(
+            div()
+                .id(("profile-item", i))
+                .h_flex()
+                .items_center()
+                .gap_2p5()
+                .px_2p5()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(SAND)))
+                .on_click(menu_action!(handle, popover, |this, cx| {
+                    this.switch_profile(i, cx);
+                }))
+                .child(
+                    Icon::new(IconAll::Server)
+                        .size_4()
+                        .text_color(rgb(if configured { INK_SOFT } else { INK_FAINT })),
+                )
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(TEXT_BODY)
+                                .text_color(rgb(INK))
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(TEXT_SMALL)
+                                .text_color(rgb(INK_SOFT))
+                                .child(detail),
+                        ),
+                )
+                .when(active, |d| {
+                    d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
+                }),
+        );
+    }
+    menu.child(
+        div()
+            .px_2p5()
+            .py_1p5()
+            .text_size(TEXT_SMALL)
+            .text_color(rgb(INK_FAINT))
+            .child("切换会重启自研内核，进行中的对话下次发消息时续接"),
     )
 }

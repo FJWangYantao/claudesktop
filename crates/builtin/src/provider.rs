@@ -21,12 +21,13 @@ pub(crate) const BACKOFF_MS: [u64; 2] = [1_000, 3_000];
 
 /// 端点使用的协议。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// OpenAI 兼容 Chat Completions（默认）
+    #[serde(rename = "openai")]
     #[default]
     OpenAiCompat,
     /// Anthropic 原生 Messages API
+    #[serde(rename = "anthropic")]
     Anthropic,
 }
 
@@ -40,7 +41,8 @@ impl Protocol {
 }
 
 /// 透传给 provider 的请求参数（设置页可配）。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RequestParams {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,

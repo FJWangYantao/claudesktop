@@ -1,24 +1,56 @@
-//! 设置页（内核 / 端点 / key / 模型）与输入框旁的模型下拉。
+//! 设置页（内核 / provider 档案 / 模型）与输入框旁的模型下拉。
 
 use super::ChatApp;
 use crate::settings::*;
 use crate::theme::*;
-use claudesktop_builtin::{PermissionRules, ProviderConfig, default_rules_path};
+use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-/// 设置页的编辑中状态（保存前不影响正在用的设置）。
-pub struct SettingsForm {
-    kernel: KernelChoice,
+/// 一套档案在表单里的输入框（与 `SettingsForm::profiles` 一一对应）。
+pub struct ProfileInputs {
+    name: Entity<InputState>,
     base_url: Entity<InputState>,
     api_key: Entity<InputState>,
     model: Entity<InputState>,
+}
+
+impl ProfileInputs {
+    fn new(window: &mut Window, cx: &mut Context<ChatApp>, p: &ProviderProfile) -> Self {
+        let make = |value: String,
+                    placeholder: &'static str,
+                    masked: bool,
+                    window: &mut Window,
+                    cx: &mut Context<ChatApp>| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .masked(masked)
+                    .default_value(value)
+            })
+        };
+        Self {
+            name: make(p.name.clone(), "如 DeepSeek（可留空）", false, window, cx),
+            base_url: make(p.base_url.clone(), "http://127.0.0.1:8045/v1", false, window, cx),
+            api_key: make(p.api_key.clone(), "没有可留空", true, window, cx),
+            model: make(p.model.clone(), "如 deepseek-chat", false, window, cx),
+        }
+    }
+}
+
+/// 设置页的编辑中状态（保存前不影响正在用的设置）。
+pub struct SettingsForm {
+    kernel: KernelChoice,
+    /// 编辑中的档案列表（保存才生效）
+    profiles: Vec<ProviderProfile>,
+    /// 正在编辑第几套
+    active: usize,
+    /// 每套档案的输入框
+    inputs: Vec<ProfileInputs>,
     acp_command: Entity<InputState>,
-    /// 表单里获取到的模型（点一下填进模型框）
-    models: Vec<String>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
     /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
@@ -27,19 +59,26 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     pub fn new(window: &mut Window, cx: &mut Context<ChatApp>) -> Self {
-        let input = |placeholder: &'static str, masked: bool, window: &mut Window, cx: &mut Context<ChatApp>| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).masked(masked))
-        };
+        let acp_command = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("留空 = 内置 mock agent")
+        });
         Self {
             kernel: KernelChoice::default(),
-            base_url: input("http://127.0.0.1:8045/v1", false, window, cx),
-            api_key: input("没有可留空", true, window, cx),
-            model: input("如 gemini-3.8-flash", false, window, cx),
-            acp_command: input("留空 = 内置 mock agent", false, window, cx),
-            models: Vec::new(),
+            profiles: Vec::new(),
+            active: 0,
+            inputs: Vec::new(),
+            acp_command,
             message: None,
             rules: Vec::new(),
         }
+    }
+
+    /// 正在编辑的档案（没有时给空档案占位）。
+    fn current(&self) -> Option<(&ProviderProfile, &ProfileInputs)> {
+        let p = self.profiles.get(self.active)?;
+        let i = self.inputs.get(self.active)?;
+        Some((p, i))
     }
 }
 
@@ -50,32 +89,41 @@ fn value(input: &Entity<InputState>, cx: &App) -> String {
 impl ChatApp {
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let s = self.settings.clone();
-        let f = &mut self.settings_form;
-        f.kernel = s.kernel();
-        f.models = s.builtin.models.clone();
-        f.message = None;
-        f.rules = PermissionRules::load(default_rules_path()).list();
-        for (input, text) in [
-            (&f.base_url, s.builtin.base_url),
-            (&f.api_key, s.builtin.api_key),
-            (&f.model, s.builtin.model),
-            (&f.acp_command, s.acp.command),
-        ] {
-            input.update(cx, |state, cx| state.set_value(text, window, cx));
+        self.settings_form.kernel = s.kernel();
+        self.settings_form.message = None;
+        self.settings_form.rules = PermissionRules::load(default_rules_path()).list();
+        // 档案：一份都没有时给一套空的可直接填
+        let mut profiles = s.builtin.profiles.clone();
+        if profiles.is_empty() {
+            profiles.push(ProviderProfile::default());
         }
+        self.settings_form.active = s.builtin.active.min(profiles.len() - 1);
+        self.settings_form.inputs = profiles
+            .iter()
+            .map(|p| ProfileInputs::new(window, cx, p))
+            .collect();
+        self.settings_form.profiles = profiles;
+        self.settings_form.acp_command.update(cx, |state, cx| {
+            state.set_value(s.acp.command.clone(), window, cx)
+        });
         self.settings_open = true;
         cx.notify();
     }
 
-    /// 表单当前的值 → 设置（模型列表沿用已保存的，除非表单里重新获取过）。
+    /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
     fn form_settings(&self, cx: &App) -> Settings {
         let f = &self.settings_form;
         let mut s = self.settings.clone();
         s.kernel = Some(f.kernel);
-        s.builtin.base_url = value(&f.base_url, cx);
-        s.builtin.api_key = value(&f.api_key, cx);
-        s.builtin.model = value(&f.model, cx);
-        s.builtin.models = f.models.clone();
+        let mut profiles = f.profiles.clone();
+        for (p, inputs) in profiles.iter_mut().zip(&f.inputs) {
+            p.name = value(&inputs.name, cx);
+            p.base_url = value(&inputs.base_url, cx);
+            p.api_key = value(&inputs.api_key, cx);
+            p.model = value(&inputs.model, cx);
+        }
+        s.builtin.profiles = profiles;
+        s.builtin.active = f.active.min(s.builtin.profiles.len().saturating_sub(1));
         s.acp.command = value(&f.acp_command, cx);
         s
     }
@@ -99,7 +147,9 @@ impl ChatApp {
         // 只重启配置变了的内核（模型列表变了不算）
         let builtin_key = |s: &Settings| {
             let mut b = s.builtin.clone();
-            b.models.clear();
+            for p in &mut b.profiles {
+                p.models.clear();
+            }
             b
         };
         let restart_builtin = builtin_key(&new) != builtin_key(&self.settings);
@@ -123,6 +173,68 @@ impl ChatApp {
         cx.notify();
     }
 
+    // ---------- 档案编辑（表单内） ----------
+
+    /// 表单里切到第 `i` 套档案。
+    fn select_form_profile(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i < self.settings_form.profiles.len() {
+            self.settings_form.active = i;
+            cx.notify();
+        }
+    }
+
+    /// 表单里删掉第 `i` 套档案。
+    fn remove_form_profile(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i >= self.settings_form.profiles.len() {
+            return;
+        }
+        self.settings_form.profiles.remove(i);
+        self.settings_form.inputs.remove(i);
+        let len = self.settings_form.profiles.len();
+        let f = &mut self.settings_form;
+        if len == 0 {
+            f.active = 0;
+        } else {
+            if i < f.active {
+                f.active -= 1;
+            }
+            f.active = f.active.min(len - 1);
+        }
+        cx.notify();
+    }
+
+    /// 表单里追加一套档案（预设 `preset = None` 时是空白自定义）。
+    fn add_form_profile(&mut self, preset: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let p = preset.map_or_else(ProviderProfile::default, |i| {
+            let mut p = preset_profiles()[i].clone();
+            p.api_key = String::new();
+            p.models = Vec::new();
+            p
+        });
+        self.settings_form.inputs.push(ProfileInputs::new(window, cx, &p));
+        self.settings_form.profiles.push(p);
+        self.settings_form.active = self.settings_form.profiles.len() - 1;
+        cx.notify();
+    }
+
+    /// 表单里切当前档案的协议。
+    fn set_form_protocol(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
+        if let Some(p) = self.settings_form.profiles.get_mut(self.settings_form.active) {
+            p.protocol = protocol;
+            cx.notify();
+        }
+    }
+
+    /// 直接切换生效中的档案（输入框旁的菜单）：写盘并重启自研内核。
+    pub(crate) fn switch_profile(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i >= self.settings.builtin.profiles.len() || i == self.settings.builtin.active {
+            return;
+        }
+        self.update_settings(|s| s.builtin.select(i));
+        self.restart_kernel(KernelChoice::Builtin, cx);
+        cx.notify();
+    }
+
     /// 改一处设置并只把这一处写回文件：生效中的设置可能含有环境变量给的值
     /// （如 key），没点「保存」就不该落盘。
     pub(super) fn update_settings(&mut self, change: impl Fn(&mut Settings)) {
@@ -134,16 +246,23 @@ impl ChatApp {
         }
     }
 
-    /// 后台获取模型列表。`from_form` = 用设置页里正在编辑的端点；否则用生效中的设置。
+    /// 后台获取模型列表。`from_form` = 用设置页里正在编辑的档案；否则用生效中的设置。
     pub(crate) fn fetch_models(&mut self, from_form: bool, cx: &mut Context<Self>) {
         if self.fetching_models {
             return;
         }
         let config = if from_form {
             let f = &self.settings_form;
+            let Some(inputs) = f.inputs.get(f.active) else {
+                return;
+            };
             ProviderConfig {
-                base_url: value(&f.base_url, cx),
-                api_key: Some(value(&f.api_key, cx)).filter(|k| !k.is_empty()),
+                protocol: f
+                    .profiles
+                    .get(f.active)
+                    .map_or(Protocol::OpenAiCompat, |p| p.protocol),
+                base_url: value(&inputs.base_url, cx),
+                api_key: Some(value(&inputs.api_key, cx)).filter(|k| !k.is_empty()),
                 model: String::new(),
                 ..Default::default()
             }
@@ -155,6 +274,7 @@ impl ChatApp {
             cx.notify();
             return;
         }
+        let form_active = if from_form { Some(self.settings_form.active) } else { None };
         self.fetching_models = true;
         cx.notify();
         let base_url = config.base_url.clone();
@@ -168,13 +288,16 @@ impl ChatApp {
                 match result {
                     Ok(models) => {
                         let n = models.len();
-                        if from_form {
-                            app.settings_form.models = models.clone();
-                            app.settings_form.message = Some((false, format!("获取到 {n} 个模型").into()));
+                        if let Some(i) = form_active {
+                            if let Some(p) = app.settings_form.profiles.get_mut(i) {
+                                p.models = models.clone();
+                            }
+                            app.settings_form.message =
+                                Some((false, format!("获取到 {n} 个模型").into()));
                         }
                         // 和生效中的端点一致时，顺便更新下拉用的列表
-                        if base_url == app.settings.builtin.base_url.trim() {
-                            app.update_settings(|s| s.builtin.models = models.clone());
+                        if base_url == app.settings.builtin.base_url().trim() {
+                            app.update_settings(|s| s.builtin.current_mut().models = models.clone());
                         }
                     }
                     Err(err) => {
@@ -301,9 +424,12 @@ impl ChatApp {
         let Some((base_url, key)) = antigravity_gateway() else {
             return;
         };
-        let f = &self.settings_form;
-        f.base_url.update(cx, |s, cx| s.set_value(base_url.clone(), window, cx));
-        f.api_key.update(cx, |s, cx| s.set_value(key, window, cx));
+        let i = self.settings_form.active;
+        let Some(inputs) = self.settings_form.inputs.get(i) else {
+            return;
+        };
+        inputs.base_url.update(cx, |s, cx| s.set_value(base_url.clone(), window, cx));
+        inputs.api_key.update(cx, |s, cx| s.set_value(key, window, cx));
         self.settings_form.message = Some((
             false,
             format!("已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）").into(),
@@ -313,7 +439,7 @@ impl ChatApp {
 
     /// 在模型下拉里选了一个：当前会话立即切换（还没建立的会话等 Started），并记为默认。
     pub(crate) fn choose_model(&mut self, model: String, cx: &mut Context<Self>) {
-        self.update_settings(|s| s.builtin.model = model.clone());
+        self.update_settings(|s| s.builtin.current_mut().model = model.clone());
         let kernel = self.session_kernel(self.active);
         let s = &mut self.sessions[self.active];
         match (kernel, s.acp_id.clone()) {
@@ -332,7 +458,7 @@ impl ChatApp {
     /// 模型下拉打开时：自研内核且还没有模型列表就顺手获取一次。
     pub(crate) fn fetch_models_for_menu(&mut self, cx: &mut Context<Self>) {
         let builtin = self.session().kernel == KernelChoice::Builtin;
-        if builtin && self.settings.builtin.models.is_empty() {
+        if builtin && self.settings.builtin.models().is_empty() {
             self.fetch_models(false, cx);
         }
     }
@@ -462,30 +588,21 @@ impl ChatApp {
 
         match f.kernel {
             KernelChoice::Builtin => {
-                let fetch_label = if self.fetching_models { "获取中…" } else { "获取模型列表" };
-                let mut model_row = div()
-                    .h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Self::text_input(&f.model)))
-                    .child(
-                        Self::button("fetch-models", fetch_label, false)
-                            .on_click(cx.listener(|this, _, _, cx| this.fetch_models(true, cx))),
-                    );
-                if antigravity_gateway().is_some() {
-                    model_row = model_row.child(
-                        Self::button("import-antigravity", "从 Antigravity Tools 导入", false).on_click(
-                            cx.listener(|this, _, window, cx| this.import_antigravity(window, cx)),
-                        ),
-                    );
-                }
-                let current_model = value(&f.model, cx);
-                let mut chips = div().flex().flex_wrap().gap_1p5();
-                for (i, m) in f.models.iter().enumerate() {
-                    let active = *m == current_model;
-                    let pick = m.clone();
-                    chips = chips.child(
+                // 配置档案切换条：点名字换档案，× 删除；后面跟「＋ 添加」
+                let mut profile_row = div().h_flex().flex_wrap().gap_1p5();
+                for (i, p) in f.profiles.iter().enumerate() {
+                    let active = i == f.active;
+                    let label: SharedString = if p.name.trim().is_empty() {
+                        format!("档案 {}", i + 1).into()
+                    } else {
+                        p.name.clone().into()
+                    };
+                    profile_row = profile_row.child(
                         div()
-                            .id(("model-chip", i))
+                            .id(("profile-chip", i))
+                            .h_flex()
+                            .items_center()
+                            .gap_1()
                             .px_2()
                             .py_0p5()
                             .rounded_md()
@@ -495,37 +612,195 @@ impl ChatApp {
                             .cursor_pointer()
                             .hover(|d| d.bg(rgb(SAND)))
                             .text_size(TEXT_SMALL)
-                            .font_family(MONO)
                             .text_color(rgb(INK))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let pick = pick.clone();
-                                this.settings_form
-                                    .model
-                                    .update(cx, |s, cx| s.set_value(pick, window, cx));
-                                cx.notify();
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_form_profile(i, cx);
                             }))
-                            .child(m.clone()),
+                            .child(label)
+                            .child(
+                                div()
+                                    .id(("profile-remove", i))
+                                    .p(px(1.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_form_profile(i, cx);
+                                    }))
+                                    .child(
+                                        Icon::new(IconAll::X)
+                                            .size_3()
+                                            .text_color(rgb(INK_SOFT)),
+                                    ),
+                            ),
                     );
                 }
-                body = body
-                    .child(Self::field(
-                        "端点地址",
-                        Some("OpenAI 兼容的 base URL，不含 /chat/completions"),
-                        Self::text_input(&f.base_url),
-                    ))
-                    .child(Self::field(
-                        "API Key",
-                        None,
+                profile_row = profile_row.child(
+                    div()
+                        .id("profile-add")
+                        .h_flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(LINE))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(SAND)))
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_form_profile(None, window, cx);
+                        }))
+                        .child(Icon::new(IconAll::Plus).size_3())
+                        .child("空白档案"),
+                );
+                // 预设一键添加
+                let mut presets = div().h_flex().flex_wrap().gap_1p5();
+                for (i, p) in preset_profiles().into_iter().enumerate() {
+                    presets = presets.child(
                         div()
+                            .id(("preset-add", i))
+                            .h_flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
                             .rounded_md()
                             .border_1()
                             .border_color(rgb(LINE))
-                            .bg(rgb(CARD))
-                            .px_1()
-                            .child(Input::new(&f.api_key).appearance(false).bordered(false).mask_toggle()),
-                    ))
-                    .child(Self::field("模型", Some("新会话的默认模型；会话里也可以在输入框旁切换"), model_row))
-                    .when(!f.models.is_empty(), |d| d.child(chips));
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(SAND)))
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.add_form_profile(Some(i), window, cx);
+                            }))
+                            .child(Icon::new(IconAll::Plus).size_3().text_color(rgb(INK_SOFT)))
+                            .child(p.name.clone()),
+                    );
+                }
+
+                let mut builtin_body = div().v_flex().gap_4().child(
+                    Self::field("配置档案", Some("可以存多套 provider 配置，输入框旁的菜单可快速切换"), profile_row),
+                );
+                if !f.profiles.is_empty() {
+                    if let Some((p, inputs)) = f.current() {
+                    // 协议二选一
+                    let proto = |id: &'static str, label: &'static str, want: Protocol| {
+                        let active = p.protocol == want;
+                        div()
+                            .id(id)
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(if active { CORAL } else { LINE }))
+                            .bg(rgb(if active { SAND } else { CARD }))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(SAND)))
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_form_protocol(want, cx);
+                            }))
+                            .child(label)
+                    };
+                    let fetch_label = if self.fetching_models { "获取中…" } else { "获取模型列表" };
+                    let mut model_row = div()
+                        .h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Self::text_input(&inputs.model)))
+                        .child(
+                            Self::button("fetch-models", fetch_label, false)
+                                .on_click(cx.listener(|this, _, _, cx| this.fetch_models(true, cx))),
+                        );
+                    if antigravity_gateway().is_some() {
+                        model_row = model_row.child(
+                            Self::button("import-antigravity", "从 Antigravity Tools 导入", false).on_click(
+                                cx.listener(|this, _, window, cx| this.import_antigravity(window, cx)),
+                            ),
+                        );
+                    }
+                    let current_model = value(&inputs.model, cx);
+                    let mut chips = div().flex().flex_wrap().gap_1p5();
+                    for (i, m) in p.models.iter().enumerate() {
+                        let active = *m == current_model;
+                        let pick = m.clone();
+                        chips = chips.child(
+                            div()
+                                .id(("model-chip", i))
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(if active { CORAL } else { LINE }))
+                                .bg(rgb(if active { SAND } else { CARD }))
+                                .cursor_pointer()
+                                .hover(|d| d.bg(rgb(SAND)))
+                                .text_size(TEXT_SMALL)
+                                .font_family(MONO)
+                                .text_color(rgb(INK))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let pick = pick.clone();
+                                    let i = this.settings_form.active;
+                                    if let Some(inputs) = this.settings_form.inputs.get(i) {
+                                        inputs.model.update(cx, |s, cx| s.set_value(pick, window, cx));
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(m.clone()),
+                        );
+                    }
+                    builtin_body = builtin_body
+                        .child(
+                            Self::field(
+                                "常用服务预设",
+                                Some("点击追加一套已填好端点的档案，再补上自己的 key"),
+                                presets,
+                            ),
+                        )
+                        .child(Self::field("名称", None, Self::text_input(&inputs.name)))
+                        .child(Self::field(
+                            "协议",
+                            Some("绝大多数服务选 OpenAI 兼容；Anthropic 官方端点用原生协议"),
+                            div()
+                                .h_flex()
+                                .gap_1p5()
+                                .child(proto("protocol-openai", "OpenAI 兼容", Protocol::OpenAiCompat))
+                                .child(proto("protocol-anthropic", "Anthropic 原生", Protocol::Anthropic)),
+                        ))
+                        .child(Self::field(
+                            "端点地址",
+                            Some("base URL，不含 /chat/completions 或 /messages 后缀"),
+                            Self::text_input(&inputs.base_url),
+                        ))
+                        .child(Self::field(
+                            "API Key",
+                            None,
+                            div()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(LINE))
+                                .bg(rgb(CARD))
+                                .px_1()
+                                .child(
+                                    Input::new(&inputs.api_key)
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .mask_toggle(),
+                                ),
+                        ))
+                        .child(Self::field(
+                            "模型",
+                            Some("新会话的默认模型；会话里也可以在输入框旁切换"),
+                            model_row,
+                        ))
+                        .when(!p.models.is_empty(), |d| d.child(chips));
+                    }
+                }
+                body = body.child(builtin_body);
             }
             KernelChoice::Acp => {
                 body = body.child(Self::field(
