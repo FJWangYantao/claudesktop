@@ -76,6 +76,49 @@ fn main() {
                             }
                             app.autodemo_hook(cx);
                         });
+                        // 压测钩子：CLAUDESKTOP_STRESS=<行数>，灌数据后先滚到顶再滚回底（各 150 帧，每帧 16ms），
+                        // 把帧间隔统计写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）
+                        if let Some(n) = std::env::var("CLAUDESKTOP_STRESS")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                        {
+                            let _ = this.update(cx, |app, cx| app.debug_stress(n, cx));
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1500))
+                                .await;
+                            let _ = this.update(cx, |app, _| app.frame_log = Some(Vec::new()));
+                            for step in 0..300 {
+                                let dy = if step < 150 { -400. } else { 400. };
+                                let _ = this.update(cx, |app, cx| app.debug_scroll(dy, cx));
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(16))
+                                    .await;
+                            }
+                            let _ = this.update(cx, |app, _| {
+                                let log = app.frame_log.take().unwrap_or_default();
+                                let mut gaps: Vec<f64> = log
+                                    .windows(2)
+                                    .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.)
+                                    .collect();
+                                gaps.sort_by(|a, b| a.total_cmp(b));
+                                let pct = |p: f64| {
+                                    gaps.get(((gaps.len() as f64 - 1.) * p) as usize).copied().unwrap_or(0.)
+                                };
+                                let report = format!(
+                                    "rows={n} frames={} p50={:.1}ms p95={:.1}ms max={:.1}ms\n",
+                                    log.len(),
+                                    pct(0.5),
+                                    pct(0.95),
+                                    pct(1.0)
+                                );
+                                match std::env::var("CLAUDESKTOP_STRESS_OUT") {
+                                    Ok(path) => {
+                                        let _ = std::fs::write(path, report);
+                                    }
+                                    Err(_) => eprint!("{report}"),
+                                }
+                            });
+                        }
                         // 调试钩子：CLAUDESKTOP_RERUN = builtin / acp / demo，
                         // 等 CLAUDESKTOP_RERUN_DELAY_MS（默认 10s）后把首条提示词放到该内核上重跑
                         let rerun = std::env::var("CLAUDESKTOP_RERUN").ok().and_then(|v| {

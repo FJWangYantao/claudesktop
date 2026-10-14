@@ -4,7 +4,7 @@ use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::SharedString;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Hash)]
 pub enum ToolPhase {
     Running,
     Done,
@@ -68,6 +68,50 @@ pub enum ChatItem {
     Plan(Vec<PlanRow>),
     Agent(String),
     Note(SharedString),
+}
+
+impl ChatItem {
+    /// 影响这一行渲染高度的内容摘要（虚拟列表据此判断要不要重新测量）。
+    /// 内容只会追加或切换状态，所以长度 + 状态位就够了。
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            Self::User(t) => (0u8, t.len()).hash(&mut h),
+            Self::Thinking {
+                text,
+                streaming,
+                open,
+            } => (1u8, text.len(), streaming, open).hash(&mut h),
+            Self::Info { text, open } => (2u8, text.len(), open).hash(&mut h),
+            Self::Tool(c) => (
+                3u8,
+                c.name.len(),
+                c.arg.len(),
+                c.result.len(),
+                c.phase,
+                c.expanded,
+                c.diffs.iter().map(|d| d.lines.len() + 1).sum::<usize>(),
+            )
+                .hash(&mut h),
+            Self::Permission {
+                title,
+                options,
+                resolved,
+                ..
+            } => (4u8, title.len(), options.len(), resolved.as_ref().map(|r| r.len())).hash(&mut h),
+            Self::Plan(rows) => (
+                5u8,
+                rows.len(),
+                rows.iter().map(|r| r.text.len()).sum::<usize>(),
+                rows.iter().filter(|r| r.done).count(),
+            )
+                .hash(&mut h),
+            Self::Agent(t) => (6u8, t.len()).hash(&mut h),
+            Self::Note(t) => (7u8, t.len()).hash(&mut h),
+        }
+        h.finish()
+    }
 }
 
 pub struct StatCard {

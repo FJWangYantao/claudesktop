@@ -74,6 +74,8 @@ pub struct ChatApp {
     fetching_models: bool,
     /// 所有会话的每轮统计（首页用量概览）
     usage: Vec<TurnStat>,
+    /// 压测钩子：每次 render 的时刻（None = 不记录）
+    pub(crate) frame_log: Option<Vec<std::time::Instant>>,
 }
 
 /// 一种内核的运行状态。
@@ -201,6 +203,7 @@ impl ChatApp {
             settings_form,
             fetching_models: false,
             usage: Vec::new(),
+            frame_log: None,
         };
         // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
@@ -364,6 +367,38 @@ impl ChatApp {
         } else {
             self.sessions[idx].autoprompt = Some(text);
         }
+        cx.notify();
+    }
+
+    /// 压测钩子：往当前会话灌 `n` 行混合内容（用户消息 / markdown 回复 / 工具行 / 备注）。
+    pub(crate) fn debug_stress(&mut self, n: usize, cx: &mut Context<Self>) {
+        let s = &mut self.sessions[self.active];
+        for i in 0..n {
+            s.transcript.push(match i % 4 {
+                0 => ChatItem::User(format!("第 {i} 条：帮我看看这段代码为什么慢").into()),
+                1 => ChatItem::Agent(format!(
+                    "**第 {i} 条回复。** 先看热点：\n\n- 每帧重建整棵树\n- 列表没有虚拟化\n\n```rust\nfn hot(i: usize) -> usize {{ i * {i} }}\n```\n\n改完再测一次。"
+                )),
+                2 => ChatItem::Tool(ToolCard {
+                    id: None,
+                    kind: "read".into(),
+                    name: "Read".into(),
+                    arg: format!("src/module_{i}.rs").into(),
+                    result: "120 行".into(),
+                    phase: ToolPhase::Done,
+                    diffs: Vec::new(),
+                    expanded: false,
+                }),
+                _ => ChatItem::Note(format!("备注 {i}").into()),
+            });
+        }
+        s.title = format!("压测 {n} 行").into();
+        cx.notify();
+    }
+
+    /// 压测钩子：当前会话的列表滚动一段距离（正数向下）。
+    pub(crate) fn debug_scroll(&mut self, dy: f32, cx: &mut Context<Self>) {
+        self.sessions[self.active].list.scroll_by(px(dy));
         cx.notify();
     }
 
@@ -535,7 +570,7 @@ impl ChatApp {
             }
             let s = &mut self.sessions[idx];
             s.busy = true;
-            s.follow_scroll = true;
+            s.follow_tail();
             match (&kernel, s.acp_id.clone()) {
                 (Some(kernel), Some(id)) => {
                     if let Err(err) = kernel.send_prompt(&id, text) {
@@ -790,6 +825,9 @@ impl ChatApp {
 
 impl Render for ChatApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(log) = &mut self.frame_log {
+            log.push(std::time::Instant::now());
+        }
         let title_bar = TitleBar::new()
             .bg(rgb(SAND))
             .child(
@@ -820,11 +858,7 @@ impl Render for ChatApp {
                     ),
             );
 
-        // 自动跟随滚动：在渲染后把滚动钉到底部
         let active = self.active;
-        if self.sessions[active].follow_scroll {
-            self.sessions[active].scroll.scroll_to_bottom();
-        }
         // 还没发过消息的会话显示首页（问候 + 概览）
         let home = !self.sessions[active].has_user_message();
 
@@ -864,24 +898,34 @@ impl Render for ChatApp {
                 )
                 .child(composer_area)
         } else {
-            let mut list = v_flex()
-                .max_w(px(760.))
-                .mx_auto()
-                .w_full()
-                .py_6()
-                .px_6()
-                .gap_4();
-            for (idx, item) in self.sessions[active].transcript.iter().enumerate() {
-                list = list.child(self.render_item(idx, item, cx));
-            }
-
-            let scroll = div()
-                .id("transcript")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.sessions[active].scroll)
-                .child(list);
+            // 虚拟列表：只布局 / 绘制视口附近的行
+            self.sessions[active].sync_list();
+            let state = self.sessions[active].list.clone();
+            let scroll = list(
+                state,
+                cx.processor(|this, ix: usize, _window, cx| {
+                    let s = &this.sessions[this.active];
+                    let Some(item) = s.transcript.get(ix) else {
+                        return div().into_any_element();
+                    };
+                    let last = ix + 1 == s.transcript.len();
+                    div()
+                        .w_full()
+                        .child(
+                            div()
+                                .max_w(px(760.))
+                                .mx_auto()
+                                .w_full()
+                                .px_6()
+                                .pt(px(if ix == 0 { 24. } else { 0. }))
+                                .pb(px(if last { 24. } else { 16. }))
+                                .child(this.render_item(ix, item, cx)),
+                        )
+                        .into_any_element()
+                }),
+            )
+            .flex_1()
+            .min_h_0();
 
             v_flex()
                 .flex_1()

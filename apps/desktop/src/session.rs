@@ -28,8 +28,10 @@ pub struct Session {
     pub busy: bool,
     /// 演示回放用：递增即取消正在播放的脚本
     pub cancel_token: u64,
-    pub scroll: ScrollHandle,
-    pub follow_scroll: bool,
+    /// 对话记录的虚拟列表状态（只渲染可见的行）；默认跟随到底，用户往上翻就停，翻回底部再跟
+    pub list: ListState,
+    /// 每行上次测量时的 [`ChatItem::fingerprint`]
+    pub measured: Vec<u64>,
     /// 当前可选模式（默认静态表，Started 后换成 agent 上报的）
     pub modes: Vec<ModeEntry>,
     pub permission_mode: usize, // modes 下标
@@ -54,6 +56,13 @@ pub struct Session {
     pub renamed: bool,
 }
 
+fn new_list_state() -> ListState {
+    // overdraw：视口外多渲染的高度，滚动时少一点空白
+    let state = ListState::new(0, ListAlignment::Top, px(600.));
+    state.set_follow_mode(FollowMode::Tail);
+    state
+}
+
 impl Session {
     /// 新会话；演示回放不需要内核会话，直接可用。
     pub fn new(token: u64, kernel: KernelChoice, cwd: PathBuf) -> Self {
@@ -67,8 +76,8 @@ impl Session {
             transcript: Vec::new(),
             busy: false,
             cancel_token: 0,
-            scroll: ScrollHandle::new(),
-            follow_scroll: true,
+            list: new_list_state(),
+            measured: Vec::new(),
             modes: default_modes(),
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
@@ -125,6 +134,35 @@ impl Session {
         s.busy = false;
         s.meta = Some(meta);
         s
+    }
+
+    /// 把对话记录的变化同步给虚拟列表：新增的行追加，高度可能变了的行重新测量。
+    /// 每次渲染前调用；只比对指纹，不做布局，1 万行也很便宜。
+    pub fn sync_list(&mut self) {
+        let n = self.transcript.len();
+        if n < self.measured.len() {
+            // 记录只会变长；万一变短就整体重来
+            self.list.reset(0);
+            self.measured.clear();
+        }
+        let old = self.measured.len();
+        for i in 0..old {
+            let f = self.transcript[i].fingerprint();
+            if f != self.measured[i] {
+                self.measured[i] = f;
+                self.list.remeasure_items(i..i + 1);
+            }
+        }
+        if n > old {
+            self.measured
+                .extend(self.transcript[old..].iter().map(ChatItem::fingerprint));
+            self.list.splice(old..old, n - old);
+        }
+    }
+
+    /// 发消息时重新跟到底部（哪怕之前往上翻过）
+    pub fn follow_tail(&self) {
+        self.list.set_follow_mode(FollowMode::Tail);
     }
 
     pub fn has_user_message(&self) -> bool {
@@ -635,6 +673,29 @@ mod tests {
         let paths: Vec<_> = card.diffs.iter().map(|d| d.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "b.txt"]);
         assert_eq!(card.diffs[0].lines.last().unwrap().text, "z");
+    }
+
+    #[core::prelude::v1::test]
+    fn list_tracks_new_and_changed_rows() {
+        let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("."));
+        s.transcript.push(ChatItem::User("hi".into()));
+        s.transcript.push(ChatItem::Agent("a".into()));
+        s.sync_list();
+        assert_eq!((s.list.item_count(), s.measured.len()), (2, 2));
+        let before = s.measured[1];
+        // 流式追加：行数不变，指纹变了
+        if let Some(ChatItem::Agent(t)) = s.transcript.last_mut() {
+            t.push_str("bc");
+        }
+        s.transcript.push(ChatItem::Note("n".into()));
+        s.sync_list();
+        assert_eq!(s.list.item_count(), 3);
+        assert_ne!(s.measured[1], before);
+        assert_eq!(s.measured[1], s.transcript[1].fingerprint());
+        // 折叠 / 展开也算高度变化
+        let open = ChatItem::Thinking { text: "x".into(), streaming: false, open: true };
+        let closed = ChatItem::Thinking { text: "x".into(), streaming: false, open: false };
+        assert_ne!(open.fingerprint(), closed.fingerprint());
     }
 
     #[core::prelude::v1::test]
