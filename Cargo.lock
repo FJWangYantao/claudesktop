@@ -904,6 +904,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "claudesktop-core",
+ "globset",
+ "ignore",
+ "regex",
  "serde",
  "serde_json",
  "ureq",

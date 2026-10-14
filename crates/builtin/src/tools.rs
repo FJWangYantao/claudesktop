@@ -17,6 +17,8 @@ const LIST_DIR: &str = "list_dir";
 const WRITE_FILE: &str = "write_file";
 const EDIT_FILE: &str = "edit_file";
 const SHELL: &str = "shell";
+const GLOB: &str = "glob";
+const GREP: &str = "grep";
 
 /// 单次读取的默认行数 / 单行最长字符数 / 最大文件
 const READ_LIMIT: usize = 2000;
@@ -31,6 +33,15 @@ const PIPE_MAX_BYTES: usize = 2 << 20;
 const PREVIEW_MAX_BYTES: u64 = 2 << 20;
 const SHELL_TIMEOUT_DEFAULT: u64 = 120;
 const SHELL_TIMEOUT_MAX: u64 = 600;
+/// glob 最多返回的路径数
+const GLOB_MAX: usize = 200;
+/// grep 最多返回的匹配行数 / 文件数
+const GREP_MAX_LINES: usize = 300;
+const GREP_MAX_FILES: usize = 200;
+/// grep 跳过的大文件
+const GREP_MAX_FILE_BYTES: u64 = 2 << 20;
+/// grep 输出里单行最多保留的字符
+const GREP_LINE_CHARS: usize = 300;
 
 /// 工具对权限的需求。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +75,21 @@ pub enum Action {
     Shell {
         command: String,
         timeout: Duration,
+        cwd: PathBuf,
+    },
+    /// 按文件名模式找文件（遵守 .gitignore）
+    Glob {
+        pattern: String,
+        root: PathBuf,
+        cwd: PathBuf,
+    },
+    /// 按正则搜文件内容（遵守 .gitignore）
+    Grep {
+        pattern: String,
+        root: PathBuf,
+        include: Option<String>,
+        ignore_case: bool,
+        files_only: bool,
         cwd: PathBuf,
     },
 }
@@ -126,6 +152,40 @@ pub fn specs(writable: bool) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": { "path": { "type": "string", "description": "Directory path" } }
+            }),
+        ),
+        f(
+            GLOB,
+            format!(
+                "Find files by name pattern, e.g. `**/*.rs` or `src/**/mod.rs`. Respects .gitignore and skips hidden files. \
+                 Returns paths relative to the working directory, most recently modified first (at most {GLOB_MAX})."
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob pattern, matched against paths relative to `path`" },
+                    "path": { "type": "string", "description": "Directory to search in (default: working directory)" }
+                },
+                "required": ["pattern"]
+            }),
+        ),
+        f(
+            GREP,
+            format!(
+                "Search file contents with a regular expression (Rust regex syntax). Respects .gitignore, skips hidden and binary files. \
+                 Returns `path:line: text` for each matching line (at most {GREP_MAX_LINES}), or only the matching file paths \
+                 when files_only is true. Prefer this over running grep/rg/findstr in the shell."
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Regular expression" },
+                    "path": { "type": "string", "description": "File or directory to search (default: working directory)" },
+                    "include": { "type": "string", "description": "Only search files matching this glob, e.g. `*.rs`" },
+                    "ignore_case": { "type": "boolean" },
+                    "files_only": { "type": "boolean", "description": "Return only paths of matching files" }
+                },
+                "required": ["pattern"]
             }),
         ),
     ];
@@ -208,6 +268,26 @@ struct EditArgs {
 }
 
 #[derive(Deserialize)]
+struct GlobArgs {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GrepArgs {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    include: Option<String>,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default)]
+    files_only: bool,
+}
+
+#[derive(Deserialize)]
 struct ShellArgs {
     command: String,
     #[serde(default)]
@@ -275,13 +355,49 @@ impl Action {
                     cwd: cwd.to_path_buf(),
                 }
             }
+            GLOB => {
+                let a: GlobArgs = de(name, args)?;
+                if a.pattern.trim().is_empty() {
+                    return Err("glob: `pattern` is empty".into());
+                }
+                globset::Glob::new(a.pattern.trim()).map_err(|e| format!("glob: invalid pattern: {e}"))?;
+                Self::Glob {
+                    pattern: a.pattern.trim().to_string(),
+                    root: dir_or_cwd(cwd, a.path),
+                    cwd: cwd.to_path_buf(),
+                }
+            }
+            GREP => {
+                let a: GrepArgs = de(name, args)?;
+                if a.pattern.is_empty() {
+                    return Err("grep: `pattern` is empty".into());
+                }
+                regex::RegexBuilder::new(&a.pattern)
+                    .case_insensitive(a.ignore_case)
+                    .build()
+                    .map_err(|e| format!("grep: invalid regex: {e}"))?;
+                let include = a.include.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
+                if let Some(g) = &include {
+                    globset::Glob::new(g).map_err(|e| format!("grep: invalid include glob: {e}"))?;
+                }
+                Self::Grep {
+                    pattern: a.pattern,
+                    root: dir_or_cwd(cwd, a.path),
+                    include,
+                    ignore_case: a.ignore_case,
+                    files_only: a.files_only,
+                    cwd: cwd.to_path_buf(),
+                }
+            }
             other => return Err(format!("Unknown tool `{other}`")),
         })
     }
 
     pub fn access(&self) -> Access {
         match self {
-            Self::Read { .. } | Self::List { .. } => Access::Read,
+            Self::Read { .. } | Self::List { .. } | Self::Glob { .. } | Self::Grep { .. } => {
+                Access::Read
+            }
             Self::Write { .. } | Self::Edit { .. } => Access::Edit,
             Self::Shell { .. } => Access::Exec,
         }
@@ -291,6 +407,7 @@ impl Action {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Read { .. } | Self::List { .. } => "read",
+            Self::Glob { .. } | Self::Grep { .. } => "search",
             Self::Write { .. } | Self::Edit { .. } => "edit",
             Self::Shell { .. } => "execute",
         }
@@ -304,6 +421,27 @@ impl Action {
             Self::Write { path, .. } => format!("Write {}", display(cwd, path)),
             Self::Edit { path, .. } => format!("Edit {}", display(cwd, path)),
             Self::Shell { command, .. } => format!("`{}`", command.trim()),
+            Self::Glob { pattern, root, cwd } => match display(cwd, root).as_str() {
+                "." => format!("Glob {pattern}"),
+                dir => format!("Glob {pattern} in {dir}"),
+            },
+            Self::Grep {
+                pattern,
+                root,
+                include,
+                cwd,
+                ..
+            } => {
+                let mut t = format!("Grep {pattern}");
+                let dir = display(cwd, root);
+                if dir != "." {
+                    t.push_str(&format!(" in {dir}"));
+                }
+                if let Some(g) = include {
+                    t.push_str(&format!(" ({g})"));
+                }
+                t
+            }
         }
     }
 
@@ -369,8 +507,194 @@ impl Action {
                 timeout,
                 cwd,
             } => run_shell(command, cwd, *timeout, should_stop),
+            Self::Glob { pattern, root, cwd } => glob_files(pattern, root, cwd, should_stop),
+            Self::Grep {
+                pattern,
+                root,
+                include,
+                ignore_case,
+                files_only,
+                cwd,
+            } => grep_files(
+                pattern,
+                root,
+                include.as_deref(),
+                *ignore_case,
+                *files_only,
+                cwd,
+                should_stop,
+            ),
         }
     }
+}
+
+/// `path` 参数为空时用工作目录
+fn dir_or_cwd(cwd: &Path, path: Option<String>) -> PathBuf {
+    path.filter(|p| !p.trim().is_empty())
+        .map_or_else(|| cwd.to_path_buf(), |p| resolve(cwd, &p))
+}
+
+/// 遍历 `root` 下的文件（遵守 .gitignore / .ignore，跳过隐藏文件；不要求是 git 仓库）
+fn walk(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .follow_links(false)
+        .build()
+}
+
+/// 相对 `root` 的路径，统一用 `/`
+fn rel_slash(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn glob_files(pattern: &str, root: &Path, cwd: &Path, should_stop: &dyn Fn() -> bool) -> ToolOutput {
+    if !root.is_dir() {
+        return ToolOutput::fail(format!("Not a directory: {}", root.display()), "目录不存在");
+    }
+    let matcher = match globset::GlobBuilder::new(pattern).literal_separator(true).build() {
+        Ok(g) => g.compile_matcher(),
+        Err(e) => return ToolOutput::fail(format!("Invalid pattern: {e}"), "模式无效"),
+    };
+    // 不含 `/` 的模式（如 `*.rs`）按文件名匹配任意层级，和常见工具的习惯一致
+    let by_name = !pattern.contains('/');
+    let mut hits: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in walk(root).flatten() {
+        if should_stop() {
+            return ToolOutput::fail("Cancelled", "已取消");
+        }
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let ok = if by_name {
+            path.file_name().is_some_and(|n| matcher.is_match(n))
+        } else {
+            matcher.is_match(rel_slash(root, path))
+        };
+        if ok {
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            hits.push((mtime, path.to_path_buf()));
+        }
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let total = hits.len();
+    if total == 0 {
+        return ToolOutput::ok("No files found", "0 个文件");
+    }
+    let mut out = String::new();
+    for (_, path) in hits.iter().take(GLOB_MAX) {
+        let _ = writeln!(out, "{}", display(cwd, path));
+    }
+    if total > GLOB_MAX {
+        let _ = writeln!(out, "… {} more files; narrow the pattern", total - GLOB_MAX);
+    }
+    ToolOutput::ok(out, format!("{total} 个文件"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grep_files(
+    pattern: &str,
+    root: &Path,
+    include: Option<&str>,
+    ignore_case: bool,
+    files_only: bool,
+    cwd: &Path,
+    should_stop: &dyn Fn() -> bool,
+) -> ToolOutput {
+    let re = match regex::RegexBuilder::new(pattern).case_insensitive(ignore_case).build() {
+        Ok(r) => r,
+        Err(e) => return ToolOutput::fail(format!("Invalid regex: {e}"), "正则无效"),
+    };
+    let include = match include.map(globset::Glob::new).transpose() {
+        Ok(g) => g.map(|g| g.compile_matcher()),
+        Err(e) => return ToolOutput::fail(format!("Invalid include glob: {e}"), "模式无效"),
+    };
+    if !root.exists() {
+        return ToolOutput::fail(format!("No such file or directory: {}", root.display()), "路径不存在");
+    }
+    let mut out = String::new();
+    let (mut lines, mut files, mut truncated) = (0usize, 0usize, false);
+    'walk: for entry in walk(root).flatten() {
+        if should_stop() {
+            return ToolOutput::fail("Cancelled", "已取消");
+        }
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        // include 按文件名匹配（`*.rs`），含 `/` 时按相对路径
+        if let Some(m) = &include {
+            let ok = match include_has_slash(m) {
+                true => m.is_match(rel_slash(root, path)),
+                false => path.file_name().is_some_and(|n| m.is_match(n)),
+            };
+            if !ok {
+                continue;
+            }
+        }
+        if entry.metadata().is_ok_and(|m| m.len() > GREP_MAX_FILE_BYTES) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        // 二进制文件：前 8KB 里有 NUL
+        if bytes.iter().take(8192).any(|b| *b == 0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let mut matched = false;
+        for (no, line) in text.lines().enumerate() {
+            if !re.is_match(line) {
+                continue;
+            }
+            matched = true;
+            if files_only {
+                break;
+            }
+            if lines >= GREP_MAX_LINES {
+                truncated = true;
+                break 'walk;
+            }
+            let line = truncate_chars(line.trim_end(), GREP_LINE_CHARS);
+            let _ = writeln!(out, "{}:{}: {line}", display(cwd, path), no + 1);
+            lines += 1;
+        }
+        if matched {
+            files += 1;
+            if files_only {
+                if files > GREP_MAX_FILES {
+                    truncated = true;
+                    break;
+                }
+                let _ = writeln!(out, "{}", display(cwd, path));
+            }
+        }
+    }
+    if files == 0 {
+        return ToolOutput::ok("No matches", "无匹配");
+    }
+    if truncated {
+        out.push_str("… results truncated; narrow the pattern or path\n");
+    }
+    let summary = if files_only {
+        format!("{} 个文件", files.min(GREP_MAX_FILES))
+    } else {
+        format!("{lines} 处匹配{}", if truncated { "（已截断）" } else { "" })
+    };
+    ToolOutput::ok(clip_output(out), summary)
+}
+
+/// GlobMatcher 不暴露原模式里有没有 `/`，看它的 glob 文本
+fn include_has_slash(m: &globset::GlobMatcher) -> bool {
+    m.glob().glob().contains('/')
 }
 
 /// 规则是否覆盖这条 shell 命令（按词前缀匹配，复合命令不匹配）。
@@ -802,6 +1126,67 @@ mod tests {
         let outside = Action::parse(WRITE_FILE, r#"{"path":"../other/x","content":""}"#, cwd).unwrap();
         assert!(!outside.inside(cwd));
         assert_eq!(outside.rule(cwd), None);
+    }
+
+    #[test]
+    fn glob_and_grep_respect_gitignore() {
+        let dir = tmp("search");
+        let w = |rel: &str, text: &[u8]| {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        w(".gitignore", b"target/\n");
+        w("src/main.rs", b"fn main() {\n    println!(\"Hello\");\n}\n");
+        w("src/app/mod.rs", b"pub fn hello() {}\n");
+        w("README.md", b"hello world\n");
+        w("target/debug/gen.rs", b"fn hello_generated() {}\n");
+        w("data.bin", b"hello\0binary");
+        let never = || false;
+        let run = |name: &str, args: &str| {
+            let a = Action::parse(name, args, &dir).unwrap();
+            assert_eq!(a.access(), Access::Read);
+            assert_eq!(a.kind(), "search");
+            a.run(&never)
+        };
+
+        // 不含 / 的模式按文件名匹配任意层级；target/ 被 .gitignore 排除
+        let out = run(GLOB, r#"{"pattern":"*.rs"}"#);
+        let mut found: Vec<&str> = out.content.lines().collect();
+        found.sort();
+        assert_eq!(found, vec!["src/app/mod.rs", "src/main.rs"]);
+        assert_eq!(out.summary, "2 个文件");
+        let out = run(GLOB, r#"{"pattern":"src/*.rs"}"#);
+        assert_eq!(out.content.trim(), "src/main.rs");
+        assert_eq!(run(GLOB, r#"{"pattern":"*.py"}"#).summary, "0 个文件");
+
+        // 内容搜索：大小写、include、files_only；二进制和忽略目录不搜
+        let out = run(GREP, r#"{"pattern":"hello"}"#);
+        let mut found: Vec<&str> = out.content.lines().collect();
+        found.sort();
+        assert_eq!(found, vec!["README.md:1: hello world", "src/app/mod.rs:1: pub fn hello() {}"]);
+        let out = run(GREP, r#"{"pattern":"hello","ignore_case":true,"include":"*.rs"}"#);
+        let mut found: Vec<&str> = out.content.lines().collect();
+        found.sort();
+        assert_eq!(found, vec!["src/app/mod.rs:1: pub fn hello() {}", "src/main.rs:2:     println!(\"Hello\");"]);
+        assert_eq!(out.summary, "2 处匹配");
+        let out = run(GREP, r#"{"pattern":"fn \\w+","files_only":true,"path":"src"}"#);
+        assert_eq!(out.summary, "2 个文件");
+        assert!(out.content.lines().all(|l| l.starts_with("src/")));
+        assert_eq!(run(GREP, r#"{"pattern":"nothing-here"}"#).summary, "无匹配");
+
+        // 参数错误直接回给模型
+        assert!(Action::parse(GREP, r#"{"pattern":"("}"#, &dir).unwrap_err().contains("invalid regex"));
+        assert!(Action::parse(GLOB, r#"{"pattern":""}"#, &dir).is_err());
+        let a = Action::parse(GREP, r#"{"pattern":"x","path":"src","include":"*.rs"}"#, &dir).unwrap();
+        assert_eq!(a.title(&dir), "Grep x in src (*.rs)");
+        // Plan 模式（只读工具）里也有这两个
+        let names: Vec<String> = specs(false)
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"glob".to_string()) && names.contains(&"grep".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

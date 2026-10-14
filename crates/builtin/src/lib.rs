@@ -429,7 +429,8 @@ fn system_prompt(cwd: &Path, mode: &str, restored: bool) -> String {
          working on the user's machine.\n\
          Working directory: {}\n\
          Platform: {}\n\n\
-         Use the tools to inspect and change the project: read files before editing them, \
+         Use the tools to inspect and change the project: find files with glob and search code with grep \
+         (rather than shell commands), read files before editing them, \
          prefer edit_file for small changes, and verify your work (e.g. build or run tests) \
          when it makes sense. Tool calls that change things may need the user's approval; \
          if one is denied, do not retry it and ask the user instead.\n\
@@ -439,9 +440,9 @@ fn system_prompt(cwd: &Path, mode: &str, restored: bool) -> String {
     );
     if restored {
         prompt.push_str(
-            "
-
-This conversation was restored from a saved log. Earlier tool calls appear as              `[tool] <title> → <status>: <summary>` lines; their full inputs and outputs are not              available, so re-read files if you need details. Never write such lines yourself.",
+            "\n\nThis conversation was restored from a saved log. Earlier tool calls appear as \
+             `[tool] <title> → <status>: <summary>` lines; their full inputs and outputs are not \
+             available, so re-read files if you need details. Never write such lines yourself.",
         );
     }
     if mode == MODE_PLAN {

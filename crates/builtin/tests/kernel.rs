@@ -371,7 +371,7 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
     // 第一步带工具定义；第二步历史里是 assistant(tool_calls) + tool 结果
     let first = body(&bodies, 0);
     let names: Vec<_> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["read_file", "list_dir", "write_file", "edit_file", "shell"]);
+    assert_eq!(names, ["read_file", "list_dir", "glob", "grep", "write_file", "edit_file", "shell"]);
     let second = body(&bodies, 1);
     let msgs = second["messages"].as_array().unwrap();
     let n = msgs.len();
@@ -516,7 +516,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
     assert!(!dir.join("x.txt").exists());
     let first = body(&bodies, 0);
     let names: Vec<_> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["read_file", "list_dir"]);
+    assert_eq!(names, ["read_file", "list_dir", "glob", "grep"]);
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
 }
