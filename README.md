@@ -24,7 +24,7 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] 恢复的会话续聊：在历史会话里发消息时先续接内核会话——优先 ACP `session/resume`，其次 `session/load`（agent 重放的历史直接丢弃，本地已有），都不支持或失败则新开会话并提示「看不到之前的上下文」；仅当记录的 agent 命令与当前一致时才尝试续接。mock 用 `MOCK_RESUME=resume|load` 模拟两种能力
   - 注：真实适配器（Claude / pi）的续接能力尚未实测
   - [x] Windows job object 防孤儿进程：启动时把本进程放进 `KILL_ON_JOB_CLOSE` job，子孙进程自动继承；强杀应用后实测 `cmd → powershell Start-Sleep`（不读 stdin）整棵树被回收
-- [ ] **M2（进行中）** 自研内核 `crates/builtin`（OpenAI 兼容 provider → Anthropic SSE）
+- [x] **M2** 自研内核 `crates/builtin`（OpenAI 兼容 provider；Anthropic 原生接口不做，需要时经兼容网关接入）
   - [x] OpenAI 兼容流式对话：正文 / 思考（`reasoning_content` 或 `reasoning`）/ 用量；429·5xx 在出字前退避重试（1s、3s）；取消即时生效且之后不再发事件；多轮历史
   - [x] 桌面端接入：`CLAUDESKTOP_KERNEL=builtin`，配置走 `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`
   - [x] 真实端点实测：Antigravity Tools 本地网关（`http://127.0.0.1:8045/v1`）的 `gemini-3.8-flash`，单测与桌面端均跑通
@@ -35,7 +35,6 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] 改文件显示 diff：`write_file` / `edit_file` 执行前算出改动预览，挂在工具行下（先于权限卡片，看着 diff 决定是否放行）；ACP agent 上报的 `ToolCallContent::Diff` 走同一条路径。事件和日志里只存带 3 行上下文的 hunk（单份最多 400 行），界面默认显示前 40 行可展开
   - [x] 设置页（侧栏「设置」）：选内核（自研 / ACP agent / 演示回放），自研内核填端点、API Key、模型，可一键获取端点的模型列表，检测到 Antigravity Tools 时可直接导入它的本地网关；ACP 填启动命令。保存到数据目录的 `settings.json`，「保存并应用」时重启内核，有对话的会话下次发消息时自动续接。启动时环境变量优先于设置文件
   - [x] 会话内切模型：输入框旁的模型名可点开，列出端点的模型，选中后当前会话下一步起生效，并记为新会话的默认模型
-  - [ ] Anthropic 原生 SSE provider
 - [ ] **M3** 双内核收口：同一 UI、同一任务、两个内核
 
 ## 开发
