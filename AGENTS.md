@@ -19,8 +19,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **按钮**：新按钮优先 `gpui-component` 的 `Button`（变体齐全）；确需特殊样式再
   手写 div，但成组出现时应抽成 `app/widgets.rs` 的 helper。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
-- **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯（11/12/13/14/15/17/28/34）和
-  `LEADING` / `LEADING_READ`，不要写 `text_size(px(..))`。中文回退字体在根视图统一设置。
+- **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯（12/13/14/15/17/20/28）和
+  `LEADING`，不要写 `text_size(px(..))`。正文一律无衬线（对照官方 Code 桌面端；
+  衬线拉丁字母会和回退的雅黑混排）。中文回退字体在根视图统一设置。
+- **界面文案**：一律中文（含占位符、模式名、问候语）；agent 自己上报的名称除外。
 - **加载 / 进行中动效**：先用 `Spinner`、`ShimmerText`（组件自带动画并尊重系统减少动效），
   别急着手写 `with_animation`。
 
@@ -35,8 +37,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - `Popover` 的 `Styled` 样式落在弹层面板上（bg / border / p / w 都能直接链）。
 - 组件路径：`gpui_kit::component::popover::Popover`、`gpui_kit::base::{Selectable, PopoverState}`
   （`component::*` 的 glob 不含子模块里的类型）。
-- **标题栏（gpui-kit `TitleBar`）整条是系统拖拽区，Windows 上 hit-test 永远返回
-  HTCAPTION，里面放任何可点控件都收不到点击**——可点控件一律放顶栏/侧栏。
+- **不用 gpui-kit `TitleBar`**：窗口框架自绘（`app/chrome.rs`），侧栏顶到窗口顶，
+  会话区顶栏兼做拖拽区和最小化 / 最大化 / 关闭。Windows hit-test 只看鼠标下的元素链里
+  有没有 `WindowControlArea::Drag`——**拖拽区只能是按钮的兄弟（`drag_area()` 填空白），
+  不能包住按钮**，否则按钮收不到点击。
 - 文件对话框与系统联动：`cx.prompt_for_paths(PathPromptOptions)`（注意有 `prompt`
   字段）、`cx.prompt_for_new_path(dir, name)`，均返回 oneshot，配 `cx.spawn_in` +
   `this.update_in` 回 UI；`cx.reveal_path(&path)` 在资源管理器中打开。

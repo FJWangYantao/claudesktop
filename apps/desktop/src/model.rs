@@ -119,12 +119,12 @@ pub struct StatCard {
     pub value: SharedString,
 }
 
-/// 权限模式（名称沿用官方桌面版）：(名称, 说明, 图标, ACP mode id)
+/// 权限模式（对应官方桌面版的 Manual / Accept edits / Plan / Auto）：(名称, 说明, 图标, ACP mode id)
 pub const PERMISSION_MODES: [(&str, &str, IconAll, &str); 4] = [
-    ("Manual", "每次编辑和命令都先询问", IconAll::ShieldCheck, "default"),
-    ("Accept edits", "自动接受文件编辑，命令仍询问", IconAll::SquarePen, "acceptEdits"),
-    ("Plan", "只出计划，不改动文件", IconAll::ListTodo, "plan"),
-    ("Auto", "由分类器判断，少打扰", IconAll::Zap, "auto"),
+    ("逐项确认", "每次编辑和命令都先询问", IconAll::ShieldCheck, "default"),
+    ("自动接受编辑", "自动接受文件编辑，命令仍询问", IconAll::SquarePen, "acceptEdits"),
+    ("计划模式", "只出计划，不改动文件", IconAll::ListTodo, "plan"),
+    ("自动", "由分类器判断，少打扰", IconAll::Zap, "auto"),
 ];
 
 /// 下拉里的一项模式：mock / 演示用上面的静态表；连上真实 agent 后改用

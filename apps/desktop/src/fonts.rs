@@ -1,5 +1,4 @@
-//! 内嵌字体：Inter（界面）、Newsreader（衬线，回复正文与标题，近似 Claude 的 Tiempos）、
-//! JetBrains Mono（代码 / 工具行）。均为 SIL OFL 1.1，来源见 `assets/fonts/README.md`。
+//! 内嵌字体：Inter（界面与正文）、JetBrains Mono（代码 / 工具行）。均为 SIL OFL 1.1，来源见 `assets/fonts/README.md`。
 //!
 //! 只含拉丁字形；中文由系统字体回退（DirectWrite fallback）。
 
@@ -18,9 +17,6 @@ pub fn register(cx: &mut App) {
         font!("Inter-400-normal.ttf"),
         font!("Inter-500-normal.ttf"),
         font!("Inter-600-normal.ttf"),
-        font!("Newsreader-400-normal.ttf"),
-        font!("Newsreader-500-normal.ttf"),
-        font!("Newsreader-400-italic.ttf"),
         font!("JetBrainsMono-400-normal.ttf"),
         font!("JetBrainsMono-500-normal.ttf"),
     ];

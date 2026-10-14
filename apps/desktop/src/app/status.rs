@@ -1,19 +1,19 @@
-//! 输入框上方的运行状态条：本轮在干什么、跑了多久、用了多少 token。
-//! 只在当前会话忙时出现；数据来自 `Session::activity` / `turn_usage` / `turn_started`。
+//! 对话流末尾的运行状态行：本轮在干什么、跑了多久、用了多少 token
+//! （对照官方「✳ 5s · ↓ 3.5k tokens」）。只在当前会话忙时出现；
+//! 数据来自 `Session::activity` / `turn_usage` / `turn_started`。
 
 use super::ChatApp;
 use crate::session::{Activity, TurnUsage};
 use crate::theme::*;
 use crate::usage;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::time::Duration;
 
 impl ChatApp {
-    pub(super) fn render_turn_status(&self) -> Option<StatusBar> {
+    pub(super) fn render_turn_status(&self) -> Option<Div> {
         let s = self.session();
         if !s.busy {
             return None;
@@ -22,12 +22,7 @@ impl ChatApp {
         let waiting = activity == Activity::WaitingPermission;
         // 等授权要用户处理：静止红点；其余转圈
         let indicator = if waiting {
-            div()
-                .size(px(6.))
-                .mx(px(3.))
-                .rounded_full()
-                .bg(rgb(RED))
-                .into_any_element()
+            div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
         } else {
             Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element()
         };
@@ -54,22 +49,33 @@ impl ChatApp {
             Activity::Replying => div().child("正在回复"),
             Activity::Waiting => div().child("等待响应"),
         };
-        let elapsed = s.turn_started.map(|t| elapsed_label(t.elapsed()));
+        let mut meta: Vec<String> = s.turn_started.map(|t| elapsed_label(t.elapsed())).into_iter().collect();
+        meta.extend(usage_label(&s.turn_usage));
 
         Some(
-            StatusBar::new()
-                .left(indicator)
-                .left(label)
-                .when_some(usage_label(&s.turn_usage), |bar, text| bar.right(text))
-                .when_some(elapsed, |bar, text| {
-                    bar.right(div().font_family(MONO).text_color(rgb(INK_SOFT)).child(text))
-                })
-                // 覆盖组件默认的底栏样式：融进纸底，不要顶部分隔线
-                .bg(rgb(PAPER))
-                .border_color(rgba(0x00000000))
-                .px_3()
-                .text_size(TEXT_META)
-                .text_color(rgb(INK_SOFT)),
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(
+                    div()
+                        .size(px(14.))
+                        .flex_shrink_0()
+                        .flex()
+                        .justify_center()
+                        .items_center()
+                        .child(indicator),
+                )
+                .child(label)
+                .children(meta.into_iter().map(|text| {
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(INK_FAINT))
+                        .child(format!("· {text}"))
+                })),
         )
     }
 }
@@ -84,13 +90,13 @@ fn elapsed_label(d: Duration) -> String {
     }
 }
 
-/// `输入 1,200 · 输出 340（思考 120）`；内核没报用量（演示回放、部分 agent）时不显示。
+/// `↑ 1.2k ↓ 340 token（思考 120）`；内核没报用量（演示回放、部分 agent）时不显示。
 fn usage_label(u: &TurnUsage) -> Option<String> {
     if u.input == 0 && u.output == 0 {
         return None;
     }
     let mut text = format!(
-        "输入 {} · 输出 {}",
+        "↑ {} ↓ {} token",
         usage::compact(u.input),
         usage::compact(u.output)
     );
@@ -115,8 +121,8 @@ mod tests {
     fn usage_label_hides_empty_and_shows_reasoning() {
         assert_eq!(usage_label(&TurnUsage::default()), None);
         let u = TurnUsage { input: 1200, output: 340, reasoning: 120 };
-        assert_eq!(usage_label(&u).unwrap(), "输入 1,200 · 输出 340（思考 120）");
+        assert_eq!(usage_label(&u).unwrap(), "↑ 1,200 ↓ 340 token（思考 120）");
         let u = TurnUsage { input: 5, output: 1, reasoning: 0 };
-        assert_eq!(usage_label(&u).unwrap(), "输入 5 · 输出 1");
+        assert_eq!(usage_label(&u).unwrap(), "↑ 5 ↓ 1 token");
     }
 }

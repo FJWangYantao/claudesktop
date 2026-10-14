@@ -11,13 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 impl ChatApp {
     pub(super) fn heat_color(v: u8) -> u32 {
-        match v {
-            0 => 0xE7E2D6,   // 空白格：沙色
-            1 => 0xD8DFF0,   // 浅蓝
-            2 => 0xA9B9DC,   // 中蓝
-            3 => 0x7C92C4,   // 深蓝
-            _ => 0x4C62A6,   // 最深
-        }
+        HEAT[(v as usize).min(HEAT.len() - 1)]
     }
 
     fn stat_card(c: &StatCard) -> Div {
@@ -64,11 +58,12 @@ impl ChatApp {
             },
         ];
 
-        let mut grid = div().v_flex().gap(px(3.));
+        // 格子按列数均分整行宽度，与上面的统计卡两端对齐
+        let mut grid = div().v_flex().w_full().gap(px(3.));
         for row in 0..HEAT_ROWS {
-            let mut line = div().h_flex().gap(px(3.));
+            let mut line = div().h_flex().w_full().gap(px(3.));
             for col in 0..HEAT_COLS {
-                let cell = div().size(px(14.)).rounded(px(3.));
+                let cell = div().flex_1().h(px(14.)).rounded(px(3.));
                 line = line.child(match o.heat[row * HEAT_COLS + col] {
                     Some(v) => cell.bg(rgb(Self::heat_color(v))),
                     None => cell,
@@ -201,21 +196,22 @@ impl ChatApp {
                     .items_center()
                     .child(
                         Icon::new(IconAll::Sparkles)
-                            .size_5()
+                            .size_6()
                             .text_color(rgb(CORAL)),
                     )
                     .child(
                         div()
-                            .font_family(SERIF)
-                            .text_size(TEXT_HERO)
+                            .text_size(TEXT_TITLE)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(INK))
-                            .child("What's up next, WYT?"),
+                            .child(greeting()),
                     ),
             )
             .child(
                 div()
                     .v_flex()
                     .gap_4()
+                    .w(px(724.))
                     .p_5()
                     .rounded_xl()
                     .bg(rgb(SAND))
@@ -250,5 +246,22 @@ impl ChatApp {
                             .child(usage::book_line(o.tokens)),
                     ),
             )
+    }
+}
+
+/// 「下午好，WYT」：时段 + 系统用户名（取不到就不带名字）
+fn greeting() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+        + usage::local_offset_secs();
+    let part = match secs.rem_euclid(86_400) / 3600 {
+        5..12 => "上午好",
+        12..18 => "下午好",
+        _ => "晚上好",
+    };
+    match std::env::var("USERNAME").or_else(|_| std::env::var("USER")) {
+        Ok(name) if !name.trim().is_empty() => format!("{part}，{name}"),
+        _ => part.to_string(),
     }
 }

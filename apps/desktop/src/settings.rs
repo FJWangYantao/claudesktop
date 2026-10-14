@@ -41,15 +41,6 @@ impl KernelChoice {
         }
     }
 
-    /// 侧栏会话行上的短标签
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::Acp => "ACP",
-            Self::Builtin => "自研",
-            Self::Demo => "演示",
-        }
-    }
-
     /// 历史会话属于哪种内核：按元信息里记的 agent 标识判断
     pub fn of_agent(agent: &str) -> Self {
         if agent.starts_with("builtin:") {

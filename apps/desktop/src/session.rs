@@ -33,6 +33,8 @@ pub struct Session {
     pub list: ListState,
     /// 每行上次测量时的 [`ChatItem::fingerprint`]
     pub measured: Vec<u64>,
+    /// 列表末尾的运行状态行上次测量时是否在忙（忙时有一行，不忙时高度为 0）
+    measured_busy: bool,
     /// 当前可选模式（默认静态表，Started 后换成 agent 上报的）
     pub modes: Vec<ModeEntry>,
     pub permission_mode: usize, // modes 下标
@@ -82,8 +84,9 @@ pub enum Activity {
 }
 
 fn new_list_state() -> ListState {
-    // overdraw：视口外多渲染的高度，滚动时少一点空白
-    let state = ListState::new(0, ListAlignment::Top, px(600.));
+    // overdraw：视口外多渲染的高度，滚动时少一点空白。
+    // 初始 1 行 = 末尾的运行状态行（对话记录的行都插在它前面）
+    let state = ListState::new(1, ListAlignment::Top, px(600.));
     state.set_follow_mode(FollowMode::Tail);
     state
 }
@@ -103,6 +106,7 @@ impl Session {
             cancel_token: 0,
             list: new_list_state(),
             measured: Vec::new(),
+            measured_busy: false,
             modes: default_modes(),
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
@@ -163,12 +167,13 @@ impl Session {
     }
 
     /// 把对话记录的变化同步给虚拟列表：新增的行追加，高度可能变了的行重新测量。
+    /// 列表比记录多一行：第 `n` 行是运行状态行，忙 / 闲切换时重新测量。
     /// 每次渲染前调用；只比对指纹，不做布局，1 万行也很便宜。
     pub fn sync_list(&mut self) {
         let n = self.transcript.len();
         if n < self.measured.len() {
             // 记录只会变长；万一变短就整体重来
-            self.list.reset(0);
+            self.list.reset(1);
             self.measured.clear();
         }
         let old = self.measured.len();
@@ -182,7 +187,12 @@ impl Session {
         if n > old {
             self.measured
                 .extend(self.transcript[old..].iter().map(ChatItem::fingerprint));
+            // 插在状态行前面
             self.list.splice(old..old, n - old);
+        }
+        if self.busy != self.measured_busy {
+            self.measured_busy = self.busy;
+            self.list.remeasure_items(n..n + 1);
         }
     }
 
@@ -821,7 +831,8 @@ mod tests {
         s.transcript.push(ChatItem::User("hi".into()));
         s.transcript.push(ChatItem::Agent("a".into()));
         s.sync_list();
-        assert_eq!((s.list.item_count(), s.measured.len()), (2, 2));
+        // 记录 2 行 + 末尾状态行
+        assert_eq!((s.list.item_count(), s.measured.len()), (3, 2));
         let before = s.measured[1];
         // 流式追加：行数不变，指纹变了
         if let Some(ChatItem::Agent(t)) = s.transcript.last_mut() {
@@ -829,7 +840,7 @@ mod tests {
         }
         s.transcript.push(ChatItem::Note("n".into()));
         s.sync_list();
-        assert_eq!(s.list.item_count(), 3);
+        assert_eq!(s.list.item_count(), 4);
         assert_ne!(s.measured[1], before);
         assert_eq!(s.measured[1], s.transcript[1].fingerprint());
         // 折叠 / 展开也算高度变化

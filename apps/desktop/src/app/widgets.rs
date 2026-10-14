@@ -12,11 +12,9 @@ impl ChatApp {
             .h_flex()
             .gap_1p5()
             .px_2p5()
-            .py_1p5()
+            .py_1()
             .rounded_md()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(CARD))
+            .bg(rgb(SAND))
             .child(
                 Icon::new(icon)
                     .size_3p5()
@@ -25,7 +23,7 @@ impl ChatApp {
             .child(
                 div()
                     .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK))
+                    .text_color(rgb(INK_SOFT))
                     .child(label.into()),
             )
     }
@@ -37,7 +35,7 @@ impl ChatApp {
             .py_1()
             .rounded_md()
             .text_size(TEXT_SMALL)
-            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) })
+            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(CLEAR) })
             .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
             .child(text)
     }

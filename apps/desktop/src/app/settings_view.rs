@@ -363,7 +363,7 @@ impl ChatApp {
             .text_size(TEXT_BODY)
             .when(primary, |d| {
                 d.bg(rgb(CORAL))
-                    .text_color(rgb(0xFFFFFF))
+                    .text_color(rgb(WHITE))
                     .hover(|d| d.opacity(0.9))
             })
             .when(!primary, |d| {
@@ -594,8 +594,8 @@ impl ChatApp {
                             .child(
                                 div()
                                     .flex_1()
-                                    .font_family(SERIF)
                                     .text_size(TEXT_TITLE)
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(rgb(INK))
                                     .child("设置"),
                             )

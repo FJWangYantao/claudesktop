@@ -6,11 +6,14 @@ use crate::settings::KernelChoice;
 use crate::theme::*;
 use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::component::shimmer::ShimmerText;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::borrow::Cow;
 
 impl ChatApp {
     pub(super) fn render_thinking(
@@ -112,65 +115,85 @@ impl ChatApp {
     }
 
     pub(super) fn render_tool(idx: usize, card: &ToolCard, cx: &mut Context<Self>) -> Div {
-        let dot = match card.phase {
-            ToolPhase::Running => CORAL,
-            ToolPhase::Done => GREEN,
-            ToolPhase::Failed => RED,
+        // 官方样式：工具名加粗 + 参数小药丸 + 改动行数；完成时不再挂状态点
+        let status = match card.phase {
+            ToolPhase::Running => Some(
+                Spinner::new()
+                    .xsmall()
+                    .color(rgb(CORAL).into())
+                    .into_any_element(),
+            ),
+            ToolPhase::Failed => Some(
+                Icon::new(IconAll::X)
+                    .size_3p5()
+                    .text_color(rgb(RED))
+                    .into_any_element(),
+            ),
+            ToolPhase::Done => None,
         };
-        let mut col = div().v_flex().gap(px(2.)).child(
-            div()
-                .h_flex()
-                .items_start()
-                .gap_2()
-                .child(
+        let (added, removed) = card
+            .diffs
+            .iter()
+            .fold((0, 0), |(a, r), d| (a + d.added, r + d.removed));
+        let arg = card.arg.clone();
+        let header = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(TEXT_BODY)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(INK))
+                    .child(card.name.clone()),
+            )
+            .when(!arg.is_empty(), |d| {
+                d.child(
                     div()
-                        .size(px(7.))
-                        .mt(px(7.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(rgb(dot)),
-                )
-                .child(
-                    div()
-                        .text_size(TEXT_LARGE)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(INK))
-                        .child(card.name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
+                        .id(("tool-arg", idx))
                         .min_w_0()
-                        .text_size(TEXT_BODY)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .bg(rgb(CODE_BG))
                         .font_family(MONO)
+                        .text_size(TEXT_SMALL)
                         .text_color(rgb(INK_SOFT))
-                        .line_height(LEADING)
+                        .tooltip(move |window, cx| Tooltip::new(arg.clone()).build(window, cx))
                         .child(card.arg.clone()),
-                ),
-        );
+                )
+            })
+            .when(added + removed > 0, |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .h_flex()
+                        .gap_1()
+                        .font_family(MONO)
+                        .text_size(TEXT_META)
+                        .child(div().text_color(rgb(DIFF_ADD_FG)).child(format!("+{added}")))
+                        .child(div().text_color(rgb(DIFF_DEL_FG)).child(format!("−{removed}"))),
+                )
+            })
+            .children(status);
+        let mut col = div().v_flex().gap_1().child(header);
         if !card.result.is_empty() {
             col = col.child(
                 div()
                     .h_flex()
                     .items_start()
-                    .gap_2()
-                    .pl_3()
-                    .child(
-                        div()
-                            .text_size(TEXT_BODY)
-                            .font_family(MONO)
-                            .text_color(rgb(INK_FAINT))
-                            .child("└"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(TEXT_BODY)
-                            .font_family(MONO)
-                            .text_color(rgb(INK_SOFT))
-                            .child(card.result.clone()),
-                    ),
+                    .gap_1p5()
+                    .pl_1()
+                    .font_family(MONO)
+                    .text_size(TEXT_SMALL)
+                    .line_height(LEADING)
+                    .text_color(rgb(INK_FAINT))
+                    .child("└")
+                    .child(div().flex_1().min_w_0().child(card.result.clone())),
             );
         }
         // 文件改动：默认每份只显示前若干行，超出给一个展开开关
@@ -262,7 +285,7 @@ impl ChatApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_size(TEXT_BODY)
-                            .when(primary, |d| d.bg(rgb(CORAL)).text_color(rgb(0xFFFFFF)))
+                            .when(primary, |d| d.bg(rgb(CORAL)).text_color(rgb(WHITE)))
                             .when(!primary, |d| {
                                 d.border_1()
                                     .border_color(rgb(LINE))
@@ -415,60 +438,55 @@ impl ChatApp {
     }
 
     pub(super) fn render_plan(rows: &[PlanRow]) -> Div {
+        let done = rows.iter().filter(|r| r.done).count();
         div()
             .v_flex()
             .gap_1p5()
-            .p_3()
-            .rounded_lg()
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(LINE))
+            .pl_3()
+            .py_0p5()
+            .border_l_2()
+            .border_color(rgb(CORAL))
             .child(
                 div()
                     .h_flex()
+                    .items_center()
                     .gap_1p5()
+                    .text_size(TEXT_SMALL)
+                    .child(Icon::new(IconAll::ListTodo).size_3p5().text_color(rgb(CORAL)))
+                    .child(div().text_color(rgb(INK_SOFT)).child("计划"))
                     .child(
-                        Icon::new(IconAll::ListTodo)
-                            .size_4()
-                            .text_color(rgb(CORAL)),
-                    )
-                    .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child("计划")),
+                        div()
+                            .text_color(rgb(INK_FAINT))
+                            .child(format!("{done}/{}", rows.len())),
+                    ),
             )
             .children(rows.iter().enumerate().map(|(i, row)| {
                 let marker = if row.done {
                     div()
-                        .size(px(15.))
+                        .size(px(14.))
                         .rounded_full()
                         .bg(rgb(GREEN))
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(
-                            Icon::new(IconAll::Check)
-                                .size_3()
-                                .text_color(rgb(0xFFFFFF)),
-                        )
+                        .child(Icon::new(IconAll::Check).size_2p5().text_color(rgb(WHITE)))
                 } else {
                     div()
-                        .size(px(15.))
+                        .size(px(14.))
                         .rounded_full()
                         .border_1()
-                        .border_color(rgb(LINE))
+                        .border_color(rgb(INK_FAINT))
                 };
                 div()
                     .id(("plan-row", i))
                     .h_flex()
                     .gap_2()
                     .items_center()
-                    .child(marker)
+                    .child(marker.flex_shrink_0())
                     .child(
                         div()
                             .text_size(TEXT_BODY)
-                            .text_color(if row.done {
-                                rgb(INK_SOFT)
-                            } else {
-                                rgb(INK)
-                            })
+                            .text_color(rgb(if row.done { INK_SOFT } else { INK }))
                             .child(row.text.clone()),
                     )
             }))
@@ -508,15 +526,16 @@ impl ChatApp {
         div()
             .group(group.clone())
             .v_flex()
+            .items_end()
             .gap_1()
             .child(
                 div()
-                    .w_full()
+                    .max_w(relative(0.85))
                     .bg(rgb(SAND))
                     .text_color(rgb(INK))
-                    .rounded(px(12.))
+                    .rounded(px(14.))
                     .px_4()
-                    .py_3()
+                    .py_2p5()
                     .text_size(TEXT_LARGE)
                     .line_height(LEADING)
                     .child(text.clone()),
@@ -546,26 +565,35 @@ impl ChatApp {
                 ..
             } => Self::railed(Self::render_permission(idx, title, options, resolved, cx)),
             ChatItem::Plan(rows) => Self::railed(Self::render_plan(rows)),
-            ChatItem::Agent(text) => Self::railed(
-                div()
-                    .font_family(SERIF)
-                    .text_size(TEXT_LEAD)
-                    .line_height(LEADING_READ)
-                    .child(
-                    TextView::markdown(("agent", idx), SharedString::from(text.clone()))
-                        .style(
-                            TextViewStyle::default()
-                                .paragraph_gap(rems(0.9))
-                                .heading_font_size(|level, _| match level {
-                                    1 => px(24.),
-                                    2 => px(21.),
-                                    3 => px(18.5),
-                                    _ => px(17.),
-                                }),
-                        )
-                        .stream_fade(true),
-                ),
-            ),
+            ChatItem::Agent(text) => {
+                let s = self.session();
+                let streaming = s.busy && idx + 1 == s.transcript.len();
+                let text = if streaming {
+                    close_dangling_code(text).into_owned()
+                } else {
+                    text.clone()
+                };
+                Self::railed(
+                    div().text_size(TEXT_LARGE).line_height(LEADING).child(
+                        TextView::markdown(("agent", idx), SharedString::from(text))
+                            .style(
+                                TextViewStyle::default()
+                                    .paragraph_gap(rems(0.75))
+                                    .heading_font_size(|level, _| match level {
+                                        1 => TEXT_HEADING,
+                                        2 => TEXT_LEAD,
+                                        _ => TEXT_LARGE,
+                                    })
+                                    .inline_code(HighlightStyle {
+                                        background_color: Some(rgb(CODE_BG).into()),
+                                        ..Default::default()
+                                    })
+                                    .code_block(StyleRefinement::default().bg(rgb(SAND))),
+                            )
+                            .stream_fade(true),
+                    ),
+                )
+            }
             ChatItem::Note(text) => {
                 div().h_flex().justify_center().pt_1().child(
                     div()
@@ -575,5 +603,47 @@ impl ChatApp {
                 )
             }
         }
+    }
+}
+
+/// 流式输出停在半截代码标记上时（`` `foo `` 或没收尾的 ``` 围栏），渲染前临时补齐，
+/// 免得反引号原样露出来、等收尾后整段又跳成代码样式。
+fn close_dangling_code(text: &str) -> Cow<'_, str> {
+    let mut in_fence = false;
+    // 当前段落（围栏外）里的反引号个数；行内代码不跨段落
+    let mut ticks = 0;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            ticks = 0;
+        } else if !in_fence {
+            if line.trim().is_empty() {
+                ticks = 0;
+            } else {
+                ticks += line.matches('`').count();
+            }
+        }
+    }
+    if in_fence {
+        Cow::Owned(format!("{text}\n```"))
+    } else if ticks % 2 == 1 {
+        Cow::Owned(format!("{text}`"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn dangling_code_is_closed_while_streaming() {
+        assert_eq!(close_dangling_code("事件来自 ACP 的 `sess"), "事件来自 ACP 的 `sess`");
+        assert_eq!(close_dangling_code("用 `a` 和 `b`"), "用 `a` 和 `b`");
+        assert_eq!(close_dangling_code("```rust\nfn a() {"), "```rust\nfn a() {\n```");
+        // 上一段的单个反引号不影响下一段
+        assert_eq!(close_dangling_code("a ` b\n\nc"), "a ` b\n\nc");
+        assert_eq!(close_dangling_code("```\n`\n```\nok"), "```\n`\n```\nok");
     }
 }

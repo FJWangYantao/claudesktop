@@ -1,10 +1,10 @@
 //! claudesktop 桌面端入口。
 //!
-//! 目标界面：Claude 桌面风（暖纸底 + 赤陶橙），含
-//! - 自绘标题栏 + 侧栏（工作区分组 / 任务列表 / 内核卡）
-//! - 会话视图：左缘头像轨道、思考块、工具卡、计划、流式 Markdown
+//! 目标界面：对照新版 Claude Code 桌面端（暖纸底 + 赤陶橙），含
+//! - 自绘窗口框架：浮起的圆角侧栏顶到窗口顶，会话区顶栏兼做拖拽区与窗口按钮
+//! - 会话视图：右对齐用户气泡、思考块、工具行、计划、流式 Markdown、末尾运行状态行
 //! - 空会话首页：问候语 + 用量概览（统计卡 + 热力图）
-//! - 底部输入区：工作区 / 模式 chips、圆角输入条、权限模式栏
+//! - 底部输入区：上方环境 / 项目 chips，输入框，下方权限模式 / 内核 / 模型
 
 
 mod app;
@@ -50,7 +50,8 @@ fn main() {
                 cx,
             )));
             if let Some(tb) = options.titlebar.as_mut() {
-                tb.title = Some("claudesktop · M1 UI 预览".into());
+                // 任务栏 / Alt+Tab 里的名字（窗口内不显示标题栏）
+                tb.title = Some("claudesktop".into());
             }
 
             gpui_kit::open_window(options, cx, |window, cx| {

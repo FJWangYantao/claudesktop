@@ -2,6 +2,7 @@
 //! 各区域的渲染拆在子模块里（都是 `impl ChatApp`）。
 
 mod chat;
+mod chrome;
 mod composer;
 mod menu;
 mod overview;
@@ -25,6 +26,7 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,7 +107,7 @@ impl Drop for ChatApp {
 impl ChatApp {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("How can I help you today?")
+            InputState::new(window, cx).placeholder("描述要做的事，回车发送")
         });
 
         cx.subscribe_in(
@@ -155,7 +157,7 @@ impl ChatApp {
         })
         .detach();
 
-        // 状态条计时：当前会话忙时每秒重绘一次（等授权时没有转圈动画驱动重绘）
+        // 运行状态行计时：当前会话忙时每秒重绘一次（等授权时没有转圈动画驱动重绘）
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let alive = this.update(cx, |app, cx| {
@@ -251,7 +253,7 @@ impl ChatApp {
         });
         let (kernel, status, agent_cmd): (Option<Arc<dyn Kernel>>, SharedString, String) =
             match kind {
-                KernelChoice::Demo => (None, "演示回放（未连接内核）".into(), String::new()),
+                KernelChoice::Demo => (None, "未连接内核".into(), String::new()),
                 KernelChoice::Builtin => match self
                     .settings
                     .builtin_config(self.cwd.clone())
@@ -826,7 +828,7 @@ impl ChatApp {
 }
 
 impl Render for ChatApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         static FIRST_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !FIRST_FRAME.swap(true, std::sync::atomic::Ordering::Relaxed) {
             if let Some(t0) = crate::STARTUP_T0.get() {
@@ -842,51 +844,20 @@ impl Render for ChatApp {
         if let Some(log) = &mut self.frame_log {
             log.push(std::time::Instant::now());
         }
-        // 标题栏整条是系统拖拽区（Windows），里面放什么都收不到点击，
-        // 只留居中标题；可点的控件一律放顶栏。
-        let title_bar = TitleBar::new().bg(rgb(SAND)).child(
-            div()
-                .flex_1()
-                .h_flex()
-                .justify_center()
-                .child(
-                    div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK_FAINT))
-                        .child("claudesktop"),
-                ),
-        );
 
         let active = self.active;
         // 还没发过消息的会话显示首页（问候 + 概览）
         let home = !self.sessions[active].has_user_message();
 
-        let sidebar = if self.sidebar_open {
-            self.render_sidebar(cx)
-        } else {
-            v_flex()
-                .w(px(48.))
-                .flex_shrink_0()
-                .h_full()
-                .items_center()
-                .pt_3()
-                .bg(rgb(SAND))
-                .border_r_1()
-                .border_color(rgb(LINE))
-                .child(self.sidebar_toggle("sidebar-toggle-collapsed", cx))
-        };
-        let composer_area = div().px_6().pb_4().pt_1().child(self.render_composer(cx));
+        let composer_area = div().px_6().pb_4().pt_2().child(self.render_composer(cx));
 
-        let main = if self.settings_open {
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(self.render_settings(cx))
+        let body = if self.settings_open {
+            v_flex().flex_1().min_h_0().child(self.render_settings(cx))
         } else if home {
-            // 首页：问候 + 用量概览
+            // 首页：问候 + 用量概览居中，输入框在底部（与官方空会话一致）
             v_flex()
                 .flex_1()
-                .min_w_0()
+                .min_h_0()
                 .child(
                     div()
                         .id("home-scroll")
@@ -897,60 +868,51 @@ impl Render for ChatApp {
                 )
                 .child(composer_area)
         } else {
-            // 虚拟列表：只布局 / 绘制视口附近的行
+            // 虚拟列表：只布局 / 绘制视口附近的行；最后一行是运行状态行（见 Session::sync_list）
             self.sessions[active].sync_list();
             let state = self.sessions[active].list.clone();
             let scroll = list(
                 state,
                 cx.processor(|this, ix: usize, _window, cx| {
                     let s = &this.sessions[this.active];
-                    let Some(item) = s.transcript.get(ix) else {
-                        return div().into_any_element();
+                    let n = s.transcript.len();
+                    let row = div().max_w(px(760.)).mx_auto().w_full().px_6();
+                    let content = match s.transcript.get(ix) {
+                        Some(item) => row
+                            .pt(px(if ix == 0 { 16. } else { 0. }))
+                            .pb_4()
+                            .child(this.render_item(ix, item, cx)),
+                        None if ix == n => row.pb_6().children(this.render_turn_status()),
+                        None => row,
                     };
-                    let last = ix + 1 == s.transcript.len();
-                    div()
-                        .w_full()
-                        .child(
-                            div()
-                                .max_w(px(760.))
-                                .mx_auto()
-                                .w_full()
-                                .px_6()
-                                .pt(px(if ix == 0 { 24. } else { 0. }))
-                                .pb(px(if last { 24. } else { 16. }))
-                                .child(this.render_item(ix, item, cx)),
-                        )
-                        .into_any_element()
+                    div().w_full().child(content).into_any_element()
                 }),
             )
             .flex_1()
             .min_h_0();
 
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(self.render_top_bar(cx))
-                .child(scroll)
-                .child(composer_area)
+            v_flex().flex_1().min_h_0().child(scroll).child(composer_area)
         };
+
+        let main = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(self.render_header(window, cx))
+            .child(body);
 
         let mut root = div();
         // 中文回退字体：根上设一次，子元素换 font_family 时继承
         root.text_style().font_fallbacks = Some(cjk_fallbacks());
-        root.v_flex()
+        // 不用系统标题栏：侧栏顶到窗口顶，会话区顶栏兼做拖拽区与窗口按钮（见 chrome.rs）
+        root.h_flex()
             .size_full()
             .font_family(SANS)
             .text_size(TEXT_LARGE)
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
-            .child(title_bar)
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(sidebar)
-                    .child(main.h_full()),
-            )
+            .when(self.sidebar_open, |d| d.child(self.render_sidebar(cx)))
+            .child(main)
     }
 }
 

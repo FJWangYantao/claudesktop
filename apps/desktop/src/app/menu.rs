@@ -10,7 +10,6 @@ use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::{PopoverState, Selectable};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 下拉 trigger chip：图标（可省）+ 文字 + 展开箭头，弹层打开时高亮。
@@ -19,25 +18,17 @@ use gpui_kit::*;
 pub(super) struct MenuChip {
     icon: Option<IconAll>,
     label: SharedString,
-    /// 顶栏样式：带边框、卡片底色、深色文字
-    bordered: bool,
     open: bool,
 }
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self { icon: Some(icon), label: label.into(), bordered: false, open: false }
+        Self { icon: Some(icon), label: label.into(), open: false }
     }
 
     /// 只有文字（模型 chip）。
     pub(super) fn text(label: impl Into<SharedString>) -> Self {
-        Self { icon: None, label: label.into(), bordered: false, open: false }
-    }
-
-    /// 顶栏样式。
-    pub(super) fn bordered(mut self) -> Self {
-        self.bordered = true;
-        self
+        Self { icon: None, label: label.into(), open: false }
     }
 }
 
@@ -60,18 +51,17 @@ impl RenderOnce for MenuChip {
         }
         chip = chip
             .child(
-                // chip 一律次要字号，与输入框下方的环境 / 项目 chip 同档
+                // chip 一律次要字号，与输入框上方的环境 / 项目 chip 同档
                 div()
                     .text_size(TEXT_SMALL)
-                    .text_color(rgb(if self.bordered { INK } else { INK_SOFT }))
+                    .text_color(rgb(INK_SOFT))
                     .child(self.label),
             )
             .child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
         if self.open {
             chip.bg(rgb(SAND))
         } else {
-            chip.when(self.bordered, |d| d.border_1().border_color(rgb(LINE)).bg(rgb(CARD)))
-                .hover(|d| d.bg(rgb(SAND)))
+            chip.hover(|d| d.bg(rgb(SAND)))
         }
     }
 }

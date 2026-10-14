@@ -1,11 +1,13 @@
-//! 侧栏：工作区分组 / 会话列表 / 内核卡。
+//! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
 
+use super::chrome::{drag_area, traffic_light_gap, CHROME_H};
 use super::ChatApp;
 use crate::settings::KernelChoice;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -16,230 +18,116 @@ impl ChatApp {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let mut body = v_flex().gap_0().pb_2();
 
-        // 工作区头部行：排序切换 + 在资源管理器中打开
-        body = body.child(
-            div()
+        // 会话：按工作目录分组，当前项目在前，其余按最近活动排序。
+        // 第一组的组名行右侧带排序切换 / 在资源管理器中打开（悬停才显出来）
+        for (g, (name, members)) in self.session_groups().into_iter().enumerate() {
+            let header = div()
+                .id(("group-header", g))
+                .group("group-header")
                 .h_flex()
                 .items_center()
-                .px_3()
-                .pt_3()
+                .gap_1()
+                .px_4()
+                .pt(px(if g == 0 { 10. } else { 16. }))
                 .pb_1()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
                         .text_size(TEXT_META)
                         .text_color(rgb(INK_SOFT))
-                        .child(if self.sessions_by_activity {
-                            "工作区 · 按最近活动"
-                        } else {
-                            "工作区"
-                        }),
-                )
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .id("sort-sessions")
-                        .p(px(2.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(rgb(LINE)))
+                        .child(name),
+                );
+            let header = if g == 0 {
+                let sort_on = self.sessions_by_activity;
+                header
+                    .child(
+                        Self::sidebar_icon_button(
+                            "sort-sessions",
+                            IconAll::ArrowDownUp,
+                            if sort_on { "按打开顺序排列" } else { "按最近活动排列" },
+                            sort_on,
+                        )
+                        .when(!sort_on, |d| {
+                            d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
+                        })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sessions_by_activity = !this.sessions_by_activity;
                             cx.notify();
-                        }))
-                        .child(
-                            Icon::new(IconAll::ArrowUpDown)
-                                .size_3p5()
-                                .text_color(rgb(if self.sessions_by_activity {
-                                    CORAL
-                                } else {
-                                    INK_SOFT
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("open-workspace")
-                        .pl_2()
-                        .p(px(2.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(rgb(LINE)))
+                        })),
+                    )
+                    .child(
+                        Self::sidebar_icon_button(
+                            "open-workspace",
+                            IconAll::FolderOpen,
+                            "在资源管理器中打开",
+                            false,
+                        )
+                        .opacity(0.)
+                        .group_hover("group-header", |d| d.opacity(1.))
                         .on_click({
                             let cwd = self.cwd.clone();
                             move |_, _, cx: &mut App| cx.reveal_path(&cwd)
-                        })
-                        .child(
-                            Icon::new(IconAll::ExternalLink)
-                                .size_3p5()
-                                .text_color(rgb(INK_SOFT)),
-                        ),
-                ),
-        );
-
-        // 会话：按工作目录分组，当前项目在前，其余按最近活动排序
-        for (name, members) in self.session_groups() {
-            body = body.child(
-                div()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .text_size(TEXT_BODY)
-                    .text_color(rgb(INK))
-                    .child(name),
-            );
+                        }),
+                    )
+            } else {
+                header
+            };
+            body = body.child(header);
             for i in members {
                 body = body.child(self.render_session_row(i, cx));
             }
         }
 
-        // 进行中：正在跑或在等授权的会话（跨项目、跨内核），点一下切过去
-        let running: Vec<usize> = (0..self.sessions.len())
-            .filter(|i| self.sessions[*i].busy)
-            .collect();
-        if !running.is_empty() {
-            body = body.child(
-                div()
-                    .px_3()
-                    .pt_4()
-                    .pb_1()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .child("进行中"),
-            );
-            for i in running {
-                let s = &self.sessions[i];
-                let waiting = s.waiting_permission();
-                body = body.child(
-                    div()
-                        .id(("running", i))
-                        .h_flex()
-                        .items_center()
-                        .gap_2()
-                        .mx_2()
-                        .px_2()
-                        .py(px(5.))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(rgb(SAND_ACTIVE)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.active = i;
-                            this.settings_open = false;
-                            cx.notify();
-                        }))
-                        // 运行中转圈；等授权是要用户处理的，保持静止红点更醒目
-                        .child(if waiting {
-                            div()
-                                .size(px(5.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(rgb(RED))
-                                .into_any_element()
-                        } else {
-                            Spinner::new()
-                                .xsmall()
-                                .color(rgb(CORAL).into())
-                                .into_any_element()
-                        })
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_size(TEXT_BODY)
-                                .text_color(rgb(INK_SOFT))
-                                .child(s.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(TEXT_META)
-                                .text_color(rgb(if waiting { RED } else { INK_FAINT }))
-                                .child(format!(
-                                    "{} · {}",
-                                    s.kernel.tag(),
-                                    if waiting { "待授权" } else { "运行中" }
-                                )),
-                        ),
-                );
-            }
-        }
+        let nav_item = |id: &'static str, icon: IconAll, label: &'static str, active: bool| {
+            div()
+                .id(id)
+                .h_flex()
+                .items_center()
+                .gap_2p5()
+                .mx_2()
+                .px_2()
+                .py(px(5.))
+                .rounded_md()
+                .cursor_pointer()
+                .when(active, |d| d.bg(rgb(SAND_ACTIVE)))
+                .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
+                .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(label))
+        };
 
-        v_flex()
-            .w(px(248.))
-            .flex_shrink_0()
-            .h_full()
+        let panel = v_flex()
+            .size_full()
+            .rounded_xl()
             .bg(rgb(SAND))
-            .border_r_1()
-            .border_color(rgb(LINE))
+            .overflow_hidden()
             .child(
-                // 品牌行
+                // 头部：侧栏开关，其余是拖拽区（与会话区顶栏同高）
                 div()
                     .h_flex()
+                    .h(CHROME_H - px(8.))
+                    .flex_shrink_0()
                     .items_center()
-                    .gap_2()
-                    .px_3()
-                    .pt_3()
-                    .pb_1()
-                    .child(
-                        Icon::new(IconAll::Sparkles)
-                            .size_4()
-                            .text_color(rgb(CORAL)),
-                    )
-                    .child(
-                        div()
-                            .font_family(SERIF)
-                            .text_size(TEXT_LEAD)
-                            .text_color(rgb(INK))
-                            .child("Claude"),
-                    )
-                    .child(div().flex_1())
-                    .child(self.sidebar_toggle("sidebar-toggle", cx)),
+                    .pl_2()
+                    .children(traffic_light_gap())
+                    .child(self.sidebar_toggle("sidebar-toggle", cx))
+                    .child(drag_area()),
             )
             .child(
-                div()
-                    .id("new-chat")
-                    .h_flex()
-                    .gap_2()
-                    .mx_2()
-                    .mt_2()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.add_session(cx);
-                    }))
-                    .child(
-                        Icon::new(IconAll::SquarePen)
-                            .size_3p5()
-                            .text_color(rgb(INK)),
-                    )
-                    .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child("新会话")),
+                nav_item("new-chat", IconAll::Plus, "新会话", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
             )
             .child(
-                div()
-                    .id("plugins")
-                    .h_flex()
-                    .gap_2()
-                    .mx_2()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(SAND_ACTIVE)))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                nav_item("plugins", IconAll::Blocks, "插件", false).on_click(cx.listener(
+                    |this, _, _, cx| {
                         this.sessions[this.active]
                             .note("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力");
                         cx.notify();
-                    }))
-                    .child(
-                        Icon::new(IconAll::Blocks)
-                            .size_3p5()
-                            .text_color(rgb(INK_SOFT)),
-                    )
-                    .child(div().text_size(TEXT_BODY).text_color(rgb(INK_SOFT)).child("插件")),
+                    },
+                )),
             )
             .child(
                 div()
@@ -250,23 +138,13 @@ impl ChatApp {
                     .child(body),
             )
             .child(
-                // 底部：更多 + 内核状态
+                // 底部：设置 + 内核状态
                 div()
                     .v_flex()
-                    .gap_2()
-                    .p_3()
+                    .gap_1()
+                    .pb_3()
                     .child(
-                        div()
-                            .id("open-settings")
-                            .h_flex()
-                            .gap_2()
-                            .items_center()
-                            .px_1()
-                            .py_0p5()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(self.settings_open, |d| d.bg(rgb(SAND_ACTIVE)))
-                            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                        nav_item("open-settings", IconAll::Settings, "设置", self.settings_open)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.settings_open {
                                     this.settings_open = false;
@@ -274,24 +152,50 @@ impl ChatApp {
                                 } else {
                                     this.open_settings(window, cx);
                                 }
-                            }))
-                            .child(
-                                Icon::new(IconAll::Settings)
-                                    .size_3p5()
-                                    .text_color(rgb(INK_SOFT)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(TEXT_BODY)
-                                    .text_color(rgb(INK_SOFT))
-                                    .child("设置"),
-                            ),
+                            })),
                     )
-                    .children(self.kernel_status_rows()),
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .px_4()
+                            .pt_1()
+                            .children(self.kernel_status_rows()),
+                    ),
+            );
+
+        // 侧栏是浮在窗口底色上的圆角面板，四周留一圈窗口底色
+        div()
+            .w(px(256.))
+            .flex_shrink_0()
+            .h_full()
+            .pl_2()
+            .py_2()
+            .child(panel)
+    }
+
+    /// 侧栏里的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
+    fn sidebar_icon_button(
+        id: &'static str,
+        icon: IconAll,
+        tip: &'static str,
+        on: bool,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .p(px(3.))
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .child(
+                Icon::new(icon)
+                    .size_3p5()
+                    .text_color(rgb(if on { CORAL } else { INK_SOFT })),
             )
     }
 
-    /// 每个已启动内核一行：状态点 + 「自研 · xxx · 已连接」
+    /// 每个已启动内核一行：状态点 + 「自研内核 · 已连接」
     fn kernel_status_rows(&self) -> Vec<Div> {
         KernelChoice::ALL
             .into_iter()
@@ -319,7 +223,7 @@ impl ChatApp {
                             .whitespace_nowrap()
                             .text_size(TEXT_META)
                             .text_color(rgb(INK_SOFT))
-                            .child(format!("{} · {}", kind.tag(), slot.status)),
+                            .child(format!("{} · {}", kind.label(), slot.status)),
                     )
             })
             .collect()
@@ -375,7 +279,7 @@ impl ChatApp {
             .px_2()
             .py(px(5.))
             .rounded_md()
-            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) });
+            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(CLEAR) });
 
         // 重命名中：标题换成输入框
         if self.renaming == Some(s.token) {
@@ -402,7 +306,7 @@ impl ChatApp {
                     .rounded_md()
                     .cursor_pointer()
                     .text_size(TEXT_SMALL)
-                    .text_color(rgb(if danger { 0xFFFFFF } else { INK_SOFT }))
+                    .text_color(rgb(if danger { WHITE } else { INK_SOFT }))
                     .bg(rgb(if danger { RED } else { CARD }))
                     .child(label)
             };
@@ -430,12 +334,18 @@ impl ChatApp {
                 )));
         }
 
-        let dot = if s.busy {
-            CORAL
-        } else if s.ready {
-            GREEN
+        // 状态标记：等授权红点、运行中转圈，其余空心圈（与官方一样，每行都有个标记位）
+        let marker = if s.busy && s.waiting_permission() {
+            div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
+        } else if s.busy {
+            Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element()
         } else {
-            LINE
+            div()
+                .size(px(9.))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(if active { INK_SOFT } else { INK_FAINT }))
+                .into_any_element()
         };
         let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
         let group: SharedString = format!("session-row-{i}").into();
@@ -450,12 +360,21 @@ impl ChatApp {
         };
         row.group(group.clone())
             .cursor_pointer()
+            .when(!active, |d| d.hover(|d| d.bg(rgb(SAND_ACTIVE))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = i;
                 this.settings_open = false;
                 cx.notify();
             }))
-            .child(div().size(px(5.)).flex_shrink_0().rounded_full().bg(rgb(dot)))
+            .child(
+                div()
+                    .size(px(14.))
+                    .flex_shrink_0()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .child(marker),
+            )
             .child(
                 div()
                     .flex_1()
@@ -464,15 +383,9 @@ impl ChatApp {
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .text_size(TEXT_BODY)
-                    .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
+                    .text_color(rgb(INK))
+                    .when(active, |d| d.font_weight(FontWeight::MEDIUM))
                     .child(s.title.clone()),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(TEXT_TAG)
-                    .text_color(rgb(INK_FAINT))
-                    .child(s.kernel.tag()),
             )
             .when_some(age, |row, age| {
                 row.child(
@@ -495,7 +408,7 @@ impl ChatApp {
                     .gap_0p5()
                     .pl_2()
                     .rounded_md()
-                    .bg(rgb(if active { SAND_ACTIVE } else { SAND }))
+                    .bg(rgb(SAND_ACTIVE))
                     .opacity(0.)
                     .group_hover(group, |d| d.opacity(1.))
                     .child(icon_button("session-rename", IconAll::SquarePen).on_click(cx.listener(
