@@ -24,13 +24,25 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] 恢复的会话续聊：在历史会话里发消息时先续接内核会话——优先 ACP `session/resume`，其次 `session/load`（agent 重放的历史直接丢弃，本地已有），都不支持或失败则新开会话并提示「看不到之前的上下文」；仅当记录的 agent 命令与当前一致时才尝试续接。mock 用 `MOCK_RESUME=resume|load` 模拟两种能力
   - 注：真实适配器（Claude / pi）的续接能力尚未实测
   - [x] Windows job object 防孤儿进程：启动时把本进程放进 `KILL_ON_JOB_CLOSE` job，子孙进程自动继承；强杀应用后实测 `cmd → powershell Start-Sleep`（不读 stdin）整棵树被回收
-- [ ] **M2** 自研内核（OpenAI 兼容 provider → Anthropic SSE）
+- [ ] **M2（进行中）** 自研内核 `crates/builtin`（OpenAI 兼容 provider → Anthropic SSE）
+  - [x] OpenAI 兼容流式对话：正文 / 思考（`reasoning_content` 或 `reasoning`）/ 用量；429·5xx 在出字前退避重试（1s、3s）；取消即时生效且之后不再发事件；多轮历史
+  - [x] 桌面端接入：`CLAUDESKTOP_KERNEL=builtin`，配置走 `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`
+  - [x] 真实端点实测：Antigravity Tools 本地网关（`http://127.0.0.1:8045/v1`）的 `gemini-3.8-flash`，单测与桌面端均跑通
+  - [ ] 工具调用循环：fs 读写 / bash / 权限规则（allow once / always / deny + 持久化）
+  - [ ] 历史会话续聊：用本地日志重建上下文（目前自研内核续接 = 新会话）
+  - [ ] Anthropic 原生 SSE provider；设置页（provider / key / 模型）
 - [ ] **M3** 双内核收口：同一 UI、同一任务、两个内核
 
 ## 开发
 
 ```bash
-cargo run -p claudesktop
+cargo run -p claudesktop                       # ACP 内核（默认 mock agent）
+
+# 自研内核 + OpenAI 兼容端点（例：Antigravity Tools 本地网关）
+CLAUDESKTOP_KERNEL=builtin CLAUDESKTOP_BASE_URL=http://127.0.0.1:8045/v1 CLAUDESKTOP_MODEL=gemini-3.8-flash CLAUDESKTOP_API_KEY=sk-... cargo run -p claudesktop --bin claudesktop
+
+# 真实端点测试（默认忽略）
+cargo test -p claudesktop-builtin -- --ignored
 ```
 
 ## 结构（随里程碑生长）
@@ -38,5 +50,5 @@ cargo run -p claudesktop
 ```
 apps/desktop   # UI 壳（gpui-kit）
 crates/core    # 会话编排层：Kernel trait + KernelEvent（M1）
-crates/kernels # builtin（进程内）/ acp（子进程）（M1-M2）
+crates/builtin # 自研内核（进程内）：OpenAI 兼容 provider（M2）
 ```

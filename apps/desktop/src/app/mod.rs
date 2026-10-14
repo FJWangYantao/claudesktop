@@ -14,6 +14,7 @@ use crate::theme::*;
 use claudesktop_core::{
     AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, Record, RoutedEvent, SessionStore,
 };
+use claudesktop_builtin::{BuiltinConfig, BuiltinKernel};
 use futures::StreamExt;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::assets::IconName as IconAll;
@@ -84,28 +85,40 @@ impl ChatApp {
 
         // 内核：默认 ACP（ACP_AGENT 未设置时用仓库内 mock agent）；
         // CLAUDESKTOP_KERNEL=demo 退回纯演示回放。
-        let config = AcpKernelConfig::from_env();
-        let agent_cmd = config.command.clone();
-        let cwd = config.cwd.clone();
-        let project_name: SharedString = config
-            .cwd
+        // 内核：CLAUDESKTOP_KERNEL = acp（默认，ACP_AGENT 未设置时用仓库内 mock agent）
+        // / builtin（自研内核，见 claudesktop-builtin 的环境变量）/ demo（纯演示回放）。
+        let kernel_kind = std::env::var("CLAUDESKTOP_KERNEL").unwrap_or_default();
+        let acp_config = AcpKernelConfig::from_env();
+        let cwd = acp_config.cwd.clone();
+        let project_name: SharedString = cwd
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "claudesktop".into())
             .into();
-        let demo_only = std::env::var("CLAUDESKTOP_KERNEL").ok().as_deref() == Some("demo");
         let (ev_tx, mut ev_rx) = futures::channel::mpsc::unbounded::<RoutedEvent>();
-        let (kernel, kernel_status): (Option<Arc<dyn Kernel>>, SharedString) = if demo_only {
-            (None, "演示回放（未连接内核）".into())
-        } else {
-            let sink: EventSink = Arc::new(move |event| {
-                let _ = ev_tx.unbounded_send(event);
-            });
-            match AcpKernel::spawn(config, sink) {
-                Ok(k) => (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into()),
-                Err(err) => (None, format!("内核启动失败：{err}").into()),
-            }
-        };
+        let sink: EventSink = Arc::new(move |event| {
+            let _ = ev_tx.unbounded_send(event);
+        });
+        let (kernel, kernel_status, agent_cmd): (Option<Arc<dyn Kernel>>, SharedString, String) =
+            match kernel_kind.as_str() {
+                "demo" => (None, "演示回放（未连接内核）".into(), String::new()),
+                "builtin" => match BuiltinConfig::from_env().and_then(|config| {
+                    let identity = config.identity();
+                    BuiltinKernel::spawn(config, sink).map(|k| (k, identity))
+                }) {
+                    Ok((k, identity)) => {
+                        (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), identity)
+                    }
+                    Err(err) => (None, format!("自研内核启动失败：{err}").into(), String::new()),
+                },
+                _ => {
+                    let agent_cmd = acp_config.command.clone();
+                    match AcpKernel::spawn(acp_config, sink) {
+                        Ok(k) => (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), agent_cmd),
+                        Err(err) => (None, format!("内核启动失败：{err}").into(), agent_cmd),
+                    }
+                }
+            };
         cx.spawn(async move |this, cx| {
             while let Some(event) = ev_rx.next().await {
                 if this

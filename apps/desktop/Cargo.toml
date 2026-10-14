@@ -12,4 +12,5 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit = { workspace = true }
 claudesktop-core = { path = "../../crates/core" }
+claudesktop-builtin = { path = "../../crates/builtin" }
 futures = { workspace = true }

@@ -132,6 +132,13 @@ pub enum KernelEvent {
     FsWrite { path: String, ok: bool },
     /// 一轮对话结束（`session/prompt` 响应到达）
     TurnEnded { stop_reason: String },
+    /// 本轮 token 用量（provider 报告时才有）
+    UsageUpdated {
+        input_tokens: u64,
+        output_tokens: u64,
+        /// 其中思考消耗的 token（不报告为 0）
+        reasoning_tokens: u64,
+    },
     /// 创建会话失败（`session/new` 报错）；连接仍然可用
     SessionFailed { token: u64, message: String },
     /// 本轮提示失败（如未登录、模型报错）；连接仍然可用
@@ -158,6 +165,7 @@ impl KernelEvent {
             Self::FsRead { .. } => "fs_read",
             Self::FsWrite { .. } => "fs_write",
             Self::TurnEnded { .. } => "turn_ended",
+            Self::UsageUpdated { .. } => "usage_updated",
             Self::SessionFailed { .. } => "session_failed",
             Self::PromptFailed { .. } => "prompt_failed",
             Self::Fatal(_) => "fatal",

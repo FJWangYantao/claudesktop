@@ -336,7 +336,8 @@ impl Session {
             | KernelEvent::Status(_)
             | KernelEvent::UserMessageChunk { .. }
             | KernelEvent::FsRead { .. }
-            | KernelEvent::FsWrite { .. } => {}
+            | KernelEvent::FsWrite { .. }
+            | KernelEvent::UsageUpdated { .. } => {}
         }
         None
     }
