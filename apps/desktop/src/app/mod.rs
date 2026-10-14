@@ -39,8 +39,6 @@ pub struct ChatApp {
     next_token: u64,
     /// 会话持久化；None = 不落盘（演示回放模式或数据目录不可用）
     store: Option<SessionStore>,
-    /// 内核启动命令（写进会话元信息）
-    agent_cmd: String,
     /// 默认工作目录（新会话用）
     cwd: PathBuf,
     /// 当前项目名（取工作目录名），侧栏分组名与输入框标签用
@@ -50,17 +48,12 @@ pub struct ChatApp {
     sidebar_open: bool,
     mode_menu_open: bool,
     model_menu_open: bool,
-    /// 当前内核；None = 纯演示回放（选了演示回放或启动失败）
-    kernel: Option<Arc<dyn Kernel>>,
-    /// 内核代号：每次启动 +1，事件带着代号回来，不是当前代号的丢弃
-    kernel_gen: u64,
-    ev_tx: UnboundedSender<(u64, RoutedEvent)>,
+    kernel_menu_open: bool,
+    /// 内核槽，按 [`KernelChoice::index`]：用到时才启动，可以同时在线，会话各自绑定一个
+    kernels: [KernelSlot; 3],
+    ev_tx: UnboundedSender<(KernelChoice, u64, RoutedEvent)>,
     /// 环境变量给的 ACP 基础配置（工作目录、调试开关）
     acp_base: AcpKernelConfig,
-    /// 与 agent 的连接已建立（可以创建会话）
-    kernel_ready: bool,
-    kernel_error: bool,
-    kernel_status: SharedString,
     /// 生效中的设置（启动时已合并环境变量）
     settings: Settings,
     settings_path: Option<PathBuf>,
@@ -70,10 +63,29 @@ pub struct ChatApp {
     fetching_models: bool,
 }
 
+/// 一种内核的运行状态。
+#[derive(Default)]
+pub(crate) struct KernelSlot {
+    /// None = 演示回放、还没启动或启动失败
+    kernel: Option<Arc<dyn Kernel>>,
+    /// 启动过（失败也算；改了设置才会重试）
+    started: bool,
+    /// 代号：每次（重新）启动 +1，事件带着代号回来，不是当前代号的丢弃
+    generation: u64,
+    /// 与内核的连接已建立（可以创建会话）
+    ready: bool,
+    error: bool,
+    status: SharedString,
+    /// 内核标识（写进会话元信息，续接时比对）
+    agent_cmd: String,
+}
+
 impl Drop for ChatApp {
     fn drop(&mut self) {
-        if let Some(kernel) = &self.kernel {
-            kernel.shutdown();
+        for slot in &self.kernels {
+            if let Some(kernel) = &slot.kernel {
+                kernel.shutdown();
+            }
         }
     }
 }
@@ -113,13 +125,14 @@ impl ChatApp {
         let (settings, settings_error) = Settings::load(settings_path.as_deref());
         let settings = settings.with_env();
 
-        let (ev_tx, mut ev_rx) = futures::channel::mpsc::unbounded::<(u64, RoutedEvent)>();
+        let (ev_tx, mut ev_rx) =
+            futures::channel::mpsc::unbounded::<(KernelChoice, u64, RoutedEvent)>();
         cx.spawn(async move |this, cx| {
-            while let Some((generation, event)) = ev_rx.next().await {
+            while let Some((kind, generation, event)) = ev_rx.next().await {
                 if this
                     .update(cx, |app, cx| {
-                        if generation == app.kernel_gen {
-                            app.on_kernel_event(event, cx);
+                        if generation == app.kernels[kind.index()].generation {
+                            app.on_kernel_event(kind, event, cx);
                         }
                     })
                     .is_err()
@@ -137,7 +150,6 @@ impl ChatApp {
             active: 0,
             next_token: 1,
             store: None,
-            agent_cmd: String::new(),
             cwd,
             project_name,
             overview_tab: 0,
@@ -145,25 +157,20 @@ impl ChatApp {
             sidebar_open: true,
             mode_menu_open: false,
             model_menu_open: false,
-            kernel: None,
-            kernel_gen: 0,
+            kernel_menu_open: false,
+            kernels: Default::default(),
             ev_tx,
             acp_base,
-            kernel_ready: false,
-            kernel_error: false,
-            kernel_status: SharedString::default(),
             settings,
             settings_path,
             settings_open: false,
             settings_form,
             fetching_models: false,
         };
-        app.spawn_kernel();
-
-        // 第一个会话：连接就绪（Connected）后统一补发 session/new
-        let ready = app.kernel.is_none();
-        app.sessions.push(Session::new(app.next_token, ready, app.cwd.clone()));
-        app.next_token += 1;
+        // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
+        // 其他内核等有会话用到时再启动
+        let cwd = app.cwd.clone();
+        app.open_session(app.settings.kernel(), cwd);
         if let Some(err) = settings_error {
             app.sessions[0].note(err);
         }
@@ -182,18 +189,18 @@ impl ChatApp {
         app
     }
 
-    /// 按当前设置启动内核（不处理会话，见 [`Self::restart_kernel`]）。
-    fn spawn_kernel(&mut self) {
-        self.kernel_gen += 1;
-        let generation = self.kernel_gen;
+    /// 按当前设置启动某种内核（不处理会话，见 [`Self::restart_kernel`]）。
+    fn spawn_kernel(&mut self, kind: KernelChoice) {
+        let slot = &mut self.kernels[kind.index()];
+        slot.started = true;
+        slot.generation += 1;
+        let generation = slot.generation;
         let tx = self.ev_tx.clone();
         let sink: EventSink = Arc::new(move |event| {
-            let _ = tx.unbounded_send((generation, event));
+            let _ = tx.unbounded_send((kind, generation, event));
         });
-        self.kernel_ready = false;
-        self.kernel_error = false;
         let (kernel, status, agent_cmd): (Option<Arc<dyn Kernel>>, SharedString, String) =
-            match self.settings.kernel() {
+            match kind {
                 KernelChoice::Demo => (None, "演示回放（未连接内核）".into(), String::new()),
                 KernelChoice::Builtin => match self
                     .settings
@@ -205,75 +212,196 @@ impl ChatApp {
                     Ok((k, identity)) => {
                         (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), identity)
                     }
-                    Err(err) => (None, format!("自研内核启动失败：{err}").into(), String::new()),
+                    Err(err) => (None, format!("启动失败：{err}").into(), String::new()),
                 },
                 KernelChoice::Acp => {
                     let config = self.settings.acp_config(self.acp_base.clone());
                     let agent_cmd = config.command.clone();
                     match AcpKernel::spawn(config, sink) {
                         Ok(k) => (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), agent_cmd),
-                        Err(err) => (None, format!("内核启动失败：{err}").into(), agent_cmd),
+                        Err(err) => (None, format!("启动失败：{err}").into(), agent_cmd),
                     }
                 }
             };
-        self.kernel_error = kernel.is_none() && self.settings.kernel() != KernelChoice::Demo;
-        self.kernel = kernel;
-        self.kernel_status = status;
-        self.agent_cmd = agent_cmd;
+        let slot = &mut self.kernels[kind.index()];
+        slot.ready = kind == KernelChoice::Demo;
+        slot.error = kernel.is_none() && kind != KernelChoice::Demo;
+        slot.kernel = kernel;
+        slot.status = status;
+        slot.agent_cmd = agent_cmd;
     }
 
-    /// 换内核（设置改了之后）：关掉旧的，所有会话脱离旧内核；
+    /// 还没启动过就启动。
+    fn ensure_kernel(&mut self, kind: KernelChoice) {
+        if !self.kernels[kind.index()].started {
+            self.spawn_kernel(kind);
+        }
+    }
+
+    /// 某种内核的设置改了：关掉旧的，绑在它上面的会话全部脱离；
     /// 有对话的会话下次发消息时按「历史会话」续接，空会话等新连接就绪后重新创建。
-    pub(crate) fn restart_kernel(&mut self, cx: &mut Context<Self>) {
-        let old = self.kernel.take();
-        for s in &mut self.sessions {
+    /// 没启动过的内核什么也不做（用到时自然按新设置启动）。
+    pub(crate) fn restart_kernel(&mut self, kind: KernelChoice, cx: &mut Context<Self>) {
+        if !self.kernels[kind.index()].started {
+            return;
+        }
+        let old = self.kernels[kind.index()].kernel.take();
+        for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
             s.detach_kernel(old.as_ref());
         }
         if let Some(old) = old {
             old.shutdown();
         }
-        self.spawn_kernel();
-        if self.kernel.is_none() {
-            // 演示回放：所有会话直接可用
-            for s in &mut self.sessions {
-                s.ready = true;
-                s.restored = false;
-            }
-        }
+        self.spawn_kernel(kind);
+        self.request_pending_sessions();
         cx.notify();
+    }
+
+    pub(crate) fn kernel_of(&self, kind: KernelChoice) -> Option<Arc<dyn Kernel>> {
+        self.kernels[kind.index()].kernel.clone()
+    }
+
+    /// 第 `idx` 个会话绑定的内核
+    pub(crate) fn session_kernel(&self, idx: usize) -> Option<Arc<dyn Kernel>> {
+        self.kernel_of(self.sessions[idx].kernel)
     }
 
     pub(crate) fn session(&self) -> &Session {
         &self.sessions[self.active]
     }
 
-    /// 新建一个会话并切过去；连接已就绪就立刻向内核要，否则等 Connected 时补发。
+    /// 新建一个会话并切过去（用默认内核）。
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
-        let token = self.next_token;
-        self.next_token += 1;
-        self.sessions
-            .push(Session::new(token, self.kernel.is_none(), self.cwd.clone()));
-        self.active = self.sessions.len() - 1;
-        self.request_pending_sessions();
+        let cwd = self.cwd.clone();
+        self.active = self.open_session(self.settings.kernel(), cwd);
         cx.notify();
     }
 
-    /// 向内核要还没要过的会话（`session/new`）。连接未就绪时什么也不做。
-    pub(crate) fn request_pending_sessions(&mut self) {
-        if !self.kernel_ready {
+    /// 在某种内核上开一个会话，返回下标。内核没启动就先启动；
+    /// 连接已就绪就立刻向内核要会话，否则等 Connected 时补发。
+    fn open_session(&mut self, kind: KernelChoice, cwd: PathBuf) -> usize {
+        self.ensure_kernel(kind);
+        let token = self.next_token;
+        self.next_token += 1;
+        self.sessions.push(Session::new(token, kind, cwd));
+        self.request_pending_sessions();
+        self.sessions.len() - 1
+    }
+
+    /// 把一个还没对话的会话换到另一种内核上：原地换成新会话，
+    /// 旧内核会话的迟到事件因为令牌 / 内核不同会被忽略。
+    pub(crate) fn rebind_session(&mut self, idx: usize, kind: KernelChoice) {
+        let s = &self.sessions[idx];
+        if s.kernel == kind || s.has_user_message() || s.busy {
             return;
         }
-        let Some(kernel) = self.kernel.clone() else {
+        let old = self.session_kernel(idx);
+        self.sessions[idx].cancel_pending_permissions(old.as_ref());
+        self.ensure_kernel(kind);
+        let token = self.next_token;
+        self.next_token += 1;
+        let cwd = self.sessions[idx].cwd.clone();
+        self.sessions[idx] = Session::new(token, kind, cwd);
+        self.request_pending_sessions();
+    }
+
+    /// 同一任务换个内核跑：拿当前会话里第 `item_idx` 条用户消息，在 `kind` 上新开会话发出去。
+    pub(crate) fn rerun_on(&mut self, item_idx: usize, kind: KernelChoice, cx: &mut Context<Self>) {
+        let src = self.active;
+        let Some(ChatItem::User(text)) = self.sessions[src].transcript.get(item_idx) else {
             return;
         };
-        for s in &mut self.sessions {
-            if !s.requested && !s.restored && s.acp_id.is_none() {
+        let text = text.to_string();
+        let from = self.sessions[src].title.clone();
+        let cwd = self.sessions[src].cwd.clone();
+        let idx = self.open_session(kind, cwd);
+        self.active = idx;
+        self.mode_menu_open = false;
+        self.model_menu_open = false;
+        self.sessions[idx].note(format!("同一任务换到「{}」上跑（原会话：{from}）", kind.label()));
+        // 内核不可用时 submit_to 会给出提示
+        if self.sessions[idx].ready || self.kernel_of(kind).is_none() {
+            self.submit_to(idx, text, cx);
+        } else {
+            self.sessions[idx].autoprompt = Some(text);
+        }
+        cx.notify();
+    }
+
+    /// 调试钩子：打开内核弹层。
+    pub(crate) fn open_kernel_menu(&mut self, cx: &mut Context<Self>) {
+        self.kernel_menu_open = true;
+        self.mode_menu_open = false;
+        self.model_menu_open = false;
+        cx.notify();
+    }
+
+    /// 调试钩子：把当前会话的首条提示词放到 `kind` 上重跑。
+    pub(crate) fn rerun_first_prompt(&mut self, kind: KernelChoice, cx: &mut Context<Self>) {
+        let first = self.sessions[self.active]
+            .transcript
+            .iter()
+            .position(|i| matches!(i, ChatItem::User(_)));
+        if let Some(item) = first {
+            self.rerun_on(item, kind, cx);
+        }
+    }
+
+    /// 向内核要还没要过的会话（`session/new`），以及要续接的历史会话。连接未就绪的内核先跳过。
+    pub(crate) fn request_pending_sessions(&mut self) {
+        for idx in 0..self.sessions.len() {
+            let slot = &self.kernels[self.sessions[idx].kernel.index()];
+            let Some(kernel) = slot.kernel.clone().filter(|_| slot.ready) else {
+                continue;
+            };
+            let s = &mut self.sessions[idx];
+            if s.requested {
+                continue;
+            }
+            if s.resuming {
+                self.send_resume(idx, &kernel);
+            } else if !s.restored && s.acp_id.is_none() {
                 s.requested = true;
                 if let Err(err) = kernel.new_session(s.token, Some(s.cwd.clone())) {
                     s.requested = false;
                     s.note(format!("创建会话失败：{err}"));
                 }
             }
+        }
+    }
+
+    /// 历史会话续接内核会话，就绪后再发待发的消息。同一个 ACP agent 才尝试；
+    /// 自研内核用本地日志重建上下文，换了端点 / 模型也能续接。
+    fn send_resume(&mut self, idx: usize, kernel: &Arc<dyn Kernel>) {
+        let s = &mut self.sessions[idx];
+        let agent_cmd = &self.kernels[s.kernel.index()].agent_cmd;
+        s.requested = true;
+        let builtin = s.kernel == KernelChoice::Builtin;
+        let resumable = s.meta.as_ref().filter(|m| {
+            if builtin {
+                m.agent.starts_with("builtin:")
+            } else {
+                m.agent == *agent_cmd && m.kernel_session_id.is_some()
+            }
+        });
+        let cwd = Some(s.cwd.clone());
+        let sent = match resumable {
+            Some(meta) => {
+                let history = match &self.store {
+                    Some(store) if builtin => store.load(&meta.id).unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                let previous = meta.kernel_session_id.clone().unwrap_or_default();
+                kernel.resume_session(s.token, &previous, cwd, &history)
+            }
+            None => kernel.new_session(s.token, cwd),
+        };
+        if let Err(err) = sent {
+            s.requested = false;
+            s.resuming = false;
+            s.restored = true;
+            s.autoprompt = None;
+            s.note(format!("续接会话失败：{err}"));
         }
     }
 
@@ -321,52 +449,33 @@ impl ChatApp {
         self.submit_to(self.active, text, cx);
     }
 
-    /// 向第 `idx` 个会话发一轮用户消息：有内核走内核，否则播放演示脚本。
+    /// 向第 `idx` 个会话发一轮用户消息：有内核走内核，演示回放会话播放演示脚本。
     pub(crate) fn submit_to(&mut self, idx: usize, text: String, cx: &mut Context<Self>) {
-        let kernel = self.kernel.clone();
+        let kind = self.sessions[idx].kernel;
+        if self.sessions[idx].busy {
+            return;
+        }
+        if kind != KernelChoice::Demo {
+            // 历史会话的内核可能还没启动
+            self.ensure_kernel(kind);
+            if self.kernel_of(kind).is_none() {
+                let status = self.kernels[kind.index()].status.clone();
+                self.sessions[idx].note(format!("{}不可用：{status}（可在设置里修改）", kind.label()));
+                cx.notify();
+                return;
+            }
+        }
+        let kernel = self.session_kernel(idx);
         let mut start_demo_token = None;
         {
             let s = &mut self.sessions[idx];
-            if s.busy {
-                return;
-            }
-            if let (Some(kernel), true) = (&kernel, s.restored) {
-                // 历史会话：先续接内核会话，就绪后再发这条消息。同一个 ACP agent 才尝试；
-                // 自研内核用本地日志重建上下文，换了端点 / 模型也能续接
+            if kernel.is_some() && s.restored {
+                // 历史会话：先续接内核会话（连接就绪后发出），就绪后再发这条消息
                 s.restored = false;
-                s.requested = true;
                 s.resuming = true;
                 s.autoprompt = Some(text);
-                let agent_cmd = &self.agent_cmd;
-                let builtin = kernel.kind() == "builtin";
-                let resumable = s.meta.as_ref().filter(|m| {
-                    if builtin {
-                        m.agent.starts_with("builtin:")
-                    } else {
-                        m.agent == *agent_cmd && m.kernel_session_id.is_some()
-                    }
-                });
-                let cwd = Some(s.cwd.clone());
-                let sent = match resumable {
-                    Some(meta) => {
-                        let history = match &self.store {
-                            Some(store) if builtin => {
-                                store.load(&meta.id).unwrap_or_default()
-                            }
-                            _ => Vec::new(),
-                        };
-                        let previous = meta.kernel_session_id.clone().unwrap_or_default();
-                        kernel.resume_session(s.token, &previous, cwd, &history)
-                    }
-                    None => kernel.new_session(s.token, cwd),
-                };
-                if let Err(err) = sent {
-                    s.requested = false;
-                    s.resuming = false;
-                    s.note(format!("续接会话失败：{err}"));
-                } else {
-                    s.note("正在续接会话…");
-                }
+                s.note("正在续接会话…");
+                self.request_pending_sessions();
                 cx.notify();
                 return;
             }
@@ -418,8 +527,8 @@ impl ChatApp {
         choice: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
-        let kernel = self.kernel.clone();
         let active = self.active;
+        let kernel = self.session_kernel(active);
         self.sessions[active].resolve_permission(item_idx, choice, kernel.as_ref());
         if let Some(ChatItem::Permission {
             id,
@@ -437,7 +546,7 @@ impl ChatApp {
     }
 
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
-        let kernel = self.kernel.clone();
+        let kernel = self.session_kernel(self.active);
         let s = &mut self.sessions[self.active];
         s.cancel_token += 1;
         s.busy = false;
@@ -452,44 +561,55 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 内核事件分发：连接级事件自己处理，会话级事件按 sessionId / token 找到会话。
-    pub(crate) fn on_kernel_event(&mut self, routed: RoutedEvent, cx: &mut Context<Self>) {
+    /// 内核事件分发：连接级事件自己处理，会话级事件在绑定这个内核的会话里按 sessionId / token 找。
+    pub(crate) fn on_kernel_event(
+        &mut self,
+        kind: KernelChoice,
+        routed: RoutedEvent,
+        cx: &mut Context<Self>,
+    ) {
         let RoutedEvent { session, event } = routed;
-        let kernel = self.kernel.clone();
+        let kernel = self.kernel_of(kind);
+        let slot = &mut self.kernels[kind.index()];
         match event {
             KernelEvent::Connected { agent_name } => {
-                self.kernel_ready = true;
-                self.kernel_error = false;
+                slot.ready = true;
+                slot.error = false;
                 // 去掉 npm 作用域前缀（@scope/name → name），底栏空间有限
                 let short = agent_name.rsplit('/').next().unwrap_or(&agent_name);
-                self.kernel_status = format!("{short} · 已连接").into();
+                slot.status = format!("{short} · 已连接").into();
                 self.request_pending_sessions();
             }
             KernelEvent::SessionFailed { token, message } => {
-                if let Some(s) = self.sessions.iter_mut().find(|s| s.token == token) {
+                if let Some(s) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|s| s.kernel == kind && s.token == token)
+                {
                     s.requested = false;
                     s.resuming = false;
                     s.note(format!("创建会话失败：{message}"));
                 }
             }
             KernelEvent::Fatal(message) => {
-                self.kernel_ready = false;
-                self.kernel_error = true;
-                self.kernel_status = "内核错误".into();
-                for s in &mut self.sessions {
+                slot.ready = false;
+                slot.error = true;
+                slot.status = "内核错误".into();
+                for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
                     s.on_fatal(&message, kernel.as_ref());
                 }
             }
             event => {
                 // 会话级事件：Started 按令牌认领，其余按 sessionId
                 let idx = match &event {
-                    KernelEvent::Started { token, .. } => {
-                        self.sessions.iter().position(|s| s.token == *token)
-                    }
+                    KernelEvent::Started { token, .. } => self
+                        .sessions
+                        .iter()
+                        .position(|s| s.kernel == kind && s.token == *token),
                     _ => session.as_deref().and_then(|id| {
                         self.sessions
                             .iter()
-                            .position(|s| s.acp_id.as_deref() == Some(id))
+                            .position(|s| s.kernel == kind && s.acp_id.as_deref() == Some(id))
                     }),
                 };
                 if let Some(idx) = idx {
@@ -519,11 +639,12 @@ impl ChatApp {
             return;
         };
         let s = &mut self.sessions[idx];
+        let agent_cmd = &self.kernels[s.kernel.index()].agent_cmd;
         if s.log.is_none() {
             let opened = match &s.meta {
                 Some(meta) => store.append_log(&meta.id),
                 None => store
-                    .create(&s.title, s.cwd.clone(), &self.agent_cmd)
+                    .create(&s.title, s.cwd.clone(), agent_cmd)
                     .map(|(mut meta, log)| {
                         meta.kernel_session_id = s.acp_id.clone();
                         let _ = store.save_meta(&meta);
@@ -556,7 +677,7 @@ impl ChatApp {
         }
         if let Some(meta) = &mut s.meta {
             // 续接到别的 agent 后，会话就归新的 agent 了
-            meta.agent = self.agent_cmd.clone();
+            meta.agent = self.kernels[s.kernel.index()].agent_cmd.clone();
             meta.title = s.title.to_string();
             meta.kernel_session_id = s.acp_id.clone();
             meta.updated_ms = now_ms();

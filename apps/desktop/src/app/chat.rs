@@ -2,6 +2,7 @@
 
 use super::ChatApp;
 use crate::model::*;
+use crate::settings::KernelChoice;
 use crate::theme::*;
 use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::component::text::{TextView, TextViewStyle};
@@ -470,6 +471,56 @@ impl ChatApp {
             }))
     }
 
+    /// 用户消息气泡；悬停时下方出现「在另一个内核上重跑」。
+    fn render_user(&self, idx: usize, text: &SharedString, cx: &mut Context<Self>) -> Div {
+        let group: SharedString = format!("user-{idx}").into();
+        let current = self.session().kernel;
+        let others = KernelChoice::ALL.into_iter().filter(|k| {
+            *k != current
+                && *k != KernelChoice::Demo
+                && (*k != KernelChoice::Builtin || self.settings.builtin.is_configured())
+        });
+        let mut actions = div().h_flex().justify_end().gap_1().opacity(0.);
+        for kind in others {
+            actions = actions.child(
+                div()
+                    .id(("rerun", idx * 4 + kind.index()))
+                    .h_flex()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(SAND)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.rerun_on(idx, kind, cx)))
+                    .child(Icon::new(IconAll::RefreshCw).size_3().text_color(rgb(INK_SOFT)))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(INK_SOFT))
+                            .child(format!("在「{}」上重跑", kind.label())),
+                    ),
+            );
+        }
+        div()
+            .group(group.clone())
+            .v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .w_full()
+                    .bg(rgb(SAND))
+                    .text_color(rgb(INK))
+                    .rounded(px(12.))
+                    .px_4()
+                    .py_3()
+                    .text_size(px(15.))
+                    .line_height(relative(1.6))
+                    .child(text.clone()),
+            )
+            .child(actions.group_hover(group, |s| s.opacity(1.)))
+    }
+
     /// 助手回合行：官方界面没有头像轨道，内容直接顶格。
     pub(super) fn railed(content: impl IntoElement) -> Div {
         div().min_w_0().child(content)
@@ -477,16 +528,7 @@ impl ChatApp {
 
     pub(super) fn render_item(&self, idx: usize, item: &ChatItem, cx: &mut Context<Self>) -> Div {
         match item {
-            ChatItem::User(text) => div()
-                .w_full()
-                .bg(rgb(SAND))
-                .text_color(rgb(INK))
-                .rounded(px(12.))
-                .px_4()
-                .py_3()
-                .text_size(px(15.))
-                .line_height(relative(1.6))
-                .child(text.clone()),
+            ChatItem::User(text) => self.render_user(idx, text, cx),
             ChatItem::Thinking {
                 text,
                 streaming,

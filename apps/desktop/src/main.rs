@@ -15,6 +15,7 @@ mod settings;
 mod theme;
 
 use app::ChatApp;
+use settings::KernelChoice;
 use gpui_kit::component::*;
 use gpui_kit::*;
 use std::time::Duration;
@@ -51,7 +52,7 @@ fn main() {
                             .await;
                         let _ = this.update_in(cx, |app, window, cx| {
                             // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
-                            // / models（打开模型下拉）/ restart（重启内核）
+                            // / models（打开模型下拉）/ kernels（打开内核弹层）/ restart（重启内核）
                             match std::env::var("CLAUDESKTOP_OPEN").as_deref() {
                                 Ok("settings") => app.open_settings(window, cx),
                                 Ok("fetch") => {
@@ -59,11 +60,35 @@ fn main() {
                                     app.fetch_models(true, cx);
                                 }
                                 Ok("models") => app.toggle_model_menu(cx),
-                                Ok("restart") => app.restart_kernel(cx),
+                                Ok("kernels") => app.open_kernel_menu(cx),
+                                Ok("restart") => {
+                                    let kind = app.session().kernel;
+                                    app.restart_kernel(kind, cx)
+                                }
                                 _ => {}
                             }
                             app.autodemo_hook(cx);
                         });
+                        // 调试钩子：CLAUDESKTOP_RERUN = builtin / acp / demo，
+                        // 等 CLAUDESKTOP_RERUN_DELAY_MS（默认 10s）后把首条提示词放到该内核上重跑
+                        let rerun = std::env::var("CLAUDESKTOP_RERUN").ok().and_then(|v| {
+                            match v.trim() {
+                                "builtin" => Some(KernelChoice::Builtin),
+                                "acp" => Some(KernelChoice::Acp),
+                                "demo" => Some(KernelChoice::Demo),
+                                _ => None,
+                            }
+                        });
+                        if let Some(kind) = rerun {
+                            let delay = std::env::var("CLAUDESKTOP_RERUN_DELAY_MS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(10_000);
+                            cx.background_executor()
+                                .timer(Duration::from_millis(delay))
+                                .await;
+                            let _ = this.update(cx, |app, cx| app.rerun_first_prompt(kind, cx));
+                        }
                     })
                     .detach();
                     app

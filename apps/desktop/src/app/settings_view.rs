@@ -62,6 +62,7 @@ impl ChatApp {
         self.settings_open = true;
         self.mode_menu_open = false;
         self.model_menu_open = false;
+        self.kernel_menu_open = false;
         cx.notify();
     }
 
@@ -94,24 +95,36 @@ impl ChatApp {
                 return;
             }
         }
-        // 只有影响内核的改动才重启（模型列表变了不算）
-        let key = |s: &Settings| {
+        // 只重启配置变了的内核（模型列表变了不算）
+        let builtin_key = |s: &Settings| {
             let mut b = s.builtin.clone();
             b.models.clear();
-            (s.kernel(), b, s.acp.clone())
+            b
         };
-        let restart = key(&new) != key(&self.settings);
+        let restart_builtin = builtin_key(&new) != builtin_key(&self.settings);
+        let restart_acp = new.acp != self.settings.acp;
+        let default = new.kernel();
+        let default_changed = default != self.settings.kernel();
         self.settings = new;
         self.settings_open = false;
-        if restart {
-            self.restart_kernel(cx);
+        if restart_builtin {
+            self.restart_kernel(KernelChoice::Builtin, cx);
+        }
+        if restart_acp {
+            self.restart_kernel(KernelChoice::Acp, cx);
+        }
+        if default_changed {
+            // 默认内核换了：还没对话的会话跟着换，有对话的留在原来的内核上
+            for idx in 0..self.sessions.len() {
+                self.rebind_session(idx, default);
+            }
         }
         cx.notify();
     }
 
     /// 改一处设置并只把这一处写回文件：生效中的设置可能含有环境变量给的值
     /// （如 key），没点「保存」就不该落盘。
-    fn update_settings(&mut self, change: impl Fn(&mut Settings)) {
+    pub(super) fn update_settings(&mut self, change: impl Fn(&mut Settings)) {
         change(&mut self.settings);
         if let Some(path) = &self.settings_path {
             let (mut saved, _) = Settings::load(Some(path));
@@ -195,7 +208,7 @@ impl ChatApp {
     pub(crate) fn choose_model(&mut self, model: String, cx: &mut Context<Self>) {
         self.model_menu_open = false;
         self.update_settings(|s| s.builtin.model = model.clone());
-        let kernel = self.kernel.clone();
+        let kernel = self.session_kernel(self.active);
         let s = &mut self.sessions[self.active];
         match (kernel, s.acp_id.clone()) {
             (Some(kernel), Some(id)) => match kernel.set_model(&id, &model) {
@@ -213,7 +226,8 @@ impl ChatApp {
     pub(crate) fn toggle_model_menu(&mut self, cx: &mut Context<Self>) {
         self.model_menu_open = !self.model_menu_open;
         self.mode_menu_open = false;
-        let builtin = self.kernel.as_ref().is_some_and(|k| k.kind() == "builtin");
+        self.kernel_menu_open = false;
+        let builtin = self.session().kernel == KernelChoice::Builtin;
         if self.model_menu_open && builtin && self.settings.builtin.models.is_empty() {
             self.fetch_models(false, cx);
         }
@@ -246,7 +260,7 @@ impl ChatApp {
                 .text_color(rgb(INK_SOFT))
                 .child(text)
         };
-        let builtin = self.kernel.as_ref().is_some_and(|k| k.kind() == "builtin");
+        let builtin = self.session().kernel == KernelChoice::Builtin;
         if !builtin {
             return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
         }
@@ -403,7 +417,7 @@ impl ChatApp {
                         div()
                             .text_size(px(13.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .child("内核"),
+                            .child("默认内核"),
                     )
                     .child(
                         div()

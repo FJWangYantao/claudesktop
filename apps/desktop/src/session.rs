@@ -2,6 +2,7 @@
 
 use crate::demo::*;
 use crate::model::*;
+use crate::settings::KernelChoice;
 use claudesktop_core::{DiffView, Kernel, KernelEvent, Record, SessionLog, SessionMeta};
 use gpui_kit::*;
 use std::path::PathBuf;
@@ -10,6 +11,8 @@ use std::sync::Arc;
 /// 一个对话会话：自己的对话记录、忙闲、模式、模型。一条内核连接上可以同时有多个。
 pub struct Session {
     pub title: SharedString,
+    /// 这个会话跑在哪种内核上（空会话可以换，有对话后固定）
+    pub kernel: KernelChoice,
     /// 创建时的令牌，用来把内核回的 Started / SessionFailed 对回这个会话
     pub token: u64,
     /// ACP sessionId（Started 之后才有；演示回放模式为 None）
@@ -45,13 +48,15 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(token: u64, ready: bool, cwd: PathBuf) -> Self {
+    /// 新会话；演示回放不需要内核会话，直接可用。
+    pub fn new(token: u64, kernel: KernelChoice, cwd: PathBuf) -> Self {
         Self {
             title: "新会话".into(),
+            kernel,
             token,
             acp_id: None,
             requested: false,
-            ready,
+            ready: kernel == KernelChoice::Demo,
             transcript: Vec::new(),
             busy: false,
             cancel_token: 0,
@@ -59,7 +64,8 @@ impl Session {
             follow_scroll: true,
             modes: default_modes(),
             permission_mode: 0,
-            model_label: "GLM-5.3".into(),
+            // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
+            model_label: if kernel == KernelChoice::Demo { "GLM-5.3" } else { "默认模型" }.into(),
             autoprompt: None,
             cwd,
             meta: None,
@@ -72,7 +78,8 @@ impl Session {
 
     /// 从持久化记录重放出一个历史会话：事件走与实时完全相同的映射。
     pub fn from_records(token: u64, meta: SessionMeta, records: Vec<Record>) -> Self {
-        let mut s = Self::new(token, false, meta.cwd.clone());
+        let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent), meta.cwd.clone());
+        s.ready = false;
         s.title = meta.title.clone().into();
         s.restored = true;
         for record in records {
@@ -608,7 +615,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn detach_kernel_interrupts_turn_and_marks_for_resume() {
-        let mut s = Session::new(1, false, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
         s.apply_event(
             KernelEvent::Started {
                 token: 1,

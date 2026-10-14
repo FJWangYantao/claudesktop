@@ -35,7 +35,11 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] 改文件显示 diff：`write_file` / `edit_file` 执行前算出改动预览，挂在工具行下（先于权限卡片，看着 diff 决定是否放行）；ACP agent 上报的 `ToolCallContent::Diff` 走同一条路径。事件和日志里只存带 3 行上下文的 hunk（单份最多 400 行），界面默认显示前 40 行可展开
   - [x] 设置页（侧栏「设置」）：选内核（自研 / ACP agent / 演示回放），自研内核填端点、API Key、模型，可一键获取端点的模型列表，检测到 Antigravity Tools 时可直接导入它的本地网关；ACP 填启动命令。保存到数据目录的 `settings.json`，「保存并应用」时重启内核，有对话的会话下次发消息时自动续接。启动时环境变量优先于设置文件
   - [x] 会话内切模型：输入框旁的模型名可点开，列出端点的模型，选中后当前会话下一步起生效，并记为新会话的默认模型
-- [ ] **M3** 双内核收口：同一 UI、同一任务、两个内核
+- [x] **M3** 双内核收口：同一 UI、同一任务、两个内核
+  - [x] 内核按需启动、可同时在线：自研 / ACP / 演示回放各一个槽，每个会话绑定自己的内核（侧栏会话行标出「自研 / ACP」，底部列出每个已启动内核的状态）；改了某个内核的设置只重启那一个
+  - [x] 输入框旁的内核下拉：空会话直接换内核（并记为新会话默认）；有对话的会话固定在原内核上，可把首条提示词放到另一个内核上新开会话重跑；用户消息悬停时也有「在 X 上重跑」
+  - [x] 历史会话按记录的 agent 标识回到原来的内核续接（内核没启动就先启动）
+  - [x] 实测：同一条提示词先在自研内核（gemini-3.8-flash）跑完，再一键放到 ACP（mock agent）上重跑，两个会话并排、各自的事件互不串
 
 ## 开发
 
@@ -44,6 +48,8 @@ cargo run -p claudesktop                       # ACP 内核（默认 mock agent�
 
 # 自研内核 + OpenAI 兼容端点（例：Antigravity Tools 本地网关）
 CLAUDESKTOP_KERNEL=builtin CLAUDESKTOP_BASE_URL=http://127.0.0.1:8045/v1 CLAUDESKTOP_MODEL=gemini-3.8-flash CLAUDESKTOP_API_KEY=sk-... cargo run -p claudesktop --bin claudesktop
+
+# CLAUDESKTOP_KERNEL 现在是「新会话的默认内核」；其他内核在会话用到时再启动
 
 # 真实端点测试（默认忽略）
 cargo test -p claudesktop-builtin -- --ignored

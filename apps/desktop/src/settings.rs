@@ -22,6 +22,45 @@ pub enum KernelChoice {
 }
 
 impl KernelChoice {
+    pub const ALL: [KernelChoice; 3] = [Self::Builtin, Self::Acp, Self::Demo];
+
+    /// 内核槽下标（`ChatApp::kernels`）
+    pub fn index(self) -> usize {
+        match self {
+            Self::Acp => 0,
+            Self::Builtin => 1,
+            Self::Demo => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Acp => "ACP agent",
+            Self::Builtin => "自研内核",
+            Self::Demo => "演示回放",
+        }
+    }
+
+    /// 侧栏会话行上的短标签
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Acp => "ACP",
+            Self::Builtin => "自研",
+            Self::Demo => "演示",
+        }
+    }
+
+    /// 历史会话属于哪种内核：按元信息里记的 agent 标识判断
+    pub fn of_agent(agent: &str) -> Self {
+        if agent.starts_with("builtin:") {
+            Self::Builtin
+        } else if agent.is_empty() {
+            Self::Demo
+        } else {
+            Self::Acp
+        }
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s.trim() {
             "acp" => Some(Self::Acp),
@@ -202,5 +241,16 @@ mod tests {
         assert_eq!((s.kernel, s.builtin.model.as_str()), (Some(KernelChoice::Builtin), "x"));
         assert!(s.builtin_config(PathBuf::from(".")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[core::prelude::v1::test]
+    fn kernel_of_history_and_slots() {
+        assert_eq!(KernelChoice::of_agent("builtin:http://x/v1#m"), KernelChoice::Builtin);
+        assert_eq!(KernelChoice::of_agent("node mock.mjs"), KernelChoice::Acp);
+        assert_eq!(KernelChoice::of_agent(""), KernelChoice::Demo);
+        // 槽下标互不相同且都在 0..3
+        let mut idx: Vec<usize> = KernelChoice::ALL.iter().map(|k| k.index()).collect();
+        idx.sort();
+        assert_eq!(idx, vec![0, 1, 2]);
     }
 }

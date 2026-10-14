@@ -1,6 +1,8 @@
 //! 会话区顶栏与底部输入区（含模式下拉）。
 
 use super::ChatApp;
+use crate::model::ChatItem;
+use crate::settings::KernelChoice;
 use crate::theme::*;
 use gpui_kit::component::input::Input;
 use gpui_kit::assets::IconName as IconAll;
@@ -168,7 +170,7 @@ impl ChatApp {
                     .hover(|d| d.bg(rgb(SAND)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.mode_menu_open = false;
-                        let kernel = this.kernel.clone();
+                        let kernel = this.session_kernel(this.active);
                         let s = &mut this.sessions[this.active];
                         s.permission_mode = i;
                         // 会话已建立时同步到 agent（ACP session/set_mode）
@@ -198,6 +200,118 @@ impl ChatApp {
                                         .child(mode.desc.clone()),
                                 )
                             }),
+                    )
+                    .when(active, |d| {
+                        d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
+                    }),
+            );
+        }
+        menu
+    }
+
+    /// 内核弹层：空会话直接换内核（并记为默认）；有对话的会话固定在原内核上，
+    /// 可以把首条提示词放到另一种内核上新开会话重跑，对比两个内核。
+    pub(super) fn render_kernel_menu(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut menu = div()
+            .id("kernel-menu")
+            .occlude()
+            .absolute()
+            .left(px(150.))
+            .bottom(px(104.))
+            .w(px(300.))
+            .v_flex()
+            .p_1()
+            .gap_0p5()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(LINE))
+            .rounded_lg()
+            .shadow_md();
+        let session = self.session();
+        let current = session.kernel;
+        let first_prompt = session
+            .transcript
+            .iter()
+            .position(|i| matches!(i, ChatItem::User(_)));
+        if first_prompt.is_some() {
+            menu = menu.child(
+                div()
+                    .px_2p5()
+                    .py_1p5()
+                    .text_size(px(12.5))
+                    .text_color(rgb(INK_SOFT))
+                    .child(format!("这个会话跑在「{}」上。换个内核重跑首条提示词：", current.label())),
+            );
+        }
+        for (i, kind) in KernelChoice::ALL.into_iter().enumerate() {
+            if first_prompt.is_some() && kind == current {
+                continue;
+            }
+            let usable = kind != KernelChoice::Builtin || self.settings.builtin.is_configured();
+            let detail: SharedString = match kind {
+                KernelChoice::Builtin if usable => self.settings.builtin.model.trim().to_string().into(),
+                KernelChoice::Builtin => "还没配置端点和模型（见设置）".into(),
+                KernelChoice::Acp => match self.settings.acp.command.trim() {
+                    "" => "内置 mock agent".into(),
+                    cmd => cmd.to_string().into(),
+                },
+                KernelChoice::Demo => "不连模型，只播放演示".into(),
+            };
+            let title: SharedString = if first_prompt.is_some() {
+                format!("在「{}」上重跑", kind.label()).into()
+            } else {
+                kind.label().into()
+            };
+            let active = first_prompt.is_none() && kind == current;
+            menu = menu.child(
+                div()
+                    .id(("kernel-item", i))
+                    .h_flex()
+                    .items_center()
+                    .gap_2p5()
+                    .px_2p5()
+                    .py_2()
+                    .rounded_md()
+                    .when(usable, |d| {
+                        d.cursor_pointer()
+                            .hover(|d| d.bg(rgb(SAND)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kernel_menu_open = false;
+                                match first_prompt {
+                                    Some(item) => this.rerun_on(item, kind, cx),
+                                    None => {
+                                        this.update_settings(|s| s.kernel = Some(kind));
+                                        this.rebind_session(this.active, kind);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                    })
+                    .child(
+                        Icon::new(if first_prompt.is_some() { IconAll::RefreshCw } else { IconAll::Cpu })
+                            .size_4()
+                            .text_color(rgb(if usable { INK_SOFT } else { INK_FAINT })),
+                    )
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .text_color(rgb(if usable { INK } else { INK_FAINT }))
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(detail),
+                            ),
                     )
                     .when(active, |d| {
                         d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
@@ -262,6 +376,7 @@ impl ChatApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.mode_menu_open = !this.mode_menu_open;
                                 this.model_menu_open = false;
+                                this.kernel_menu_open = false;
                                 cx.notify();
                             }))
                             .child(
@@ -274,6 +389,36 @@ impl ChatApp {
                                     .text_size(px(13.5))
                                     .text_color(rgb(INK_SOFT))
                                     .child(mode_name),
+                            )
+                            .child(
+                                Icon::new(IconAll::ChevronDown)
+                                    .size_3()
+                                    .text_color(rgb(INK_SOFT)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("kernel-chip")
+                            .h_flex()
+                            .gap_1p5()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(self.kernel_menu_open, |d| d.bg(rgb(SAND)))
+                            .hover(|d| d.bg(rgb(SAND)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.kernel_menu_open = !this.kernel_menu_open;
+                                this.mode_menu_open = false;
+                                this.model_menu_open = false;
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconAll::Cpu).size_3p5().text_color(rgb(INK_SOFT)))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(self.session().kernel.label()),
                             )
                             .child(
                                 Icon::new(IconAll::ChevronDown)
@@ -336,7 +481,8 @@ impl ChatApp {
                     ),
             )
             .when(self.mode_menu_open, |d| d.child(self.render_mode_menu(cx)))
-            .when(self.model_menu_open, |d| d.child(self.render_model_menu(cx)));
+            .when(self.model_menu_open, |d| d.child(self.render_model_menu(cx)))
+            .when(self.kernel_menu_open, |d| d.child(self.render_kernel_menu(cx)));
 
         div()
             .v_flex()

@@ -1,6 +1,7 @@
 //! 侧栏：工作区分组 / 会话列表 / 内核卡。
 
 use super::ChatApp;
+use crate::settings::KernelChoice;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
@@ -219,33 +220,42 @@ impl ChatApp {
                                     .child("设置"),
                             ),
                     )
+                    .children(self.kernel_status_rows()),
+            )
+    }
+
+    /// 每个已启动内核一行：状态点 + 「自研 · xxx · 已连接」
+    fn kernel_status_rows(&self) -> Vec<Div> {
+        KernelChoice::ALL
+            .into_iter()
+            .filter(|k| self.kernels[k.index()].started)
+            .map(|kind| {
+                let slot = &self.kernels[kind.index()];
+                let dot = if slot.error {
+                    RED
+                } else if slot.ready {
+                    GREEN
+                } else {
+                    CORAL
+                };
+                div()
+                    .h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(rgb(dot)))
                     .child(
                         div()
-                            .h_flex()
-                            .gap_1p5()
-                            .items_center()
-                            .child(div().size(px(6.)).rounded_full().bg(rgb(
-                                if self.kernel_error {
-                                    RED
-                                } else if self.kernel_ready {
-                                    GREEN
-                                } else {
-                                    CORAL
-                                },
-                            )))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(INK_SOFT))
-                                    .child(self.kernel_status.clone()),
-                            ),
-                    ),
-            )
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(12.))
+                            .text_color(rgb(INK_SOFT))
+                            .child(format!("{} · {}", kind.tag(), slot.status)),
+                    )
+            })
+            .collect()
     }
 
     /// 侧栏分组：(组名, 会话下标)。当前工作目录一组在最前，组内保持会话顺序。
@@ -312,6 +322,13 @@ impl ChatApp {
                     .text_size(px(14.))
                     .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
                     .child(s.title.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(rgb(INK_FAINT))
+                    .child(s.kernel.tag()),
             )
             .when_some(age, |row, age| {
                 row.child(
