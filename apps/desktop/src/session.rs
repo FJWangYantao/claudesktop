@@ -130,6 +130,13 @@ impl Session {
             .any(|i| matches!(i, ChatItem::User(_)))
     }
 
+    /// 有还没应答的权限请求
+    pub fn waiting_permission(&self) -> bool {
+        self.transcript
+            .iter()
+            .any(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
+    }
+
     pub fn note(&mut self, text: impl Into<SharedString>) {
         self.transcript.push(ChatItem::Note(text.into()));
     }

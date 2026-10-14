@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 impl ChatApp {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
-        let mut body = v_flex().gap_0().flex_1().min_h_0().overflow_hidden();
+        let mut body = v_flex().gap_0().pb_2();
 
         // 工作区头部行
         body = body.child(
@@ -59,57 +59,67 @@ impl ChatApp {
             }
         }
 
-        // 任务分组
-        body = body.child(
-            div()
-                .px_3()
-                .pt_4()
-                .pb_1()
-                .text_size(px(12.))
-                .text_color(rgb(INK_SOFT))
-                .child("任务"),
-        );
-        for (i, (title, age)) in [
-            ("看一下我电脑上 antigravity to…", "9 分钟"),
-            ("Investigating zcode codingpla…", "1 天"),
-            ("检查一下我的 dsh 的插件，有一…", "2 天"),
-        ]
-        .iter()
-        .enumerate()
-        {
+        // 进行中：正在跑或在等授权的会话（跨项目、跨内核），点一下切过去
+        let running: Vec<usize> = (0..self.sessions.len())
+            .filter(|i| self.sessions[*i].busy)
+            .collect();
+        if !running.is_empty() {
             body = body.child(
                 div()
-                    .id(("task", i))
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .mx_2()
-                    .px_2()
-                    .py(px(5.))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .child(
-                        div().size(px(5.)).flex_shrink_0().rounded_full().bg(rgb(LINE)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(14.))
-                            .text_color(rgb(INK_SOFT))
-                            .child(SharedString::from(*title)),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(12.))
-                            .text_color(rgb(INK_FAINT))
-                            .child(SharedString::from(*age)),
-                    ),
+                    .px_3()
+                    .pt_4()
+                    .pb_1()
+                    .text_size(px(12.))
+                    .text_color(rgb(INK_SOFT))
+                    .child("进行中"),
             );
+            for i in running {
+                let s = &self.sessions[i];
+                let waiting = s.waiting_permission();
+                body = body.child(
+                    div()
+                        .id(("running", i))
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_2()
+                        .px_2()
+                        .py(px(5.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.active = i;
+                            this.settings_open = false;
+                            cx.notify();
+                        }))
+                        .child(div().size(px(5.)).flex_shrink_0().rounded_full().bg(rgb(
+                            if waiting { RED } else { CORAL },
+                        )))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(14.))
+                                .text_color(rgb(INK_SOFT))
+                                .child(s.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(12.))
+                                .text_color(rgb(if waiting { RED } else { INK_FAINT }))
+                                .child(format!(
+                                    "{} · {}",
+                                    s.kernel.tag(),
+                                    if waiting { "待授权" } else { "运行中" }
+                                )),
+                        ),
+                );
+            }
         }
 
         v_flex()
@@ -181,7 +191,14 @@ impl ChatApp {
                     )
                     .child(div().text_size(px(14.)).text_color(rgb(INK_SOFT)).child("插件")),
             )
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .id("sidebar-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
             .child(
                 // 底部：更多 + 内核状态
                 div()
@@ -309,6 +326,9 @@ impl ChatApp {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = i;
                 this.mode_menu_open = false;
+                this.kernel_menu_open = false;
+                this.model_menu_open = false;
+                this.settings_open = false;
                 cx.notify();
             }))
             .child(div().size(px(5.)).flex_shrink_0().rounded_full().bg(rgb(dot)))
