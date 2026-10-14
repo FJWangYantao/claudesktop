@@ -24,30 +24,19 @@ impl ChatApp {
             )
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK))
                     .child(label.into()),
             )
     }
 
-    /// 标题栏中间的 Chat / Cowork / Code 分段切换。
-    pub(super) fn top_tab(text: &'static str, active: bool) -> Div {
-        div()
-            .px_3p5()
-            .py_1()
-            .rounded_md()
-            .text_size(px(14.))
-            .bg(if active { rgb(CARD) } else { rgba(0x00000000) })
-            .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
-            .child(text)
-    }
-
+    /// 首页概览的分段切换底（点击逻辑在 overview 的 tab 里）。
     pub(super) fn seg(text: &'static str, active: bool) -> Div {
         div()
             .px_3()
             .py_1()
             .rounded_md()
-            .text_size(px(13.))
+            .text_size(TEXT_SMALL)
             .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) })
             .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
             .child(text)

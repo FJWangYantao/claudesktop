@@ -6,6 +6,7 @@
 //! - 空会话首页：问候语 + 用量概览（统计卡 + 热力图）
 //! - 底部输入区：工作区 / 模式 chips、圆角输入条、权限模式栏
 
+
 mod app;
 mod demo;
 mod fonts;
@@ -21,17 +22,26 @@ use gpui_kit::component::*;
 use gpui_kit::*;
 use std::time::Duration;
 
+pub(crate) static STARTUP_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 fn main() {
+    let t0 = std::time::Instant::now();
+    let bench = std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok();
+    let _ = STARTUP_T0.set(t0);
+
     // 先于任何子进程：应用退出（含被强杀）时连带结束 agent 进程树
     if let Err(err) = claudesktop_core::kill_children_on_exit() {
         eprintln!("[claudesktop] 防孤儿进程保护未启用: {err}");
     }
+    let t_job = t0.elapsed();
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
+            let t_gpui_run = t0.elapsed();
             gpui_kit::init(cx);
             fonts::register(cx);
+            let t_fonts = t0.elapsed();
 
             let mut options = TitleBar::window_options();
             options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
@@ -44,30 +54,36 @@ fn main() {
             }
 
             gpui_kit::open_window(options, cx, |window, cx| {
+                let t_window_open = t0.elapsed();
                 cx.new(|cx| {
                     let app = ChatApp::new(window, cx);
+                    let t_app_new = t0.elapsed();
+                    if bench {
+                        eprintln!("[startup_bench] main -> job_object:       {:>6.2} ms", t_job.as_secs_f64() * 1000.0);
+                        eprintln!("[startup_bench] main -> gpui_runtime:     {:>6.2} ms", t_gpui_run.as_secs_f64() * 1000.0);
+                        eprintln!("[startup_bench] main -> fonts_registered: {:>6.2} ms", t_fonts.as_secs_f64() * 1000.0);
+                        eprintln!("[startup_bench] main -> window_opened:    {:>6.2} ms", t_window_open.as_secs_f64() * 1000.0);
+                        eprintln!("[startup_bench] main -> app_initialized:  {:>6.2} ms", t_app_new.as_secs_f64() * 1000.0);
+                    }
                     // 延迟 1.5s 触发自动演示，避开启动阶段的窗口初始化。
                     cx.spawn_in(window, async move |this, cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(1500))
                             .await;
                         let _ = this.update_in(cx, |app, window, cx| {
-                            // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
-                            // / models、top-models（输入框旁 / 顶栏的模型下拉）/ kernels（打开内核弹层）/ restart（重启内核）
-                            // / rename、ask-delete、delete（对侧栏第 2 个会话）
+                                // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
+                                // / restart（重启内核）
+                                // / rename、ask-delete、delete（对侧栏第 2 个会话）
                             match std::env::var("CLAUDESKTOP_OPEN").as_deref() {
                                 Ok("settings") => app.open_settings(window, cx),
                                 Ok("fetch") => {
                                     app.open_settings(window, cx);
                                     app.fetch_models(true, cx);
                                 }
-                                Ok("models") => app.toggle_model_menu(false, cx),
-                                Ok("top-models") => app.toggle_model_menu(true, cx),
                                 // 侧栏第 2 行（第一个历史会话）：重命名 / 删除确认 / 直接删除
                                 Ok("rename") => app.start_rename(1, window, cx),
                                 Ok("ask-delete") => app.ask_delete(1, cx),
                                 Ok("delete") => app.delete_session(1, cx),
-                                Ok("kernels") => app.open_kernel_menu(cx),
                                 Ok("restart") => {
                                     let kind = app.session().kernel;
                                     app.restart_kernel(kind, cx)

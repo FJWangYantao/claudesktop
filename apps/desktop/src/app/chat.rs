@@ -5,6 +5,7 @@ use crate::model::*;
 use crate::settings::KernelChoice;
 use crate::theme::*;
 use claudesktop_core::{DiffView, PermissionOptionView};
+use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
@@ -36,13 +37,15 @@ impl ChatApp {
                     .size_3p5()
                     .text_color(rgb(INK_SOFT)),
             )
-            .child(
-                div().text_size(px(12.5)).text_color(rgb(INK_SOFT)).child(if streaming {
-                    SharedString::from("思考中…")
-                } else {
-                    SharedString::from("已思考")
-                }),
-            )
+            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(if streaming {
+                // 流式中高光扫过；系统开了「减少动画」时组件自己退回静态文字
+                ShimmerText::new("思考中…")
+                    .id(("think-shimmer", idx))
+                    .highlight_color(rgb(INK))
+                    .into_any_element()
+            } else {
+                "已思考".into_any_element()
+            }))
             .child(
                 Icon::new(if open {
                     IconAll::ChevronDown
@@ -57,9 +60,9 @@ impl ChatApp {
         if open {
             col = col.child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
-                    .line_height(relative(1.6))
+                    .line_height(LEADING)
                     .child(format!("{text}{caret}")),
             );
         }
@@ -81,7 +84,7 @@ impl ChatApp {
             .child(Icon::new(IconAll::Info).size_3p5().text_color(rgb(INK_SOFT)))
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
                     .child("启动信息"),
             )
@@ -98,10 +101,10 @@ impl ChatApp {
         if open {
             col = col.child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(TEXT_SMALL)
                     .font_family(MONO)
                     .text_color(rgb(INK_SOFT))
-                    .line_height(relative(1.6))
+                    .line_height(LEADING)
                     .child(text.to_string()),
             );
         }
@@ -129,7 +132,7 @@ impl ChatApp {
                 )
                 .child(
                     div()
-                        .text_size(px(14.5))
+                        .text_size(TEXT_LARGE)
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(INK))
                         .child(card.name.clone()),
@@ -138,10 +141,10 @@ impl ChatApp {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(13.5))
+                        .text_size(TEXT_BODY)
                         .font_family(MONO)
                         .text_color(rgb(INK_SOFT))
-                        .line_height(relative(1.7))
+                        .line_height(LEADING)
                         .child(card.arg.clone()),
                 ),
         );
@@ -154,7 +157,7 @@ impl ChatApp {
                     .pl_3()
                     .child(
                         div()
-                            .text_size(px(13.5))
+                            .text_size(TEXT_BODY)
                             .font_family(MONO)
                             .text_color(rgb(INK_FAINT))
                             .child("└"),
@@ -163,7 +166,7 @@ impl ChatApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(13.5))
+                            .text_size(TEXT_BODY)
                             .font_family(MONO)
                             .text_color(rgb(INK_SOFT))
                             .child(card.result.clone()),
@@ -191,7 +194,7 @@ impl ChatApp {
                     .id(("diff-toggle", idx))
                     .pl_3()
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
                     .hover(|d| d.text_color(rgb(INK)))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -226,7 +229,7 @@ impl ChatApp {
             )
             .child(
                 div()
-                    .text_size(px(14.5))
+                    .text_size(TEXT_LARGE)
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("请求权限"),
             )
@@ -234,7 +237,7 @@ impl ChatApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(13.5))
+                    .text_size(TEXT_BODY)
                     .font_family(MONO)
                     .text_color(rgb(INK_SOFT))
                     .child(title.clone()),
@@ -242,7 +245,7 @@ impl ChatApp {
 
         let footer = match resolved {
             Some(label) => div()
-                .text_size(px(13.5))
+                .text_size(TEXT_BODY)
                 .text_color(rgb(INK_SOFT))
                 .child(format!("已选择：{label}")),
             None => {
@@ -258,7 +261,7 @@ impl ChatApp {
                             .py_1p5()
                             .rounded_md()
                             .cursor_pointer()
-                            .text_size(px(13.5))
+                            .text_size(TEXT_BODY)
                             .when(primary, |d| d.bg(rgb(CORAL)).text_color(rgb(0xFFFFFF)))
                             .when(!primary, |d| {
                                 d.border_1()
@@ -304,7 +307,7 @@ impl ChatApp {
                         .h(px(18.))
                         .pl(px(44.))
                         .font_family(MONO)
-                        .text_size(px(12.))
+                        .text_size(TEXT_META)
                         .text_color(rgb(INK_FAINT))
                         .bg(rgb(SAND))
                         .child("⋯"),
@@ -322,8 +325,8 @@ impl ChatApp {
                     .items_start()
                     .when_some(bg, |d, c| d.bg(rgb(c)))
                     .font_family(MONO)
-                    .text_size(px(13.5))
-                    .line_height(relative(1.6))
+                    .text_size(TEXT_BODY)
+                    .line_height(LEADING)
                     .child(
                         div()
                             .w(px(44.))
@@ -355,7 +358,7 @@ impl ChatApp {
                 div()
                     .px_3()
                     .py_1()
-                    .text_size(px(12.5))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_FAINT))
                     .child("改动过大，其余部分未显示"),
             );
@@ -377,25 +380,25 @@ impl ChatApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(13.))
+                    .text_size(TEXT_SMALL)
                     .font_family(MONO)
                     .text_color(rgb(INK_SOFT))
                     .child(diff.path.clone()),
             );
         if diff.created {
-            header = header.child(div().text_size(px(12.5)).text_color(rgb(INK_FAINT)).child("新文件"));
+            header = header.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_FAINT)).child("新文件"));
         }
         header = header
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(TEXT_SMALL)
                     .font_family(MONO)
                     .text_color(rgb(DIFF_ADD_FG))
                     .child(format!("+{}", diff.added)),
             )
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(TEXT_SMALL)
                     .font_family(MONO)
                     .text_color(rgb(DIFF_DEL_FG))
                     .child(format!("−{}", diff.removed)),
@@ -429,7 +432,7 @@ impl ChatApp {
                             .size_4()
                             .text_color(rgb(CORAL)),
                     )
-                    .child(div().text_size(px(14.)).text_color(rgb(INK)).child("计划")),
+                    .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child("计划")),
             )
             .children(rows.iter().enumerate().map(|(i, row)| {
                 let marker = if row.done {
@@ -460,7 +463,7 @@ impl ChatApp {
                     .child(marker)
                     .child(
                         div()
-                            .text_size(px(13.5))
+                            .text_size(TEXT_BODY)
                             .text_color(if row.done {
                                 rgb(INK_SOFT)
                             } else {
@@ -496,7 +499,7 @@ impl ChatApp {
                     .child(Icon::new(IconAll::RefreshCw).size_3().text_color(rgb(INK_SOFT)))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(TEXT_META)
                             .text_color(rgb(INK_SOFT))
                             .child(format!("在「{}」上重跑", kind.label())),
                     ),
@@ -514,8 +517,8 @@ impl ChatApp {
                     .rounded(px(12.))
                     .px_4()
                     .py_3()
-                    .text_size(px(15.))
-                    .line_height(relative(1.6))
+                    .text_size(TEXT_LARGE)
+                    .line_height(LEADING)
                     .child(text.clone()),
             )
             .child(actions.group_hover(group, |s| s.opacity(1.)))
@@ -546,8 +549,8 @@ impl ChatApp {
             ChatItem::Agent(text) => Self::railed(
                 div()
                     .font_family(SERIF)
-                    .text_size(px(17.))
-                    .line_height(relative(1.75))
+                    .text_size(TEXT_LEAD)
+                    .line_height(LEADING_READ)
                     .child(
                     TextView::markdown(("agent", idx), SharedString::from(text.clone()))
                         .style(
@@ -566,7 +569,7 @@ impl ChatApp {
             ChatItem::Note(text) => {
                 div().h_flex().justify_center().pt_1().child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(TEXT_META)
                         .text_color(rgb(INK_FAINT))
                         .child(text.clone()),
                 )

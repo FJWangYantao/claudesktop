@@ -64,9 +64,6 @@ impl ChatApp {
             input.update(cx, |state, cx| state.set_value(text, window, cx));
         }
         self.settings_open = true;
-        self.mode_menu_open = false;
-        self.model_menu_open = false;
-        self.kernel_menu_open = false;
         cx.notify();
     }
 
@@ -213,13 +210,13 @@ impl ChatApp {
             .border_color(rgb(LINE))
             .child(
                 div()
-                    .text_size(px(13.5))
+                    .text_size(TEXT_BODY)
                     .font_weight(FontWeight::MEDIUM)
                     .child("已保存的权限规则"),
             )
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
                     .child("自研内核里在权限卡片上选「总是允许」时记下的，按项目生效；删除后立即生效。"),
             );
@@ -228,7 +225,7 @@ impl ChatApp {
             return section.child(
                 div()
                     .py_2()
-                    .text_size(px(13.))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_FAINT))
                     .child("还没有规则"),
             );
@@ -258,7 +255,7 @@ impl ChatApp {
                                 .text_ellipsis()
                                 .whitespace_nowrap()
                                 .font_family(MONO)
-                                .text_size(px(12.5))
+                                .text_size(TEXT_SMALL)
                                 .text_color(rgb(INK))
                                 .child(project.clone()),
                         ),
@@ -275,7 +272,7 @@ impl ChatApp {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .text_size(px(13.))
+                                .text_size(TEXT_SMALL)
                                 .text_color(rgb(INK))
                                 .child(rule_label(rule)),
                         )
@@ -315,7 +312,6 @@ impl ChatApp {
 
     /// 在模型下拉里选了一个：当前会话立即切换（还没建立的会话等 Started），并记为默认。
     pub(crate) fn choose_model(&mut self, model: String, cx: &mut Context<Self>) {
-        self.model_menu_open = false;
         self.update_settings(|s| s.builtin.model = model.clone());
         let kernel = self.session_kernel(self.active);
         let s = &mut self.sessions[self.active];
@@ -332,103 +328,12 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 打开 / 关闭模型下拉；`top` = 从顶栏打开。从另一处点时直接换位置。
-    pub(crate) fn toggle_model_menu(&mut self, top: bool, cx: &mut Context<Self>) {
-        self.model_menu_open = !(self.model_menu_open && self.model_menu_top == top);
-        self.model_menu_top = top;
-        self.mode_menu_open = false;
-        self.kernel_menu_open = false;
+    /// 模型下拉打开时：自研内核且还没有模型列表就顺手获取一次。
+    pub(crate) fn fetch_models_for_menu(&mut self, cx: &mut Context<Self>) {
         let builtin = self.session().kernel == KernelChoice::Builtin;
-        if self.model_menu_open && builtin && self.settings.builtin.models.is_empty() {
+        if builtin && self.settings.builtin.models.is_empty() {
             self.fetch_models(false, cx);
         }
-        cx.notify();
-    }
-
-    pub(super) fn render_model_menu(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let mut menu = div()
-            .id("model-menu")
-            .occlude()
-            .absolute()
-            .w(px(280.))
-            .max_h(px(380.))
-            .overflow_y_scroll()
-            .v_flex()
-            .p_1()
-            .gap_0p5()
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(LINE))
-            .rounded_lg()
-            .shadow_md();
-        let hint = |text: SharedString| {
-            div()
-                .px_2p5()
-                .py_2()
-                .text_size(px(13.))
-                .text_color(rgb(INK_SOFT))
-                .child(text)
-        };
-        let builtin = self.session().kernel == KernelChoice::Builtin;
-        if !builtin {
-            return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
-        }
-        let models = &self.settings.builtin.models;
-        if models.is_empty() {
-            menu = menu.child(hint(if self.fetching_models {
-                "正在获取模型列表…".into()
-            } else {
-                "没有模型列表，可在设置里获取".into()
-            }));
-        }
-        let current = self.session().model_label.clone();
-        for (i, model) in models.iter().enumerate() {
-            let active = current.as_ref() == model.as_str();
-            let m = model.clone();
-            menu = menu.child(
-                div()
-                    .id(("model-item", i))
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2p5()
-                    .py_1p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(SAND)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose_model(m.clone(), cx)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(13.5))
-                            .font_family(MONO)
-                            .text_color(rgb(INK))
-                            .child(model.clone()),
-                    )
-                    .when(active, |d| {
-                        d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                    }),
-            );
-        }
-        menu.child(
-            div()
-                .id("model-refresh")
-                .h_flex()
-                .gap_2()
-                .px_2p5()
-                .py_1p5()
-                .mt_0p5()
-                .border_t_1()
-                .border_color(rgb(LINE))
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(SAND)))
-                .text_size(px(13.))
-                .text_color(rgb(INK_SOFT))
-                .on_click(cx.listener(|this, _, _, cx| this.fetch_models(false, cx)))
-                .child(Icon::new(IconAll::RefreshCw).size_3p5())
-                .child("刷新模型列表"),
-        )
     }
 
     fn field(label: &'static str, hint: Option<&'static str>, input: impl IntoElement) -> Div {
@@ -437,14 +342,14 @@ impl ChatApp {
             .gap_1p5()
             .child(
                 div()
-                    .text_size(px(13.5))
+                    .text_size(TEXT_BODY)
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(INK))
                     .child(label),
             )
             .child(input)
             .when_some(hint, |d, h| {
-                d.child(div().text_size(px(12.5)).text_color(rgb(INK_SOFT)).child(h))
+                d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(h))
             })
     }
 
@@ -455,7 +360,7 @@ impl ChatApp {
             .py_1p5()
             .rounded_md()
             .cursor_pointer()
-            .text_size(px(13.5))
+            .text_size(TEXT_BODY)
             .when(primary, |d| {
                 d.bg(rgb(CORAL))
                     .text_color(rgb(0xFFFFFF))
@@ -507,12 +412,12 @@ impl ChatApp {
                     div()
                         .h_flex()
                         .gap_1p5()
-                        .child(div().text_size(px(14.)).text_color(rgb(INK)).child(title))
+                        .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(title))
                         .when(active, |d| {
                             d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
                         }),
                 )
-                .child(div().text_size(px(12.5)).text_color(rgb(INK_SOFT)).child(desc))
+                .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc))
         };
 
         let mut body = div()
@@ -524,7 +429,7 @@ impl ChatApp {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(13.5))
+                            .text_size(TEXT_BODY)
                             .font_weight(FontWeight::MEDIUM)
                             .child("默认内核"),
                     )
@@ -588,7 +493,7 @@ impl ChatApp {
                             .bg(rgb(if active { SAND } else { CARD }))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgb(SAND)))
-                            .text_size(px(12.5))
+                            .text_size(TEXT_SMALL)
                             .font_family(MONO)
                             .text_color(rgb(INK))
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -634,7 +539,7 @@ impl ChatApp {
         if let Some((error, text)) = &f.message {
             body = body.child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(if *error { RED } else { GREEN }))
                     .child(text.clone()),
             );
@@ -661,7 +566,7 @@ impl ChatApp {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(TEXT_META)
                     .text_color(rgb(INK_FAINT))
                     .child(format!(
                         "保存在 {path}（API Key 为明文）。启动时环境变量优先于这里的设置。只重启配置变了的内核，它上面进行中的对话会中断，下次发消息时自动续接。"
@@ -690,7 +595,7 @@ impl ChatApp {
                                 div()
                                     .flex_1()
                                     .font_family(SERIF)
-                                    .text_size(px(28.))
+                                    .text_size(TEXT_TITLE)
                                     .text_color(rgb(INK))
                                     .child("设置"),
                             )

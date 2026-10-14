@@ -5,6 +5,7 @@ use crate::settings::KernelChoice;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Input;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -15,7 +16,7 @@ impl ChatApp {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let mut body = v_flex().gap_0().pb_2();
 
-        // 工作区头部行
+        // 工作区头部行：排序切换 + 在资源管理器中打开
         body = body.child(
             div()
                 .h_flex()
@@ -25,22 +26,53 @@ impl ChatApp {
                 .pb_1()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(TEXT_META)
                         .text_color(rgb(INK_SOFT))
-                        .child("工作区"),
+                        .child(if self.sessions_by_activity {
+                            "工作区 · 按最近活动"
+                        } else {
+                            "工作区"
+                        }),
                 )
                 .child(div().flex_1())
                 .child(
-                    Icon::new(IconAll::ArrowUpDown)
-                        .size_3p5()
-                        .text_color(rgb(INK_SOFT)),
+                    div()
+                        .id("sort-sessions")
+                        .p(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(LINE)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sessions_by_activity = !this.sessions_by_activity;
+                            cx.notify();
+                        }))
+                        .child(
+                            Icon::new(IconAll::ArrowUpDown)
+                                .size_3p5()
+                                .text_color(rgb(if self.sessions_by_activity {
+                                    CORAL
+                                } else {
+                                    INK_SOFT
+                                })),
+                        ),
                 )
                 .child(
-                    div().pl_2().child(
-                        Icon::new(IconAll::ExternalLink)
-                            .size_3p5()
-                            .text_color(rgb(INK_SOFT)),
-                    ),
+                    div()
+                        .id("open-workspace")
+                        .pl_2()
+                        .p(px(2.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(LINE)))
+                        .on_click({
+                            let cwd = self.cwd.clone();
+                            move |_, _, cx: &mut App| cx.reveal_path(&cwd)
+                        })
+                        .child(
+                            Icon::new(IconAll::ExternalLink)
+                                .size_3p5()
+                                .text_color(rgb(INK_SOFT)),
+                        ),
                 ),
         );
 
@@ -51,7 +83,7 @@ impl ChatApp {
                     .px_3()
                     .pt_3()
                     .pb_1()
-                    .text_size(px(13.5))
+                    .text_size(TEXT_BODY)
                     .text_color(rgb(INK))
                     .child(name),
             );
@@ -70,7 +102,7 @@ impl ChatApp {
                     .px_3()
                     .pt_4()
                     .pb_1()
-                    .text_size(px(12.))
+                    .text_size(TEXT_META)
                     .text_color(rgb(INK_SOFT))
                     .child("进行中"),
             );
@@ -94,9 +126,20 @@ impl ChatApp {
                             this.settings_open = false;
                             cx.notify();
                         }))
-                        .child(div().size(px(5.)).flex_shrink_0().rounded_full().bg(rgb(
-                            if waiting { RED } else { CORAL },
-                        )))
+                        // 运行中转圈；等授权是要用户处理的，保持静止红点更醒目
+                        .child(if waiting {
+                            div()
+                                .size(px(5.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(rgb(RED))
+                                .into_any_element()
+                        } else {
+                            Spinner::new()
+                                .xsmall()
+                                .color(rgb(CORAL).into())
+                                .into_any_element()
+                        })
                         .child(
                             div()
                                 .flex_1()
@@ -104,14 +147,14 @@ impl ChatApp {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .text_size(px(14.))
+                                .text_size(TEXT_BODY)
                                 .text_color(rgb(INK_SOFT))
                                 .child(s.title.clone()),
                         )
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .text_size(px(12.))
+                                .text_size(TEXT_META)
                                 .text_color(rgb(if waiting { RED } else { INK_FAINT }))
                                 .child(format!(
                                     "{} · {}",
@@ -147,7 +190,7 @@ impl ChatApp {
                     .child(
                         div()
                             .font_family(SERIF)
-                            .text_size(px(18.))
+                            .text_size(TEXT_LEAD)
                             .text_color(rgb(INK))
                             .child("Claude"),
                     )
@@ -173,7 +216,7 @@ impl ChatApp {
                             .size_3p5()
                             .text_color(rgb(INK)),
                     )
-                    .child(div().text_size(px(14.)).text_color(rgb(INK)).child("新会话")),
+                    .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child("新会话")),
             )
             .child(
                 div()
@@ -185,12 +228,18 @@ impl ChatApp {
                     .py_1p5()
                     .rounded_md()
                     .cursor_pointer()
+                    .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sessions[this.active]
+                            .note("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力");
+                        cx.notify();
+                    }))
                     .child(
                         Icon::new(IconAll::Blocks)
                             .size_3p5()
                             .text_color(rgb(INK_SOFT)),
                     )
-                    .child(div().text_size(px(14.)).text_color(rgb(INK_SOFT)).child("插件")),
+                    .child(div().text_size(TEXT_BODY).text_color(rgb(INK_SOFT)).child("插件")),
             )
             .child(
                 div()
@@ -233,7 +282,7 @@ impl ChatApp {
                             )
                             .child(
                                 div()
-                                    .text_size(px(13.5))
+                                    .text_size(TEXT_BODY)
                                     .text_color(rgb(INK_SOFT))
                                     .child("设置"),
                             ),
@@ -268,7 +317,7 @@ impl ChatApp {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(px(12.))
+                            .text_size(TEXT_META)
                             .text_color(rgb(INK_SOFT))
                             .child(format!("{} · {}", kind.tag(), slot.status)),
                     )
@@ -276,7 +325,8 @@ impl ChatApp {
             .collect()
     }
 
-    /// 侧栏分组：(组名, 会话下标)。当前工作目录一组在最前，组内保持会话顺序。
+    /// 侧栏分组：(组名, 会话下标)。当前工作目录一组在最前；
+    /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
     fn session_groups(&self) -> Vec<(SharedString, Vec<usize>)> {
         let mut groups: Vec<(&Path, Vec<usize>)> = vec![(self.cwd.as_path(), Vec::new())];
         for (i, s) in self.sessions.iter().enumerate() {
@@ -288,7 +338,17 @@ impl ChatApp {
         groups
             .into_iter()
             .enumerate()
-            .map(|(g, (cwd, members))| {
+            .map(|(g, (cwd, mut members))| {
+                if self.sessions_by_activity {
+                    // 无元信息的会话（刚开、还没落盘）视为最新
+                    let activity = |i: usize| {
+                        self.sessions[i]
+                            .meta
+                            .as_ref()
+                            .map_or(u64::MAX, |m| m.updated_ms)
+                    };
+                    members.sort_by(|a, b| activity(*b).cmp(&activity(*a)));
+                }
                 let name = if g == 0 {
                     self.project_name.clone()
                 } else {
@@ -327,7 +387,7 @@ impl ChatApp {
                     .border_1()
                     .border_color(rgb(CORAL))
                     .bg(rgb(CARD))
-                    .text_size(px(14.))
+                    .text_size(TEXT_BODY)
                     .child(Input::new(&self.rename_input).appearance(false).bordered(false).small()),
             );
         }
@@ -341,7 +401,7 @@ impl ChatApp {
                     .py_0p5()
                     .rounded_md()
                     .cursor_pointer()
-                    .text_size(px(12.5))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(if danger { 0xFFFFFF } else { INK_SOFT }))
                     .bg(rgb(if danger { RED } else { CARD }))
                     .child(label)
@@ -354,7 +414,7 @@ impl ChatApp {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_size(px(13.))
+                        .text_size(TEXT_SMALL)
                         .text_color(rgb(RED))
                         .child(format!("删除「{}」？", s.title)),
                 )
@@ -392,9 +452,6 @@ impl ChatApp {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = i;
-                this.mode_menu_open = false;
-                this.kernel_menu_open = false;
-                this.model_menu_open = false;
                 this.settings_open = false;
                 cx.notify();
             }))
@@ -406,14 +463,14 @@ impl ChatApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(14.))
+                    .text_size(TEXT_BODY)
                     .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
                     .child(s.title.clone()),
             )
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(11.))
+                    .text_size(TEXT_TAG)
                     .text_color(rgb(INK_FAINT))
                     .child(s.kernel.tag()),
             )
@@ -421,7 +478,7 @@ impl ChatApp {
                 row.child(
                     div()
                         .flex_shrink_0()
-                        .text_size(px(12.))
+                        .text_size(TEXT_META)
                         .text_color(rgb(INK_FAINT))
                         .child(age),
                 )

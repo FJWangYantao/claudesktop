@@ -7,6 +7,7 @@ use claudesktop_core::{DiffView, Kernel, KernelEvent, Record, SessionLog, Sessio
 use gpui_kit::*;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// 内核没上报模型时显示的模型名（统计时当作「未知模型」）
 pub const UNKNOWN_MODEL: &str = "默认模型";
@@ -50,10 +51,34 @@ pub struct Session {
     pub resuming: bool,
     /// 内核会话建立前选的模型：Started 之后再告诉内核
     pub pending_model: Option<String>,
-    /// 本轮累计的 token（输入, 输出），一轮结束时写进日志后清零
-    pub turn_usage: (u64, u64),
+    /// 本轮累计的 token，一轮结束时写进日志后清零
+    pub turn_usage: TurnUsage,
+    /// 本轮开始的时刻（状态条计时用；只在 busy 时有意义）
+    pub turn_started: Option<Instant>,
     /// 用户手动改过标题（首条消息不再覆盖）
     pub renamed: bool,
+}
+
+/// 一轮里累计的 token 用量（内核的 `UsageUpdated` 逐次累加）。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct TurnUsage {
+    pub input: u64,
+    pub output: u64,
+    /// 其中思考消耗的部分（包含在 `output` 里；内核不报告时为 0）
+    pub reasoning: u64,
+}
+
+/// 进行中的一轮此刻在干什么（状态条的左侧文字）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Activity {
+    /// 有权限请求等用户应答
+    WaitingPermission,
+    /// 有工具正在执行（取本轮最近一个）
+    Tool { name: SharedString, arg: SharedString },
+    Thinking,
+    Replying,
+    /// 已发出，还没收到任何东西
+    Waiting,
 }
 
 fn new_list_state() -> ListState {
@@ -89,7 +114,8 @@ impl Session {
             restored: false,
             resuming: false,
             pending_model: None,
-            turn_usage: (0, 0),
+            turn_usage: TurnUsage::default(),
+            turn_started: None,
             renamed: false,
         }
     }
@@ -178,8 +204,85 @@ impl Session {
             .any(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
     }
 
+    /// 一轮开始：置忙并开始计时。
+    pub fn begin_turn(&mut self) {
+        self.busy = true;
+        self.turn_started = Some(Instant::now());
+    }
+
+    /// 本轮此刻的活动：等授权 > 执行中的工具 > 最后一条记录的类型。
+    /// 只看本轮（最后一条用户消息之后）。
+    pub fn activity(&self) -> Activity {
+        if self.waiting_permission() {
+            return Activity::WaitingPermission;
+        }
+        let turn_start = self
+            .transcript
+            .iter()
+            .rposition(|i| matches!(i, ChatItem::User(_)))
+            .map_or(0, |i| i + 1);
+        let turn = &self.transcript[turn_start..];
+        let running = turn.iter().rev().find_map(|item| match item {
+            ChatItem::Tool(card) if card.phase == ToolPhase::Running => Some(card),
+            _ => None,
+        });
+        if let Some(card) = running {
+            return Activity::Tool {
+                name: card.name.clone(),
+                arg: card.arg.clone(),
+            };
+        }
+        match turn.last() {
+            Some(ChatItem::Thinking { streaming: true, .. }) => Activity::Thinking,
+            Some(ChatItem::Agent(_)) => Activity::Replying,
+            _ => Activity::Waiting,
+        }
+    }
+
     pub fn note(&mut self, text: impl Into<SharedString>) {
         self.transcript.push(ChatItem::Note(text.into()));
+    }
+
+    /// 整段对话导出为 Markdown（「分享」按钮用）。
+    pub fn to_markdown(&self) -> String {
+        let mut out = format!(
+            "# {}\n\n> 内核：{} · 模型：{}\n\n",
+            self.title,
+            self.kernel.label(),
+            self.model_label
+        );
+        for item in &self.transcript {
+            match item {
+                ChatItem::User(text) => out += &format!("## 我\n\n{text}\n\n"),
+                ChatItem::Agent(text) => out += &format!("## Claude\n\n{text}\n\n"),
+                ChatItem::Thinking { text, .. } => {
+                    out += &format!("<details><summary>思考过程</summary>\n\n{text}\n\n</details>\n\n");
+                }
+                ChatItem::Info { text, .. } => {
+                    out += &format!("<details><summary>启动信息</summary>\n\n```{text}```\n\n</details>\n\n");
+                }
+                ChatItem::Tool(card) => {
+                    out += &format!("> **{}** `{}` → {}\n\n", card.name, card.arg, card.result);
+                }
+                ChatItem::Permission { title, resolved, .. } => {
+                    let state = resolved.as_deref().unwrap_or("待处理");
+                    out += &format!("> 权限请求 `{title}`（{state}）\n\n");
+                }
+                ChatItem::Plan(rows) => {
+                    out += "**计划**\n\n";
+                    for row in rows.iter() {
+                        out += &format!(
+                            "{} {}\n",
+                            if row.done { "- [x]" } else { "- [ ]" },
+                            row.text
+                        );
+                    }
+                    out += "\n";
+                }
+                ChatItem::Note(text) => out += &format!("*{text}*\n\n"),
+            }
+        }
+        out
     }
 
     pub fn finish_thinking(&mut self) {
@@ -452,10 +555,11 @@ impl Session {
             KernelEvent::UsageUpdated {
                 input_tokens,
                 output_tokens,
-                ..
+                reasoning_tokens,
             } => {
-                self.turn_usage.0 += input_tokens;
-                self.turn_usage.1 += output_tokens;
+                self.turn_usage.input += input_tokens;
+                self.turn_usage.output += output_tokens;
+                self.turn_usage.reasoning += reasoning_tokens;
             }
         }
         None
@@ -552,6 +656,42 @@ impl Session {
 mod tests {
     use super::*;
     use claudesktop_core::PermissionOptionView;
+
+    // 注意：本文件顶层 `use gpui_kit::*` 会把 gpui 的 test 宏带进作用域，
+    // 遮蔽内建 #[test]，必须用全路径（原文件其他测试同理）。
+    #[core::prelude::v1::test]
+    fn markdown_export_covers_item_kinds() {
+        let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("C:/proj"));
+        s.title = "测试会话".into();
+        s.note("一条备注");
+        let user = ChatItem::User("你好".into());
+        let agent = ChatItem::Agent("**回复**".into());
+        let card = ToolCard {
+            id: None,
+            kind: "read".into(),
+            name: "Read".into(),
+            arg: "README.md".into(),
+            result: "12 行".into(),
+            phase: ToolPhase::Done,
+            diffs: Vec::new(),
+            expanded: false,
+        };
+        let tool = ChatItem::Tool(card);
+        let row = PlanRow { done: false, text: "第一步".into() };
+        let plan = ChatItem::Plan(vec![row]);
+        s.transcript.push(user);
+        s.transcript.push(agent);
+        s.transcript.push(tool);
+        s.transcript.push(plan);
+        let md = s.to_markdown();
+        assert!(md.starts_with("# 测试会话"));
+        assert!(md.contains("## 我"));
+        assert!(md.contains("你好"));
+        assert!(md.contains("**Read**"));
+        assert!(md.contains("README.md"));
+        assert!(md.contains("- [ ] 第一步"));
+        assert!(md.contains("一条备注"));
+    }
 
     fn meta() -> SessionMeta {
         SessionMeta {
@@ -736,5 +876,76 @@ mod tests {
         assert!(s.restored && !s.busy && !s.ready);
         assert!(s.transcript.iter().any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Failed)));
         assert!(matches!(s.transcript.last(), Some(ChatItem::Note(_))));
+    }
+
+    #[core::prelude::v1::test]
+    fn activity_follows_turn_and_usage_accumulates() {
+        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        // 上一轮遗留的执行中工具不算进本轮
+        s.transcript.push(ChatItem::User("上一轮".into()));
+        s.apply_event(
+            KernelEvent::ToolCallStarted {
+                id: "old".into(),
+                title: "Read a".into(),
+                status: "in_progress".into(),
+                kind: "read".into(),
+            },
+            None,
+        );
+        s.transcript.push(ChatItem::User("这一轮".into()));
+        s.begin_turn();
+        assert!(s.busy && s.turn_started.is_some());
+        assert_eq!(s.activity(), Activity::Waiting);
+
+        s.apply_event(KernelEvent::AgentThoughtChunk { text: "想".into() }, None);
+        assert_eq!(s.activity(), Activity::Thinking);
+
+        s.apply_event(
+            KernelEvent::ToolCallStarted {
+                id: "t".into(),
+                title: "Bash cargo test".into(),
+                status: "in_progress".into(),
+                kind: "execute".into(),
+            },
+            None,
+        );
+        assert!(matches!(s.activity(), Activity::Tool { .. }));
+
+        s.apply_event(
+            KernelEvent::ToolCallUpdated {
+                id: "t".into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: None,
+            },
+            None,
+        );
+        s.apply_event(KernelEvent::AgentMessageChunk { text: "好了".into() }, None);
+        assert_eq!(s.activity(), Activity::Replying);
+
+        s.apply_event(permission_event(7), None);
+        assert_eq!(s.activity(), Activity::WaitingPermission);
+
+        for _ in 0..2 {
+            s.apply_event(
+                KernelEvent::UsageUpdated {
+                    input_tokens: 100,
+                    output_tokens: 30,
+                    reasoning_tokens: 10,
+                },
+                None,
+            );
+        }
+        assert_eq!(
+            s.turn_usage,
+            TurnUsage { input: 200, output: 60, reasoning: 20 }
+        );
+    }
+
+    fn permission_event(id: u64) -> KernelEvent {
+        match permission(id) {
+            Record::Event { event } => event,
+            _ => unreachable!(),
+        }
     }
 }

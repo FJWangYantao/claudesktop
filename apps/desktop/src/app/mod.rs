@@ -3,9 +3,11 @@
 
 mod chat;
 mod composer;
+mod menu;
 mod overview;
 mod settings_view;
 mod sidebar;
+mod status;
 mod widgets;
 
 use crate::demo::*;
@@ -22,9 +24,7 @@ use claudesktop_builtin::BuiltinKernel;
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,11 +48,8 @@ pub struct ChatApp {
     overview_tab: usize, // 0 概览 / 1 模型
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
     sidebar_open: bool,
-    mode_menu_open: bool,
-    model_menu_open: bool,
-    /// 模型下拉从顶栏打开（否则锚在输入框）
-    model_menu_top: bool,
-    kernel_menu_open: bool,
+    /// 侧栏会话按最近活动排序（否则按打开顺序）
+    sessions_by_activity: bool,
     /// 侧栏里正在重命名的会话（令牌）
     renaming: Option<u64>,
     rename_input: Entity<InputState>,
@@ -158,6 +155,20 @@ impl ChatApp {
         })
         .detach();
 
+        // 状态条计时：当前会话忙时每秒重绘一次（等授权时没有转圈动画驱动重绘）
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let alive = this.update(cx, |app, cx| {
+                if app.session().busy {
+                    cx.notify();
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+        })
+        .detach();
+
         // 侧栏重命名框：回车或失焦即提交
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         cx.subscribe_in(
@@ -186,10 +197,7 @@ impl ChatApp {
             overview_tab: 0,
             overview_range: 0,
             sidebar_open: true,
-            mode_menu_open: false,
-            model_menu_open: false,
-            model_menu_top: false,
-            kernel_menu_open: false,
+            sessions_by_activity: false,
             renaming: None,
             rename_input,
             rename_focused: false,
@@ -358,8 +366,6 @@ impl ChatApp {
         let cwd = self.sessions[src].cwd.clone();
         let idx = self.open_session(kind, cwd);
         self.active = idx;
-        self.mode_menu_open = false;
-        self.model_menu_open = false;
         self.sessions[idx].note(format!("同一任务换到「{}」上跑（原会话：{from}）", kind.label()));
         // 内核不可用时 submit_to 会给出提示
         if self.sessions[idx].ready || self.kernel_of(kind).is_none() {
@@ -399,14 +405,6 @@ impl ChatApp {
     /// 压测钩子：当前会话的列表滚动一段距离（正数向下）。
     pub(crate) fn debug_scroll(&mut self, dy: f32, cx: &mut Context<Self>) {
         self.sessions[self.active].list.scroll_by(px(dy));
-        cx.notify();
-    }
-
-    /// 调试钩子：打开内核弹层。
-    pub(crate) fn open_kernel_menu(&mut self, cx: &mut Context<Self>) {
-        self.kernel_menu_open = true;
-        self.mode_menu_open = false;
-        self.model_menu_open = false;
         cx.notify();
     }
 
@@ -569,7 +567,7 @@ impl ChatApp {
                 self.persist(idx, Record::User { text: text.clone() });
             }
             let s = &mut self.sessions[idx];
-            s.busy = true;
+            s.begin_turn();
             s.follow_tail();
             match (&kernel, s.acp_id.clone()) {
                 (Some(kernel), Some(id)) => {
@@ -744,7 +742,11 @@ impl ChatApp {
     /// 一轮结束：把时间、模型、token 记进日志和用量统计。
     fn record_turn(&mut self, idx: usize) {
         let s = &mut self.sessions[idx];
-        let (input_tokens, output_tokens) = std::mem::take(&mut s.turn_usage);
+        let TurnUsage {
+            input: input_tokens,
+            output: output_tokens,
+            ..
+        } = std::mem::take(&mut s.turn_usage);
         let model = Some(s.model_label.to_string()).filter(|m| m != UNKNOWN_MODEL);
         let at_ms = now_ms();
         self.persist(
@@ -825,38 +827,35 @@ impl ChatApp {
 
 impl Render for ChatApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        static FIRST_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !FIRST_FRAME.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(t0) = crate::STARTUP_T0.get() {
+                if std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok() {
+                    let elapsed = t0.elapsed();
+                    eprintln!("[startup_bench] main -> first_frame:     {:>6.2} ms", elapsed.as_secs_f64() * 1000.0);
+                    if std::env::var("CLAUDESKTOP_BENCH_EXIT").is_ok() {
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
         if let Some(log) = &mut self.frame_log {
             log.push(std::time::Instant::now());
         }
-        let title_bar = TitleBar::new()
-            .bg(rgb(SAND))
-            .child(
-                div()
-                    .h_flex()
-                    .ml_2()
-                    .gap_3()
-                    .items_center()
-                    .child(Icon::new(IconAll::PanelLeft).size_4().text_color(rgb(INK_SOFT)))
-                    .child(Icon::new(IconAll::ArrowLeft).size_4().text_color(rgb(INK_FAINT)))
-                    .child(Icon::new(IconAll::ArrowRight).size_4().text_color(rgb(INK_FAINT))),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .h_flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_0p5()
-                            .p(px(3.))
-                            .rounded_lg()
-                            .bg(rgb(SAND_ACTIVE))
-                            .child(Self::top_tab("Chat", false))
-                            .child(Self::top_tab("Cowork", false))
-                            .child(Self::top_tab("Code", true)),
-                    ),
-            );
+        // 标题栏整条是系统拖拽区（Windows），里面放什么都收不到点击，
+        // 只留居中标题；可点的控件一律放顶栏。
+        let title_bar = TitleBar::new().bg(rgb(SAND)).child(
+            div()
+                .flex_1()
+                .h_flex()
+                .justify_center()
+                .child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_FAINT))
+                        .child("claudesktop"),
+                ),
+        );
 
         let active = self.active;
         // 还没发过消息的会话显示首页（问候 + 概览）
@@ -930,21 +929,18 @@ impl Render for ChatApp {
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .relative()
                 .child(self.render_top_bar(cx))
                 .child(scroll)
                 .child(composer_area)
-                // 顶栏打开的模型下拉放在最后画，盖在对话上面
-                .when(self.model_menu_open && self.model_menu_top, |d| {
-                    d.child(self.render_model_menu(cx).top(px(50.)).right(px(100.)))
-                })
         };
 
-        div()
-            .v_flex()
+        let mut root = div();
+        // 中文回退字体：根上设一次，子元素换 font_family 时继承
+        root.text_style().font_fallbacks = Some(cjk_fallbacks());
+        root.v_flex()
             .size_full()
             .font_family(SANS)
-            .text_size(px(15.))
+            .text_size(TEXT_LARGE)
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
             .child(title_bar)

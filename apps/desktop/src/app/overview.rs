@@ -30,7 +30,7 @@ impl ChatApp {
             .bg(rgb(CARD))
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
                     .child(c.label),
             )
@@ -39,7 +39,7 @@ impl ChatApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(17.))
+                    .text_size(TEXT_LEAD)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(INK))
                     .child(c.value.clone()),
@@ -97,7 +97,7 @@ impl ChatApp {
             return list.child(
                 div()
                     .py_6()
-                    .text_size(px(13.5))
+                    .text_size(TEXT_BODY)
                     .text_color(rgb(INK_SOFT))
                     .child("这段时间还没有记录到模型（ACP agent 不上报模型时不计入）"),
             );
@@ -124,14 +124,14 @@ impl ChatApp {
                                     .text_ellipsis()
                                     .whitespace_nowrap()
                                     .font_family(MONO)
-                                    .text_size(px(13.5))
+                                    .text_size(TEXT_BODY)
                                     .text_color(rgb(INK))
                                     .child(m.name.clone()),
                             )
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(12.5))
+                                    .text_size(TEXT_SMALL)
                                     .text_color(rgb(INK_SOFT))
                                     .child(format!(
                                         "{} 轮 · {} token",
@@ -207,7 +207,7 @@ impl ChatApp {
                     .child(
                         div()
                             .font_family(SERIF)
-                            .text_size(px(34.))
+                            .text_size(TEXT_HERO)
                             .text_color(rgb(INK))
                             .child("What's up next, WYT?"),
                     ),
@@ -245,7 +245,7 @@ impl ChatApp {
                     .child(
                         div()
                             .pt_1()
-                            .text_size(px(13.))
+                            .text_size(TEXT_SMALL)
                             .text_color(rgb(INK_SOFT))
                             .child(usage::book_line(o.tokens)),
                     ),
