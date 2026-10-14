@@ -19,7 +19,8 @@ use crate::settings::*;
 use crate::theme::*;
 use crate::usage::{self, TurnStat};
 use claudesktop_core::{
-    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, Record, RoutedEvent, SessionStore,
+    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PromptImage, Record, RoutedEvent,
+    SessionStore, UserPrompt,
 };
 use claudesktop_builtin::BuiltinKernel;
 use futures::StreamExt;
@@ -37,6 +38,8 @@ const MAX_RESTORED: usize = 100;
 
 pub struct ChatApp {
     input: Entity<InputState>,
+    /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
+    pub(crate) pending: Vec<PendingImage>,
     /// 内核会话（可多个）；至少有一个，`active` 始终有效
     sessions: Vec<Session>,
     active: usize,
@@ -190,6 +193,7 @@ impl ChatApp {
         let settings_form = SettingsForm::new(window, cx);
         let mut app = Self {
             input,
+            pending: Vec::new(),
             sessions: Vec::new(),
             active: 0,
             next_token: 1,
@@ -360,10 +364,14 @@ impl ChatApp {
     /// 同一任务换个内核跑：拿当前会话里第 `item_idx` 条用户消息，在 `kind` 上新开会话发出去。
     pub(crate) fn rerun_on(&mut self, item_idx: usize, kind: KernelChoice, cx: &mut Context<Self>) {
         let src = self.active;
-        let Some(ChatItem::User(text)) = self.sessions[src].transcript.get(item_idx) else {
+        let Some(ChatItem::User { text, images }) = self.sessions[src].transcript.get(item_idx)
+        else {
             return;
         };
-        let text = text.to_string();
+        let prompt = UserPrompt {
+            text: text.to_string(),
+            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
+        };
         let from = self.sessions[src].title.clone();
         let cwd = self.sessions[src].cwd.clone();
         let idx = self.open_session(kind, cwd);
@@ -371,9 +379,9 @@ impl ChatApp {
         self.sessions[idx].note(format!("同一任务换到「{}」上跑（原会话：{from}）", kind.label()));
         // 内核不可用时 submit_to 会给出提示
         if self.sessions[idx].ready || self.kernel_of(kind).is_none() {
-            self.submit_to(idx, text, cx);
+            self.submit_to(idx, prompt, cx);
         } else {
-            self.sessions[idx].autoprompt = Some(text);
+            self.sessions[idx].autoprompt = Some(prompt);
         }
         cx.notify();
     }
@@ -383,7 +391,10 @@ impl ChatApp {
         let s = &mut self.sessions[self.active];
         for i in 0..n {
             s.transcript.push(match i % 4 {
-                0 => ChatItem::User(format!("第 {i} 条：帮我看看这段代码为什么慢").into()),
+                0 => ChatItem::User {
+                    text: format!("第 {i} 条：帮我看看这段代码为什么慢").into(),
+                    images: Vec::new(),
+                },
                 1 => ChatItem::Agent(format!(
                     "**第 {i} 条回复。** 先看热点：\n\n- 每帧重建整棵树\n- 列表没有虚拟化\n\n```rust\nfn hot(i: usize) -> usize {{ i * {i} }}\n```\n\n改完再测一次。"
                 )),
@@ -415,7 +426,7 @@ impl ChatApp {
         let first = self.sessions[self.active]
             .transcript
             .iter()
-            .position(|i| matches!(i, ChatItem::User(_)));
+            .position(|i| matches!(i, ChatItem::User { .. }));
         if let Some(item) = first {
             self.rerun_on(item, kind, cx);
         }
@@ -503,9 +514,9 @@ impl ChatApp {
         self.active = idx;
         // 历史会话直接走 submit_to：由它先续接内核会话
         if self.sessions[idx].ready || self.sessions[idx].restored {
-            self.submit_to(idx, text, cx);
+            self.submit_to(idx, UserPrompt::text(text), cx);
         } else {
-            self.sessions[idx].autoprompt = Some(text);
+            self.sessions[idx].autoprompt = Some(UserPrompt::text(text));
         }
         cx.notify();
     }
@@ -515,16 +526,87 @@ impl ChatApp {
             return;
         }
         let text = self.input.read(cx).value().to_string();
-        if text.trim().is_empty() {
+        let images = self
+            .pending
+            .iter()
+            .map(|p| PromptImage {
+                media_type: p.media_type.clone(),
+                data: p.data.clone(),
+            })
+            .collect::<Vec<_>>();
+        if text.trim().is_empty() && images.is_empty() {
             return;
         }
         self.input
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.submit_to(self.active, text, cx);
+        self.pending.clear();
+        self.submit_to(self.active, UserPrompt { text, images }, cx);
+    }
+
+    // ---------- 图片附件 ----------
+
+    /// 待发送图片张数上限（多了模型端也吃不下，界面先挡住）。
+    const MAX_PENDING_IMAGES: usize = 8;
+
+    /// 加入待发送图片（超出上限截断并提示）。
+    pub(crate) fn add_pending_images(
+        &mut self,
+        images: Vec<PendingImage>,
+        cx: &mut Context<Self>,
+    ) {
+        let room = Self::MAX_PENDING_IMAGES.saturating_sub(self.pending.len());
+        if images.is_empty() {
+            return;
+        }
+        if images.len() > room {
+            self.sessions[self.active].note(format!(
+                "一轮最多附 {} 张图片，多出的没有加上",
+                Self::MAX_PENDING_IMAGES
+            ));
+        }
+        self.pending.extend(images.into_iter().take(room));
+        cx.notify();
+    }
+
+    /// 撤掉第 `i` 张待发送图片。
+    pub(crate) fn remove_pending_image(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i < self.pending.len() {
+            self.pending.remove(i);
+            cx.notify();
+        }
+    }
+
+    /// 把附件图片写进会话的资产目录，返回各自的绝对路径（仅文本消息返回空）。
+    /// 演示回放没有会话存储，跳过（消息仍发送，只是不带图）。
+    fn store_images(&mut self, idx: usize, images: &[PromptImage]) -> Vec<String> {
+        use base64::Engine as _;
+        if images.is_empty() || self.session_kernel(idx).is_none() {
+            return Vec::new();
+        }
+        self.ensure_log(idx);
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let Some(meta) = self.sessions[idx].meta.clone() else {
+            return Vec::new();
+        };
+        images
+            .iter()
+            .filter_map(|image| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(image.data.as_bytes())
+                    .ok()?;
+                let ext = ext_of(&image.media_type);
+                store.save_image(&meta.id, ext, &bytes).ok().map(|p| {
+                    p.to_string_lossy()
+                        .into_owned()
+                })
+            })
+            .collect()
     }
 
     /// 向第 `idx` 个会话发一轮用户消息：有内核走内核，演示回放会话播放演示脚本。
-    pub(crate) fn submit_to(&mut self, idx: usize, text: String, cx: &mut Context<Self>) {
+    pub(crate) fn submit_to(&mut self, idx: usize, prompt: UserPrompt, cx: &mut Context<Self>) {
         let kind = self.sessions[idx].kernel;
         if self.sessions[idx].busy {
             return;
@@ -547,7 +629,7 @@ impl ChatApp {
                 // 历史会话：先续接内核会话（连接就绪后发出），就绪后再发这条消息
                 s.restored = false;
                 s.resuming = true;
-                s.autoprompt = Some(text);
+                s.autoprompt = Some(prompt);
                 s.note("正在续接会话…");
                 self.request_pending_sessions();
                 cx.notify();
@@ -560,20 +642,34 @@ impl ChatApp {
             }
             if !s.has_user_message() && !s.renamed {
                 // 会话标题取首条消息的前 18 个字符
-                let title: String = text.chars().take(18).collect();
+                let title: String = prompt.text.chars().take(18).collect();
                 s.title = title.into();
             }
-            s.transcript
-                .push(ChatItem::User(SharedString::from(text.clone())));
+            // 图片附件先落盘（需要会话元信息），路径进记录与气泡
+            let stored = self.store_images(idx, &prompt.images);
+            if !prompt.images.is_empty() && stored.is_empty() && kind == KernelChoice::Demo {
+                self.sessions[idx].note("演示回放不保存图片附件，本轮只发送文字");
+            }
+            let image_paths = stored.iter().map(PathBuf::from).collect::<Vec<_>>();
+            self.sessions[idx].transcript.push(ChatItem::User {
+                text: SharedString::from(prompt.text.clone()),
+                images: image_paths,
+            });
             if kernel.is_some() {
-                self.persist(idx, Record::User { text: text.clone() });
+                self.persist(
+                    idx,
+                    Record::User {
+                        text: prompt.text.clone(),
+                        images: stored,
+                    },
+                );
             }
             let s = &mut self.sessions[idx];
             s.begin_turn();
             s.follow_tail();
             match (&kernel, s.acp_id.clone()) {
                 (Some(kernel), Some(id)) => {
-                    if let Err(err) = kernel.send_prompt(&id, text) {
+                    if let Err(err) = kernel.send_prompt(&id, prompt) {
                         s.busy = false;
                         s.note(format!("发送失败：{err}"));
                     }
@@ -698,8 +794,8 @@ impl ChatApp {
                         self.record_turn(idx);
                         self.touch_meta(idx);
                     }
-                    if let Some(text) = self.sessions[idx].apply_event(event, kernel.as_ref()) {
-                        self.submit_to(idx, text, cx);
+                    if let Some(prompt) = self.sessions[idx].apply_event(event, kernel.as_ref()) {
+                        self.submit_to(idx, prompt, cx);
                     }
                 }
             }
@@ -707,36 +803,44 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 确保第 `idx` 个会话的日志已打开（首次写入时建档）；失败时提示并停用存储。
+    fn ensure_log(&mut self, idx: usize) {
+        if self.sessions[idx].log.is_some() || self.store.is_none() {
+            return;
+        }
+        let s = &mut self.sessions[idx];
+        let agent_cmd = self.kernels[s.kernel.index()].agent_cmd.clone();
+        let opened = match &s.meta {
+            Some(meta) => self.store.as_ref().unwrap().append_log(&meta.id),
+            None => self
+                .store
+                .as_ref()
+                .unwrap()
+                .create(&s.title, s.cwd.clone(), &agent_cmd)
+                .map(|(mut meta, log)| {
+                    meta.kernel_session_id = s.acp_id.clone();
+                    let _ = self.store.as_ref().unwrap().save_meta(&meta);
+                    s.meta = Some(meta);
+                    log
+                }),
+        };
+        match opened {
+            Ok(log) => s.log = Some(log),
+            Err(err) => {
+                s.note(format!("会话未能保存：{err}"));
+                self.store = None;
+            }
+        }
+    }
+
     /// 往第 `idx` 个会话的日志追加一条记录；首次写入时建档。
     /// 写盘失败只提示一次，不影响对话本身。
     fn persist(&mut self, idx: usize, record: Record) {
-        let Some(store) = &self.store else {
+        if self.store.is_none() {
             return;
-        };
-        let s = &mut self.sessions[idx];
-        let agent_cmd = &self.kernels[s.kernel.index()].agent_cmd;
-        if s.log.is_none() {
-            let opened = match &s.meta {
-                Some(meta) => store.append_log(&meta.id),
-                None => store
-                    .create(&s.title, s.cwd.clone(), agent_cmd)
-                    .map(|(mut meta, log)| {
-                        meta.kernel_session_id = s.acp_id.clone();
-                        let _ = store.save_meta(&meta);
-                        s.meta = Some(meta);
-                        log
-                    }),
-            };
-            match opened {
-                Ok(log) => s.log = Some(log),
-                Err(err) => {
-                    s.note(format!("会话未能保存：{err}"));
-                    self.store = None;
-                    return;
-                }
-            }
         }
-        if let Some(log) = &mut s.log {
+        self.ensure_log(idx);
+        if let Some(log) = &mut self.sessions[idx].log {
             let _ = log.append(record);
         }
     }
@@ -920,4 +1024,44 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// MIME 类型 → 存盘扩展名。
+fn ext_of(media_type: &str) -> &'static str {
+    match media_type {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        _ => "png",
+    }
+}
+
+/// 扩展名 → MIME 类型。
+pub(crate) fn mime_of(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+/// 从磁盘读一张附件图片 → 发给内核的 base64（文件丢了返回 None，跳过）。
+fn load_prompt_image(path: &std::path::Path) -> Option<PromptImage> {
+    use base64::Engine as _;
+    let bytes = std::fs::read(path).ok()?;
+    Some(PromptImage {
+        media_type: mime_of(path).to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }

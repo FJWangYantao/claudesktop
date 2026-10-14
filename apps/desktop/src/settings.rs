@@ -183,6 +183,7 @@ impl BuiltinSettings {
             base_url: self.base_url.trim().to_string(),
             api_key: Some(self.api_key.trim().to_string()).filter(|k| !k.is_empty()),
             model: self.model.trim().to_string(),
+            ..Default::default()
         }
     }
 }

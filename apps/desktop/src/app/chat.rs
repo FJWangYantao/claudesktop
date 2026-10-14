@@ -14,6 +14,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::borrow::Cow;
+use std::path::PathBuf;
 
 impl ChatApp {
     pub(super) fn render_thinking(
@@ -493,7 +494,13 @@ impl ChatApp {
     }
 
     /// 用户消息气泡；悬停时下方出现「在另一个内核上重跑」。
-    fn render_user(&self, idx: usize, text: &SharedString, cx: &mut Context<Self>) -> Div {
+    fn render_user(
+        &self,
+        idx: usize,
+        text: &SharedString,
+        images: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> Div {
         let group: SharedString = format!("user-{idx}").into();
         let current = self.session().kernel;
         let others = KernelChoice::ALL.into_iter().filter(|k| {
@@ -523,12 +530,11 @@ impl ChatApp {
                     ),
             );
         }
-        div()
-            .group(group.clone())
-            .v_flex()
-            .items_end()
-            .gap_1()
-            .child(
+        // 气泡：有文字才画文本气泡，图片另起一行缩略图（丢了文件就跳过）。
+        let bubble = if text.is_empty() {
+            None
+        } else {
+            Some(
                 div()
                     .max_w(relative(0.85))
                     .bg(rgb(SAND))
@@ -540,6 +546,32 @@ impl ChatApp {
                     .line_height(LEADING)
                     .child(text.clone()),
             )
+        };
+        let thumbs = if images.is_empty() {
+            None
+        } else {
+            Some(
+                div()
+                    .h_flex()
+                    .justify_end()
+                    .gap_1p5()
+                    .flex_wrap()
+                    .max_w(relative(0.85))
+                    .children(images.iter().filter(|p| p.exists()).map(|p| {
+                        img(p.clone())
+                            .size_20()
+                            .rounded_md()
+                            .object_fit(ObjectFit::Cover)
+                    })),
+            )
+        };
+        div()
+            .group(group.clone())
+            .v_flex()
+            .items_end()
+            .gap_1()
+            .children(thumbs)
+            .children(bubble)
             .child(actions.group_hover(group, |s| s.opacity(1.)))
     }
 
@@ -550,7 +582,7 @@ impl ChatApp {
 
     pub(super) fn render_item(&self, idx: usize, item: &ChatItem, cx: &mut Context<Self>) -> Div {
         match item {
-            ChatItem::User(text) => self.render_user(idx, text, cx),
+            ChatItem::User { text, images } => self.render_user(idx, text, images, cx),
             ChatItem::Thinking {
                 text,
                 streaming,

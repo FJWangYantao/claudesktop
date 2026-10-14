@@ -40,7 +40,7 @@ pub struct Session {
     pub permission_mode: usize, // modes 下标
     pub model_label: SharedString,
     /// 自动演示：会话就绪后发送的提示词
-    pub autoprompt: Option<String>,
+    pub autoprompt: Option<claudesktop_core::UserPrompt>,
     /// 会话工作目录（侧栏按它分组；session/new 用它）
     pub cwd: PathBuf,
     /// 持久化元信息：首条消息发出后才建档（空会话不落盘）
@@ -132,7 +132,10 @@ impl Session {
         s.restored = true;
         for record in records {
             match record {
-                Record::User { text } => s.transcript.push(ChatItem::User(text.into())),
+                Record::User { text, images } => s.transcript.push(ChatItem::User {
+                    text: text.into(),
+                    images: images.iter().map(PathBuf::from).collect(),
+                }),
                 Record::Event { event } => {
                     s.apply_event(event, None);
                 }
@@ -204,7 +207,7 @@ impl Session {
     pub fn has_user_message(&self) -> bool {
         self.transcript
             .iter()
-            .any(|i| matches!(i, ChatItem::User(_)))
+            .any(|i| matches!(i, ChatItem::User { .. }))
     }
 
     /// 有还没应答的权限请求
@@ -229,7 +232,7 @@ impl Session {
         let turn_start = self
             .transcript
             .iter()
-            .rposition(|i| matches!(i, ChatItem::User(_)))
+            .rposition(|i| matches!(i, ChatItem::User { .. }))
             .map_or(0, |i| i + 1);
         let turn = &self.transcript[turn_start..];
         let running = turn.iter().rev().find_map(|item| match item {
@@ -263,7 +266,12 @@ impl Session {
         );
         for item in &self.transcript {
             match item {
-                ChatItem::User(text) => out += &format!("## 我\n\n{text}\n\n"),
+                ChatItem::User { text, images } => {
+                    out += &format!("## 我\n\n{text}\n\n");
+                    if !images.is_empty() {
+                        out += &format!("（{} 张图片附件）\n\n", images.len());
+                    }
+                }
                 ChatItem::Agent(text) => out += &format!("## Claude\n\n{text}\n\n"),
                 ChatItem::Thinking { text, .. } => {
                     out += &format!("<details><summary>思考过程</summary>\n\n{text}\n\n</details>\n\n");
@@ -384,7 +392,7 @@ impl Session {
         &mut self,
         event: KernelEvent,
         kernel: Option<&Arc<dyn Kernel>>,
-    ) -> Option<String> {
+    ) -> Option<claudesktop_core::UserPrompt> {
         match event {
             KernelEvent::Started {
                 session_id,
@@ -517,7 +525,7 @@ impl Session {
                 let turn_start = self
                     .transcript
                     .iter()
-                    .rposition(|i| matches!(i, ChatItem::User(_)))
+                    .rposition(|i| matches!(i, ChatItem::User { .. }))
                     .map_or(0, |i| i + 1);
                 let existing = self.transcript[turn_start..]
                     .iter()
@@ -674,7 +682,7 @@ mod tests {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("C:/proj"));
         s.title = "测试会话".into();
         s.note("一条备注");
-        let user = ChatItem::User("你好".into());
+        let user = ChatItem::User { text: "你好".into(), images: Vec::new() };
         let agent = ChatItem::Agent("**回复**".into());
         let card = ToolCard {
             id: None,
@@ -734,7 +742,10 @@ mod tests {
     #[core::prelude::v1::test]
     fn replay_rebuilds_transcript() {
         let records = vec![
-            Record::User { text: "读 README".into() },
+            Record::User {
+                text: "读 README".into(),
+                images: Vec::new(),
+            },
             ev(KernelEvent::AgentThoughtChunk { text: "想一想".into() }),
             ev(KernelEvent::ToolCallStarted {
                 id: "t1".into(),
@@ -753,7 +764,10 @@ mod tests {
             ev(KernelEvent::AgentMessageChunk { text: "总结完毕".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             // 上次退出时没应答的请求
-            Record::User { text: "再写个文件".into() },
+            Record::User {
+                text: "再写个文件".into(),
+                images: Vec::new(),
+            },
             permission(2),
         ];
         let s = Session::from_records(7, meta(), records);
@@ -765,7 +779,7 @@ mod tests {
             .transcript
             .iter()
             .map(|i| match i {
-                ChatItem::User(_) => "user",
+                ChatItem::User { .. } => "user",
                 ChatItem::Thinking { .. } => "thinking",
                 ChatItem::Tool(_) => "tool",
                 ChatItem::Permission { .. } => "permission",
@@ -806,7 +820,10 @@ mod tests {
             })
         };
         let records = vec![
-            Record::User { text: "改".into() },
+            Record::User {
+                text: "改".into(),
+                images: Vec::new(),
+            },
             started,
             diff("y
 "),
@@ -828,7 +845,7 @@ mod tests {
     #[core::prelude::v1::test]
     fn list_tracks_new_and_changed_rows() {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("."));
-        s.transcript.push(ChatItem::User("hi".into()));
+        s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
         s.transcript.push(ChatItem::Agent("a".into()));
         s.sync_list();
         // 记录 2 行 + 末尾状态行
@@ -871,7 +888,7 @@ mod tests {
 
         s.acp_id = Some("k2".into());
         s.ready = true;
-        s.transcript.push(ChatItem::User("hi".into()));
+        s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
         s.apply_event(
             KernelEvent::ToolCallStarted {
                 id: "t".into(),
@@ -893,7 +910,7 @@ mod tests {
     fn activity_follows_turn_and_usage_accumulates() {
         let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
         // 上一轮遗留的执行中工具不算进本轮
-        s.transcript.push(ChatItem::User("上一轮".into()));
+        s.transcript.push(ChatItem::User { text: "上一轮".into(), images: Vec::new() });
         s.apply_event(
             KernelEvent::ToolCallStarted {
                 id: "old".into(),
@@ -903,7 +920,7 @@ mod tests {
             },
             None,
         );
-        s.transcript.push(ChatItem::User("这一轮".into()));
+        s.transcript.push(ChatItem::User { text: "这一轮".into(), images: Vec::new() });
         s.begin_turn();
         assert!(s.busy && s.turn_started.is_some());
         assert_eq!(s.activity(), Activity::Waiting);

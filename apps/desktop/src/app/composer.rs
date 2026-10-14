@@ -2,7 +2,7 @@
 
 use super::ChatApp;
 use super::menu::{menu_popover, MenuChip};
-use crate::model::ChatItem;
+use crate::model::{ChatItem, PendingImage};
 use crate::settings::KernelChoice;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
@@ -13,6 +13,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::sync::Arc;
 
 impl ChatApp {
     /// 「分享」：当前会话导出为 Markdown，系统保存对话框选位置。
@@ -72,6 +73,33 @@ impl ChatApp {
         .detach();
     }
 
+    // ---------- 图片附件 ----------
+
+    /// 图片按钮：选图片文件，作为附件随下一条消息发给模型。
+    pub(crate) fn attach_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("选择要附上的图片（png / jpg / gif / webp / bmp）".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let _ = this.update_in(cx, |app, _window, cx| {
+                    let images: Vec<_> =
+                        paths.iter().filter_map(|p| PendingImage::from_path(p)).collect();
+                    let bad = paths.len() - images.len();
+                    app.add_pending_images(images, cx);
+                    if bad > 0 {
+                        app.sessions[app.active]
+                            .note(format!("{bad} 个文件不是可识别的图片，已跳过"));
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     // ---------- 输入区 ----------
     /// 侧栏开关：展开时在侧栏头部，收起时在会话区顶栏最左（同一时刻只出现一个）。
     pub(super) fn sidebar_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -103,6 +131,43 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 输入框上方的一张待发送图片缩略图（右上角 × 撤掉）。
+    fn pending_image_thumb(&self, i: usize, cx: &mut Context<Self>) -> Div {
+        div()
+            .relative()
+            .size(px(56.))
+            .flex_shrink_0()
+            .rounded_md()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(LINE))
+            .child(
+                img(Arc::new(self.pending[i].preview.clone()))
+                    .size_full()
+                    .object_fit(ObjectFit::Cover),
+            )
+            .child(
+                div()
+                    .id(("pending-image-x", i))
+                    .absolute()
+                    .top_0p5()
+                    .right_0p5()
+                    .size(px(16.))
+                    .rounded_full()
+                    .bg(rgb(INK))
+                    .opacity(0.75)
+                    .hover(|d| d.opacity(1.))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_pending_image(i, cx);
+                    }))
+                    .child(Icon::new(IconAll::X).size_3().text_color(rgb(WHITE))),
+            )
+    }
+
     pub(super) fn render_composer(&self, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
         let busy = self.session().busy;
@@ -119,7 +184,7 @@ impl ChatApp {
             .map(|n| SharedString::from(n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| self.project_name.clone());
 
-        // 输入框：右侧发送；忙时换成停止（方块）
+        // 输入框：右侧发送；忙时换成停止（方块）；粘贴图片转成附件
         let card = div()
             .id("composer")
             .h_flex()
@@ -139,7 +204,12 @@ impl ChatApp {
                     .flex_1()
                     .min_w_0()
                     .py_0p5()
-                    .child(Input::new(&self.input).appearance(false).bordered(false)),
+                    .child(
+                        Input::new(&self.input)
+                            .appearance(false)
+                            .bordered(false)
+                            .on_paste(paste_to_attachments(app.clone())),
+                    ),
             )
             .child(
                 div()
@@ -186,6 +256,18 @@ impl ChatApp {
                     .child(Self::chip(IconAll::Monitor, "本地"))
                     .child(Self::chip(IconAll::Folder, project)),
             )
+            // 待发送图片缩略图（点右上角 × 撤掉）
+            .when(!self.pending.is_empty(), |d| {
+                d.child(
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .children(
+                            (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
+                        ),
+                )
+            })
             .child(card)
             // 输入框下方：权限模式 / 内核 / 附件，右侧模型。open 状态由 Popover 自管
             .child(
@@ -224,6 +306,25 @@ impl ChatApp {
                             .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx)))
                             .child(Icon::new(IconAll::Plus).size_4().text_color(rgb(INK_SOFT))),
                     )
+                    .child(
+                        div()
+                            .id("attach-images")
+                            .size(px(26.))
+                            .flex_shrink_0()
+                            .rounded_md()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("附加图片（也可直接粘贴）").build(window, cx)
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.attach_images(window, cx)
+                            }))
+                            .child(Icon::new(IconAll::ImagePlus).size_4().text_color(rgb(INK_SOFT))),
+                    )
                     .child(div().flex_1())
                     .child(model_menu_popover(
                         &app,
@@ -232,6 +333,39 @@ impl ChatApp {
                         MenuChip::text(self.session().model_label.clone()),
                     )),
             )
+    }
+}
+
+/// 粘贴处理：剪贴板里是图片（截图）或图片文件路径时收成待发送附件并吃掉这次粘贴；
+/// 纯文字返回 false，交给输入框照常插入。
+fn paste_to_attachments(
+    app: Entity<ChatApp>,
+) -> impl Fn(&gpui::ClipboardItem, &mut Window, &mut App) -> bool {
+    move |item, _window, cx| {
+        let mut images = Vec::new();
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::Image(image) => images.push(PendingImage::from_bytes(
+                    "剪贴板图片".into(),
+                    image.bytes.clone(),
+                    image.format,
+                )),
+                // 从资源管理器复制的文件：认得出图片扩展名的收下
+                ClipboardEntry::ExternalPaths(paths) => {
+                    for path in paths.0.iter() {
+                        if let Some(image) = PendingImage::from_path(path) {
+                            images.push(image);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if images.is_empty() {
+            return false;
+        }
+        app.update(cx, |app, cx| app.add_pending_images(images, cx));
+        true
     }
 }
 
@@ -331,7 +465,7 @@ fn kernel_menu_items(
     let first_prompt = session
         .transcript
         .iter()
-        .position(|i| matches!(i, ChatItem::User(_)));
+        .position(|i| matches!(i, ChatItem::User { .. }));
     let mut menu = div().v_flex().gap_0p5();
     if first_prompt.is_some() {
         menu = menu.child(

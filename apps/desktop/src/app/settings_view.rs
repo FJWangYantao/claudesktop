@@ -145,6 +145,7 @@ impl ChatApp {
                 base_url: value(&f.base_url, cx),
                 api_key: Some(value(&f.api_key, cx)).filter(|k| !k.is_empty()),
                 model: String::new(),
+                ..Default::default()
             }
         } else {
             self.settings.builtin.provider()

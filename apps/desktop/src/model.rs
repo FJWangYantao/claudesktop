@@ -46,7 +46,11 @@ pub struct PlanRow {
 }
 
 pub enum ChatItem {
-    User(SharedString),
+    User {
+        text: SharedString,
+        /// 图片附件的绝对路径（气泡里渲染缩略图；发给内核时读回 base64）
+        images: Vec<std::path::PathBuf>,
+    },
     Thinking {
         text: String,
         streaming: bool,
@@ -70,6 +74,50 @@ pub enum ChatItem {
     Note(SharedString),
 }
 
+/// 输入框里待发送的一张图片附件（已编好 base64，预览用 gpui Image）。
+pub struct PendingImage {
+    pub name: SharedString,
+    /// 如 `image/png`
+    pub media_type: String,
+    /// 存盘扩展名（如 `png`）
+    pub ext: String,
+    /// 图片字节（base64 编码；发送与落盘共用）
+    pub data: String,
+    /// 输入框上方的预览
+    pub preview: gpui_kit::Image,
+}
+
+impl PendingImage {
+    /// 从图片字节构造（格式已知，如剪贴板里的 gpui Image）。
+    pub fn from_bytes(name: SharedString, bytes: Vec<u8>, format: gpui_kit::ImageFormat) -> Self {
+        use base64::Engine as _;
+        Self {
+            name,
+            media_type: format.mime_type().to_string(),
+            ext: format.extension().to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            preview: gpui_kit::Image::from_bytes(format, bytes),
+        }
+    }
+
+    /// 从磁盘文件构造（按扩展名认格式）；认不出的扩展名或读不了返回 None。
+    pub fn from_path(path: &std::path::Path) -> Option<Self> {
+        use gpui_kit::ImageFormat;
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        let format = match ext.as_str() {
+            "png" => ImageFormat::Png,
+            "jpg" | "jpeg" => ImageFormat::Jpeg,
+            "gif" => ImageFormat::Gif,
+            "webp" => ImageFormat::Webp,
+            "bmp" => ImageFormat::Bmp,
+            _ => return None,
+        };
+        let bytes = std::fs::read(path).ok()?;
+        let name = path.file_name()?.to_string_lossy().into_owned().into();
+        Some(Self::from_bytes(name, bytes, format))
+    }
+}
+
 impl ChatItem {
     /// 影响这一行渲染高度的内容摘要（虚拟列表据此判断要不要重新测量）。
     /// 内容只会追加或切换状态，所以长度 + 状态位就够了。
@@ -77,7 +125,7 @@ impl ChatItem {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match self {
-            Self::User(t) => (0u8, t.len()).hash(&mut h),
+            Self::User { text, images } => (0u8, text.len(), images.len()).hash(&mut h),
             Self::Thinking {
                 text,
                 streaming,
