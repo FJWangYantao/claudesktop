@@ -1,0 +1,55 @@
+//! 小组件（chip / 顶部 tab / 分段按钮）。
+
+use super::ChatApp;
+use crate::theme::*;
+use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::*;
+use gpui_kit::*;
+
+impl ChatApp {
+    pub(super) fn chip(icon: IconAll, label: impl Into<SharedString>) -> Div {
+        div()
+            .h_flex()
+            .gap_1p5()
+            .px_2p5()
+            .py_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CARD))
+            .child(
+                Icon::new(icon)
+                    .size_3p5()
+                    .text_color(rgb(INK_SOFT)),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(INK))
+                    .child(label.into()),
+            )
+    }
+
+    /// 标题栏中间的 Chat / Cowork / Code 分段切换。
+    pub(super) fn top_tab(text: &'static str, active: bool) -> Div {
+        div()
+            .px_3p5()
+            .py_1()
+            .rounded_md()
+            .text_size(px(14.))
+            .bg(if active { rgb(CARD) } else { rgba(0x00000000) })
+            .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
+            .child(text)
+    }
+
+    pub(super) fn seg(text: &'static str, active: bool) -> Div {
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .text_size(px(13.))
+            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(0x00000000) })
+            .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
+            .child(text)
+    }
+}
