@@ -249,7 +249,9 @@ fn new_id(now: u64) -> String {
     format!("{now:011x}-{:x}-{n}", std::process::id())
 }
 
-fn default_data_dir() -> io::Result<PathBuf> {
+/// 用户数据根目录（会话、权限规则等都放在这里）：`CLAUDESKTOP_DATA_DIR`，否则
+/// Windows `%APPDATA%\claudesktop`，其他平台 XDG 数据目录。
+pub fn default_data_dir() -> io::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDESKTOP_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }

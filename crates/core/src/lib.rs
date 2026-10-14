@@ -18,7 +18,7 @@ mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
 pub use process_guard::kill_children_on_exit;
-pub use store::{Record, SessionLog, SessionMeta, SessionStore};
+pub use store::{Record, SessionLog, SessionMeta, SessionStore, default_data_dir};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

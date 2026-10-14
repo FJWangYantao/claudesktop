@@ -2,7 +2,8 @@
 //!
 //! 一个实现覆盖 OpenAI / OpenRouter / Ollama / vLLM / LM Studio，以及
 //! Antigravity Tools 这类本地网关。思考内容兼容 `reasoning_content`
-//! （DeepSeek / 多数网关）与 `reasoning`（OpenRouter）两种字段。
+//! （DeepSeek / 多数网关）与 `reasoning`（OpenRouter）两种字段；
+//! 工具调用按 `delta.tool_calls[]` 流式拼接。
 
 use crate::sse::{self, SseEvent};
 use serde::Serialize;
@@ -27,16 +28,59 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    /// 只有工具调用的 assistant 消息为 null
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// role = tool 时对应的调用 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
     pub fn new(role: &str, content: impl Into<String>) -> Self {
         Self {
             role: role.to_string(),
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
+
+    /// 带工具调用的 assistant 消息（`text` 为同一步里模型说的话，可为空）
+    pub fn assistant_tool_calls(text: String, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: (!text.is_empty()).then_some(text),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(call_id: String, content: String) -> Self {
+        Self {
+            role: "tool".into(),
+            content: Some(content),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id),
+        }
+    }
+}
+
+/// 模型发起的一次函数调用（OpenAI `tool_calls[]`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON 文本（流式拼接而来）
+    pub arguments: String,
 }
 
 /// 流式过程中交给调用方的事件。
@@ -59,6 +103,14 @@ pub struct Usage {
     pub reasoning_tokens: u64,
 }
 
+impl Usage {
+    pub fn add(&mut self, other: Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamOutcome {
     /// provider 的 `finish_reason`（stop / length / tool_calls …）
@@ -66,6 +118,8 @@ pub struct StreamOutcome {
     pub usage: Option<Usage>,
     /// false = 被 `should_stop` 叫停
     pub completed: bool,
+    /// 本步模型请求的工具调用（按 index 顺序）
+    pub tool_calls: Vec<ToolCall>,
 }
 
 pub struct OpenAiProvider {
@@ -88,11 +142,12 @@ impl OpenAiProvider {
         &self.config.model
     }
 
-    /// 发起一轮流式补全。`should_stop` 每读一行检查一次；
-    /// 事件经 `on_event` 同步交付（调用线程即读流线程）。
+    /// 发起一轮流式补全。`tools` 为 OpenAI 工具定义（空 = 不带）；
+    /// `should_stop` 每读一行检查一次；事件经 `on_event` 同步交付（调用线程即读流线程）。
     pub fn stream_chat(
         &self,
         messages: &[ChatMessage],
+        tools: &[Value],
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
@@ -100,13 +155,16 @@ impl OpenAiProvider {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "stream": true,
             "stream_options": { "include_usage": true },
             "messages": messages,
-        })
-        .to_string();
+        });
+        if !tools.is_empty() {
+            body["tools"] = Value::from(tools.to_vec());
+        }
+        let body = body.to_string();
 
         let mut attempt = 0;
         let response = loop {
@@ -145,6 +203,7 @@ impl OpenAiProvider {
 
         let reader = BufReader::new(response.into_body().into_reader());
         let mut outcome = StreamOutcome::default();
+        let mut calls = ToolCallAccumulator::default();
         let mut stream_error = None;
         let completed = sse::read_events(reader, should_stop, |event| {
             if let SseEvent::Data(payload) = event {
@@ -152,6 +211,9 @@ impl OpenAiProvider {
                     Ok(chunk) => {
                         for e in chunk.events {
                             on_event(e);
+                        }
+                        for d in chunk.tool_deltas {
+                            calls.push(d);
                         }
                         if chunk.finish_reason.is_some() {
                             outcome.finish_reason = chunk.finish_reason;
@@ -170,14 +232,88 @@ impl OpenAiProvider {
             anyhow::bail!(message);
         }
         outcome.completed = completed;
+        outcome.tool_calls = calls.finish();
         Ok(outcome)
     }
+}
+
+/// 工具调用的一个流式片段（`delta.tool_calls[]`）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolCallDelta {
+    pub index: Option<u64>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
+/// 把片段拼成完整调用：按 `index` 归并；没有 `index` 的（部分网关一次给全）
+/// 按 `id` 归并，都没有就接到最后一个上。
+#[derive(Default)]
+struct ToolCallAccumulator {
+    calls: Vec<(u64, ToolCall)>,
+}
+
+impl ToolCallAccumulator {
+    fn push(&mut self, d: ToolCallDelta) {
+        let pos = match (d.index, &d.id) {
+            (Some(i), _) => self.calls.iter().position(|(k, _)| *k == i),
+            (None, Some(id)) => self.calls.iter().position(|(_, c)| &c.id == id),
+            (None, None) => self.calls.len().checked_sub(1),
+        };
+        let pos = pos.unwrap_or_else(|| {
+            let key = d.index.unwrap_or(self.calls.len() as u64);
+            self.calls.push((
+                key,
+                ToolCall {
+                    id: String::new(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: String::new(),
+                        arguments: String::new(),
+                    },
+                },
+            ));
+            self.calls.len() - 1
+        });
+        let call = &mut self.calls[pos].1;
+        if let Some(id) = d.id.filter(|id| !id.is_empty()) {
+            call.id = id;
+        }
+        if let Some(name) = d.name {
+            call.function.name.push_str(&name);
+        }
+        if let Some(args) = d.arguments {
+            call.function.arguments.push_str(&args);
+        }
+    }
+
+    fn finish(mut self) -> Vec<ToolCall> {
+        self.calls.sort_by_key(|(k, _)| *k);
+        self.calls
+            .into_iter()
+            .filter(|(_, c)| !c.function.name.is_empty())
+            .map(|(_, mut c)| {
+                if c.id.is_empty() {
+                    c.id = next_call_id();
+                }
+                c
+            })
+            .collect()
+    }
+}
+
+/// provider 没给 ID 时自己编一个（同一进程内唯一）
+fn next_call_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(1);
+    format!("call_local_{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
 /// 一个 SSE chunk 解析出的内容。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Chunk {
     pub events: Vec<StreamEvent>,
+    pub tool_deltas: Vec<ToolCallDelta>,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
 }
@@ -200,6 +336,20 @@ pub(crate) fn parse_chunk(payload: &str) -> Result<Chunk, String> {
         }
         if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
             chunk.events.push(StreamEvent::Text(t.to_string()));
+        }
+        for tc in delta["tool_calls"].as_array().into_iter().flatten() {
+            let s = |p: &str| tc.pointer(p).and_then(Value::as_str).map(str::to_owned);
+            chunk.tool_deltas.push(ToolCallDelta {
+                index: tc["index"].as_u64(),
+                id: s("/id"),
+                name: s("/function/name"),
+                // 个别网关把 arguments 给成对象而不是 JSON 文本
+                arguments: match tc.pointer("/function/arguments") {
+                    Some(Value::String(a)) => Some(a.clone()),
+                    Some(v @ Value::Object(_)) => Some(v.to_string()),
+                    _ => None,
+                },
+            });
         }
         chunk.finish_reason = choice["finish_reason"].as_str().map(str::to_owned);
     }
@@ -259,6 +409,64 @@ mod tests {
         assert_eq!(c.events, vec![StreamEvent::Reasoning("r".into())]);
         let err = parse_chunk(r#"{"error":{"message":"quota exhausted"}}"#).unwrap_err();
         assert!(err.contains("quota exhausted"), "{err}");
+    }
+
+    #[test]
+    fn accumulates_streamed_tool_calls() {
+        let mut acc = ToolCallAccumulator::default();
+        for payload in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"shell","arguments":{"command":"ls"}}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ] {
+            for d in parse_chunk(payload).unwrap().tool_deltas {
+                acc.push(d);
+            }
+        }
+        let calls = acc.finish();
+        let got: Vec<_> = calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.function.name.as_str(), c.function.arguments.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("call_a", "read_file", r#"{"path":"a.rs"}"#),
+                ("call_b", "shell", r#"{"command":"ls"}"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_calls_without_index_or_id() {
+        let mut acc = ToolCallAccumulator::default();
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"list_dir","arguments":"{}"}}]}}]}"#;
+        for d in parse_chunk(payload).unwrap().tool_deltas {
+            acc.push(d);
+        }
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].id.starts_with("call_local_"));
+    }
+
+    #[test]
+    fn serializes_tool_messages() {
+        let call = ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall { name: "shell".into(), arguments: "{}".into() },
+        };
+        let m = serde_json::to_value(ChatMessage::assistant_tool_calls(String::new(), vec![call])).unwrap();
+        assert_eq!(m["content"], Value::Null);
+        assert_eq!(m["tool_calls"][0]["type"], "function");
+        assert_eq!(m["tool_calls"][0]["function"]["name"], "shell");
+        let m = serde_json::to_value(ChatMessage::tool_result("c1".into(), "ok".into())).unwrap();
+        assert_eq!(m["role"], "tool");
+        assert_eq!(m["tool_call_id"], "c1");
+        let m = serde_json::to_value(ChatMessage::new("user", "hi")).unwrap();
+        assert!(m.get("tool_calls").is_none() && m.get("tool_call_id").is_none());
     }
 
     #[test]

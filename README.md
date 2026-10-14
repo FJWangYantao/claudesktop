@@ -28,7 +28,9 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] OpenAI 兼容流式对话：正文 / 思考（`reasoning_content` 或 `reasoning`）/ 用量；429·5xx 在出字前退避重试（1s、3s）；取消即时生效且之后不再发事件；多轮历史
   - [x] 桌面端接入：`CLAUDESKTOP_KERNEL=builtin`，配置走 `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`
   - [x] 真实端点实测：Antigravity Tools 本地网关（`http://127.0.0.1:8045/v1`）的 `gemini-3.8-flash`，单测与桌面端均跑通
-  - [ ] 工具调用循环：fs 读写 / bash / 权限规则（allow once / always / deny + 持久化）
+  - [x] 工具调用循环：`read_file` / `list_dir` / `write_file` / `edit_file`（精确替换，兼容 CRLF）/ `shell`（Windows 用 pwsh，超时、取消连子进程一起结束）；一轮最多 50 步
+  - [x] 权限：读工具直接放行；写和命令按模式（Manual / Accept edits / Plan 只读 / Bypass）→ 已保存规则 → 弹卡片询问（允许一次 / 总是允许 / 拒绝）。「总是允许」按项目存到数据目录的 `permissions.json`（编辑 = `edit`，命令 = `shell:<程序> [子命令]` 前缀，复合命令不提供）；工作目录外的写入永远询问
+  - [x] 工具循环实测：gemini-3.8-flash 读 → 写（弹权限）→ 回答，桌面端工具行与权限卡片正常
   - [ ] 历史会话续聊：用本地日志重建上下文（目前自研内核续接 = 新会话）
   - [ ] Anthropic 原生 SSE provider；设置页（provider / key / 模型）
 - [ ] **M3** 双内核收口：同一 UI、同一任务、两个内核
@@ -50,5 +52,5 @@ cargo test -p claudesktop-builtin -- --ignored
 ```
 apps/desktop   # UI 壳（gpui-kit）
 crates/core    # 会话编排层：Kernel trait + KernelEvent（M1）
-crates/builtin # 自研内核（进程内）：OpenAI 兼容 provider（M2）
+crates/builtin # 自研内核（进程内）：OpenAI 兼容 provider、工具循环、权限规则（M2）
 ```
