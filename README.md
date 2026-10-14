@@ -20,7 +20,7 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] 权限审批 UI：agent 请求权限时界面弹卡片（允许 / 拒绝），内核挂起等待；`ACP_AUTO_APPROVE=1` 可退回自动批准
   - [x] 权限模式下拉接 `session/set_mode`（真实适配器实测接受）
   - [x] 修复：提示词不再阻塞指令循环，一轮进行中「停止」可即时生效
-  - [ ] Windows job object 防孤儿进程（目前靠 stdin 关闭退出，强杀应用后实测无残留）
+  - [x] Windows job object 防孤儿进程：启动时把本进程放进 `KILL_ON_JOB_CLOSE` job，子孙进程自动继承；强杀应用后实测 `cmd → powershell Start-Sleep`（不读 stdin）整棵树被回收
 - [ ] **M2** 自研内核（OpenAI 兼容 provider → Anthropic SSE）
 - [ ] **M3** 双内核收口：同一 UI、同一任务、两个内核
 

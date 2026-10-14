@@ -18,6 +18,11 @@ use gpui_kit::*;
 use std::time::Duration;
 
 fn main() {
+    // 先于任何子进程：应用退出（含被强杀）时连带结束 agent 进程树
+    if let Err(err) = claudesktop_core::kill_children_on_exit() {
+        eprintln!("[claudesktop] 防孤儿进程保护未启用: {err}");
+    }
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {

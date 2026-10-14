@@ -13,8 +13,10 @@
 //! （内核线程调用），指令经 channel（UI 线程投递）。
 
 mod acp;
+mod process_guard;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
+pub use process_guard::kill_children_on_exit;
 
 use std::path::PathBuf;
 use std::sync::Arc;
