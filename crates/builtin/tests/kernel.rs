@@ -814,3 +814,55 @@ fn image_prompt_reaches_wire() {
         "data:image/png;base64,QUJD"
     );
 }
+
+/// Anthropic 原生协议下，图片走 `image` / `source.base64` 分段。
+#[test]
+fn anthropic_image_prompt_reaches_wire() {
+    fn acme(payload: &str) -> String {
+        format!("data: {payload}")
+    }
+    let stream = Reply::Sse {
+        lines: vec![
+            acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#),
+            acme(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
+            acme(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"看到图了"}}"#),
+            acme(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#),
+            acme(r#"{"type":"message_stop"}"#),
+        ],
+        gap_ms: 5,
+    };
+    let (base, bodies) = serve(vec![stream]);
+    let dir = std::env::temp_dir().join(format!("claudesktop-anthropic-img-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let h = Harness::with_config(
+        ProviderConfig {
+            protocol: Protocol::Anthropic,
+            base_url: format!("{base}/v1"),
+            api_key: Some("test-key".into()),
+            model: "claude-sonnet-4-5".into(),
+            ..Default::default()
+        },
+        dir.clone(),
+    );
+    let sid = h.start();
+    let prompt = claudesktop_core::UserPrompt {
+        text: "看图".into(),
+        images: vec![claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        }],
+    };
+    h.kernel.send_prompt(&sid, prompt).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = body(&bodies, 0);
+    let content = first["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "看图");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "QUJD");
+    // 原生协议把 max_tokens 放在顶层（必填）
+    assert!(first["max_tokens"].as_u64().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
