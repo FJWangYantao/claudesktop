@@ -356,3 +356,72 @@ fn wait_for(events: &Arc<Mutex<Vec<KernelEvent>>>, timeout_ms: u64, pred: impl F
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+/// 续接已有会话：按 agent 能力走 resume / load / 退回新建。
+/// 返回 (Started 的 sessionId, resumed, 续接后到首轮结束前收到的 agent 文本)。
+fn run_resume(mock_flag: &str) -> (String, bool, String) {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
+    };
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: format!("{} {mock_flag}", mock_command()),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+        },
+        sink,
+    )
+    .expect("spawn kernel");
+
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
+    kernel
+        .resume_session(5, "old-session-42", None)
+        .expect("resume session");
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
+    let (sid, resumed) = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::Started {
+                token: 5,
+                session_id,
+                resumed,
+                ..
+            } => Some((session_id.clone(), *resumed)),
+            _ => None,
+        })
+        .expect("started");
+    kernel.send_prompt(&sid, "继续".into()).expect("send prompt");
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let text = assistant_text(&events.lock().unwrap());
+    (sid, resumed, text)
+}
+
+#[test]
+fn resume_uses_session_resume() {
+    let (sid, resumed, text) = run_resume("--resume=resume");
+    assert_eq!(sid, "old-session-42");
+    assert!(resumed);
+    assert!(!text.contains("历史回放"), "{text}");
+}
+
+#[test]
+fn resume_via_load_drops_replayed_history() {
+    let (sid, resumed, text) = run_resume("--resume=load");
+    assert_eq!(sid, "old-session-42");
+    assert!(resumed);
+    assert!(!text.contains("历史回放"), "replayed history leaked: {text}");
+    assert!(text.contains("mock 内核"), "new turn must still stream: {text}");
+}
+
+#[test]
+fn resume_falls_back_to_new_session() {
+    let (sid, resumed, _) = run_resume("");
+    assert_ne!(sid, "old-session-42");
+    assert!(!resumed);
+}

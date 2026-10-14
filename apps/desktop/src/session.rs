@@ -38,6 +38,8 @@ pub struct Session {
     pub log: Option<SessionLog>,
     /// 从磁盘恢复、还没接上内核会话的历史会话（不自动 session/new）
     pub restored: bool,
+    /// 历史会话正在续接：Started 到达时告诉用户上下文是否延续
+    pub resuming: bool,
 }
 
 impl Session {
@@ -61,6 +63,7 @@ impl Session {
             meta: None,
             log: None,
             restored: false,
+            resuming: false,
         }
     }
 
@@ -175,10 +178,18 @@ impl Session {
                 model,
                 modes,
                 current_mode,
+                resumed,
                 ..
             } => {
                 self.acp_id = Some(session_id);
                 self.ready = true;
+                if std::mem::take(&mut self.resuming) {
+                    self.note(if resumed {
+                        "已续接之前的会话，agent 保有上下文"
+                    } else {
+                        "agent 不支持续接：已新开会话，agent 看不到之前的上下文"
+                    });
+                }
                 if let Some(model) = model {
                     // provider/family/name → 只留最后一段，顶栏空间有限
                     self.model_label =

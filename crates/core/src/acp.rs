@@ -15,7 +15,7 @@
 //! 本实现完全复用 `agent-client-protocol` crate 的类型系统与连接层，
 //! 不手写 JSON-RPC——协议升级时跟随 crate 版本即可。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,9 +25,10 @@ use std::thread::JoinHandle;
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation,
-    InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionModeState,
+    SessionNotification,
     SetSessionModeRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
@@ -167,6 +168,19 @@ impl Kernel for AcpKernel {
         self.send_command(KernelCommand::NewSession { token, cwd })
     }
 
+    fn resume_session(
+        &self,
+        token: u64,
+        session_id: &str,
+        cwd: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        self.send_command(KernelCommand::ResumeSession {
+            token,
+            session_id: session_id.to_string(),
+            cwd,
+        })
+    }
+
     fn send_prompt(&self, session: &str, text: String) -> anyhow::Result<()> {
         self.send_command(KernelCommand::Prompt {
             session: session.to_string(),
@@ -224,6 +238,11 @@ fn run_kernel(
         let sink_fs_read = sink.clone();
         let sink_fs_write = sink.clone();
 
+        // session/load 期间 agent 会重放历史；本地已有记录，这些重放直接丢弃。
+        // 直到该会话发出下一轮提示才解除（不依赖通知与响应的到达顺序）。
+        let replaying: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let replaying_updates = replaying.clone();
+
         let default_cwd = config.cwd.clone();
         let auto_approve = config.auto_approve;
         let next_request_id = Arc::new(AtomicU64::new(1));
@@ -232,6 +251,10 @@ fn run_kernel(
             .builder()
             .on_receive_notification(
                 async move |notification: SessionNotification, _connection| {
+                    let sid = notification.session_id.to_string();
+                    if replaying_updates.lock().unwrap().contains(&sid) {
+                        return Ok(());
+                    }
                     map_notification(&sink_updates, &notification);
                     Ok(())
                 },
@@ -386,6 +409,9 @@ fn run_kernel(
                     )
                     .block_task()
                     .await?;
+                let caps = &init.agent_capabilities;
+                let can_resume = caps.session_capabilities.resume.is_some();
+                let can_load = caps.load_session;
                 let agent_name = init
                     .agent_info
                     .map(|info| info.name)
@@ -411,53 +437,70 @@ fn run_kernel(
                     match command {
                         KernelCommand::NewSession { token, cwd } => {
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
-                            let created = connection
-                                .send_request(NewSessionRequest::new(cwd))
-                                .block_task()
-                                .await;
-                            match created {
-                                Ok(session) => {
-                                    let model = current_model(&session.config_options);
-                                    let (modes, current_mode) = match &session.modes {
-                                        Some(state) => (
-                                            state
-                                                .available_modes
-                                                .iter()
-                                                .map(|m| ModeView {
-                                                    id: m.id.to_string(),
-                                                    name: m.name.clone(),
-                                                    description: m.description.clone(),
-                                                })
-                                                .collect(),
-                                            Some(state.current_mode_id.to_string()),
-                                        ),
-                                        None => (Vec::new(), None),
-                                    };
-                                    let session_id = session.session_id.to_string();
+                            let opened = open_new_session(&connection, cwd).await;
+                            report_started(&sink, &agent_name, token, opened, false);
+                        }
+                        KernelCommand::ResumeSession {
+                            token,
+                            session_id,
+                            cwd,
+                        } => {
+                            let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
+                            let restored = if can_resume {
+                                connection
+                                    .send_request(ResumeSessionRequest::new(
+                                        session_id.clone(),
+                                        cwd.clone(),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .map(|r| OpenedSession {
+                                        session_id: session_id.clone(),
+                                        model: current_model(&r.config_options),
+                                        modes: r.modes,
+                                    })
+                                    .map_err(|e| format!("session/resume: {e}"))
+                            } else if can_load {
+                                replaying.lock().unwrap().insert(session_id.clone());
+                                let loaded = connection
+                                    .send_request(LoadSessionRequest::new(
+                                        session_id.clone(),
+                                        cwd.clone(),
+                                    ))
+                                    .block_task()
+                                    .await;
+                                if loaded.is_err() {
+                                    replaying.lock().unwrap().remove(&session_id);
+                                }
+                                loaded
+                                    .map(|r| OpenedSession {
+                                        session_id: session_id.clone(),
+                                        model: current_model(&r.config_options),
+                                        modes: r.modes,
+                                    })
+                                    .map_err(|e| format!("session/load: {e}"))
+                            } else {
+                                Err("agent 不支持 session/resume 或 session/load".to_string())
+                            };
+                            match restored {
+                                Ok(opened) => {
+                                    report_started(&sink, &agent_name, token, Ok(opened), true)
+                                }
+                                Err(reason) => {
                                     emit(
                                         &sink,
-                                        Some(session_id.clone()),
-                                        KernelEvent::Started {
-                                            token,
-                                            agent_name: agent_name.clone(),
-                                            session_id,
-                                            model,
-                                            modes,
-                                            current_mode,
-                                        },
+                                        None,
+                                        KernelEvent::Status(format!(
+                                            "无法续接会话 {session_id}，改为新会话：{reason}"
+                                        )),
                                     );
+                                    let opened = open_new_session(&connection, cwd).await;
+                                    report_started(&sink, &agent_name, token, opened, false);
                                 }
-                                Err(err) => emit(
-                                    &sink,
-                                    None,
-                                    KernelEvent::SessionFailed {
-                                        token,
-                                        message: format!("{err}"),
-                                    },
-                                ),
                             }
                         }
                         KernelCommand::Prompt { session, text } => {
+                            replaying.lock().unwrap().remove(&session);
                             // 在独立任务里等本轮结束：指令循环必须保持空闲，
                             // 否则一轮进行中的 Cancel / SetMode / 其他会话的提示
                             // 都要等到轮末才处理。
@@ -558,6 +601,76 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
     };
     if let Some(event) = event {
         emit(sink, Some(notification.session_id.to_string()), event);
+    }
+}
+
+/// 新建 / 续接会话的共同结果。
+struct OpenedSession {
+    session_id: String,
+    model: Option<String>,
+    modes: Option<SessionModeState>,
+}
+
+async fn open_new_session(
+    connection: &ConnectionTo<Agent>,
+    cwd: PathBuf,
+) -> Result<OpenedSession, String> {
+    connection
+        .send_request(NewSessionRequest::new(cwd))
+        .block_task()
+        .await
+        .map(|session| OpenedSession {
+            session_id: session.session_id.to_string(),
+            model: current_model(&session.config_options),
+            modes: session.modes,
+        })
+        .map_err(|e| format!("{e}"))
+}
+
+/// 把会话打开结果报给 UI：成功 = `Started`，失败 = `SessionFailed`。
+fn report_started(
+    sink: &EventSink,
+    agent_name: &str,
+    token: u64,
+    opened: Result<OpenedSession, String>,
+    resumed: bool,
+) {
+    match opened {
+        Ok(OpenedSession {
+            session_id,
+            model,
+            modes,
+        }) => {
+            let (modes, current_mode) = match modes {
+                Some(state) => (
+                    state
+                        .available_modes
+                        .iter()
+                        .map(|m| ModeView {
+                            id: m.id.to_string(),
+                            name: m.name.clone(),
+                            description: m.description.clone(),
+                        })
+                        .collect(),
+                    Some(state.current_mode_id.to_string()),
+                ),
+                None => (Vec::new(), None),
+            };
+            emit(
+                sink,
+                Some(session_id.clone()),
+                KernelEvent::Started {
+                    token,
+                    agent_name: agent_name.to_string(),
+                    session_id,
+                    model,
+                    modes,
+                    current_mode,
+                    resumed,
+                },
+            );
+        }
+        Err(message) => emit(sink, None, KernelEvent::SessionFailed { token, message }),
     }
 }
 

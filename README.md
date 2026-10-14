@@ -21,7 +21,8 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] 权限模式下拉接 `session/set_mode`（真实适配器实测接受）
   - [x] 修复：提示词不再阻塞指令循环，一轮进行中「停止」可即时生效
   - [x] 会话持久化：每会话一份追加式事件日志（`%APPDATA%\claudesktop\sessions\<id>.jsonl` + 元信息 `<id>.json`；`CLAUDESKTOP_DATA_DIR` 可改位置），流式块合并后写入；启动时重放恢复，侧栏按工作目录分组并显示最近活动时间；演示回放模式不落盘
-  - [ ] 恢复的会话续聊：目前是新开内核会话（agent 看不到旧上下文），下一步接 ACP `session/resume` / `session/load`
+  - [x] 恢复的会话续聊：在历史会话里发消息时先续接内核会话——优先 ACP `session/resume`，其次 `session/load`（agent 重放的历史直接丢弃，本地已有），都不支持或失败则新开会话并提示「看不到之前的上下文」；仅当记录的 agent 命令与当前一致时才尝试续接。mock 用 `MOCK_RESUME=resume|load` 模拟两种能力
+  - 注：真实适配器（Claude / pi）的续接能力尚未实测
   - [x] Windows job object 防孤儿进程：启动时把本进程放进 `KILL_ON_JOB_CLOSE` job，子孙进程自动继承；强杀应用后实测 `cmd → powershell Start-Sleep`（不读 stdin）整棵树被回收
 - [ ] **M2** 自研内核（OpenAI 兼容 provider → Anthropic SSE）
 - [ ] **M3** 双内核收口：同一 UI、同一任务、两个内核

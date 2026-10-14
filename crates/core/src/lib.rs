@@ -85,6 +85,9 @@ pub enum KernelEvent {
         modes: Vec<ModeView>,
         /// 当前模式 ID
         current_mode: Option<String>,
+        /// 续接了已有会话（agent 保有之前的上下文）；false = 全新会话
+        #[serde(default)]
+        resumed: bool,
     },
     /// agent 回复的流式文本块（追加渲染）
     AgentMessageChunk { text: String },
@@ -180,6 +183,13 @@ pub type EventSink = Arc<dyn Fn(RoutedEvent) + Send + Sync + 'static>;
 pub enum KernelCommand {
     /// 创建会话；`cwd` 为空用内核的默认工作目录
     NewSession { token: u64, cwd: Option<PathBuf> },
+    /// 续接一个已有会话（ACP `session/resume`，其次 `session/load`）；
+    /// 都不支持或失败时退回新建，结果经 `Started { resumed }` 报告
+    ResumeSession {
+        token: u64,
+        session_id: String,
+        cwd: Option<PathBuf>,
+    },
     /// 向某会话发送一轮用户消息
     Prompt { session: String, text: String },
     /// 请求取消某会话的当前轮
@@ -202,6 +212,17 @@ pub trait Kernel: Send + Sync {
     /// 创建一个会话；结果经 `Started` / `SessionFailed` 事件异步回报，
     /// 事件里带回同一个 `token`。
     fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()>;
+    /// 续接之前的会话（`session_id` 为内核侧 ID）；结果经 `Started` 回报，
+    /// 其 `resumed` 表示上下文是否得以延续。默认实现：不支持续接，直接新建。
+    fn resume_session(
+        &self,
+        token: u64,
+        session_id: &str,
+        cwd: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let _ = session_id;
+        self.new_session(token, cwd)
+    }
     /// 向某会话发送一轮用户消息；返回仅代表「已投递」。
     fn send_prompt(&self, session: &str, text: String) -> anyhow::Result<()>;
     /// 请求取消某会话的当前轮（尽力而为）。

@@ -207,11 +207,18 @@ impl ChatApp {
             }
             _ => return,
         };
-        self.active = 0;
-        if self.sessions[0].ready {
-            self.submit_to(0, text, cx);
+        // CLAUDESKTOP_AUTODEMO_SESSION 指定发往第几个会话（默认 0；历史会话从 1 起）
+        let idx = std::env::var("CLAUDESKTOP_AUTODEMO_SESSION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|i| *i < self.sessions.len())
+            .unwrap_or(0);
+        self.active = idx;
+        // 历史会话直接走 submit_to：由它先续接内核会话
+        if self.sessions[idx].ready || self.sessions[idx].restored {
+            self.submit_to(idx, text, cx);
         } else {
-            self.sessions[0].autoprompt = Some(text);
+            self.sessions[idx].autoprompt = Some(text);
         }
         cx.notify();
     }
@@ -238,12 +245,29 @@ impl ChatApp {
             if s.busy {
                 return;
             }
-            if kernel.is_some() && s.restored {
-                // 历史会话：先开一个新的内核会话，就绪后再发这条消息
+            if let (Some(kernel), true) = (&kernel, s.restored) {
+                // 历史会话：先续接内核会话（同一个 agent 才尝试），就绪后再发这条消息
                 s.restored = false;
+                s.requested = true;
+                s.resuming = true;
                 s.autoprompt = Some(text);
-                s.note("已恢复的历史会话：新开内核会话继续，agent 看不到之前的上下文");
-                self.request_pending_sessions();
+                let previous = s
+                    .meta
+                    .as_ref()
+                    .filter(|m| m.agent == self.agent_cmd)
+                    .and_then(|m| m.kernel_session_id.clone());
+                let cwd = Some(s.cwd.clone());
+                let sent = match &previous {
+                    Some(id) => kernel.resume_session(s.token, id, cwd),
+                    None => kernel.new_session(s.token, cwd),
+                };
+                if let Err(err) = sent {
+                    s.requested = false;
+                    s.resuming = false;
+                    s.note(format!("续接会话失败：{err}"));
+                } else {
+                    s.note("正在续接会话…");
+                }
                 cx.notify();
                 return;
             }
@@ -345,6 +369,7 @@ impl ChatApp {
             KernelEvent::SessionFailed { token, message } => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.token == token) {
                     s.requested = false;
+                    s.resuming = false;
                     s.note(format!("创建会话失败：{message}"));
                 }
             }

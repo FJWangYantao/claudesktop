@@ -12,6 +12,11 @@ import { fileURLToPath } from 'node:url';
 
 const SELF_PATH = fileURLToPath(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 续接能力：`--resume=resume|load` 参数优先（测试并行时不共享环境变量），其次 MOCK_RESUME
+const RESUME_MODE =
+  process.argv.find((a) => a.startsWith('--resume='))?.slice('--resume='.length) ??
+  process.env.MOCK_RESUME ??
+  '';
 
 // 一条连接上可有多个会话：每个会话各自一个 sessionId，事件按它路由。
 let sessionCount = 0;
@@ -114,7 +119,11 @@ rl.on('line', (line) => {
     case 'initialize':
       reply(id, {
         protocolVersion: params?.protocolVersion ?? 1,
-        agentCapabilities: {},
+        // MOCK_RESUME=resume → 声明 sessionCapabilities.resume；=load → 声明 loadSession
+        agentCapabilities: {
+          ...(RESUME_MODE === 'load' ? { loadSession: true } : {}),
+          ...(RESUME_MODE === 'resume' ? { sessionCapabilities: { resume: {} } } : {}),
+        },
         authMethods: [],
         agentInfo: { name: 'mock-agent', title: 'Mock Agent', version: '0.1.0' },
       });
@@ -125,6 +134,18 @@ rl.on('line', (line) => {
     case 'session/new':
       reply(id, { sessionId: `mock-session-${Date.now()}-${++sessionCount}` });
       break;
+    case 'session/resume':
+      // 不回放历史，直接续用原 sessionId
+      reply(id, {});
+      break;
+    case 'session/load': {
+      // 先按协议回放历史（客户端应丢弃），再应答
+      const sid = params?.sessionId;
+      update(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: '（历史回放）旧提问' } });
+      update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '（历史回放）旧回答' } });
+      reply(id, {});
+      break;
+    }
     case 'session/prompt': {
       const text = (params?.prompt ?? [])
         .filter((b) => b?.type === 'text')
