@@ -1,6 +1,5 @@
 //! 演示回放脚本（CLAUDESKTOP_KERNEL=demo 或内核启动失败时使用）。
 
-use crate::model::*;
 
 pub enum MockAction {
     BeginThinking,

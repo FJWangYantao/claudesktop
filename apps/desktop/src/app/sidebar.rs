@@ -189,11 +189,26 @@ impl ChatApp {
                     .p_3()
                     .child(
                         div()
+                            .id("open-settings")
                             .h_flex()
                             .gap_2()
                             .items_center()
+                            .px_1()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(self.settings_open, |d| d.bg(rgb(SAND_ACTIVE)))
+                            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.settings_open {
+                                    this.settings_open = false;
+                                    cx.notify();
+                                } else {
+                                    this.open_settings(window, cx);
+                                }
+                            }))
                             .child(
-                                Icon::new(IconAll::Ellipsis)
+                                Icon::new(IconAll::Settings)
                                     .size_3p5()
                                     .text_color(rgb(INK_SOFT)),
                             )
@@ -201,7 +216,7 @@ impl ChatApp {
                                 div()
                                     .text_size(px(13.5))
                                     .text_color(rgb(INK_SOFT))
-                                    .child("更多"),
+                                    .child("设置"),
                             ),
                     )
                     .child(

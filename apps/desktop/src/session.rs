@@ -40,6 +40,8 @@ pub struct Session {
     pub restored: bool,
     /// 历史会话正在续接：Started 到达时告诉用户上下文是否延续
     pub resuming: bool,
+    /// 内核会话建立前选的模型：Started 之后再告诉内核
+    pub pending_model: Option<String>,
 }
 
 impl Session {
@@ -64,6 +66,7 @@ impl Session {
             log: None,
             restored: false,
             resuming: false,
+            pending_model: None,
         }
     }
 
@@ -164,6 +167,34 @@ impl Session {
         }
     }
 
+    /// 内核要换了：收尾进行中的一轮，断开与旧内核会话的关联。
+    /// 有对话的会话变成「历史会话」，下次发消息时在新内核上续接。
+    pub fn detach_kernel(&mut self, kernel: Option<&Arc<dyn Kernel>>) {
+        self.cancel_pending_permissions(kernel);
+        self.cancel_token += 1;
+        if self.busy {
+            self.busy = false;
+            self.finish_thinking();
+            for item in &mut self.transcript {
+                if let ChatItem::Tool(card) = item {
+                    if card.phase == ToolPhase::Running {
+                        card.phase = ToolPhase::Failed;
+                        if card.result.is_empty() {
+                            card.result = "已中断".into();
+                        }
+                    }
+                }
+            }
+            self.note("内核已切换，这一轮已中断");
+        }
+        self.acp_id = None;
+        self.requested = false;
+        self.resuming = false;
+        self.ready = false;
+        self.autoprompt = None;
+        self.restored = self.has_user_message();
+    }
+
     /// 内核致命错误：这个会话不再可用。
     pub fn on_fatal(&mut self, message: &str, kernel: Option<&Arc<dyn Kernel>>) {
         self.busy = false;
@@ -215,6 +246,15 @@ impl Session {
                     self.permission_mode = current_mode
                         .and_then(|id| self.modes.iter().position(|m| m.id == id))
                         .unwrap_or(0);
+                }
+                // 会话建立前在下拉里选过模型：现在告诉内核
+                if let (Some(model), Some(kernel), Some(id)) =
+                    (self.pending_model.take(), kernel, self.acp_id.clone())
+                {
+                    match kernel.set_model(&id, &model) {
+                        Ok(()) => self.model_label = model.into(),
+                        Err(err) => self.note(format!("切换模型失败：{err}")),
+                    }
                 }
                 return self.autoprompt.take();
             }
@@ -564,5 +604,45 @@ mod tests {
         let paths: Vec<_> = card.diffs.iter().map(|d| d.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "b.txt"]);
         assert_eq!(card.diffs[0].lines.last().unwrap().text, "z");
+    }
+
+    #[core::prelude::v1::test]
+    fn detach_kernel_interrupts_turn_and_marks_for_resume() {
+        let mut s = Session::new(1, false, PathBuf::from("."));
+        s.apply_event(
+            KernelEvent::Started {
+                token: 1,
+                agent_name: "a".into(),
+                session_id: "k1".into(),
+                model: Some("m".into()),
+                modes: Vec::new(),
+                current_mode: None,
+                resumed: false,
+            },
+            None,
+        );
+        assert!(s.ready);
+        // 空会话：脱离后等新内核重新创建
+        s.detach_kernel(None);
+        assert!(!s.ready && !s.restored && s.acp_id.is_none() && !s.requested);
+
+        s.acp_id = Some("k2".into());
+        s.ready = true;
+        s.transcript.push(ChatItem::User("hi".into()));
+        s.apply_event(
+            KernelEvent::ToolCallStarted {
+                id: "t".into(),
+                title: "Read a".into(),
+                status: "in_progress".into(),
+                kind: "read".into(),
+            },
+            None,
+        );
+        s.busy = true;
+        s.detach_kernel(None);
+        // 有对话：变成历史会话，进行中的工具收尾
+        assert!(s.restored && !s.busy && !s.ready);
+        assert!(s.transcript.iter().any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Failed)));
+        assert!(matches!(s.transcript.last(), Some(ChatItem::Note(_))));
     }
 }

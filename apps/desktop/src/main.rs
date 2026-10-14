@@ -11,6 +11,7 @@ mod demo;
 mod fonts;
 mod model;
 mod session;
+mod settings;
 mod theme;
 
 use app::ChatApp;
@@ -44,11 +45,25 @@ fn main() {
                 cx.new(|cx| {
                     let app = ChatApp::new(window, cx);
                     // 延迟 1.5s 触发自动演示，避开启动阶段的窗口初始化。
-                    cx.spawn(async move |this, cx| {
+                    cx.spawn_in(window, async move |this, cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(1500))
                             .await;
-                        let _ = this.update(cx, |app, cx| app.autodemo_hook(cx));
+                        let _ = this.update_in(cx, |app, window, cx| {
+                            // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
+                            // / models（打开模型下拉）/ restart（重启内核）
+                            match std::env::var("CLAUDESKTOP_OPEN").as_deref() {
+                                Ok("settings") => app.open_settings(window, cx),
+                                Ok("fetch") => {
+                                    app.open_settings(window, cx);
+                                    app.fetch_models(true, cx);
+                                }
+                                Ok("models") => app.toggle_model_menu(cx),
+                                Ok("restart") => app.restart_kernel(cx),
+                                _ => {}
+                            }
+                            app.autodemo_hook(cx);
+                        });
                     })
                     .detach();
                     app

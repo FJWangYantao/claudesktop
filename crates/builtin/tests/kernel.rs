@@ -415,6 +415,36 @@ fn write_asks_permission_and_allow_always_is_remembered() {
 }
 
 #[test]
+fn set_model_switches_the_session_and_new_sessions() {
+    let (base, bodies) = serve(vec![happy_stream("一"), happy_stream("二"), happy_stream("三")]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, "a".into()).unwrap();
+    h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert!(h.kernel.set_model(&sid, "  ").is_err());
+    assert!(h.kernel.set_model("nope", "m2").is_err());
+    h.kernel.set_model(&sid, "m2").unwrap();
+    h.kernel.send_prompt(&sid, "b".into()).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(body(&bodies, 0)["model"], "mock-model");
+    assert_eq!(body(&bodies, 1)["model"], "m2");
+    // 新会话沿用最近选的模型
+    h.kernel.new_session(2, None).unwrap();
+    h.wait_n("second session", 2, |e| matches!(e, KernelEvent::Started { .. }));
+    let models: Vec<_> = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match &r.event {
+            KernelEvent::Started { model, .. } => model.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(models, ["mock-model", "m2"]);
+}
+
+#[test]
 fn edit_previews_diff_before_asking() {
     let dir = workdir("diff");
     std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();

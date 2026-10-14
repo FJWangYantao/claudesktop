@@ -248,6 +248,11 @@ pub trait Kernel: Send + Sync {
     fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()>;
     /// 切换权限模式；结果经 `Status` 事件回报，不支持的 agent 会被忽略。
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()>;
+    /// 切换某会话之后各轮使用的模型；默认不支持。
+    fn set_model(&self, session: &str, model: &str) -> anyhow::Result<()> {
+        let _ = (session, model);
+        anyhow::bail!("当前内核不支持切换模型")
+    }
     /// 关闭内核。
     fn shutdown(&self);
 }

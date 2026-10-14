@@ -14,3 +14,6 @@ gpui-kit = { workspace = true }
 claudesktop-core = { path = "../../crates/core" }
 claudesktop-builtin = { path = "../../crates/builtin" }
 futures = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

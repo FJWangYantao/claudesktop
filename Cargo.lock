@@ -888,10 +888,13 @@ dependencies = [
 name = "claudesktop"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "claudesktop-builtin",
  "claudesktop-core",
  "futures",
  "gpui-kit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

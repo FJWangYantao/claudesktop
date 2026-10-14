@@ -138,14 +138,34 @@ impl OpenAiProvider {
         Self { config, agent }
     }
 
+    /// 配置里的默认模型
     pub fn model(&self) -> &str {
         &self.config.model
     }
 
-    /// 发起一轮流式补全。`tools` 为 OpenAI 工具定义（空 = 不带）；
+    /// 端点提供的模型 ID（`GET /models`），按返回顺序。
+    pub fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
+        let mut request = self.agent.get(&url).header("Accept", "application/json");
+        if let Some(key) = &self.config.api_key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let response = request
+            .call()
+            .map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
+        let status = response.status().as_u16();
+        let text = response.into_body().read_to_string().unwrap_or_default();
+        if !(200..300).contains(&status) {
+            anyhow::bail!("HTTP {status}: {}", error_message(&text));
+        }
+        parse_models(&text)
+    }
+
+    /// 发起一轮流式补全（`model` 为本次使用的模型 ID）。`tools` 为 OpenAI 工具定义（空 = 不带）；
     /// `should_stop` 每读一行检查一次；事件经 `on_event` 同步交付（调用线程即读流线程）。
     pub fn stream_chat(
         &self,
+        model: &str,
         messages: &[ChatMessage],
         tools: &[Value],
         should_stop: &dyn Fn() -> bool,
@@ -156,7 +176,7 @@ impl OpenAiProvider {
             self.config.base_url.trim_end_matches('/')
         );
         let mut body = serde_json::json!({
-            "model": self.config.model,
+            "model": model,
             "stream": true,
             "stream_options": { "include_usage": true },
             "messages": messages,
@@ -235,6 +255,20 @@ impl OpenAiProvider {
         outcome.tool_calls = calls.finish();
         Ok(outcome)
     }
+}
+
+/// `GET /models` 的响应 → 模型 ID 列表（OpenAI 格式 `{"data": [{"id": …}]}`）。
+fn parse_models(text: &str) -> anyhow::Result<Vec<String>> {
+    let value: Value = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("模型列表不是 JSON: {e}"))?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("模型列表缺少 data 字段"))?;
+    Ok(data
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect())
 }
 
 /// 工具调用的一个流式片段（`delta.tool_calls[]`）。
@@ -384,6 +418,13 @@ fn error_message(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_model_list() {
+        let ids = parse_models(r#"{"object":"list","data":[{"id":"a"},{"id":"b","owned_by":"x"},{"x":1}]}"#).unwrap();
+        assert_eq!(ids, ["a", "b"]);
+        assert!(parse_models("{}").is_err());
+    }
 
     #[test]
     fn parses_reasoning_text_finish_and_usage() {

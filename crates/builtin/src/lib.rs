@@ -24,6 +24,11 @@ pub use openai::{
 };
 pub use permissions::PermissionRules;
 
+/// 列出端点提供的模型（阻塞，设置页在后台线程调用）。
+pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<String>> {
+    OpenAiProvider::new(config).list_models()
+}
+
 use claudesktop_core::{
     EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, Record, RoutedEvent,
 };
@@ -52,6 +57,17 @@ pub struct BuiltinConfig {
 }
 
 impl BuiltinConfig {
+    /// 规则文件放在默认数据目录。
+    pub fn new(provider: ProviderConfig, cwd: PathBuf) -> Self {
+        Self {
+            provider,
+            cwd,
+            rules_path: claudesktop_core::default_data_dir()
+                .ok()
+                .map(|d| d.join("permissions.json")),
+        }
+    }
+
     /// 从环境变量读取：
     /// - `CLAUDESKTOP_BASE_URL`（必填）：OpenAI 兼容端点，如 `http://127.0.0.1:8045/v1`
     /// - `CLAUDESKTOP_MODEL`（必填）：模型 ID
@@ -62,17 +78,14 @@ impl BuiltinConfig {
             .ok_or_else(|| anyhow::anyhow!("未设置 CLAUDESKTOP_BASE_URL（OpenAI 兼容端点）"))?;
         let model =
             var("CLAUDESKTOP_MODEL").ok_or_else(|| anyhow::anyhow!("未设置 CLAUDESKTOP_MODEL"))?;
-        Ok(Self {
-            provider: ProviderConfig {
+        Ok(Self::new(
+            ProviderConfig {
                 base_url,
                 api_key: var("CLAUDESKTOP_API_KEY").or_else(|| var("OPENAI_API_KEY")),
                 model,
             },
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            rules_path: claudesktop_core::default_data_dir()
-                .ok()
-                .map(|d| d.join("permissions.json")),
-        })
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ))
     }
 
     /// 写进会话元信息的内核标识：同一端点 + 模型才算同一个「agent」。
@@ -97,6 +110,8 @@ fn modes() -> Vec<ModeView> {
 
 struct SessionState {
     cwd: PathBuf,
+    /// 本会话使用的模型
+    model: String,
     /// 不含系统提示词的对话历史
     history: Vec<ChatMessage>,
     mode: String,
@@ -108,6 +123,8 @@ struct SessionState {
 
 struct Inner {
     provider: OpenAiProvider,
+    /// 新会话的默认模型（最近一次 `set_model` 选的，初始为配置里的）
+    default_model: Mutex<String>,
     sink: EventSink,
     agent_name: String,
     default_cwd: PathBuf,
@@ -134,8 +151,8 @@ impl Inner {
         });
     }
 
-    /// 本步要发给模型的消息与当前模式；会话已不存在返回 None。
-    fn snapshot(&self, session: &str) -> Option<(Vec<ChatMessage>, String, PathBuf)> {
+    /// 本步要发给模型的消息、当前模式、工作目录与模型；会话已不存在返回 None。
+    fn snapshot(&self, session: &str) -> Option<(Vec<ChatMessage>, String, PathBuf, String)> {
         let sessions = self.sessions.lock().unwrap();
         let state = sessions.get(session)?;
         let mut messages = vec![ChatMessage::new(
@@ -143,7 +160,7 @@ impl Inner {
             system_prompt(&state.cwd, &state.mode, state.restored),
         )];
         messages.extend(state.history.iter().cloned());
-        Some((messages, state.mode.clone(), state.cwd.clone()))
+        Some((messages, state.mode.clone(), state.cwd.clone(), state.model.clone()))
     }
 
     fn mode(&self, session: &str) -> String {
@@ -357,6 +374,7 @@ impl BuiltinKernel {
         let agent_name = format!("builtin · {}", config.provider.model);
         let inner = Arc::new(Inner {
             provider: OpenAiProvider::new(config.provider.clone()),
+            default_model: Mutex::new(config.provider.model.clone()),
             sink,
             agent_name: agent_name.clone(),
             default_cwd: config.cwd,
@@ -380,10 +398,12 @@ impl BuiltinKernel {
         let session_id = format!("builtin-{}-{n}", std::process::id());
         let cwd = cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
         let resumed = !history.is_empty();
+        let model = self.inner.default_model.lock().unwrap().clone();
         self.inner.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionState {
                 cwd,
+                model: model.clone(),
                 history,
                 mode: MODE_DEFAULT.into(),
                 restored: resumed,
@@ -396,7 +416,7 @@ impl BuiltinKernel {
                 token,
                 agent_name: self.inner.agent_name.clone(),
                 session_id: session_id.clone(),
-                model: Some(self.inner.provider.model().to_string()),
+                model: Some(model),
                 modes: modes(),
                 current_mode: Some(MODE_DEFAULT.into()),
                 resumed,
@@ -452,14 +472,14 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     let mut stop = "max_turn_requests".to_string();
 
     for _ in 0..MAX_STEPS {
-        let Some((messages, mode, cwd)) = inner.snapshot(&session) else {
+        let Some((messages, mode, cwd, model)) = inner.snapshot(&session) else {
             return;
         };
         let specs = tools::specs(mode != MODE_PLAN);
         let mut text = String::new();
         let result = inner
             .provider
-            .stream_chat(&messages, &specs, &stopped, &mut |event| {
+            .stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
                 if stopped() {
                     return;
                 }
@@ -633,6 +653,21 @@ impl Kernel for BuiltinKernel {
             .get_mut(session)
             .ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
         state.mode = mode_id.to_string();
+        Ok(())
+    }
+
+    fn set_model(&self, session: &str, model: &str) -> anyhow::Result<()> {
+        let model = model.trim();
+        if model.is_empty() {
+            anyhow::bail!("模型 ID 为空");
+        }
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        let state = sessions
+            .get_mut(session)
+            .ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+        // 进行中的一轮用完当前模型，下一步请求起生效
+        state.model = model.to_string();
+        *self.inner.default_model.lock().unwrap() = model.to_string();
         Ok(())
     }
 

@@ -63,7 +63,7 @@ impl ChatApp {
                         div()
                             .text_size(px(12.5))
                             .text_color(rgb(BLUE))
-                            .child("claudesktop"),
+                            .child(self.project_name.clone()),
                     ),
             )
             .child(
@@ -261,6 +261,7 @@ impl ChatApp {
                             .hover(|d| d.bg(rgb(SAND)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.mode_menu_open = !this.mode_menu_open;
+                                this.model_menu_open = false;
                                 cx.notify();
                             }))
                             .child(
@@ -283,10 +284,16 @@ impl ChatApp {
                     .child(div().flex_1())
                     .child(
                         div()
+                            .id("model-chip")
                             .h_flex()
                             .gap_1()
                             .px_2()
                             .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(self.model_menu_open, |d| d.bg(rgb(SAND)))
+                            .hover(|d| d.bg(rgb(SAND)))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_model_menu(cx)))
                             .child(
                                 div()
                                     .text_size(px(13.5))
@@ -328,7 +335,8 @@ impl ChatApp {
                             })),
                     ),
             )
-            .when(self.mode_menu_open, |d| d.child(self.render_mode_menu(cx)));
+            .when(self.mode_menu_open, |d| d.child(self.render_mode_menu(cx)))
+            .when(self.model_menu_open, |d| d.child(self.render_model_menu(cx)));
 
         div()
             .v_flex()
