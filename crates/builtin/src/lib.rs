@@ -198,6 +198,16 @@ impl Inner {
                 kind: kind.into(),
             },
         );
+        // 改动预览：先于权限请求发出，用户能看着 diff 决定是否放行
+        if let Some(diff) = action.as_ref().ok().and_then(|a| a.preview(cwd)) {
+            self.emit(
+                Some(session),
+                KernelEvent::ToolCallDiff {
+                    id: call.id.clone(),
+                    diff,
+                },
+            );
+        }
         let output = match action {
             Err(message) => ToolOutput::fail(message, "参数无效"),
             Ok(action) => match self.authorize(session, cwd, &action, &title, stopped) {

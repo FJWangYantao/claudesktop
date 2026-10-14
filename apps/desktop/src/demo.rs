@@ -8,7 +8,8 @@ pub enum MockAction {
     EndThinking,
     BeginTool(&'static str, &'static str),
     ToolDone(&'static str),
-    Diff(&'static str, DiffRows),
+    /// 给上一个工具行挂一份 diff：(路径, 旧文本, 新文本)
+    Diff(&'static str, &'static str, &'static str),
     BeginPlan,
     PlanRowAdd(&'static str),
     PlanRowDone(usize),
@@ -42,13 +43,16 @@ pub fn stream_steps(
     out
 }
 
-pub const DEMO_DIFF: DiffRows = &[
-    (' ', "pub trait Kernel: Send {"),
-    ('-', "    fn send(&mut self, text: String);"),
-    ('+', "    fn send(&mut self, text: String) -> Result<()>;"),
-    ('+', "    fn cancel(&mut self);"),
-    (' ', "}"),
-];
+pub const DEMO_DIFF_OLD: &str = "pub trait Kernel: Send {
+    fn send(&mut self, text: String);
+}
+";
+pub const DEMO_DIFF_NEW: &str =
+    "pub trait Kernel: Send {
+    fn send(&mut self, text: String) -> Result<()>;
+    fn cancel(&mut self);
+}
+";
 
 pub fn build_demo_script() -> Vec<MockStep> {
     let mut s = Vec::new();
@@ -84,7 +88,7 @@ pub fn build_demo_script() -> Vec<MockStep> {
     ));
     s.push(MockStep(
         150,
-        MockAction::Diff("crates/core/src/lib.rs", DEMO_DIFF),
+        MockAction::Diff("crates/core/src/lib.rs", DEMO_DIFF_OLD, DEMO_DIFF_NEW),
     ));
 
     // 4) 跑构建

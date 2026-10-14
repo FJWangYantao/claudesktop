@@ -914,6 +914,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "similar",
  "smol",
  "windows-sys 0.61.2",
 ]

@@ -1,6 +1,6 @@
 //! 对话记录的数据模型、模式表与工具行辅助函数（UI 无关逻辑）。
 
-use claudesktop_core::PermissionOptionView;
+use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::SharedString;
 
@@ -21,10 +21,24 @@ pub struct ToolCard {
     pub arg: SharedString,
     pub result: SharedString,
     pub phase: ToolPhase,
+    /// 该调用改动的文件（同一路径只保留最新一份）
+    pub diffs: Vec<DiffView>,
+    /// diff 已展开全部行（默认只显示前 [`DIFF_PREVIEW_ROWS`] 行）
+    pub expanded: bool,
 }
 
-/// diff 行：(' ' 上下文 / '+' 新增 / '-' 删除, 文本)
-pub type DiffRows = &'static [(char, &'static str)];
+/// 折叠状态下每个 diff 最多显示的行数
+pub const DIFF_PREVIEW_ROWS: usize = 40;
+
+impl ToolCard {
+    /// 记录一份 diff：同一路径替换（执行前的预览会被之后的结果覆盖）。
+    pub fn set_diff(&mut self, diff: DiffView) {
+        match self.diffs.iter_mut().find(|d| d.path == diff.path) {
+            Some(slot) => *slot = diff,
+            None => self.diffs.push(diff),
+        }
+    }
+}
 
 pub struct PlanRow {
     pub text: SharedString,
@@ -50,10 +64,6 @@ pub enum ChatItem {
         title: SharedString,
         options: Vec<PermissionOptionView>,
         resolved: Option<SharedString>,
-    },
-    Diff {
-        path: &'static str,
-        rows: DiffRows,
     },
     Plan(Vec<PlanRow>),
     Agent(String),

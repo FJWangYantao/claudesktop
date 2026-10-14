@@ -13,10 +13,12 @@
 //! （内核线程调用），指令经 channel（UI 线程投递）。
 
 mod acp;
+mod diff;
 mod process_guard;
 mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
+pub use diff::{DiffLineView, DiffView};
 pub use process_guard::kill_children_on_exit;
 pub use store::{Record, SessionLog, SessionMeta, SessionStore, default_data_dir};
 
@@ -114,6 +116,8 @@ pub enum KernelEvent {
         /// 输出摘要：能从结构化输出里取到文本就取文本，否则是 JSON 文本；已截断
         raw_output: Option<String>,
     },
+    /// 工具调用涉及的文件改动（可能在执行前作为预览发出，同一路径再次发出时替换）
+    ToolCallDiff { id: String, diff: DiffView },
     /// 计划整体替换（ACP 语义：每次都是全量列表）
     PlanReplaced { entries: Vec<PlanEntryView> },
     /// 权限请求已按策略自动应答（`auto_approve` 开启时：allow_once 优先）
@@ -159,6 +163,7 @@ impl KernelEvent {
             Self::UserMessageChunk { .. } => "user_message_chunk",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallUpdated { .. } => "tool_call_updated",
+            Self::ToolCallDiff { .. } => "tool_call_diff",
             Self::PlanReplaced { .. } => "plan_replaced",
             Self::PermissionAuto { .. } => "permission_auto",
             Self::PermissionRequest { .. } => "permission_request",

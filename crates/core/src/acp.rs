@@ -29,7 +29,8 @@ use agent_client_protocol::schema::v1::{
     ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionModeState,
     SessionNotification,
-    SetSessionModeRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    SetSessionModeRequest, TextContent, ToolCallContent, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
@@ -38,7 +39,7 @@ use futures::channel::oneshot;
 use futures::StreamExt;
 
 use crate::{
-    EventSink, Kernel, KernelCommand, KernelEvent, ModeView, PermissionOptionView, PlanEntryView,
+    DiffView, EventSink, Kernel, KernelCommand, KernelEvent, ModeView, PermissionOptionView, PlanEntryView,
     RoutedEvent,
 };
 
@@ -601,8 +602,32 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
         // 其余变体（usage/notice/mode/commands…）M1 统一降级为 Status
         other => Some(KernelEvent::Status(format!("update: {other:?}"))),
     };
+    let session = notification.session_id.to_string();
     if let Some(event) = event {
-        emit(sink, Some(notification.session_id.to_string()), event);
+        emit(sink, Some(session.clone()), event);
+    }
+    // 工具内容里的文件改动单独发成 ToolCallDiff
+    let (id, content) = match &notification.update {
+        SessionUpdate::ToolCall(call) => (&call.tool_call_id, Some(&call.content)),
+        SessionUpdate::ToolCallUpdate(update) => (&update.tool_call_id, update.fields.content.as_ref()),
+        _ => return,
+    };
+    for item in content.into_iter().flatten() {
+        if let ToolCallContent::Diff(diff) = item {
+            let view = DiffView::compute(
+                diff.path.display().to_string(),
+                diff.old_text.as_deref(),
+                &diff.new_text,
+            );
+            emit(
+                sink,
+                Some(session.clone()),
+                KernelEvent::ToolCallDiff {
+                    id: id.to_string(),
+                    diff: view,
+                },
+            );
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 use super::ChatApp;
 use crate::model::*;
 use crate::theme::*;
-use claudesktop_core::PermissionOptionView;
+use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
@@ -107,7 +107,7 @@ impl ChatApp {
         col
     }
 
-    pub(super) fn render_tool(card: &ToolCard) -> Div {
+    pub(super) fn render_tool(idx: usize, card: &ToolCard, cx: &mut Context<Self>) -> Div {
         let dot = match card.phase {
             ToolPhase::Running => CORAL,
             ToolPhase::Done => GREEN,
@@ -167,6 +167,41 @@ impl ChatApp {
                             .text_color(rgb(INK_SOFT))
                             .child(card.result.clone()),
                     ),
+            );
+        }
+        // 文件改动：默认每份只显示前若干行，超出给一个展开开关
+        let limit = (!card.expanded).then_some(DIFF_PREVIEW_ROWS);
+        for diff in &card.diffs {
+            col = col.child(div().mt_1().child(Self::render_diff(diff, limit)));
+        }
+        let hidden: usize = card
+            .diffs
+            .iter()
+            .map(|d| d.lines.len().saturating_sub(DIFF_PREVIEW_ROWS))
+            .sum();
+        if hidden > 0 || card.expanded {
+            let label = if card.expanded {
+                "收起".to_string()
+            } else {
+                format!("展开其余 {hidden} 行")
+            };
+            col = col.child(
+                div()
+                    .id(("diff-toggle", idx))
+                    .pl_3()
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(rgb(INK_SOFT))
+                    .hover(|d| d.text_color(rgb(INK)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(ChatItem::Tool(card)) =
+                            this.sessions[this.active].transcript.get_mut(idx)
+                        {
+                            card.expanded = !card.expanded;
+                            cx.notify();
+                        }
+                    }))
+                    .child(label),
             );
         }
         col
@@ -257,28 +292,28 @@ impl ChatApp {
             .child(footer)
     }
 
-    pub(super) fn render_diff(path: &'static str, rows: DiffRows) -> Div {
-        let mut old_no = 1usize;
-        let mut new_no = 1usize;
+    /// 一个文件的 diff 卡片；`limit` = 最多显示的行数（None = 全部）。
+    pub(super) fn render_diff(diff: &DiffView, limit: Option<usize>) -> Div {
+        let shown = limit.map_or(diff.lines.len(), |n| n.min(diff.lines.len()));
         let mut body = div().v_flex();
-        for (kind, text) in rows {
-            let (bg, fg, no) = match kind {
-                '+' => {
-                    let n = new_no;
-                    new_no += 1;
-                    (Some(DIFF_ADD_BG), DIFF_ADD_FG, n)
-                }
-                '-' => {
-                    let n = old_no;
-                    old_no += 1;
-                    (Some(DIFF_DEL_BG), DIFF_DEL_FG, n)
-                }
-                _ => {
-                    let n = new_no;
-                    old_no += 1;
-                    new_no += 1;
-                    (None, INK_SOFT, n)
-                }
+        for line in &diff.lines[..shown] {
+            if line.tag == '~' {
+                body = body.child(
+                    div()
+                        .h(px(18.))
+                        .pl(px(44.))
+                        .font_family(MONO)
+                        .text_size(px(12.))
+                        .text_color(rgb(INK_FAINT))
+                        .bg(rgb(SAND))
+                        .child("⋯"),
+                );
+                continue;
+            }
+            let (bg, fg) = match line.tag {
+                '+' => (Some(DIFF_ADD_BG), DIFF_ADD_FG),
+                '-' => (Some(DIFF_DEL_BG), DIFF_DEL_FG),
+                _ => (None, INK_SOFT),
             };
             body = body.child(
                 div()
@@ -290,30 +325,80 @@ impl ChatApp {
                     .line_height(relative(1.6))
                     .child(
                         div()
-                            .w(px(36.))
+                            .w(px(44.))
                             .flex_shrink_0()
                             .pr_2()
                             .flex()
                             .justify_end()
                             .text_color(rgb(INK_FAINT))
-                            .child(format!("{no}")),
+                            .child(format!("{}", line.no)),
                     )
                     .child(
                         div()
                             .w(px(14.))
                             .flex_shrink_0()
                             .text_color(rgb(fg))
-                            .child(kind.to_string()),
+                            .child(line.tag.to_string()),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_color(rgb(if bg.is_some() { fg } else { INK }))
-                            .child(*text),
+                            .child(line.text.clone()),
                     ),
             );
         }
+        if diff.truncated && shown == diff.lines.len() {
+            body = body.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(12.5))
+                    .text_color(rgb(INK_FAINT))
+                    .child("改动过大，其余部分未显示"),
+            );
+        }
+        let mut header = div()
+            .h_flex()
+            .gap_1p5()
+            .px_3()
+            .py_1p5()
+            .bg(rgb(SAND))
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(
+                Icon::new(IconAll::FileText)
+                    .size_3p5()
+                    .text_color(rgb(INK_SOFT)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.))
+                    .font_family(MONO)
+                    .text_color(rgb(INK_SOFT))
+                    .child(diff.path.clone()),
+            );
+        if diff.created {
+            header = header.child(div().text_size(px(12.5)).text_color(rgb(INK_FAINT)).child("新文件"));
+        }
+        header = header
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .font_family(MONO)
+                    .text_color(rgb(DIFF_ADD_FG))
+                    .child(format!("+{}", diff.added)),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .font_family(MONO)
+                    .text_color(rgb(DIFF_DEL_FG))
+                    .child(format!("−{}", diff.removed)),
+            );
         div()
             .v_flex()
             .rounded_lg()
@@ -321,28 +406,7 @@ impl ChatApp {
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
             .overflow_hidden()
-            .child(
-                div()
-                    .h_flex()
-                    .gap_1p5()
-                    .px_3()
-                    .py_1p5()
-                    .bg(rgb(SAND))
-                    .border_b_1()
-                    .border_color(rgb(LINE))
-                    .child(
-                        Icon::new(IconAll::FileText)
-                            .size_3p5()
-                            .text_color(rgb(INK_SOFT)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_family(MONO)
-                            .text_color(rgb(INK_SOFT))
-                            .child(path),
-                    ),
-            )
+            .child(header)
             .child(body)
     }
 
@@ -429,8 +493,7 @@ impl ChatApp {
                 open,
             } => Self::railed(Self::render_thinking(idx, text, *streaming, *open, cx)),
             ChatItem::Info { text, open } => Self::railed(Self::render_info(idx, text, *open, cx)),
-            ChatItem::Tool(card) => Self::railed(Self::render_tool(card)),
-            ChatItem::Diff { path, rows } => Self::railed(Self::render_diff(path, rows)),
+            ChatItem::Tool(card) => Self::railed(Self::render_tool(idx, card, cx)),
             ChatItem::Permission {
                 title,
                 options,

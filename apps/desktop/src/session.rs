@@ -2,7 +2,7 @@
 
 use crate::demo::*;
 use crate::model::*;
-use claudesktop_core::{Kernel, KernelEvent, Record, SessionLog, SessionMeta};
+use claudesktop_core::{DiffView, Kernel, KernelEvent, Record, SessionLog, SessionMeta};
 use gpui_kit::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -261,6 +261,8 @@ impl Session {
                     arg,
                     result: SharedString::default(),
                     phase: tool_phase(&status),
+                    diffs: Vec::new(),
+                    expanded: false,
                 }));
             }
             KernelEvent::ToolCallUpdated {
@@ -269,11 +271,7 @@ impl Session {
                 status,
                 raw_output,
             } => {
-                let card = self.transcript.iter_mut().rev().find_map(|item| match item {
-                    ChatItem::Tool(card) if card.id.as_deref() == Some(id.as_str()) => Some(card),
-                    _ => None,
-                });
-                if let Some(card) = card {
+                if let Some(card) = self.tool_card(&id) {
                     if let Some(title) = title {
                         let (name, arg) = tool_label(&card.kind, &title);
                         card.name = name;
@@ -285,6 +283,11 @@ impl Session {
                     if let Some(raw) = raw_output {
                         card.result = summarize_output(&raw).into();
                     }
+                }
+            }
+            KernelEvent::ToolCallDiff { id, diff } => {
+                if let Some(card) = self.tool_card(&id) {
+                    card.set_diff(diff);
                 }
             }
             KernelEvent::PlanReplaced { entries } => {
@@ -349,6 +352,14 @@ impl Session {
         None
     }
 
+    /// 按 tool_call_id 找最近的工具行。
+    fn tool_card(&mut self, id: &str) -> Option<&mut ToolCard> {
+        self.transcript.iter_mut().rev().find_map(|item| match item {
+            ChatItem::Tool(card) if card.id.as_deref() == Some(id) => Some(card),
+            _ => None,
+        })
+    }
+
     pub fn apply_mock(&mut self, action: &MockAction) {
         match action {
             MockAction::BeginThinking => {
@@ -379,6 +390,8 @@ impl Session {
                     arg: (*arg).into(),
                     result: SharedString::default(),
                     phase: ToolPhase::Running,
+                    diffs: Vec::new(),
+                    expanded: false,
                 }));
             }
             MockAction::ToolDone(result) => {
@@ -387,8 +400,10 @@ impl Session {
                     card.phase = ToolPhase::Done;
                 }
             }
-            MockAction::Diff(path, rows) => {
-                self.transcript.push(ChatItem::Diff { path, rows });
+            MockAction::Diff(path, old, new) => {
+                if let Some(ChatItem::Tool(card)) = self.transcript.last_mut() {
+                    card.set_diff(DiffView::compute(*path, Some(old), new));
+                }
             }
             MockAction::BeginPlan => {
                 self.transcript.push(ChatItem::Plan(Vec::new()));
@@ -514,5 +529,40 @@ mod tests {
             })
             .collect();
         assert_eq!(labels, ["Yes", "已取消"]);
+    }
+
+    #[core::prelude::v1::test]
+    fn diffs_attach_to_tool_card_and_replace_by_path() {
+        let started = ev(KernelEvent::ToolCallStarted {
+            id: "e1".into(),
+            title: "Edit a.txt".into(),
+            status: "pending".into(),
+            kind: "edit".into(),
+        });
+        let diff = |new: &str| {
+            ev(KernelEvent::ToolCallDiff {
+                id: "e1".into(),
+                diff: DiffView::compute("a.txt", Some("x
+"), new),
+            })
+        };
+        let records = vec![
+            Record::User { text: "改".into() },
+            started,
+            diff("y
+"),
+            diff("z
+"),
+            ev(KernelEvent::ToolCallDiff {
+                id: "e1".into(),
+                diff: DiffView::compute("b.txt", None, "b
+"),
+            }),
+        ];
+        let s = Session::from_records(1, meta(), records);
+        let ChatItem::Tool(card) = &s.transcript[1] else { panic!("tool card") };
+        let paths: Vec<_> = card.diffs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "b.txt"]);
+        assert_eq!(card.diffs[0].lines.last().unwrap().text, "z");
     }
 }

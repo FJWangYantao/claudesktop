@@ -415,6 +415,36 @@ fn write_asks_permission_and_allow_always_is_remembered() {
 }
 
 #[test]
+fn edit_previews_diff_before_asking() {
+    let dir = workdir("diff");
+    std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let (base, _bodies) = serve(vec![
+        tool_call("e1", "edit_file", serde_json::json!({ "path": "a.txt", "old_string": "two", "new_string": "2" })),
+        happy_stream("不改了"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, "改一下".into()).unwrap();
+    let (req, _) = h.permission(1);
+    {
+        let events = h.events.lock().unwrap();
+        let pos = |pred: &dyn Fn(&KernelEvent) -> bool| events.iter().position(|r| pred(&r.event));
+        let diff_at = pos(&|e| matches!(e, KernelEvent::ToolCallDiff { id, .. } if id == "e1")).expect("diff");
+        let ask_at = pos(&|e| matches!(e, KernelEvent::PermissionRequest { .. })).unwrap();
+        assert!(diff_at < ask_at, "diff 应先于权限请求");
+        let KernelEvent::ToolCallDiff { diff, .. } = &events[diff_at].event else { unreachable!() };
+        assert_eq!((diff.path.as_str(), diff.added, diff.removed, diff.created), ("a.txt", 1, 1, false));
+        let tags: String = diff.lines.iter().map(|l| l.tag).collect();
+        assert_eq!(tags, " -+ ");
+    }
+    h.kernel.resolve_permission(req, Some("reject_once".into())).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 拒绝后文件不变
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\ntwo\nthree\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn rejected_call_is_reported_to_the_model() {
     let dir = workdir("reject");
     let (base, bodies) = serve(vec![

@@ -10,6 +10,7 @@ agent-client-protocol = { workspace = true, features = ["process"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+similar = "2"
 futures = { workspace = true }
 smol = { workspace = true }
 

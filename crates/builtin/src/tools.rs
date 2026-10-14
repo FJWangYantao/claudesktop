@@ -2,6 +2,7 @@
 //!
 //! 给模型看的说明与结果用英文（与系统提示词一致），给 UI 的摘要用中文。
 
+use claudesktop_core::DiffView;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -26,6 +27,8 @@ const LIST_MAX: usize = 1000;
 const OUTPUT_MAX_CHARS: usize = 30_000;
 /// 每个管道最多收集的字节
 const PIPE_MAX_BYTES: usize = 2 << 20;
+/// 超过这个大小的文件不做 diff 预览
+const PREVIEW_MAX_BYTES: u64 = 2 << 20;
 const SHELL_TIMEOUT_DEFAULT: u64 = 120;
 const SHELL_TIMEOUT_MAX: u64 = 600;
 
@@ -323,6 +326,28 @@ impl Action {
         }
     }
 
+    /// 写 / 改文件将产生的改动（执行前算，供权限卡片和工具卡片展示）；
+    /// 其他工具、预计会失败或文件不适合预览时返回 None。
+    pub fn preview(&self, cwd: &Path) -> Option<DiffView> {
+        match self {
+            Self::Write { path, content } => {
+                let old = read_for_preview(path).ok()?;
+                Some(DiffView::compute(display(cwd, path), old.as_deref(), content))
+            }
+            Self::Edit {
+                path,
+                old,
+                new,
+                all,
+            } => {
+                let text = read_for_preview(path).ok()??;
+                let r = replace_in(&text, path, old, new, *all).ok()?;
+                Some(DiffView::compute(display(cwd, path), Some(&text), &r.text))
+            }
+            _ => None,
+        }
+    }
+
     /// 执行；`should_stop` 用于中断长命令。
     pub fn run(&self, should_stop: &dyn Fn() -> bool) -> ToolOutput {
         match self {
@@ -519,14 +544,19 @@ fn write_file(path: &Path, content: &str) -> ToolOutput {
     }
 }
 
-fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> ToolOutput {
+/// 一次替换的结果：新全文、替换处数、实际使用的旧 / 新片段（可能已转成 CRLF）
+struct Replaced {
+    text: String,
+    count: usize,
+    old: String,
+    new: String,
+}
+
+/// 在 `text` 里做精确替换；失败时返回给模型 / UI 的错误。
+fn replace_in(text: &str, path: &Path, old: &str, new: &str, all: bool) -> Result<Replaced, ToolOutput> {
     if old.is_empty() {
-        return ToolOutput::fail("old_string must not be empty; use write_file to create files", "参数无效");
+        return Err(ToolOutput::fail("old_string must not be empty; use write_file to create files", "参数无效"));
     }
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败"),
-    };
     // 文件是 CRLF 而模型给的是 LF：按 CRLF 再试一次
     let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
     let (old, new) = if !text.contains(old) && text.contains("\r\n") && text.contains(&crlf(old)) {
@@ -536,28 +566,53 @@ fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> ToolOutput {
     };
     let count = text.matches(old.as_str()).count();
     if count == 0 {
-        return ToolOutput::fail(
+        return Err(ToolOutput::fail(
             format!("old_string not found in {}. Read the file and copy the text exactly.", path.display()),
             "未找到要替换的内容",
-        );
+        ));
     }
     if count > 1 && !all {
-        return ToolOutput::fail(
+        return Err(ToolOutput::fail(
             format!("old_string occurs {count} times in {}; add surrounding context or set replace_all", path.display()),
             format!("匹配到 {count} 处"),
-        );
+        ));
     }
-    let updated = if all { text.replace(&old, &new) } else { text.replacen(&old, &new, 1) };
-    match std::fs::write(path, updated) {
+    let text = if all { text.replace(&old, &new) } else { text.replacen(&old, &new, 1) };
+    Ok(Replaced {
+        text,
+        count: if all { count } else { 1 },
+        old,
+        new,
+    })
+}
+
+fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> ToolOutput {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败"),
+    };
+    let r = match replace_in(&text, path, old, new, all) {
+        Ok(r) => r,
+        Err(out) => return out,
+    };
+    match std::fs::write(path, &r.text) {
         Ok(()) => {
-            let n = if all { count } else { 1 };
-            let (minus, plus) = (old.lines().count(), new.lines().count());
+            let (minus, plus) = (r.old.lines().count(), r.new.lines().count());
             ToolOutput::ok(
-                format!("Replaced {n} occurrence(s) in {}", path.display()),
-                format!("替换 {n} 处（−{minus} +{plus} 行）"),
+                format!("Replaced {} occurrence(s) in {}", r.count, path.display()),
+                format!("替换 {} 处（−{minus} +{plus} 行）", r.count),
             )
         }
         Err(e) => ToolOutput::fail(format!("Cannot write {}: {e}", path.display()), "写入失败"),
+    }
+}
+
+/// 读出用于 diff 预览的旧内容：不存在 → Ok(None)；过大或不是 UTF-8 → Err(())
+fn read_for_preview(path: &Path) -> Result<Option<String>, ()> {
+    match std::fs::metadata(path) {
+        Err(_) => Ok(None),
+        Ok(m) if m.len() > PREVIEW_MAX_BYTES => Err(()),
+        Ok(_) => std::fs::read_to_string(path).map(Some).map_err(|_| ()),
     }
 }
 
@@ -759,6 +814,31 @@ mod tests {
         assert!(!shell_rule_matches("git status", "git push"));
         assert!(!shell_rule_matches("git status", "git status; rm x"));
         assert!(!shell_rule_matches("cargo", "cargo test > out.txt"));
+    }
+
+    #[test]
+    fn preview_diffs() {
+        let dir = tmp("preview");
+        let args = |v: Value| v.to_string();
+        let new = Action::parse(WRITE_FILE, &args(json!({"path": "n.txt", "content": "a
+b
+"})), &dir).unwrap();
+        let d = new.preview(&dir).unwrap();
+        assert_eq!((d.path.as_str(), d.created, d.added), ("n.txt", true, 2));
+        // 预览不落盘
+        assert!(!dir.join("n.txt").exists());
+
+        std::fs::write(dir.join("e.txt"), "x
+y
+").unwrap();
+        let edit = |old: &str| {
+            Action::parse(EDIT_FILE, &args(json!({"path": "e.txt", "old_string": old, "new_string": "Y"})), &dir).unwrap()
+        };
+        let d = edit("y").preview(&dir).unwrap();
+        assert_eq!((d.added, d.removed, d.created), (1, 1, false));
+        // 找不到要替换的内容 → 不给预览（执行时会报错）
+        assert!(edit("zzz").preview(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
