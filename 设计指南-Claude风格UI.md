@@ -429,7 +429,7 @@ claude.ai 的输入框圆角比卡片大一档（约 20px），这是它看起�
 
 **P1：体验差异化**
 
-> 第 7–11 条已于 2026-10 落地（标 ✅）；第 12 条（深色模式）待做。
+> P1 第 7–12 条已于 2026-10 全部落地（标 ✅）；P2 待做。
 
 7. ✅ **视图模式三档**（Summary / Normal / Verbose，`Ctrl+O` 循环）。
    → 摘要 / 标准 / 详细，全局一档（不是每个会话一档），顶栏下拉或 `Ctrl+O` 切换，写回 `settings.json` 的 `view_mode`（只改盘上那份的这一项，内存里的设置合并过环境变量）。
@@ -444,7 +444,10 @@ claude.ai 的输入框圆角比卡片大一档（约 20px），这是它看起�
 10. ✅ **权限卡**：标题改成问句"要允许这一步吗？"，下面是内核给的操作标题。
     → 数字键选项**刻意没做**：权限卡出现时焦点通常在输入框里，用户可能正在打下一句话，按到 `1` 就会误批一条命令。官方桌面端的数字键也只用于已打开的菜单。
 11. ✅ **输入框**：附件缩略图、文字、工具栏（权限模式 / 内核 / 附件 / 档案 / 模型 / 发送）收进同一张卡片；圆角 16px（`rounded_2xl`）；聚焦时边框换 `INK_FAINT`、阴影加一档；点卡片空白处把焦点给输入框。
-12. **深色模式的前提**：把 `theme.rs` 的 `const u32` 改成 `Palette` 结构体（浅色 / 深色各一份），通过全局状态读取；深色色值参考 §2.1 的表，上线前逐对校对比度。
+12. ✅ **深色模式**：直接做完了，不只是前提。
+    → `theme.rs` 的每个颜色改成 `Color { light, dark }` 一对，`theme::rgb()` 遮住 gpui 的同名函数、按当前外观取值，所以调用处仍是 `rgb(INK)`，而且直接传十六进制会编译不过。设置页顶部加了"外观：跟随系统 / 浅色 / 深色"，即时生效并写回 `settings.json`；跟随系统时监听 `observe_window_appearance`。gpui-kit 自己的组件（输入框、提示、滚动条）通过 `Theme::change` 同步切换。
+    → 深色色值见 §7.3；所有承载信息的文字在深色各底上对比度 ≥ 5.9:1（`INK_SOFT`），赤陶橙在深色主区上 4.9:1。
+    → 实测时发现两类在深色下会"消失"的写法，已修并记进 AGENTS.md：① 底色是会反转的颜色（如停止按钮的 `INK` 底）时，前景不能用固定的 `WHITE`，要用同样会反转的 `PAPER`；② `RED` 在深色下提亮成前景色，当实色按钮底时白字不够，危险按钮另用 `DANGER`。
 
 **P2：品牌感和完整度**
 
@@ -456,19 +459,29 @@ claude.ai 的输入框圆角比卡片大一档（约 20px），这是它看起�
 
 ### 7.3 `theme.rs` 里的 token（已落地）
 
-```rust
-pub const CORAL_DEEP: u32 = 0xBF502B;        // 带文字的主按钮（白字 4.8:1）
-pub const CORAL_DEEP_HOVER: u32 = 0xAF4928;  // 主按钮悬停（白字 5.5:1）
+每个颜色是浅色 / 深色一对，界面里一律写 `rgb(TOKEN)`：
 
-pub const HOVER: u32 = SAND;                 // 纸底 / 卡片上的悬停
-pub const SELECTED: u32 = SAND_ACTIVE;       // 选中态；沙色底上的悬停
-pub const HOVER_STRONG: u32 = 0xDCD6C6;      // SELECTED 行里再叠一层的悬停
+| Token | 浅色 | 深色 | 用途 |
+|---|---|---|---|
+| `PAPER` | `#FAF9F5` | `#262624` | 主区底色 |
+| `SAND` | `#F0EEE6` | `#1F1E1D` | 凹下去的面：侧栏、用户气泡、代码块、概览面板 |
+| `CARD` | `#FFFFFF` | `#30302E` | 浮起来的面：输入框、卡片、弹层 |
+| `INK` | `#1F1E1D` | `#F5F4EE` | 主文字 |
+| `INK_SOFT` | `#6E6B65` | `#BDB9AE` | 次要文字 |
+| `INK_FAINT` | `#B5B0A4` | `#6E6C66` | 占位、禁用、分隔、装饰 |
+| `LINE` | `#E5E1D5` | `#3D3C38` | 细线 |
+| `HOVER` | `#F0EEE6` | `#3A3936` | 纸底 / 卡片上的悬停 |
+| `SELECTED` | `#E8E3D6` | `#33322F` | 选中；沙色底上的悬停 |
+| `HOVER_STRONG` | `#DCD6C6` | `#45443F` | 选中行里再叠一层的悬停 |
+| `CORAL` | `#D97757` | 同左 | 品牌强调、发送按钮（只放图标） |
+| `CORAL_DEEP` / `_HOVER` | `#BF502B` / `#AF4928` | 同左 | 带文字的主按钮（白字 4.8 / 5.5:1） |
+| `RED` / `GREEN` | `#C0504D` / `#7A9A65` | `#E5726C` / `#94B07E` | 前景状态色 |
+| `DANGER` | `#C0504D` | `#B8433F` | 危险操作实色按钮底（白字） |
+| `WHITE` | `#FFFFFF` | 同左 | 固定深色实底上的文字 / 图标 |
+| `CODE_BG` | `#EDE9DF` | `#1A1918` | 行内代码底 |
+| `DIFF_ADD_*` / `DIFF_DEL_*` | 浅绿 / 浅红底 + 深字 | 暗绿 / 暗红底 + 亮字 | diff |
 
-pub const READING_W: Pixels = px(760.);      // 对话列与输入框
-pub const FORM_W: Pixels = px(720.);         // 设置页
-pub const OVERVIEW_W: Pixels = px(724.);     // 首页用量概览面板
-pub const SIDEBAR_W: Pixels = px(256.);      // 侧栏（含外圈留白）
-```
+布局宽度：`READING_W` 760（对话列与输入框）/ `FORM_W` 720（设置页）/ `OVERVIEW_W` 724（概览面板）/ `SIDEBAR_W` 256（侧栏）。
 
 圆角不另设常量，直接用 gpui 的档位（`rounded_xs` 2px / `rounded_sm` 4px / `rounded_md` 6px / `rounded_lg` 8px / `rounded_xl` 12px / `rounded_2xl` 16px），各档用途写在 `theme.rs` 的注释里。AGENTS.md 的"颜色 / 字号"惯例旁已补上对应规则。
 

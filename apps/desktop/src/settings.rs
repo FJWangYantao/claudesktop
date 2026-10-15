@@ -183,6 +183,30 @@ pub struct Settings {
     pub acp: AcpSettings,
     /// 对话视图模式（摘要 / 标准 / 详细），顶栏下拉或 Ctrl+O 切换后立即写回
     pub view_mode: ViewMode,
+    /// 外观（跟随系统 / 浅色 / 深色），设置页切换后立即生效并写回
+    pub appearance: Appearance,
+}
+
+/// 外观偏好。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Appearance::System => "跟随系统",
+            Appearance::Light => "浅色",
+            Appearance::Dark => "深色",
+        }
+    }
 }
 
 impl Settings {
@@ -368,6 +392,16 @@ pub fn antigravity_gateway() -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[core::prelude::v1::test]
+    fn ui_prefs_default_and_parse() {
+        // 旧设置文件没有这两项：跟随系统 + 标准视图
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!((s.appearance, s.view_mode), (Appearance::System, ViewMode::Normal));
+        let s: Settings =
+            serde_json::from_str(r#"{"appearance":"dark","view_mode":"verbose"}"#).unwrap();
+        assert_eq!((s.appearance, s.view_mode), (Appearance::Dark, ViewMode::Verbose));
+    }
 
     #[core::prelude::v1::test]
     fn roundtrip_and_defaults() {

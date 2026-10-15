@@ -3,6 +3,7 @@
 use super::ChatApp;
 use crate::model::*;
 use crate::theme::*;
+use crate::theme::rgb;
 use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
@@ -10,7 +11,7 @@ use gpui_kit::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 impl ChatApp {
-    pub(super) fn heat_color(v: u8) -> u32 {
+    pub(super) fn heat_color(v: u8) -> Color {
         HEAT[(v as usize).min(HEAT.len() - 1)]
     }
 

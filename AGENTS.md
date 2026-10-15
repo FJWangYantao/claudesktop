@@ -27,6 +27,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **按钮**：新按钮优先 `gpui-component` 的 `Button`（变体齐全）；确需特殊样式再
   手写 div，但成组出现时应抽成 `app/widgets.rs` 的 helper。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
+  - 每个常量是浅色 / 深色一对（`Color`），界面里写 `rgb(INK)`；这个 `rgb` 是 `theme::rgb`（按当前外观取值），
+    文件里要 `use crate::theme::rgb;`，否则和 `gpui_kit::*` 里的同名函数冲突。新颜色两种外观都要给值并校对对比度。
+  - 前景放在会随外观反转的实底上（如 `INK` 底的停止按钮）时用 `PAPER` 当前景，不用固定的 `WHITE`；
+    `RED` 是前景色（深色下提亮），危险操作的实色按钮底用 `DANGER`。
   - 交互态：纸底 / 卡片上悬停用 `HOVER`，选中态和沙色底上悬停用 `SELECTED`，已选中行里再叠一层用
     `HOVER_STRONG`；不要拿 `LINE` / `PAPER` / 透明度当悬停。
   - 带文字的主按钮底色用 `CORAL_DEEP`（悬停 `CORAL_DEEP_HOVER`）；`CORAL` 上白字只有 3.1:1，只给图标按钮。

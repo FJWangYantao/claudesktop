@@ -5,6 +5,7 @@
 use super::ChatApp;
 use crate::session::{Activity, TurnUsage};
 use crate::theme::*;
+use crate::theme::rgb;
 use crate::usage;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::*;

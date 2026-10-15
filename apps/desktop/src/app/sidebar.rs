@@ -4,6 +4,7 @@ use super::chrome::{drag_area, traffic_light_gap, CHROME_H};
 use super::ChatApp;
 use crate::settings::KernelChoice;
 use crate::theme::*;
+use crate::theme::rgb;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
@@ -307,7 +308,7 @@ impl ChatApp {
                     .cursor_pointer()
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(if danger { WHITE } else { INK_SOFT }))
-                    .bg(rgb(if danger { RED } else { CARD }))
+                    .bg(rgb(if danger { DANGER } else { CARD }))
                     .child(label)
             };
             return row

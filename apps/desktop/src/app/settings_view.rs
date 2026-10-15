@@ -3,9 +3,11 @@
 use super::ChatApp;
 use crate::settings::*;
 use crate::theme::*;
+use crate::theme::rgb;
 use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -111,6 +113,75 @@ impl ChatApp {
     }
 
     /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
+    /// 视图模式、外观这类即时生效的偏好：改内存里的设置，并只把这一项写回盘上的设置文件
+    /// （内存里的设置合并过环境变量，不能整份写回；文件坏了就不碰，免得用默认值盖掉）。
+    pub(crate) fn save_ui_pref(&mut self, edit: impl Fn(&mut Settings)) {
+        edit(&mut self.settings);
+        if let Some(path) = &self.settings_path {
+            let (mut on_disk, broken) = Settings::load(Some(path));
+            if broken.is_none() {
+                edit(&mut on_disk);
+                if let Err(err) = on_disk.save(path) {
+                    self.sessions[self.active].note(format!("设置没能保存：{err}"));
+                }
+            }
+        }
+    }
+
+    /// 按设置（或系统外观）切浅色 / 深色：我们自己的色板和 gpui-kit 组件（输入框、提示、滚动条）一起切。
+    pub(crate) fn apply_appearance(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let dark = match self.settings.appearance {
+            Appearance::System => {
+                matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
+            }
+            Appearance::Light => false,
+            Appearance::Dark => true,
+        };
+        crate::theme::set_dark(dark);
+        let mode = if dark { ThemeMode::Dark } else { ThemeMode::Light };
+        if Theme::global(cx).mode != mode {
+            Theme::change(mode, None, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_appearance(&mut self, a: Appearance, window: &Window, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.appearance = a);
+        self.apply_appearance(window, cx);
+    }
+
+    /// 设置页顶部的外观切换（即时生效，不走「保存并应用」）。
+    fn render_appearance(&self, cx: &mut Context<Self>) -> Div {
+        let current = self.settings.appearance;
+        let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
+        for (i, a) in Appearance::ALL.into_iter().enumerate() {
+            segs = segs.child(
+                div()
+                    .id(("appearance", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| this.set_appearance(a, window, cx)))
+                    .child(Self::seg(a.label(), a == current)),
+            );
+        }
+        div()
+            .v_flex()
+            .gap_2()
+            .child(div().text_size(TEXT_BODY).font_weight(FontWeight::MEDIUM).child("外观"))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(segs)
+                    .child(
+                        div()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK_SOFT))
+                            .child("立即生效，不用点保存"),
+                    ),
+            )
+    }
+
     fn form_settings(&self, cx: &App) -> Settings {
         let f = &self.settings_form;
         let mut s = self.settings.clone();
@@ -891,6 +962,7 @@ impl ChatApp {
                                     .child(Icon::new(IconAll::X).size_4().text_color(rgb(INK_SOFT))),
                             ),
                     )
+                    .child(self.render_appearance(cx))
                     .child(body)
                     .child(self.render_rules(cx)),
             )

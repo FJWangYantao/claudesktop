@@ -5,6 +5,7 @@ use super::menu::{menu_action, menu_item, menu_popover, MenuChip};
 use crate::model::{ChatItem, PendingImage};
 use crate::settings::KernelChoice;
 use crate::theme::*;
+use crate::theme::rgb;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::input::Input;
@@ -170,7 +171,7 @@ impl ChatApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_pending_image(i, cx);
                     }))
-                    .child(Icon::new(IconAll::X).size_3().text_color(rgb(WHITE))),
+                    .child(Icon::new(IconAll::X).size_3().text_color(rgb(PAPER))),
             )
     }
 
@@ -218,7 +219,8 @@ impl ChatApp {
                 .build(window, cx)
             })
             .child(if busy {
-                div().size(px(9.)).rounded_xs().bg(rgb(WHITE)).into_any_element()
+                // 停止方块取纸色：浅色下是深底白块，深色下是浅底深块
+                div().size(px(9.)).rounded_xs().bg(rgb(PAPER)).into_any_element()
             } else {
                 Icon::new(IconAll::ArrowUp)
                     .size_4()

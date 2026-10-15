@@ -3,8 +3,9 @@
 use super::ChatApp;
 use crate::model::*;
 use crate::session::Session;
-use crate::settings::{KernelChoice, Settings};
+use crate::settings::KernelChoice;
 use crate::theme::*;
+use crate::theme::rgb;
 use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
@@ -496,7 +497,7 @@ impl ChatApp {
                         .flex()
                         .justify_center()
                         .items_center()
-                        .child(Icon::new(IconAll::Check).size_2p5().text_color(rgb(WHITE)))
+                        .child(Icon::new(IconAll::Check).size_2p5().text_color(rgb(PAPER)))
                 } else {
                     div()
                         .size(px(14.))
@@ -519,22 +520,12 @@ impl ChatApp {
             }))
     }
 
-    /// 切换视图模式并写回设置文件。只改盘上那份的这一项：内存里的设置合并过环境变量，不能整份写回。
+    /// 切换视图模式并写回设置文件。
     pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         if self.settings.view_mode == mode {
             return;
         }
-        self.settings.view_mode = mode;
-        if let Some(path) = &self.settings_path {
-            let (mut on_disk, broken) = Settings::load(Some(path));
-            // 文件坏了就不碰，免得用默认值盖掉
-            if broken.is_none() {
-                on_disk.view_mode = mode;
-                if let Err(err) = on_disk.save(path) {
-                    self.sessions[self.active].note(format!("视图模式没能保存：{err}"));
-                }
-            }
-        }
+        self.save_ui_pref(move |s| s.view_mode = mode);
         cx.notify();
     }
 

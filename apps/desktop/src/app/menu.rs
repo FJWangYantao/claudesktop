@@ -6,6 +6,7 @@
 
 use super::ChatApp;
 use crate::theme::*;
+use crate::theme::rgb;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::{PopoverState, Selectable};
 use gpui_kit::component::popover::Popover;

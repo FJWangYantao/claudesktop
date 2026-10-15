@@ -18,6 +18,7 @@ use crate::model::*;
 use crate::session::*;
 use crate::settings::*;
 use crate::theme::*;
+use crate::theme::rgb;
 use crate::usage::{self, TurnStat};
 use claudesktop_core::{
     AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PromptImage, Record, RoutedEvent,
@@ -139,6 +140,11 @@ impl ChatApp {
         input.update(cx, |state, cx| state.focus(window, cx));
         cx.on_focus_lost(window, |this: &mut ChatApp, window, cx| this.restore_focus(window, cx))
             .detach();
+        // 外观跟随系统时，系统切深浅色要跟着变
+        cx.observe_window_appearance(window, |this: &mut ChatApp, window, cx| {
+            this.apply_appearance(window, cx)
+        })
+        .detach();
 
 
         // 内核与配置：设置文件 + 环境变量覆盖（见 settings.rs）；
@@ -256,6 +262,7 @@ impl ChatApp {
             }
             Err(err) => app.sessions[0].note(format!("会话历史不可用：{err}")),
         }
+        app.apply_appearance(window, cx);
         app
     }
 

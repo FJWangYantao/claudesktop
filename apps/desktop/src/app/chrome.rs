@@ -7,6 +7,7 @@ use super::menu::{menu_action, menu_item, menu_popover, MenuChip};
 use super::ChatApp;
 use crate::model::ViewMode;
 use crate::theme::*;
+use crate::theme::rgb;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::tooltip::Tooltip;
@@ -53,7 +54,7 @@ pub(super) fn window_controls(window: &Window) -> Option<Div> {
             .justify_center()
             .items_center()
             .text_color(rgb(INK_SOFT))
-            .when(close, |d| d.hover(|d| d.bg(rgb(RED)).text_color(rgb(WHITE))))
+            .when(close, |d| d.hover(|d| d.bg(rgb(DANGER)).text_color(rgb(WHITE))))
             .when(!close, |d| d.hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK))))
             .window_control_area(area)
             .when(!cfg!(target_os = "windows"), |d| {
