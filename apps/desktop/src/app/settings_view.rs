@@ -204,7 +204,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 「通用」分类：外观、侧栏内核状态（都即时生效，不走「保存并应用」）。
+    /// 「通用」分类：外观、侧栏内核状态、系统通知（都即时生效，不走「保存并应用」）。
     fn render_general(&self, cx: &mut Context<Self>) -> Div {
         let current = self.settings.appearance;
         let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
@@ -227,6 +227,18 @@ impl ChatApp {
                     .color(rgb(CORAL))
                     .on_change(cx.listener(|this, checked, _, cx| {
                         this.set_sidebar_kernel_status(*checked, cx)
+                    })),
+            ),
+            setting_row(
+                "系统通知",
+                "窗口不在前台时，回复完成、等你授权或出错会弹系统通知；点通知回到那个会话",
+                Switch::new("notifications")
+                    .checked(self.settings.notifications)
+                    .color(rgb(CORAL))
+                    .on_change(cx.listener(|this, checked, _, cx| {
+                        let on = *checked;
+                        this.save_ui_pref(move |s| s.notifications = on);
+                        cx.notify();
                     })),
             ),
         ])
@@ -270,6 +282,7 @@ impl ChatApp {
             let mut b = s.builtin.clone();
             for p in &mut b.profiles {
                 p.models.clear();
+                p.context_windows.clear();
             }
             b
         };
@@ -329,7 +342,7 @@ impl ChatApp {
         let p = preset.map_or_else(ProviderProfile::default, |i| {
             let mut p = preset_profiles()[i].clone();
             p.api_key = String::new();
-            p.models = Vec::new();
+            p.set_models(&[]);
             p
         });
         self.settings_form.inputs.push(ProfileInputs::new(window, cx, &p));
@@ -346,16 +359,6 @@ impl ChatApp {
         }
     }
 
-    /// 直接切换生效中的档案（输入框旁的菜单）：写盘并重启自研内核。
-    pub(crate) fn switch_profile(&mut self, i: usize, cx: &mut Context<Self>) {
-        if i >= self.settings.builtin.profiles.len() || i == self.settings.builtin.active {
-            return;
-        }
-        self.update_settings(|s| s.builtin.select(i));
-        self.restart_kernel(KernelChoice::Builtin, cx);
-        cx.notify();
-    }
-
     /// 改一处设置并只把这一处写回文件：生效中的设置可能含有环境变量给的值
     /// （如 key），没点「保存」就不该落盘。
     pub(super) fn update_settings(&mut self, change: impl Fn(&mut Settings)) {
@@ -369,6 +372,26 @@ impl ChatApp {
 
     /// 后台获取模型列表。`from_form` = 用设置页里正在编辑的档案；否则用生效中的设置。
     pub(crate) fn fetch_models(&mut self, from_form: bool, cx: &mut Context<Self>) {
+        self.start_fetch_models(from_form, false, cx);
+    }
+
+    /// 一轮结束或切到一个会话时：自研内核报告过上下文用量、但还不知道当前模型的窗口大小，
+    /// 就悄悄取一次模型列表（窗口大小随列表缓存在档案里）。每次启动最多试一次，失败不提示。
+    pub(crate) fn probe_context_window(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let s = &self.sessions[idx];
+        if self.context_probed
+            || s.kernel != KernelChoice::Builtin
+            || s.context_tokens == 0
+            || self.settings.builtin.context_window(&s.model_label).is_some()
+        {
+            return;
+        }
+        self.context_probed = true;
+        self.start_fetch_models(false, true, cx);
+    }
+
+    /// `quiet`：后台顺手取的，失败不往会话里写提示。
+    fn start_fetch_models(&mut self, from_form: bool, quiet: bool, cx: &mut Context<Self>) {
         if self.fetching_models {
             return;
         }
@@ -391,8 +414,11 @@ impl ChatApp {
             self.settings.builtin.provider()
         };
         if config.base_url.is_empty() {
-            self.settings_form.message = Some((true, "先填端点地址".into()));
-            cx.notify();
+            // 后台探测时自研内核可能已经没配了（只剩历史会话），不往设置页塞错误提示
+            if !quiet {
+                self.settings_form.message = Some((true, "先填端点地址".into()));
+                cx.notify();
+            }
             return;
         }
         let form_active = if from_form { Some(self.settings_form.active) } else { None };
@@ -411,21 +437,26 @@ impl ChatApp {
                         let n = models.len();
                         if let Some(i) = form_active {
                             if let Some(p) = app.settings_form.profiles.get_mut(i) {
-                                p.models = models.clone();
+                                p.set_models(&models);
                             }
                             app.settings_form.message =
                                 Some((false, format!("获取到 {n} 个模型").into()));
                         }
                         // 和生效中的端点一致时，顺便更新下拉用的列表
                         if base_url == app.settings.builtin.base_url().trim() {
-                            app.update_settings(|s| s.builtin.current_mut().models = models.clone());
+                            app.update_settings(|s| s.builtin.current_mut().set_models(&models));
+                            // 运行中的自研内核也要知道窗口大小（自动压缩用）
+                            if let Some(kernel) = &app.kernels[KernelChoice::Builtin.index()].kernel {
+                                let windows = &app.settings.builtin.current().context_windows;
+                                kernel.set_context_windows(windows.clone().into_iter().collect());
+                            }
                         }
                     }
                     Err(err) => {
                         let text: SharedString = format!("获取模型失败：{err}").into();
                         if from_form {
                             app.settings_form.message = Some((true, text));
-                        } else {
+                        } else if !quiet {
                             app.sessions[app.active].note(text);
                         }
                     }
@@ -1070,9 +1101,13 @@ impl ChatApp {
 
 /// 规则 → 给人看的说明
 fn rule_label(rule: &str) -> String {
-    match rule.strip_prefix("shell:") {
-        Some(prefix) => format!("运行以「{prefix}」开头的命令"),
-        None if rule == "edit" => "编辑项目内的文件".into(),
-        None => rule.to_string(),
+    if let Some(prefix) = rule.strip_prefix("shell:") {
+        format!("运行以「{prefix}」开头的命令")
+    } else if let Some(host) = rule.strip_prefix("fetch:") {
+        format!("访问网站 {host}")
+    } else if rule == "edit" {
+        "编辑项目内的文件".into()
+    } else {
+        rule.to_string()
     }
 }

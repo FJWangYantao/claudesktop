@@ -8,6 +8,7 @@
 
 
 mod app;
+mod complete;
 mod demo;
 mod fonts;
 mod model;
@@ -40,6 +41,8 @@ fn main() {
         .run(move |cx| {
             let t_gpui_run = t0.elapsed();
             gpui_kit::init(cx);
+            // 系统通知要有应用身份（Windows AppUserModelID，通知上显示的应用名）
+            cx.set_app_identity("claudesktop.desktop", "claudesktop");
             app::keys::bind(cx);
             fonts::register(cx);
             let t_fonts = t0.elapsed();

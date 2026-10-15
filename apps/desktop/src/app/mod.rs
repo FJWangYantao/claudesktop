@@ -3,9 +3,11 @@
 
 mod chat;
 mod chrome;
+mod complete_view;
 mod composer;
 pub(crate) mod keys;
 mod menu;
+mod notify;
 mod overview;
 mod settings_view;
 mod sidebar;
@@ -27,11 +29,11 @@ use claudesktop_core::{
 use claudesktop_builtin::BuiltinKernel;
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +41,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_RESTORED: usize = 100;
 
 pub struct ChatApp {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
     /// 内核会话（可多个）；至少有一个，`active` 始终有效
@@ -62,6 +64,8 @@ pub struct ChatApp {
     rename_input: Entity<InputState>,
     /// 重命名框真正拿到过焦点（之后失焦才算提交；刚打开时的失焦事件不算）
     rename_focused: bool,
+    /// 输入框的 `/指令`、`@文件` 补全（见 `complete_view.rs`）
+    completion: complete_view::CompletionState,
     /// 侧栏里等待确认删除的会话（令牌）
     confirm_delete: Option<u64>,
     /// 内核槽，按 [`KernelChoice::index`]：用到时才启动，可以同时在线，会话各自绑定一个
@@ -78,12 +82,19 @@ pub struct ChatApp {
     settings_form: SettingsForm,
     /// 正在后台获取模型列表
     fetching_models: bool,
-    /// 刚点了「复制」的消息（会话令牌, 记录下标），1.5 秒内按钮显示「已复制」
-    copied: Option<(u64, usize)>,
+    /// 本次启动已为上下文窗口大小悄悄取过一次模型列表（见 `probe_context_window`）
+    context_probed: bool,
+    /// 刚点了「复制」的地方（会话令牌, 记录下标, 代码块在 Markdown 里的起点；整条消息为 None），
+    /// 1.5 秒内按钮显示「已复制」
+    copied: Option<(u64, usize, Option<usize>)>,
     /// 所有会话的每轮统计（首页用量概览）
     usage: Vec<TurnStat>,
     /// 压测钩子：每次 render 的时刻（None = 不记录）
     pub(crate) frame_log: Option<Vec<std::time::Instant>>,
+    /// 窗口在前台：激活且没最小化（不在前台时才发系统通知，见 `notify.rs`）
+    window_active: bool,
+    /// 发出去还没撤的系统通知标签（回到窗口时撤掉）
+    notified: Vec<SharedString>,
 }
 
 /// 一种内核的运行状态。
@@ -115,22 +126,33 @@ impl Drop for ChatApp {
 
 impl ChatApp {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // 多行、随内容长高（最多 10 行后出滚动条）；回车发送，Shift+回车换行
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("描述要做的事，回车发送")
+            TextareaState::new(window, cx)
+                .auto_grow(1, 10)
+                .submit_on_enter(true)
+                .placeholder("描述要做的事，回车发送，Shift+回车换行")
         });
 
         cx.subscribe_in(
             &input,
             window,
             |this: &mut ChatApp,
-             _entity: &Entity<InputState>,
+             _entity: &Entity<TextareaState>,
              event: &InputEvent,
              window: &mut Window,
              cx: &mut Context<ChatApp>| {
                 match event {
-                    InputEvent::PressEnter { .. } => this.send(window, cx),
+                    // Shift+回车已由输入框插入换行，同样会发这个事件，要排除
+                    InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+                    InputEvent::PressEnter { .. } => {}
+                    // 打字时刷新 `/`、`@` 补全
+                    InputEvent::Change => {
+                        this.update_completion(cx);
+                        cx.notify();
+                    }
                     // 发送按钮随输入框空 / 非空换样式；输入框卡片随聚焦换边框
-                    InputEvent::Change | InputEvent::Focus | InputEvent::Blur => cx.notify(),
+                    InputEvent::Focus | InputEvent::Blur => cx.notify(),
                 }
             },
         )
@@ -150,15 +172,16 @@ impl ChatApp {
         // 内核与配置：设置文件 + 环境变量覆盖（见 settings.rs）；
         // 每次（重新）启动内核都换一个代号，旧内核的迟到事件按代号丢弃
         let acp_base = AcpKernelConfig::from_env();
-        let cwd = acp_base.cwd.clone();
-        let project_name: SharedString = cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "claudesktop".into())
-            .into();
         let settings_path = Settings::default_path();
         let (settings, settings_error) = Settings::load(settings_path.as_deref());
         let settings = settings.with_env();
+        // 默认工作目录：环境变量 ACP_CWD 优先，其次上次选的（目录还在的话），最后是启动目录
+        let cwd = settings
+            .workspace
+            .clone()
+            .filter(|dir| std::env::var_os("ACP_CWD").is_none() && dir.is_dir())
+            .unwrap_or_else(|| acp_base.cwd.clone());
+        let project_name = project_label(&cwd);
 
         let (ev_tx, mut ev_rx) =
             futures::channel::mpsc::unbounded::<(KernelChoice, u64, RoutedEvent)>();
@@ -225,6 +248,7 @@ impl ChatApp {
             renaming: None,
             rename_input,
             rename_focused: false,
+            completion: Default::default(),
             confirm_delete: None,
             kernels: Default::default(),
             ev_tx,
@@ -235,9 +259,12 @@ impl ChatApp {
             settings_focus: cx.focus_handle(),
             settings_form,
             fetching_models: false,
+            context_probed: false,
             copied: None,
             usage: Vec::new(),
             frame_log: None,
+            window_active: true,
+            notified: Vec::new(),
         };
         // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
@@ -263,6 +290,7 @@ impl ChatApp {
             Err(err) => app.sessions[0].note(format!("会话历史不可用：{err}")),
         }
         app.apply_appearance(window, cx);
+        app.init_notifications(window, cx);
         app
     }
 
@@ -372,14 +400,102 @@ impl ChatApp {
         if s.kernel == kind || s.has_user_message() || s.busy {
             return;
         }
+        let cwd = s.cwd.clone();
+        self.replace_session(idx, kind, cwd);
+    }
+
+    /// 第 `idx` 个会话原地换成 `kind` 内核、`cwd` 目录下的新会话（调用方保证它还没对话）。
+    fn replace_session(&mut self, idx: usize, kind: KernelChoice, cwd: PathBuf) {
         let old = self.session_kernel(idx);
         self.sessions[idx].cancel_pending_permissions(old.as_ref());
         self.ensure_kernel(kind);
         let token = self.next_token;
         self.next_token += 1;
-        let cwd = self.sessions[idx].cwd.clone();
         self.sessions[idx] = Session::new(token, kind, cwd);
         self.request_pending_sessions();
+    }
+
+    /// 切换工作目录（输入框上方的目录 chip）：设为新会话的默认目录并记进设置；
+    /// 当前会话还没对话就原地换到这个目录，已有对话就在那里开一个新会话（对话中途不换目录）。
+    pub(crate) fn switch_workspace(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.project_name = project_label(&dir);
+        self.cwd = dir.clone();
+        self.update_settings(|s| s.workspace = Some(dir.clone()));
+        let s = self.session();
+        if s.cwd != dir {
+            if s.has_user_message() || s.busy {
+                self.active = self.open_session(self.settings.kernel(), dir);
+            } else {
+                let kind = s.kernel;
+                self.replace_session(self.active, kind, dir);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 目录菜单里的「选择文件夹…」：系统对话框选一个目录切过去。
+    pub(crate) fn pick_workspace(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择工作目录".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let _ = this.update(cx, |app, cx| app.switch_workspace(dir, cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 目录菜单列出的工作目录：默认目录在前，其余按会话最近活动排，已不存在的略去，最多 8 个。
+    pub(crate) fn recent_workspaces(&self) -> Vec<PathBuf> {
+        // 无元信息的会话（刚开、还没落盘）视为最新；排序稳定，默认目录排在同为最新的前面
+        let mut dirs: Vec<(&Path, u64)> = vec![(self.cwd.as_path(), u64::MAX)];
+        for s in &self.sessions {
+            let at = s.meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
+            match dirs.iter_mut().find(|(d, _)| *d == s.cwd.as_path()) {
+                Some((_, last)) => *last = (*last).max(at),
+                None => dirs.push((s.cwd.as_path(), at)),
+            }
+        }
+        dirs.sort_by(|a, b| b.1.cmp(&a.1));
+        dirs.into_iter()
+            .map(|(d, _)| d.to_path_buf())
+            .filter(|d| d.is_dir())
+            .take(8)
+            .collect()
+    }
+
+    /// 切到第 `i` 个会话（侧栏点击 / 快捷键共用）：重开会话的模型名从日志恢复了，
+    /// 但窗口大小可能还没缓存过，顺带悄悄探测一次（见 [`Self::probe_context_window`]）。
+    pub(crate) fn activate_session(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.active = i;
+        self.settings_open = false;
+        self.probe_context_window(i, cx);
+        cx.notify();
+    }
+
+    /// 失败卡片上的「重试」：把第 `failed_idx` 行所在这一轮的用户消息原样再发一遍。
+    pub(crate) fn retry_turn(&mut self, failed_idx: usize, cx: &mut Context<Self>) {
+        let idx = self.active;
+        let s = &self.sessions[idx];
+        if s.busy {
+            return;
+        }
+        let Some(ChatItem::User { text, images }) =
+            s.turn_prompt(failed_idx).and_then(|u| s.transcript.get(u))
+        else {
+            return;
+        };
+        let prompt = UserPrompt {
+            text: text.to_string(),
+            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
+        };
+        self.submit_to(idx, prompt, cx);
     }
 
     /// 同一任务换个内核跑：拿当前会话里第 `item_idx` 条用户消息，在 `kind` 上新开会话发出去。
@@ -425,6 +541,7 @@ impl ChatApp {
                     name: "Read".into(),
                     arg: format!("src/module_{i}.rs").into(),
                     result: "120 行".into(),
+                    output: SharedString::default(),
                     phase: ToolPhase::Done,
                     diffs: Vec::new(),
                     expanded: false,
@@ -662,9 +779,7 @@ impl ChatApp {
                 return;
             }
             if !s.has_user_message() && !s.renamed {
-                // 会话标题取首条消息的前 18 个字符
-                let title: String = prompt.text.chars().take(18).collect();
-                s.title = title.into();
+                s.title = crate::model::title_from_prompt(&prompt.text).into();
             }
             // 图片附件先落盘（需要会话元信息），路径进记录与气泡
             let stored = self.store_images(idx, &prompt.images);
@@ -692,7 +807,7 @@ impl ChatApp {
                 (Some(kernel), Some(id)) => {
                     if let Err(err) = kernel.send_prompt(&id, prompt) {
                         s.busy = false;
-                        s.note(format!("发送失败：{err}"));
+                        s.fail(format!("发送失败：{err}"));
                     }
                 }
                 (Some(_), None) => {
@@ -736,13 +851,37 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 手动压缩当前会话的上下文（自研内核、空闲时）：自成一轮，进度和结果作为一行出现在对话里。
+    pub(crate) fn compact_session(&mut self, cx: &mut Context<Self>) {
+        let active = self.active;
+        let kernel = self.session_kernel(active);
+        let s = &mut self.sessions[active];
+        if s.busy {
+            return;
+        }
+        match (kernel, s.acp_id.clone()) {
+            (Some(kernel), Some(id)) => match kernel.compact(&id) {
+                Ok(()) => {
+                    s.begin_turn();
+                    s.compact_turn = true;
+                }
+                Err(err) => s.note(format!("压缩上下文失败：{err}")),
+            },
+            _ => s.note("这个会话还没接上内核：先发一条消息，再压缩"),
+        }
+        cx.notify();
+    }
+
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
-        let kernel = self.session_kernel(self.active);
-        let s = &mut self.sessions[self.active];
+        let active = self.active;
+        let kernel = self.session_kernel(active);
+        let s = &mut self.sessions[active];
         s.cancel_token += 1;
         s.busy = false;
-        // 正在流式的思考块收起，不然停下后还挂着「思考中…」
+        // 正在流式的思考块收起，不然停下后还挂着「思考中…」；压缩到一半的那行也收尾
         s.finish_thinking();
+        s.settle_compaction(CompactState::Failed("已停止".into()));
+        let thought = s.take_thought_done();
         s.cancel_pending_permissions(kernel.as_ref());
         match (&kernel, s.acp_id.clone()) {
             (Some(kernel), Some(id)) => {
@@ -750,6 +889,10 @@ impl ChatApp {
                 s.note("已请求停止");
             }
             _ => s.note("已停止（演示回放）"),
+        }
+        // 演示回放不落盘
+        if let (Some(ms), Some(_)) = (thought, &kernel) {
+            self.persist(active, Record::Thought { elapsed_ms: ms });
         }
         cx.notify();
     }
@@ -810,6 +953,8 @@ impl ChatApp {
                         event,
                         KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. }
                     );
+                    // 先看（record_turn 会清掉手动压缩的标记）
+                    let attention = self.sessions[idx].attention(&event);
                     if Record::worth_keeping(&event) {
                         self.persist(idx, Record::Event { event: event.clone() });
                     }
@@ -817,7 +962,18 @@ impl ChatApp {
                         self.record_turn(idx);
                         self.touch_meta(idx);
                     }
-                    if let Some(prompt) = self.sessions[idx].apply_event(event, kernel.as_ref()) {
+                    let prompt = self.sessions[idx].apply_event(event, kernel.as_ref());
+                    // 这条事件收尾了一段思考：用时紧跟着写进日志，重放时挂回那段思考
+                    if let Some(ms) = self.sessions[idx].take_thought_done() {
+                        self.persist(idx, Record::Thought { elapsed_ms: ms });
+                    }
+                    if turn_over {
+                        self.probe_context_window(idx, cx);
+                    }
+                    if let Some(body) = attention {
+                        self.notify_attention(idx, body, cx);
+                    }
+                    if let Some(prompt) = prompt {
                         self.submit_to(idx, prompt, cx);
                     }
                 }
@@ -868,15 +1024,24 @@ impl ChatApp {
         }
     }
 
-    /// 一轮结束：把时间、模型、token 记进日志和用量统计。
+    /// 一轮结束：把时间、模型、token、用时记进日志和用量统计。
     fn record_turn(&mut self, idx: usize) {
         let s = &mut self.sessions[idx];
+        // 手动压缩自成一轮但没有用户消息：不记（用量概览只数跟在用户消息后面的轮次），
+        // 也不能挂到上一轮名下，把那一轮回复下面的用时和用量换掉
+        if std::mem::take(&mut s.compact_turn) {
+            s.turn_started = None;
+            s.turn_usage = Default::default();
+            return;
+        }
+        let summary = s.close_turn();
         let TurnUsage {
             input: input_tokens,
             output: output_tokens,
             ..
-        } = std::mem::take(&mut s.turn_usage);
+        } = summary.usage;
         let model = Some(s.model_label.to_string()).filter(|m| m != UNKNOWN_MODEL);
+        let context_tokens = Some(s.context_tokens).filter(|n| *n > 0);
         let at_ms = now_ms();
         self.persist(
             idx,
@@ -885,6 +1050,8 @@ impl ChatApp {
                 model: model.clone(),
                 input_tokens,
                 output_tokens,
+                elapsed_ms: summary.elapsed_ms,
+                context_tokens,
             },
         );
         let s = &self.sessions[idx];
@@ -946,6 +1113,7 @@ impl ChatApp {
             let _ = this.update(cx, |app, cx| {
                 if let Some(s) = app.sessions.iter_mut().find(|s| s.token == session) {
                     s.busy = false;
+                    s.close_turn();
                 }
                 cx.notify();
             });
@@ -1005,15 +1173,14 @@ impl Render for ChatApp {
                     let s = &this.sessions[this.active];
                     let n = s.transcript.len();
                     let row = div().max_w(READING_W).mx_auto().w_full().px_6();
-                    let content = match s.transcript.get(ix) {
-                        // 当前视图模式下不显示的行：零高度（测量指纹里带着视图模式，切换时整表重测）
-                        Some(item) if !item.visible_in(this.settings.view_mode) => div(),
-                        Some(item) => row
+                    let content = match (s.transcript.get(ix), s.layout.get(ix)) {
+                        // 收起的组内步骤、当前视图不显示的行：零高度（分组结果在测量指纹里，变了就重测）
+                        (Some(_), Some(layout)) if !layout.body && layout.head.is_none() => div(),
+                        (Some(item), Some(&layout)) => row
                             .pt(px(if ix == 0 { 16. } else { 0. }))
-                            .pb_4()
-                            .child(this.render_item(ix, item, cx)),
-                        None if ix == n => row.pb_6().children(this.render_turn_status()),
-                        None => row,
+                            .child(this.render_row(ix, item, layout, cx)),
+                        (None, _) if ix == n => row.pb_6().children(this.render_turn_status()),
+                        _ => row,
                     };
                     div().w_full().child(content).into_any_element()
                 }),
@@ -1021,7 +1188,29 @@ impl Render for ChatApp {
             .flex_1()
             .min_h_0();
 
-            v_flex().flex_1().min_h_0().child(scroll).child(composer_area)
+            // 上下边缘渐隐：内容滚到顶栏 / 输入区下面时淡出，不是一刀切。高度不超过首行上边距和
+            // 状态行下边距，滚到头时不遮内容；覆盖层不挂事件，不挡点击和滚轮
+            let paper = rgb(PAPER);
+            let clear = Rgba { a: 0., ..paper };
+            let fade = |h: Pixels, from: Rgba, to: Rgba| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .h(h)
+                    .bg(linear_gradient(180., linear_color_stop(from, 0.), linear_color_stop(to, 1.)))
+            };
+            let transcript = div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .v_flex()
+                .child(scroll)
+                .child(fade(px(16.), paper, clear).top_0())
+                .child(fade(px(24.), clear, paper).bottom_0())
+                .children(self.render_jump_to_bottom(cx));
+
+            v_flex().flex_1().min_h_0().child(transcript).child(composer_area)
         };
 
         let main = v_flex()
@@ -1046,6 +1235,24 @@ impl Render for ChatApp {
             .child(main);
         // 快捷键（见 keys.rs）
         self.with_key_actions(root, cx)
+    }
+}
+
+/// 工作目录的显示名：取目录名，没有（如盘符根目录）就用整个路径。
+pub(crate) fn project_label(dir: &Path) -> SharedString {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+        .into()
+}
+
+/// 菜单里显示的完整路径：用户目录缩写成 `~`，免得长路径撑出面板。
+pub(crate) fn short_path(dir: &Path) -> String {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    match home.and_then(|h| dir.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => dir.display().to_string(),
     }
 }
 

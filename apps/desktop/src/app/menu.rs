@@ -14,23 +14,33 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-/// 下拉 trigger chip：图标（可省）+ 文字 + 展开箭头，弹层打开时高亮。
+/// 下拉 trigger chip：图标 + 文字 + 展开箭头，或只有文字，弹层打开时高亮。
 /// 实现 [`Selectable`] 以便作为 `Popover::trigger` 使用。
 #[derive(IntoElement)]
 pub(super) struct MenuChip {
     icon: Option<IconAll>,
     label: SharedString,
+    /// 纯文字（输入框下方那一行）：不带图标和展开箭头，靠悬停底色提示可点
+    plain: bool,
+    /// 沙色实底，和输入框上方那排静态 chip 同款
+    filled: bool,
     open: bool,
 }
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self { icon: Some(icon), label: label.into(), open: false }
+        Self { icon: Some(icon), label: label.into(), plain: false, filled: false, open: false }
     }
 
-    /// 只有文字（模型 chip）。
-    pub(super) fn text(label: impl Into<SharedString>) -> Self {
-        Self { icon: None, label: label.into(), open: false }
+    /// 只有文字，不带展开箭头（输入框下方的权限模式 / 模型）。
+    pub(super) fn plain(label: impl Into<SharedString>) -> Self {
+        Self { icon: None, label: label.into(), plain: true, filled: false, open: false }
+    }
+
+    /// 沙色实底（输入框上方的项目目录），与旁边的「本地」chip 并排不突兀。
+    pub(super) fn filled(mut self) -> Self {
+        self.filled = true;
+        self
     }
 }
 
@@ -47,23 +57,31 @@ impl Selectable for MenuChip {
 
 impl RenderOnce for MenuChip {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        let mut chip = div().h_flex().gap_1p5().px_2().py_1().rounded_md();
+        let mut chip = div()
+            .h_flex()
+            .gap_1p5()
+            .py_1()
+            .rounded_md()
+            .map(|d| if self.filled { d.px_2p5().bg(rgb(SAND)) } else { d.px_2() });
         if let Some(icon) = self.icon {
             chip = chip.child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)));
         }
-        chip = chip
-            .child(
-                // chip 一律次要字号，与输入框上方的环境 / 项目 chip 同档
-                div()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .child(self.label),
-            )
-            .child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
+        chip = chip.child(
+            // chip 一律次要字号，与输入框上方的环境 / 项目 chip 同档
+            div()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(self.label),
+        );
+        if !self.plain {
+            chip = chip.child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
+        }
+        // 沙色底上的悬停 / 打开用 SELECTED，纸底上用 HOVER
+        let active = if self.filled { SELECTED } else { HOVER };
         if self.open {
-            chip.bg(rgb(HOVER))
+            chip.bg(rgb(active))
         } else {
-            chip.hover(|d| d.bg(rgb(HOVER)))
+            chip.hover(move |d| d.bg(rgb(active)))
         }
     }
 }
@@ -101,9 +119,11 @@ pub(super) fn menu_item(
         .hover(|d| d.bg(rgb(HOVER)))
         .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
         .child(
+            // min_w_0：长说明（如路径）在面板宽度内换行，不撑出去
             div()
                 .v_flex()
                 .flex_1()
+                .min_w_0()
                 .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(name.into()))
                 .when(!desc.is_empty(), |d| {
                     d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc))

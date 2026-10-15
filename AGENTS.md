@@ -19,13 +19,19 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **菜单条目**：两行式（图标 + 名称 + 灰色说明 + 当前项对勾）用 `menu.rs` 的 `menu_item()`，
   点击收尾用同文件导出的 `menu_action!`。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
   `widgets.rs` 的 `message_action()`。
-- **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否；
-  行高受别的状态影响时（如"是不是回合末尾"），把那个状态并进 `Session::row_key`，否则虚拟列表不会重测。
+- **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
+  在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
+  分组规则在 `Session::compute_layout`）；
+  行高受别的状态影响时（如"是不是回合末尾"），把那个状态并进 `Session::row_key`（或 `RowLayout`），否则虚拟列表不会重测。
+- **Markdown（`TextView`）**：字号、颜色、行高要直接设在 `TextView` 上（它实现了 `Styled`），
+  设在外层 div 上不生效。
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，
   动作经 `Entity<ChatApp>.update(cx, |this, cx| ...)` 回根视图；参照
   `composer.rs` 里 `mode_menu_items` 等菜单条目函数的写法（`menu_action!` 宏在 `menu.rs`）。
 - **按钮**：新按钮优先 `gpui-component` 的 `Button`（变体齐全）；确需特殊样式再
   手写 div，但成组出现时应抽成 `app/widgets.rs` 的 helper。
+  带边框的容器（卡片、权限卡、输入框）里的按钮不再描边（单层边框）：次级用 `SAND` 实底
+  （悬停 `SELECTED`），拒绝 / 危险项只留 `RED` 字、悬停出底色（红字在 `SAND` 上只有 4.0:1）。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
   - 每个常量是浅色 / 深色一对（`Color`），界面里写 `rgb(INK)`；这个 `rgb` 是 `theme::rgb`（按当前外观取值），
     文件里要 `use crate::theme::rgb;`，否则和 `gpui_kit::*` 里的同名函数冲突。新颜色两种外观都要给值并校对对比度。
@@ -33,6 +39,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     `RED` 是前景色（深色下提亮），危险操作的实色按钮底用 `DANGER`。
   - 交互态：纸底 / 卡片上悬停用 `HOVER`，选中态和沙色底上悬停用 `SELECTED`，已选中行里再叠一层用
     `HOVER_STRONG`；不要拿 `LINE` / `PAPER` / 透明度当悬停。
+    整块可点的卡片（输入框）悬停时加深边框而不是换底色：静止 `LINE` → 悬停 `LINE_STRONG` →
+    聚焦 `INK_FAINT` + 阴影。焦点几乎总在输入框上，「聚焦」要同时看 `window.is_window_active()`，
+    否则切到别的程序后也一直显示聚焦态，悬停态永远看不到。
   - 带文字的主按钮底色用 `CORAL_DEEP`（悬停 `CORAL_DEEP_HOVER`）；`CORAL` 上白字只有 3.1:1，只给图标按钮。
   - `INK_FAINT` 只给占位、禁用、分隔符和装饰（纸底上 2.05:1），承载信息的文字用 `INK_SOFT`。
 - **圆角 / 宽度**：圆角只用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
@@ -40,6 +49,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯（12/13/14/15/17/20/28）和
   `LEADING`，不要写 `text_size(px(..))`。正文一律无衬线（对照官方 Code 桌面端；
   衬线拉丁字母会和回退的雅黑混排）。中文回退字体在根视图统一设置。
+  会跳动的数字（用时、token、计数）加 `.font_features(tabular_nums())`，位数不变时宽度不变。
 - **界面文案**：一律中文（含占位符、模式名、问候语）；agent 自己上报的名称除外。
 - **快捷键**：全局快捷键集中在 `app/keys.rs`（`actions!` + `KeyBinding`，键上下文 `ChatApp`），
   新快捷键加在那里；处理函数没事可做时 `cx.propagate()`，让给外层（gpui-kit Root 的 Tab 焦点切换等）。
@@ -63,6 +73,15 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   会话区顶栏兼做拖拽区和最小化 / 最大化 / 关闭。Windows hit-test 只看鼠标下的元素链里
   有没有 `WindowControlArea::Drag`——**拖拽区只能是按钮的兄弟（`drag_area()` 填空白），
   不能包住按钮**，否则按钮收不到点击。
+- **输入框是 `TextareaState`**（`auto_grow` + `submit_on_enter`）：Shift+回车插入换行后**同样会发**
+  `InputEvent::PressEnter { shift: true }`，只在 `shift: false` 时发送。输入法组字时的回车由系统输入法消化，
+  不会变成 `Enter` 动作，不用自己判断（已用微软拼音实测）。
+- `TextView::code_block_actions` 给了之后组件不再自己画右上角的语言名，要在 actions 里一起画；
+  actions 叠在代码块第一行上，代码块的上内边距要留出它的高度（`markdown_style` 里的 `pt`）。
+- **输入框的键盘接管**（补全列表开着时的上下键 / 回车 / Tab / Esc）：输入框自己把这些键绑成了
+  `MoveUp` / `Enter` / `IndentInline` / `Escape` 动作，动作先于原始按键事件分发，所以 `on_key_down`
+  截不到；要在输入框的祖先上 `capture_action`（capture 阶段从根到焦点），处理了 `cx.stop_propagation()`，
+  没处理就什么都不做（放行）。见 `app/complete_view.rs`。
 - 文件对话框与系统联动：`cx.prompt_for_paths(PathPromptOptions)`（注意有 `prompt`
   字段）、`cx.prompt_for_new_path(dir, name)`，均返回 oneshot，配 `cx.spawn_in` +
   `this.update_in` 回 UI；`cx.reveal_path(&path)` 在资源管理器中打开。
@@ -73,3 +92,6 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 调试钩子统一走环境变量（`CLAUDEDESKTOP_*`），入口集中在 `main.rs`；
   涉及 Popover 内部状态的钩子做不了（open 状态不在我们手里），别为此改成受控模式。
 - 提交信息用英文 conventional commits（见 git log），代码注释用中文。
+- 本文件会整份进自研内核的系统提示词（`crates/builtin/src/instructions.rs`，每次请求都带），新增内容保持精炼。
+- 新增要进日志的 `KernelEvent` 时，同时想清楚 `Record::worth_keeping`、`history::rebuild`（续接时进不进上下文）
+  和 `Session::apply_event`（重放时怎么显示）三处。

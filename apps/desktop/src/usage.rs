@@ -38,6 +38,7 @@ pub fn collect(meta: &SessionMeta, records: &[Record]) -> Vec<TurnStat> {
                 model,
                 input_tokens,
                 output_tokens,
+                ..
             } if pending > 0 => {
                 pending -= 1;
                 turns.push(TurnStat {
@@ -180,6 +181,57 @@ pub fn compact(n: u64) -> String {
     }
 }
 
+/// 输入框旁的上下文用量。
+#[derive(Debug, PartialEq)]
+pub struct ContextGauge {
+    /// 占窗口的百分比（1–100，有用量就至少 1）；不知道窗口大小时为 None
+    pub percent: Option<u32>,
+    /// 显示的字：`9%`；不知道窗口时 `上下文 23.4K`
+    pub label: String,
+    /// 悬停提示：具体用了多少
+    pub tooltip: String,
+}
+
+/// 已用 `used` token、窗口 `window` 时上下文用量怎么显示。
+pub fn context_gauge(used: u64, window: Option<u64>) -> ContextGauge {
+    // 窗口大小多是整千：256.0K → 256K
+    let short = |n: u64| compact(n).replace(".0K", "K").replace(".0M", "M");
+    match window.filter(|w| *w > 0) {
+        Some(w) => {
+            let percent = ((used.saturating_mul(100) + w / 2) / w).clamp(1, 100) as u32;
+            ContextGauge {
+                percent: Some(percent),
+                label: format!("{percent}%"),
+                tooltip: format!("上下文已用 {} / {} token", short(used), short(w)),
+            }
+        }
+        None => ContextGauge {
+            percent: None,
+            label: format!("上下文 {}", short(used)),
+            tooltip: format!("上下文已用 {} token（端点没报告窗口大小）", short(used)),
+        },
+    }
+}
+
+/// 侧栏按日期分组的组名，下标即 [`day_bucket`] 的返回值。
+pub const DAY_BUCKETS: [&str; 4] = ["今天", "昨天", "最近 7 天", "更早"];
+
+/// 最后活动在 `updated_ms` 的会话落在哪个日期组（按本地日历日算，`offset_secs` 见 [`local_offset_secs`]）。
+pub fn day_bucket(updated_ms: u64, now_ms: u64, offset_secs: i64) -> usize {
+    let day_of = |ms: u64| (ms as i64 / 1000 + offset_secs).div_euclid(86_400);
+    match day_of(now_ms) - day_of(updated_ms) {
+        i64::MIN..=0 => 0,
+        1 => 1,
+        2..=6 => 2,
+        _ => 3,
+    }
+}
+
+/// 命中缓存的比例（%）：没报告（0）或没有输入时为 None。
+pub fn cache_hit_percent(cache_read: u64, input: u64) -> Option<u32> {
+    (cache_read > 0 && input > 0).then(|| ((cache_read.min(input) * 100 + input / 2) / input) as u32)
+}
+
 /// 首页底部那句话：token 换算成《善恶的彼岸》（按一本约 8 万 token）。
 pub fn book_line(tokens: u64) -> String {
     const BOOK: u64 = 80_000;
@@ -230,6 +282,8 @@ mod tests {
             model: model.map(Into::into),
             input_tokens: tokens,
             output_tokens: 0,
+            elapsed_ms: None,
+            context_tokens: None,
         }
     }
 
@@ -291,5 +345,42 @@ mod tests {
         assert_eq!(compact(12_345), "12.3K");
         assert!(book_line(40_000).contains("50%"));
         assert!(book_line(800_000).contains("10 本"));
+    }
+
+    #[core::prelude::v1::test]
+    fn day_bucket_follows_local_calendar_days() {
+        const H: u64 = 3_600_000;
+        // 东八区 2026-10-15 00:30（UTC 10-14 16:30）
+        let now = 1_791_995_400_000;
+        let cn = 8 * 3600;
+        assert_eq!(day_bucket(now - H / 4, now, cn), 0);
+        // 一小时前是本地的昨天 23:30，不是「今天」
+        assert_eq!(day_bucket(now - H, now, cn), 1);
+        assert_eq!(day_bucket(now - 3 * 24 * H, now, cn), 2);
+        assert_eq!(day_bucket(now - 30 * 24 * H, now, cn), 3);
+        // 时钟回拨 / 刚建的会话也算今天
+        assert_eq!(day_bucket(now + H, now, cn), 0);
+    }
+
+    #[core::prelude::v1::test]
+    fn cache_hit_needs_a_report() {
+        assert_eq!(cache_hit_percent(0, 1000), None);
+        assert_eq!(cache_hit_percent(805, 1000), Some(81));
+        assert_eq!(cache_hit_percent(5, 0), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn context_gauge_rounds_and_clamps() {
+        let g = context_gauge(23_400, Some(256_000));
+        assert_eq!(g.percent, Some(9));
+        assert_eq!(g.label, "9%");
+        assert_eq!(g.tooltip, "上下文已用 23.4K / 256K token");
+        // 刚开头也至少 1%；超出窗口（换了个小模型）按满算
+        assert_eq!(context_gauge(300, Some(1_000_000)).percent, Some(1));
+        assert_eq!(context_gauge(300_000, Some(128_000)).percent, Some(100));
+        // 不知道窗口：只说用了多少
+        let g = context_gauge(4_194, None);
+        assert_eq!((g.percent, g.label.as_str()), (None, "上下文 4,194"));
+        assert_eq!(context_gauge(5, Some(0)).percent, None);
     }
 }

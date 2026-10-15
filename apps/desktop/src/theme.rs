@@ -1,6 +1,6 @@
 //! 色板、字体与字号阶梯（Claude 品牌基准：暖纸底 + 赤陶橙）。
 
-use gpui_kit::{px, relative, DefiniteLength, FontFallbacks, Pixels, Rgba};
+use gpui_kit::{px, relative, DefiniteLength, FontFallbacks, FontFeatures, Pixels, Rgba};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------- 色板 ----------
@@ -56,6 +56,8 @@ pub const INK_SOFT: Color = c(0x6E6B65, 0xBDB9AE);
 /// 只给占位、禁用、分隔符和装饰用（纸底上约 2–3:1）——承载信息的文字用 `INK_SOFT`
 pub const INK_FAINT: Color = c(0xB5B0A4, 0x6E6C66);
 pub const LINE: Color = c(0xE5E1D5, 0x3D3C38);
+/// 悬停时加深一档的边框（输入框），介于 `LINE` 和聚焦用的 `INK_FAINT` 之间
+pub const LINE_STRONG: Color = c(0xD3CEC1, 0x55534E);
 pub const GREEN: Color = c(0x7A9A65, 0x94B07E);
 /// 红色文字 / 小圆点（深色下提亮，只适合放在底色上当前景）
 pub const RED: Color = c(0xC0504D, 0xE5726C);
@@ -102,6 +104,12 @@ pub fn cjk_fallbacks() -> FontFallbacks {
             .map(String::from)
             .to_vec(),
     )
+}
+
+/// 等宽数字（OpenType `tnum`）：用时、token 这类会跳动的数字用它，位数不变时宽度不变，
+/// 后面的文字不会跟着左右抖。只影响数字字形，文字照常。
+pub fn tabular_nums() -> FontFeatures {
+    FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
 }
 
 // ---------- 字号阶梯 ----------

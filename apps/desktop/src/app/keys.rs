@@ -8,6 +8,7 @@
 //! - 打开某个 Popover 的快捷键做不了（open 状态在组件里），权限模式改用 Shift+Tab 循环。
 
 use super::ChatApp;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
 /// 根视图的键上下文名。
@@ -55,6 +56,10 @@ impl ChatApp {
 
     /// 焦点丢失时的兜底：设置页开着就给设置页的焦点锚（输入框这时不在界面里），否则给输入框。
     pub(super) fn restore_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        // 对话框（看大图）开着时焦点归它，Esc 才能关掉它
+        if window.has_active_dialog(cx) {
+            return;
+        }
         if self.settings_open {
             self.settings_focus.focus(window, cx);
         } else {
@@ -109,9 +114,7 @@ impl ChatApp {
     fn step_session(&mut self, step: isize, cx: &mut Context<Self>) {
         let order = session_order(self.session_groups().into_iter().map(|(_, members)| members));
         if let Some(next) = neighbor(&order, self.active, step) {
-            self.active = next;
-            self.settings_open = false;
-            cx.notify();
+            self.activate_session(next, cx);
         }
     }
 }

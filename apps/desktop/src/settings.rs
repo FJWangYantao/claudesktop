@@ -9,10 +9,11 @@
 //! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）以及 `ACP_AGENT`。
 //! 设置页保存时写下的是当时界面上的值。
 
-use claudesktop_builtin::{BuiltinConfig, Protocol, ProviderConfig, RequestParams};
+use claudesktop_builtin::{BuiltinConfig, ModelInfo, Protocol, ProviderConfig, RequestParams};
 use crate::model::ViewMode;
 use claudesktop_core::AcpKernelConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,20 +85,14 @@ pub struct ProviderProfile {
     pub model: String,
     /// 上次从端点获取的模型列表（模型下拉用）
     pub models: Vec<String>,
+    /// 同一次获取里端点报告的上下文窗口（模型 ID → token；输入框旁的上下文用量用）
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub context_windows: BTreeMap<String, u64>,
     /// 透传参数（温度 / 最大 token / 额外 JSON 字段）
     pub params: RequestParams,
 }
 
 impl ProviderProfile {
-    /// 档案显示名：没起名就用 base_url。
-    pub fn display_name(&self) -> &str {
-        if self.name.trim().is_empty() {
-            &self.base_url
-        } else {
-            &self.name
-        }
-    }
-
     pub fn is_configured(&self) -> bool {
         !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
     }
@@ -110,6 +105,26 @@ impl ProviderProfile {
             model: self.model.trim().to_string(),
             params: self.params.clone(),
         }
+    }
+
+    /// 记下一次获取到的模型列表（连同窗口大小）。
+    pub fn set_models(&mut self, models: &[ModelInfo]) {
+        self.models = models.iter().map(|m| m.id.clone()).collect();
+        self.context_windows = models
+            .iter()
+            .filter_map(|m| Some((m.id.clone(), m.context_window?)))
+            .collect();
+    }
+
+    /// 某个模型的上下文窗口。顶栏显示的模型名可能只是 ID 的最后一段（`provider/name` → `name`），
+    /// 对不上完整 ID 时按最后一段找。
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.context_windows.get(model).copied().or_else(|| {
+            self.context_windows
+                .iter()
+                .find(|(id, _)| id.rsplit('/').next() == Some(model))
+                .map(|(_, n)| *n)
+        })
     }
 }
 
@@ -189,6 +204,13 @@ pub struct Settings {
     /// 默认显示：老设置文件里没有这一项时也保持原样（容器级 `#[serde(default)]`
     /// 会用下面的 `Default` 实现补齐缺失字段）。
     pub sidebar_kernel_status: bool,
+    /// 上次在输入框上方的目录 chip 里选的工作目录（新会话默认在这里开）；
+    /// None = 用启动目录。环境变量 `ACP_CWD` 优先于它（启动时处理，不写进这里）
+    pub workspace: Option<PathBuf>,
+    /// 侧栏按日期（今天 / 昨天 / 最近 7 天 / 更早）而不是按工作目录分组，侧栏组名旁的按钮切换后写回
+    pub sidebar_by_date: bool,
+    /// 窗口不在前台时，回复完成 / 等待授权 / 出错发系统通知；默认开
+    pub notifications: bool,
 }
 
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
@@ -205,6 +227,9 @@ impl Default for Settings {
             view_mode: ViewMode::default(),
             appearance: Appearance::default(),
             sidebar_kernel_status: yes(),
+            workspace: None,
+            sidebar_by_date: false,
+            notifications: yes(),
         }
     }
 }
@@ -326,7 +351,10 @@ impl Settings {
         if p.model.trim().is_empty() {
             anyhow::bail!("还没有选择模型（设置 → 自研内核）");
         }
-        Ok(BuiltinConfig::new(p.provider_config(), cwd))
+        let mut config = BuiltinConfig::new(p.provider_config(), cwd);
+        // 自动压缩要知道窗口多大
+        config.context_windows = p.context_windows.clone().into_iter().collect();
+        Ok(config)
     }
 
     /// ACP 配置：命令为空时沿用默认（mock agent）。
@@ -348,6 +376,7 @@ impl BuiltinSettings {
             api_key: String::new(),
             model: String::new(),
             models: Vec::new(),
+            context_windows: BTreeMap::new(),
             params: RequestParams {
                 temperature: None,
                 max_tokens: None,
@@ -368,13 +397,6 @@ impl BuiltinSettings {
         &mut self.profiles[idx]
     }
 
-    /// 切到第 `i` 套档案（越界忽略）。
-    pub fn select(&mut self, i: usize) {
-        if i < self.profiles.len() {
-            self.active = i;
-        }
-    }
-
     pub fn is_configured(&self) -> bool {
         self.current().is_configured()
     }
@@ -383,12 +405,12 @@ impl BuiltinSettings {
         &self.current().base_url
     }
 
-    pub fn model(&self) -> &str {
-        &self.current().model
-    }
-
     pub fn models(&self) -> &[String] {
         &self.current().models
+    }
+
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.current().context_window(model)
     }
 
     pub fn provider(&self) -> ProviderConfig {
@@ -421,6 +443,7 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::System, ViewMode::Normal));
         assert!(s.sidebar_kernel_status);
+        assert!(s.notifications);
         let s: Settings = serde_json::from_str(
             r#"{"appearance":"dark","view_mode":"verbose","sidebar_kernel_status":false}"#,
         )
@@ -470,7 +493,7 @@ mod tests {
         assert_eq!(s.builtin.current().base_url, "http://127.0.0.1:8045/v1");
         assert_eq!(s.builtin.current().models, vec!["m", "m2"]);
         assert!(s.builtin.is_configured());
-        assert_eq!(s.builtin.model(), "m");
+        assert_eq!(s.builtin.current().model, "m");
         // 旧格式省略字段
         let s: Settings = serde_json::from_str(r#"{"builtin":{}}"#).unwrap();
         assert_eq!(s.builtin.profiles.len(), 1);
@@ -534,8 +557,6 @@ mod tests {
         b.current_mut().model = "m".into();
         assert_eq!(b.profiles.len(), 1);
         assert!(b.is_configured());
-        b.select(5); // 越界忽略
-        assert_eq!(b.active, 0);
     }
 
     #[core::prelude::v1::test]

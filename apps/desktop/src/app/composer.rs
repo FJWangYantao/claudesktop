@@ -1,15 +1,16 @@
-//! 底部输入区（含权限模式 / 内核 / 模型下拉）与导出、附件等动作。
+//! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
 
-use super::ChatApp;
+use super::{project_label, short_path, ChatApp};
 use super::menu::{menu_action, menu_item, menu_popover, MenuChip};
-use crate::model::{ChatItem, PendingImage};
+use crate::model::PendingImage;
 use crate::settings::KernelChoice;
 use crate::theme::*;
 use crate::theme::rgb;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::Textarea;
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::progress::ProgressCircle;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -68,33 +69,6 @@ impl ChatApp {
                         state.set_value(next, window, cx);
                     });
                     cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    // ---------- 图片附件 ----------
-
-    /// 图片按钮：选图片文件，作为附件随下一条消息发给模型。
-    pub(crate) fn attach_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("选择要附上的图片（png / jpg / gif / webp / bmp）".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                let _ = this.update_in(cx, |app, _window, cx| {
-                    let images: Vec<_> =
-                        paths.iter().filter_map(|p| PendingImage::from_path(p)).collect();
-                    let bad = paths.len() - images.len();
-                    app.add_pending_images(images, cx);
-                    if bad > 0 {
-                        app.sessions[app.active]
-                            .note(format!("{bad} 个文件不是可识别的图片，已跳过"));
-                    }
                 });
             }
         })
@@ -178,19 +152,17 @@ impl ChatApp {
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
         let busy = self.session().busy;
-        let (mode_name, mode_icon): (SharedString, IconAll) = self
+        let mode_name: SharedString = self
             .session()
             .modes
             .get(self.session().permission_mode)
-            .map(|m| (m.name.clone(), m.icon))
-            .unwrap_or_else(|| ("—".into(), IconAll::Gauge));
-        let project = self
-            .session()
-            .cwd
-            .file_name()
-            .map(|n| SharedString::from(n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| self.project_name.clone());
-        let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| "—".into());
+        let project = project_label(&self.session().cwd);
+        // 焦点几乎总在输入框上（丢了由 restore_focus 找回），所以窗口不在前台时按没聚焦画：
+        // 切去别的程序后输入框回到静止样子，鼠标移上来是悬停态，点回来才是聚焦态
+        let focused =
+            window.is_window_active() && self.input.read(cx).focus_handle(cx).is_focused(window);
 
         // 发送按钮三态：空（淡、不可点）/ 可发送（赤陶）/ 忙（深色停止方块，同 Esc）
         let can_send = !self.input.read(cx).value().trim().is_empty() || !self.pending.is_empty();
@@ -202,7 +174,6 @@ impl ChatApp {
         let send = div()
             .id("send")
             .size(px(28.))
-            .ml_1()
             .flex_shrink_0()
             .rounded_lg()
             .bg(rgb(send_bg))
@@ -236,26 +207,20 @@ impl ChatApp {
                 }
             }));
 
-        // 卡片底部工具栏：权限模式 / 内核 / 附件，右侧档案 / 模型 / 发送。open 状态由 Popover 自管
+        // 卡片下方紧贴一行：左侧权限模式 / 添加文件，右侧模型。纯文字 chip，open 状态由 Popover 自管；
+        // 左右内缩到和输入文字对齐，读起来仍是输入框的一部分
         let toolbar = div()
             .h_flex()
             .items_center()
-            .gap_1()
+            .gap_0p5()
+            .px_2()
             .child(menu_popover(
                 "mode-menu",
                 Anchor::BottomLeft,
                 px(300.),
                 &app,
-                MenuChip::new(mode_icon, mode_name),
+                MenuChip::plain(mode_name),
                 mode_menu_items,
-            ))
-            .child(menu_popover(
-                "kernel-menu",
-                Anchor::BottomLeft,
-                px(300.),
-                &app,
-                MenuChip::new(IconAll::Cpu, self.session().kernel.label()),
-                kernel_menu_items,
             ))
             .child(
                 div()
@@ -272,89 +237,66 @@ impl ChatApp {
                     .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx)))
                     .child(Icon::new(IconAll::Plus).size_4().text_color(rgb(INK_SOFT))),
             )
-            .child(
-                div()
-                    .id("attach-images")
-                    .size(px(26.))
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)))
-                    .tooltip(|window, cx| {
-                        Tooltip::new("附加图片（也可直接粘贴）").build(window, cx)
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.attach_images(window, cx)
-                    }))
-                    .child(Icon::new(IconAll::ImagePlus).size_4().text_color(rgb(INK_SOFT))),
-            )
             .child(div().flex_1())
-            .when(self.settings.builtin.profiles.len() > 1, |d| {
-                d.child(menu_popover(
-                    "profile-menu",
-                    Anchor::BottomRight,
-                    px(280.),
-                    &app,
-                    MenuChip::new(
-                        IconAll::Server,
-                        self.settings.builtin.current().display_name(),
-                    ),
-                    profile_menu_items,
-                ))
-            })
+            .children(self.render_context_gauge())
             .child(model_menu_popover(
                 &app,
                 "model-menu",
                 Anchor::BottomRight,
-                MenuChip::text(self.session().model_label.clone()),
-            ))
-            .child(send);
+                MenuChip::plain(self.session().model_label.clone()),
+            ));
 
-        // 输入框是一个整体：附件缩略图、文字、工具栏都在同一张卡片里（对照 claude.ai / 官方 Code 桌面端）。
-        // 聚焦时边框和阴影加深一档；点卡片空白处也把焦点给输入框。
+        // 卡片里只有附件缩略图和随内容长高的多行输入 + 发送键（对照官方 Code 桌面端的紧凑输入框）。
+        // 三档：静止细边；悬停边框加深一档（提示整块都能点）；聚焦再深一档并加阴影。
+        // 点卡片空白处也把焦点给输入框。
         let card = div()
             .id("composer")
             .v_flex()
-            .gap_1()
             .w_full()
             .bg(rgb(CARD))
             .border_1()
             .border_color(rgb(if focused { INK_FAINT } else { LINE }))
+            .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
             .rounded_2xl()
             .map(|d| if focused { d.shadow_sm() } else { d.shadow_xs() })
-            .px_2()
-            .pt_2()
-            .pb_2()
+            // 发送键离右边和上下都是 6px
+            .px_1p5()
+            .py_1()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
             )
-            // 待发送图片缩略图（点右上角 × 撤掉）
+            // 待发送图片缩略图（点右上角 × 撤掉），左边和输入文字对齐
             .when(!self.pending.is_empty(), |d| {
                 d.child(
                     div()
                         .h_flex()
                         .flex_wrap()
                         .gap_1p5()
-                        .px_2()
-                        .pt_1()
+                        .px_2p5()
+                        .pt_1p5()
+                        .pb_1()
                         .children(
                             (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
                         ),
                 )
             })
+            // 发送键贴底：输入框长高后它留在右下角（单行时和文字齐平）
             .child(
-                div().px_2().py_1().child(
-                    Input::new(&self.input)
-                        .appearance(false)
-                        .bordered(false)
-                        .on_paste(paste_to_attachments(app.clone())),
-                ),
-            )
-            .child(toolbar);
+                div()
+                    .h_flex()
+                    .items_end()
+                    .gap_1()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Textarea::new(&self.input)
+                                .appearance(false)
+                                .bordered(false)
+                                .on_paste(paste_to_attachments(app.clone())),
+                        ),
+                    )
+                    .child(send),
+            );
 
         div()
             .v_flex()
@@ -362,15 +304,146 @@ impl ChatApp {
             .mx_auto()
             .w_full()
             .gap_2()
-            // 输入框上方：运行环境 + 项目目录
+            // 进行中这一轮的计划钉在最上面（对话往下走它也一直看得见）
+            .children(self.render_pinned_plan(cx))
+            // 输入框上方：运行环境 + 项目目录（点开切换工作目录）
             .child(
                 div()
                     .h_flex()
                     .gap_1p5()
                     .child(Self::chip(IconAll::Monitor, "本地"))
-                    .child(Self::chip(IconAll::Folder, project)),
+                    .child(menu_popover(
+                        "workspace-menu",
+                        Anchor::BottomLeft,
+                        px(320.),
+                        &app,
+                        MenuChip::new(IconAll::Folder, project).filled(),
+                        workspace_menu_items,
+                    )),
             )
-            .child(card)
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .children(self.render_context_warning(cx))
+                    // `/`、`@` 补全列表浮在卡片正上方，盖住对话而不是把输入框往下挤
+                    .child(div().relative().child(self.with_completion_keys(card, cx)).children(
+                        self.render_completion(cx).map(|list| {
+                            div().absolute().left_0().right_0().bottom_full().mb_1p5().child(list)
+                        }),
+                    ))
+                    .child(toolbar),
+            )
+    }
+}
+
+impl ChatApp {
+    /// 当前会话的上下文用量；没报告过用量时为 None（只有自研内核报告，窗口大小也只有它知道）。
+    fn context_gauge(&self) -> Option<crate::usage::ContextGauge> {
+        let s = self.session();
+        if s.context_tokens == 0 {
+            return None;
+        }
+        let window = match s.kernel {
+            KernelChoice::Builtin => self.settings.builtin.context_window(&s.model_label),
+            _ => None,
+        };
+        Some(crate::usage::context_gauge(s.context_tokens, window))
+    }
+
+    /// 上下文用到九成以上：输入框正上方一行提示，建议新开会话（再发很可能超出上限失败）。
+    /// 正在跑的一轮不提示，等它结束再说。
+    fn render_context_warning(&self, cx: &mut Context<Self>) -> Option<Div> {
+        // 自研内核过八成就会在下一次请求前自动压缩（见 claudesktop-builtin 的 compact 模块），
+        // 这里提前说一声，并给「现在压缩」「新开会话」两条路
+        let percent = self.context_gauge()?.percent.filter(|p| *p >= 80)?;
+        if self.session().busy {
+            return None;
+        }
+        let action = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(rgb(INK))
+                .hover(|d| d.bg(rgb(SELECTED)))
+                .child(label)
+        };
+        Some(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .pl_3()
+                .pr_1p5()
+                .py_1()
+                .rounded_lg()
+                .bg(rgb(SAND))
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(Icon::new(IconAll::TriangleAlert).size_3p5().text_color(rgb(RED)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_features(tabular_nums())
+                        .child(format!(
+                            "上下文已用 {percent}%，下一条消息发出前会先把较早的对话压缩成摘要"
+                        )),
+                )
+                .child(action("context-compact", "现在压缩").on_click(cx.listener(
+                    |this, _, _, cx| this.compact_session(cx),
+                )))
+                .child(action("context-new-session", "新开会话").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.add_session(cx);
+                        this.focus_input(window, cx);
+                    },
+                ))),
+        )
+    }
+
+    /// 模型名左边的上下文用量：小圆环 + 百分比，悬停看具体数字；端点没报窗口大小时只写用了多少。
+    /// 只有自研内核报告用量（ACP 协议没有），一轮结束后才出现。过七成圆环转赤陶，过九成连字一起变红。
+    fn render_context_gauge(&self) -> Option<Stateful<Div>> {
+        let gauge = self.context_gauge()?;
+        let tone = match gauge.percent {
+            Some(p) if p >= 90 => RED,
+            Some(p) if p >= 70 => CORAL,
+            _ => INK_SOFT,
+        };
+        // 悬停提示第二行：上一轮命中提示缓存的比例（命中的部分按折扣计费，越高越省）
+        let tooltip: SharedString = match self.session().cache_hit {
+            Some(hit) => format!("{}\n上一轮命中缓存 {hit}%", gauge.tooltip),
+            None => gauge.tooltip,
+        }
+        .into();
+        Some(
+            div()
+                .id("context-gauge")
+                .h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .py_1()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(if tone == RED { RED } else { INK_SOFT }))
+                .font_features(tabular_nums())
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .when_some(gauge.percent, |d, p| {
+                    d.child(
+                        ProgressCircle::new("context-ring")
+                            .value(p as f32)
+                            .color(rgb(tone))
+                            .size(px(14.)),
+                    )
+                })
+                .child(gauge.label),
+        )
     }
 }
 
@@ -448,108 +521,32 @@ fn mode_menu_items(
     menu
 }
 
-/// 内核条目：空会话直接换内核（并记为默认）；有对话的会话固定在原内核上，
-/// 列出「在别的内核上重跑首条提示词」。
-fn kernel_menu_items(
+/// 工作目录条目：用过的目录（当前会话所在的打对勾）+「选择文件夹…」。
+fn workspace_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
 ) -> Div {
-    let session = app.session();
-    let current = session.kernel;
-    let first_prompt = session
-        .transcript
-        .iter()
-        .position(|i| matches!(i, ChatItem::User { .. }));
+    let current = &app.session().cwd;
     let mut menu = div().v_flex().gap_0p5();
-    if first_prompt.is_some() {
-        menu = menu.child(
-            div()
-                .px_2p5()
-                .py_1p5()
-                .text_size(TEXT_SMALL)
-                .text_color(rgb(INK_SOFT))
-                .child(format!(
-                    "这个会话跑在「{}」上。换个内核重跑首条提示词：",
-                    current.label()
-                )),
-        );
-    }
-    for (i, kind) in KernelChoice::ALL.into_iter().enumerate() {
-        if first_prompt.is_some() && kind == current {
-            continue;
-        }
-        let usable = kind != KernelChoice::Builtin || app.settings.builtin.is_configured();
-        let detail: SharedString = match kind {
-            KernelChoice::Builtin if usable => app.settings.builtin.model().trim().to_string().into(),
-            KernelChoice::Builtin => "还没配置端点和模型（见设置）".into(),
-            KernelChoice::Acp => match app.settings.acp.command.trim() {
-                "" => "内置 mock agent".into(),
-                cmd => cmd.to_string().into(),
-            },
-            KernelChoice::Demo => "不连模型，只播放演示".into(),
-        };
-        let title: SharedString = if first_prompt.is_some() {
-            format!("在「{}」上重跑", kind.label()).into()
-        } else {
-            kind.label().into()
-        };
-        let active = first_prompt.is_none() && kind == current;
+    for (i, dir) in app.recent_workspaces().into_iter().enumerate() {
+        let active = dir == *current;
+        let path = short_path(&dir);
         let (handle, popover) = (handle.clone(), popover.clone());
         menu = menu.child(
-            div()
-                .id(("kernel-item", i))
-                .h_flex()
-                .items_center()
-                .gap_2p5()
-                .px_2p5()
-                .py_2()
-                .rounded_md()
-                .when(usable, |d| {
-                    d.cursor_pointer()
-                        .hover(|d| d.bg(rgb(HOVER)))
-                        .on_click(menu_action!(handle, popover, |this, cx| {
-                            match first_prompt {
-                                Some(item) => this.rerun_on(item, kind, cx),
-                                None => {
-                                    this.update_settings(|s| s.kernel = Some(kind));
-                                    this.rebind_session(this.active, kind);
-                                }
-                            }
-                        }))
-                })
-                .child(
-                    Icon::new(if first_prompt.is_some() { IconAll::RefreshCw } else { IconAll::Cpu })
-                        .size_4()
-                        .text_color(rgb(if usable { INK_SOFT } else { INK_FAINT })),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(TEXT_BODY)
-                                .text_color(rgb(if usable { INK } else { INK_FAINT }))
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_size(TEXT_SMALL)
-                                .text_color(rgb(INK_SOFT))
-                                .child(detail),
-                        ),
-                )
-                .when(active, |d| {
-                    d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                }),
+            menu_item(("workspace-item", i), IconAll::Folder, project_label(&dir), path, active)
+                .on_click(menu_action!(handle, popover, |this, cx| {
+                    this.switch_workspace(dir.clone(), cx);
+                })),
         );
     }
-    menu
+    let (handle, popover) = (handle.clone(), popover.clone());
+    menu.child(
+        div().mt_0p5().pt_0p5().border_t_1().border_color(rgb(LINE)).child(
+            menu_item("workspace-pick", IconAll::FolderOpen, "选择文件夹…", "", false)
+                .on_click(menu_action!(handle, popover, |this, cx| this.pick_workspace(cx))),
+        ),
+    )
 }
 
 /// 模型条目：非自研内核给提示；列表 + 刷新入口（刷新不收起面板，看得到进度）。
@@ -637,78 +634,5 @@ fn model_menu_items(
             })
             .child(Icon::new(IconAll::RefreshCw).size_3p5())
             .child("刷新模型列表"),
-    )
-}
-
-/// provider 档案条目：切档案并重启自研内核（当前项打勾）。
-fn profile_menu_items(
-    app: &ChatApp,
-    handle: &Entity<ChatApp>,
-    popover: &Entity<PopoverState>,
-) -> Div {
-    let current = app.settings.builtin.active;
-    let mut menu = div().v_flex().gap_0p5();
-    for (i, p) in app.settings.builtin.profiles.iter().enumerate() {
-        let active = i == current;
-        let configured = p.is_configured();
-        let title: SharedString = p.display_name().into();
-        let detail: SharedString = if configured {
-            p.model.trim().to_string().into()
-        } else {
-            "还没填完（见设置）".into()
-        };
-        let (handle, popover) = (handle.clone(), popover.clone());
-        menu = menu.child(
-            div()
-                .id(("profile-item", i))
-                .h_flex()
-                .items_center()
-                .gap_2p5()
-                .px_2p5()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(HOVER)))
-                .on_click(menu_action!(handle, popover, |this, cx| {
-                    this.switch_profile(i, cx);
-                }))
-                .child(
-                    Icon::new(IconAll::Server)
-                        .size_4()
-                        .text_color(rgb(if configured { INK_SOFT } else { INK_FAINT })),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(TEXT_BODY)
-                                .text_color(rgb(INK))
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_size(TEXT_SMALL)
-                                .text_color(rgb(INK_SOFT))
-                                .child(detail),
-                        ),
-                )
-                .when(active, |d| {
-                    d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                }),
-        );
-    }
-    menu.child(
-        div()
-            .px_2p5()
-            .py_1p5()
-            .text_size(TEXT_SMALL)
-            .text_color(rgb(INK_SOFT))
-            .child("切换会重启自研内核，进行中的对话下次发消息时续接"),
     )
 }

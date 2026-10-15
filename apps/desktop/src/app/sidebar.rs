@@ -1,7 +1,7 @@
 //! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
 
 use super::chrome::{drag_area, traffic_light_gap, CHROME_H};
-use super::ChatApp;
+use super::{project_label, ChatApp};
 use crate::settings::KernelChoice;
 use crate::theme::*;
 use crate::theme::rgb;
@@ -19,8 +19,8 @@ impl ChatApp {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let mut body = v_flex().gap_0().pb_2();
 
-        // 会话：按工作目录分组，当前项目在前，其余按最近活动排序。
-        // 第一组的组名行右侧带排序切换 / 在资源管理器中打开（悬停才显出来）
+        // 会话：按工作目录分组，当前项目在前，其余按最近活动排序（或按日期分组）。
+        // 第一组的组名行右侧带分组方式 / 排序切换 / 在资源管理器中打开（悬停才显出来）
         for (g, (name, members)) in self.session_groups().into_iter().enumerate() {
             let header = div()
                 .id(("group-header", g))
@@ -44,8 +44,25 @@ impl ChatApp {
                 );
             let header = if g == 0 {
                 let sort_on = self.sessions_by_activity;
+                let by_date = self.settings.sidebar_by_date;
                 header
                     .child(
+                        Self::sidebar_icon_button(
+                            "group-by-date",
+                            IconAll::CalendarDays,
+                            if by_date { "按项目分组" } else { "按日期分组" },
+                            by_date,
+                        )
+                        .when(!by_date, |d| {
+                            d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save_ui_pref(move |s| s.sidebar_by_date = !by_date);
+                            cx.notify();
+                        })),
+                    )
+                    // 按日期分组时组内总是按最近活动排，排序切换没有意义
+                    .when(!by_date, |d| d.child(
                         Self::sidebar_icon_button(
                             "sort-sessions",
                             IconAll::ArrowDownUp,
@@ -59,7 +76,7 @@ impl ChatApp {
                             this.sessions_by_activity = !this.sessions_by_activity;
                             cx.notify();
                         })),
-                    )
+                    ))
                     .child(
                         Self::sidebar_icon_button(
                             "open-workspace",
@@ -239,6 +256,28 @@ impl ChatApp {
     /// 侧栏分组：(组名, 会话下标)。当前工作目录一组在最前；
     /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
     pub(super) fn session_groups(&self) -> Vec<(SharedString, Vec<usize>)> {
+        // 无元信息的会话（刚开、还没落盘）视为最新
+        let activity =
+            |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
+        if self.settings.sidebar_by_date {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            let offset = crate::usage::local_offset_secs();
+            let mut buckets: [Vec<usize>; 4] = Default::default();
+            for i in 0..self.sessions.len() {
+                buckets[crate::usage::day_bucket(activity(i).min(now), now, offset)].push(i);
+            }
+            return buckets
+                .into_iter()
+                .zip(crate::usage::DAY_BUCKETS)
+                .filter(|(members, _)| !members.is_empty())
+                .map(|(mut members, name)| {
+                    members.sort_by(|a, b| activity(*b).cmp(&activity(*a)));
+                    (name.into(), members)
+                })
+                .collect();
+        }
         let mut groups: Vec<(&Path, Vec<usize>)> = vec![(self.cwd.as_path(), Vec::new())];
         for (i, s) in self.sessions.iter().enumerate() {
             match groups.iter_mut().find(|(cwd, _)| *cwd == s.cwd.as_path()) {
@@ -251,23 +290,9 @@ impl ChatApp {
             .enumerate()
             .map(|(g, (cwd, mut members))| {
                 if self.sessions_by_activity {
-                    // 无元信息的会话（刚开、还没落盘）视为最新
-                    let activity = |i: usize| {
-                        self.sessions[i]
-                            .meta
-                            .as_ref()
-                            .map_or(u64::MAX, |m| m.updated_ms)
-                    };
                     members.sort_by(|a, b| activity(*b).cmp(&activity(*a)));
                 }
-                let name = if g == 0 {
-                    self.project_name.clone()
-                } else {
-                    cwd.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| cwd.display().to_string())
-                        .into()
-                };
+                let name = if g == 0 { self.project_name.clone() } else { project_label(cwd) };
                 (name, members)
             })
             .collect()
@@ -369,9 +394,7 @@ impl ChatApp {
             .cursor_pointer()
             .when(!active, |d| d.hover(|d| d.bg(rgb(SELECTED))))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.active = i;
-                this.settings_open = false;
-                cx.notify();
+                this.activate_session(i, cx);
             }))
             .child(
                 div()
