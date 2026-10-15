@@ -5,8 +5,8 @@
 //! 内完成；对上层暴露统一的 [`ChatProvider`] 接口。
 
 use crate::provider::{
-    ChatMessage, ChatProvider, ProviderConfig, StreamEvent, StreamOutcome, ToolCall,
-    debug_http, error_message, post_sse_with_retry, read_sse,
+    ChatMessage, ChatProvider, ModelInfo, ProviderConfig, StreamEvent, StreamOutcome, ToolCall,
+    debug_http, error_message, parse_model_list, post_sse_with_retry, read_sse,
 };
 use serde_json::{Value, json};
 
@@ -45,7 +45,7 @@ impl AnthropicProvider {
 }
 
 impl ChatProvider for AnthropicProvider {
-    fn list_models(&self) -> anyhow::Result<Vec<String>> {
+    fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let url = self.endpoint("/models?limit=1000");
         let mut request = self.agent.get(&url).header("Accept", "application/json");
         for (name, value) in self.headers() {
@@ -61,14 +61,9 @@ impl ChatProvider for AnthropicProvider {
         }
         let value: Value =
             serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("模型列表不是 JSON: {e}"))?;
-        Ok(value
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|m| m.get("id").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect())
+        Ok(parse_model_list(
+            value.get("data").and_then(Value::as_array).map_or(&[], Vec::as_slice),
+        ))
     }
 
     fn stream_chat(
@@ -303,8 +298,13 @@ fn parse_event(
         .map_err(|e| format!("无法解析流数据（{e}）: {payload}"))?;
     match value.get("type").and_then(Value::as_str).unwrap_or("") {
         "message_start" => {
-            if let Some(input) = value.pointer("/message/usage/input_tokens").and_then(Value::as_u64) {
-                usage.input_tokens = input;
+            // 开了提示缓存时 input_tokens 只是没命中缓存的部分；三项加起来才是整个提示
+            // （和 OpenAI 的 prompt_tokens 同口径，上下文用量据此计算）
+            if let Some(u) = value.pointer("/message/usage").filter(|u| u.is_object()) {
+                let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+                usage.input_tokens =
+                    n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+                usage.cache_read_tokens = n("cache_read_input_tokens");
                 *usage_seen = true;
             }
             Ok(None)
@@ -459,7 +459,7 @@ mod tests {
         let mut seen = false;
         let mut events = Vec::new();
         let lines = [
-            r#"{"type":"message_start","message":{"usage":{"input_tokens":25}}}"#,
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":12,"cache_creation_input_tokens":8}}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想"}}"#,
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
@@ -481,6 +481,7 @@ mod tests {
         }
         assert_eq!(finish.as_deref(), Some("tool_calls"));
         assert_eq!(usage.input_tokens, 25);
+        assert_eq!(usage.cache_read_tokens, 12);
         assert_eq!(usage.output_tokens, 41);
         assert_eq!(
             events,

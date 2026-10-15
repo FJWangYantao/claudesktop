@@ -217,8 +217,9 @@ pub struct FunctionCall {
 pub enum StreamEvent {
     Text(String),
     Reasoning(String),
-    /// 即将重试（第 `attempt` 次，等待 `delay_ms`），`reason` 为上一次的错误
+    /// 即将重试（第 `attempt` 次，等待 `delay_ms`），`status` / `reason` 为上一次的错误
     Retrying {
+        status: u16,
         attempt: usize,
         delay_ms: u64,
         reason: String,
@@ -230,6 +231,8 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
+    /// 输入里命中提示缓存的部分（包含在 `input_tokens` 里）
+    pub cache_read_tokens: u64,
 }
 
 impl Usage {
@@ -237,7 +240,40 @@ impl Usage {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
     }
+}
+
+/// 端点模型列表里的一项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// 上下文窗口（token）；端点没报告时为 None
+    pub context_window: Option<u64>,
+}
+
+/// 模型列表响应（`{"data":[{"id":…}, …]}`，OpenAI / Anthropic 同形）→ 模型条目；没有 id 的跳过。
+/// 窗口大小各家字段名不一：OpenRouter 和多数网关 `context_length`，vLLM `max_model_len`，
+/// Anthropic `max_input_tokens`，其余几种也认。
+pub(crate) fn parse_model_list(data: &[Value]) -> Vec<ModelInfo> {
+    const WINDOW_KEYS: [&str; 6] = [
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_model_len",
+        "max_input_tokens",
+        "input_token_limit",
+    ];
+    data.iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.to_owned();
+            let context_window = WINDOW_KEYS
+                .iter()
+                .find_map(|k| m.get(*k).and_then(Value::as_u64))
+                .filter(|n| *n > 0);
+            Some(ModelInfo { id, context_window })
+        })
+        .collect()
 }
 
 /// 一次流式补全的结果（协议无关；`finish_reason` 用 OpenAI 词汇）。
@@ -266,8 +302,8 @@ pub trait ChatProvider: Send + Sync {
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome>;
 
-    /// 端点提供的模型 ID 列表。
-    fn list_models(&self) -> anyhow::Result<Vec<String>>;
+    /// 端点提供的模型（含上下文窗口，端点报告的话）。
+    fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>>;
 }
 
 /// 带退避重试的 SSE POST（两个 provider 共用）：非 2xx 读出错误体，
@@ -305,6 +341,7 @@ pub(crate) fn post_sse_with_retry(
         let delay_ms = BACKOFF_MS[attempt];
         attempt += 1;
         on_event(StreamEvent::Retrying {
+            status,
             attempt,
             delay_ms,
             reason,

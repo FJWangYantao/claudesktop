@@ -5,6 +5,7 @@
 
 use claudesktop_builtin::{BuiltinConfig, BuiltinKernel, Protocol, ProviderConfig};
 use claudesktop_core::{EventSink, Kernel, KernelEvent, RoutedEvent, UserPrompt};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -128,6 +129,11 @@ impl Harness {
 
     /// 指定协议的端点（Anthropic 原生等）。
     fn with_config(provider: ProviderConfig, cwd: PathBuf) -> Self {
+        Self::with_windows(provider, cwd, HashMap::new())
+    }
+
+    /// 带上下文窗口（自动压缩用）。
+    fn with_windows(provider: ProviderConfig, cwd: PathBuf, context_windows: HashMap<String, u64>) -> Self {
         let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
         let sink: EventSink = {
             let events = events.clone();
@@ -138,6 +144,8 @@ impl Harness {
                 provider,
                 cwd,
                 rules_path: None,
+                user_instructions: None,
+                context_windows,
             },
             sink,
         )
@@ -197,7 +205,7 @@ fn streams_reasoning_text_usage_and_ends_turn() {
     assert_eq!(
         h.count(|e| matches!(
             e,
-            KernelEvent::UsageUpdated { input_tokens: 6, output_tokens: 14, reasoning_tokens: 8 }
+            KernelEvent::UsageUpdated { input_tokens: 6, output_tokens: 14, reasoning_tokens: 8, context_tokens: 20, cache_read_tokens: 0 }
         )),
         1
     );
@@ -252,7 +260,10 @@ fn retries_transient_errors_then_succeeds() {
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.text(false), "重试后成功");
     assert_eq!(
-        h.count(|e| matches!(e, KernelEvent::Status(s) if s.contains("HTTP 429") && s.contains("重试"))),
+        h.count(|e| matches!(
+            e,
+            KernelEvent::Retrying { status: 429, attempt: 1, reason, .. } if reason.contains("exhausted")
+        )),
         1
     );
 }
@@ -268,6 +279,30 @@ fn non_retryable_error_fails_the_turn() {
     });
     // 失败后会话仍可用：可以立刻发下一轮
     assert_eq!(h.count(|e| matches!(e, KernelEvent::TurnEnded { .. })), 0);
+}
+
+#[test]
+fn retry_after_failure_keeps_roles_alternating() {
+    let (base, bodies) = serve(vec![
+        Reply::Status(400, r#"{"error":{"message":"bad request"}}"#),
+        happy_stream("好了"),
+    ]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("x")).unwrap();
+    h.wait("prompt failed", |e| matches!(e, KernelEvent::PromptFailed { .. }));
+    // 界面上的「重试」= 同一句再发一遍
+    h.kernel.send_prompt(&sid, UserPrompt::text("x")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let body: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap();
+    let roles: Vec<&str> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["role"].as_str())
+        .filter(|r| *r != "system")
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "user"]);
 }
 
 #[test]
@@ -380,7 +415,7 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
     // 第一步带工具定义；第二步历史里是 assistant(tool_calls) + tool 结果
     let first = body(&bodies, 0);
     let names: Vec<_> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["read_file", "list_dir", "glob", "grep", "write_file", "edit_file", "shell"]);
+    assert_eq!(names, ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "write_file", "edit_file", "shell"]);
     let second = body(&bodies, 1);
     let msgs = second["messages"].as_array().unwrap();
     let n = msgs.len();
@@ -390,6 +425,78 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
     assert_eq!(msgs[n - 1]["role"], "tool");
     assert_eq!(msgs[n - 1]["tool_call_id"], "call_1");
     assert!(msgs[n - 1]["content"].as_str().unwrap().contains("2\t秘密是 42"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 模型这一步发多个工具调用
+fn tool_calls(calls: &[(&str, &str, serde_json::Value)]) -> Reply {
+    let calls: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (id, name, args))| serde_json::json!({
+            "index": i, "id": id, "type": "function",
+            "function": { "name": name, "arguments": args.to_string() }
+        }))
+        .collect();
+    let chunk = serde_json::json!({
+        "choices": [{ "index": 0, "delta": { "tool_calls": calls }, "finish_reason": null }]
+    });
+    Reply::Sse {
+        lines: vec![format!("data: {chunk}"), finish("tool_calls"), "data: [DONE]".into()],
+        gap_ms: 5,
+    }
+}
+
+#[test]
+fn consecutive_reads_run_together_and_results_keep_call_order() {
+    let dir = workdir("parallel");
+    std::fs::write(dir.join("a.txt"), "AAA\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "BBB\n").unwrap();
+    let (base, bodies) = serve(vec![
+        tool_calls(&[
+            ("r1", "read_file", serde_json::json!({ "path": "a.txt" })),
+            ("r2", "read_file", serde_json::json!({ "path": "b.txt" })),
+            ("w", "write_file", serde_json::json!({ "path": "c.txt", "content": "C" })),
+            ("r3", "read_file", serde_json::json!({ "path": "c.txt" })),
+        ]),
+        happy_stream("好了"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("读读写写")).unwrap();
+    let (req, _) = h.permission(1);
+    h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 事件顺序：r1、r2 两行先一起报出，再开始执行；写入要等它们都完成，r3 在写入之后才读
+    let order: Vec<String> = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match &r.event {
+            KernelEvent::ToolCallStarted { id, .. } => Some(format!("start:{id}")),
+            KernelEvent::ToolCallUpdated { id, status: Some(s), .. } if s != "pending" => Some(format!("{s}:{id}")),
+            _ => None,
+        })
+        .collect();
+    let pos = |s: &str| order.iter().position(|o| o == s).unwrap_or_else(|| panic!("{s} missing: {order:?}"));
+    assert!(pos("start:r2") < pos("in_progress:r1"), "{order:?}");
+    assert!(pos("completed:r1") < pos("start:w") && pos("completed:r2") < pos("start:w"), "{order:?}");
+    assert!(pos("completed:w") < pos("start:r3"), "{order:?}");
+    assert_eq!(h.tool_status("r3").as_deref(), Some("completed"));
+
+    let second = body(&bodies, 1);
+    let results: Vec<(String, String)> = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| (m["tool_call_id"].as_str().unwrap().into(), m["content"].as_str().unwrap().into()))
+        .collect();
+    let ids: Vec<_> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["r1", "r2", "w", "r3"]);
+    assert!(results[0].1.contains("AAA") && results[1].1.contains("BBB") && results[3].1.contains('C'));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -525,8 +632,62 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
     assert!(!dir.join("x.txt").exists());
     let first = body(&bodies, 0);
     let names: Vec<_> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["read_file", "list_dir", "glob", "grep"]);
+    assert_eq!(names, ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch"]);
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 本地网页服务器：每个请求都回同一页 HTML；返回网址前缀
+fn serve_page(html: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            read_request(&stream);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                html.len()
+            );
+        }
+    });
+    base
+}
+
+#[test]
+fn web_fetch_asks_per_host_even_in_plan_mode_and_converts_html() {
+    let dir = workdir("fetch");
+    let page = serve_page("<html><head><title>文档</title></head><body><h2>安装</h2><p>运行 <code>cargo add x</code></p></body></html>");
+    let (base, bodies) = serve(vec![
+        tool_call("f1", "web_fetch", serde_json::json!({ "url": format!("{page}/docs") })),
+        happy_stream("看完了"),
+        tool_call("f2", "web_fetch", serde_json::json!({ "url": format!("{page}/other") })),
+        happy_stream("又看完了"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.set_mode(&sid, "plan").unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看下文档")).unwrap();
+    let (req, options) = h.permission(1);
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+    h.kernel.resolve_permission(req, Some("allow_always".into())).unwrap();
+    h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.tool_status("f1").as_deref(), Some("completed"));
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::ToolCallStarted { title, kind, .. } if title == &format!("Fetch {page}/docs") && kind == "fetch")),
+        1
+    );
+    let second = body(&bodies, 1);
+    let msgs = second["messages"].as_array().unwrap();
+    let result = msgs[msgs.len() - 1]["content"].as_str().unwrap();
+    assert!(result.contains("Title: 文档") && result.contains("## 安装\n\n运行 `cargo add x`"), "{result}");
+
+    // 同一主机已总是允许：不再询问
+    h.kernel.send_prompt(&sid, UserPrompt::text("再看一页")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 1);
+    assert_eq!(h.tool_status("f2").as_deref(), Some("completed"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -563,6 +724,168 @@ fn bad_arguments_fail_the_call_not_the_turn() {
     let last = second["messages"].as_array().unwrap().last().unwrap().clone();
     assert!(last["content"].as_str().unwrap().contains("path"), "{last}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn project_instructions_go_into_the_system_prompt_and_are_reread() {
+    let dir = workdir("instructions");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "代码注释用中文").unwrap();
+    let (base, bodies) = serve(vec![happy_stream("好"), happy_stream("好")]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("一")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let system = body(&bodies, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("代码注释用中文") && system.contains("AGENTS.md"), "{system}");
+
+    std::fs::write(dir.join("AGENTS.md"), "提交信息用英文").unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("二")).unwrap();
+    h.wait_n("turn end", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let system = body(&bodies, 1)["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("提交信息用英文") && !system.contains("代码注释用中文"), "{system}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn todo_write_replaces_the_plan_without_a_tool_row() {
+    let (base, bodies) = serve(vec![
+        tool_call(
+            "t1",
+            "todo_write",
+            serde_json::json!({ "todos": [
+                { "content": "读代码", "status": "completed" },
+                { "content": "改代码", "status": "in_progress" }
+            ]}),
+        ),
+        happy_stream("在改了"),
+    ]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("改一下")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { .. })), 0);
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::PlanReplaced { entries }
+            if entries.len() == 2 && entries[1].content == "改代码" && entries[1].status == "in_progress")),
+        1
+    );
+    let second = body(&bodies, 1);
+    let last = second["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["tool_call_id"], "t1");
+    assert!(last["content"].as_str().unwrap().contains("[>] 改代码"), "{last}");
+}
+
+// ---------- 上下文压缩 ----------
+
+/// 一段回复，带指定的用量
+fn reply_with_usage(answer: &str, prompt_tokens: u64) -> Reply {
+    Reply::Sse {
+        lines: vec![
+            delta("content", answer),
+            finish("stop"),
+            format!(r#"data: {{"choices":[],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":10}}}}"#),
+            "data: [DONE]".into(),
+        ],
+        gap_ms: 5,
+    }
+}
+
+/// 请求里的 (系统提示词, 其余消息的文本)
+fn conversation(bodies: &Arc<Mutex<Vec<String>>>, i: usize) -> (String, Vec<String>) {
+    let b = body(bodies, i);
+    let msgs = b["messages"].as_array().unwrap();
+    let system = msgs[0]["content"].as_str().unwrap_or_default().to_string();
+    let rest = msgs[1..].iter().map(|m| m["content"].as_str().unwrap_or_default().to_string()).collect();
+    (system, rest)
+}
+
+fn provider(base: String) -> ProviderConfig {
+    ProviderConfig {
+        base_url: base,
+        api_key: Some("test-key".into()),
+        model: "mock-model".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn compacts_before_the_request_when_context_is_nearly_full() {
+    let (base, bodies) = serve(vec![
+        reply_with_usage("第一轮的回答", 850),
+        happy_stream("## 摘要\n用户先问了第一轮的问题"),
+        happy_stream("第二轮的回答"),
+    ]);
+    let windows = HashMap::from([("mock-model".to_string(), 1_000)]);
+    let h = Harness::with_windows(provider(base), std::env::temp_dir(), windows);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一轮的问题")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 上一轮结束时 860 / 1000，过了 80%：发第二轮前先压缩
+    h.kernel.send_prompt(&sid, UserPrompt::text("第二轮的问题")).unwrap();
+    h.wait_n("turn end", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 总结请求不带工具，内容是第一轮的记录
+    let summary_req = body(&bodies, 1);
+    assert!(summary_req.get("tools").is_none());
+    let (_, rest) = conversation(&bodies, 1);
+    assert!(rest[0].contains("第一轮的问题") && rest[0].contains("第一轮的回答"), "{rest:?}");
+    assert!(!rest[0].contains("第二轮的问题"), "本轮保留，不进摘要");
+
+    // 正式请求：摘要在系统提示词里，历史只剩本轮
+    let (system, rest) = conversation(&bodies, 2);
+    assert!(system.contains("用户先问了第一轮的问题"), "{system}");
+    assert_eq!(rest, ["第二轮的问题"]);
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Compacting)), 1);
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::Compacted { summary, context_tokens } if summary.starts_with("## 摘要") && *context_tokens > 0)),
+        1
+    );
+    assert_eq!(h.text(false), "第一轮的回答第二轮的回答");
+}
+
+#[test]
+fn context_overflow_error_compacts_and_resends_once() {
+    let (base, bodies) = serve(vec![
+        happy_stream("第一轮的回答"),
+        Reply::Status(400, r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#),
+        happy_stream("早先的摘要"),
+        happy_stream("第二轮的回答"),
+    ]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一轮的问题")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    h.kernel.send_prompt(&sid, UserPrompt::text("第二轮的问题")).unwrap();
+    h.wait_n("turn end", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PromptFailed { .. })), 0);
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Compacted { .. })), 1);
+    let (system, rest) = conversation(&bodies, 3);
+    assert!(system.contains("早先的摘要"), "{system}");
+    assert_eq!(rest, ["第二轮的问题"]);
+    assert_eq!(h.text(false), "第一轮的回答第二轮的回答");
+}
+
+#[test]
+fn manual_compact_summarizes_everything_and_ends_a_turn() {
+    let (base, bodies) = serve(vec![happy_stream("第一轮的回答"), happy_stream("全部的摘要"), happy_stream("好")]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    assert!(h.kernel.compact(&sid).is_err(), "空会话没什么可压");
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一轮的问题")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    h.kernel.compact(&sid).unwrap();
+    // 压缩期间不能发消息
+    assert!(h.kernel.send_prompt(&sid, UserPrompt::text("插队")).is_err());
+    h.wait_n("turn end", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Compacted { summary, .. } if summary == "全部的摘要")), 1);
+
+    h.kernel.send_prompt(&sid, UserPrompt::text("第二轮的问题")).unwrap();
+    h.wait_n("turn end", 3, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let (system, rest) = conversation(&bodies, 2);
+    assert!(system.contains("全部的摘要"), "{system}");
+    assert_eq!(rest, ["第二轮的问题"]);
 }
 
 /// 真实端点（如 Antigravity Tools 的 gemini-3.8-flash）。
@@ -759,7 +1082,7 @@ fn anthropic_protocol_streams_and_runs_tools() {
     assert_eq!(
         h.count(|e| matches!(
             e,
-            KernelEvent::UsageUpdated { input_tokens: 39, output_tokens: 17, reasoning_tokens: 0 }
+            KernelEvent::UsageUpdated { input_tokens: 39, output_tokens: 17, reasoning_tokens: 0, context_tokens: 35, cache_read_tokens: 0 }
         )),
         1
     );

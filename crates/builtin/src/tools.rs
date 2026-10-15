@@ -1,8 +1,9 @@
-//! 自研内核的内置工具：读文件 / 列目录 / 写文件 / 精确替换编辑 / shell。
+//! 自研内核的内置工具：读文件 / 列目录 / 写文件 / 精确替换编辑 / shell / 抓网页（见 [`crate::fetch`]），
+//! 以及不碰文件的待办清单（`todo_write`，内核直接转成界面上的计划，见 [`parse_todos`]）。
 //!
 //! 给模型看的说明与结果用英文（与系统提示词一致），给 UI 的摘要用中文。
 
-use claudesktop_core::DiffView;
+use claudesktop_core::{DiffView, PlanEntryView};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -19,6 +20,15 @@ const EDIT_FILE: &str = "edit_file";
 const SHELL: &str = "shell";
 const GLOB: &str = "glob";
 const GREP: &str = "grep";
+const WEB_FETCH: &str = "web_fetch";
+pub const TODO_WRITE: &str = "todo_write";
+/// 待办清单最多几项
+const TODO_MAX: usize = 50;
+
+/// 能和相邻调用并行执行的工具：只读、不问权限、互不影响。
+pub fn parallel_safe(name: &str) -> bool {
+    matches!(name, READ_FILE | LIST_DIR | GLOB | GREP)
+}
 
 /// 单次读取的默认行数 / 单行最长字符数 / 最大文件
 const READ_LIMIT: usize = 2000;
@@ -49,6 +59,8 @@ pub enum Access {
     Read,
     Edit,
     Exec,
+    /// 联网（只读，但会把网址发出去，所以要问）
+    Fetch,
 }
 
 /// 解析好的一次工具调用。
@@ -91,6 +103,11 @@ pub enum Action {
         ignore_case: bool,
         files_only: bool,
         cwd: PathBuf,
+    },
+    /// 抓网页；`offset` 是转换后文本的字符偏移
+    Fetch {
+        url: String,
+        offset: usize,
     },
 }
 
@@ -170,6 +187,32 @@ pub fn specs(writable: bool) -> Vec<Value> {
             }),
         ),
         f(
+            TODO_WRITE,
+            "Create or update the task list for the current work; the user sees it as a checklist. \
+             Use it for tasks with three or more steps: write the whole list up front, then call it again \
+             to mark items in_progress / completed as you go. Always send the complete list (it replaces \
+             the previous one) and keep exactly one item in_progress while working. \
+             Do not use it for simple one-step requests."
+                .into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string", "description": "What to do, in the user's language" },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["todos"]
+            }),
+        ),
+        f(
             GREP,
             format!(
                 "Search file contents with a regular expression (Rust regex syntax). Respects .gitignore, skips hidden and binary files. \
@@ -186,6 +229,24 @@ pub fn specs(writable: bool) -> Vec<Value> {
                     "files_only": { "type": "boolean", "description": "Return only paths of matching files" }
                 },
                 "required": ["pattern"]
+            }),
+        ),
+        f(
+            WEB_FETCH,
+            format!(
+                "Fetch a web page (http/https) and return its text: HTML is converted to plain text with \
+                 headings, lists, code blocks and [text](absolute-url) links; JSON and other text are returned as is. \
+                 Scripts are not run. Returns at most {} characters; use offset to read further. \
+                 Use it for documentation, issues or articles the user points to; the user may be asked to approve the domain.",
+                crate::fetch::FETCH_PAGE_CHARS
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Full URL, e.g. https://docs.rs/serde" },
+                    "offset": { "type": "integer", "description": "Character offset into the converted text (for long pages)" }
+                },
+                "required": ["url"]
             }),
         ),
     ];
@@ -240,6 +301,63 @@ pub fn specs(writable: bool) -> Vec<Value> {
         ));
     }
     tools
+}
+
+#[derive(Deserialize)]
+struct FetchArgs {
+    url: String,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct TodoArgs {
+    todos: Vec<TodoItem>,
+}
+
+#[derive(Deserialize)]
+struct TodoItem {
+    content: String,
+    #[serde(default)]
+    status: String,
+}
+
+/// `todo_write` 的参数 → 计划条目（错误信息回给模型）。认不出的状态按 pending。
+pub fn parse_todos(arguments: &str) -> Result<Vec<PlanEntryView>, String> {
+    let args: TodoArgs = serde_json::from_str(arguments)
+        .map_err(|e| format!("Invalid arguments for {TODO_WRITE}: {e}"))?;
+    if args.todos.len() > TODO_MAX {
+        return Err(format!("{TODO_WRITE}: at most {TODO_MAX} items"));
+    }
+    Ok(args
+        .todos
+        .into_iter()
+        .filter(|t| !t.content.trim().is_empty())
+        .map(|t| PlanEntryView {
+            content: t.content.trim().to_string(),
+            priority: "medium".into(),
+            status: match t.status.as_str() {
+                "in_progress" | "completed" => t.status,
+                _ => "pending".into(),
+            },
+        })
+        .collect())
+}
+
+/// 待办清单的一行摘要（日志重建上下文 / 回给模型的确认用）：`[x] 已完成; [>] 进行中; [ ] 待做`。
+pub fn todo_summary(entries: &[PlanEntryView]) -> String {
+    entries
+        .iter()
+        .map(|e| {
+            let mark = match e.status.as_str() {
+                "completed" => "[x]",
+                "in_progress" => "[>]",
+                _ => "[ ]",
+            };
+            format!("{mark} {}", e.content)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[derive(Deserialize)]
@@ -389,6 +507,13 @@ impl Action {
                     cwd: cwd.to_path_buf(),
                 }
             }
+            WEB_FETCH => {
+                let a: FetchArgs = de(name, args)?;
+                Self::Fetch {
+                    url: crate::fetch::normalize_url(&a.url)?,
+                    offset: a.offset.unwrap_or(0),
+                }
+            }
             other => return Err(format!("Unknown tool `{other}`")),
         })
     }
@@ -400,6 +525,7 @@ impl Action {
             }
             Self::Write { .. } | Self::Edit { .. } => Access::Edit,
             Self::Shell { .. } => Access::Exec,
+            Self::Fetch { .. } => Access::Fetch,
         }
     }
 
@@ -410,6 +536,7 @@ impl Action {
             Self::Glob { .. } | Self::Grep { .. } => "search",
             Self::Write { .. } | Self::Edit { .. } => "edit",
             Self::Shell { .. } => "execute",
+            Self::Fetch { .. } => "fetch",
         }
     }
 
@@ -421,6 +548,7 @@ impl Action {
             Self::Write { path, .. } => format!("Write {}", display(cwd, path)),
             Self::Edit { path, .. } => format!("Edit {}", display(cwd, path)),
             Self::Shell { command, .. } => format!("`{}`", command.trim()),
+            Self::Fetch { url, .. } => format!("Fetch {url}"),
             Self::Glob { pattern, root, cwd } => match display(cwd, root).as_str() {
                 "." => format!("Glob {pattern}"),
                 dir => format!("Glob {pattern} in {dir}"),
@@ -456,10 +584,12 @@ impl Action {
     /// 「总是允许」对应的规则；None = 不提供该选项。
     /// - 编辑：`edit`（仅工作目录内）
     /// - shell：`shell:<程序> [子命令]`，含管道 / 重定向 / 串联等的复合命令不提供
+    /// - 抓网页：`fetch:<主机名>`
     pub fn rule(&self, cwd: &Path) -> Option<String> {
         match self {
             Self::Write { .. } | Self::Edit { .. } => self.inside(cwd).then(|| "edit".to_string()),
             Self::Shell { command, .. } => shell_rule(command).map(|r| format!("shell:{r}")),
+            Self::Fetch { url, .. } => Some(format!("fetch:{}", crate::fetch::host_of(url))),
             _ => None,
         }
     }
@@ -524,6 +654,7 @@ impl Action {
                 cwd,
                 should_stop,
             ),
+            Self::Fetch { url, offset } => crate::fetch::fetch(url, *offset, should_stop),
         }
     }
 }
@@ -1122,6 +1253,11 @@ mod tests {
         assert_eq!(a.rule(cwd).as_deref(), Some("shell:cargo test"));
         assert!(Action::parse(WRITE_FILE, r#"{"path":"a"}"#, cwd).unwrap_err().contains("content"));
         assert!(Action::parse("nope", "{}", cwd).unwrap_err().contains("Unknown tool"));
+        let a = Action::parse(WEB_FETCH, r#"{"url":"Docs.rs/serde"}"#, cwd).unwrap();
+        assert_eq!(a.title(cwd), "Fetch https://Docs.rs/serde");
+        assert_eq!((a.access(), a.kind()), (Access::Fetch, "fetch"));
+        assert_eq!(a.rule(cwd).as_deref(), Some("fetch:docs.rs"));
+        assert!(Action::parse(WEB_FETCH, r#"{"url":"file:///etc/passwd"}"#, cwd).is_err());
         // 工作目录外的写入：不提供「总是允许」
         let outside = Action::parse(WRITE_FILE, r#"{"path":"../other/x","content":""}"#, cwd).unwrap();
         assert!(!outside.inside(cwd));
@@ -1187,6 +1323,20 @@ mod tests {
             .collect();
         assert!(names.contains(&"glob".to_string()) && names.contains(&"grep".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn todos_become_plan_entries() {
+        let entries = parse_todos(
+            r#"{"todos":[{"content":"读代码","status":"completed"},{"content":" 改 ","status":"in_progress"},{"content":"测","status":"x"},{"content":"  ","status":"pending"}]}"#,
+        )
+        .unwrap();
+        let got: Vec<(&str, &str)> = entries.iter().map(|e| (e.content.as_str(), e.status.as_str())).collect();
+        assert_eq!(got, [("读代码", "completed"), ("改", "in_progress"), ("测", "pending")]);
+        assert_eq!(todo_summary(&entries), "[x] 读代码; [>] 改; [ ] 测");
+        assert!(parse_todos(r#"{"items":[]}"#).unwrap_err().contains("todo_write"));
+        // Plan 模式也能用
+        assert!(specs(false).iter().any(|t| t["function"]["name"] == TODO_WRITE));
     }
 
     #[test]

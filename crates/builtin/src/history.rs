@@ -4,6 +4,9 @@
 //! 参数与输出。所以重建成纯文本的 user / assistant 交替消息，工具调用写成
 //! `[tool] 标题 → 状态：摘要` 行并入 assistant 消息；系统提示词会告诉模型
 //! 这些是摘要，需要细节就重新读。
+//!
+//! 日志里有压缩记录（`Compacted`）时，摘要另外返回（进系统提示词），记录之前的对话丢掉：
+//! 一轮中间的自动压缩保留这一轮，空闲时的手动压缩全部丢掉（规则同 `compact` 模块）。
 
 use crate::ChatMessage;
 use crate::provider::ContentPart;
@@ -80,15 +83,28 @@ impl Assistant {
     }
 }
 
-/// 日志 → 对话历史（不含系统提示词）。
-pub fn rebuild(records: &[Record]) -> Vec<ChatMessage> {
-    let mut messages = Vec::new();
+/// 从日志重建的上下文。
+#[derive(Debug, Default)]
+pub struct Rebuilt {
+    /// 最近一次压缩的摘要
+    pub summary: Option<String>,
+    /// 对话历史（不含系统提示词和摘要）
+    pub messages: Vec<ChatMessage>,
+}
+
+/// 日志 → 对话历史。
+pub fn rebuild(records: &[Record]) -> Rebuilt {
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    let mut summary = None;
     let mut assistant = Assistant::default();
+    // 有进行中的一轮（最后一条用户消息之后还没结束）
+    let mut in_turn = false;
     for record in records {
         match record {
             Record::User { text, images } => {
                 messages.extend(assistant.take());
                 messages.push(user_message(text, images));
+                in_turn = true;
             }
             Record::Event { event } => match event {
                 KernelEvent::AgentMessageChunk { text } => assistant.text(text),
@@ -105,6 +121,7 @@ pub fn rebuild(records: &[Record]) -> Vec<ChatMessage> {
                     title: new_title,
                     status: new_status,
                     raw_output,
+                    ..
                 } => {
                     if let Some((title, status, output)) = assistant.tool(id) {
                         if let Some(t) = new_title {
@@ -118,20 +135,42 @@ pub fn rebuild(records: &[Record]) -> Vec<ChatMessage> {
                         }
                     }
                 }
-                KernelEvent::TurnEnded { stop_reason } if stop_reason == "cancelled" => {
-                    assistant.text("\n[interrupted by the user]")
+                KernelEvent::TurnEnded { stop_reason } => {
+                    if stop_reason == "cancelled" {
+                        assistant.text("\n[interrupted by the user]");
+                    }
+                    in_turn = false;
                 }
                 KernelEvent::PromptFailed { message } => {
-                    assistant.text(&format!("\n[turn failed: {message}]"))
+                    assistant.text(&format!("\n[turn failed: {message}]"));
+                    in_turn = false;
                 }
-                // 思考、计划、权限请求不进上下文
+                // 待办清单写成一行工具摘要，续接后模型还知道做到哪了
+                KernelEvent::PlanReplaced { entries } => assistant.segments.push(Segment::Tool {
+                    id: String::new(),
+                    title: crate::tools::TODO_WRITE.into(),
+                    status: "completed".into(),
+                    output: crate::tools::todo_summary(entries),
+                }),
+                KernelEvent::Compacted { summary: text, .. } => {
+                    summary = Some(text.clone());
+                    if in_turn {
+                        // 本轮的用户消息起保留（本轮的回复还在 assistant 缓冲里）
+                        let turn = messages.iter().rposition(|m| m.role == "user").unwrap_or(0);
+                        messages.drain(..turn);
+                    } else {
+                        assistant.take();
+                        messages.clear();
+                    }
+                }
+                // 思考、权限请求不进上下文
                 _ => {}
             },
-            Record::PermissionResolved { .. } | Record::Turn { .. } => {}
+            Record::PermissionResolved { .. } | Record::Turn { .. } | Record::Thought { .. } => {}
         }
     }
     messages.extend(assistant.take());
-    trim(messages)
+    Rebuilt { summary, messages: trim(messages) }
 }
 
 /// 超出上限时从最早的轮次丢，并保证从一条用户消息开始。
@@ -204,6 +243,7 @@ mod tests {
                 title: None,
                 status: Some("completed".into()),
                 raw_output: Some("1 行".into()),
+                output: None,
             }),
             ev(KernelEvent::AgentMessageChunk { text: "秘密是 42。".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
@@ -217,7 +257,7 @@ mod tests {
             ev(KernelEvent::TurnEnded { stop_reason: "cancelled".into() }),
             Record::User { text: "算了".into(), images: Vec::new() },
         ];
-        let msgs = rebuild(&records);
+        let msgs = rebuild(&records).messages;
         let got: Vec<_> = msgs
             .iter()
             .map(|m| format!("{}:{}", m.role, m.text().unwrap()))
@@ -235,6 +275,25 @@ mod tests {
     }
 
     #[test]
+    fn compaction_keeps_the_running_turn_or_drops_everything() {
+        let user = |t: &str| Record::User { text: t.into(), images: Vec::new() };
+        let reply = |t: &str| ev(KernelEvent::AgentMessageChunk { text: t.into() });
+        let end = || ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
+        let compacted = |s: &str| ev(KernelEvent::Compacted { summary: s.into(), context_tokens: 0 });
+        let texts = |r: &Rebuilt| r.messages.iter().map(|m| m.text().unwrap()).collect::<Vec<_>>();
+
+        // 一轮中间的自动压缩：保留这一轮（含压缩前已有的回复）
+        let r = rebuild(&[user("一"), reply("a"), end(), user("二"), reply("想"), compacted("摘要1"), reply("好"), end()]);
+        assert_eq!(r.summary.as_deref(), Some("摘要1"));
+        assert_eq!(texts(&r), ["二", "想好"]);
+
+        // 空闲时的手动压缩：全丢，之后的轮次照常
+        let r = rebuild(&[user("一"), reply("a"), end(), ev(KernelEvent::Compacting), compacted("摘要2"), end(), user("三"), reply("c"), end()]);
+        assert_eq!(r.summary.as_deref(), Some("摘要2"));
+        assert_eq!(texts(&r), ["三", "c"]);
+    }
+
+    #[test]
     fn trims_oldest_turns_and_starts_with_user() {
         let big = "x".repeat(HISTORY_MAX_CHARS / 2 + 10);
         let records = vec![
@@ -243,7 +302,7 @@ mod tests {
             Record::User { text: "新问题".into(), images: Vec::new() },
             ev(KernelEvent::AgentMessageChunk { text: "新回答".into() }),
         ];
-        let msgs = rebuild(&records);
+        let msgs = rebuild(&records).messages;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].text().as_deref(), Some("新问题"));
     }

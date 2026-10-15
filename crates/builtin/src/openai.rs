@@ -6,8 +6,8 @@
 //! 工具调用按 `delta.tool_calls[]` 流式拼接。
 
 use crate::provider::{
-    ChatMessage, ChatProvider, RequestParams, StreamEvent, StreamOutcome, ToolCall, Usage,
-    debug_http, error_message, post_sse_with_retry, read_sse,
+    ChatMessage, ChatProvider, ModelInfo, RequestParams, StreamEvent, StreamOutcome, ToolCall,
+    Usage, debug_http, error_message, parse_model_list, post_sse_with_retry, read_sse,
 };
 use serde_json::Value;
 
@@ -41,7 +41,7 @@ impl OpenAiProvider {
 }
 
 impl ChatProvider for OpenAiProvider {
-    fn list_models(&self) -> anyhow::Result<Vec<String>> {
+    fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let url = self.endpoint("/models");
         let mut request = self.agent.get(&url).header("Accept", "application/json");
         if let Some((name, value)) = self.auth_header() {
@@ -129,17 +129,13 @@ fn apply_params(body: &mut Value, params: &RequestParams) {
 }
 
 /// `GET /models` 的响应 → 模型 ID 列表（OpenAI 格式 `{"data": [{"id": …}]}`）。
-fn parse_models(text: &str) -> anyhow::Result<Vec<String>> {
+fn parse_models(text: &str) -> anyhow::Result<Vec<ModelInfo>> {
     let value: Value = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("模型列表不是 JSON: {e}"))?;
     let data = value
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("模型列表缺少 data 字段"))?;
-    Ok(data
-        .iter()
-        .filter_map(|m| m.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect())
+    Ok(parse_model_list(data))
 }
 
 /// 工具调用的一个流式片段（`delta.tool_calls[]`）。
@@ -264,6 +260,8 @@ pub(crate) fn parse_chunk(payload: &str) -> Result<Chunk, String> {
             input_tokens: n("/prompt_tokens"),
             output_tokens: n("/completion_tokens"),
             reasoning_tokens: n("/completion_tokens_details/reasoning_tokens"),
+            // OpenAI 报在 prompt_tokens_details 里，DeepSeek 用自己的字段名
+            cache_read_tokens: n("/prompt_tokens_details/cached_tokens").max(n("/prompt_cache_hit_tokens")),
         });
     }
     Ok(chunk)
@@ -276,8 +274,12 @@ mod tests {
 
     #[test]
     fn parses_model_list() {
-        let ids = parse_models(r#"{"object":"list","data":[{"id":"a"},{"id":"b","owned_by":"x"},{"x":1}]}"#).unwrap();
-        assert_eq!(ids, ["a", "b"]);
+        let models = parse_models(
+            r#"{"object":"list","data":[{"id":"a"},{"id":"b","owned_by":"x","context_length":256000},{"x":1},{"id":"c","max_model_len":32768}]}"#,
+        )
+        .unwrap();
+        let got: Vec<_> = models.iter().map(|m| (m.id.as_str(), m.context_window)).collect();
+        assert_eq!(got, [("a", None), ("b", Some(256000)), ("c", Some(32768))]);
         assert!(parse_models("{}").is_err());
     }
 
@@ -295,8 +297,12 @@ mod tests {
         assert!(c.events.is_empty());
         assert_eq!(
             c.usage,
-            Some(Usage { input_tokens: 6, output_tokens: 14, reasoning_tokens: 408 })
+            Some(Usage { input_tokens: 6, output_tokens: 14, reasoning_tokens: 408, cache_read_tokens: 0 })
         );
+        let c = parse_chunk(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80}}}"#).unwrap();
+        assert_eq!(c.usage.map(|u| u.cache_read_tokens), Some(80));
+        let c = parse_chunk(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_hit_tokens":64}}"#).unwrap();
+        assert_eq!(c.usage.map(|u| u.cache_read_tokens), Some(64));
     }
 
     #[test]

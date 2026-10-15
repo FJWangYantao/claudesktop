@@ -8,12 +8,17 @@
 //!   等 UI 应答）→ 执行 → 结果回给模型，直到模型不再调用工具
 //! - 模式：Manual / Accept edits / Plan（只读）/ Bypass；「总是允许」规则按项目落盘
 //! - 续接：用本地会话日志重建上下文（见 `history` 模块）
+//! - 项目说明：AGENTS.md / CLAUDE.md 读进系统提示词（见 `instructions` 模块）
+//! - 上下文压缩：快满时 / 超限报错后把较早的对话总结成摘要（见 `compact` 模块）
 //!
 //! 线程模型：每轮对话一个线程（阻塞读 SSE 流、执行工具、等权限应答）；
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
 
 mod anthropic;
+mod compact;
+mod fetch;
 mod history;
+mod instructions;
 mod openai;
 mod provider;
 mod permissions;
@@ -24,12 +29,12 @@ pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 pub use permissions::{PermissionRules, default_rules_path};
 pub use provider::{
-    ChatMessage, ChatProvider, ContentPart, FunctionCall, Protocol, ProviderConfig, RequestParams,
-    StreamEvent, StreamOutcome, ToolCall, Usage,
+    ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, Protocol, ProviderConfig,
+    RequestParams, StreamEvent, StreamOutcome, ToolCall, Usage,
 };
 
 /// 列出端点提供的模型（阻塞，设置页在后台线程调用）。
-pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<String>> {
+pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<ModelInfo>> {
     make_provider(&config).list_models()
 }
 
@@ -53,6 +58,8 @@ use tools::{Access, Action, ToolOutput};
 
 /// 一轮里最多请求模型的次数（防止工具循环停不下来）
 const MAX_STEPS: usize = 50;
+/// 同一步里最多同时执行几个只读工具
+const PARALLEL_TOOLS: usize = 8;
 
 const MODE_DEFAULT: &str = "default";
 const MODE_ACCEPT_EDITS: &str = "acceptEdits";
@@ -66,6 +73,12 @@ pub struct BuiltinConfig {
     pub cwd: PathBuf,
     /// 「总是允许」规则文件；None = 只在内存里
     pub rules_path: Option<PathBuf>,
+    /// 用户级说明文件（默认 `~/.claude/CLAUDE.md`），和项目里的 AGENTS.md / CLAUDE.md
+    /// 一起进系统提示词；None = 不读
+    pub user_instructions: Option<PathBuf>,
+    /// 端点报告的上下文窗口（模型 ID → token）：用量快到窗口时自动压缩；
+    /// 查不到窗口的模型只在端点报「超出上下文」后压缩
+    pub context_windows: HashMap<String, u64>,
 }
 
 impl BuiltinConfig {
@@ -75,6 +88,8 @@ impl BuiltinConfig {
             provider,
             cwd,
             rules_path: default_rules_path(),
+            user_instructions: instructions::default_user_file(),
+            context_windows: HashMap::new(),
         }
     }
 
@@ -134,8 +149,31 @@ struct SessionState {
     mode: String,
     /// 历史是从本地日志重建的（工具调用只剩摘要）
     restored: bool,
+    /// 用户级和项目里的说明（每轮开始时重读）
+    instructions: Vec<instructions::Instruction>,
+    /// 较早对话的摘要（压缩过才有，进系统提示词）
+    summary: Option<String>,
+    /// 端点最近一次报告的上下文大小：(token, 当时覆盖到的历史条数)；压缩后清空
+    measured: Option<(u64, usize)>,
     /// 进行中的一轮的取消标志
     turn: Option<Arc<AtomicBool>>,
+}
+
+impl SessionState {
+    fn system_prompt(&self) -> String {
+        system_prompt(
+            &self.cwd,
+            &self.mode,
+            self.restored,
+            &self.instructions,
+            self.summary.as_deref(),
+        )
+    }
+
+    /// 系统提示词 + 历史的粗估 token（端点还没报告过用量时用）。
+    fn estimate_tokens(&self) -> u64 {
+        self.system_prompt().len() as u64 / 4 + compact::estimate_tokens(&self.history)
+    }
 }
 
 struct Inner {
@@ -145,6 +183,9 @@ struct Inner {
     sink: EventSink,
     agent_name: String,
     default_cwd: PathBuf,
+    user_instructions: Option<PathBuf>,
+    /// 见 [`BuiltinConfig::context_windows`]；界面取到模型列表后经 `set_context_windows` 更新
+    context_windows: Mutex<HashMap<String, u64>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     next_session: AtomicU64,
     rules: Mutex<PermissionRules>,
@@ -172,12 +213,170 @@ impl Inner {
     fn snapshot(&self, session: &str) -> Option<(Vec<ChatMessage>, String, PathBuf, String)> {
         let sessions = self.sessions.lock().unwrap();
         let state = sessions.get(session)?;
-        let mut messages = vec![ChatMessage::new(
-            "system",
-            system_prompt(&state.cwd, &state.mode, state.restored),
-        )];
+        let mut messages = vec![ChatMessage::new("system", state.system_prompt())];
         messages.extend(state.history.iter().cloned());
         Some((messages, state.mode.clone(), state.cwd.clone(), state.model.clone()))
+    }
+
+    /// 模型的上下文窗口；对不上完整 ID 时按最后一段找（`provider/name` → `name`）。
+    fn window(&self, model: &str) -> Option<u64> {
+        let name = |id: &str| id.rsplit('/').next().unwrap_or(id).to_string();
+        let windows = self.context_windows.lock().unwrap();
+        windows
+            .get(model)
+            .copied()
+            .or_else(|| {
+                windows
+                    .iter()
+                    .find(|(id, _)| name(id) == name(model))
+                    .map(|(_, n)| *n)
+            })
+            .filter(|w| *w > 0)
+    }
+
+    /// 下一次请求大约要带的 token：端点上次报告的 + 之后新加的消息（粗估）；没报告过就整个粗估。
+    fn context_estimate(&self, session: &str) -> u64 {
+        let sessions = self.sessions.lock().unwrap();
+        let Some(state) = sessions.get(session) else {
+            return 0;
+        };
+        match state.measured {
+            Some((tokens, covered)) if covered <= state.history.len() => {
+                tokens + compact::estimate_tokens(&state.history[covered..])
+            }
+            _ => state.estimate_tokens(),
+        }
+    }
+
+    /// 记下端点报告的上下文大小：历史里除了最后 `unmeasured` 条，都算在 `tokens` 里。
+    fn measure(&self, session: &str, tokens: u64, unmeasured: usize) {
+        if tokens == 0 {
+            return;
+        }
+        if let Some(state) = self.sessions.lock().unwrap().get_mut(session) {
+            state.measured = Some((tokens, state.history.len().saturating_sub(unmeasured)));
+        }
+    }
+
+    /// 压缩上下文：挑切点、请模型总结、换掉历史（规则见 `compact` 模块）。
+    /// `idle` = 手动压缩（没有进行中的一轮），全部进摘要；`keep_budget` 是保留尾部的 token 预算。
+    /// 开始和结果都报给 UI（`Compacting` → `Compacted` / `CompactFailed`）。
+    /// 没有可压缩的内容返回 `Ok(None)`，成功返回总结请求的用量，被取消或失败返回 `Err`。
+    fn compact(
+        &self,
+        session: &str,
+        flag: &AtomicBool,
+        model: &str,
+        idle: bool,
+        keep_budget: u64,
+        transcript_bytes: usize,
+    ) -> anyhow::Result<Option<Usage>> {
+        let stopped = || flag.load(Ordering::SeqCst);
+        let (history, previous) = {
+            let sessions = self.sessions.lock().unwrap();
+            let state = sessions
+                .get(session)
+                .ok_or_else(|| anyhow::anyhow!("会话已关闭"))?;
+            (state.history.clone(), state.summary.clone())
+        };
+        let Some(split) = compact::split(&history, keep_budget, idle) else {
+            return Ok(None);
+        };
+        self.emit(Some(session), KernelEvent::Compacting);
+        let result = self.summarize(
+            session,
+            model,
+            &history[..split.tail_from],
+            previous.as_deref(),
+            transcript_bytes,
+            &stopped,
+        );
+        if stopped() {
+            anyhow::bail!("cancelled");
+        }
+        let (summary, usage) = match result {
+            Ok(r) => r,
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.emit(Some(session), KernelEvent::CompactFailed { message });
+                return Err(err);
+            }
+        };
+        // 和 commit() 一样持锁判断取消；一轮之内历史只有本线程在改，切点仍然有效
+        let context_tokens = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let state = match sessions.get_mut(session) {
+                Some(state) if !stopped() => state,
+                _ => anyhow::bail!("cancelled"),
+            };
+            state.history = split.apply(&history);
+            state.summary = Some(summary.clone());
+            state.measured = None;
+            state.estimate_tokens()
+        };
+        self.emit(
+            Some(session),
+            KernelEvent::Compacted {
+                summary,
+                context_tokens,
+            },
+        );
+        Ok(Some(usage.unwrap_or_default()))
+    }
+
+    /// 请模型把一段对话写成摘要（不带工具）。记录太长、总结请求本身也超限时，记录减半再试，最多两次。
+    fn summarize(
+        &self,
+        session: &str,
+        model: &str,
+        head: &[ChatMessage],
+        previous: Option<&str>,
+        mut max_bytes: usize,
+        stopped: &dyn Fn() -> bool,
+    ) -> anyhow::Result<(String, Option<Usage>)> {
+        let mut attempt = 0;
+        loop {
+            let request = compact::summary_request(previous, &compact::transcript(head, max_bytes));
+            let mut text = String::new();
+            let result = self.provider.stream_chat(model, &request, &[], stopped, &mut |event| {
+                match event {
+                    StreamEvent::Text(t) => text.push_str(&t),
+                    StreamEvent::Reasoning(_) => {}
+                    StreamEvent::Retrying {
+                        status,
+                        attempt,
+                        delay_ms,
+                        reason,
+                    } => self.emit(
+                        Some(session),
+                        KernelEvent::Retrying {
+                            status,
+                            attempt,
+                            delay_ms,
+                            reason,
+                        },
+                    ),
+                }
+            });
+            match result {
+                Err(err)
+                    if attempt < 2 && claudesktop_core::is_context_overflow(&format!("{err:#}")) =>
+                {
+                    attempt += 1;
+                    max_bytes /= 2;
+                }
+                Err(err) => return Err(err),
+                Ok(outcome) => {
+                    let text = text.trim().to_string();
+                    anyhow::ensure!(!text.is_empty(), "模型没有返回摘要");
+                    return Ok((text, outcome.usage));
+                }
+            }
+        }
+    }
+
+    fn model_of(&self, session: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(session).map(|s| s.model.clone())
     }
 
     fn mode(&self, session: &str) -> String {
@@ -218,6 +417,69 @@ impl Inner {
         call: &ToolCall,
         stopped: &dyn Fn() -> bool,
     ) -> ToolOutput {
+        // 待办清单不碰文件、不用授权，也不占一行工具：直接换掉界面上的计划
+        if call.function.name == tools::TODO_WRITE {
+            return match tools::parse_todos(&call.function.arguments) {
+                Ok(entries) => {
+                    let summary = tools::todo_summary(&entries);
+                    self.emit(Some(session), KernelEvent::PlanReplaced { entries });
+                    ToolOutput::ok(format!("Todo list updated: {summary}"), summary)
+                }
+                Err(message) => ToolOutput::fail(message, "参数无效"),
+            };
+        }
+        let (action, title) = self.start_tool(session, cwd, call);
+        self.finish_tool(session, cwd, call, action, &title, stopped)
+    }
+
+    /// 一步里的全部调用：连续的只读调用一起并行跑，其余依次执行；结果按调用顺序返回。
+    /// 中途被取消时返回 None。
+    fn run_tools(
+        &self,
+        session: &str,
+        cwd: &Path,
+        calls: &[ToolCall],
+        stopped: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Vec<ToolOutput>> {
+        let mut outputs = Vec::with_capacity(calls.len());
+        let mut rest = calls;
+        while !rest.is_empty() {
+            let n = rest
+                .iter()
+                .take_while(|c| tools::parallel_safe(&c.function.name))
+                .count()
+                .min(PARALLEL_TOOLS);
+            if n < 2 {
+                outputs.push(self.run_tool(session, cwd, &rest[0], stopped));
+                rest = &rest[1..];
+            } else {
+                let (group, tail) = rest.split_at(n);
+                // 先按顺序报出全部工具行，界面上的顺序和模型的调用顺序一致
+                let started: Vec<_> = group.iter().map(|c| self.start_tool(session, cwd, c)).collect();
+                outputs.extend(std::thread::scope(|s| {
+                    let handles: Vec<_> = group
+                        .iter()
+                        .zip(started)
+                        .map(|(call, (action, title))| {
+                            s.spawn(move || self.finish_tool(session, cwd, call, action, &title, stopped))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_else(|_| ToolOutput::fail("tool crashed", "出错")))
+                        .collect::<Vec<_>>()
+                }));
+                rest = tail;
+            }
+            if stopped() {
+                return None;
+            }
+        }
+        Some(outputs)
+    }
+
+    /// 解析调用并报出工具行（改动类先带上 diff 预览）。
+    fn start_tool(&self, session: &str, cwd: &Path, call: &ToolCall) -> (Result<Action, String>, String) {
         let action = Action::parse(&call.function.name, &call.function.arguments, cwd);
         let (title, kind) = match &action {
             Ok(a) => (a.title(cwd), a.kind()),
@@ -242,9 +504,22 @@ impl Inner {
                 },
             );
         }
+        (action, title)
+    }
+
+    /// 授权、执行，并报告结果。
+    fn finish_tool(
+        &self,
+        session: &str,
+        cwd: &Path,
+        call: &ToolCall,
+        action: Result<Action, String>,
+        title: &str,
+        stopped: &dyn Fn() -> bool,
+    ) -> ToolOutput {
         let output = match action {
             Err(message) => ToolOutput::fail(message, "参数无效"),
-            Ok(action) => match self.authorize(session, cwd, &action, &title, stopped) {
+            Ok(action) => match self.authorize(session, cwd, &action, title, stopped) {
                 Verdict::Allow => {
                     if stopped() {
                         return ToolOutput::fail("cancelled", "已中断");
@@ -256,6 +531,7 @@ impl Inner {
                             title: None,
                             status: Some("in_progress".into()),
                             raw_output: None,
+                            output: None,
                         },
                     );
                     action.run(stopped)
@@ -271,6 +547,7 @@ impl Inner {
                     title: None,
                     status: Some(if output.ok { "completed" } else { "failed" }.into()),
                     raw_output: Some(output.summary.clone()),
+                    output: Some(claudesktop_core::output_preview(&output.content)),
                 },
             );
         }
@@ -278,6 +555,7 @@ impl Inner {
     }
 
     /// 读工具直接放行；其余按模式 → 已保存规则 → 询问用户。
+    /// 抓网页是只读的，Plan 模式下也能用（照样要问）。
     fn authorize(
         &self,
         session: &str,
@@ -292,7 +570,7 @@ impl Inner {
         }
         let mode = self.mode(session);
         match mode.as_str() {
-            MODE_PLAN => {
+            MODE_PLAN if access != Access::Fetch => {
                 return Verdict::Deny(
                     "Plan mode is active: writing files and running commands are not allowed. \
                      Investigate with read-only tools and present a plan instead."
@@ -323,9 +601,12 @@ impl Inner {
         };
         let mut options = vec![option("allow_once", "允许一次".into())];
         if let Some(rule) = &rule {
-            let name = match rule.strip_prefix("shell:") {
-                Some(prefix) => format!("总是允许 `{prefix}` 开头的命令"),
-                None => "本项目内总是允许编辑".into(),
+            let name = if let Some(prefix) = rule.strip_prefix("shell:") {
+                format!("总是允许 `{prefix}` 开头的命令")
+            } else if let Some(host) = rule.strip_prefix("fetch:") {
+                format!("本项目内总是允许访问 {host}")
+            } else {
+                "本项目内总是允许编辑".into()
             };
             options.push(option("allow_always", name));
         }
@@ -395,6 +676,8 @@ impl BuiltinKernel {
             sink,
             agent_name: agent_name.clone(),
             default_cwd: config.cwd,
+            user_instructions: config.user_instructions,
+            context_windows: Mutex::new(config.context_windows),
             sessions: Mutex::default(),
             next_session: AtomicU64::new(1),
             rules: Mutex::new(PermissionRules::load(config.rules_path)),
@@ -409,21 +692,25 @@ impl BuiltinKernel {
         Ok(Self { inner })
     }
 
-    /// 新建会话（`history` 非空 = 续接），报告 `Started`。
-    fn open_session(&self, token: u64, cwd: Option<PathBuf>, history: Vec<ChatMessage>) {
+    /// 新建会话（`history` 有内容 = 续接），报告 `Started`。
+    fn open_session(&self, token: u64, cwd: Option<PathBuf>, history: history::Rebuilt) {
         let n = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
         let session_id = format!("builtin-{}-{n}", std::process::id());
         let cwd = cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
-        let resumed = !history.is_empty();
+        let resumed = !history.messages.is_empty() || history.summary.is_some();
+        let instructions = instructions::load(&cwd, self.inner.user_instructions.as_deref());
         let model = self.inner.default_model.lock().unwrap().clone();
         self.inner.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionState {
                 cwd,
                 model: model.clone(),
-                history,
+                history: history.messages,
                 mode: MODE_DEFAULT.into(),
                 restored: resumed,
+                instructions,
+                summary: history.summary,
+                measured: None,
                 turn: None,
             },
         );
@@ -442,7 +729,13 @@ impl BuiltinKernel {
     }
 }
 
-fn system_prompt(cwd: &Path, mode: &str, restored: bool) -> String {
+fn system_prompt(
+    cwd: &Path,
+    mode: &str,
+    restored: bool,
+    project: &[instructions::Instruction],
+    summary: Option<&str>,
+) -> String {
     let mut prompt = format!(
         "You are a coding agent running inside claudesktop, a desktop agent harness, \
          working on the user's machine.\n\
@@ -450,8 +743,10 @@ fn system_prompt(cwd: &Path, mode: &str, restored: bool) -> String {
          Platform: {}\n\n\
          Use the tools to inspect and change the project: find files with glob and search code with grep \
          (rather than shell commands), read files before editing them, \
-         prefer edit_file for small changes, and verify your work (e.g. build or run tests) \
-         when it makes sense. Tool calls that change things may need the user's approval; \
+         request independent reads and searches together in one step (they run in parallel), \
+         prefer edit_file for small changes, read URLs the user gives with web_fetch, and verify your work (e.g. build or run tests) \
+         when it makes sense. For tasks with several steps, track progress with todo_write. \
+         Tool calls that change things may need the user's approval; \
          if one is denied, do not retry it and ask the user instead.\n\
          Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
         cwd.display(),
@@ -463,6 +758,14 @@ fn system_prompt(cwd: &Path, mode: &str, restored: bool) -> String {
              `[tool] <title> → <status>: <summary>` lines; their full inputs and outputs are not \
              available, so re-read files if you need details. Never write such lines yourself.",
         );
+    }
+    if let Some(section) = instructions::prompt_section(project) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
+    if let Some(summary) = summary {
+        prompt.push_str("\n\n");
+        prompt.push_str(&compact::prompt_section(summary));
     }
     if mode == MODE_PLAN {
         prompt.push_str(
@@ -483,13 +786,52 @@ fn stop_reason(finish: Option<&str>) -> String {
     }
 }
 
+/// 交给模型总结的记录最多多少字节：窗口的一部分（按 4 字节 / token 估），窗口未知时用固定上限。
+fn transcript_budget(window: Option<u64>) -> usize {
+    window.map_or(compact::TRANSCRIPT_MAX_BYTES_UNKNOWN, |w| {
+        (w * compact::TRANSCRIPT_PERCENT / 100 * 4) as usize
+    })
+}
+
 /// 一轮对话（在独立线程里运行）：请求模型 → 执行工具 → 再请求，直到不再调用工具。
 fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     let stopped = || flag.load(Ordering::SeqCst);
     let mut usage: Option<Usage> = None;
+    // 最后一次请求的输入 + 输出 = 此刻上下文的大小（之前各步都包含在这次的输入里）
+    let mut context_tokens = 0;
     let mut stop = "max_turn_requests".to_string();
+    // 上一步刚压缩过（不连着压两次）/ 这一轮已经因为超限报错压缩过（只压一次）
+    let mut just_compacted = false;
+    let mut overflow_compacted = false;
 
     for _ in 0..MAX_STEPS {
+        // 用量快到窗口：先压缩再请求
+        if !just_compacted {
+            if let Some((model, window)) = inner
+                .model_of(&session)
+                .and_then(|m| inner.window(&m).map(|w| (m, w)))
+            {
+                if inner.context_estimate(&session) * 100 >= window * compact::AUTO_COMPACT_PERCENT {
+                    match inner.compact(
+                        &session,
+                        &flag,
+                        &model,
+                        false,
+                        window * compact::KEEP_PERCENT / 100,
+                        transcript_budget(Some(window)),
+                    ) {
+                        Ok(Some(u)) => usage.get_or_insert_default().add(u),
+                        Ok(None) => {}
+                        // 压缩失败（已报给界面）就带着原样的上下文接着请求
+                        Err(_) if !stopped() => {}
+                        Err(_) => return,
+                    }
+                    just_compacted = true;
+                }
+            }
+        } else {
+            just_compacted = false;
+        }
         let Some((messages, mode, cwd, model)) = inner.snapshot(&session) else {
             return;
         };
@@ -510,12 +852,18 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
                         inner.emit(Some(&session), KernelEvent::AgentThoughtChunk { text: t })
                     }
                     StreamEvent::Retrying {
+                        status,
                         attempt,
                         delay_ms,
                         reason,
                     } => inner.emit(
-                        None,
-                        KernelEvent::Status(format!("{reason}；{delay_ms}ms 后第 {attempt} 次重试")),
+                        Some(&session),
+                        KernelEvent::Retrying {
+                            status,
+                            attempt,
+                            delay_ms,
+                            reason,
+                        },
                     ),
                 }
             });
@@ -525,44 +873,73 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(err) => {
-                inner.finish(&session, &flag);
-                inner.emit(
-                    Some(&session),
-                    KernelEvent::PromptFailed {
-                        message: format!("{err:#}"),
-                    },
+                let mut message = format!("{err:#}");
+                // 超出上下文：压缩一次再重发这一步
+                if !overflow_compacted && claudesktop_core::is_context_overflow(&message) {
+                    overflow_compacted = true;
+                    let window = inner.window(&model);
+                    let keep = window.unwrap_or_else(|| compact::estimate_tokens(&messages))
+                        * compact::KEEP_PERCENT
+                        / 100;
+                    match inner.compact(&session, &flag, &model, false, keep, transcript_budget(window)) {
+                        Ok(Some(u)) => {
+                            usage.get_or_insert_default().add(u);
+                            just_compacted = true;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(_) if stopped() => return,
+                        Err(e) => message.push_str(&format!("\n（自动压缩上下文也失败了：{e:#}）")),
+                    }
+                }
+                // 和从日志重建的历史一致（见 history::rebuild）：失败也占一条 assistant 消息，
+                // 用户点「重试」重发时不会出现两条连着的用户消息（Anthropic 要求交替）
+                inner.commit(
+                    &session,
+                    &flag,
+                    vec![ChatMessage::new("assistant", format!("[turn failed: {message}]"))],
                 );
+                inner.finish(&session, &flag);
+                inner.emit(Some(&session), KernelEvent::PromptFailed { message });
                 return;
             }
         };
+        let mut step_tokens = 0;
         if let Some(u) = outcome.usage {
             usage.get_or_insert_default().add(u);
+            step_tokens = u.input_tokens + u.output_tokens;
+            context_tokens = step_tokens;
         }
 
         if outcome.tool_calls.is_empty() {
             if !text.is_empty() {
                 inner.commit(&session, &flag, vec![ChatMessage::new("assistant", text)]);
             }
+            inner.measure(&session, step_tokens, 0);
             stop = stop_reason(outcome.finish_reason.as_deref());
             break;
         }
 
-        // 同一步的多个调用依次执行；assistant 消息和全部结果一起写进历史，
+        // 同一步的多个调用执行完（连续的只读调用并行）；assistant 消息和全部结果一起写进历史，
         // 保证 tool_calls 后面总跟着对应的 tool 消息
-        let mut step = Vec::with_capacity(outcome.tool_calls.len() + 1);
-        let mut results = Vec::with_capacity(outcome.tool_calls.len());
-        for call in &outcome.tool_calls {
-            let output = inner.run_tool(&session, &cwd, call, &stopped);
-            if stopped() {
-                return;
-            }
-            results.push(ChatMessage::tool_result(call.id.clone(), output.content));
-        }
+        let Some(outputs) = inner.run_tools(&session, &cwd, &outcome.tool_calls, &stopped) else {
+            return;
+        };
+        let results: Vec<_> = outcome
+            .tool_calls
+            .iter()
+            .zip(outputs)
+            .map(|(call, output)| ChatMessage::tool_result(call.id.clone(), output.content))
+            .collect();
+        let mut step = Vec::with_capacity(results.len() + 1);
+        let unmeasured = results.len();
         step.push(ChatMessage::assistant_tool_calls(text, outcome.tool_calls));
         step.extend(results);
         if !inner.commit(&session, &flag, step) {
             return;
         }
+        // 工具结果还没被端点数过
+        inner.measure(&session, step_tokens, unmeasured);
     }
 
     inner.finish(&session, &flag);
@@ -573,6 +950,8 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
                 reasoning_tokens: u.reasoning_tokens,
+                context_tokens,
+                cache_read_tokens: u.cache_read_tokens,
             },
         );
     }
@@ -589,7 +968,7 @@ impl Kernel for BuiltinKernel {
     }
 
     fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()> {
-        self.open_session(token, cwd, Vec::new());
+        self.open_session(token, cwd, history::Rebuilt::default());
         Ok(())
     }
 
@@ -614,6 +993,9 @@ impl Kernel for BuiltinKernel {
             if state.turn.is_some() {
                 anyhow::bail!("上一轮还没结束");
             }
+            // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
+            state.instructions =
+                instructions::load(&state.cwd, self.inner.user_instructions.as_deref());
             // 文本 + 图片附件合成一条多段用户消息
             let mut parts = vec![ContentPart::Text(prompt.text)];
             for image in prompt.images {
@@ -694,6 +1076,62 @@ impl Kernel for BuiltinKernel {
         // 进行中的一轮用完当前模型，下一步请求起生效
         state.model = model.to_string();
         *self.inner.default_model.lock().unwrap() = model.to_string();
+        Ok(())
+    }
+
+    fn set_context_windows(&self, windows: HashMap<String, u64>) {
+        *self.inner.context_windows.lock().unwrap() = windows;
+    }
+
+    /// 手动压缩：自成一轮（占着 `turn`，期间不能发消息、可以取消），全部对话进摘要。
+    fn compact(&self, session: &str) -> anyhow::Result<()> {
+        let (flag, model) = {
+            let mut sessions = self.inner.sessions.lock().unwrap();
+            let state = sessions
+                .get_mut(session)
+                .ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+            if state.turn.is_some() {
+                anyhow::bail!("这一轮还没结束");
+            }
+            if state.history.is_empty() {
+                anyhow::bail!("还没有可以压缩的对话");
+            }
+            let flag = Arc::new(AtomicBool::new(false));
+            state.turn = Some(flag.clone());
+            (flag, state.model.clone())
+        };
+        let inner = self.inner.clone();
+        let session = session.to_string();
+        std::thread::Builder::new()
+            .name("builtin-compact".into())
+            .spawn(move || {
+                let budget = transcript_budget(inner.window(&model));
+                let result = inner.compact(&session, &flag, &model, true, 0, budget);
+                if flag.load(Ordering::SeqCst) {
+                    return; // cancel() 已经报告过 TurnEnded
+                }
+                inner.finish(&session, &flag);
+                if let Ok(Some(u)) = result {
+                    inner.emit(
+                        Some(&session),
+                        KernelEvent::UsageUpdated {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                            reasoning_tokens: u.reasoning_tokens,
+                            context_tokens: 0,
+                            cache_read_tokens: u.cache_read_tokens,
+                        },
+                    );
+                }
+                // 失败已经以 CompactFailed 报过，这一轮照常结束
+                inner.emit(
+                    Some(&session),
+                    KernelEvent::TurnEnded {
+                        stop_reason: "end_turn".into(),
+                    },
+                );
+            })
+            .map_err(|e| anyhow::anyhow!("spawn compact thread: {e}"))?;
         Ok(())
     }
 
