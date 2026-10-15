@@ -135,7 +135,8 @@ Claude Code 官方把信息展示分成三档："hidden"（只有模型看到）
 | `INK_FAINT #B5B0A4` / `PAPER` | **2.05 : 1** | ⚠️ 只能用于占位、禁用、分隔符，**不能承载信息** |
 | 白字 / `CORAL #D97757` | **3.12 : 1** | ⚠️ 图标可以（≥3:1），带文字的按钮不够（需 4.5:1） |
 | 白字 / `#C15F3C` | 4.23 : 1 | ⚠️ 接近 |
-| 白字 / `HEAT[4] #AE5236` | 5.17 : 1 | ✅ 可作为"带文字的主按钮"底色 |
+| 白字 / `CORAL_DEEP #BF502B` | 4.78 : 1 | ✅ 带文字的主按钮底色（与 `CORAL` 同色相，只压暗一档） |
+| 白字 / `CORAL_DEEP_HOVER #AF4928` | 5.52 : 1 | ✅ 主按钮悬停 |
 | `CORAL` / `PAPER`（橙色文字） | 2.96 : 1 | ⚠️ 橙色别用来写小字 |
 | `RED #C0504D` / `PAPER` | 4.43 : 1 | ≈ 达标 |
 
@@ -164,15 +165,15 @@ Claude Code 官方把信息展示分成三档："hidden"（只有模型看到）
 
 ### 2.5 圆角
 
-圆角**随尺寸递增**（括号里的 gpui 档位按 1rem = 16px 换算），并且遵守"外圆角 = 内圆角 + 内边距"，这样嵌套时弧线平行：
+圆角**随尺寸递增**（括号里是 gpui 对应的档位，按默认 1rem = 16px，已核对 gpui 源码），并且遵守"外圆角 = 内圆角 + 内边距"，这样嵌套时弧线平行：
 
 | 档位 | 值 | 用在 |
 |---|---|---|
-| XS | 4px | 行内代码、参数药丸、热力格 |
-| SM | 6px（≈ gpui `rounded_md`） | chip、菜单项、图标按钮 |
-| MD | 8px（≈ `rounded_lg`） | 按钮、缩略图、发送按钮 |
-| LG | 12px（≈ `rounded_xl`） | 卡片、弹层、权限卡、侧栏面板 |
-| XL | 16–20px（≈ `rounded_2xl`） | 输入框、用户气泡 |
+| XS | 4px（gpui `rounded_sm`） | 行内代码、参数药丸、热力格 |
+| SM | 6px（`rounded_md`） | chip、菜单项、图标按钮 |
+| MD | 8px（`rounded_lg`） | 按钮、缩略图、发送按钮 |
+| LG | 12px（`rounded_xl`） | 卡片、弹层、权限卡、侧栏面板 |
+| XL | 16px（`rounded_2xl`），claude.ai 的输入框约 20px | 输入框、用户气泡 |
 | Full | — | 状态点、头像、开关 |
 
 claude.ai 的输入框圆角比卡片大一档（约 20px），这是它看起来"软"的主要原因之一【观察】。
@@ -389,40 +390,48 @@ claude.ai 的输入框圆角比卡片大一档（约 20px），这是它看起�
 - 下拉统一用 `menu_popover`，条目两行式 + 选中对勾。
 - 只在底部时自动跟随；运行状态行显示用时和 token。
 - 侧栏悬停才出现的操作用透明度切换，不挤动布局。
+- （P0 落地后）交互态、主按钮、圆角、宽度都有 token；Esc / Shift+Tab / Ctrl+N / Ctrl+B / Ctrl+Tab 快捷键；发送按钮三态。
 
 ### 7.2 落地清单
 
+> P0 已于 2026-10 全部落地（标 ✅），做法见各条末尾；P1 / P2 待做。
+
 **P0：成本低，立刻让观感更统一**
 
-1. **把散落的尺寸收成 token**（见 §7.3）。现状：
+1. ✅ **把散落的尺寸收成 token**（见 §7.3）。原先：
    - 圆角魔法数：`apps/desktop/src/app/chat.rs:162`（4px）、`apps/desktop/src/app/chat.rs:542`（14px）、`apps/desktop/src/app/settings_view.rs:624`（4px）、`apps/desktop/src/app/overview.rs:66`（3px）。
    - 宽度魔法数：`760` 两处（`apps/desktop/src/app/mod.rs:983`、`apps/desktop/src/app/composer.rs:252`），`720`（`apps/desktop/src/app/settings_view.rs:860`），`684` / `724`（`apps/desktop/src/app/overview.rs:90`、`apps/desktop/src/app/overview.rs:214`），`256`（`apps/desktop/src/app/sidebar.rs:169`）。
-2. **统一交互态颜色**。现在悬停有五种写法：`SAND`（大多数）、`SAND_ACTIVE`（输入区、侧栏）、`LINE`（`apps/desktop/src/app/sidebar.rs:358`）、`PAPER`（`apps/desktop/src/app/settings_view.rs:532`）、透明度（`apps/desktop/src/app/settings_view.rs:494`）。建议定义 `HOVER` / `SELECTED` 两个语义常量：同一种底上的悬停永远是同一个颜色。
-3. **承载信息的文字不用 `INK_FAINT`**（对比度 2.05:1）。工具结果摘要（`apps/desktop/src/app/chat.rs:195`）和状态行里的用时 / token（`apps/desktop/src/app/status.rs:76`）建议改成 `INK_SOFT`；`INK_FAINT` 只留给占位、禁用和分隔符（例如 `apps/desktop/src/app/chrome.rs:105` 的 `/`）。
-4. **带文字的橙色主按钮加深底色**：权限卡"允许一次"是白字放在 `CORAL` 上（`apps/desktop/src/app/chat.rs:289`，3.1:1）。可以加一个 `CORAL_DEEP = 0xAE5236`（即现有的 `HEAT[4]`，5.2:1）给带文字的按钮和按下态用。发送按钮只有图标，3:1 达标，保持不变。
-5. **发送按钮空态**：输入为空时变淡并且不可点（`apps/desktop/src/app/composer.rs:219` 起），现在空输入也是橙色。
-6. **接上快捷键**：仓库里目前没有任何 `actions!` / `KeyBinding`。最少要有：`Esc` 停止、`Shift+Tab` 循环权限模式、`Ctrl+N` 新会话、`Ctrl+B` 切换侧栏、`Ctrl+Tab` 切会话。做法：
+   → 圆角改用 gpui 自带档位（`rounded_xs` … `rounded_2xl`），用户气泡 14px 并入 16px 档；宽度改用 `READING_W` / `FORM_W` / `OVERVIEW_W` / `SIDEBAR_W`，模型列表改为 `w_full()` 随面板。
+2. ✅ **统一交互态颜色**。原先悬停有五种写法：`SAND`（大多数）、`SAND_ACTIVE`（输入区、侧栏）、`LINE`（`apps/desktop/src/app/sidebar.rs:358`）、`PAPER`（`apps/desktop/src/app/settings_view.rs:532`）、透明度（`apps/desktop/src/app/settings_view.rs:494`）。建议定义 `HOVER` / `SELECTED` 两个语义常量：同一种底上的悬停永远是同一个颜色。
+   → 纸底 / 卡片上统一 `HOVER`，选中和沙色底上统一 `SELECTED`；侧栏会话行（悬停已是 `SELECTED`）里的小图标按钮用新加的 `HOVER_STRONG`，原来的 `LINE` 和 `SELECTED` 几乎分不出来。
+3. ✅ **承载信息的文字不用 `INK_FAINT`**（对比度 2.05:1）。工具结果摘要（`apps/desktop/src/app/chat.rs:195`）和状态行里的用时 / token（`apps/desktop/src/app/status.rs:76`）建议改成 `INK_SOFT`；`INK_FAINT` 只留给占位、禁用和分隔符（例如 `apps/desktop/src/app/chrome.rs:105` 的 `/`）。
+   → 同时改了：对话流居中备注、diff 的"新文件"和"改动过大"、计划进度、侧栏相对时间、菜单提示、设置页说明与空状态。diff 行号、空心圈、禁用项保持 `INK_FAINT`。
+4. ✅ **带文字的橙色主按钮加深底色**：权限卡"允许一次"和设置页主按钮原先是白字放在 `CORAL` 上（3.1:1）。
+   → 新增 `CORAL_DEEP = 0xBF502B`（与 `CORAL` 同色相、压暗一档，4.8:1）和悬停用的 `CORAL_DEEP_HOVER = 0xAF4928`（5.5:1）；设置页主按钮原来的"透明度 0.9"悬停（会把对比度再拉低）一并换掉。发送按钮只有图标，3:1 达标，保持 `CORAL`。
+5. ✅ **发送按钮空态**：原先空输入也是橙色。
+   → 三态：空（`SAND` 底、`INK_FAINT` 箭头、无手形光标）/ 可发送（`CORAL`）/ 运行中（`INK` 底停止方块，提示"停止（Esc）"）；输入框 `InputEvent::Change` 时重绘。
+6. ✅ **接上快捷键**：原先仓库里没有任何 `actions!` / `KeyBinding`。
+   → `apps/desktop/src/app/keys.rs`：GPUI `actions!` + `KeyBinding`，键上下文 `ChatApp` 挂在根视图上。
 
-   ```rust
-   // main.rs：集中注册
-   actions!(claudesktop, [StopTurn, NewSession, CycleMode, ToggleSidebar, NextSession]);
-   cx.bind_keys([
-       KeyBinding::new("escape", StopTurn, Some("ChatApp")),
-       KeyBinding::new("shift-tab", CycleMode, Some("ChatApp")),
-       KeyBinding::new("ctrl-n", NewSession, Some("ChatApp")),
-       KeyBinding::new("ctrl-b", ToggleSidebar, Some("ChatApp")),
-       KeyBinding::new("ctrl-tab", NextSession, Some("ChatApp")),
-   ]);
-   // 根视图：.key_context("ChatApp").on_action(cx.listener(|this, _: &StopTurn, _, cx| this.stop(cx)))
-   ```
+   | 快捷键 | 动作 |
+   |---|---|
+   | `Esc` | 停止当前一轮；设置页开着时关设置页 |
+   | `Shift+Tab` | 循环权限模式（设置页里让给焦点倒序切换） |
+   | `Ctrl+N`（macOS `Cmd+N`） | 新会话 |
+   | `Ctrl+B`（macOS `Cmd+B`） | 显示 / 隐藏侧栏 |
+   | `Ctrl+Tab` / `Ctrl+Shift+Tab` | 按侧栏顺序切到下一个 / 上一个会话 |
 
-   注意：Popover 自己会处理 Esc（关菜单），输入框也有自己的按键上下文，要验证 Esc 在菜单打开时先关菜单、菜单关闭时才停止。用快捷键"打开某个 Popover"做不到（open 状态不在我们手里，AGENTS.md 已经说明），所以权限模式用 `Shift+Tab` 循环代替 `Ctrl+Shift+M`。
+   几个 GPUI 细节：
+   - 输入框（gpui-kit `Input`）自己绑了 Esc / Shift+Tab，没事可做时会 `propagate`，GPUI 接着试外层的绑定，所以不冲突；菜单打开时 Esc 先由 Popover 关菜单。
+   - **没有焦点时 GPUI 从窗口根分发，键上下文里没有 `ChatApp`，快捷键全部失效。** 所以启动时把焦点给输入框，用 `cx.on_focus_lost` 在焦点丢失（关设置页、重命名提交）时还给输入框；设置页没有输入框，就在它的滚动容器上 `track_focus` 作为焦点锚。
+   - **不在根视图上 `track_focus`**：GPUI 会在按下鼠标时把焦点转给带 `track_focus` 的元素，点任何按钮都会把焦点从输入框抢走。
+   - 用快捷键打开某个 Popover 做不到（open 状态不在我们手里，AGENTS.md 已经说明），所以权限模式用 `Shift+Tab` 循环代替 `Ctrl+Shift+M`。
 
 **P1：体验差异化**
 
 7. **视图模式三档**（Summary / Normal / Verbose，`Ctrl+O` 循环）：会话级别的状态，决定思考块、启动信息、工具结果行是否渲染。现有的逐条 `open` 开关保留，视图模式只决定默认值。
 8. **消息悬停操作补齐**：助手回复加"复制""重试"，用户消息加"编辑""复制"；复制后图标变 ✓ 约 1.5 秒。现在用户消息只有"在 X 上重跑"。
-9. **运行状态行加"Esc 停止"**（依赖第 6 条）：`· Esc 停止` 用 `INK_SOFT`，跟在用时后面。
+9. ✅ **运行状态行加"Esc 停止"**：随 P0 一起做了，`· Esc 停止` 跟在用时和 token 后面。
 10. **权限卡**：标题写成"要修改 `x` 吗？"的问句；按钮加 `1` / `2` / `3` 数字键（依赖第 6 条的 action 机制）。
 11. **输入框**：圆角从 `rounded_xl`（12px）提到 16px；聚焦时边框换成 `INK_FAINT` 或阴影加一档；考虑把输入框下方那排 chip 收进卡片底部，让输入区成为一个整体。
 12. **深色模式的前提**：把 `theme.rs` 的 `const u32` 改成 `Palette` 结构体（浅色 / 深色各一份），通过全局状态读取；深色色值参考 §2.1 的表，上线前逐对校对比度。
@@ -435,40 +444,23 @@ claude.ai 的输入框圆角比卡片大一档（约 20px），这是它看起�
 16. **侧栏只留活的**：按状态筛选；长时间无活动的会话折叠到"更早"分组。
 17. **快捷键速查面板**：`Ctrl+/` 打开，可以直接用 gpui-kit 的 Modal。
 
-### 7.3 建议补进 `theme.rs` 的 token
+### 7.3 `theme.rs` 里的 token（已落地）
 
 ```rust
-// ---------- 圆角 ----------
-// 随尺寸递增；嵌套时外圆角 = 内圆角 + 内边距
-/// 行内代码、参数药丸、热力格
-pub const RADIUS_XS: Pixels = px(4.);
-/// chip、菜单项、图标按钮（≈ gpui rounded_md）
-pub const RADIUS_SM: Pixels = px(6.);
-/// 按钮、缩略图、发送按钮（≈ rounded_lg）
-pub const RADIUS_MD: Pixels = px(8.);
-/// 卡片、弹层、权限卡、侧栏面板（≈ rounded_xl）
-pub const RADIUS_LG: Pixels = px(12.);
-/// 输入框、用户气泡
-pub const RADIUS_XL: Pixels = px(16.);
+pub const CORAL_DEEP: u32 = 0xBF502B;        // 带文字的主按钮（白字 4.8:1）
+pub const CORAL_DEEP_HOVER: u32 = 0xAF4928;  // 主按钮悬停（白字 5.5:1）
 
-// ---------- 布局 ----------
-/// 对话 / 输入框阅读列最大宽度
-pub const READING_W: Pixels = px(760.);
-/// 设置页内容最大宽度
-pub const FORM_W: Pixels = px(720.);
-/// 侧栏宽度（含外圈留白）
-pub const SIDEBAR_W: Pixels = px(256.);
+pub const HOVER: u32 = SAND;                 // 纸底 / 卡片上的悬停
+pub const SELECTED: u32 = SAND_ACTIVE;       // 选中态；沙色底上的悬停
+pub const HOVER_STRONG: u32 = 0xDCD6C6;      // SELECTED 行里再叠一层的悬停
 
-// ---------- 交互态 ----------
-/// 纸底 / 卡片上的悬停底色
-pub const HOVER: u32 = SAND;
-/// 选中 / 按下底色，以及沙色底上的悬停
-pub const SELECTED: u32 = SAND_ACTIVE;
-/// 带文字的橙色主按钮底色、橙色按下态（白字 5.2:1）
-pub const CORAL_DEEP: u32 = 0xAE5236;
+pub const READING_W: Pixels = px(760.);      // 对话列与输入框
+pub const FORM_W: Pixels = px(720.);         // 设置页
+pub const OVERVIEW_W: Pixels = px(724.);     // 首页用量概览面板
+pub const SIDEBAR_W: Pixels = px(256.);      // 侧栏（含外圈留白）
 ```
 
-加上以后，在 AGENTS.md 的"颜色 / 字号"惯例旁补一条"圆角 / 宽度只用 `RADIUS_*` / `*_W`"即可。
+圆角不另设常量，直接用 gpui 的档位（`rounded_xs` 2px / `rounded_sm` 4px / `rounded_md` 6px / `rounded_lg` 8px / `rounded_xl` 12px / `rounded_2xl` 16px），各档用途写在 `theme.rs` 的注释里。AGENTS.md 的"颜色 / 字号"惯例旁已补上对应规则。
 
 ---
 
