@@ -10,6 +10,7 @@
 //! 设置页保存时写下的是当时界面上的值。
 
 use claudesktop_builtin::{BuiltinConfig, Protocol, ProviderConfig, RequestParams};
+use crate::model::ViewMode;
 use claudesktop_core::AcpKernelConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -180,6 +181,8 @@ pub struct Settings {
     pub kernel: Option<KernelChoice>,
     pub builtin: BuiltinSettings,
     pub acp: AcpSettings,
+    /// 对话视图模式（摘要 / 标准 / 详细），顶栏下拉或 Ctrl+O 切换后立即写回
+    pub view_mode: ViewMode,
 }
 
 impl Settings {

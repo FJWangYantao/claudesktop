@@ -1,7 +1,7 @@
 //! 底部输入区（含权限模式 / 内核 / 模型下拉）与导出、附件等动作。
 
 use super::ChatApp;
-use super::menu::{menu_popover, MenuChip};
+use super::menu::{menu_action, menu_item, menu_popover, MenuChip};
 use crate::model::{ChatItem, PendingImage};
 use crate::settings::KernelChoice;
 use crate::theme::*;
@@ -174,7 +174,7 @@ impl ChatApp {
             )
     }
 
-    pub(super) fn render_composer(&self, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
         let busy = self.session().busy;
         let (mode_name, mode_icon): (SharedString, IconAll) = self
@@ -189,6 +189,7 @@ impl ChatApp {
             .file_name()
             .map(|n| SharedString::from(n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| self.project_name.clone());
+        let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
 
         // 发送按钮三态：空（淡、不可点）/ 可发送（赤陶）/ 忙（深色停止方块，同 Esc）
         let can_send = !self.input.read(cx).value().trim().is_empty() || !self.pending.is_empty();
@@ -197,70 +198,161 @@ impl ChatApp {
             (false, true) => CORAL,
             (false, false) => SAND,
         };
+        let send = div()
+            .id("send")
+            .size(px(28.))
+            .ml_1()
+            .flex_shrink_0()
+            .rounded_lg()
+            .bg(rgb(send_bg))
+            .flex()
+            .justify_center()
+            .items_center()
+            .when(busy || can_send, |d| d.cursor_pointer())
+            .tooltip(move |window, cx| {
+                Tooltip::new(match (busy, can_send) {
+                    (true, _) => "停止（Esc）",
+                    (false, true) => "发送（回车）",
+                    (false, false) => "先输入内容或附上图片",
+                })
+                .build(window, cx)
+            })
+            .child(if busy {
+                div().size(px(9.)).rounded_xs().bg(rgb(WHITE)).into_any_element()
+            } else {
+                Icon::new(IconAll::ArrowUp)
+                    .size_4()
+                    .text_color(rgb(if can_send { WHITE } else { INK_FAINT }))
+                    .into_any_element()
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.session().busy {
+                    this.stop(cx);
+                } else {
+                    // 空输入时 send 自己会忽略
+                    this.send(window, cx);
+                }
+            }));
 
-        // 输入框：右侧发送；忙时换成停止（方块）；粘贴图片转成附件
-        let card = div()
-            .id("composer")
+        // 卡片底部工具栏：权限模式 / 内核 / 附件，右侧档案 / 模型 / 发送。open 状态由 Popover 自管
+        let toolbar = div()
             .h_flex()
-            .items_end()
-            .gap_2()
-            .w_full()
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(LINE))
-            .rounded_xl()
-            .shadow_xs()
-            .pl_4()
-            .pr_2()
-            .py_2()
+            .items_center()
+            .gap_1()
+            .child(menu_popover(
+                "mode-menu",
+                Anchor::BottomLeft,
+                px(300.),
+                &app,
+                MenuChip::new(mode_icon, mode_name),
+                mode_menu_items,
+            ))
+            .child(menu_popover(
+                "kernel-menu",
+                Anchor::BottomLeft,
+                px(300.),
+                &app,
+                MenuChip::new(IconAll::Cpu, self.session().kernel.label()),
+                kernel_menu_items,
+            ))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .py_0p5()
-                    .child(
-                        Input::new(&self.input)
-                            .appearance(false)
-                            .bordered(false)
-                            .on_paste(paste_to_attachments(app.clone())),
-                    ),
-            )
-            .child(
-                div()
-                    .id("send")
-                    .size(px(28.))
+                    .id("attach-files")
+                    .size(px(26.))
                     .flex_shrink_0()
-                    .rounded_lg()
-                    .bg(rgb(send_bg))
+                    .rounded_md()
                     .flex()
                     .justify_center()
                     .items_center()
-                    .when(busy || can_send, |d| d.cursor_pointer())
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(match (busy, can_send) {
-                            (true, _) => "停止（Esc）",
-                            (false, true) => "发送（回车）",
-                            (false, false) => "先输入内容或附上图片",
-                        })
-                        .build(window, cx)
-                    })
-                    .child(if busy {
-                        div().size(px(9.)).rounded_xs().bg(rgb(WHITE)).into_any_element()
-                    } else {
-                        Icon::new(IconAll::ArrowUp)
-                            .size_4()
-                            .text_color(rgb(if can_send { WHITE } else { INK_FAINT }))
-                            .into_any_element()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(HOVER)))
+                    .tooltip(|window, cx| Tooltip::new("添加文件").build(window, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx)))
+                    .child(Icon::new(IconAll::Plus).size_4().text_color(rgb(INK_SOFT))),
+            )
+            .child(
+                div()
+                    .id("attach-images")
+                    .size(px(26.))
+                    .flex_shrink_0()
+                    .rounded_md()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(HOVER)))
+                    .tooltip(|window, cx| {
+                        Tooltip::new("附加图片（也可直接粘贴）").build(window, cx)
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if this.session().busy {
-                            this.stop(cx);
-                        } else {
-                            // 空输入时 send 自己会忽略
-                            this.send(window, cx);
-                        }
-                    })),
-            );
+                        this.attach_images(window, cx)
+                    }))
+                    .child(Icon::new(IconAll::ImagePlus).size_4().text_color(rgb(INK_SOFT))),
+            )
+            .child(div().flex_1())
+            .when(self.settings.builtin.profiles.len() > 1, |d| {
+                d.child(menu_popover(
+                    "profile-menu",
+                    Anchor::BottomRight,
+                    px(280.),
+                    &app,
+                    MenuChip::new(
+                        IconAll::Server,
+                        self.settings.builtin.current().display_name(),
+                    ),
+                    profile_menu_items,
+                ))
+            })
+            .child(model_menu_popover(
+                &app,
+                "model-menu",
+                Anchor::BottomRight,
+                MenuChip::text(self.session().model_label.clone()),
+            ))
+            .child(send);
+
+        // 输入框是一个整体：附件缩略图、文字、工具栏都在同一张卡片里（对照 claude.ai / 官方 Code 桌面端）。
+        // 聚焦时边框和阴影加深一档；点卡片空白处也把焦点给输入框。
+        let card = div()
+            .id("composer")
+            .v_flex()
+            .gap_1()
+            .w_full()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(if focused { INK_FAINT } else { LINE }))
+            .rounded_2xl()
+            .map(|d| if focused { d.shadow_sm() } else { d.shadow_xs() })
+            .px_2()
+            .pt_2()
+            .pb_2()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
+            )
+            // 待发送图片缩略图（点右上角 × 撤掉）
+            .when(!self.pending.is_empty(), |d| {
+                d.child(
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .px_2()
+                        .pt_1()
+                        .children(
+                            (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
+                        ),
+                )
+            })
+            .child(
+                div().px_2().py_1().child(
+                    Input::new(&self.input)
+                        .appearance(false)
+                        .bordered(false)
+                        .on_paste(paste_to_attachments(app.clone())),
+                ),
+            )
+            .child(toolbar);
 
         div()
             .v_flex()
@@ -276,96 +368,7 @@ impl ChatApp {
                     .child(Self::chip(IconAll::Monitor, "本地"))
                     .child(Self::chip(IconAll::Folder, project)),
             )
-            // 待发送图片缩略图（点右上角 × 撤掉）
-            .when(!self.pending.is_empty(), |d| {
-                d.child(
-                    div()
-                        .h_flex()
-                        .flex_wrap()
-                        .gap_1p5()
-                        .children(
-                            (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
-                        ),
-                )
-            })
             .child(card)
-            // 输入框下方：权限模式 / 内核 / 附件，右侧模型。open 状态由 Popover 自管
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(menu_popover(
-                        "mode-menu",
-                        Anchor::BottomLeft,
-                        px(300.),
-                        &app,
-                        MenuChip::new(mode_icon, mode_name),
-                        mode_menu_items,
-                    ))
-                    .child(menu_popover(
-                        "kernel-menu",
-                        Anchor::BottomLeft,
-                        px(300.),
-                        &app,
-                        MenuChip::new(IconAll::Cpu, self.session().kernel.label()),
-                        kernel_menu_items,
-                    ))
-                    .child(
-                        div()
-                            .id("attach-files")
-                            .size(px(26.))
-                            .flex_shrink_0()
-                            .rounded_md()
-                            .flex()
-                            .justify_center()
-                            .items_center()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(rgb(HOVER)))
-                            .tooltip(|window, cx| Tooltip::new("添加文件").build(window, cx))
-                            .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx)))
-                            .child(Icon::new(IconAll::Plus).size_4().text_color(rgb(INK_SOFT))),
-                    )
-                    .child(
-                        div()
-                            .id("attach-images")
-                            .size(px(26.))
-                            .flex_shrink_0()
-                            .rounded_md()
-                            .flex()
-                            .justify_center()
-                            .items_center()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(rgb(HOVER)))
-                            .tooltip(|window, cx| {
-                                Tooltip::new("附加图片（也可直接粘贴）").build(window, cx)
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.attach_images(window, cx)
-                            }))
-                            .child(Icon::new(IconAll::ImagePlus).size_4().text_color(rgb(INK_SOFT))),
-                    )
-                    .child(div().flex_1())
-                    .when(self.settings.builtin.profiles.len() > 1, |d| {
-                        d.child(menu_popover(
-                            "profile-menu",
-                            Anchor::BottomRight,
-                            px(280.),
-                            &app,
-                            MenuChip::new(
-                                IconAll::Server,
-                                self.settings.builtin.current().display_name(),
-                            ),
-                            profile_menu_items,
-                        ))
-                    })
-                    .child(model_menu_popover(
-                        &app,
-                        "model-menu",
-                        Anchor::BottomRight,
-                        MenuChip::text(self.session().model_label.clone()),
-                    )),
-            )
     }
 }
 
@@ -422,16 +425,6 @@ fn model_menu_popover(
 
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
 
-/// 条目点击的公共收尾：执行动作后收起面板。
-macro_rules! menu_action {
-    ($handle:expr, $popover:expr, $body:expr) => {
-        move |_, window, cx: &mut App| {
-            $handle.update(cx, $body);
-            $popover.update(cx, |s, cx| s.dismiss(window, cx));
-        }
-    };
-}
-
 /// 权限模式条目：图标 + 名称（+说明），当前项打勾。
 fn mode_menu_items(
     app: &ChatApp,
@@ -442,45 +435,12 @@ fn mode_menu_items(
     let mut menu = div().v_flex().gap_0p5();
     for (i, mode) in session.modes.iter().enumerate() {
         let active = session.permission_mode == i;
-        let has_desc = !mode.desc.is_empty();
         let (handle, popover) = (handle.clone(), popover.clone());
         menu = menu.child(
-            div()
-                .id(("mode-item", i))
-                .h_flex()
-                .items_center()
-                .gap_2p5()
-                .px_2p5()
-                .py_2()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(HOVER)))
+            menu_item(("mode-item", i), mode.icon, mode.name.clone(), mode.desc.clone(), active)
                 .on_click(menu_action!(handle, popover, |this, cx| {
                     this.choose_mode(i, cx);
-                }))
-                .child(Icon::new(mode.icon).size_4().text_color(rgb(INK_SOFT)))
-                .child(
-                    div()
-                        .v_flex()
-                        .flex_1()
-                        .child(
-                            div()
-                                .text_size(TEXT_BODY)
-                                .text_color(rgb(INK))
-                                .child(mode.name.clone()),
-                        )
-                        .when(has_desc, |d| {
-                            d.child(
-                                div()
-                                    .text_size(TEXT_SMALL)
-                                    .text_color(rgb(INK_SOFT))
-                                    .child(mode.desc.clone()),
-                            )
-                        }),
-                )
-                .when(active, |d| {
-                    d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                }),
+                })),
         );
     }
     menu

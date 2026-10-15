@@ -28,6 +28,8 @@ actions!(
         NextSession,
         /// 按侧栏顺序切到上一个会话
         PrevSession,
+        /// 循环切换视图模式（摘要 / 标准 / 详细）
+        CycleView,
     ]
 );
 
@@ -40,6 +42,8 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("secondary-b", ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new("ctrl-tab", NextSession, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PrevSession, Some(CONTEXT)),
+        // 与官方一致，macOS 上也是 Ctrl+O
+        KeyBinding::new("ctrl-o", CycleView, Some(CONTEXT)),
     ]);
 }
 
@@ -74,6 +78,9 @@ impl ChatApp {
             }))
             .on_action(cx.listener(|this, _: &NextSession, _, cx| this.step_session(1, cx)))
             .on_action(cx.listener(|this, _: &PrevSession, _, cx| this.step_session(-1, cx)))
+            .on_action(cx.listener(|this, _: &CycleView, _, cx| {
+                this.set_view_mode(this.settings.view_mode.next(), cx)
+            }))
     }
 
     fn on_stop_turn(&mut self, _: &StopTurn, window: &mut Window, cx: &mut Context<Self>) {

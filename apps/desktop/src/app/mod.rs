@@ -77,6 +77,8 @@ pub struct ChatApp {
     settings_form: SettingsForm,
     /// 正在后台获取模型列表
     fetching_models: bool,
+    /// 刚点了「复制」的消息（会话令牌, 记录下标），1.5 秒内按钮显示「已复制」
+    copied: Option<(u64, usize)>,
     /// 所有会话的每轮统计（首页用量概览）
     usage: Vec<TurnStat>,
     /// 压测钩子：每次 render 的时刻（None = 不记录）
@@ -126,9 +128,8 @@ impl ChatApp {
              cx: &mut Context<ChatApp>| {
                 match event {
                     InputEvent::PressEnter { .. } => this.send(window, cx),
-                    // 发送按钮随输入框空 / 非空换样式
-                    InputEvent::Change => cx.notify(),
-                    _ => {}
+                    // 发送按钮随输入框空 / 非空换样式；输入框卡片随聚焦换边框
+                    InputEvent::Change | InputEvent::Focus | InputEvent::Blur => cx.notify(),
                 }
             },
         )
@@ -228,6 +229,7 @@ impl ChatApp {
             settings_focus: cx.focus_handle(),
             settings_form,
             fetching_models: false,
+            copied: None,
             usage: Vec::new(),
             frame_log: None,
         };
@@ -967,7 +969,7 @@ impl Render for ChatApp {
         // 还没发过消息的会话显示首页（问候 + 概览）
         let home = !self.sessions[active].has_user_message();
 
-        let composer_area = div().px_6().pb_4().pt_2().child(self.render_composer(cx));
+        let composer_area = div().px_6().pb_4().pt_2().child(self.render_composer(window, cx));
 
         let body = if self.settings_open {
             v_flex().flex_1().min_h_0().child(self.render_settings(cx))
@@ -987,7 +989,8 @@ impl Render for ChatApp {
                 .child(composer_area)
         } else {
             // 虚拟列表：只布局 / 绘制视口附近的行；最后一行是运行状态行（见 Session::sync_list）
-            self.sessions[active].sync_list();
+            let view = self.settings.view_mode;
+            self.sessions[active].sync_list(view);
             let state = self.sessions[active].list.clone();
             let scroll = list(
                 state,
@@ -996,6 +999,8 @@ impl Render for ChatApp {
                     let n = s.transcript.len();
                     let row = div().max_w(READING_W).mx_auto().w_full().px_6();
                     let content = match s.transcript.get(ix) {
+                        // 当前视图模式下不显示的行：零高度（测量指纹里带着视图模式，切换时整表重测）
+                        Some(item) if !item.visible_in(this.settings.view_mode) => div(),
                         Some(item) => row
                             .pt(px(if ix == 0 { 16. } else { 0. }))
                             .pb_4()

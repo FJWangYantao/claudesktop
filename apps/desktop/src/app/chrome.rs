@@ -3,9 +3,12 @@
 //! Windows 的 hit-test 只看鼠标下的元素链里有没有 `Drag` 区：拖拽区包住的按钮
 //! 一律收不到点击。所以拖拽区只能是按钮的**兄弟**（填空白的 flex_1），不能当容器。
 
+use super::menu::{menu_action, menu_item, menu_popover, MenuChip};
 use super::ChatApp;
+use crate::model::ViewMode;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::base::PopoverState;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -79,7 +82,7 @@ pub(super) fn window_controls(window: &Window) -> Option<Div> {
 }
 
 impl ChatApp {
-    /// 会话区顶栏：「项目 / 会话标题」面包屑 + 导出 + 窗口按钮。整行除按钮外都能拖动窗口。
+    /// 会话区顶栏：「项目 / 会话标题」面包屑 + 视图模式 + 导出 + 窗口按钮。整行除按钮外都能拖动窗口。
     pub(super) fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let s = self.session();
         let crumb = div()
@@ -114,6 +117,7 @@ impl ChatApp {
                 )
         };
         let can_export = !self.settings_open && s.has_user_message();
+        let view = self.settings.view_mode;
 
         div()
             .h_flex()
@@ -126,6 +130,19 @@ impl ChatApp {
                     .child(self.sidebar_toggle("header-sidebar-toggle", cx))
             })
             .child(drag_area().pl_4().pr_2().child(crumb))
+            // 视图模式（Ctrl+O 循环）：只在有对话时出现
+            .when(can_export, |d| {
+                d.child(
+                    div().mr_1().child(menu_popover(
+                        "view-menu",
+                        Anchor::TopRight,
+                        px(280.),
+                        &cx.entity(),
+                        MenuChip::new(view.icon(), view.label()),
+                        view_menu_items,
+                    )),
+                )
+            })
             .when(can_export, |d| {
                 d.child(
                     div()
@@ -146,4 +163,29 @@ impl ChatApp {
             })
             .children(window_controls(window))
     }
+}
+
+/// 视图模式条目：摘要 / 标准 / 详细，末尾提示快捷键。
+fn view_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> Div {
+    let current = app.settings.view_mode;
+    let mut menu = div().v_flex().gap_0p5();
+    for (i, mode) in ViewMode::ALL.into_iter().enumerate() {
+        let (handle, popover) = (handle.clone(), popover.clone());
+        menu = menu.child(
+            menu_item(("view-item", i), mode.icon(), mode.label(), mode.desc(), mode == current)
+                .on_click(menu_action!(handle, popover, |this, cx| this.set_view_mode(mode, cx))),
+        );
+    }
+    menu.child(
+        div()
+            .px_2p5()
+            .py_1p5()
+            .text_size(TEXT_META)
+            .text_color(rgb(INK_SOFT))
+            .child("Ctrl+O 循环切换"),
+    )
 }

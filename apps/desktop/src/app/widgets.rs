@@ -1,4 +1,4 @@
-//! 小组件（chip / 顶部 tab / 分段按钮）。
+//! 小组件（chip / 顶部 tab / 分段按钮 / 消息操作按钮）。
 
 use super::ChatApp;
 use crate::theme::*;
@@ -26,6 +26,25 @@ impl ChatApp {
                     .text_color(rgb(INK_SOFT))
                     .child(label.into()),
             )
+    }
+
+    /// 消息下方的小操作按钮（复制 / 编辑 / 重跑）：图标 + 元信息字号文字，悬停出底色。
+    pub(super) fn message_action(
+        id: impl Into<ElementId>,
+        icon: IconAll,
+        label: impl Into<SharedString>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .h_flex()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|d| d.bg(rgb(HOVER)))
+            .child(Icon::new(icon).size_3().text_color(rgb(INK_SOFT)))
+            .child(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(label.into()))
     }
 
     /// 首页概览的分段切换底（点击逻辑在 overview 的 tab 里）。

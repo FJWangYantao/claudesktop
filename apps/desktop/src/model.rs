@@ -11,6 +11,56 @@ pub enum ToolPhase {
     Failed,
 }
 
+/// 对话的视图模式（对照官方 Summary / Normal / Verbose）：只决定看多少过程，不影响内核怎么跑。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewMode {
+    /// 只看结果：隐藏思考、启动信息、计划和工具调用（正在等你看 diff 的那一步除外）
+    Summary,
+    /// 工具调用折叠成一行，思考默认收起
+    #[default]
+    Normal,
+    /// 全部展开：思考、启动信息、完整 diff
+    Verbose,
+}
+
+impl ViewMode {
+    pub const ALL: [ViewMode; 3] = [ViewMode::Summary, ViewMode::Normal, ViewMode::Verbose];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Summary => "摘要",
+            ViewMode::Normal => "标准",
+            ViewMode::Verbose => "详细",
+        }
+    }
+
+    pub fn desc(self) -> &'static str {
+        match self {
+            ViewMode::Summary => "只看回复和需要你处理的事",
+            ViewMode::Normal => "工具调用折叠成一行，思考默认收起",
+            ViewMode::Verbose => "展开思考、启动信息和完整 diff",
+        }
+    }
+
+    pub fn icon(self) -> IconAll {
+        match self {
+            ViewMode::Summary => IconAll::ListCollapse,
+            ViewMode::Normal => IconAll::Rows3,
+            ViewMode::Verbose => IconAll::ScrollText,
+        }
+    }
+
+    /// Ctrl+O 循环的下一档
+    pub fn next(self) -> Self {
+        match self {
+            ViewMode::Summary => ViewMode::Normal,
+            ViewMode::Normal => ViewMode::Verbose,
+            ViewMode::Verbose => ViewMode::Summary,
+        }
+    }
+}
+
 /// 工具调用：`● Name arg` + `└ result`（Claude Code 的紧凑样式）
 pub struct ToolCard {
     /// 内核侧的 tool_call_id（演示脚本为 None）
@@ -117,6 +167,16 @@ impl PendingImage {
 }
 
 impl ChatItem {
+    /// 这一行在某个视图模式下是否显示。摘要模式只留回复、用户消息、权限卡和备注；
+    /// 工具调用只在「执行中且带 diff」时留着——那是正等你对着改动决定放不放行的一步。
+    pub fn visible_in(&self, view: ViewMode) -> bool {
+        match (view, self) {
+            (ViewMode::Summary, Self::Thinking { .. } | Self::Info { .. } | Self::Plan(_)) => false,
+            (ViewMode::Summary, Self::Tool(c)) => c.phase == ToolPhase::Running && !c.diffs.is_empty(),
+            _ => true,
+        }
+    }
+
     /// 影响这一行渲染高度的内容摘要（虚拟列表据此判断要不要重新测量）。
     /// 内容只会追加或切换状态，所以长度 + 状态位就够了。
     pub fn fingerprint(&self) -> u64 {
@@ -309,6 +369,55 @@ mod tests {
         let out = summarize_output(&long);
         assert_eq!(out.chars().count(), 141);
         assert!(out.ends_with('…'));
+    }
+
+    #[core::prelude::v1::test]
+    fn summary_view_keeps_results_and_pending_diffs() {
+        let card = |phase, with_diff: bool| {
+            ChatItem::Tool(ToolCard {
+                id: None,
+                kind: "edit".into(),
+                name: "Edit".into(),
+                arg: "a.rs".into(),
+                result: "".into(),
+                phase,
+                diffs: if with_diff {
+                    vec![DiffView {
+                        path: "a.rs".into(),
+                        created: false,
+                        added: 1,
+                        removed: 0,
+                        lines: Vec::new(),
+                        truncated: false,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                expanded: false,
+            })
+        };
+        let thinking = ChatItem::Thinking { text: "t".into(), streaming: false, open: false };
+        let agent = ChatItem::Agent("a".into());
+        for item in [&thinking, &agent, &card(ToolPhase::Done, true)] {
+            assert!(item.visible_in(ViewMode::Normal));
+            assert!(item.visible_in(ViewMode::Verbose));
+        }
+        assert!(!thinking.visible_in(ViewMode::Summary));
+        assert!(agent.visible_in(ViewMode::Summary));
+        // 摘要模式：只留正在执行、带 diff 的那一步
+        assert!(card(ToolPhase::Running, true).visible_in(ViewMode::Summary));
+        assert!(!card(ToolPhase::Running, false).visible_in(ViewMode::Summary));
+        assert!(!card(ToolPhase::Done, true).visible_in(ViewMode::Summary));
+    }
+
+    #[core::prelude::v1::test]
+    fn view_mode_cycles_through_all() {
+        let mut v = ViewMode::default();
+        assert_eq!(v, ViewMode::Normal);
+        for _ in 0..ViewMode::ALL.len() {
+            v = v.next();
+        }
+        assert_eq!(v, ViewMode::Normal);
     }
 
     #[core::prelude::v1::test]

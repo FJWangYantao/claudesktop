@@ -10,6 +10,7 @@ use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::{PopoverState, Selectable};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 下拉 trigger chip：图标（可省）+ 文字 + 展开箭头，弹层打开时高亮。
@@ -64,6 +65,50 @@ impl RenderOnce for MenuChip {
             chip.hover(|d| d.bg(rgb(HOVER)))
         }
     }
+}
+
+/// 条目点击的公共收尾：执行动作后收起面板。
+macro_rules! menu_action {
+    ($handle:expr, $popover:expr, $body:expr) => {
+        move |_, window, cx: &mut App| {
+            $handle.update(cx, $body);
+            $popover.update(cx, |s, cx| s.dismiss(window, cx));
+        }
+    };
+}
+pub(super) use menu_action;
+
+/// 两行式菜单条目：图标 + 名称（+ 灰色说明，空串不显示），当前项右侧打赤陶色对勾。
+/// 点击动作由调用方链 `.on_click(menu_action!(..))`。
+pub(super) fn menu_item(
+    id: impl Into<ElementId>,
+    icon: IconAll,
+    name: impl Into<SharedString>,
+    desc: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    let desc: SharedString = desc.into();
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .gap_2p5()
+        .px_2p5()
+        .py_2()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(HOVER)))
+        .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(name.into()))
+                .when(!desc.is_empty(), |d| {
+                    d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc))
+                }),
+        )
+        .when(active, |d| d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL))))
 }
 
 /// 组一个下拉菜单：`chip` 是 trigger，面板锚在 chip 上按 `anchor` 方向展开，

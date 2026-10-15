@@ -2,40 +2,49 @@
 
 use super::ChatApp;
 use crate::model::*;
-use crate::settings::KernelChoice;
+use crate::session::Session;
+use crate::settings::{KernelChoice, Settings};
 use crate::theme::*;
 use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::input::Position;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::time::Duration;
 
 impl ChatApp {
+    /// 思考块；`verbose`（详细视图）时总是展开、不能收起。
     pub(super) fn render_thinking(
         idx: usize,
         text: &str,
         streaming: bool,
         open: bool,
+        verbose: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let caret = if streaming { " ▍" } else { "" };
+        let open = open || verbose;
         let header = div()
             .id(("think-toggle", idx))
             .h_flex()
             .gap_1p5()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(ChatItem::Thinking { open, .. }) = this.sessions[this.active].transcript.get_mut(idx) {
-                    *open = !*open;
-                    cx.notify();
-                }
-            }))
+            .when(!verbose, |d| {
+                d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(ChatItem::Thinking { open, .. }) =
+                        this.sessions[this.active].transcript.get_mut(idx)
+                    {
+                        *open = !*open;
+                        cx.notify();
+                    }
+                }))
+            })
             .child(
                 Icon::new(IconAll::Brain)
                     .size_3p5()
@@ -50,15 +59,13 @@ impl ChatApp {
             } else {
                 "已思考".into_any_element()
             }))
-            .child(
-                Icon::new(if open {
-                    IconAll::ChevronDown
-                } else {
-                    IconAll::ChevronRight
-                })
-                .size_3()
-                .text_color(rgb(INK_SOFT)),
-            );
+            .when(!verbose, |d| {
+                d.child(
+                    Icon::new(if open { IconAll::ChevronDown } else { IconAll::ChevronRight })
+                        .size_3()
+                        .text_color(rgb(INK_SOFT)),
+                )
+            });
 
         let mut col = div().v_flex().gap_1().child(header);
         if open {
@@ -73,18 +80,29 @@ impl ChatApp {
         col
     }
 
-    pub(super) fn render_info(idx: usize, text: &str, open: bool, cx: &mut Context<Self>) -> Div {
+    /// 启动信息块；`verbose` 时总是展开。
+    pub(super) fn render_info(
+        idx: usize,
+        text: &str,
+        open: bool,
+        verbose: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let open = open || verbose;
         let header = div()
             .id(("info-toggle", idx))
             .h_flex()
             .gap_1p5()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(ChatItem::Info { open, .. }) = this.sessions[this.active].transcript.get_mut(idx) {
-                    *open = !*open;
-                    cx.notify();
-                }
-            }))
+            .when(!verbose, |d| {
+                d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(ChatItem::Info { open, .. }) =
+                        this.sessions[this.active].transcript.get_mut(idx)
+                    {
+                        *open = !*open;
+                        cx.notify();
+                    }
+                }))
+            })
             .child(Icon::new(IconAll::Info).size_3p5().text_color(rgb(INK_SOFT)))
             .child(
                 div()
@@ -92,15 +110,13 @@ impl ChatApp {
                     .text_color(rgb(INK_SOFT))
                     .child("启动信息"),
             )
-            .child(
-                Icon::new(if open {
-                    IconAll::ChevronDown
-                } else {
-                    IconAll::ChevronRight
-                })
-                .size_3()
-                .text_color(rgb(INK_SOFT)),
-            );
+            .when(!verbose, |d| {
+                d.child(
+                    Icon::new(if open { IconAll::ChevronDown } else { IconAll::ChevronRight })
+                        .size_3()
+                        .text_color(rgb(INK_SOFT)),
+                )
+            });
         let mut col = div().v_flex().gap_1().child(header);
         if open {
             col = col.child(
@@ -115,7 +131,13 @@ impl ChatApp {
         col
     }
 
-    pub(super) fn render_tool(idx: usize, card: &ToolCard, cx: &mut Context<Self>) -> Div {
+    /// 工具行；`verbose` 时 diff 全部展开、不给展开 / 收起开关。
+    pub(super) fn render_tool(
+        idx: usize,
+        card: &ToolCard,
+        verbose: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
         // 官方样式：工具名加粗 + 参数小药丸 + 改动行数；完成时不再挂状态点
         let status = match card.phase {
             ToolPhase::Running => Some(
@@ -198,7 +220,7 @@ impl ChatApp {
             );
         }
         // 文件改动：默认每份只显示前若干行，超出给一个展开开关
-        let limit = (!card.expanded).then_some(DIFF_PREVIEW_ROWS);
+        let limit = (!card.expanded && !verbose).then_some(DIFF_PREVIEW_ROWS);
         for diff in &card.diffs {
             col = col.child(div().mt_1().child(Self::render_diff(diff, limit)));
         }
@@ -207,7 +229,7 @@ impl ChatApp {
             .iter()
             .map(|d| d.lines.len().saturating_sub(DIFF_PREVIEW_ROWS))
             .sum();
-        if hidden > 0 || card.expanded {
+        if !verbose && (hidden > 0 || card.expanded) {
             let label = if card.expanded {
                 "收起".to_string()
             } else {
@@ -255,7 +277,7 @@ impl ChatApp {
                 div()
                     .text_size(TEXT_LARGE)
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("请求权限"),
+                    .child("要允许这一步吗？"),
             )
             .child(
                 div()
@@ -497,7 +519,77 @@ impl ChatApp {
             }))
     }
 
-    /// 用户消息气泡；悬停时下方出现「在另一个内核上重跑」。
+    /// 切换视图模式并写回设置文件。只改盘上那份的这一项：内存里的设置合并过环境变量，不能整份写回。
+    pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        if self.settings.view_mode == mode {
+            return;
+        }
+        self.settings.view_mode = mode;
+        if let Some(path) = &self.settings_path {
+            let (mut on_disk, broken) = Settings::load(Some(path));
+            // 文件坏了就不碰，免得用默认值盖掉
+            if broken.is_none() {
+                on_disk.view_mode = mode;
+                if let Err(err) = on_disk.save(path) {
+                    self.sessions[self.active].note(format!("视图模式没能保存：{err}"));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 「复制」按钮：点了把 `text(当前会话, idx)` 放进剪贴板，图标短暂变成对勾、文字变「已复制」。
+    fn copy_action(
+        &self,
+        id: impl Into<ElementId>,
+        idx: usize,
+        cx: &mut Context<Self>,
+        text: impl Fn(&Session, usize) -> String + 'static,
+    ) -> Stateful<Div> {
+        let copied = self.copied == Some((self.session().token, idx));
+        let (icon, label) = if copied { (IconAll::Check, "已复制") } else { (IconAll::Copy, "复制") };
+        Self::message_action(id, icon, label).on_click(cx.listener(move |this, _, _, cx| {
+            let content = text(this.session(), idx);
+            this.copy_to_clipboard(idx, content, cx);
+        }))
+    }
+
+    /// 写剪贴板并记下「刚复制的是哪条」，1.5 秒后自动清掉对勾。
+    pub(crate) fn copy_to_clipboard(&mut self, idx: usize, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        let key = (self.session().token, idx);
+        self.copied = Some(key);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.copied == Some(key) {
+                    app.copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 「编辑」：把这条用户消息放回输入框（输入框里已有草稿就接在后面，不覆盖），光标放到末尾。
+    pub(crate) fn edit_message(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ChatItem::User { text, .. }) = self.session().transcript.get(idx) else {
+            return;
+        };
+        let text = text.to_string();
+        self.input.update(cx, |state, cx| {
+            let draft = state.value().to_string();
+            let next = if draft.trim().is_empty() { text } else { format!("{draft}\n{text}") };
+            let last_line = next.matches('\n').count() as u32;
+            state.set_value(next, window, cx);
+            // 列号超出会被截到行尾
+            state.set_cursor_position(Position::new(last_line, u32::MAX), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// 用户消息气泡；悬停时下方出现「复制 / 编辑 / 在另一个内核上重跑」。
     fn render_user(
         &self,
         idx: usize,
@@ -512,26 +604,33 @@ impl ChatApp {
                 && *k != KernelChoice::Demo
                 && (*k != KernelChoice::Builtin || self.settings.builtin.is_configured())
         });
-        let mut actions = div().h_flex().justify_end().gap_1().opacity(0.);
+        let edit_tip = if images.is_empty() {
+            "放回输入框，改完重新发送"
+        } else {
+            "放回输入框（图片要重新附上），改完重新发送"
+        };
+        let mut actions = div()
+            .h_flex()
+            .justify_end()
+            .gap_1()
+            .opacity(0.)
+            .child(self.copy_action(("copy-user", idx), idx, cx, |s, idx| match &s.transcript[idx] {
+                ChatItem::User { text, .. } => text.to_string(),
+                _ => String::new(),
+            }))
+            .child(
+                Self::message_action(("edit-user", idx), IconAll::Pencil, "编辑")
+                    .tooltip(move |window, cx| Tooltip::new(edit_tip).build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| this.edit_message(idx, window, cx))),
+            );
         for kind in others {
             actions = actions.child(
-                div()
-                    .id(("rerun", idx * 4 + kind.index()))
-                    .h_flex()
-                    .gap_1()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.rerun_on(idx, kind, cx)))
-                    .child(Icon::new(IconAll::RefreshCw).size_3().text_color(rgb(INK_SOFT)))
-                    .child(
-                        div()
-                            .text_size(TEXT_META)
-                            .text_color(rgb(INK_SOFT))
-                            .child(format!("在「{}」上重跑", kind.label())),
-                    ),
+                Self::message_action(
+                    ("rerun", idx * 4 + kind.index()),
+                    IconAll::RefreshCw,
+                    format!("在「{}」上重跑", kind.label()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.rerun_on(idx, kind, cx))),
             );
         }
         // 气泡：有文字才画文本气泡，图片另起一行缩略图（丢了文件就跳过）。
@@ -585,15 +684,18 @@ impl ChatApp {
     }
 
     pub(super) fn render_item(&self, idx: usize, item: &ChatItem, cx: &mut Context<Self>) -> Div {
+        let verbose = self.settings.view_mode == ViewMode::Verbose;
         match item {
             ChatItem::User { text, images } => self.render_user(idx, text, images, cx),
             ChatItem::Thinking {
                 text,
                 streaming,
                 open,
-            } => Self::railed(Self::render_thinking(idx, text, *streaming, *open, cx)),
-            ChatItem::Info { text, open } => Self::railed(Self::render_info(idx, text, *open, cx)),
-            ChatItem::Tool(card) => Self::railed(Self::render_tool(idx, card, cx)),
+            } => Self::railed(Self::render_thinking(idx, text, *streaming, *open, verbose, cx)),
+            ChatItem::Info { text, open } => {
+                Self::railed(Self::render_info(idx, text, *open, verbose, cx))
+            }
+            ChatItem::Tool(card) => Self::railed(Self::render_tool(idx, card, verbose, cx)),
             ChatItem::Permission {
                 title,
                 options,
@@ -609,26 +711,38 @@ impl ChatApp {
                 } else {
                     text.clone()
                 };
-                Self::railed(
-                    div().text_size(TEXT_LARGE).line_height(LEADING).child(
-                        TextView::markdown(("agent", idx), SharedString::from(text))
-                            .style(
-                                TextViewStyle::default()
-                                    .paragraph_gap(rems(0.75))
-                                    .heading_font_size(|level, _| match level {
-                                        1 => TEXT_HEADING,
-                                        2 => TEXT_LEAD,
-                                        _ => TEXT_LARGE,
-                                    })
-                                    .inline_code(HighlightStyle {
-                                        background_color: Some(rgb(CODE_BG).into()),
-                                        ..Default::default()
-                                    })
-                                    .code_block(StyleRefinement::default().bg(rgb(SAND))),
-                            )
-                            .stream_fade(true),
-                    ),
-                )
+                let body = div().text_size(TEXT_LARGE).line_height(LEADING).child(
+                    TextView::markdown(("agent", idx), SharedString::from(text))
+                        .style(
+                            TextViewStyle::default()
+                                .paragraph_gap(rems(0.75))
+                                .heading_font_size(|level, _| match level {
+                                    1 => TEXT_HEADING,
+                                    2 => TEXT_LEAD,
+                                    _ => TEXT_LARGE,
+                                })
+                                .inline_code(HighlightStyle {
+                                    background_color: Some(rgb(CODE_BG).into()),
+                                    ..Default::default()
+                                })
+                                .code_block(StyleRefinement::default().bg(rgb(SAND))),
+                        )
+                        .stream_fade(true),
+                );
+                if !s.is_turn_end(idx) {
+                    return Self::railed(body);
+                }
+                // 一轮回复的末尾挂「复制」：最后一轮常显，更早的悬停才出现（只切透明度，不挤布局）
+                let group: SharedString = format!("agent-{idx}").into();
+                let latest = !s.transcript[idx + 1..]
+                    .iter()
+                    .any(|i| matches!(i, ChatItem::User { .. }));
+                let actions = div()
+                    .h_flex()
+                    .pt_2()
+                    .child(self.copy_action(("copy-agent", idx), idx, cx, |s, idx| s.turn_text(idx)))
+                    .when(!latest, |d| d.opacity(0.).group_hover(group.clone(), |d| d.opacity(1.)));
+                Self::railed(div().group(group).v_flex().child(body).child(actions))
             }
             ChatItem::Note(text) => {
                 div().h_flex().justify_center().pt_1().child(

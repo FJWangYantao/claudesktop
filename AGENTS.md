@@ -16,9 +16,14 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `MenuChip`）。open 状态由 Popover 自己持有（点外 / Esc 关闭，选中后
   `PopoverState::dismiss`），**不要**在 `ChatApp` 根 struct 里加 `*_open` bool、
   手摆 `absolute()` 坐标或手写互斥——那是 2026-10 之前的老写法，已清除。
+- **菜单条目**：两行式（图标 + 名称 + 灰色说明 + 当前项对勾）用 `menu.rs` 的 `menu_item()`，
+  点击收尾用同文件导出的 `menu_action!`。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
+  `widgets.rs` 的 `message_action()`。
+- **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否；
+  行高受别的状态影响时（如"是不是回合末尾"），把那个状态并进 `Session::row_key`，否则虚拟列表不会重测。
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，
   动作经 `Entity<ChatApp>.update(cx, |this, cx| ...)` 回根视图；参照
-  `composer.rs` 里 `mode_menu_items` 等三个菜单条目函数的写法（含 `menu_action!` 宏）。
+  `composer.rs` 里 `mode_menu_items` 等菜单条目函数的写法（`menu_action!` 宏在 `menu.rs`）。
 - **按钮**：新按钮优先 `gpui-component` 的 `Button`（变体齐全）；确需特殊样式再
   手写 div，但成组出现时应抽成 `app/widgets.rs` 的 helper。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。

@@ -31,7 +31,7 @@ pub struct Session {
     pub cancel_token: u64,
     /// 对话记录的虚拟列表状态（只渲染可见的行）；默认跟随到底，用户往上翻就停，翻回底部再跟
     pub list: ListState,
-    /// 每行上次测量时的 [`ChatItem::fingerprint`]
+    /// 每行上次测量时的指纹（[`Session::row_key`]）
     pub measured: Vec<u64>,
     /// 列表末尾的运行状态行上次测量时是否在忙（忙时有一行，不忙时高度为 0）
     measured_busy: bool,
@@ -172,7 +172,8 @@ impl Session {
     /// 把对话记录的变化同步给虚拟列表：新增的行追加，高度可能变了的行重新测量。
     /// 列表比记录多一行：第 `n` 行是运行状态行，忙 / 闲切换时重新测量。
     /// 每次渲染前调用；只比对指纹，不做布局，1 万行也很便宜。
-    pub fn sync_list(&mut self) {
+    /// 指纹里带着视图模式，切模式时所有行自动重测。
+    pub fn sync_list(&mut self, view: ViewMode) {
         let n = self.transcript.len();
         if n < self.measured.len() {
             // 记录只会变长；万一变短就整体重来
@@ -181,15 +182,17 @@ impl Session {
         }
         let old = self.measured.len();
         for i in 0..old {
-            let f = self.transcript[i].fingerprint();
+            let f = self.row_key(i, view);
             if f != self.measured[i] {
                 self.measured[i] = f;
                 self.list.remeasure_items(i..i + 1);
             }
         }
         if n > old {
-            self.measured
-                .extend(self.transcript[old..].iter().map(ChatItem::fingerprint));
+            for i in old..n {
+                let f = self.row_key(i, view);
+                self.measured.push(f);
+            }
             // 插在状态行前面
             self.list.splice(old..old, n - old);
         }
@@ -197,6 +200,47 @@ impl Session {
             self.measured_busy = self.busy;
             self.list.remeasure_items(n..n + 1);
         }
+    }
+
+    /// 一行的测量指纹：内容指纹 + 视图模式 + 是否回合末尾（回合末尾的回复下面多一行操作）。
+    fn row_key(&self, i: usize, view: ViewMode) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.transcript[i].fingerprint(), view, self.is_turn_end(i)).hash(&mut h);
+        h.finish()
+    }
+
+    /// `ix` 是不是一轮回复的最后一段正文：它后面（跳过备注）紧跟用户消息，
+    /// 或者它就是最后一段且这一轮已经结束。这样的回复下面挂「复制」等操作。
+    pub fn is_turn_end(&self, ix: usize) -> bool {
+        if !matches!(self.transcript.get(ix), Some(ChatItem::Agent(_))) {
+            return false;
+        }
+        match self.transcript[ix + 1..]
+            .iter()
+            .find(|i| !matches!(i, ChatItem::Note(_)))
+        {
+            Some(ChatItem::User { .. }) => true,
+            Some(_) => false,
+            None => !self.busy,
+        }
+    }
+
+    /// 一轮回复里的全部正文（从上一条用户消息到 `ix`），段与段之间空一行；「复制」用。
+    pub fn turn_text(&self, ix: usize) -> String {
+        let start = self.transcript[..ix]
+            .iter()
+            .rposition(|i| matches!(i, ChatItem::User { .. }))
+            .map_or(0, |p| p + 1);
+        self.transcript[start..=ix]
+            .iter()
+            .filter_map(|i| match i {
+                ChatItem::Agent(t) => Some(t.trim()),
+                _ => None,
+            })
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// 发消息时重新跟到底部（哪怕之前往上翻过）
@@ -847,7 +891,7 @@ mod tests {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
         s.transcript.push(ChatItem::Agent("a".into()));
-        s.sync_list();
+        s.sync_list(ViewMode::Normal);
         // 记录 2 行 + 末尾状态行
         assert_eq!((s.list.item_count(), s.measured.len()), (3, 2));
         let before = s.measured[1];
@@ -856,14 +900,44 @@ mod tests {
             t.push_str("bc");
         }
         s.transcript.push(ChatItem::Note("n".into()));
-        s.sync_list();
+        s.sync_list(ViewMode::Normal);
         assert_eq!(s.list.item_count(), 4);
         assert_ne!(s.measured[1], before);
-        assert_eq!(s.measured[1], s.transcript[1].fingerprint());
+        assert_eq!(s.measured[1], s.row_key(1, ViewMode::Normal));
+        // 换视图模式：所有行的指纹都变，整表重测
+        let normal = s.measured.clone();
+        s.sync_list(ViewMode::Summary);
+        assert!(normal.iter().zip(&s.measured).all(|(a, b)| a != b));
         // 折叠 / 展开也算高度变化
         let open = ChatItem::Thinking { text: "x".into(), streaming: false, open: true };
         let closed = ChatItem::Thinking { text: "x".into(), streaming: false, open: false };
         assert_ne!(open.fingerprint(), closed.fingerprint());
+    }
+
+    #[core::prelude::v1::test]
+    fn turn_end_and_turn_text() {
+        let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("."));
+        let user = || ChatItem::User { text: "q".into(), images: Vec::new() };
+        s.transcript = vec![
+            user(),
+            ChatItem::Agent("a".into()),
+            ChatItem::Plan(Vec::new()),
+            ChatItem::Agent(" b ".into()),
+            ChatItem::Note("已停止".into()),
+            user(),
+            ChatItem::Agent("c".into()),
+        ];
+        // 后面还有过程行的不算；跳过备注后紧跟用户消息的算
+        assert!(!s.is_turn_end(1));
+        assert!(s.is_turn_end(3));
+        assert!(!s.is_turn_end(0));
+        // 最后一段：这一轮结束了才算
+        assert!(s.is_turn_end(6));
+        s.busy = true;
+        assert!(!s.is_turn_end(6));
+        // 复制整轮正文，不跨到上一轮
+        assert_eq!(s.turn_text(3), "a\n\nb");
+        assert_eq!(s.turn_text(6), "c");
     }
 
     #[core::prelude::v1::test]
