@@ -1,11 +1,11 @@
 //! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
 
-use super::{project_label, short_path, ChatApp};
-use super::menu::{menu_action, menu_item, menu_popover, MenuChip};
+use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
+use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
 use crate::settings::KernelChoice;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::input::Textarea;
@@ -249,54 +249,48 @@ impl ChatApp {
         // 卡片里只有附件缩略图和随内容长高的多行输入 + 发送键（对照官方 Code 桌面端的紧凑输入框）。
         // 三档：静止细边；悬停边框加深一档（提示整块都能点）；聚焦再深一档并加阴影。
         // 点卡片空白处也把焦点给输入框。
-        let card = div()
-            .id("composer")
-            .v_flex()
-            .w_full()
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(if focused { INK_FAINT } else { LINE }))
-            .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
-            .rounded_2xl()
-            .map(|d| if focused { d.shadow_sm() } else { d.shadow_xs() })
-            // 发送键离右边和上下都是 6px
-            .px_1p5()
-            .py_1()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
-            )
-            // 待发送图片缩略图（点右上角 × 撤掉），左边和输入文字对齐
-            .when(!self.pending.is_empty(), |d| {
-                d.child(
-                    div()
-                        .h_flex()
-                        .flex_wrap()
-                        .gap_1p5()
-                        .px_2p5()
-                        .pt_1p5()
-                        .pb_1()
-                        .children(
+        let card =
+            div()
+                .id("composer")
+                .v_flex()
+                .w_full()
+                .bg(rgb(CARD))
+                .border_1()
+                .border_color(rgb(if focused { INK_FAINT } else { LINE }))
+                .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
+                .rounded_2xl()
+                .map(|d| if focused { d.shadow_sm() } else { d.shadow_xs() })
+                // 发送键离右边和上下都是 6px
+                .px_1p5()
+                .py_1()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
+                )
+                // 待发送图片缩略图（点右上角 × 撤掉），左边和输入文字对齐
+                .when(!self.pending.is_empty(), |d| {
+                    d.child(
+                        div().h_flex().flex_wrap().gap_1p5().px_2p5().pt_1p5().pb_1().children(
                             (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
                         ),
-                )
-            })
-            // 发送键贴底：输入框长高后它留在右下角（单行时和文字齐平）
-            .child(
-                div()
-                    .h_flex()
-                    .items_end()
-                    .gap_1()
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Textarea::new(&self.input)
-                                .appearance(false)
-                                .bordered(false)
-                                .on_paste(paste_to_attachments(app.clone())),
-                        ),
                     )
-                    .child(send),
-            );
+                })
+                // 发送键贴底：输入框长高后它留在右下角（单行时和文字齐平）
+                .child(
+                    div()
+                        .h_flex()
+                        .items_end()
+                        .gap_1()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Textarea::new(&self.input)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .on_paste(paste_to_attachments(app.clone())),
+                            ),
+                        )
+                        .child(send),
+                );
 
         div()
             .v_flex()
@@ -307,20 +301,16 @@ impl ChatApp {
             // 进行中这一轮的计划钉在最上面（对话往下走它也一直看得见）
             .children(self.render_pinned_plan(cx))
             // 输入框上方：运行环境 + 项目目录（点开切换工作目录）
-            .child(
-                div()
-                    .h_flex()
-                    .gap_1p5()
-                    .child(Self::chip(IconAll::Monitor, "本地"))
-                    .child(menu_popover(
-                        "workspace-menu",
-                        Anchor::BottomLeft,
-                        px(320.),
-                        &app,
-                        MenuChip::new(IconAll::Folder, project).filled(),
-                        workspace_menu_items,
-                    )),
-            )
+            .child(div().h_flex().gap_1p5().child(Self::chip(IconAll::Monitor, "本地")).child(
+                menu_popover(
+                    "workspace-menu",
+                    Anchor::BottomLeft,
+                    px(320.),
+                    &app,
+                    MenuChip::new(IconAll::Folder, project).filled(),
+                    workspace_menu_items,
+                ),
+            ))
             .child(
                 div()
                     .v_flex()
@@ -385,18 +375,13 @@ impl ChatApp {
                 .text_size(TEXT_SMALL)
                 .text_color(rgb(INK_SOFT))
                 .child(Icon::new(IconAll::TriangleAlert).size_3p5().text_color(rgb(RED)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .font_features(tabular_nums())
-                        .child(format!(
-                            "上下文已用 {percent}%，下一条消息发出前会先把较早的对话压缩成摘要"
-                        )),
-                )
-                .child(action("context-compact", "现在压缩").on_click(cx.listener(
-                    |this, _, _, cx| this.compact_session(cx),
+                .child(div().flex_1().min_w_0().font_features(tabular_nums()).child(format!(
+                    "上下文已用 {percent}%，下一条消息发出前会先把较早的对话压缩成摘要"
                 )))
+                .child(
+                    action("context-compact", "现在压缩")
+                        .on_click(cx.listener(|this, _, _, cx| this.compact_session(cx))),
+                )
                 .child(action("context-new-session", "新开会话").on_click(cx.listener(
                     |this, _, window, cx| {
                         this.add_session(cx);
@@ -501,11 +486,7 @@ fn model_menu_popover(
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
 
 /// 权限模式条目：图标 + 名称（+说明），当前项打勾。
-fn mode_menu_items(
-    app: &ChatApp,
-    handle: &Entity<ChatApp>,
-    popover: &Entity<PopoverState>,
-) -> Div {
+fn mode_menu_items(app: &ChatApp, handle: &Entity<ChatApp>, popover: &Entity<PopoverState>) -> Div {
     let session = app.session();
     let mut menu = div().v_flex().gap_0p5();
     for (i, mode) in session.modes.iter().enumerate() {
@@ -556,20 +537,11 @@ fn model_menu_items(
     popover: &Entity<PopoverState>,
 ) -> Stateful<Div> {
     let hint = |text: SharedString| {
-        div()
-            .px_2p5()
-            .py_2()
-            .text_size(TEXT_SMALL)
-            .text_color(rgb(INK_SOFT))
-            .child(text)
+        div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
     };
     let builtin = app.session().kernel == KernelChoice::Builtin;
-    let mut menu = div()
-        .id("model-menu-list")
-        .max_h(px(380.))
-        .overflow_y_scroll()
-        .v_flex()
-        .gap_0p5();
+    let mut menu =
+        div().id("model-menu-list").max_h(px(380.)).overflow_y_scroll().v_flex().gap_0p5();
     if !builtin {
         return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
     }

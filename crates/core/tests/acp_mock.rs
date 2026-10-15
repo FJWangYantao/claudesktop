@@ -14,11 +14,8 @@ use claudesktop_core::{
 
 fn mock_command() -> String {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mock = manifest
-        .join("../../tools/mock-acp-agent.mjs")
-        .display()
-        .to_string()
-        .replace('\\', "/");
+    let mock =
+        manifest.join("../../tools/mock-acp-agent.mjs").display().to_string().replace('\\', "/");
     format!("node \"{mock}\"")
 }
 
@@ -111,7 +108,9 @@ fn mock_agent_full_event_chain() {
     let tool_updated = events
         .iter()
         .find_map(|e| match e {
-            KernelEvent::ToolCallUpdated { status, raw_output, .. } => Some((status.clone(), raw_output.clone())),
+            KernelEvent::ToolCallUpdated { status, raw_output, .. } => {
+                Some((status.clone(), raw_output.clone()))
+            }
             _ => None,
         })
         .expect("tool update");
@@ -153,7 +152,8 @@ fn start_session(kernel: &AcpKernel, events: &Arc<Mutex<Vec<KernelEvent>>>) -> S
     wait_for(events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
     kernel.new_session(1, None).expect("new session");
     wait_for(events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
-    let sid = events
+
+    events
         .lock()
         .unwrap()
         .iter()
@@ -161,8 +161,7 @@ fn start_session(kernel: &AcpKernel, events: &Arc<Mutex<Vec<KernelEvent>>>) -> S
             KernelEvent::Started { session_id, .. } => Some(session_id.clone()),
             _ => None,
         })
-        .expect("started");
-    sid
+        .expect("started")
 }
 
 /// 一条连接上两个会话并发：事件按 sessionId 归属，互不串线。
@@ -195,16 +194,11 @@ fn two_sessions_are_isolated() {
         }
     };
 
-    poll("connected", &|evs| {
-        evs.iter().any(|r| matches!(r.event, KernelEvent::Connected { .. }))
-    });
+    poll("connected", &|evs| evs.iter().any(|r| matches!(r.event, KernelEvent::Connected { .. })));
     kernel.new_session(11, None).expect("new session 1");
     kernel.new_session(22, None).expect("new session 2");
     poll("two sessions", &|evs| {
-        evs.iter()
-            .filter(|r| matches!(r.event, KernelEvent::Started { .. }))
-            .count()
-            == 2
+        evs.iter().filter(|r| matches!(r.event, KernelEvent::Started { .. })).count() == 2
     });
 
     let session_of = |token: u64| -> String {
@@ -226,10 +220,7 @@ fn two_sessions_are_isolated() {
     kernel.send_prompt(&s1, UserPrompt::text("甲甲甲")).unwrap();
     kernel.send_prompt(&s2, UserPrompt::text("乙乙乙")).unwrap();
     poll("both turns end", &|evs| {
-        evs.iter()
-            .filter(|r| matches!(r.event, KernelEvent::TurnEnded { .. }))
-            .count()
-            == 2
+        evs.iter().filter(|r| matches!(r.event, KernelEvent::TurnEnded { .. })).count() == 2
     });
     kernel.shutdown();
 
@@ -296,16 +287,14 @@ fn run_interactive(choose: &str) -> Vec<KernelEvent> {
     };
     assert!(option_ids.contains(&"allow_once".to_string()));
     assert!(option_ids.contains(&"reject_once".to_string()));
-    kernel
-        .resolve_permission(id, Some(choose.to_string()))
-        .expect("resolve permission");
+    kernel.resolve_permission(id, Some(choose.to_string())).expect("resolve permission");
     // 同一请求不能应答两次
     assert!(kernel.resolve_permission(id, None).is_err());
 
     wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
     kernel.shutdown();
-    let out = events.lock().unwrap().clone();
-    out
+
+    events.lock().unwrap().clone()
 }
 
 fn assistant_text(events: &[KernelEvent]) -> String {
@@ -341,7 +330,11 @@ fn interactive_permission_reject() {
 }
 
 /// 轮询等待直到谓词命中或超时（毫秒）。
-fn wait_for(events: &Arc<Mutex<Vec<KernelEvent>>>, timeout_ms: u64, pred: impl Fn(&KernelEvent) -> bool) {
+fn wait_for(
+    events: &Arc<Mutex<Vec<KernelEvent>>>,
+    timeout_ms: u64,
+    pred: impl Fn(&KernelEvent) -> bool,
+) {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         {
@@ -379,21 +372,16 @@ fn run_resume(mock_flag: &str) -> (String, bool, String) {
     .expect("spawn kernel");
 
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
-    kernel
-        .resume_session(5, "old-session-42", None, &[])
-        .expect("resume session");
+    kernel.resume_session(5, "old-session-42", None, &[]).expect("resume session");
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
     let (sid, resumed) = events
         .lock()
         .unwrap()
         .iter()
         .find_map(|e| match e {
-            KernelEvent::Started {
-                token: 5,
-                session_id,
-                resumed,
-                ..
-            } => Some((session_id.clone(), *resumed)),
+            KernelEvent::Started { token: 5, session_id, resumed, .. } => {
+                Some((session_id.clone(), *resumed))
+            }
             _ => None,
         })
         .expect("started");

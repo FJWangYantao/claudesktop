@@ -5,8 +5,8 @@
 //! `PopoverState::dismiss` 收起面板。
 
 use super::ChatApp;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::{PopoverState, Selectable};
 use gpui_kit::component::popover::Popover;
@@ -68,21 +68,14 @@ impl RenderOnce for MenuChip {
         }
         chip = chip.child(
             // chip 一律次要字号，与输入框上方的环境 / 项目 chip 同档
-            div()
-                .text_size(TEXT_SMALL)
-                .text_color(rgb(INK_SOFT))
-                .child(self.label),
+            div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(self.label),
         );
         if !self.plain {
             chip = chip.child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
         }
         // 沙色底上的悬停 / 打开用 SELECTED，纸底上用 HOVER
         let active = if self.filled { SELECTED } else { HOVER };
-        if self.open {
-            chip.bg(rgb(active))
-        } else {
-            chip.hover(move |d| d.bg(rgb(active)))
-        }
+        if self.open { chip.bg(rgb(active)) } else { chip.hover(move |d| d.bg(rgb(active))) }
     }
 }
 
@@ -156,6 +149,6 @@ pub(super) fn menu_popover<E: IntoElement + 'static>(
         .p_1()
         .content(move |_, _, cx| {
             let popover = cx.entity();
-            items(&handle.read(cx), &handle, &popover)
+            items(handle.read(cx), &handle, &popover)
         })
 }

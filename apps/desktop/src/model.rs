@@ -1,8 +1,8 @@
 //! 对话记录的数据模型、模式表与工具行辅助函数（UI 无关逻辑）。
 
 use claudesktop_core::{DiffView, PermissionOptionView};
-use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::SharedString;
+use gpui_kit::assets::IconName as IconAll;
 use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Hash)]
@@ -13,7 +13,9 @@ pub enum ToolPhase {
 }
 
 /// 对话的视图模式（对照官方 Summary / Normal / Verbose）：只决定看多少过程，不影响内核怎么跑。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
     /// 只看结果：隐藏思考、启动信息、计划和工具调用（正在等你看 diff 的那一步除外）
@@ -349,9 +351,14 @@ impl ChatItem {
         match (view, self) {
             (
                 ViewMode::Summary,
-                Self::Thinking { .. } | Self::Info { .. } | Self::Plan(_) | Self::AutoApproved { .. },
+                Self::Thinking { .. }
+                | Self::Info { .. }
+                | Self::Plan(_)
+                | Self::AutoApproved { .. },
             ) => false,
-            (ViewMode::Summary, Self::Tool(c)) => c.phase == ToolPhase::Running && !c.diffs.is_empty(),
+            (ViewMode::Summary, Self::Tool(c)) => {
+                c.phase == ToolPhase::Running && !c.diffs.is_empty()
+            }
             _ => true,
         }
     }
@@ -381,13 +388,9 @@ impl ChatItem {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match self {
             Self::User { text, images } => (0u8, text.len(), images.len()).hash(&mut h),
-            Self::Thinking {
-                text,
-                streaming,
-                open,
-                elapsed_ms,
-                ..
-            } => (1u8, text.len(), streaming, open, elapsed_ms.is_some()).hash(&mut h),
+            Self::Thinking { text, streaming, open, elapsed_ms, .. } => {
+                (1u8, text.len(), streaming, open, elapsed_ms.is_some()).hash(&mut h)
+            }
             Self::Info { text, open } => (2u8, text.len(), open).hash(&mut h),
             Self::Tool(c) => (
                 3u8,
@@ -400,12 +403,9 @@ impl ChatItem {
                 c.diffs.iter().map(|d| d.lines.len() + 1).sum::<usize>(),
             )
                 .hash(&mut h),
-            Self::Permission {
-                title,
-                options,
-                resolved,
-                ..
-            } => (4u8, title.len(), options.len(), resolved.as_ref().map(|r| r.len())).hash(&mut h),
+            Self::Permission { title, options, resolved, .. } => {
+                (4u8, title.len(), options.len(), resolved.as_ref().map(|r| r.len())).hash(&mut h)
+            }
             Self::Plan(rows) => {
                 5u8.hash(&mut h);
                 for r in rows {
@@ -485,10 +485,10 @@ pub fn split_tool_title(title: &str) -> (SharedString, SharedString) {
     if t.starts_with('`') {
         return ("Bash".into(), t.trim_matches('`').to_string().into());
     }
-    if let Some((head, rest)) = t.split_once(' ') {
-        if is_name(head) {
-            return (head.to_string().into(), rest.trim().to_string().into());
-        }
+    if let Some((head, rest)) = t.split_once(' ')
+        && is_name(head)
+    {
+        return (head.to_string().into(), rest.trim().to_string().into());
     }
     if is_name(t) {
         return (t.to_string().into(), SharedString::default());
@@ -712,7 +712,9 @@ mod tests {
         let rows: Vec<PlanRow> = ["completed", "in_progress", "pending"]
             .iter()
             .enumerate()
-            .map(|(i, s)| PlanRow { text: format!("第{i}步").into(), status: PlanStatus::parse(s) })
+            .map(|(i, s)| PlanRow {
+                text: format!("第{i}步").into(), status: PlanStatus::parse(s)
+            })
             .collect();
         let (done, total, current) = plan_progress(&rows);
         assert_eq!((done, total), (1, 3));

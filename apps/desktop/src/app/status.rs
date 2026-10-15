@@ -5,8 +5,8 @@
 
 use super::ChatApp;
 use crate::session::{Activity, TurnSummary, TurnUsage};
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use crate::usage;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::*;
@@ -40,10 +40,15 @@ impl ChatApp {
             ),
             Activity::Working | Activity::Replying => (
                 Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element(),
-                div().child(if activity == Activity::Replying { "正在回复" } else { "工作中" }),
+                div().child(if activity == Activity::Replying {
+                    "正在回复"
+                } else {
+                    "工作中"
+                }),
             ),
         };
-        let mut meta: Vec<String> = s.turn_started.map(|t| elapsed_label(t.elapsed())).into_iter().collect();
+        let mut meta: Vec<String> =
+            s.turn_started.map(|t| elapsed_label(t.elapsed())).into_iter().collect();
         meta.extend(usage_label(&s.turn_usage));
         // 顺带告诉用户怎么停（Esc 见 keys.rs）
         meta.push("Esc 停止".into());
@@ -80,7 +85,11 @@ impl ChatApp {
 
 /// 自动重试时状态行的文字：「网关限流，3 秒后第 1 次重试」，倒计时走完是「正在第 1 次重试」。
 fn retry_label(status: u16, attempt: usize, remaining: Duration) -> String {
-    let cause = if status == 429 { "网关限流".to_string() } else { format!("网关出错（HTTP {status}）") };
+    let cause = if status == 429 {
+        "网关限流".to_string()
+    } else {
+        format!("网关出错（HTTP {status}）")
+    };
     match remaining.as_millis().div_ceil(1000) {
         0 => format!("{cause}，正在第 {attempt} 次重试"),
         secs => format!("{cause}，{secs} 秒后第 {attempt} 次重试"),
@@ -113,11 +122,7 @@ fn usage_label(u: &TurnUsage) -> Option<String> {
     if u.input == 0 && u.output == 0 {
         return None;
     }
-    let mut text = format!(
-        "↑ {} ↓ {} token",
-        usage::compact(u.input),
-        usage::compact(u.output)
-    );
+    let mut text = format!("↑ {} ↓ {} token", usage::compact(u.input), usage::compact(u.output));
     if u.reasoning > 0 {
         text += &format!("（思考 {}）", usage::compact(u.reasoning));
     }

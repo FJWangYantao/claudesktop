@@ -187,7 +187,8 @@ impl Session {
             modes: default_modes(),
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
-            model_label: if kernel == KernelChoice::Demo { "GLM-5.3" } else { UNKNOWN_MODEL }.into(),
+            model_label: if kernel == KernelChoice::Demo { "GLM-5.3" } else { UNKNOWN_MODEL }
+                .into(),
             autoprompt: None,
             cwd,
             meta: None,
@@ -242,7 +243,8 @@ impl Session {
                         s.model_label = model.into();
                     }
                     if let Some(user) = s.last_user() {
-                        let usage = TurnUsage { input: input_tokens, output: output_tokens, reasoning: 0 };
+                        let usage =
+                            TurnUsage { input: input_tokens, output: output_tokens, reasoning: 0 };
                         s.turn_summaries.insert(user, TurnSummary { elapsed_ms, usage });
                     }
                     if let Some(n) = context_tokens {
@@ -342,9 +344,8 @@ impl Session {
         let t = &self.transcript;
         let mut out = vec![RowLayout::default(); t.len()];
         // 最后一段正文 / 用户消息之后的组还在长
-        let last_text = t
-            .iter()
-            .rposition(|i| matches!(i, ChatItem::Agent(_) | ChatItem::User { .. }));
+        let last_text =
+            t.iter().rposition(|i| matches!(i, ChatItem::Agent(_) | ChatItem::User { .. }));
         let pinned = self.pinned_plan();
         let mut i = 0;
         while i < t.len() {
@@ -397,9 +398,7 @@ impl Session {
 
     /// 最后一条用户消息的下标。
     fn last_user(&self) -> Option<usize> {
-        self.transcript
-            .iter()
-            .rposition(|i| matches!(i, ChatItem::User { .. }))
+        self.transcript.iter().rposition(|i| matches!(i, ChatItem::User { .. }))
     }
 
     /// 本轮（最后一条用户消息之后）的第一行。
@@ -416,11 +415,14 @@ impl Session {
             KernelEvent::PromptFailed { message } => {
                 Some(format!("出错了：{}", preview_line(message).unwrap_or_default()))
             }
-            KernelEvent::TurnEnded { stop_reason } if stop_reason != "cancelled" && !self.compact_turn => {
-                let reply = self.transcript[self.turn_start()..].iter().rev().find_map(|i| match i {
-                    ChatItem::Agent(text) => preview_line(text),
-                    _ => None,
-                });
+            KernelEvent::TurnEnded { stop_reason }
+                if stop_reason != "cancelled" && !self.compact_turn =>
+            {
+                let reply =
+                    self.transcript[self.turn_start()..].iter().rev().find_map(|i| match i {
+                        ChatItem::Agent(text) => preview_line(text),
+                        _ => None,
+                    });
                 Some(reply.map_or_else(|| "回复完了".into(), |r| format!("回复完了：{r}")))
             }
             _ => None,
@@ -454,9 +456,8 @@ impl Session {
 
     /// `ix` 所在这一轮的用时和用量（这一轮结束后才有）。
     pub fn turn_summary(&self, ix: usize) -> Option<&TurnSummary> {
-        let user = self.transcript[..ix]
-            .iter()
-            .rposition(|i| matches!(i, ChatItem::User { .. }))?;
+        let user =
+            self.transcript[..ix].iter().rposition(|i| matches!(i, ChatItem::User { .. }))?;
         self.turn_summaries.get(&user)
     }
 
@@ -466,12 +467,9 @@ impl Session {
         if !matches!(self.transcript.get(ix), Some(ChatItem::Agent(_))) {
             return false;
         }
-        match self.transcript[ix + 1..]
-            .iter()
-            .find(|i| {
-                !matches!(i, ChatItem::Note(_) | ChatItem::Failed { .. } | ChatItem::Compaction { .. })
-            })
-        {
+        match self.transcript[ix + 1..].iter().find(|i| {
+            !matches!(i, ChatItem::Note(_) | ChatItem::Failed { .. } | ChatItem::Compaction { .. })
+        }) {
             Some(ChatItem::User { .. }) => true,
             Some(_) => false,
             None => !self.busy,
@@ -511,16 +509,12 @@ impl Session {
     }
 
     pub fn has_user_message(&self) -> bool {
-        self.transcript
-            .iter()
-            .any(|i| matches!(i, ChatItem::User { .. }))
+        self.transcript.iter().any(|i| matches!(i, ChatItem::User { .. }))
     }
 
     /// 有还没应答的权限请求
     pub fn waiting_permission(&self) -> bool {
-        self.transcript
-            .iter()
-            .any(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
+        self.transcript.iter().any(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
     }
 
     /// 一轮开始：置忙并开始计时。
@@ -547,9 +541,8 @@ impl Session {
         {
             return Activity::Compacting;
         }
-        let running = turn
-            .iter()
-            .any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Running));
+        let running =
+            turn.iter().any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Running));
         match turn.last() {
             Some(ChatItem::Agent(_)) if !running => Activity::Replying,
             _ => Activity::Working,
@@ -604,10 +597,14 @@ impl Session {
                 }
                 ChatItem::Agent(text) => out += &format!("## Claude\n\n{text}\n\n"),
                 ChatItem::Thinking { text, .. } => {
-                    out += &format!("<details><summary>思考过程</summary>\n\n{text}\n\n</details>\n\n");
+                    out += &format!(
+                        "<details><summary>思考过程</summary>\n\n{text}\n\n</details>\n\n"
+                    );
                 }
                 ChatItem::Info { text, .. } => {
-                    out += &format!("<details><summary>启动信息</summary>\n\n```{text}```\n\n</details>\n\n");
+                    out += &format!(
+                        "<details><summary>启动信息</summary>\n\n```{text}```\n\n</details>\n\n"
+                    );
                 }
                 ChatItem::Tool(card) => {
                     out += &format!("> **{}** `{}` → {}\n\n", card.name, card.arg, card.result);
@@ -649,12 +646,8 @@ impl Session {
     /// 正在流式的思考块收尾，记下想了多久（计时的才有）。
     /// 展开与否保持原样（默认就是收起的，用户点开过的不替他收）。
     pub fn finish_thinking(&mut self) {
-        if let Some(ChatItem::Thinking {
-            streaming,
-            started,
-            elapsed_ms,
-            ..
-        }) = self.transcript.last_mut()
+        if let Some(ChatItem::Thinking { streaming, started, elapsed_ms, .. }) =
+            self.transcript.last_mut()
         {
             *streaming = false;
             if let Some(t) = started.take() {
@@ -701,11 +694,11 @@ impl Session {
             return;
         };
         for item in &mut self.transcript {
-            if let ChatItem::Permission { id, resolved, .. } = item {
-                if resolved.is_none() {
-                    let _ = kernel.resolve_permission(*id, None);
-                    *resolved = Some("已取消".into());
-                }
+            if let ChatItem::Permission { id, resolved, .. } = item
+                && resolved.is_none()
+            {
+                let _ = kernel.resolve_permission(*id, None);
+                *resolved = Some("已取消".into());
             }
         }
     }
@@ -719,12 +712,12 @@ impl Session {
             self.busy = false;
             self.finish_thinking();
             for item in &mut self.transcript {
-                if let ChatItem::Tool(card) = item {
-                    if card.phase == ToolPhase::Running {
-                        card.phase = ToolPhase::Failed;
-                        if card.result.is_empty() {
-                            card.result = "已中断".into();
-                        }
+                if let ChatItem::Tool(card) = item
+                    && card.phase == ToolPhase::Running
+                {
+                    card.phase = ToolPhase::Failed;
+                    if card.result.is_empty() {
+                        card.result = "已中断".into();
                     }
                 }
             }
@@ -759,31 +752,21 @@ impl Session {
         // 重试的倒计时只撑到下一个实质事件（重发后出字、出错或结束）
         if !matches!(
             event,
-            KernelEvent::Retrying { .. } | KernelEvent::Status(_) | KernelEvent::UsageUpdated { .. }
+            KernelEvent::Retrying { .. }
+                | KernelEvent::Status(_)
+                | KernelEvent::UsageUpdated { .. }
         ) {
             self.retry = None;
         }
         match event {
-            KernelEvent::Retrying {
-                status,
-                attempt,
-                delay_ms,
-                ..
-            } => {
+            KernelEvent::Retrying { status, attempt, delay_ms, .. } => {
                 self.retry = Some(Retry {
                     status,
                     attempt,
                     at: Instant::now() + std::time::Duration::from_millis(delay_ms),
                 });
             }
-            KernelEvent::Started {
-                session_id,
-                model,
-                modes,
-                current_mode,
-                resumed,
-                ..
-            } => {
+            KernelEvent::Started { session_id, model, modes, current_mode, resumed, .. } => {
                 self.acp_id = Some(session_id);
                 self.ready = true;
                 if std::mem::take(&mut self.resuming) {
@@ -832,31 +815,21 @@ impl Session {
                         buf.push_str(&text)
                     }
                     Some(ChatItem::Agent(buf)) => buf.push_str(&text),
-                    _ if before_first_prompt => self.transcript.push(ChatItem::Info {
-                        text,
-                        open: false,
-                    }),
+                    _ if before_first_prompt => {
+                        self.transcript.push(ChatItem::Info { text, open: false })
+                    }
                     _ => self.transcript.push(ChatItem::Agent(text)),
                 }
             }
             KernelEvent::AgentThoughtChunk { text } => match self.transcript.last_mut() {
-                Some(ChatItem::Thinking {
-                    text: buf,
-                    streaming: true,
-                    ..
-                }) => buf.push_str(&text),
+                Some(ChatItem::Thinking { text: buf, streaming: true, .. }) => buf.push_str(&text),
                 // 默认收起：流式时只扫光「思考中…」，不先展开再收回（那样每段思考都会跳一下）
                 _ => {
                     let started = (!self.replaying).then(Instant::now);
                     self.transcript.push(ChatItem::thinking(text, started));
                 }
             },
-            KernelEvent::ToolCallStarted {
-                id,
-                title,
-                status,
-                kind,
-            } => {
+            KernelEvent::ToolCallStarted { id, title, status, kind } => {
                 self.finish_thinking();
                 let (name, arg) = tool_label(&kind, &title);
                 self.transcript.push(ChatItem::Tool(ToolCard {
@@ -871,13 +844,7 @@ impl Session {
                     expanded: false,
                 }));
             }
-            KernelEvent::ToolCallUpdated {
-                id,
-                title,
-                status,
-                raw_output,
-                output,
-            } => {
+            KernelEvent::ToolCallUpdated { id, title, status, raw_output, output } => {
                 if let Some(card) = self.tool_card(&id) {
                     if let Some(title) = title {
                         let (name, arg) = tool_label(&card.kind, &title);
@@ -920,10 +887,8 @@ impl Session {
                 }
             }
             KernelEvent::PermissionAuto { title, chosen } => {
-                self.transcript.push(ChatItem::AutoApproved {
-                    title: title.into(),
-                    chosen: chosen.into(),
-                });
+                self.transcript
+                    .push(ChatItem::AutoApproved { title: title.into(), chosen: chosen.into() });
             }
             KernelEvent::PermissionRequest { id, title, options } => {
                 self.finish_thinking();
@@ -936,7 +901,8 @@ impl Session {
             }
             KernelEvent::Compacting => {
                 self.finish_thinking();
-                self.transcript.push(ChatItem::Compaction { state: CompactState::Running, open: false });
+                self.transcript
+                    .push(ChatItem::Compaction { state: CompactState::Running, open: false });
             }
             KernelEvent::Compacted { summary, context_tokens } => {
                 self.settle_compaction(CompactState::Done(summary.into()));
@@ -1042,7 +1008,8 @@ impl Session {
             MockAction::PlanRowAdd(row) => {
                 if let Some(ChatItem::Plan(rows)) = self.transcript.last_mut() {
                     // 第一项一加进来就算在做
-                    let status = if rows.is_empty() { PlanStatus::InProgress } else { PlanStatus::Pending };
+                    let status =
+                        if rows.is_empty() { PlanStatus::InProgress } else { PlanStatus::Pending };
                     rows.push(PlanRow { text: (*row).into(), status });
                 }
             }
@@ -1052,10 +1019,10 @@ impl Session {
                         row.status = PlanStatus::Done;
                     }
                     // 下一项接着做
-                    if let Some(next) = rows.get_mut(*i + 1) {
-                        if next.status == PlanStatus::Pending {
-                            next.status = PlanStatus::InProgress;
-                        }
+                    if let Some(next) = rows.get_mut(*i + 1)
+                        && next.status == PlanStatus::Pending
+                    {
+                        next.status = PlanStatus::InProgress;
                     }
                 }
             }
@@ -1162,10 +1129,7 @@ mod tests {
     #[core::prelude::v1::test]
     fn replay_rebuilds_transcript() {
         let records = vec![
-            Record::User {
-                text: "读 README".into(),
-                images: Vec::new(),
-            },
+            Record::User { text: "读 README".into(), images: Vec::new() },
             ev(KernelEvent::AgentThoughtChunk { text: "想一想".into() }),
             ev(KernelEvent::ToolCallStarted {
                 id: "t1".into(),
@@ -1180,9 +1144,12 @@ mod tests {
                 title: None,
                 status: Some("completed".into()),
                 raw_output: Some("# claudesktop".into()),
-                output: Some("# claudesktop
+                output: Some(
+                    "# claudesktop
 
-桌面端".into()),
+桌面端"
+                        .into(),
+                ),
             }),
             permission(1),
             Record::PermissionResolved { id: 1, label: "Yes".into() },
@@ -1197,10 +1164,7 @@ mod tests {
                 context_tokens: Some(520),
             },
             // 上次退出时没应答的请求；前面那段思考没记用时（旧日志）
-            Record::User {
-                text: "再写个文件".into(),
-                images: Vec::new(),
-            },
+            Record::User { text: "再写个文件".into(), images: Vec::new() },
             ev(KernelEvent::AgentThoughtChunk { text: "旧的".into() }),
             permission(2),
         ];
@@ -1234,9 +1198,11 @@ mod tests {
         assert_eq!(s.context_tokens, 520);
         assert!(matches!(&s.transcript[2], ChatItem::Tool(c) if c.phase == ToolPhase::Done));
         // 输出预览随记录恢复，点开工具行还能看
-        assert!(matches!(&s.transcript[2], ChatItem::Tool(c) if c.output.as_ref() == "# claudesktop
+        assert!(
+            matches!(&s.transcript[2], ChatItem::Tool(c) if c.output.as_ref() == "# claudesktop
 
-桌面端"));
+桌面端")
+        );
         let labels: Vec<_> = s
             .transcript
             .iter()
@@ -1259,24 +1225,33 @@ mod tests {
         let diff = |new: &str| {
             ev(KernelEvent::ToolCallDiff {
                 id: "e1".into(),
-                diff: DiffView::compute("a.txt", Some("x
-"), new),
+                diff: DiffView::compute(
+                    "a.txt",
+                    Some(
+                        "x
+",
+                    ),
+                    new,
+                ),
             })
         };
         let records = vec![
-            Record::User {
-                text: "改".into(),
-                images: Vec::new(),
-            },
+            Record::User { text: "改".into(), images: Vec::new() },
             started,
-            diff("y
-"),
-            diff("z
-"),
+            diff(
+                "y
+",
+            ),
+            diff(
+                "z
+",
+            ),
             ev(KernelEvent::ToolCallDiff {
                 id: "e1".into(),
-                diff: DiffView::compute("b.txt", None, "b
-"),
+                diff: DiffView::compute(
+                    "b.txt", None, "b
+",
+                ),
             }),
         ];
         let s = Session::from_records(1, meta(), records);
@@ -1348,7 +1323,12 @@ mod tests {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
         s.begin_turn();
-        let retrying = KernelEvent::Retrying { status: 429, attempt: 1, delay_ms: 1000, reason: "HTTP 429: x".into() };
+        let retrying = KernelEvent::Retrying {
+            status: 429,
+            attempt: 1,
+            delay_ms: 1000,
+            reason: "HTTP 429: x".into(),
+        };
         s.apply_event(retrying, None);
         assert_eq!(s.activity(), Activity::Retrying);
         assert_eq!(s.retry.as_ref().map(|r| (r.status, r.attempt)), Some((429, 1)));
@@ -1427,7 +1407,11 @@ mod tests {
         s.detach_kernel(None);
         // 有对话：变成历史会话，进行中的工具收尾
         assert!(s.restored && !s.busy && !s.ready);
-        assert!(s.transcript.iter().any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Failed)));
+        assert!(
+            s.transcript
+                .iter()
+                .any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Failed))
+        );
         assert!(matches!(s.transcript.last(), Some(ChatItem::Note(_))));
     }
 
@@ -1495,10 +1479,7 @@ mod tests {
                 None,
             );
         }
-        assert_eq!(
-            s.turn_usage,
-            TurnUsage { input: 200, output: 60, reasoning: 20 }
-        );
+        assert_eq!(s.turn_usage, TurnUsage { input: 200, output: 60, reasoning: 20 });
         assert_eq!(s.cache_hit, Some(80));
         // 上下文用量取最近一次报告的，不累加
         assert_eq!(s.context_tokens, 130);
@@ -1522,7 +1503,10 @@ mod tests {
         assert!(matches!(&s.transcript[1], ChatItem::Thinking { started: Some(_), .. }));
         assert_eq!(s.take_thought_done(), None);
         s.apply_event(read("a"), None);
-        assert!(matches!(&s.transcript[1], ChatItem::Thinking { elapsed_ms: Some(_), started: None, .. }));
+        assert!(matches!(
+            &s.transcript[1],
+            ChatItem::Thinking { elapsed_ms: Some(_), started: None, .. }
+        ));
         // 用时只交出一次；之后再收尾（已经不在流式）不重复
         assert!(s.take_thought_done().is_some());
         s.finish_thinking();
@@ -1604,10 +1588,16 @@ mod tests {
         // 编辑还没 diff 时算一步，和前面连成一组
         assert_eq!(s.compute_layout(ViewMode::Normal)[1].head.unwrap().end, 4);
         s.apply_event(
-            KernelEvent::ToolCallDiff { id: "e".into(), diff: DiffView::compute("a.rs", Some("x\n"), "y\n") },
+            KernelEvent::ToolCallDiff {
+                id: "e".into(),
+                diff: DiffView::compute("a.rs", Some("x\n"), "y\n"),
+            },
             None,
         );
-        s.apply_event(KernelEvent::PermissionAuto { title: "Bash ls".into(), chosen: "总是允许".into() }, None);
+        s.apply_event(
+            KernelEvent::PermissionAuto { title: "Bash ls".into(), chosen: "总是允许".into() },
+            None,
+        );
         s.apply_event(read("c"), None);
         let l = s.compute_layout(ViewMode::Normal);
         // 带 diff 的编辑单独成行，把前后断成两组
@@ -1653,7 +1643,14 @@ mod tests {
             Record::User { text: "q".into(), images: Vec::new() },
             ev(KernelEvent::AgentMessageChunk { text: "a".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
-            Record::Turn { at_ms: 1, model: None, input_tokens: 10, output_tokens: 2, elapsed_ms: Some(65_000), context_tokens: None },
+            Record::Turn {
+                at_ms: 1,
+                model: None,
+                input_tokens: 10,
+                output_tokens: 2,
+                elapsed_ms: Some(65_000),
+                context_tokens: None,
+            },
         ];
         let s = Session::from_records(1, meta(), records);
         let summary = s.turn_summary(1).expect("回复那行有统计");
@@ -1668,10 +1665,24 @@ mod tests {
         let records = vec![
             Record::User { text: "q".into(), images: Vec::new() },
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
-            Record::Turn { at_ms: 1, model: Some("cn:deepseek-v4.1-flash".into()), input_tokens: 10, output_tokens: 2, elapsed_ms: None, context_tokens: Some(1508) },
+            Record::Turn {
+                at_ms: 1,
+                model: Some("cn:deepseek-v4.1-flash".into()),
+                input_tokens: 10,
+                output_tokens: 2,
+                elapsed_ms: None,
+                context_tokens: Some(1508),
+            },
             Record::User { text: "再问".into(), images: Vec::new() },
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
-            Record::Turn { at_ms: 2, model: Some("other-model".into()), input_tokens: 5, output_tokens: 1, elapsed_ms: None, context_tokens: Some(2000) },
+            Record::Turn {
+                at_ms: 2,
+                model: Some("other-model".into()),
+                input_tokens: 5,
+                output_tokens: 1,
+                elapsed_ms: None,
+                context_tokens: Some(2000),
+            },
         ];
         let s = Session::from_records(1, meta(), records);
         // 最后一次上报的模型胜出；早于它的照样能恢复
@@ -1681,7 +1692,14 @@ mod tests {
         let first = vec![
             Record::User { text: "q".into(), images: Vec::new() },
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
-            Record::Turn { at_ms: 1, model: Some("cn:deepseek-v4.1-flash".into()), input_tokens: 10, output_tokens: 2, elapsed_ms: None, context_tokens: Some(1508) },
+            Record::Turn {
+                at_ms: 1,
+                model: Some("cn:deepseek-v4.1-flash".into()),
+                input_tokens: 10,
+                output_tokens: 2,
+                elapsed_ms: None,
+                context_tokens: Some(1508),
+            },
         ];
         let s = Session::from_records(1, meta(), first);
         assert_eq!(s.model_label.as_ref(), "cn:deepseek-v4.1-flash");
@@ -1689,7 +1707,14 @@ mod tests {
         // 旧日志没记模型：维持「默认模型」
         let none = vec![
             Record::User { text: "q".into(), images: Vec::new() },
-            Record::Turn { at_ms: 1, model: None, input_tokens: 1, output_tokens: 1, elapsed_ms: None, context_tokens: None },
+            Record::Turn {
+                at_ms: 1,
+                model: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                elapsed_ms: None,
+                context_tokens: None,
+            },
         ];
         let s = Session::from_records(1, meta(), none);
         assert_eq!(s.model_label.as_ref(), UNKNOWN_MODEL);
@@ -1706,7 +1731,9 @@ mod tests {
     fn attention_picks_events_worth_a_notification() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
-        s.transcript.push(ChatItem::Agent("## 结论\n\n**改好了**，测试 `cargo test` 全过。\n第二行".into()));
+        s.transcript.push(ChatItem::Agent(
+            "## 结论\n\n**改好了**，测试 `cargo test` 全过。\n第二行".into(),
+        ));
         let ended = |r: &str| KernelEvent::TurnEnded { stop_reason: r.into() };
         assert_eq!(s.attention(&ended("end_turn")).as_deref(), Some("回复完了：结论"));
         assert_eq!(s.attention(&ended("cancelled")), None);

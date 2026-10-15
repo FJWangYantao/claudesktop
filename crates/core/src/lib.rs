@@ -267,11 +267,7 @@ pub fn output_preview(text: &str) -> String {
         .map(|r| r.len() - r.trim_start_matches(' ').len())
         .min()
         .unwrap_or(0);
-    let mut out = rows
-        .iter()
-        .map(|r| r.get(indent..).unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut out = rows.iter().map(|r| r.get(indent..).unwrap_or("")).collect::<Vec<_>>().join("\n");
     if rows.len() < lines.len() {
         out.push_str(&format!("\n… 其余 {} 行未显示", lines.len() - rows.len()));
     }
@@ -324,10 +320,7 @@ pub struct UserPrompt {
 impl UserPrompt {
     /// 纯文本提示词。
     pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            images: Vec::new(),
-        }
+        Self { text: text.into(), images: Vec::new() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -345,16 +338,9 @@ pub enum KernelCommand {
     NewSession { token: u64, cwd: Option<PathBuf> },
     /// 续接一个已有会话（ACP `session/resume`，其次 `session/load`）；
     /// 都不支持或失败时退回新建，结果经 `Started { resumed }` 报告
-    ResumeSession {
-        token: u64,
-        session_id: String,
-        cwd: Option<PathBuf>,
-    },
+    ResumeSession { token: u64, session_id: String, cwd: Option<PathBuf> },
     /// 向某会话发送一轮用户消息
-    Prompt {
-        session: String,
-        prompt: UserPrompt,
-    },
+    Prompt { session: String, prompt: UserPrompt },
     /// 请求取消某会话的当前轮
     Cancel { session: String },
     /// 切换某会话的权限模式（ACP `session/set_mode`，如 `default` / `plan`）
@@ -426,7 +412,9 @@ mod tests {
         assert!(is_context_overflow(
             "HTTP 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."
         ));
-        assert!(is_context_overflow("HTTP 400: prompt is too long: 210000 tokens > 200000 maximum"));
+        assert!(is_context_overflow(
+            "HTTP 400: prompt is too long: 210000 tokens > 200000 maximum"
+        ));
         assert!(is_context_overflow("HTTP 400: 输入超出上下文长度限制"));
         assert!(!is_context_overflow("HTTP 429: Resource has been exhausted"));
     }
@@ -453,7 +441,10 @@ mod tests {
         let rows: Vec<&str> = out.lines().collect();
         assert_eq!(rows.len(), OUTPUT_PREVIEW_LINES + 1);
         assert_eq!(rows[OUTPUT_PREVIEW_LINES - 1], format!("line {OUTPUT_PREVIEW_LINES}"));
-        assert_eq!(rows[OUTPUT_PREVIEW_LINES], format!("… 其余 {} 行未显示", 100 - OUTPUT_PREVIEW_LINES));
+        assert_eq!(
+            rows[OUTPUT_PREVIEW_LINES],
+            format!("… 其余 {} 行未显示", 100 - OUTPUT_PREVIEW_LINES)
+        );
     }
 
     #[test]
@@ -463,7 +454,11 @@ mod tests {
         // 每行都很长时按总字符数提前收住
         let text = vec!["x".repeat(500); 30].join("\n");
         let out = output_preview(&text);
-        assert!(out.chars().count() < OUTPUT_PREVIEW_CHARS + 2 * OUTPUT_PREVIEW_LINE_CHARS, "{}", out.len());
+        assert!(
+            out.chars().count() < OUTPUT_PREVIEW_CHARS + 2 * OUTPUT_PREVIEW_LINE_CHARS,
+            "{}",
+            out.len()
+        );
         assert!(out.ends_with("行未显示"), "{out}");
     }
 }

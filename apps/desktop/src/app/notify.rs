@@ -26,18 +26,15 @@ impl ChatApp {
             }
         }
         self.window_active = in_front(window);
-        cx.observe_window_activation(window, |this, window, cx| update(this, window, cx))
-            .detach();
+        cx.observe_window_activation(window, |this, window, cx| update(this, window, cx)).detach();
         cx.observe_window_visibility(window, |this, _, window, cx| update(this, window, cx))
             .detach();
 
         let app = cx.entity().downgrade();
         let handle = window.window_handle();
         cx.on_system_notification_response(move |response, cx| {
-            let Some(token) = response
-                .tag
-                .strip_prefix("session-")
-                .and_then(|t| t.parse::<u64>().ok())
+            let Some(token) =
+                response.tag.strip_prefix("session-").and_then(|t| t.parse::<u64>().ok())
             else {
                 return;
             };

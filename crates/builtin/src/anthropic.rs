@@ -29,10 +29,7 @@ impl AnthropicProvider {
     }
 
     fn headers(&self) -> Vec<(&'static str, String)> {
-        let mut headers = vec![(
-            "anthropic-version",
-            "2023-06-01".to_string(),
-        )];
+        let mut headers = vec![("anthropic-version", "2023-06-01".to_string())];
         if let Some(key) = &self.config.api_key {
             headers.push(("x-api-key", key.clone()));
         }
@@ -51,9 +48,7 @@ impl ChatProvider for AnthropicProvider {
         for (name, value) in self.headers() {
             request = request.header(name, &value);
         }
-        let response = request
-            .call()
-            .map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
+        let response = request.call().map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
         let status = response.status().as_u16();
         let text = response.into_body().read_to_string().unwrap_or_default();
         if !(200..300).contains(&status) {
@@ -61,9 +56,7 @@ impl ChatProvider for AnthropicProvider {
         }
         let value: Value =
             serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("模型列表不是 JSON: {e}"))?;
-        Ok(parse_model_list(
-            value.get("data").and_then(Value::as_array).map_or(&[], Vec::as_slice),
-        ))
+        Ok(parse_model_list(value.get("data").and_then(Value::as_array).map_or(&[], Vec::as_slice)))
     }
 
     fn stream_chat(
@@ -104,23 +97,28 @@ impl ChatProvider for AnthropicProvider {
         let body = body.to_string();
 
         let headers = self.headers();
-        let reader = post_sse_with_retry(&self.agent, &url, &headers, &body, should_stop, on_event)?;
+        let reader =
+            post_sse_with_retry(&self.agent, &url, &headers, &body, should_stop, on_event)?;
 
         let mut outcome = StreamOutcome::default();
         let mut usage = crate::provider::Usage::default();
         let mut usage_seen = false;
         let mut blocks = ToolBlocks::default();
-        let completed = read_sse(reader, should_stop, &mut |payload| {
-            match parse_event(payload, &mut blocks, &mut usage, &mut usage_seen, on_event) {
-                Ok(Some(finish)) => {
-                    outcome.finish_reason = Some(finish);
-                    Ok(())
-                }
-                Ok(None) => Ok(()),
-                Err(message) => {
-                    debug_http(|| format!("✗ {message}"));
-                    Err(message)
-                }
+        let completed = read_sse(reader, should_stop, &mut |payload| match parse_event(
+            payload,
+            &mut blocks,
+            &mut usage,
+            &mut usage_seen,
+            on_event,
+        ) {
+            Ok(Some(finish)) => {
+                outcome.finish_reason = Some(finish);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(message) => {
+                debug_http(|| format!("✗ {message}"));
+                Err(message)
             }
         })?;
         outcome.completed = completed;
@@ -267,11 +265,7 @@ impl ToolBlocks {
     }
 
     fn finish(self) -> Vec<ToolCall> {
-        self.blocks
-            .into_iter()
-            .flatten()
-            .filter(|c| !c.function.name.is_empty())
-            .collect()
+        self.blocks.into_iter().flatten().filter(|c| !c.function.name.is_empty()).collect()
     }
 }
 
@@ -294,16 +288,17 @@ fn parse_event(
     usage_seen: &mut bool,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Parsed {
-    let value: Value = serde_json::from_str(payload)
-        .map_err(|e| format!("无法解析流数据（{e}）: {payload}"))?;
+    let value: Value =
+        serde_json::from_str(payload).map_err(|e| format!("无法解析流数据（{e}）: {payload}"))?;
     match value.get("type").and_then(Value::as_str).unwrap_or("") {
         "message_start" => {
             // 开了提示缓存时 input_tokens 只是没命中缓存的部分；三项加起来才是整个提示
             // （和 OpenAI 的 prompt_tokens 同口径，上下文用量据此计算）
             if let Some(u) = value.pointer("/message/usage").filter(|u| u.is_object()) {
                 let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-                usage.input_tokens =
-                    n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+                usage.input_tokens = n("input_tokens")
+                    + n("cache_read_input_tokens")
+                    + n("cache_creation_input_tokens");
                 usage.cache_read_tokens = n("cache_read_input_tokens");
                 *usage_seen = true;
             }
@@ -355,10 +350,8 @@ fn parse_event(
                 .map(|stop| finish_reason(stop).to_string()))
         }
         "error" => {
-            let message = value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("provider 错误");
+            let message =
+                value.pointer("/error/message").and_then(Value::as_str).unwrap_or("provider 错误");
             Err(format!("provider 错误: {message}"))
         }
         // ping / message_stop / content_block_stop / message_start 之外的事件忽略
@@ -373,10 +366,7 @@ mod tests {
 
     #[test]
     fn extracts_system_and_converts_user_parts() {
-        let messages = vec![
-            M::new("system", "You are helpful."),
-            M::new("user", "看图"),
-        ];
+        let messages = vec![M::new("system", "You are helpful."), M::new("user", "看图")];
         let (system, out) = convert_messages(&messages);
         assert_eq!(system, "You are helpful.");
         assert_eq!(out.len(), 1);
@@ -414,10 +404,7 @@ mod tests {
             M::new("assistant", "好了"),
         ];
         let (_, out) = convert_messages(&messages);
-        let roles: Vec<&str> = out
-            .iter()
-            .map(|m| m["role"].as_str().unwrap())
-            .collect();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
         let results = &out[2]["content"];
         assert_eq!(results.as_array().unwrap().len(), 2);

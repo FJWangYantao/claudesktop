@@ -124,7 +124,7 @@ impl SessionStore {
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
             .filter_map(|e| serde_json::from_slice(&fs::read(e.path()).ok()?).ok())
             .collect();
-        metas.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+        metas.sort_by_key(|m| std::cmp::Reverse(m.updated_ms));
         metas
     }
 
@@ -160,14 +160,8 @@ impl SessionStore {
 
     /// 打开已有会话的日志用于继续追加。
     pub fn append_log(&self, id: &str) -> io::Result<SessionLog> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.log_path(id))?;
-        Ok(SessionLog {
-            file,
-            pending: None,
-        })
+        let file = OpenOptions::new().create(true).append(true).open(self.log_path(id))?;
+        Ok(SessionLog { file, pending: None })
     }
 
     /// 读出全部记录；末尾半行（写到一半崩溃）及无法解析的行跳过。
@@ -272,16 +266,11 @@ impl Drop for SessionLog {
 }
 
 fn is_chunk(event: &KernelEvent) -> bool {
-    matches!(
-        event,
-        KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. }
-    )
+    matches!(event, KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. })
 }
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// 时间戳 + 进程号 + 计数器：同一进程内单调、跨进程不撞。
@@ -319,9 +308,7 @@ mod tests {
     }
 
     fn chunk(text: &str) -> Record {
-        Record::Event {
-            event: KernelEvent::AgentMessageChunk { text: text.into() },
-        }
+        Record::Event { event: KernelEvent::AgentMessageChunk { text: text.into() } }
     }
 
     #[test]
@@ -332,14 +319,10 @@ mod tests {
         for piece in ["你", "好", "！"] {
             log.append(chunk(piece)).unwrap();
         }
+        log.append(Record::Event { event: KernelEvent::AgentThoughtChunk { text: "想".into() } })
+            .unwrap();
         log.append(Record::Event {
-            event: KernelEvent::AgentThoughtChunk { text: "想".into() },
-        })
-        .unwrap();
-        log.append(Record::Event {
-            event: KernelEvent::TurnEnded {
-                stop_reason: "end_turn".into(),
-            },
+            event: KernelEvent::TurnEnded { stop_reason: "end_turn".into() },
         })
         .unwrap();
         drop(log);
@@ -350,14 +333,8 @@ mod tests {
             vec![
                 Record::User { text: "你好".into(), images: Vec::new() },
                 chunk("你好！"),
-                Record::Event {
-                    event: KernelEvent::AgentThoughtChunk { text: "想".into() }
-                },
-                Record::Event {
-                    event: KernelEvent::TurnEnded {
-                        stop_reason: "end_turn".into()
-                    }
-                },
+                Record::Event { event: KernelEvent::AgentThoughtChunk { text: "想".into() } },
+                Record::Event { event: KernelEvent::TurnEnded { stop_reason: "end_turn".into() } },
             ]
         );
         let _ = fs::remove_dir_all(store.dir());
@@ -421,14 +398,9 @@ mod tests {
 
     #[test]
     fn only_conversation_events_are_kept() {
-        assert!(Record::worth_keeping(&KernelEvent::TurnEnded {
-            stop_reason: "end_turn".into()
-        }));
+        assert!(Record::worth_keeping(&KernelEvent::TurnEnded { stop_reason: "end_turn".into() }));
         assert!(!Record::worth_keeping(&KernelEvent::Status("x".into())));
-        assert!(!Record::worth_keeping(&KernelEvent::FsRead {
-            path: "a".into(),
-            ok: true
-        }));
+        assert!(!Record::worth_keeping(&KernelEvent::FsRead { path: "a".into(), ok: true }));
     }
 
     #[test]
@@ -452,7 +424,9 @@ mod tests {
         let line = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), record);
         // 没有附件时不写 images 键（日志不膨胀）
-        let plain = serde_json::to_string(&Record::User { text: "纯文本".into(), images: Vec::new() }).unwrap();
+        let plain =
+            serde_json::to_string(&Record::User { text: "纯文本".into(), images: Vec::new() })
+                .unwrap();
         assert!(!plain.contains("images"));
         let _ = fs::remove_dir_all(store.dir());
     }

@@ -2,8 +2,8 @@
 
 use super::ChatApp;
 use crate::settings::*;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputState};
@@ -14,11 +14,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
-const SETTINGS_TABS: [(IconAll, &str); 3] = [
-    (IconAll::Settings, "通用"),
-    (IconAll::Cpu, "内核与模型"),
-    (IconAll::ShieldCheck, "权限"),
-];
+const SETTINGS_TABS: [(IconAll, &str); 3] =
+    [(IconAll::Settings, "通用"), (IconAll::Cpu, "内核与模型"), (IconAll::ShieldCheck, "权限")];
 
 /// 设置项的一行：左边标题 + 灰色说明，右边控件。
 fn setting_row(title: &'static str, desc: &'static str, control: impl IntoElement) -> Div {
@@ -50,8 +47,7 @@ fn setting_group(rows: impl IntoIterator<Item = Div>) -> Div {
     let mut group = div().v_flex();
     for (i, row) in rows.into_iter().enumerate() {
         group = group.child(
-            row.when(i == 0, |d| d.pt_0())
-                .when(i > 0, |d| d.border_t_1().border_color(rgb(LINE))),
+            row.when(i == 0, |d| d.pt_0()).when(i > 0, |d| d.border_t_1().border_color(rgb(LINE))),
         );
     }
     group
@@ -108,10 +104,8 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     pub fn new(window: &mut Window, cx: &mut Context<ChatApp>) -> Self {
-        let acp_command = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("留空 = 内置 mock agent")
-        });
+        let acp_command =
+            cx.new(|cx| InputState::new(window, cx).placeholder("留空 = 内置 mock agent"));
         Self {
             kernel: KernelChoice::default(),
             profiles: Vec::new(),
@@ -148,14 +142,12 @@ impl ChatApp {
             profiles.push(ProviderProfile::default());
         }
         self.settings_form.active = s.builtin.active.min(profiles.len() - 1);
-        self.settings_form.inputs = profiles
-            .iter()
-            .map(|p| ProfileInputs::new(window, cx, p))
-            .collect();
+        self.settings_form.inputs =
+            profiles.iter().map(|p| ProfileInputs::new(window, cx, p)).collect();
         self.settings_form.profiles = profiles;
-        self.settings_form.acp_command.update(cx, |state, cx| {
-            state.set_value(s.acp.command.clone(), window, cx)
-        });
+        self.settings_form
+            .acp_command
+            .update(cx, |state, cx| state.set_value(s.acp.command.clone(), window, cx));
         self.settings_open = true;
         cx.notify();
     }
@@ -180,7 +172,10 @@ impl ChatApp {
     pub(crate) fn apply_appearance(&mut self, window: &Window, cx: &mut Context<Self>) {
         let dark = match self.settings.appearance {
             Appearance::System => {
-                matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
+                matches!(
+                    window.appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                )
             }
             Appearance::Light => false,
             Appearance::Dark => true,
@@ -193,7 +188,12 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(crate) fn set_appearance(&mut self, a: Appearance, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_appearance(
+        &mut self,
+        a: Appearance,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         self.save_ui_pref(move |s| s.appearance = a);
         self.apply_appearance(window, cx);
     }
@@ -213,7 +213,9 @@ impl ChatApp {
                 div()
                     .id(("appearance", i))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| this.set_appearance(a, window, cx)))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.set_appearance(a, window, cx)),
+                    )
                     .child(Self::seg(a.label(), a == current)),
             );
         }
@@ -263,19 +265,19 @@ impl ChatApp {
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
         let new = self.form_settings(cx);
-        if new.kernel() == KernelChoice::Builtin {
-            if let Err(err) = new.builtin_config(self.cwd.clone()) {
-                self.settings_form.message = Some((true, err.to_string().into()));
-                cx.notify();
-                return;
-            }
+        if new.kernel() == KernelChoice::Builtin
+            && let Err(err) = new.builtin_config(self.cwd.clone())
+        {
+            self.settings_form.message = Some((true, err.to_string().into()));
+            cx.notify();
+            return;
         }
-        if let Some(path) = &self.settings_path {
-            if let Err(err) = new.save(path) {
-                self.settings_form.message = Some((true, format!("保存失败：{err}").into()));
-                cx.notify();
-                return;
-            }
+        if let Some(path) = &self.settings_path
+            && let Err(err) = new.save(path)
+        {
+            self.settings_form.message = Some((true, format!("保存失败：{err}").into()));
+            cx.notify();
+            return;
         }
         // 只重启配置变了的内核（模型列表变了不算）
         let builtin_key = |s: &Settings| {
@@ -338,7 +340,12 @@ impl ChatApp {
     }
 
     /// 表单里追加一套档案（预设 `preset = None` 时是空白自定义）。
-    fn add_form_profile(&mut self, preset: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_form_profile(
+        &mut self,
+        preset: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let p = preset.map_or_else(ProviderProfile::default, |i| {
             let mut p = preset_profiles()[i].clone();
             p.api_key = String::new();
@@ -401,10 +408,7 @@ impl ChatApp {
                 return;
             };
             ProviderConfig {
-                protocol: f
-                    .profiles
-                    .get(f.active)
-                    .map_or(Protocol::OpenAiCompat, |p| p.protocol),
+                protocol: f.profiles.get(f.active).map_or(Protocol::OpenAiCompat, |p| p.protocol),
                 base_url: value(&inputs.base_url, cx),
                 api_key: Some(value(&inputs.api_key, cx)).filter(|k| !k.is_empty()),
                 model: String::new(),
@@ -446,7 +450,8 @@ impl ChatApp {
                         if base_url == app.settings.builtin.base_url().trim() {
                             app.update_settings(|s| s.builtin.current_mut().set_models(&models));
                             // 运行中的自研内核也要知道窗口大小（自动压缩用）
-                            if let Some(kernel) = &app.kernels[KernelChoice::Builtin.index()].kernel {
+                            if let Some(kernel) = &app.kernels[KernelChoice::Builtin.index()].kernel
+                            {
                                 let windows = &app.settings.builtin.current().context_windows;
                                 kernel.set_context_windows(windows.clone().into_iter().collect());
                             }
@@ -487,31 +492,19 @@ impl ChatApp {
                     .font_weight(FontWeight::MEDIUM)
                     .child("已保存的权限规则"),
             )
-            .child(
-                div()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .child("自研内核里在权限卡片上选「总是允许」时记下的，按项目生效；删除后立即生效。"),
-            );
+            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
+                "自研内核里在权限卡片上选「总是允许」时记下的，按项目生效；删除后立即生效。",
+            ));
         let rules = &self.settings_form.rules;
         if rules.is_empty() {
             return section.child(
-                div()
-                    .py_2()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .child("还没有规则"),
+                div().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("还没有规则"),
             );
         }
         let mut n = 0usize;
         for (project, list) in rules {
-            let mut card = div()
-                .v_flex()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(CARD))
-                .child(
+            let mut card =
+                div().v_flex().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).child(
                     div()
                         .h_flex()
                         .gap_2()
@@ -581,7 +574,8 @@ impl ChatApp {
         inputs.api_key.update(cx, |s, cx| s.set_value(key, window, cx));
         self.settings_form.message = Some((
             false,
-            format!("已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）").into(),
+            format!("已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）")
+                .into(),
         ));
         self.fetch_models(true, cx);
     }
@@ -638,9 +632,7 @@ impl ChatApp {
             .cursor_pointer()
             .text_size(TEXT_BODY)
             .when(primary, |d| {
-                d.bg(rgb(CORAL_DEEP))
-                    .text_color(rgb(WHITE))
-                    .hover(|d| d.bg(rgb(CORAL_DEEP_HOVER)))
+                d.bg(rgb(CORAL_DEEP)).text_color(rgb(WHITE)).hover(|d| d.bg(rgb(CORAL_DEEP_HOVER)))
             })
             .when(!primary, |d| {
                 d.border_1()
@@ -664,76 +656,69 @@ impl ChatApp {
 
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let f = &self.settings_form;
-        let choice = |id: &'static str, kind: KernelChoice, title: &'static str, desc: &'static str| {
-            let active = f.kernel == kind;
-            div()
-                .id(id)
-                .flex_1()
-                .min_w_0()
-                .v_flex()
-                .gap_1()
-                .p_3()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(if active { CORAL } else { LINE }))
-                .bg(rgb(CARD))
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(HOVER)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.settings_form.kernel = kind;
-                    this.settings_form.message = None;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .h_flex()
-                        .gap_1p5()
-                        .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(title))
-                        .when(active, |d| {
-                            d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                        }),
-                )
-                .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc))
-        };
-
-        let mut body = div()
-            .v_flex()
-            .gap_5()
-            .child(
+        let choice =
+            |id: &'static str, kind: KernelChoice, title: &'static str, desc: &'static str| {
+                let active = f.kernel == kind;
                 div()
+                    .id(id)
+                    .flex_1()
+                    .min_w_0()
                     .v_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(TEXT_BODY)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("默认内核"),
-                    )
+                    .gap_1()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(if active { CORAL } else { LINE }))
+                    .bg(rgb(CARD))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_form.kernel = kind;
+                        this.settings_form.message = None;
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .h_flex()
-                            .gap_2()
-                            .items_start()
-                            .child(choice(
-                                "kernel-builtin",
-                                KernelChoice::Builtin,
-                                "自研内核",
-                                "OpenAI 兼容接口，含 Ollama 和本地网关",
-                            ))
-                            .child(choice(
-                                "kernel-acp",
-                                KernelChoice::Acp,
-                                "ACP agent",
-                                "外部 agent：Claude Code、pi 等",
-                            ))
-                            .child(choice(
-                                "kernel-demo",
-                                KernelChoice::Demo,
-                                "演示回放",
-                                "不连模型，只播放界面演示",
-                            )),
-                    ),
-            );
+                            .gap_1p5()
+                            .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(title))
+                            .when(active, |d| {
+                                d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
+                            }),
+                    )
+                    .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc))
+            };
+
+        let mut body = div().v_flex().gap_5().child(
+            div()
+                .v_flex()
+                .gap_2()
+                .child(div().text_size(TEXT_BODY).font_weight(FontWeight::MEDIUM).child("默认内核"))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(choice(
+                            "kernel-builtin",
+                            KernelChoice::Builtin,
+                            "自研内核",
+                            "OpenAI 兼容接口，含 Ollama 和本地网关",
+                        ))
+                        .child(choice(
+                            "kernel-acp",
+                            KernelChoice::Acp,
+                            "ACP agent",
+                            "外部 agent：Claude Code、pi 等",
+                        ))
+                        .child(choice(
+                            "kernel-demo",
+                            KernelChoice::Demo,
+                            "演示回放",
+                            "不连模型，只播放界面演示",
+                        )),
+                ),
+        );
 
         match f.kernel {
             KernelChoice::Builtin => {
@@ -777,9 +762,7 @@ impl ChatApp {
                                         this.remove_form_profile(i, cx);
                                     }))
                                     .child(
-                                        Icon::new(IconAll::X)
-                                            .size_3()
-                                            .text_color(rgb(INK_SOFT)),
+                                        Icon::new(IconAll::X).size_3().text_color(rgb(INK_SOFT)),
                                     ),
                             ),
                     );
@@ -831,11 +814,14 @@ impl ChatApp {
                     );
                 }
 
-                let mut builtin_body = div().v_flex().gap_4().child(
-                    Self::field("配置档案", Some("可以存多套 provider 配置，输入框旁的菜单可快速切换"), profile_row),
-                );
-                if !f.profiles.is_empty() {
-                    if let Some((p, inputs)) = f.current() {
+                let mut builtin_body = div().v_flex().gap_4().child(Self::field(
+                    "配置档案",
+                    Some("可以存多套 provider 配置，输入框旁的菜单可快速切换"),
+                    profile_row,
+                ));
+                if !f.profiles.is_empty()
+                    && let Some((p, inputs)) = f.current()
+                {
                     // 协议二选一
                     let proto = |id: &'static str, label: &'static str, want: Protocol| {
                         let active = p.protocol == want;
@@ -856,20 +842,22 @@ impl ChatApp {
                             }))
                             .child(label)
                     };
-                    let fetch_label = if self.fetching_models { "获取中…" } else { "获取模型列表" };
-                    let mut model_row = div()
-                        .h_flex()
-                        .gap_2()
-                        .child(div().flex_1().child(Self::text_input(&inputs.model)))
-                        .child(
-                            Self::button("fetch-models", fetch_label, false)
-                                .on_click(cx.listener(|this, _, _, cx| this.fetch_models(true, cx))),
-                        );
+                    let fetch_label =
+                        if self.fetching_models { "获取中…" } else { "获取模型列表" };
+                    let mut model_row =
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Self::text_input(&inputs.model)))
+                            .child(Self::button("fetch-models", fetch_label, false).on_click(
+                                cx.listener(|this, _, _, cx| this.fetch_models(true, cx)),
+                            ));
                     if antigravity_gateway().is_some() {
                         model_row = model_row.child(
-                            Self::button("import-antigravity", "从 Antigravity Tools 导入", false).on_click(
-                                cx.listener(|this, _, window, cx| this.import_antigravity(window, cx)),
-                            ),
+                            Self::button("import-antigravity", "从 Antigravity Tools 导入", false)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.import_antigravity(window, cx)
+                                })),
                         );
                     }
                     let current_model = value(&inputs.model, cx);
@@ -895,7 +883,9 @@ impl ChatApp {
                                     let pick = pick.clone();
                                     let i = this.settings_form.active;
                                     if let Some(inputs) = this.settings_form.inputs.get(i) {
-                                        inputs.model.update(cx, |s, cx| s.set_value(pick, window, cx));
+                                        inputs
+                                            .model
+                                            .update(cx, |s, cx| s.set_value(pick, window, cx));
                                     }
                                     cx.notify();
                                 }))
@@ -903,13 +893,11 @@ impl ChatApp {
                         );
                     }
                     builtin_body = builtin_body
-                        .child(
-                            Self::field(
-                                "常用服务预设",
-                                Some("点击追加一套已填好端点的档案，再补上自己的 key"),
-                                presets,
-                            ),
-                        )
+                        .child(Self::field(
+                            "常用服务预设",
+                            Some("点击追加一套已填好端点的档案，再补上自己的 key"),
+                            presets,
+                        ))
                         .child(Self::field("名称", None, Self::text_input(&inputs.name)))
                         .child(Self::field(
                             "协议",
@@ -917,8 +905,16 @@ impl ChatApp {
                             div()
                                 .h_flex()
                                 .gap_1p5()
-                                .child(proto("protocol-openai", "OpenAI 兼容", Protocol::OpenAiCompat))
-                                .child(proto("protocol-anthropic", "Anthropic 原生", Protocol::Anthropic)),
+                                .child(proto(
+                                    "protocol-openai",
+                                    "OpenAI 兼容",
+                                    Protocol::OpenAiCompat,
+                                ))
+                                .child(proto(
+                                    "protocol-anthropic",
+                                    "Anthropic 原生",
+                                    Protocol::Anthropic,
+                                )),
                         ))
                         .child(Self::field(
                             "端点地址",
@@ -947,7 +943,6 @@ impl ChatApp {
                             model_row,
                         ))
                         .when(!p.models.is_empty(), |d| d.child(chips));
-                    }
                 }
                 body = body.child(builtin_body);
             }
@@ -969,10 +964,10 @@ impl ChatApp {
                     .child(text.clone()),
             );
         }
-        let path = self
-            .settings_path
-            .as_ref()
-            .map_or_else(|| "（数据目录不可用，设置不会保存）".to_string(), |p| p.display().to_string());
+        let path = self.settings_path.as_ref().map_or_else(
+            || "（数据目录不可用，设置不会保存）".to_string(),
+            |p| p.display().to_string(),
+        );
         let kernel_tab = body
             .child(
                 div()
@@ -1075,25 +1070,22 @@ impl ChatApp {
                                         this.settings_open = false;
                                         cx.notify();
                                     }))
-                                    .child(Icon::new(IconAll::X).size_4().text_color(rgb(INK_SOFT))),
+                                    .child(
+                                        Icon::new(IconAll::X).size_4().text_color(rgb(INK_SOFT)),
+                                    ),
                             ),
                     )
                     // 导航固定，只滚右侧内容
                     .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_h_0()
-                            .child(nav)
-                            .child(
-                                div()
-                                    .id("settings-scroll")
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_y_scroll()
-                                    // pt_2：首行文字与导航第一项的文字对齐
-                                    .child(div().v_flex().px_8().pt_2().pb_8().child(tab_content)),
-                            ),
+                        div().flex().flex_1().min_h_0().child(nav).child(
+                            div()
+                                .id("settings-scroll")
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_y_scroll()
+                                // pt_2：首行文字与导航第一项的文字对齐
+                                .child(div().v_flex().px_8().pt_2().pb_8().child(tab_content)),
+                        ),
                     ),
             )
     }

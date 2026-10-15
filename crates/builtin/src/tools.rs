@@ -121,19 +121,11 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self {
-            ok: true,
-            content: content.into(),
-            summary: summary.into(),
-        }
+        Self { ok: true, content: content.into(), summary: summary.into() }
     }
 
     pub fn fail(content: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            content: content.into(),
-            summary: summary.into(),
-        }
+        Self { ok: false, content: content.into(), summary: summary.into() }
     }
 }
 
@@ -444,10 +436,7 @@ impl Action {
             }
             WRITE_FILE => {
                 let a: WriteArgs = de(name, args)?;
-                Self::Write {
-                    path: need_path(Some(a.path))?,
-                    content: a.content,
-                }
+                Self::Write { path: need_path(Some(a.path))?, content: a.content }
             }
             EDIT_FILE => {
                 let a: EditArgs = de(name, args)?;
@@ -463,10 +452,8 @@ impl Action {
                 if a.command.trim().is_empty() {
                     return Err("shell: `command` is empty".into());
                 }
-                let secs = a
-                    .timeout_secs
-                    .unwrap_or(SHELL_TIMEOUT_DEFAULT)
-                    .clamp(1, SHELL_TIMEOUT_MAX);
+                let secs =
+                    a.timeout_secs.unwrap_or(SHELL_TIMEOUT_DEFAULT).clamp(1, SHELL_TIMEOUT_MAX);
                 Self::Shell {
                     command: a.command,
                     timeout: Duration::from_secs(secs),
@@ -478,7 +465,8 @@ impl Action {
                 if a.pattern.trim().is_empty() {
                     return Err("glob: `pattern` is empty".into());
                 }
-                globset::Glob::new(a.pattern.trim()).map_err(|e| format!("glob: invalid pattern: {e}"))?;
+                globset::Glob::new(a.pattern.trim())
+                    .map_err(|e| format!("glob: invalid pattern: {e}"))?;
                 Self::Glob {
                     pattern: a.pattern.trim().to_string(),
                     root: dir_or_cwd(cwd, a.path),
@@ -496,7 +484,8 @@ impl Action {
                     .map_err(|e| format!("grep: invalid regex: {e}"))?;
                 let include = a.include.map(|g| g.trim().to_string()).filter(|g| !g.is_empty());
                 if let Some(g) = &include {
-                    globset::Glob::new(g).map_err(|e| format!("grep: invalid include glob: {e}"))?;
+                    globset::Glob::new(g)
+                        .map_err(|e| format!("grep: invalid include glob: {e}"))?;
                 }
                 Self::Grep {
                     pattern: a.pattern,
@@ -553,13 +542,7 @@ impl Action {
                 "." => format!("Glob {pattern}"),
                 dir => format!("Glob {pattern} in {dir}"),
             },
-            Self::Grep {
-                pattern,
-                root,
-                include,
-                cwd,
-                ..
-            } => {
+            Self::Grep { pattern, root, include, cwd, .. } => {
                 let mut t = format!("Grep {pattern}");
                 let dir = display(cwd, root);
                 if dir != "." {
@@ -602,12 +585,7 @@ impl Action {
                 let old = read_for_preview(path).ok()?;
                 Some(DiffView::compute(display(cwd, path), old.as_deref(), content))
             }
-            Self::Edit {
-                path,
-                old,
-                new,
-                all,
-            } => {
+            Self::Edit { path, old, new, all } => {
                 let text = read_for_preview(path).ok()??;
                 let r = replace_in(&text, path, old, new, *all).ok()?;
                 Some(DiffView::compute(display(cwd, path), Some(&text), &r.text))
@@ -619,33 +597,13 @@ impl Action {
     /// 执行；`should_stop` 用于中断长命令。
     pub fn run(&self, should_stop: &dyn Fn() -> bool) -> ToolOutput {
         match self {
-            Self::Read {
-                path,
-                offset,
-                limit,
-            } => read_file(path, *offset, *limit),
+            Self::Read { path, offset, limit } => read_file(path, *offset, *limit),
             Self::List { path } => list_dir(path),
             Self::Write { path, content } => write_file(path, content),
-            Self::Edit {
-                path,
-                old,
-                new,
-                all,
-            } => edit_file(path, old, new, *all),
-            Self::Shell {
-                command,
-                timeout,
-                cwd,
-            } => run_shell(command, cwd, *timeout, should_stop),
+            Self::Edit { path, old, new, all } => edit_file(path, old, new, *all),
+            Self::Shell { command, timeout, cwd } => run_shell(command, cwd, *timeout, should_stop),
             Self::Glob { pattern, root, cwd } => glob_files(pattern, root, cwd, should_stop),
-            Self::Grep {
-                pattern,
-                root,
-                include,
-                ignore_case,
-                files_only,
-                cwd,
-            } => grep_files(
+            Self::Grep { pattern, root, include, ignore_case, files_only, cwd } => grep_files(
                 pattern,
                 root,
                 include.as_deref(),
@@ -661,27 +619,25 @@ impl Action {
 
 /// `path` 参数为空时用工作目录
 fn dir_or_cwd(cwd: &Path, path: Option<String>) -> PathBuf {
-    path.filter(|p| !p.trim().is_empty())
-        .map_or_else(|| cwd.to_path_buf(), |p| resolve(cwd, &p))
+    path.filter(|p| !p.trim().is_empty()).map_or_else(|| cwd.to_path_buf(), |p| resolve(cwd, &p))
 }
 
 /// 遍历 `root` 下的文件（遵守 .gitignore / .ignore，跳过隐藏文件；不要求是 git 仓库）
 fn walk(root: &Path) -> ignore::Walk {
-    ignore::WalkBuilder::new(root)
-        .require_git(false)
-        .follow_links(false)
-        .build()
+    ignore::WalkBuilder::new(root).require_git(false).follow_links(false).build()
 }
 
 /// 相对 `root` 的路径，统一用 `/`
 fn rel_slash(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
-fn glob_files(pattern: &str, root: &Path, cwd: &Path, should_stop: &dyn Fn() -> bool) -> ToolOutput {
+fn glob_files(
+    pattern: &str,
+    root: &Path,
+    cwd: &Path,
+    should_stop: &dyn Fn() -> bool,
+) -> ToolOutput {
     if !root.is_dir() {
         return ToolOutput::fail(format!("Not a directory: {}", root.display()), "目录不存在");
     }
@@ -748,7 +704,10 @@ fn grep_files(
         Err(e) => return ToolOutput::fail(format!("Invalid include glob: {e}"), "模式无效"),
     };
     if !root.exists() {
-        return ToolOutput::fail(format!("No such file or directory: {}", root.display()), "路径不存在");
+        return ToolOutput::fail(
+            format!("No such file or directory: {}", root.display()),
+            "路径不存在",
+        );
     }
     let mut out = String::new();
     let (mut lines, mut files, mut truncated) = (0usize, 0usize, false);
@@ -851,9 +810,9 @@ fn shell_rule(command: &str) -> Option<String> {
     }
     let mut words = command.split_whitespace();
     let program = words.next()?;
-    let sub = words
-        .next()
-        .filter(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !w.starts_with('-'));
+    let sub = words.next().filter(|w| {
+        w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !w.starts_with('-')
+    });
     Some(match sub {
         Some(sub) => format!("{program} {sub}"),
         None => program.to_string(),
@@ -914,10 +873,15 @@ fn clip_output(s: String) -> String {
 fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(e) => return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败"),
+        Err(e) => {
+            return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败");
+        }
     };
     if meta.is_dir() {
-        return ToolOutput::fail(format!("{} is a directory; use list_dir", path.display()), "是目录");
+        return ToolOutput::fail(
+            format!("{} is a directory; use list_dir", path.display()),
+            "是目录",
+        );
     }
     if meta.len() > READ_MAX_BYTES {
         return ToolOutput::fail(
@@ -927,10 +891,15 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
     }
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) => return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败"),
+        Err(e) => {
+            return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败");
+        }
     };
     if bytes[..bytes.len().min(8192)].contains(&0) {
-        return ToolOutput::fail(format!("{} looks like a binary file", path.display()), "二进制文件");
+        return ToolOutput::fail(
+            format!("{} looks like a binary file", path.display()),
+            "二进制文件",
+        );
     }
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
@@ -940,7 +909,10 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
     }
     let start = offset - 1;
     if start >= total {
-        return ToolOutput::fail(format!("offset {offset} is past the end ({total} lines)"), "超出行数");
+        return ToolOutput::fail(
+            format!("offset {offset} is past the end ({total} lines)"),
+            "超出行数",
+        );
     }
     let end = (start + limit).min(total);
     let mut out = String::new();
@@ -948,7 +920,11 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
         let _ = writeln!(out, "{:>6}\t{}", start + i + 1, truncate_chars(line, LINE_MAX_CHARS));
     }
     if start > 0 || end < total {
-        let _ = writeln!(out, "… showing lines {}-{end} of {total}; use offset to read more", start + 1);
+        let _ = writeln!(
+            out,
+            "… showing lines {}-{end} of {total}; use offset to read more",
+            start + 1
+        );
     }
     ToolOutput::ok(clip_output(out), format!("{} 行", end - start))
 }
@@ -956,7 +932,9 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
 fn list_dir(path: &Path) -> ToolOutput {
     let entries = match std::fs::read_dir(path) {
         Ok(e) => e,
-        Err(e) => return ToolOutput::fail(format!("Cannot list {}: {e}", path.display()), "列目录失败"),
+        Err(e) => {
+            return ToolOutput::fail(format!("Cannot list {}: {e}", path.display()), "列目录失败");
+        }
     };
     let mut items: Vec<(bool, String)> = entries
         .flatten()
@@ -982,17 +960,21 @@ fn list_dir(path: &Path) -> ToolOutput {
 
 fn write_file(path: &Path, content: &str) -> ToolOutput {
     let existed = path.exists();
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return ToolOutput::fail(format!("Cannot create {}: {e}", parent.display()), "写入失败");
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return ToolOutput::fail(format!("Cannot create {}: {e}", parent.display()), "写入失败");
     }
     match std::fs::write(path, content) {
         Ok(()) => {
             let lines = content.lines().count();
             ToolOutput::ok(
                 format!("Wrote {lines} lines to {}", path.display()),
-                if existed { format!("覆盖 · {lines} 行") } else { format!("新建 · {lines} 行") },
+                if existed {
+                    format!("覆盖 · {lines} 行")
+                } else {
+                    format!("新建 · {lines} 行")
+                },
             )
         }
         Err(e) => ToolOutput::fail(format!("Cannot write {}: {e}", path.display()), "写入失败"),
@@ -1008,9 +990,18 @@ struct Replaced {
 }
 
 /// 在 `text` 里做精确替换；失败时返回给模型 / UI 的错误。
-fn replace_in(text: &str, path: &Path, old: &str, new: &str, all: bool) -> Result<Replaced, ToolOutput> {
+fn replace_in(
+    text: &str,
+    path: &Path,
+    old: &str,
+    new: &str,
+    all: bool,
+) -> Result<Replaced, ToolOutput> {
     if old.is_empty() {
-        return Err(ToolOutput::fail("old_string must not be empty; use write_file to create files", "参数无效"));
+        return Err(ToolOutput::fail(
+            "old_string must not be empty; use write_file to create files",
+            "参数无效",
+        ));
     }
     // 文件是 CRLF 而模型给的是 LF：按 CRLF 再试一次
     let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -1022,29 +1013,32 @@ fn replace_in(text: &str, path: &Path, old: &str, new: &str, all: bool) -> Resul
     let count = text.matches(old.as_str()).count();
     if count == 0 {
         return Err(ToolOutput::fail(
-            format!("old_string not found in {}. Read the file and copy the text exactly.", path.display()),
+            format!(
+                "old_string not found in {}. Read the file and copy the text exactly.",
+                path.display()
+            ),
             "未找到要替换的内容",
         ));
     }
     if count > 1 && !all {
         return Err(ToolOutput::fail(
-            format!("old_string occurs {count} times in {}; add surrounding context or set replace_all", path.display()),
+            format!(
+                "old_string occurs {count} times in {}; add surrounding context or set replace_all",
+                path.display()
+            ),
             format!("匹配到 {count} 处"),
         ));
     }
     let text = if all { text.replace(&old, &new) } else { text.replacen(&old, &new, 1) };
-    Ok(Replaced {
-        text,
-        count: if all { count } else { 1 },
-        old,
-        new,
-    })
+    Ok(Replaced { text, count: if all { count } else { 1 }, old, new })
 }
 
 fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> ToolOutput {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) => return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败"),
+        Err(e) => {
+            return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败");
+        }
     };
     let r = match replace_in(&text, path, old, new, all) {
         Ok(r) => r,
@@ -1134,7 +1128,12 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn run_shell(command: &str, cwd: &Path, timeout: Duration, should_stop: &dyn Fn() -> bool) -> ToolOutput {
+fn run_shell(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    should_stop: &dyn Fn() -> bool,
+) -> ToolOutput {
     let mut child = match shell_command(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -1206,16 +1205,23 @@ fn run_shell(command: &str, cwd: &Path, timeout: Duration, should_stop: &dyn Fn(
     let code = status.and_then(|s| s.code());
     if let Some(why) = interrupted {
         let _ = write!(out, "\n[command {why} after {}s]", started.elapsed().as_secs());
-        return ToolOutput::fail(clip_output(out), if why == "cancelled" { "已中断" } else { "超时" });
+        return ToolOutput::fail(
+            clip_output(out),
+            if why == "cancelled" { "已中断" } else { "超时" },
+        );
     }
-    let first_line = |s: &str| s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+    let first_line =
+        |s: &str| s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
     match code {
         Some(0) => {
             let summary = first_line(&stdout);
             if out.is_empty() {
                 out.push_str("(no output)");
             }
-            ToolOutput::ok(clip_output(out), if summary.is_empty() { "完成".into() } else { summary })
+            ToolOutput::ok(
+                clip_output(out),
+                if summary.is_empty() { "完成".into() } else { summary },
+            )
         }
         code => {
             let code = code.map_or("unknown".into(), |c| c.to_string());
@@ -1223,7 +1229,11 @@ fn run_shell(command: &str, cwd: &Path, timeout: Duration, should_stop: &dyn Fn(
             let detail = first_line(&stderr);
             ToolOutput::fail(
                 clip_output(out),
-                if detail.is_empty() { format!("exit {code}") } else { format!("exit {code} · {detail}") },
+                if detail.is_empty() {
+                    format!("exit {code}")
+                } else {
+                    format!("exit {code} · {detail}")
+                },
             )
         }
     }
@@ -1234,7 +1244,8 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("claudesktop-tools-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("claudesktop-tools-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1259,7 +1270,8 @@ mod tests {
         assert_eq!(a.rule(cwd).as_deref(), Some("fetch:docs.rs"));
         assert!(Action::parse(WEB_FETCH, r#"{"url":"file:///etc/passwd"}"#, cwd).is_err());
         // 工作目录外的写入：不提供「总是允许」
-        let outside = Action::parse(WRITE_FILE, r#"{"path":"../other/x","content":""}"#, cwd).unwrap();
+        let outside =
+            Action::parse(WRITE_FILE, r#"{"path":"../other/x","content":""}"#, cwd).unwrap();
         assert!(!outside.inside(cwd));
         assert_eq!(outside.rule(cwd), None);
     }
@@ -1304,7 +1316,10 @@ mod tests {
         let out = run(GREP, r#"{"pattern":"hello","ignore_case":true,"include":"*.rs"}"#);
         let mut found: Vec<&str> = out.content.lines().collect();
         found.sort();
-        assert_eq!(found, vec!["src/app/mod.rs:1: pub fn hello() {}", "src/main.rs:2:     println!(\"Hello\");"]);
+        assert_eq!(
+            found,
+            vec!["src/app/mod.rs:1: pub fn hello() {}", "src/main.rs:2:     println!(\"Hello\");"]
+        );
         assert_eq!(out.summary, "2 处匹配");
         let out = run(GREP, r#"{"pattern":"fn \\w+","files_only":true,"path":"src"}"#);
         assert_eq!(out.summary, "2 个文件");
@@ -1312,9 +1327,12 @@ mod tests {
         assert_eq!(run(GREP, r#"{"pattern":"nothing-here"}"#).summary, "无匹配");
 
         // 参数错误直接回给模型
-        assert!(Action::parse(GREP, r#"{"pattern":"("}"#, &dir).unwrap_err().contains("invalid regex"));
+        assert!(
+            Action::parse(GREP, r#"{"pattern":"("}"#, &dir).unwrap_err().contains("invalid regex")
+        );
         assert!(Action::parse(GLOB, r#"{"pattern":""}"#, &dir).is_err());
-        let a = Action::parse(GREP, r#"{"pattern":"x","path":"src","include":"*.rs"}"#, &dir).unwrap();
+        let a =
+            Action::parse(GREP, r#"{"pattern":"x","path":"src","include":"*.rs"}"#, &dir).unwrap();
         assert_eq!(a.title(&dir), "Grep x in src (*.rs)");
         // Plan 模式（只读工具）里也有这两个
         let names: Vec<String> = specs(false)
@@ -1331,7 +1349,8 @@ mod tests {
             r#"{"todos":[{"content":"读代码","status":"completed"},{"content":" 改 ","status":"in_progress"},{"content":"测","status":"x"},{"content":"  ","status":"pending"}]}"#,
         )
         .unwrap();
-        let got: Vec<(&str, &str)> = entries.iter().map(|e| (e.content.as_str(), e.status.as_str())).collect();
+        let got: Vec<(&str, &str)> =
+            entries.iter().map(|e| (e.content.as_str(), e.status.as_str())).collect();
         assert_eq!(got, [("读代码", "completed"), ("改", "in_progress"), ("测", "pending")]);
         assert_eq!(todo_summary(&entries), "[x] 读代码; [>] 改; [ ] 测");
         assert!(parse_todos(r#"{"items":[]}"#).unwrap_err().contains("todo_write"));
@@ -1355,19 +1374,33 @@ mod tests {
     fn preview_diffs() {
         let dir = tmp("preview");
         let args = |v: Value| v.to_string();
-        let new = Action::parse(WRITE_FILE, &args(json!({"path": "n.txt", "content": "a
+        let new = Action::parse(
+            WRITE_FILE,
+            &args(json!({"path": "n.txt", "content": "a
 b
-"})), &dir).unwrap();
+"})),
+            &dir,
+        )
+        .unwrap();
         let d = new.preview(&dir).unwrap();
         assert_eq!((d.path.as_str(), d.created, d.added), ("n.txt", true, 2));
         // 预览不落盘
         assert!(!dir.join("n.txt").exists());
 
-        std::fs::write(dir.join("e.txt"), "x
+        std::fs::write(
+            dir.join("e.txt"),
+            "x
 y
-").unwrap();
+",
+        )
+        .unwrap();
         let edit = |old: &str| {
-            Action::parse(EDIT_FILE, &args(json!({"path": "e.txt", "old_string": old, "new_string": "Y"})), &dir).unwrap()
+            Action::parse(
+                EDIT_FILE,
+                &args(json!({"path": "e.txt", "old_string": old, "new_string": "Y"})),
+                &dir,
+            )
+            .unwrap()
         };
         let d = edit("y").preview(&dir).unwrap();
         assert_eq!((d.added, d.removed, d.created), (1, 1, false));
@@ -1421,7 +1454,9 @@ y
         let dir = tmp("cancel");
         let started = Instant::now();
         let cmd = if cfg!(windows) { "Start-Sleep 30" } else { "sleep 30" };
-        let out = run_shell(cmd, &dir, Duration::from_secs(60), &|| started.elapsed() > Duration::from_millis(300));
+        let out = run_shell(cmd, &dir, Duration::from_secs(60), &|| {
+            started.elapsed() > Duration::from_millis(300)
+        });
         assert!(!out.ok && out.content.contains("cancelled"), "{out:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(&dir);

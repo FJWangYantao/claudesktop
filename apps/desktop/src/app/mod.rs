@@ -15,24 +15,24 @@ mod status;
 mod widgets;
 
 use crate::demo::*;
-use settings_view::SettingsForm;
 use crate::model::*;
 use crate::session::*;
 use crate::settings::*;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use crate::usage::{self, TurnStat};
+use claudesktop_builtin::BuiltinKernel;
 use claudesktop_core::{
     AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PromptImage, Record, RoutedEvent,
     SessionStore, UserPrompt,
 };
-use claudesktop_builtin::BuiltinKernel;
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use settings_view::SettingsForm;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,7 +54,7 @@ pub struct ChatApp {
     cwd: PathBuf,
     /// 当前项目名（取工作目录名），侧栏分组名与输入框标签用
     project_name: SharedString,
-    overview_tab: usize, // 0 概览 / 1 模型
+    overview_tab: usize,   // 0 概览 / 1 模型
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
     sidebar_open: bool,
     /// 侧栏会话按最近活动排序（否则按打开顺序）
@@ -168,7 +168,6 @@ impl ChatApp {
         })
         .detach();
 
-
         // 内核与配置：设置文件 + 环境变量覆盖（见 settings.rs）；
         // 每次（重新）启动内核都换一个代号，旧内核的迟到事件按代号丢弃
         let acp_base = AcpKernelConfig::from_env();
@@ -202,15 +201,17 @@ impl ChatApp {
         .detach();
 
         // 运行状态行计时：当前会话忙时每秒重绘一次（等授权时没有转圈动画驱动重绘）
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            let alive = this.update(cx, |app, cx| {
-                if app.session().busy {
-                    cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let alive = this.update(cx, |app, cx| {
+                    if app.session().busy {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
                 }
-            });
-            if alive.is_err() {
-                break;
             }
         })
         .detach();
@@ -220,13 +221,11 @@ impl ChatApp {
         cx.subscribe_in(
             &rename_input,
             window,
-            |this: &mut ChatApp, _: &Entity<InputState>, event: &InputEvent, _, cx| {
-                match event {
-                    InputEvent::Focus => this.rename_focused = true,
-                    InputEvent::PressEnter { .. } => this.commit_rename(cx),
-                    InputEvent::Blur if this.rename_focused => this.commit_rename(cx),
-                    _ => {}
-                }
+            |this: &mut ChatApp, _: &Entity<InputState>, event: &InputEvent, _, cx| match event {
+                InputEvent::Focus => this.rename_focused = true,
+                InputEvent::PressEnter { .. } => this.commit_rename(cx),
+                InputEvent::Blur if this.rename_focused => this.commit_rename(cx),
+                _ => {}
             },
         )
         .detach();
@@ -307,23 +306,24 @@ impl ChatApp {
         let (kernel, status, agent_cmd): (Option<Arc<dyn Kernel>>, SharedString, String) =
             match kind {
                 KernelChoice::Demo => (None, "未连接内核".into(), String::new()),
-                KernelChoice::Builtin => match self
-                    .settings
-                    .builtin_config(self.cwd.clone())
-                    .and_then(|config| {
+                KernelChoice::Builtin => {
+                    match self.settings.builtin_config(self.cwd.clone()).and_then(|config| {
                         let identity = config.identity();
                         BuiltinKernel::spawn(config, sink).map(|k| (k, identity))
                     }) {
-                    Ok((k, identity)) => {
-                        (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), identity)
+                        Ok((k, identity)) => {
+                            (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), identity)
+                        }
+                        Err(err) => (None, format!("启动失败：{err}").into(), String::new()),
                     }
-                    Err(err) => (None, format!("启动失败：{err}").into(), String::new()),
-                },
+                }
                 KernelChoice::Acp => {
                     let config = self.settings.acp_config(self.acp_base.clone());
                     let agent_cmd = config.command.clone();
                     match AcpKernel::spawn(config, sink) {
-                        Ok(k) => (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), agent_cmd),
+                        Ok(k) => {
+                            (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), agent_cmd)
+                        }
                         Err(err) => (None, format!("启动失败：{err}").into(), agent_cmd),
                     }
                 }
@@ -442,10 +442,10 @@ impl ChatApp {
             prompt: Some("选择工作目录".into()),
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                if let Some(dir) = paths.into_iter().next() {
-                    let _ = this.update(cx, |app, cx| app.switch_workspace(dir, cx));
-                }
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(dir) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |app, cx| app.switch_workspace(dir, cx));
             }
         })
         .detach();
@@ -462,12 +462,8 @@ impl ChatApp {
                 None => dirs.push((s.cwd.as_path(), at)),
             }
         }
-        dirs.sort_by(|a, b| b.1.cmp(&a.1));
-        dirs.into_iter()
-            .map(|(d, _)| d.to_path_buf())
-            .filter(|d| d.is_dir())
-            .take(8)
-            .collect()
+        dirs.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+        dirs.into_iter().map(|(d, _)| d.to_path_buf()).filter(|d| d.is_dir()).take(8).collect()
     }
 
     /// 切到第 `i` 个会话（侧栏点击 / 快捷键共用）：重开会话的模型名从日志恢复了，
@@ -667,16 +663,12 @@ impl ChatApp {
         let images = self
             .pending
             .iter()
-            .map(|p| PromptImage {
-                media_type: p.media_type.clone(),
-                data: p.data.clone(),
-            })
+            .map(|p| PromptImage { media_type: p.media_type.clone(), data: p.data.clone() })
             .collect::<Vec<_>>();
         if text.trim().is_empty() && images.is_empty() {
             return;
         }
-        self.input
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.input.update(cx, |state, cx| state.set_value("", window, cx));
         self.pending.clear();
         self.submit_to(self.active, UserPrompt { text, images }, cx);
     }
@@ -687,20 +679,14 @@ impl ChatApp {
     const MAX_PENDING_IMAGES: usize = 8;
 
     /// 加入待发送图片（超出上限截断并提示）。
-    pub(crate) fn add_pending_images(
-        &mut self,
-        images: Vec<PendingImage>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn add_pending_images(&mut self, images: Vec<PendingImage>, cx: &mut Context<Self>) {
         let room = Self::MAX_PENDING_IMAGES.saturating_sub(self.pending.len());
         if images.is_empty() {
             return;
         }
         if images.len() > room {
-            self.sessions[self.active].note(format!(
-                "一轮最多附 {} 张图片，多出的没有加上",
-                Self::MAX_PENDING_IMAGES
-            ));
+            self.sessions[self.active]
+                .note(format!("一轮最多附 {} 张图片，多出的没有加上", Self::MAX_PENDING_IMAGES));
         }
         self.pending.extend(images.into_iter().take(room));
         cx.notify();
@@ -731,14 +717,13 @@ impl ChatApp {
         images
             .iter()
             .filter_map(|image| {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(image.data.as_bytes())
-                    .ok()?;
+                let bytes =
+                    base64::engine::general_purpose::STANDARD.decode(image.data.as_bytes()).ok()?;
                 let ext = ext_of(&image.media_type);
-                store.save_image(&meta.id, ext, &bytes).ok().map(|p| {
-                    p.to_string_lossy()
-                        .into_owned()
-                })
+                store
+                    .save_image(&meta.id, ext, &bytes)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
             })
             .collect()
     }
@@ -754,7 +739,8 @@ impl ChatApp {
             self.ensure_kernel(kind);
             if self.kernel_of(kind).is_none() {
                 let status = self.kernels[kind.index()].status.clone();
-                self.sessions[idx].note(format!("{}不可用：{status}（可在设置里修改）", kind.label()));
+                self.sessions[idx]
+                    .note(format!("{}不可用：{status}（可在设置里修改）", kind.label()));
                 cx.notify();
                 return;
             }
@@ -792,13 +778,7 @@ impl ChatApp {
                 images: image_paths,
             });
             if kernel.is_some() {
-                self.persist(
-                    idx,
-                    Record::User {
-                        text: prompt.text.clone(),
-                        images: stored,
-                    },
-                );
+                self.persist(idx, Record::User { text: prompt.text.clone(), images: stored });
             }
             let s = &mut self.sessions[idx];
             s.begin_turn();
@@ -836,16 +816,10 @@ impl ChatApp {
         let active = self.active;
         let kernel = self.session_kernel(active);
         self.sessions[active].resolve_permission(item_idx, choice, kernel.as_ref());
-        if let Some(ChatItem::Permission {
-            id,
-            resolved: Some(label),
-            ..
-        }) = self.sessions[active].transcript.get(item_idx)
+        if let Some(ChatItem::Permission { id, resolved: Some(label), .. }) =
+            self.sessions[active].transcript.get(item_idx)
         {
-            let record = Record::PermissionResolved {
-                id: *id,
-                label: label.to_string(),
-            };
+            let record = Record::PermissionResolved { id: *id, label: label.to_string() };
             self.persist(active, record);
         }
         cx.notify();
@@ -917,10 +891,8 @@ impl ChatApp {
                 self.request_pending_sessions();
             }
             KernelEvent::SessionFailed { token, message } => {
-                if let Some(s) = self
-                    .sessions
-                    .iter_mut()
-                    .find(|s| s.kernel == kind && s.token == token)
+                if let Some(s) =
+                    self.sessions.iter_mut().find(|s| s.kernel == kind && s.token == token)
                 {
                     s.requested = false;
                     s.resuming = false;
@@ -938,10 +910,9 @@ impl ChatApp {
             event => {
                 // 会话级事件：Started 按令牌认领，其余按 sessionId
                 let idx = match &event {
-                    KernelEvent::Started { token, .. } => self
-                        .sessions
-                        .iter()
-                        .position(|s| s.kernel == kind && s.token == *token),
+                    KernelEvent::Started { token, .. } => {
+                        self.sessions.iter().position(|s| s.kernel == kind && s.token == *token)
+                    }
                     _ => session.as_deref().and_then(|id| {
                         self.sessions
                             .iter()
@@ -984,24 +955,24 @@ impl ChatApp {
 
     /// 确保第 `idx` 个会话的日志已打开（首次写入时建档）；失败时提示并停用存储。
     fn ensure_log(&mut self, idx: usize) {
-        if self.sessions[idx].log.is_some() || self.store.is_none() {
+        if self.sessions[idx].log.is_some() {
             return;
         }
+        // 存储可能已在别处停用（写盘失败）。这里取局部引用，不再 `unwrap`——
+        // 那是运行期持久化路径，存储异常不该让整个界面 panic。
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
         let s = &mut self.sessions[idx];
         let agent_cmd = self.kernels[s.kernel.index()].agent_cmd.clone();
         let opened = match &s.meta {
-            Some(meta) => self.store.as_ref().unwrap().append_log(&meta.id),
-            None => self
-                .store
-                .as_ref()
-                .unwrap()
-                .create(&s.title, s.cwd.clone(), &agent_cmd)
-                .map(|(mut meta, log)| {
-                    meta.kernel_session_id = s.acp_id.clone();
-                    let _ = self.store.as_ref().unwrap().save_meta(&meta);
-                    s.meta = Some(meta);
-                    log
-                }),
+            Some(meta) => store.append_log(&meta.id),
+            None => store.create(&s.title, s.cwd.clone(), &agent_cmd).map(|(mut meta, log)| {
+                meta.kernel_session_id = s.acp_id.clone();
+                let _ = store.save_meta(&meta);
+                s.meta = Some(meta);
+                log
+            }),
         };
         match opened {
             Ok(log) => s.log = Some(log),
@@ -1035,11 +1006,7 @@ impl ChatApp {
             return;
         }
         let summary = s.close_turn();
-        let TurnUsage {
-            input: input_tokens,
-            output: output_tokens,
-            ..
-        } = summary.usage;
+        let TurnUsage { input: input_tokens, output: output_tokens, .. } = summary.usage;
         let model = Some(s.model_label.to_string()).filter(|m| m != UNKNOWN_MODEL);
         let context_tokens = Some(s.context_tokens).filter(|n| *n > 0);
         let at_ms = now_ms();
@@ -1055,16 +1022,8 @@ impl ChatApp {
             },
         );
         let s = &self.sessions[idx];
-        let session = s
-            .meta
-            .as_ref()
-            .map_or_else(|| format!("live-{}", s.token), |m| m.id.clone());
-        self.usage.push(TurnStat {
-            session,
-            at_ms,
-            model,
-            tokens: input_tokens + output_tokens,
-        });
+        let session = s.meta.as_ref().map_or_else(|| format!("live-{}", s.token), |m| m.id.clone());
+        self.usage.push(TurnStat { session, at_ms, model, tokens: input_tokens + output_tokens });
     }
 
     /// 一轮结束：刷新日志，更新元信息（标题 / 内核会话 ID / 更新时间）。
@@ -1092,9 +1051,7 @@ impl ChatApp {
         let session = self.sessions[idx].token;
         cx.spawn(async move |this, cx| {
             for step in script {
-                cx.background_executor()
-                    .timer(Duration::from_millis(step.0))
-                    .await;
+                cx.background_executor().timer(Duration::from_millis(step.0)).await;
                 let mut cancelled = false;
                 let _ = this.update(cx, |app, cx| {
                     match app.sessions.iter_mut().find(|s| s.token == session) {
@@ -1124,16 +1081,19 @@ impl ChatApp {
 
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        static FIRST_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !FIRST_FRAME.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            if let Some(t0) = crate::STARTUP_T0.get() {
-                if std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok() {
-                    let elapsed = t0.elapsed();
-                    eprintln!("[startup_bench] main -> first_frame:     {:>6.2} ms", elapsed.as_secs_f64() * 1000.0);
-                    if std::env::var("CLAUDESKTOP_BENCH_EXIT").is_ok() {
-                        std::process::exit(0);
-                    }
-                }
+        static FIRST_FRAME: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !FIRST_FRAME.swap(true, std::sync::atomic::Ordering::Relaxed)
+            && let Some(t0) = crate::STARTUP_T0.get()
+            && std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok()
+        {
+            let elapsed = t0.elapsed();
+            eprintln!(
+                "[startup_bench] main -> first_frame:     {:>6.2} ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            if std::env::var("CLAUDESKTOP_BENCH_EXIT").is_ok() {
+                std::process::exit(0);
             }
         }
         if let Some(log) = &mut self.frame_log {
@@ -1193,12 +1153,11 @@ impl Render for ChatApp {
             let paper = rgb(PAPER);
             let clear = Rgba { a: 0., ..paper };
             let fade = |h: Pixels, from: Rgba, to: Rgba| {
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .h(h)
-                    .bg(linear_gradient(180., linear_color_stop(from, 0.), linear_color_stop(to, 1.)))
+                div().absolute().left_0().right_0().h(h).bg(linear_gradient(
+                    180.,
+                    linear_color_stop(from, 0.),
+                    linear_color_stop(to, 1.),
+                ))
             };
             let transcript = div()
                 .relative()
@@ -1213,12 +1172,8 @@ impl Render for ChatApp {
             v_flex().flex_1().min_h_0().child(transcript).child(composer_area)
         };
 
-        let main = v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .child(self.render_header(window, cx))
-            .child(body);
+        let main =
+            v_flex().flex_1().min_w_0().h_full().child(self.render_header(window, cx)).child(body);
 
         let mut root = div();
         // 中文回退字体：根上设一次，子元素换 font_family 时继承
@@ -1257,9 +1212,7 @@ pub(crate) fn short_path(dir: &Path) -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// MIME 类型 → 存盘扩展名。

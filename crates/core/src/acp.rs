@@ -22,24 +22,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, Implementation,
-    ImageContent, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
+    CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, ImageContent,
+    Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
     PromptRequest, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
     SelectedPermissionOutcome, SessionModeState, SessionNotification, SetSessionModeRequest,
     TextContent, ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
 };
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
+use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
-use futures::StreamExt;
 
 use crate::{
-    DiffView, EventSink, Kernel, KernelCommand, KernelEvent, ModeView, PermissionOptionView, PlanEntryView,
-    RoutedEvent,
+    DiffView, EventSink, Kernel, KernelCommand, KernelEvent, ModeView, PermissionOptionView,
+    PlanEntryView, RoutedEvent,
 };
 
 /// 发出一个事件；`session` 为空表示连接级事件。
@@ -104,11 +104,8 @@ impl AcpKernelConfig {
 /// 默认内核：仓库内的 mock ACP agent（零外部依赖，M1 冒烟用）。
 fn default_agent_command() -> String {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mock = manifest
-        .join("../../tools/mock-acp-agent.mjs")
-        .display()
-        .to_string()
-        .replace('\\', "/");
+    let mock =
+        manifest.join("../../tools/mock-acp-agent.mjs").display().to_string().replace('\\', "/");
     format!("node \"{mock}\"")
 }
 
@@ -131,21 +128,14 @@ impl AcpKernel {
         let (tx, rx) = unbounded::<KernelCommand>();
         let pending: PendingPermissions = Arc::default();
         let pending_for_thread = pending.clone();
-        emit(
-            &sink,
-            None,
-            KernelEvent::Status(format!("启动 ACP 内核: {}", config.command)),
-        );
+        emit(&sink, None, KernelEvent::Status(format!("启动 ACP 内核: {}", config.command)));
 
         let _handle: JoinHandle<()> = std::thread::Builder::new()
             .name("acp-kernel".into())
             .spawn(move || run_kernel(config, rx, sink, pending_for_thread))
             .map_err(|e| anyhow::anyhow!("spawn acp-kernel thread: {e}"))?;
 
-        Ok(Self {
-            command_tx: tx,
-            pending,
-        })
+        Ok(Self { command_tx: tx, pending })
     }
 
     fn send_command(&self, command: KernelCommand) -> anyhow::Result<()> {
@@ -184,16 +174,11 @@ impl Kernel for AcpKernel {
     }
 
     fn send_prompt(&self, session: &str, prompt: crate::UserPrompt) -> anyhow::Result<()> {
-        self.send_command(KernelCommand::Prompt {
-            session: session.to_string(),
-            prompt,
-        })
+        self.send_command(KernelCommand::Prompt { session: session.to_string(), prompt })
     }
 
     fn cancel(&self, session: &str) -> anyhow::Result<()> {
-        self.send_command(KernelCommand::Cancel {
-            session: session.to_string(),
-        })
+        self.send_command(KernelCommand::Cancel { session: session.to_string() })
     }
 
     fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()> {
@@ -320,10 +305,7 @@ fn run_kernel(
                             emit(
                                 &sink_permission,
                                 Some(session),
-                                KernelEvent::PermissionAuto {
-                                    chosen: option.name.clone(),
-                                    title,
-                                },
+                                KernelEvent::PermissionAuto { chosen: option.name.clone(), title },
                             );
                             responder.respond(RequestPermissionResponse::new(
                                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
@@ -366,10 +348,7 @@ fn run_kernel(
                             emit(
                                 &sink_fs_read,
                                 Some(session),
-                                KernelEvent::FsRead {
-                                    path: format!("{path} ({err})"),
-                                    ok: false,
-                                },
+                                KernelEvent::FsRead { path: format!("{path} ({err})"), ok: false },
                             );
                             String::new()
                         }
@@ -383,11 +362,7 @@ fn run_kernel(
                     let session = request.session_id.to_string();
                     let path = request.path.to_string_lossy().into_owned();
                     let ok = std::fs::write(&request.path, &request.content).is_ok();
-                    emit(
-                        &sink_fs_write,
-                        Some(session),
-                        KernelEvent::FsWrite { path, ok },
-                    );
+                    emit(&sink_fs_write, Some(session), KernelEvent::FsWrite { path, ok });
                     responder.respond(WriteTextFileResponse::new())
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -398,11 +373,9 @@ fn run_kernel(
                     .send_request(
                         InitializeRequest::new(ProtocolVersion::V1)
                             .client_capabilities(
-                                ClientCapabilities::default().fs(
-                                    FileSystemCapabilities::new()
-                                        .read_text_file(true)
-                                        .write_text_file(true),
-                                ),
+                                ClientCapabilities::default().fs(FileSystemCapabilities::new()
+                                    .read_text_file(true)
+                                    .write_text_file(true)),
                             )
                             .client_info(Implementation::new(
                                 "claudesktop",
@@ -414,10 +387,8 @@ fn run_kernel(
                 let caps = &init.agent_capabilities;
                 let can_resume = caps.session_capabilities.resume.is_some();
                 let can_load = caps.load_session;
-                let agent_name = init
-                    .agent_info
-                    .map(|info| info.name)
-                    .unwrap_or_else(|| "unknown-agent".into());
+                let agent_name =
+                    init.agent_info.map(|info| info.name).unwrap_or_else(|| "unknown-agent".into());
                 emit(
                     &sink,
                     None,
@@ -426,13 +397,7 @@ fn run_kernel(
                         init.protocol_version.as_u16()
                     )),
                 );
-                emit(
-                    &sink,
-                    None,
-                    KernelEvent::Connected {
-                        agent_name: agent_name.clone(),
-                    },
-                );
+                emit(&sink, None, KernelEvent::Connected { agent_name: agent_name.clone() });
 
                 // ---- 指令循环 --------------------------------------------
                 while let Some(command) = cmd_rx.next().await {
@@ -442,11 +407,7 @@ fn run_kernel(
                             let opened = open_new_session(&connection, cwd).await;
                             report_started(&sink, &agent_name, token, opened, false);
                         }
-                        KernelCommand::ResumeSession {
-                            token,
-                            session_id,
-                            cwd,
-                        } => {
+                        KernelCommand::ResumeSession { token, session_id, cwd } => {
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
                             let restored = if can_resume {
                                 connection
@@ -526,9 +487,9 @@ fn run_kernel(
                                     Ok(r) => KernelEvent::TurnEnded {
                                         stop_reason: wire_name(&r.stop_reason),
                                     },
-                                    Err(err) => KernelEvent::PromptFailed {
-                                        message: format!("{err}"),
-                                    },
+                                    Err(err) => {
+                                        KernelEvent::PromptFailed { message: format!("{err}") }
+                                    }
                                 };
                                 emit(&sink_turn, Some(session), event);
                                 Ok(())
@@ -571,12 +532,15 @@ fn run_kernel(
 /// 把 ACP `session/update` 通知映射为 [`KernelEvent`]。
 fn map_notification(sink: &EventSink, notification: &SessionNotification) {
     let event = match &notification.update {
-        SessionUpdate::UserMessageChunk(chunk) => text_of(&chunk.content)
-            .map(|text| KernelEvent::UserMessageChunk { text }),
-        SessionUpdate::AgentMessageChunk(chunk) => text_of(&chunk.content)
-            .map(|text| KernelEvent::AgentMessageChunk { text }),
-        SessionUpdate::AgentThoughtChunk(chunk) => text_of(&chunk.content)
-            .map(|text| KernelEvent::AgentThoughtChunk { text }),
+        SessionUpdate::UserMessageChunk(chunk) => {
+            text_of(&chunk.content).map(|text| KernelEvent::UserMessageChunk { text })
+        }
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            text_of(&chunk.content).map(|text| KernelEvent::AgentMessageChunk { text })
+        }
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            text_of(&chunk.content).map(|text| KernelEvent::AgentThoughtChunk { text })
+        }
         SessionUpdate::ToolCall(call) => Some(KernelEvent::ToolCallStarted {
             id: call.tool_call_id.to_string(),
             title: call.title.clone(),
@@ -614,7 +578,9 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
     // 工具内容里的文件改动单独发成 ToolCallDiff
     let (id, content) = match &notification.update {
         SessionUpdate::ToolCall(call) => (&call.tool_call_id, Some(&call.content)),
-        SessionUpdate::ToolCallUpdate(update) => (&update.tool_call_id, update.fields.content.as_ref()),
+        SessionUpdate::ToolCallUpdate(update) => {
+            (&update.tool_call_id, update.fields.content.as_ref())
+        }
         _ => return,
     };
     for item in content.into_iter().flatten() {
@@ -627,10 +593,7 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
             emit(
                 sink,
                 Some(session.clone()),
-                KernelEvent::ToolCallDiff {
-                    id: id.to_string(),
-                    diff: view,
-                },
+                KernelEvent::ToolCallDiff { id: id.to_string(), diff: view },
             );
         }
     }
@@ -668,11 +631,7 @@ fn report_started(
     resumed: bool,
 ) {
     match opened {
-        Ok(OpenedSession {
-            session_id,
-            model,
-            modes,
-        }) => {
+        Ok(OpenedSession { session_id, model, modes }) => {
             let (modes, current_mode) = match modes {
                 Some(state) => (
                     state
@@ -716,9 +675,7 @@ fn current_model(options: &impl serde::Serialize) -> Option<String> {
         if !is_model {
             return None;
         }
-        opt.get("currentValue")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
+        opt.get("currentValue").and_then(|v| v.as_str()).map(str::to_owned)
     })
 }
 
@@ -739,27 +696,6 @@ fn output_text(value: &serde_json::Value) -> String {
         }
     }
     extract(value).unwrap_or_else(|| value.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn output_text_extracts_nested_text() {
-        let v = json!({"content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]});
-        assert_eq!(output_text(&v), "hello\nworld");
-        assert_eq!(output_text(&json!("plain")), "plain");
-        assert_eq!(output_text(&json!({"stdout": "ok", "code": 0})), "ok");
-    }
-
-    #[test]
-    fn output_text_falls_back_to_json() {
-        let v = json!({"granted": true, "lines": 148});
-        let out = output_text(&v);
-        assert!(out.contains("granted") && out.contains("148"), "{out}");
-    }
 }
 
 /// 取文本内容块；M1 只处理 Text，其余（图片/资源）忽略。
@@ -788,5 +724,26 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let cut: String = s.chars().take(max).collect();
         format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn output_text_extracts_nested_text() {
+        let v = json!({"content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]});
+        assert_eq!(output_text(&v), "hello\nworld");
+        assert_eq!(output_text(&json!("plain")), "plain");
+        assert_eq!(output_text(&json!({"stdout": "ok", "code": 0})), "ok");
+    }
+
+    #[test]
+    fn output_text_falls_back_to_json() {
+        let v = json!({"granted": true, "lines": 148});
+        let out = output_text(&v);
+        assert!(out.contains("granted") && out.contains("148"), "{out}");
     }
 }

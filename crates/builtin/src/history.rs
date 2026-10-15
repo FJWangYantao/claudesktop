@@ -17,12 +17,7 @@ const HISTORY_MAX_CHARS: usize = 200_000;
 
 enum Segment {
     Text(String),
-    Tool {
-        id: String,
-        title: String,
-        status: String,
-        output: String,
-    },
+    Tool { id: String, title: String, status: String, output: String },
 }
 
 #[derive(Default)]
@@ -40,12 +35,9 @@ impl Assistant {
 
     fn tool(&mut self, id: &str) -> Option<(&mut String, &mut String, &mut String)> {
         self.segments.iter_mut().rev().find_map(|s| match s {
-            Segment::Tool {
-                id: i,
-                title,
-                status,
-                output,
-            } if i == id => Some((title, status, output)),
+            Segment::Tool { id: i, title, status, output } if i == id => {
+                Some((title, status, output))
+            }
             _ => None,
         })
     }
@@ -56,12 +48,7 @@ impl Assistant {
         for seg in self.segments.drain(..) {
             match seg {
                 Segment::Text(t) => out.push_str(&t),
-                Segment::Tool {
-                    title,
-                    status,
-                    output,
-                    ..
-                } => {
+                Segment::Tool { title, status, output, .. } => {
                     // 没等到结果的调用（上次退出时还在进行 / 等权限）
                     let (status, output) = match status.as_str() {
                         "completed" | "failed" => (status, output),
@@ -108,14 +95,14 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
             }
             Record::Event { event } => match event {
                 KernelEvent::AgentMessageChunk { text } => assistant.text(text),
-                KernelEvent::ToolCallStarted {
-                    id, title, status, ..
-                } => assistant.segments.push(Segment::Tool {
-                    id: id.clone(),
-                    title: title.clone(),
-                    status: status.clone(),
-                    output: String::new(),
-                }),
+                KernelEvent::ToolCallStarted { id, title, status, .. } => {
+                    assistant.segments.push(Segment::Tool {
+                        id: id.clone(),
+                        title: title.clone(),
+                        status: status.clone(),
+                        output: String::new(),
+                    })
+                }
                 KernelEvent::ToolCallUpdated {
                     id,
                     title: new_title,
@@ -198,10 +185,7 @@ fn user_message(text: &str, images: &[String]) -> ChatMessage {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        parts.push(ContentPart::Image {
-            media_type: mime_type(path),
-            data: engine.encode(bytes),
-        });
+        parts.push(ContentPart::Image { media_type: mime_type(path), data: engine.encode(bytes) });
     }
     ChatMessage::with_parts("user", parts)
 }
@@ -258,10 +242,8 @@ mod tests {
             Record::User { text: "算了".into(), images: Vec::new() },
         ];
         let msgs = rebuild(&records).messages;
-        let got: Vec<_> = msgs
-            .iter()
-            .map(|m| format!("{}:{}", m.role, m.text().unwrap()))
-            .collect();
+        let got: Vec<_> =
+            msgs.iter().map(|m| format!("{}:{}", m.role, m.text().unwrap())).collect();
         assert_eq!(
             got,
             [
@@ -279,16 +261,36 @@ mod tests {
         let user = |t: &str| Record::User { text: t.into(), images: Vec::new() };
         let reply = |t: &str| ev(KernelEvent::AgentMessageChunk { text: t.into() });
         let end = || ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
-        let compacted = |s: &str| ev(KernelEvent::Compacted { summary: s.into(), context_tokens: 0 });
+        let compacted =
+            |s: &str| ev(KernelEvent::Compacted { summary: s.into(), context_tokens: 0 });
         let texts = |r: &Rebuilt| r.messages.iter().map(|m| m.text().unwrap()).collect::<Vec<_>>();
 
         // 一轮中间的自动压缩：保留这一轮（含压缩前已有的回复）
-        let r = rebuild(&[user("一"), reply("a"), end(), user("二"), reply("想"), compacted("摘要1"), reply("好"), end()]);
+        let r = rebuild(&[
+            user("一"),
+            reply("a"),
+            end(),
+            user("二"),
+            reply("想"),
+            compacted("摘要1"),
+            reply("好"),
+            end(),
+        ]);
         assert_eq!(r.summary.as_deref(), Some("摘要1"));
         assert_eq!(texts(&r), ["二", "想好"]);
 
         // 空闲时的手动压缩：全丢，之后的轮次照常
-        let r = rebuild(&[user("一"), reply("a"), end(), ev(KernelEvent::Compacting), compacted("摘要2"), end(), user("三"), reply("c"), end()]);
+        let r = rebuild(&[
+            user("一"),
+            reply("a"),
+            end(),
+            ev(KernelEvent::Compacting),
+            compacted("摘要2"),
+            end(),
+            user("三"),
+            reply("c"),
+            end(),
+        ]);
         assert_eq!(r.summary.as_deref(), Some("摘要2"));
         assert_eq!(texts(&r), ["三", "c"]);
     }

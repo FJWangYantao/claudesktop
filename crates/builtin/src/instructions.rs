@@ -50,7 +50,9 @@ fn candidates(cwd: &Path, user_file: Option<&Path>) -> Vec<PathBuf> {
 pub fn load(cwd: &Path, user_file: Option<&Path>) -> Vec<Instruction> {
     let mut found: Vec<Instruction> = Vec::new();
     for path in candidates(cwd, user_file) {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let text = clip(text.trim(), FILE_MAX_CHARS);
         if text.is_empty() || found.iter().any(|f| f.text == text) {
             continue;

@@ -29,10 +29,7 @@ impl OpenAiProvider {
     }
 
     fn auth_header(&self) -> Option<(&'static str, String)> {
-        self.config
-            .api_key
-            .as_ref()
-            .map(|key| ("Authorization", format!("Bearer {key}")))
+        self.config.api_key.as_ref().map(|key| ("Authorization", format!("Bearer {key}")))
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -47,9 +44,7 @@ impl ChatProvider for OpenAiProvider {
         if let Some((name, value)) = self.auth_header() {
             request = request.header(name, &value);
         }
-        let response = request
-            .call()
-            .map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
+        let response = request.call().map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
         let status = response.status().as_u16();
         let text = response.into_body().read_to_string().unwrap_or_default();
         if !(200..300).contains(&status) {
@@ -80,31 +75,30 @@ impl ChatProvider for OpenAiProvider {
         let body = body.to_string();
 
         let headers = self.auth_header().into_iter().collect::<Vec<_>>();
-        let reader = post_sse_with_retry(&self.agent, &url, &headers, &body, should_stop, on_event)?;
+        let reader =
+            post_sse_with_retry(&self.agent, &url, &headers, &body, should_stop, on_event)?;
 
         let mut outcome = StreamOutcome::default();
         let mut calls = ToolCallAccumulator::default();
-        let completed = read_sse(reader, should_stop, &mut |payload| {
-            match parse_chunk(payload) {
-                Ok(chunk) => {
-                    for event in chunk.events {
-                        on_event(event);
-                    }
-                    for delta in chunk.tool_deltas {
-                        calls.push(delta);
-                    }
-                    if chunk.finish_reason.is_some() {
-                        outcome.finish_reason = chunk.finish_reason;
-                    }
-                    if chunk.usage.is_some() {
-                        outcome.usage = chunk.usage;
-                    }
-                    Ok(())
+        let completed = read_sse(reader, should_stop, &mut |payload| match parse_chunk(payload) {
+            Ok(chunk) => {
+                for event in chunk.events {
+                    on_event(event);
                 }
-                Err(message) => {
-                    debug_http(|| format!("✗ {message}"));
-                    Err(message)
+                for delta in chunk.tool_deltas {
+                    calls.push(delta);
                 }
+                if chunk.finish_reason.is_some() {
+                    outcome.finish_reason = chunk.finish_reason;
+                }
+                if chunk.usage.is_some() {
+                    outcome.usage = chunk.usage;
+                }
+                Ok(())
+            }
+            Err(message) => {
+                debug_http(|| format!("✗ {message}"));
+                Err(message)
             }
         })?;
         outcome.completed = completed;
@@ -130,7 +124,8 @@ fn apply_params(body: &mut Value, params: &RequestParams) {
 
 /// `GET /models` 的响应 → 模型 ID 列表（OpenAI 格式 `{"data": [{"id": …}]}`）。
 fn parse_models(text: &str) -> anyhow::Result<Vec<ModelInfo>> {
-    let value: Value = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("模型列表不是 JSON: {e}"))?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| anyhow::anyhow!("模型列表不是 JSON: {e}"))?;
     let data = value
         .get("data")
         .and_then(Value::as_array)
@@ -261,7 +256,8 @@ pub(crate) fn parse_chunk(payload: &str) -> Result<Chunk, String> {
             output_tokens: n("/completion_tokens"),
             reasoning_tokens: n("/completion_tokens_details/reasoning_tokens"),
             // OpenAI 报在 prompt_tokens_details 里，DeepSeek 用自己的字段名
-            cache_read_tokens: n("/prompt_tokens_details/cached_tokens").max(n("/prompt_cache_hit_tokens")),
+            cache_read_tokens: n("/prompt_tokens_details/cached_tokens")
+                .max(n("/prompt_cache_hit_tokens")),
         });
     }
     Ok(chunk)
@@ -289,7 +285,10 @@ mod tests {
         assert_eq!(c.events, vec![StreamEvent::Reasoning("想".into())]);
         assert_eq!(c.finish_reason, None);
 
-        let c = parse_chunk(r#"{"choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":"stop"}]}"#).unwrap();
+        let c = parse_chunk(
+            r#"{"choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
         assert_eq!(c.events, vec![StreamEvent::Text("你好".into())]);
         assert_eq!(c.finish_reason.as_deref(), Some("stop"));
 
@@ -297,7 +296,12 @@ mod tests {
         assert!(c.events.is_empty());
         assert_eq!(
             c.usage,
-            Some(Usage { input_tokens: 6, output_tokens: 14, reasoning_tokens: 408, cache_read_tokens: 0 })
+            Some(Usage {
+                input_tokens: 6,
+                output_tokens: 14,
+                reasoning_tokens: 408,
+                cache_read_tokens: 0
+            })
         );
         let c = parse_chunk(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80}}}"#).unwrap();
         assert_eq!(c.usage.map(|u| u.cache_read_tokens), Some(80));

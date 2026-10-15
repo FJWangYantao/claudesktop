@@ -6,7 +6,6 @@
 //! - 空会话首页：问候语 + 用量概览（统计卡 + 热力图）
 //! - 底部输入区：上方环境 / 项目 chips，输入框，下方权限模式 / 内核 / 模型
 
-
 mod app;
 mod complete;
 mod demo;
@@ -18,9 +17,9 @@ mod theme;
 mod usage;
 
 use app::ChatApp;
-use settings::KernelChoice;
 use gpui_kit::component::*;
 use gpui_kit::*;
+use settings::KernelChoice;
 use std::time::Duration;
 
 pub(crate) static STARTUP_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -36,136 +35,139 @@ fn main() {
     }
     let t_job = t0.elapsed();
 
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
-        .run(move |cx| {
-            let t_gpui_run = t0.elapsed();
-            gpui_kit::init(cx);
-            // 系统通知要有应用身份（Windows AppUserModelID，通知上显示的应用名）
-            cx.set_app_identity("claudesktop.desktop", "claudesktop");
-            app::keys::bind(cx);
-            fonts::register(cx);
-            let t_fonts = t0.elapsed();
+    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+        let t_gpui_run = t0.elapsed();
+        gpui_kit::init(cx);
+        // 系统通知要有应用身份（Windows AppUserModelID，通知上显示的应用名）
+        cx.set_app_identity("claudesktop.desktop", "claudesktop");
+        app::keys::bind(cx);
+        fonts::register(cx);
+        let t_fonts = t0.elapsed();
 
-            let mut options = TitleBar::window_options();
-            options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1280.), px(820.)),
-                cx,
-            )));
-            if let Some(tb) = options.titlebar.as_mut() {
-                // 任务栏 / Alt+Tab 里的名字（窗口内不显示标题栏）
-                tb.title = Some("claudesktop".into());
-            }
+        let mut options = TitleBar::window_options();
+        options.window_bounds =
+            Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx)));
+        if let Some(tb) = options.titlebar.as_mut() {
+            // 任务栏 / Alt+Tab 里的名字（窗口内不显示标题栏）
+            tb.title = Some("claudesktop".into());
+        }
 
-            gpui_kit::open_window(options, cx, |window, cx| {
-                let t_window_open = t0.elapsed();
-                cx.new(|cx| {
-                    let app = ChatApp::new(window, cx);
-                    let t_app_new = t0.elapsed();
-                    if bench {
-                        eprintln!("[startup_bench] main -> job_object:       {:>6.2} ms", t_job.as_secs_f64() * 1000.0);
-                        eprintln!("[startup_bench] main -> gpui_runtime:     {:>6.2} ms", t_gpui_run.as_secs_f64() * 1000.0);
-                        eprintln!("[startup_bench] main -> fonts_registered: {:>6.2} ms", t_fonts.as_secs_f64() * 1000.0);
-                        eprintln!("[startup_bench] main -> window_opened:    {:>6.2} ms", t_window_open.as_secs_f64() * 1000.0);
-                        eprintln!("[startup_bench] main -> app_initialized:  {:>6.2} ms", t_app_new.as_secs_f64() * 1000.0);
+        gpui_kit::open_window(options, cx, |window, cx| {
+            let t_window_open = t0.elapsed();
+            cx.new(|cx| {
+                let app = ChatApp::new(window, cx);
+                let t_app_new = t0.elapsed();
+                if bench {
+                    eprintln!(
+                        "[startup_bench] main -> job_object:       {:>6.2} ms",
+                        t_job.as_secs_f64() * 1000.0
+                    );
+                    eprintln!(
+                        "[startup_bench] main -> gpui_runtime:     {:>6.2} ms",
+                        t_gpui_run.as_secs_f64() * 1000.0
+                    );
+                    eprintln!(
+                        "[startup_bench] main -> fonts_registered: {:>6.2} ms",
+                        t_fonts.as_secs_f64() * 1000.0
+                    );
+                    eprintln!(
+                        "[startup_bench] main -> window_opened:    {:>6.2} ms",
+                        t_window_open.as_secs_f64() * 1000.0
+                    );
+                    eprintln!(
+                        "[startup_bench] main -> app_initialized:  {:>6.2} ms",
+                        t_app_new.as_secs_f64() * 1000.0
+                    );
+                }
+                // 延迟 1.5s 触发自动演示，避开启动阶段的窗口初始化。
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(1500)).await;
+                    let _ = this.update_in(cx, |app, window, cx| {
+                        // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
+                        // / restart（重启内核）
+                        // / rename、ask-delete、delete（对侧栏第 2 个会话）
+                        match std::env::var("CLAUDESKTOP_OPEN").as_deref() {
+                            Ok("settings") => app.open_settings(window, cx),
+                            Ok("fetch") => {
+                                app.open_settings(window, cx);
+                                app.fetch_models(true, cx);
+                            }
+                            // 侧栏第 2 行（第一个历史会话）：重命名 / 删除确认 / 直接删除
+                            Ok("rename") => app.start_rename(1, window, cx),
+                            Ok("ask-delete") => app.ask_delete(1, cx),
+                            Ok("delete") => app.delete_session(1, cx),
+                            Ok("restart") => {
+                                let kind = app.session().kernel;
+                                app.restart_kernel(kind, cx)
+                            }
+                            _ => {}
+                        }
+                        app.autodemo_hook(cx);
+                    });
+                    // 压测钩子：CLAUDESKTOP_STRESS=<行数>，灌数据后先滚到顶再滚回底（各 150 帧，每帧 16ms），
+                    // 把帧间隔统计写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）
+                    if let Some(n) = std::env::var("CLAUDESKTOP_STRESS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                    {
+                        let _ = this.update(cx, |app, cx| app.debug_stress(n, cx));
+                        cx.background_executor().timer(Duration::from_millis(1500)).await;
+                        let _ = this.update(cx, |app, _| app.frame_log = Some(Vec::new()));
+                        for step in 0..300 {
+                            let dy = if step < 150 { -400. } else { 400. };
+                            let _ = this.update(cx, |app, cx| app.debug_scroll(dy, cx));
+                            cx.background_executor().timer(Duration::from_millis(16)).await;
+                        }
+                        let _ = this.update(cx, |app, _| {
+                            let log = app.frame_log.take().unwrap_or_default();
+                            let mut gaps: Vec<f64> = log
+                                .windows(2)
+                                .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.)
+                                .collect();
+                            gaps.sort_by(|a, b| a.total_cmp(b));
+                            let pct = |p: f64| {
+                                gaps.get(((gaps.len() as f64 - 1.) * p) as usize)
+                                    .copied()
+                                    .unwrap_or(0.)
+                            };
+                            let report = format!(
+                                "rows={n} frames={} p50={:.1}ms p95={:.1}ms max={:.1}ms\n",
+                                log.len(),
+                                pct(0.5),
+                                pct(0.95),
+                                pct(1.0)
+                            );
+                            match std::env::var("CLAUDESKTOP_STRESS_OUT") {
+                                Ok(path) => {
+                                    let _ = std::fs::write(path, report);
+                                }
+                                Err(_) => eprint!("{report}"),
+                            }
+                        });
                     }
-                    // 延迟 1.5s 触发自动演示，避开启动阶段的窗口初始化。
-                    cx.spawn_in(window, async move |this, cx| {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(1500))
-                            .await;
-                        let _ = this.update_in(cx, |app, window, cx| {
-                                // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
-                                // / restart（重启内核）
-                                // / rename、ask-delete、delete（对侧栏第 2 个会话）
-                            match std::env::var("CLAUDESKTOP_OPEN").as_deref() {
-                                Ok("settings") => app.open_settings(window, cx),
-                                Ok("fetch") => {
-                                    app.open_settings(window, cx);
-                                    app.fetch_models(true, cx);
-                                }
-                                // 侧栏第 2 行（第一个历史会话）：重命名 / 删除确认 / 直接删除
-                                Ok("rename") => app.start_rename(1, window, cx),
-                                Ok("ask-delete") => app.ask_delete(1, cx),
-                                Ok("delete") => app.delete_session(1, cx),
-                                Ok("restart") => {
-                                    let kind = app.session().kernel;
-                                    app.restart_kernel(kind, cx)
-                                }
-                                _ => {}
-                            }
-                            app.autodemo_hook(cx);
+                    // 调试钩子：CLAUDESKTOP_RERUN = builtin / acp / demo，
+                    // 等 CLAUDESKTOP_RERUN_DELAY_MS（默认 10s）后把首条提示词放到该内核上重跑
+                    let rerun =
+                        std::env::var("CLAUDESKTOP_RERUN").ok().and_then(|v| match v.trim() {
+                            "builtin" => Some(KernelChoice::Builtin),
+                            "acp" => Some(KernelChoice::Acp),
+                            "demo" => Some(KernelChoice::Demo),
+                            _ => None,
                         });
-                        // 压测钩子：CLAUDESKTOP_STRESS=<行数>，灌数据后先滚到顶再滚回底（各 150 帧，每帧 16ms），
-                        // 把帧间隔统计写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）
-                        if let Some(n) = std::env::var("CLAUDESKTOP_STRESS")
+                    if let Some(kind) = rerun {
+                        let delay = std::env::var("CLAUDESKTOP_RERUN_DELAY_MS")
                             .ok()
-                            .and_then(|v| v.parse::<usize>().ok())
-                        {
-                            let _ = this.update(cx, |app, cx| app.debug_stress(n, cx));
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1500))
-                                .await;
-                            let _ = this.update(cx, |app, _| app.frame_log = Some(Vec::new()));
-                            for step in 0..300 {
-                                let dy = if step < 150 { -400. } else { 400. };
-                                let _ = this.update(cx, |app, cx| app.debug_scroll(dy, cx));
-                                cx.background_executor()
-                                    .timer(Duration::from_millis(16))
-                                    .await;
-                            }
-                            let _ = this.update(cx, |app, _| {
-                                let log = app.frame_log.take().unwrap_or_default();
-                                let mut gaps: Vec<f64> = log
-                                    .windows(2)
-                                    .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.)
-                                    .collect();
-                                gaps.sort_by(|a, b| a.total_cmp(b));
-                                let pct = |p: f64| {
-                                    gaps.get(((gaps.len() as f64 - 1.) * p) as usize).copied().unwrap_or(0.)
-                                };
-                                let report = format!(
-                                    "rows={n} frames={} p50={:.1}ms p95={:.1}ms max={:.1}ms\n",
-                                    log.len(),
-                                    pct(0.5),
-                                    pct(0.95),
-                                    pct(1.0)
-                                );
-                                match std::env::var("CLAUDESKTOP_STRESS_OUT") {
-                                    Ok(path) => {
-                                        let _ = std::fs::write(path, report);
-                                    }
-                                    Err(_) => eprint!("{report}"),
-                                }
-                            });
-                        }
-                        // 调试钩子：CLAUDESKTOP_RERUN = builtin / acp / demo，
-                        // 等 CLAUDESKTOP_RERUN_DELAY_MS（默认 10s）后把首条提示词放到该内核上重跑
-                        let rerun = std::env::var("CLAUDESKTOP_RERUN").ok().and_then(|v| {
-                            match v.trim() {
-                                "builtin" => Some(KernelChoice::Builtin),
-                                "acp" => Some(KernelChoice::Acp),
-                                "demo" => Some(KernelChoice::Demo),
-                                _ => None,
-                            }
-                        });
-                        if let Some(kind) = rerun {
-                            let delay = std::env::var("CLAUDESKTOP_RERUN_DELAY_MS")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(10_000);
-                            cx.background_executor()
-                                .timer(Duration::from_millis(delay))
-                                .await;
-                            let _ = this.update(cx, |app, cx| app.rerun_first_prompt(kind, cx));
-                        }
-                    })
-                    .detach();
-                    app
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(10_000);
+                        cx.background_executor().timer(Duration::from_millis(delay)).await;
+                        let _ = this.update(cx, |app, cx| app.rerun_first_prompt(kind, cx));
+                    }
                 })
+                .detach();
+                app
             })
-            .expect("Failed to open window");
-            cx.activate(true);
-        });
+        })
+        .expect("Failed to open window");
+        cx.activate(true);
+    });
 }

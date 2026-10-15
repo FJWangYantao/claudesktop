@@ -28,10 +28,10 @@ pub fn read_events(
         let line = line?;
         let line = line.strip_suffix('\r').unwrap_or(&line);
         if line.is_empty() {
-            if let Some(payload) = data.take() {
-                if dispatch(payload, &mut on_event)? {
-                    return Ok(true);
-                }
+            if let Some(payload) = data.take()
+                && dispatch(payload, &mut on_event)?
+            {
+                return Ok(true);
             }
             continue;
         }
@@ -78,10 +78,14 @@ mod tests {
 
     fn collect(input: &str) -> Vec<SseEvent> {
         let mut out = Vec::new();
-        read_events(input.as_bytes(), || false, |e| {
-            out.push(e);
-            Ok(())
-        })
+        read_events(
+            input.as_bytes(),
+            || false,
+            |e| {
+                out.push(e);
+                Ok(())
+            },
+        )
         .unwrap();
         out
     }
@@ -104,20 +108,21 @@ mod tests {
         let input = "event: x\ndata: line1\ndata:line2\n\ndata: tail";
         assert_eq!(
             collect(input),
-            vec![
-                SseEvent::Data("line1\nline2".into()),
-                SseEvent::Data("tail".into()),
-            ]
+            vec![SseEvent::Data("line1\nline2".into()), SseEvent::Data("tail".into()),]
         );
     }
 
     #[test]
     fn stop_flag_interrupts() {
         let mut n = 0;
-        let finished = read_events("data: 1\n\ndata: 2\n\n".as_bytes(), || {
-            n += 1;
-            n > 2
-        }, |_| Ok(()))
+        let finished = read_events(
+            "data: 1\n\ndata: 2\n\n".as_bytes(),
+            || {
+                n += 1;
+                n > 2
+            },
+            |_| Ok(()),
+        )
         .unwrap();
         assert!(!finished);
     }

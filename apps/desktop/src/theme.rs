@@ -1,6 +1,6 @@
 //! 色板、字体与字号阶梯（Claude 品牌基准：暖纸底 + 赤陶橙）。
 
-use gpui_kit::{px, relative, DefiniteLength, FontFallbacks, FontFeatures, Pixels, Rgba};
+use gpui_kit::{DefiniteLength, FontFallbacks, FontFeatures, Pixels, Rgba, px, relative};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------- 色板 ----------

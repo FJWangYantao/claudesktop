@@ -3,11 +3,11 @@
 //! Windows 的 hit-test 只看鼠标下的元素链里有没有 `Drag` 区：拖拽区包住的按钮
 //! 一律收不到点击。所以拖拽区只能是按钮的**兄弟**（填空白的 flex_1），不能当容器。
 
-use super::menu::{menu_action, menu_item, menu_popover, MenuChip};
 use super::ChatApp;
+use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
 use crate::model::ViewMode;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::tooltip::Tooltip;
@@ -66,11 +66,8 @@ pub(super) fn window_controls(window: &Window) -> Option<Div> {
             })
             .child(Icon::new(icon).small())
     };
-    let max_icon = if window.is_maximized() {
-        IconAll::WindowRestore
-    } else {
-        IconAll::WindowMaximize
-    };
+    let max_icon =
+        if window.is_maximized() { IconAll::WindowRestore } else { IconAll::WindowMaximize };
     Some(
         div()
             .h_flex()
@@ -133,16 +130,14 @@ impl ChatApp {
             .child(drag_area().pl_4().pr_2().child(crumb))
             // 视图模式（Ctrl+O 循环）：只在有对话时出现
             .when(can_export, |d| {
-                d.child(
-                    div().mr_1().child(menu_popover(
-                        "view-menu",
-                        Anchor::TopRight,
-                        px(280.),
-                        &cx.entity(),
-                        MenuChip::new(view.icon(), view.label()),
-                        view_menu_items,
-                    )),
-                )
+                d.child(div().mr_1().child(menu_popover(
+                    "view-menu",
+                    Anchor::TopRight,
+                    px(280.),
+                    &cx.entity(),
+                    MenuChip::new(view.icon(), view.label()),
+                    view_menu_items,
+                )))
             })
             .when(can_export, |d| {
                 d.child(
@@ -167,11 +162,7 @@ impl ChatApp {
 }
 
 /// 视图模式条目：摘要 / 标准 / 详细，末尾提示快捷键。
-fn view_menu_items(
-    app: &ChatApp,
-    handle: &Entity<ChatApp>,
-    popover: &Entity<PopoverState>,
-) -> Div {
+fn view_menu_items(app: &ChatApp, handle: &Entity<ChatApp>, popover: &Entity<PopoverState>) -> Div {
     let current = app.settings.view_mode;
     let mut menu = div().v_flex().gap_0p5();
     for (i, mode) in ViewMode::ALL.into_iter().enumerate() {

@@ -20,8 +20,8 @@ mod fetch;
 mod history;
 mod instructions;
 mod openai;
-mod provider;
 mod permissions;
+mod provider;
 mod sse;
 mod tools;
 
@@ -203,10 +203,7 @@ enum Verdict {
 
 impl Inner {
     fn emit(&self, session: Option<&str>, event: KernelEvent) {
-        (self.sink)(RoutedEvent {
-            session: session.map(str::to_owned),
-            event,
-        });
+        (self.sink)(RoutedEvent { session: session.map(str::to_owned), event });
     }
 
     /// 本步要发给模型的消息、当前模式、工作目录与模型；会话已不存在返回 None。
@@ -225,12 +222,7 @@ impl Inner {
         windows
             .get(model)
             .copied()
-            .or_else(|| {
-                windows
-                    .iter()
-                    .find(|(id, _)| name(id) == name(model))
-                    .map(|(_, n)| *n)
-            })
+            .or_else(|| windows.iter().find(|(id, _)| name(id) == name(model)).map(|(_, n)| *n))
             .filter(|w| *w > 0)
     }
 
@@ -274,9 +266,7 @@ impl Inner {
         let stopped = || flag.load(Ordering::SeqCst);
         let (history, previous) = {
             let sessions = self.sessions.lock().unwrap();
-            let state = sessions
-                .get(session)
-                .ok_or_else(|| anyhow::anyhow!("会话已关闭"))?;
+            let state = sessions.get(session).ok_or_else(|| anyhow::anyhow!("会话已关闭"))?;
             (state.history.clone(), state.summary.clone())
         };
         let Some(split) = compact::split(&history, keep_budget, idle) else {
@@ -314,13 +304,7 @@ impl Inner {
             state.measured = None;
             state.estimate_tokens()
         };
-        self.emit(
-            Some(session),
-            KernelEvent::Compacted {
-                summary,
-                context_tokens,
-            },
-        );
+        self.emit(Some(session), KernelEvent::Compacted { summary, context_tokens });
         Ok(Some(usage.unwrap_or_default()))
     }
 
@@ -338,29 +322,25 @@ impl Inner {
         loop {
             let request = compact::summary_request(previous, &compact::transcript(head, max_bytes));
             let mut text = String::new();
-            let result = self.provider.stream_chat(model, &request, &[], stopped, &mut |event| {
-                match event {
-                    StreamEvent::Text(t) => text.push_str(&t),
-                    StreamEvent::Reasoning(_) => {}
-                    StreamEvent::Retrying {
-                        status,
-                        attempt,
-                        delay_ms,
-                        reason,
-                    } => self.emit(
-                        Some(session),
-                        KernelEvent::Retrying {
-                            status,
-                            attempt,
-                            delay_ms,
-                            reason,
-                        },
-                    ),
-                }
-            });
+            let result =
+                self.provider.stream_chat(
+                    model,
+                    &request,
+                    &[],
+                    stopped,
+                    &mut |event| match event {
+                        StreamEvent::Text(t) => text.push_str(&t),
+                        StreamEvent::Reasoning(_) => {}
+                        StreamEvent::Retrying { status, attempt, delay_ms, reason } => self.emit(
+                            Some(session),
+                            KernelEvent::Retrying { status, attempt, delay_ms, reason },
+                        ),
+                    },
+                );
             match result {
                 Err(err)
-                    if attempt < 2 && claudesktop_core::is_context_overflow(&format!("{err:#}")) =>
+                    if attempt < 2
+                        && claudesktop_core::is_context_overflow(&format!("{err:#}")) =>
                 {
                     attempt += 1;
                     max_bytes /= 2;
@@ -402,10 +382,10 @@ impl Inner {
 
     /// 本轮结束：清掉自己的标志（取消后可能已经开始了新的一轮）。
     fn finish(&self, session: &str, flag: &Arc<AtomicBool>) {
-        if let Some(state) = self.sessions.lock().unwrap().get_mut(session) {
-            if state.turn.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag)) {
-                state.turn = None;
-            }
+        if let Some(state) = self.sessions.lock().unwrap().get_mut(session)
+            && state.turn.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag))
+        {
+            state.turn = None;
         }
     }
 
@@ -455,18 +435,23 @@ impl Inner {
             } else {
                 let (group, tail) = rest.split_at(n);
                 // 先按顺序报出全部工具行，界面上的顺序和模型的调用顺序一致
-                let started: Vec<_> = group.iter().map(|c| self.start_tool(session, cwd, c)).collect();
+                let started: Vec<_> =
+                    group.iter().map(|c| self.start_tool(session, cwd, c)).collect();
                 outputs.extend(std::thread::scope(|s| {
                     let handles: Vec<_> = group
                         .iter()
                         .zip(started)
                         .map(|(call, (action, title))| {
-                            s.spawn(move || self.finish_tool(session, cwd, call, action, &title, stopped))
+                            s.spawn(move || {
+                                self.finish_tool(session, cwd, call, action, &title, stopped)
+                            })
                         })
                         .collect();
                     handles
                         .into_iter()
-                        .map(|h| h.join().unwrap_or_else(|_| ToolOutput::fail("tool crashed", "出错")))
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| ToolOutput::fail("tool crashed", "出错"))
+                        })
                         .collect::<Vec<_>>()
                 }));
                 rest = tail;
@@ -479,7 +464,12 @@ impl Inner {
     }
 
     /// 解析调用并报出工具行（改动类先带上 diff 预览）。
-    fn start_tool(&self, session: &str, cwd: &Path, call: &ToolCall) -> (Result<Action, String>, String) {
+    fn start_tool(
+        &self,
+        session: &str,
+        cwd: &Path,
+        call: &ToolCall,
+    ) -> (Result<Action, String>, String) {
         let action = Action::parse(&call.function.name, &call.function.arguments, cwd);
         let (title, kind) = match &action {
             Ok(a) => (a.title(cwd), a.kind()),
@@ -496,13 +486,7 @@ impl Inner {
         );
         // 改动预览：先于权限请求发出，用户能看着 diff 决定是否放行
         if let Some(diff) = action.as_ref().ok().and_then(|a| a.preview(cwd)) {
-            self.emit(
-                Some(session),
-                KernelEvent::ToolCallDiff {
-                    id: call.id.clone(),
-                    diff,
-                },
-            );
+            self.emit(Some(session), KernelEvent::ToolCallDiff { id: call.id.clone(), diff });
         }
         (action, title)
     }
@@ -588,17 +572,14 @@ impl Inner {
             Action::Shell { command, .. } => Some(command.as_str()),
             _ => None,
         };
-        if let Some(rule) = &rule {
-            if self.rules.lock().unwrap().allows(cwd, rule, command) {
-                return Verdict::Allow;
-            }
+        if let Some(rule) = &rule
+            && self.rules.lock().unwrap().allows(cwd, rule, command)
+        {
+            return Verdict::Allow;
         }
 
-        let option = |id: &str, name: String| PermissionOptionView {
-            id: id.into(),
-            name,
-            kind: id.into(),
-        };
+        let option =
+            |id: &str, name: String| PermissionOptionView { id: id.into(), name, kind: id.into() };
         let mut options = vec![option("allow_once", "允许一次".into())];
         if let Some(rule) = &rule {
             let name = if let Some(prefix) = rule.strip_prefix("shell:") {
@@ -615,10 +596,10 @@ impl Inner {
         match self.ask(session, title, options, stopped).as_deref() {
             Some("allow_once") => Verdict::Allow,
             Some("allow_always") => {
-                if let Some(rule) = rule {
-                    if let Err(e) = self.rules.lock().unwrap().add(cwd, rule) {
-                        self.emit(None, KernelEvent::Status(format!("保存权限规则失败: {e}")));
-                    }
+                if let Some(rule) = rule
+                    && let Err(e) = self.rules.lock().unwrap().add(cwd, rule)
+                {
+                    self.emit(None, KernelEvent::Status(format!("保存权限规则失败: {e}")));
                 }
                 Verdict::Allow
             }
@@ -643,11 +624,7 @@ impl Inner {
         self.pending.lock().unwrap().insert(id, tx);
         self.emit(
             Some(session),
-            KernelEvent::PermissionRequest {
-                id,
-                title: title.to_string(),
-                options,
-            },
+            KernelEvent::PermissionRequest { id, title: title.to_string(), options },
         );
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -684,10 +661,7 @@ impl BuiltinKernel {
             pending: Mutex::default(),
             next_request: AtomicU64::new(1),
         });
-        inner.emit(
-            None,
-            KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)),
-        );
+        inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
         Ok(Self { inner })
     }
@@ -807,27 +781,25 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     for _ in 0..MAX_STEPS {
         // 用量快到窗口：先压缩再请求
         if !just_compacted {
-            if let Some((model, window)) = inner
-                .model_of(&session)
-                .and_then(|m| inner.window(&m).map(|w| (m, w)))
+            if let Some((model, window)) =
+                inner.model_of(&session).and_then(|m| inner.window(&m).map(|w| (m, w)))
+                && inner.context_estimate(&session) * 100 >= window * compact::AUTO_COMPACT_PERCENT
             {
-                if inner.context_estimate(&session) * 100 >= window * compact::AUTO_COMPACT_PERCENT {
-                    match inner.compact(
-                        &session,
-                        &flag,
-                        &model,
-                        false,
-                        window * compact::KEEP_PERCENT / 100,
-                        transcript_budget(Some(window)),
-                    ) {
-                        Ok(Some(u)) => usage.get_or_insert_default().add(u),
-                        Ok(None) => {}
-                        // 压缩失败（已报给界面）就带着原样的上下文接着请求
-                        Err(_) if !stopped() => {}
-                        Err(_) => return,
-                    }
-                    just_compacted = true;
+                match inner.compact(
+                    &session,
+                    &flag,
+                    &model,
+                    false,
+                    window * compact::KEEP_PERCENT / 100,
+                    transcript_budget(Some(window)),
+                ) {
+                    Ok(Some(u)) => usage.get_or_insert_default().add(u),
+                    Ok(None) => {}
+                    // 压缩失败（已报给界面）就带着原样的上下文接着请求
+                    Err(_) if !stopped() => {}
+                    Err(_) => return,
                 }
+                just_compacted = true;
             }
         } else {
             just_compacted = false;
@@ -837,9 +809,8 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
         };
         let specs = tools::specs(mode != MODE_PLAN);
         let mut text = String::new();
-        let result = inner
-            .provider
-            .stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
+        let result =
+            inner.provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
                 if stopped() {
                     return;
                 }
@@ -851,19 +822,9 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
                     StreamEvent::Reasoning(t) => {
                         inner.emit(Some(&session), KernelEvent::AgentThoughtChunk { text: t })
                     }
-                    StreamEvent::Retrying {
-                        status,
-                        attempt,
-                        delay_ms,
-                        reason,
-                    } => inner.emit(
+                    StreamEvent::Retrying { status, attempt, delay_ms, reason } => inner.emit(
                         Some(&session),
-                        KernelEvent::Retrying {
-                            status,
-                            attempt,
-                            delay_ms,
-                            reason,
-                        },
+                        KernelEvent::Retrying { status, attempt, delay_ms, reason },
                     ),
                 }
             });
@@ -881,7 +842,14 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
                     let keep = window.unwrap_or_else(|| compact::estimate_tokens(&messages))
                         * compact::KEEP_PERCENT
                         / 100;
-                    match inner.compact(&session, &flag, &model, false, keep, transcript_budget(window)) {
+                    match inner.compact(
+                        &session,
+                        &flag,
+                        &model,
+                        false,
+                        keep,
+                        transcript_budget(window),
+                    ) {
                         Ok(Some(u)) => {
                             usage.get_or_insert_default().add(u);
                             just_compacted = true;
@@ -984,12 +952,15 @@ impl Kernel for BuiltinKernel {
         Ok(())
     }
 
-    fn send_prompt(&self, session: &str, prompt: claudesktop_core::UserPrompt) -> anyhow::Result<()> {
+    fn send_prompt(
+        &self,
+        session: &str,
+        prompt: claudesktop_core::UserPrompt,
+    ) -> anyhow::Result<()> {
         let flag = {
             let mut sessions = self.inner.sessions.lock().unwrap();
-            let state = sessions
-                .get_mut(session)
-                .ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+            let state =
+                sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
             if state.turn.is_some() {
                 anyhow::bail!("上一轮还没结束");
             }
@@ -999,10 +970,7 @@ impl Kernel for BuiltinKernel {
             // 文本 + 图片附件合成一条多段用户消息
             let mut parts = vec![ContentPart::Text(prompt.text)];
             for image in prompt.images {
-                parts.push(ContentPart::Image {
-                    media_type: image.media_type,
-                    data: image.data,
-                });
+                parts.push(ContentPart::Image { media_type: image.media_type, data: image.data });
             }
             state.history.push(ChatMessage::with_parts("user", parts));
             let flag = Arc::new(AtomicBool::new(false));
@@ -1031,12 +999,8 @@ impl Kernel for BuiltinKernel {
             }
         };
         if cancelled {
-            self.inner.emit(
-                Some(session),
-                KernelEvent::TurnEnded {
-                    stop_reason: "cancelled".into(),
-                },
-            );
+            self.inner
+                .emit(Some(session), KernelEvent::TurnEnded { stop_reason: "cancelled".into() });
         }
         Ok(())
     }
@@ -1057,9 +1021,8 @@ impl Kernel for BuiltinKernel {
             anyhow::bail!("未知模式 {mode_id}");
         }
         let mut sessions = self.inner.sessions.lock().unwrap();
-        let state = sessions
-            .get_mut(session)
-            .ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+        let state =
+            sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
         state.mode = mode_id.to_string();
         Ok(())
     }
@@ -1070,9 +1033,8 @@ impl Kernel for BuiltinKernel {
             anyhow::bail!("模型 ID 为空");
         }
         let mut sessions = self.inner.sessions.lock().unwrap();
-        let state = sessions
-            .get_mut(session)
-            .ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+        let state =
+            sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
         // 进行中的一轮用完当前模型，下一步请求起生效
         state.model = model.to_string();
         *self.inner.default_model.lock().unwrap() = model.to_string();
@@ -1087,9 +1049,8 @@ impl Kernel for BuiltinKernel {
     fn compact(&self, session: &str) -> anyhow::Result<()> {
         let (flag, model) = {
             let mut sessions = self.inner.sessions.lock().unwrap();
-            let state = sessions
-                .get_mut(session)
-                .ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+            let state =
+                sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
             if state.turn.is_some() {
                 anyhow::bail!("这一轮还没结束");
             }
@@ -1126,9 +1087,7 @@ impl Kernel for BuiltinKernel {
                 // 失败已经以 CompactFailed 报过，这一轮照常结束
                 inner.emit(
                     Some(&session),
-                    KernelEvent::TurnEnded {
-                        stop_reason: "end_turn".into(),
-                    },
+                    KernelEvent::TurnEnded { stop_reason: "end_turn".into() },
                 );
             })
             .map_err(|e| anyhow::anyhow!("spawn compact thread: {e}"))?;

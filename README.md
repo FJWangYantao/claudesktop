@@ -94,4 +94,12 @@ cargo test -p claudesktop-builtin -- --ignored
 apps/desktop   # UI 壳（gpui-kit）
 crates/core    # 会话编排层：Kernel trait + KernelEvent（M1）
 crates/builtin # 自研内核（进程内）：OpenAI 兼容 provider、工具循环、权限规则（M2）
+tools          # 调试与接入工具（截图脚本、mock agent），见下
 ```
+
+## tools
+
+| 文件 | 用途 |
+|---|---|
+| [tools/shot.ps1](./tools/shot.ps1) | 抓窗口截图，改完 UI 后自检渲染 |
+| [tools/mock-acp-agent.mjs](./tools/mock-acp-agent.mjs) | mock ACP agent，跑内核事件链测试 |

@@ -28,7 +28,9 @@ fn serve(script: Vec<Reply>) -> (String, Arc<Mutex<Vec<String>>>) {
     let seen = bodies.clone();
     std::thread::spawn(move || {
         for reply in script {
-            let Ok((stream, _)) = listener.accept() else { return };
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
             let body = read_request(&stream);
             seen.lock().unwrap().push(body);
             let _ = respond(stream, reply);
@@ -133,7 +135,11 @@ impl Harness {
     }
 
     /// 带上下文窗口（自动压缩用）。
-    fn with_windows(provider: ProviderConfig, cwd: PathBuf, context_windows: HashMap<String, u64>) -> Self {
+    fn with_windows(
+        provider: ProviderConfig,
+        cwd: PathBuf,
+        context_windows: HashMap<String, u64>,
+    ) -> Self {
         let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
         let sink: EventSink = {
             let events = events.clone();
@@ -169,7 +175,11 @@ impl Harness {
     fn wait(&self, what: &str, pred: impl Fn(&KernelEvent) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.events.lock().unwrap().iter().any(|r| pred(&r.event)) {
-            assert!(Instant::now() < deadline, "timeout waiting for {what}: {:?}", self.events.lock().unwrap());
+            assert!(
+                Instant::now() < deadline,
+                "timeout waiting for {what}: {:?}",
+                self.events.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -205,17 +215,26 @@ fn streams_reasoning_text_usage_and_ends_turn() {
     assert_eq!(
         h.count(|e| matches!(
             e,
-            KernelEvent::UsageUpdated { input_tokens: 6, output_tokens: 14, reasoning_tokens: 8, context_tokens: 20, cache_read_tokens: 0 }
+            KernelEvent::UsageUpdated {
+                input_tokens: 6,
+                output_tokens: 14,
+                reasoning_tokens: 8,
+                context_tokens: 20,
+                cache_read_tokens: 0
+            }
         )),
         1
     );
     assert_eq!(
-        h.count(|e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn")),
+        h.count(
+            |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn")
+        ),
         1
     );
     // 所有会话事件都带 sessionId
     assert!(h.events.lock().unwrap().iter().all(|r| match r.event {
-        KernelEvent::AgentMessageChunk { .. } | KernelEvent::TurnEnded { .. } => r.session.as_deref() == Some(sid.as_str()),
+        KernelEvent::AgentMessageChunk { .. } | KernelEvent::TurnEnded { .. } =>
+            r.session.as_deref() == Some(sid.as_str()),
         _ => true,
     }));
     let body: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
@@ -243,7 +262,13 @@ fn history_carries_into_next_turn() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| format!("{}:{}", m["role"].as_str().unwrap(), m["content"].as_str().unwrap().chars().take(3).collect::<String>()))
+        .map(|m| {
+            format!(
+                "{}:{}",
+                m["role"].as_str().unwrap(),
+                m["content"].as_str().unwrap().chars().take(3).collect::<String>()
+            )
+        })
         .collect();
     assert_eq!(roles[1..], ["user:第一问", "assistant:第一答", "user:第二问"]);
 }
@@ -318,7 +343,9 @@ fn cancel_stops_events_immediately() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(h.count(|_| true), after_cancel, "no events after cancel");
     assert_eq!(
-        h.count(|e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "cancelled")),
+        h.count(
+            |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "cancelled")
+        ),
         1
     );
     // 取消后立即可以开始新的一轮（不会报「上一轮还没结束」）
@@ -347,7 +374,8 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> Reply {
 }
 
 fn workdir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("claudesktop-kernel-{}-{name}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("claudesktop-kernel-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -357,14 +385,20 @@ impl Harness {
     fn wait_n(&self, what: &str, n: usize, pred: impl Fn(&KernelEvent) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while self.count(&pred) < n {
-            assert!(Instant::now() < deadline, "timeout waiting for {what}: {:?}", self.events.lock().unwrap());
+            assert!(
+                Instant::now() < deadline,
+                "timeout waiting for {what}: {:?}",
+                self.events.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
     /// 第 n 个（从 1 起）权限请求：(请求 ID, 选项 ID 列表)
     fn permission(&self, n: usize) -> (u64, Vec<String>) {
-        self.wait_n("permission request", n, |e| matches!(e, KernelEvent::PermissionRequest { .. }));
+        self.wait_n("permission request", n, |e| {
+            matches!(e, KernelEvent::PermissionRequest { .. })
+        });
         self.events
             .lock()
             .unwrap()
@@ -381,7 +415,9 @@ impl Harness {
 
     fn tool_status(&self, id: &str) -> Option<String> {
         self.events.lock().unwrap().iter().rev().find_map(|r| match &r.event {
-            KernelEvent::ToolCallUpdated { id: i, status: Some(s), .. } if i == id => Some(s.clone()),
+            KernelEvent::ToolCallUpdated { id: i, status: Some(s), .. } if i == id => {
+                Some(s.clone())
+            }
             _ => None,
         })
     }
@@ -414,8 +450,26 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
 
     // 第一步带工具定义；第二步历史里是 assistant(tool_calls) + tool 结果
     let first = body(&bodies, 0);
-    let names: Vec<_> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names, ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "write_file", "edit_file", "shell"]);
+    let names: Vec<_> = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "read_file",
+            "list_dir",
+            "glob",
+            "todo_write",
+            "grep",
+            "web_fetch",
+            "write_file",
+            "edit_file",
+            "shell"
+        ]
+    );
     let second = body(&bodies, 1);
     let msgs = second["messages"].as_array().unwrap();
     let n = msgs.len();
@@ -433,10 +487,12 @@ fn tool_calls(calls: &[(&str, &str, serde_json::Value)]) -> Reply {
     let calls: Vec<_> = calls
         .iter()
         .enumerate()
-        .map(|(i, (id, name, args))| serde_json::json!({
-            "index": i, "id": id, "type": "function",
-            "function": { "name": name, "arguments": args.to_string() }
-        }))
+        .map(|(i, (id, name, args))| {
+            serde_json::json!({
+                "index": i, "id": id, "type": "function",
+                "function": { "name": name, "arguments": args.to_string() }
+            })
+        })
         .collect();
     let chunk = serde_json::json!({
         "choices": [{ "index": 0, "delta": { "tool_calls": calls }, "finish_reason": null }]
@@ -476,13 +532,20 @@ fn consecutive_reads_run_together_and_results_keep_call_order() {
         .iter()
         .filter_map(|r| match &r.event {
             KernelEvent::ToolCallStarted { id, .. } => Some(format!("start:{id}")),
-            KernelEvent::ToolCallUpdated { id, status: Some(s), .. } if s != "pending" => Some(format!("{s}:{id}")),
+            KernelEvent::ToolCallUpdated { id, status: Some(s), .. } if s != "pending" => {
+                Some(format!("{s}:{id}"))
+            }
             _ => None,
         })
         .collect();
-    let pos = |s: &str| order.iter().position(|o| o == s).unwrap_or_else(|| panic!("{s} missing: {order:?}"));
+    let pos = |s: &str| {
+        order.iter().position(|o| o == s).unwrap_or_else(|| panic!("{s} missing: {order:?}"))
+    };
     assert!(pos("start:r2") < pos("in_progress:r1"), "{order:?}");
-    assert!(pos("completed:r1") < pos("start:w") && pos("completed:r2") < pos("start:w"), "{order:?}");
+    assert!(
+        pos("completed:r1") < pos("start:w") && pos("completed:r2") < pos("start:w"),
+        "{order:?}"
+    );
     assert!(pos("completed:w") < pos("start:r3"), "{order:?}");
     assert_eq!(h.tool_status("r3").as_deref(), Some("completed"));
 
@@ -492,11 +555,15 @@ fn consecutive_reads_run_together_and_results_keep_call_order() {
         .unwrap()
         .iter()
         .filter(|m| m["role"] == "tool")
-        .map(|m| (m["tool_call_id"].as_str().unwrap().into(), m["content"].as_str().unwrap().into()))
+        .map(|m| {
+            (m["tool_call_id"].as_str().unwrap().into(), m["content"].as_str().unwrap().into())
+        })
         .collect();
     let ids: Vec<_> = results.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(ids, ["r1", "r2", "w", "r3"]);
-    assert!(results[0].1.contains("AAA") && results[1].1.contains("BBB") && results[3].1.contains('C'));
+    assert!(
+        results[0].1.contains("AAA") && results[1].1.contains("BBB") && results[3].1.contains('C')
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -565,7 +632,11 @@ fn edit_previews_diff_before_asking() {
     let dir = workdir("diff");
     std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
     let (base, _bodies) = serve(vec![
-        tool_call("e1", "edit_file", serde_json::json!({ "path": "a.txt", "old_string": "two", "new_string": "2" })),
+        tool_call(
+            "e1",
+            "edit_file",
+            serde_json::json!({ "path": "a.txt", "old_string": "two", "new_string": "2" }),
+        ),
         happy_stream("不改了"),
     ]);
     let h = Harness::with_cwd(base, dir.clone());
@@ -575,11 +646,15 @@ fn edit_previews_diff_before_asking() {
     {
         let events = h.events.lock().unwrap();
         let pos = |pred: &dyn Fn(&KernelEvent) -> bool| events.iter().position(|r| pred(&r.event));
-        let diff_at = pos(&|e| matches!(e, KernelEvent::ToolCallDiff { id, .. } if id == "e1")).expect("diff");
+        let diff_at = pos(&|e| matches!(e, KernelEvent::ToolCallDiff { id, .. } if id == "e1"))
+            .expect("diff");
         let ask_at = pos(&|e| matches!(e, KernelEvent::PermissionRequest { .. })).unwrap();
         assert!(diff_at < ask_at, "diff 应先于权限请求");
         let KernelEvent::ToolCallDiff { diff, .. } = &events[diff_at].event else { unreachable!() };
-        assert_eq!((diff.path.as_str(), diff.added, diff.removed, diff.created), ("a.txt", 1, 1, false));
+        assert_eq!(
+            (diff.path.as_str(), diff.added, diff.removed, diff.created),
+            ("a.txt", 1, 1, false)
+        );
         let tags: String = diff.lines.iter().map(|l| l.tag).collect();
         assert_eq!(tags, " -+ ");
     }
@@ -631,7 +706,12 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
     assert_eq!(h.tool_status("p1").as_deref(), Some("failed"));
     assert!(!dir.join("x.txt").exists());
     let first = body(&bodies, 0);
-    let names: Vec<_> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+    let names: Vec<_> = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
     assert_eq!(names, ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch"]);
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -658,7 +738,9 @@ fn serve_page(html: &'static str) -> String {
 #[test]
 fn web_fetch_asks_per_host_even_in_plan_mode_and_converts_html() {
     let dir = workdir("fetch");
-    let page = serve_page("<html><head><title>文档</title></head><body><h2>安装</h2><p>运行 <code>cargo add x</code></p></body></html>");
+    let page = serve_page(
+        "<html><head><title>文档</title></head><body><h2>安装</h2><p>运行 <code>cargo add x</code></p></body></html>",
+    );
     let (base, bodies) = serve(vec![
         tool_call("f1", "web_fetch", serde_json::json!({ "url": format!("{page}/docs") })),
         happy_stream("看完了"),
@@ -681,7 +763,10 @@ fn web_fetch_asks_per_host_even_in_plan_mode_and_converts_html() {
     let second = body(&bodies, 1);
     let msgs = second["messages"].as_array().unwrap();
     let result = msgs[msgs.len() - 1]["content"].as_str().unwrap();
-    assert!(result.contains("Title: 文档") && result.contains("## 安装\n\n运行 `cargo add x`"), "{result}");
+    assert!(
+        result.contains("Title: 文档") && result.contains("## 安装\n\n运行 `cargo add x`"),
+        "{result}"
+    );
 
     // 同一主机已总是允许：不再询问
     h.kernel.send_prompt(&sid, UserPrompt::text("再看一页")).unwrap();
@@ -694,7 +779,11 @@ fn web_fetch_asks_per_host_even_in_plan_mode_and_converts_html() {
 #[test]
 fn cancel_while_waiting_for_permission() {
     let dir = workdir("cancel-perm");
-    let (base, _) = serve(vec![tool_call("c1", "write_file", serde_json::json!({ "path": "x.txt", "content": "x" }))]);
+    let (base, _) = serve(vec![tool_call(
+        "c1",
+        "write_file",
+        serde_json::json!({ "path": "x.txt", "content": "x" }),
+    )]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
     h.kernel.send_prompt(&sid, UserPrompt::text("写")).unwrap();
@@ -718,7 +807,10 @@ fn bad_arguments_fail_the_call_not_the_turn() {
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
     h.kernel.send_prompt(&sid, UserPrompt::text("读")).unwrap();
-    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn"));
+    h.wait(
+        "turn end",
+        |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn"),
+    );
     assert_eq!(h.tool_status("b1").as_deref(), Some("failed"));
     let second = body(&bodies, 1);
     let last = second["messages"].as_array().unwrap().last().unwrap().clone();
@@ -784,7 +876,9 @@ fn reply_with_usage(answer: &str, prompt_tokens: u64) -> Reply {
         lines: vec![
             delta("content", answer),
             finish("stop"),
-            format!(r#"data: {{"choices":[],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":10}}}}"#),
+            format!(
+                r#"data: {{"choices":[],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":10}}}}"#
+            ),
             "data: [DONE]".into(),
         ],
         gap_ms: 5,
@@ -796,7 +890,8 @@ fn conversation(bodies: &Arc<Mutex<Vec<String>>>, i: usize) -> (String, Vec<Stri
     let b = body(bodies, i);
     let msgs = b["messages"].as_array().unwrap();
     let system = msgs[0]["content"].as_str().unwrap_or_default().to_string();
-    let rest = msgs[1..].iter().map(|m| m["content"].as_str().unwrap_or_default().to_string()).collect();
+    let rest =
+        msgs[1..].iter().map(|m| m["content"].as_str().unwrap_or_default().to_string()).collect();
     (system, rest)
 }
 
@@ -848,7 +943,10 @@ fn compacts_before_the_request_when_context_is_nearly_full() {
 fn context_overflow_error_compacts_and_resends_once() {
     let (base, bodies) = serve(vec![
         happy_stream("第一轮的回答"),
-        Reply::Status(400, r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#),
+        Reply::Status(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#,
+        ),
         happy_stream("早先的摘要"),
         happy_stream("第二轮的回答"),
     ]);
@@ -869,7 +967,8 @@ fn context_overflow_error_compacts_and_resends_once() {
 
 #[test]
 fn manual_compact_summarizes_everything_and_ends_a_turn() {
-    let (base, bodies) = serve(vec![happy_stream("第一轮的回答"), happy_stream("全部的摘要"), happy_stream("好")]);
+    let (base, bodies) =
+        serve(vec![happy_stream("第一轮的回答"), happy_stream("全部的摘要"), happy_stream("好")]);
     let h = Harness::new(base);
     let sid = h.start();
     assert!(h.kernel.compact(&sid).is_err(), "空会话没什么可压");
@@ -879,7 +978,10 @@ fn manual_compact_summarizes_everything_and_ends_a_turn() {
     // 压缩期间不能发消息
     assert!(h.kernel.send_prompt(&sid, UserPrompt::text("插队")).is_err());
     h.wait_n("turn end", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    assert_eq!(h.count(|e| matches!(e, KernelEvent::Compacted { summary, .. } if summary == "全部的摘要")), 1);
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::Compacted { summary, .. } if summary == "全部的摘要")),
+        1
+    );
 
     h.kernel.send_prompt(&sid, UserPrompt::text("第二轮的问题")).unwrap();
     h.wait_n("turn end", 3, |e| matches!(e, KernelEvent::TurnEnded { .. }));
@@ -898,17 +1000,15 @@ fn live_endpoint_streams_a_reply() {
         let events = events.clone();
         Arc::new(move |e| events.lock().unwrap().push(e))
     };
-    let h = Harness {
-        kernel: BuiltinKernel::spawn(config, sink).unwrap(),
-        events,
-    };
+    let h = Harness { kernel: BuiltinKernel::spawn(config, sink).unwrap(), events };
     let sid = h.start();
-    h.kernel
-        .send_prompt(&sid, UserPrompt::text("用一句话介绍你自己，不超过 30 个字。"))
-        .unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("用一句话介绍你自己，不超过 30 个字。")).unwrap();
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        if h.count(|e| matches!(e, KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. })) > 0 {
+        if h.count(|e| {
+            matches!(e, KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. })
+        }) > 0
+        {
             break;
         }
         assert!(Instant::now() < deadline, "live turn timeout");
@@ -930,7 +1030,8 @@ fn live_endpoint_streams_a_reply() {
 #[test]
 #[ignore]
 fn live_endpoint_tool_loop() {
-    let mut config = BuiltinConfig::from_env().expect("需要 CLAUDESKTOP_BASE_URL / CLAUDESKTOP_MODEL");
+    let mut config =
+        BuiltinConfig::from_env().expect("需要 CLAUDESKTOP_BASE_URL / CLAUDESKTOP_MODEL");
     let dir = workdir("live");
     std::fs::write(dir.join("notes.txt"), "the secret number is 4217\n").unwrap();
     config.cwd = dir.clone();
@@ -940,10 +1041,7 @@ fn live_endpoint_tool_loop() {
         let events = events.clone();
         Arc::new(move |e| events.lock().unwrap().push(e))
     };
-    let h = Harness {
-        kernel: BuiltinKernel::spawn(config, sink).unwrap(),
-        events,
-    };
+    let h = Harness { kernel: BuiltinKernel::spawn(config, sink).unwrap(), events };
     let sid = h.start();
     h.kernel
         .send_prompt(
@@ -970,7 +1068,10 @@ fn live_endpoint_tool_loop() {
             h.kernel.resolve_permission(id, Some("allow_once".into())).unwrap();
             answered += 1;
         }
-        if h.count(|e| matches!(e, KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. })) > 0 {
+        if h.count(|e| {
+            matches!(e, KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. })
+        }) > 0
+        {
             break;
         }
         assert!(Instant::now() < deadline, "live turn timeout");
@@ -995,7 +1096,9 @@ fn resume_rebuilds_context_from_log() {
     let h = Harness::new(base);
     let log = vec![
         Record::User { text: "秘密是 42，记住".into(), images: Vec::new() },
-        Record::Event { event: KernelEvent::AgentMessageChunk { text: "好的，记住了。".into() } },
+        Record::Event {
+            event: KernelEvent::AgentMessageChunk { text: "好的，记住了。".into() }
+        },
         Record::Event { event: KernelEvent::TurnEnded { stop_reason: "end_turn".into() } },
     ];
     h.kernel.resume_session(1, "builtin-old-1", None, &log).unwrap();
@@ -1023,10 +1126,7 @@ fn resume_rebuilds_context_from_log() {
 
     // 空日志 = 普通新会话
     h.kernel.resume_session(2, "x", None, &[]).unwrap();
-    assert_eq!(
-        h.count(|e| matches!(e, KernelEvent::Started { token: 2, resumed: false, .. })),
-        1
-    );
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Started { token: 2, resumed: false, .. })), 1);
 }
 
 /// Anthropic 原生协议：思考 / 正文 / 用量 / stop_reason 映射 + 工具调用整圈。
@@ -1039,12 +1139,24 @@ fn anthropic_protocol_streams_and_runs_tools() {
     let first = Reply::Sse {
         lines: vec![
             acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#),
-            acme(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#),
-            acme(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想想"}}"#),
-            acme(r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#),
-            acme(r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"notes"}}"#),
-            acme(r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":".txt\"}"}}"#),
-            acme(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}"#),
+            acme(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想想"}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"notes"}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":".txt\"}"}}"#,
+            ),
+            acme(
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}"#,
+            ),
             acme(r#"{"type":"message_stop"}"#),
         ],
         gap_ms: 5,
@@ -1052,9 +1164,15 @@ fn anthropic_protocol_streams_and_runs_tools() {
     let second = Reply::Sse {
         lines: vec![
             acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":30}}}"#),
-            acme(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
-            acme(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"文件里是 77。"}}"#),
-            acme(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#),
+            acme(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"文件里是 77。"}}"#,
+            ),
+            acme(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+            ),
             acme(r#"{"type":"message_stop"}"#),
         ],
         gap_ms: 5,
@@ -1082,22 +1200,27 @@ fn anthropic_protocol_streams_and_runs_tools() {
     assert_eq!(
         h.count(|e| matches!(
             e,
-            KernelEvent::UsageUpdated { input_tokens: 39, output_tokens: 17, reasoning_tokens: 0, context_tokens: 35, cache_read_tokens: 0 }
+            KernelEvent::UsageUpdated {
+                input_tokens: 39,
+                output_tokens: 17,
+                reasoning_tokens: 0,
+                context_tokens: 35,
+                cache_read_tokens: 0
+            }
         )),
         1
     );
     assert_eq!(
-        h.count(|e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn")),
+        h.count(
+            |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn")
+        ),
         1
     );
     // 请求体：system 顶层抽出 + max_tokens 必填 + 工具结果合并进 user 轮
     let first = body(&bodies, 0);
     assert_eq!(first["model"], "claude-mock");
     assert_eq!(first["max_tokens"], 16384);
-    assert!(first["system"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("coding agent"));
+    assert!(first["system"][0]["text"].as_str().unwrap().contains("coding agent"));
     assert_eq!(first["messages"][0]["role"], "user");
     assert_eq!(first["messages"][0]["content"][0]["type"], "text");
     assert_eq!(first["messages"][0]["content"][0]["text"], "读 notes.txt");
@@ -1132,10 +1255,7 @@ fn image_prompt_reaches_wire() {
     assert_eq!(content[0]["type"], "text");
     assert_eq!(content[0]["text"], "看图");
     assert_eq!(content[1]["type"], "image_url");
-    assert_eq!(
-        content[1]["image_url"]["url"],
-        "data:image/png;base64,QUJD"
-    );
+    assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
 }
 
 /// Anthropic 原生协议下，图片走 `image` / `source.base64` 分段。
@@ -1147,15 +1267,22 @@ fn anthropic_image_prompt_reaches_wire() {
     let stream = Reply::Sse {
         lines: vec![
             acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#),
-            acme(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
-            acme(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"看到图了"}}"#),
-            acme(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#),
+            acme(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"看到图了"}}"#,
+            ),
+            acme(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+            ),
             acme(r#"{"type":"message_stop"}"#),
         ],
         gap_ms: 5,
     };
     let (base, bodies) = serve(vec![stream]);
-    let dir = std::env::temp_dir().join(format!("claudesktop-anthropic-img-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("claudesktop-anthropic-img-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let h = Harness::with_config(
         ProviderConfig {

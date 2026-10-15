@@ -9,8 +9,8 @@
 //! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）以及 `ACP_AGENT`。
 //! 设置页保存时写下的是当时界面上的值。
 
-use claudesktop_builtin::{BuiltinConfig, ModelInfo, Protocol, ProviderConfig, RequestParams};
 use crate::model::ViewMode;
+use claudesktop_builtin::{BuiltinConfig, ModelInfo, Protocol, ProviderConfig, RequestParams};
 use claudesktop_core::AcpKernelConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -110,10 +110,8 @@ impl ProviderProfile {
     /// 记下一次获取到的模型列表（连同窗口大小）。
     pub fn set_models(&mut self, models: &[ModelInfo]) {
         self.models = models.iter().map(|m| m.id.clone()).collect();
-        self.context_windows = models
-            .iter()
-            .filter_map(|m| Some((m.id.clone(), m.context_window?)))
-            .collect();
+        self.context_windows =
+            models.iter().filter_map(|m| Some((m.id.clone(), m.context_window?))).collect();
     }
 
     /// 某个模型的上下文窗口。顶栏显示的模型名可能只是 ID 的最后一段（`provider/name` → `name`），
@@ -147,17 +145,14 @@ impl<'de> Deserialize<'de> for BuiltinSettings {
                 #[serde(default)]
                 active: usize,
             },
-            Legacy(ProviderProfile),
+            // 旧档案比 New 分支小得多，Box 一层避免整个枚举被撑到 256 字节
+            Legacy(Box<ProviderProfile>),
         }
         Ok(match Raw::deserialize(d)? {
-            Raw::New { profiles, active } => Self {
-                active: active.min(profiles.len().saturating_sub(1)),
-                profiles,
-            },
-            Raw::Legacy(p) => Self {
-                profiles: vec![p],
-                active: 0,
-            },
+            Raw::New { profiles, active } => {
+                Self { active: active.min(profiles.len().saturating_sub(1)), profiles }
+            }
+            Raw::Legacy(p) => Self { profiles: vec![*p], active: 0 },
         })
     }
 }
@@ -174,8 +169,18 @@ pub fn preset_profiles() -> Vec<ProviderProfile> {
     vec![
         make("DeepSeek", Protocol::OpenAiCompat, "https://api.deepseek.com/v1", "deepseek-chat"),
         make("GLM 智谱", Protocol::OpenAiCompat, "https://open.bigmodel.cn/api/paas/v4", "glm-4.6"),
-        make("Kimi 月之暗面", Protocol::OpenAiCompat, "https://api.moonshot.cn/v1", "kimi-k2-0905-preview"),
-        make("Anthropic", Protocol::Anthropic, "https://api.anthropic.com/v1", "claude-sonnet-4-5-20250929"),
+        make(
+            "Kimi 月之暗面",
+            Protocol::OpenAiCompat,
+            "https://api.moonshot.cn/v1",
+            "kimi-k2-0905-preview",
+        ),
+        make(
+            "Anthropic",
+            Protocol::Anthropic,
+            "https://api.anthropic.com/v1",
+            "claude-sonnet-4-5-20250929",
+        ),
         make("OpenAI", Protocol::OpenAiCompat, "https://api.openai.com/v1", "gpt-4.1-mini"),
         make("OpenRouter", Protocol::OpenAiCompat, "https://openrouter.ai/api/v1", ""),
         make("Ollama 本地", Protocol::OpenAiCompat, "http://127.0.0.1:11434/v1", ""),
@@ -259,9 +264,7 @@ impl Appearance {
 impl Settings {
     /// 默认位置：`<数据目录>/settings.json`
     pub fn default_path() -> Option<PathBuf> {
-        claudesktop_core::default_data_dir()
-            .ok()
-            .map(|d| d.join("settings.json"))
+        claudesktop_core::default_data_dir().ok().map(|d| d.join("settings.json"))
     }
 
     /// 读取；文件不存在或损坏时返回默认值（损坏的原因放进第二项）。
@@ -311,11 +314,8 @@ impl Settings {
             };
         }
         // 请求参数覆盖（temperature / max_tokens / 额外 JSON 字段），写进当前档案
-        let param_names = [
-            "CLAUDESKTOP_TEMPERATURE",
-            "CLAUDESKTOP_MAX_TOKENS",
-            "CLAUDESKTOP_EXTRA_JSON",
-        ];
+        let param_names =
+            ["CLAUDESKTOP_TEMPERATURE", "CLAUDESKTOP_MAX_TOKENS", "CLAUDESKTOP_EXTRA_JSON"];
         if param_names.iter().any(|k| var(k).is_some()) {
             let p = self.builtin.current_mut();
             if let Some(v) = var("CLAUDESKTOP_TEMPERATURE").and_then(|v| v.parse::<f64>().ok()) {
@@ -324,7 +324,9 @@ impl Settings {
             if let Some(v) = var("CLAUDESKTOP_MAX_TOKENS").and_then(|v| v.parse::<u64>().ok()) {
                 p.params.max_tokens = Some(v);
             }
-            if let Some(v) = var("CLAUDESKTOP_EXTRA_JSON").and_then(|v| serde_json::from_str(&v).ok()) {
+            if let Some(v) =
+                var("CLAUDESKTOP_EXTRA_JSON").and_then(|v| serde_json::from_str(&v).ok())
+            {
                 p.params.extra = v;
             }
         }
@@ -422,14 +424,11 @@ impl BuiltinSettings {
 pub fn antigravity_gateway() -> Option<(String, String)> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let path = PathBuf::from(home).join(".antigravity_tools").join("gui_config.json");
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let proxy = value.get("proxy")?;
     let port = proxy.get("port").and_then(|p| p.as_u64()).unwrap_or(8045);
-    let key = proxy
-        .get("api_key")
-        .and_then(|k| k.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let key = proxy.get("api_key").and_then(|k| k.as_str()).unwrap_or_default().to_string();
     Some((format!("http://127.0.0.1:{port}/v1"), key))
 }
 
@@ -560,7 +559,8 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
-    fn presets_have_distinct_endpoints() {        let presets = preset_profiles();
+    fn presets_have_distinct_endpoints() {
+        let presets = preset_profiles();
         assert!(presets.len() >= 5);
         let urls: Vec<&str> = presets.iter().map(|p| p.base_url.as_str()).collect();
         let mut sorted = urls.clone();
@@ -575,7 +575,10 @@ mod tests {
     #[core::prelude::v1::test]
     fn kernel_of_history_and_slots() {
         assert_eq!(KernelChoice::of_agent("builtin:http://x/v1#m"), KernelChoice::Builtin);
-        assert_eq!(KernelChoice::of_agent("builtin:anthropic:http://x/v1#m"), KernelChoice::Builtin);
+        assert_eq!(
+            KernelChoice::of_agent("builtin:anthropic:http://x/v1#m"),
+            KernelChoice::Builtin
+        );
         assert_eq!(KernelChoice::of_agent("node mock.mjs"), KernelChoice::Acp);
         assert_eq!(KernelChoice::of_agent(""), KernelChoice::Demo);
         // 槽下标互不相同且都在 0..3

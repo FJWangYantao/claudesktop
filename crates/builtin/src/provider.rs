@@ -52,7 +52,9 @@ pub struct RequestParams {
 
 impl RequestParams {
     pub fn is_empty(&self) -> bool {
-        self.temperature.is_none() && self.max_tokens.is_none() && self.extra.as_object().is_none_or(|o| o.is_empty())
+        self.temperature.is_none()
+            && self.max_tokens.is_none()
+            && self.extra.as_object().is_none_or(|o| o.is_empty())
     }
 }
 
@@ -109,12 +111,7 @@ impl ChatMessage {
     }
 
     pub fn with_parts(role: &str, parts: Vec<ContentPart>) -> Self {
-        Self {
-            role: role.to_string(),
-            parts,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
+        Self { role: role.to_string(), parts, tool_calls: Vec::new(), tool_call_id: None }
     }
 
     /// 带工具调用的 assistant 消息（`text` 为同一步里模型说的话，可为空）
@@ -326,9 +323,7 @@ pub(crate) fn post_sse_with_retry(
         for (name, value) in headers {
             request = request.header(*name, value.as_str());
         }
-        let response = request
-            .send(body)
-            .map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
+        let response = request.send(body).map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
             return Ok(BufReader::new(response.into_body().into_reader()));
@@ -340,12 +335,7 @@ pub(crate) fn post_sse_with_retry(
         }
         let delay_ms = BACKOFF_MS[attempt];
         attempt += 1;
-        on_event(StreamEvent::Retrying {
-            status,
-            attempt,
-            delay_ms,
-            reason,
-        });
+        on_event(StreamEvent::Retrying { status, attempt, delay_ms, reason });
         std::thread::sleep(Duration::from_millis(delay_ms));
     }
 }
@@ -382,10 +372,10 @@ pub(crate) fn read_sse(
     on_data: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> anyhow::Result<bool> {
     crate::sse::read_events(reader, should_stop, |event| {
-        if let crate::sse::SseEvent::Data(payload) = event {
-            if let Err(message) = on_data(&payload) {
-                return Err(std::io::Error::other(message));
-            }
+        if let crate::sse::SseEvent::Data(payload) = event
+            && let Err(message) = on_data(&payload)
+        {
+            return Err(std::io::Error::other(message));
         }
         Ok(())
     })
@@ -419,10 +409,7 @@ mod tests {
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "看图");
         assert_eq!(content[1]["type"], "image_url");
-        assert_eq!(
-            content[1]["image_url"]["url"],
-            "data:image/png;base64,QUJD"
-        );
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
         // 文本段拼接
         assert_eq!(m.text().as_deref(), Some("看图"));
     }

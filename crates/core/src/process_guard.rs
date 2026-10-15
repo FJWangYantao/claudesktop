@@ -35,7 +35,9 @@ mod windows_impl {
 
     pub fn install() -> io::Result<()> {
         INSTALLED
-            .get_or_init(|| unsafe { create_and_assign() }.map_err(|e| e.raw_os_error().unwrap_or(-1)))
+            .get_or_init(|| {
+                unsafe { create_and_assign() }.map_err(|e| e.raw_os_error().unwrap_or(-1))
+            })
             .map_err(io::Error::from_raw_os_error)
     }
 

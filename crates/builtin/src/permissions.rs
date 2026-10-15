@@ -27,18 +27,13 @@ pub struct PermissionRules {
 
 /// 默认规则文件：数据目录下的 `permissions.json`。
 pub fn default_rules_path() -> Option<PathBuf> {
-    claudesktop_core::default_data_dir()
-        .ok()
-        .map(|d| d.join("permissions.json"))
+    claudesktop_core::default_data_dir().ok().map(|d| d.join("permissions.json"))
 }
 
 impl PermissionRules {
     /// 读取规则文件；不存在或损坏时从空规则开始。
     pub fn load(path: Option<PathBuf>) -> Self {
-        let mut rules = Self {
-            path,
-            data: FileFormat::default(),
-        };
+        let mut rules = Self { path, data: FileFormat::default() };
         rules.reload();
         rules
     }
@@ -140,7 +135,10 @@ mod tests {
         // 另一个实例（设置页）删掉规则：正在用的实例下次判断就看到
         let key = a.display().to_string();
         let mut other = PermissionRules::load(Some(file.clone()));
-        assert_eq!(other.list(), vec![(key.clone(), vec!["edit".to_string(), "shell:git status".to_string()])]);
+        assert_eq!(
+            other.list(),
+            vec![(key.clone(), vec!["edit".to_string(), "shell:git status".to_string()])]
+        );
         other.remove(&key, "edit").unwrap();
         assert!(!rules.allows(a, "edit", None));
         other.remove(&key, "shell:git status").unwrap();

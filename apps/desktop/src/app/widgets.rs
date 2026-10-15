@@ -1,8 +1,8 @@
 //! 小组件（chip / 顶部 tab / 分段按钮 / 消息操作按钮）。
 
 use super::ChatApp;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -16,17 +16,8 @@ impl ChatApp {
             .py_1()
             .rounded_md()
             .bg(rgb(SAND))
-            .child(
-                Icon::new(icon)
-                    .size_3p5()
-                    .text_color(rgb(INK_SOFT)),
-            )
-            .child(
-                div()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .child(label.into()),
-            )
+            .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
+            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(label.into()))
     }
 
     /// 消息下方的小操作按钮（复制 / 编辑 / 重跑）：图标 + 元信息字号文字，悬停出底色。

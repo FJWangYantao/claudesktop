@@ -32,7 +32,11 @@ pub fn trigger_at(text: &str, cursor: usize) -> Option<Trigger> {
     // `/指令` 占整个第一行（指令名后面可以跟空格和参数，如「/mode 计划」）
     if text.starts_with('/') && !before.contains('\n') {
         let end = text.find('\n').unwrap_or(text.len());
-        return Some(Trigger { kind: TriggerKind::Slash, range: 0..end, query: before[1..].to_string() });
+        return Some(Trigger {
+            kind: TriggerKind::Slash,
+            range: 0..end,
+            query: before[1..].to_string(),
+        });
     }
     let start = before
         .char_indices()
@@ -56,12 +60,16 @@ pub fn list_files(root: &Path, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut entries: Vec<_> = entries.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_dir() {
                 let skip = name.starts_with('.')
                     || SKIP.contains(&name.as_str())
@@ -69,12 +77,12 @@ pub fn list_files(root: &Path, limit: usize) -> Vec<String> {
                 if !skip {
                     stack.push(entry.path());
                 }
-            } else if kind.is_file() {
-                if let Ok(rel) = entry.path().strip_prefix(root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
-                    if out.len() >= limit {
-                        return out;
-                    }
+            } else if kind.is_file()
+                && let Ok(rel) = entry.path().strip_prefix(root)
+            {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+                if out.len() >= limit {
+                    return out;
                 }
             }
         }
@@ -144,11 +152,15 @@ mod tests {
 
     #[test]
     fn ranks_name_prefix_first() {
-        let files: Vec<String> = ["docs/main-notes.md", "src/app/main.rs", "src/main.rs", "src/domain.rs"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(rank_files(&files, "MAIN", 3), ["src/main.rs", "docs/main-notes.md", "src/app/main.rs"]);
+        let files: Vec<String> =
+            ["docs/main-notes.md", "src/app/main.rs", "src/main.rs", "src/domain.rs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            rank_files(&files, "MAIN", 3),
+            ["src/main.rs", "docs/main-notes.md", "src/app/main.rs"]
+        );
         assert_eq!(rank_files(&files, "app", 5), ["src/app/main.rs"]);
         assert_eq!(rank_files(&files, "", 1), ["src/main.rs"]);
     }

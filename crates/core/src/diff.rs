@@ -46,11 +46,7 @@ impl DiffView {
         let mut truncated = false;
         for (i, group) in diff.grouped_ops(CONTEXT).iter().enumerate() {
             if i > 0 {
-                lines.push(DiffLineView {
-                    tag: '~',
-                    no: 0,
-                    text: String::new(),
-                });
+                lines.push(DiffLineView { tag: '~', no: 0, text: String::new() });
             }
             for op in group {
                 for change in diff.iter_changes(op) {
@@ -78,14 +74,7 @@ impl DiffView {
                 }
             }
         }
-        Self {
-            path: path.into(),
-            created,
-            added,
-            removed,
-            lines,
-            truncated,
-        }
+        Self { path: path.into(), created, added, removed, lines, truncated }
     }
 }
 
@@ -104,10 +93,7 @@ mod tests {
     use super::*;
 
     fn rows(d: &DiffView) -> Vec<String> {
-        d.lines
-            .iter()
-            .map(|l| format!("{}{} {}", l.tag, l.no, l.text))
-            .collect()
+        d.lines.iter().map(|l| format!("{}{} {}", l.tag, l.no, l.text)).collect()
     }
 
     #[test]
@@ -119,8 +105,8 @@ mod tests {
         assert_eq!(
             rows(&d),
             [
-                " 1 l1", "-2 l2", "+2 L2", " 3 l3", " 4 l4", " 5 l5", "~0 ",
-                " 16 l16", " 17 l17", " 18 l18", "+19 X", " 20 l19", " 21 l20",
+                " 1 l1", "-2 l2", "+2 L2", " 3 l3", " 4 l4", " 5 l5", "~0 ", " 16 l16", " 17 l17",
+                " 18 l18", "+19 X", " 20 l19", " 21 l20",
             ]
         );
     }

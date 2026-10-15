@@ -55,7 +55,8 @@ pub struct Split {
 impl Split {
     /// 压缩后的历史（不含摘要，摘要进系统提示词）。
     pub fn apply(&self, history: &[ChatMessage]) -> Vec<ChatMessage> {
-        let mut out: Vec<ChatMessage> = self.keep_user.map(|i| history[i].clone()).into_iter().collect();
+        let mut out: Vec<ChatMessage> =
+            self.keep_user.map(|i| history[i].clone()).into_iter().collect();
         out.extend(history[self.tail_from..].iter().cloned());
         out
     }
@@ -65,7 +66,8 @@ impl Split {
 /// `keep_budget` 是保留尾部的 token 预算。没有可压缩的内容返回 None。
 pub fn split(history: &[ChatMessage], keep_budget: u64, idle: bool) -> Option<Split> {
     if idle {
-        return (!history.is_empty()).then_some(Split { tail_from: history.len(), keep_user: None });
+        return (!history.is_empty())
+            .then_some(Split { tail_from: history.len(), keep_user: None });
     }
     let turn = history.iter().rposition(|m| m.role == "user")?;
     if turn > 0 && estimate_tokens(&history[turn..]) <= keep_budget {
@@ -154,7 +156,9 @@ pub fn summary_request(previous: Option<&str>, transcript: &str) -> Vec<ChatMess
             "<earlier-summary>\nA summary of the conversation before the part below:\n\n{prev}\n</earlier-summary>\n\n"
         ));
     }
-    body.push_str(&format!("<conversation>\n{transcript}\n</conversation>\n\n{SUMMARY_INSTRUCTIONS}"));
+    body.push_str(&format!(
+        "<conversation>\n{transcript}\n</conversation>\n\n{SUMMARY_INSTRUCTIONS}"
+    ));
     vec![ChatMessage::new("system", SUMMARY_SYSTEM), ChatMessage::new("user", body)]
 }
 
@@ -236,7 +240,12 @@ mod tests {
 
     #[test]
     fn transcript_clips_tool_output_and_drops_oldest() {
-        let h = vec![user("第一轮"), call("c1", r#"{"path":"a.rs"}"#), result("c1", &"y".repeat(5_000)), reply("完成")];
+        let h = vec![
+            user("第一轮"),
+            call("c1", r#"{"path":"a.rs"}"#),
+            result("c1", &"y".repeat(5_000)),
+            reply("完成"),
+        ];
         let t = transcript(&h, 100_000);
         assert!(t.starts_with("### User\n第一轮"), "{t}");
         assert!(t.contains("[tool call] read_file {\"path\":\"a.rs\"}"), "{t}");

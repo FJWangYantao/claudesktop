@@ -2,8 +2,8 @@
 
 use super::ChatApp;
 use crate::model::*;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
@@ -23,12 +23,7 @@ impl ChatApp {
             .p_3()
             .rounded_lg()
             .bg(rgb(CARD))
-            .child(
-                div()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .child(c.label),
-            )
+            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(c.label))
             .child(
                 div()
                     .overflow_hidden()
@@ -137,25 +132,27 @@ impl ChatApp {
                             ),
                     )
                     .child(
-                        div()
-                            .h(px(6.))
-                            .w_full()
-                            .rounded_full()
-                            .bg(rgb(Self::heat_color(0)))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(share))
-                                    .rounded_full()
-                                    .bg(rgb(Self::heat_color(3))),
-                            ),
+                        div().h(px(6.)).w_full().rounded_full().bg(rgb(Self::heat_color(0))).child(
+                            div()
+                                .h_full()
+                                .w(relative(share))
+                                .rounded_full()
+                                .bg(rgb(Self::heat_color(3))),
+                        ),
                     ),
             );
         }
         list
     }
 
-    fn tab(&self, id: &'static str, label: &'static str, active: bool, cx: &mut Context<Self>, set: fn(&mut Self)) -> Stateful<Div> {
+    fn tab(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        active: bool,
+        cx: &mut Context<Self>,
+        set: fn(&mut Self),
+    ) -> Stateful<Div> {
         div()
             .id(id)
             .cursor_pointer()
@@ -167,9 +164,7 @@ impl ChatApp {
     }
 
     pub(super) fn render_overview(&self, cx: &mut Context<Self>) -> Div {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let range = match self.overview_range {
             1 => Some(30),
             2 => Some(7),
@@ -195,11 +190,7 @@ impl ChatApp {
                     .h_flex()
                     .gap_2p5()
                     .items_center()
-                    .child(
-                        Icon::new(IconAll::Sparkles)
-                            .size_6()
-                            .text_color(rgb(CORAL)),
-                    )
+                    .child(Icon::new(IconAll::Sparkles).size_6().text_color(rgb(CORAL)))
                     .child(
                         div()
                             .text_size(TEXT_TITLE)
@@ -225,17 +216,47 @@ impl ChatApp {
                                 div()
                                     .h_flex()
                                     .gap_1()
-                                    .child(self.tab("tab-overview", "概览", self.overview_tab == 0, cx, |t| t.overview_tab = 0))
-                                    .child(self.tab("tab-model", "模型", self.overview_tab == 1, cx, |t| t.overview_tab = 1)),
+                                    .child(self.tab(
+                                        "tab-overview",
+                                        "概览",
+                                        self.overview_tab == 0,
+                                        cx,
+                                        |t| t.overview_tab = 0,
+                                    ))
+                                    .child(self.tab(
+                                        "tab-model",
+                                        "模型",
+                                        self.overview_tab == 1,
+                                        cx,
+                                        |t| t.overview_tab = 1,
+                                    )),
                             )
                             .child(div().flex_1())
                             .child(
                                 div()
                                     .h_flex()
                                     .gap_1()
-                                    .child(self.tab("range-all", "全部", self.overview_range == 0, cx, |t| t.overview_range = 0))
-                                    .child(self.tab("range-30", "30 天", self.overview_range == 1, cx, |t| t.overview_range = 1))
-                                    .child(self.tab("range-7", "7 天", self.overview_range == 2, cx, |t| t.overview_range = 2)),
+                                    .child(self.tab(
+                                        "range-all",
+                                        "全部",
+                                        self.overview_range == 0,
+                                        cx,
+                                        |t| t.overview_range = 0,
+                                    ))
+                                    .child(self.tab(
+                                        "range-30",
+                                        "30 天",
+                                        self.overview_range == 1,
+                                        cx,
+                                        |t| t.overview_range = 1,
+                                    ))
+                                    .child(self.tab(
+                                        "range-7",
+                                        "7 天",
+                                        self.overview_range == 2,
+                                        cx,
+                                        |t| t.overview_range = 2,
+                                    )),
                             ),
                     )
                     .child(body)
@@ -252,9 +273,7 @@ impl ChatApp {
 
 /// 「下午好，WYT」：时段 + 系统用户名（取不到就不带名字）
 fn greeting() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
         + usage::local_offset_secs();
     let part = match secs.rem_euclid(86_400) / 3600 {
         5..12 => "上午好",

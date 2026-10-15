@@ -9,8 +9,8 @@ use super::ChatApp;
 use crate::complete::{self, Trigger, TriggerKind};
 use crate::model::ViewMode;
 use crate::settings::KernelChoice;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Position};
 use gpui_kit::component::*;
@@ -46,7 +46,6 @@ enum CompletionAction {
     Mention(String),
     NewSession,
     Mode(usize),
-    Model(String),
     View(ViewMode),
     Compact,
     Export,
@@ -85,7 +84,11 @@ impl ChatApp {
                 .slash_commands()
                 .into_iter()
                 .filter(|(keyword, item)| {
-                    complete::command_matches(keyword, &format!("{} {}", item.title, item.detail), &trigger.query)
+                    complete::command_matches(
+                        keyword,
+                        &format!("{} {}", item.title, item.detail),
+                        &trigger.query,
+                    )
                 })
                 .map(|(_, item)| item)
                 .collect(),
@@ -94,9 +97,11 @@ impl ChatApp {
                 let stale = was != Some(TriggerKind::Mention)
                     || self.completion.files.as_ref().is_none_or(|(dir, _)| *dir != cwd);
                 if stale {
-                    self.completion.files = Some((cwd.clone(), complete::list_files(&cwd, MAX_FILES)));
+                    self.completion.files =
+                        Some((cwd.clone(), complete::list_files(&cwd, MAX_FILES)));
                 }
-                let files = self.completion.files.as_ref().map(|(_, f)| f.as_slice()).unwrap_or_default();
+                let files =
+                    self.completion.files.as_ref().map(|(_, f)| f.as_slice()).unwrap_or_default();
                 complete::rank_files(files, &trigger.query, MAX_ITEMS)
                     .into_iter()
                     .map(|path| {
@@ -126,7 +131,8 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 可用的 `/指令`：(匹配用的英文关键字, 候选项)。模式来自当前 agent，模型只有自研内核能切。
+    /// 可用的 `/指令`：(匹配用的英文关键字, 候选项)。模式来自当前 agent；模型不在这里，
+    /// 走输入框右下角的模型菜单（列表长度随档案变，列进来会把补全面板撑得顶穿窗口）。
     fn slash_commands(&self) -> Vec<(String, CompletionItem)> {
         let item = |icon, title: String, detail: &str, current, action| CompletionItem {
             icon,
@@ -138,7 +144,13 @@ impl ChatApp {
         let s = self.session();
         let mut out = vec![(
             "new".to_string(),
-            item(IconAll::MessageSquarePlus, "/new".into(), "新开会话", false, CompletionAction::NewSession),
+            item(
+                IconAll::MessageSquarePlus,
+                "/new".into(),
+                "新开会话",
+                false,
+                CompletionAction::NewSession,
+            ),
         )];
         for (i, mode) in s.modes.iter().enumerate() {
             out.push((
@@ -152,20 +164,8 @@ impl ChatApp {
                 ),
             ));
         }
-        if s.kernel == KernelChoice::Builtin {
-            for model in self.settings.builtin.models() {
-                out.push((
-                    format!("model {model}"),
-                    item(
-                        IconAll::Box,
-                        format!("/model {model}"),
-                        "切换模型",
-                        s.model_label.as_ref() == model.as_str(),
-                        CompletionAction::Model(model.clone()),
-                    ),
-                ));
-            }
-        }
+        // 模型不进补全列表：数量随档案变（本机 16 个），列在这里会把高度撑爆，
+        // 而输入框右下角的模型菜单本来就是干这个的，这里只留稳定的常用指令
         for view in ViewMode::ALL {
             out.push((
                 format!("view {:?}", view).to_lowercase(),
@@ -192,19 +192,35 @@ impl ChatApp {
         }
         out.push((
             "export".into(),
-            item(IconAll::Share, "/export".into(), "把对话导出成 Markdown", false, CompletionAction::Export),
+            item(
+                IconAll::Share,
+                "/export".into(),
+                "把对话导出成 Markdown",
+                false,
+                CompletionAction::Export,
+            ),
         ));
         out.push((
             "settings".into(),
-            item(IconAll::Settings, "/settings".into(), "打开设置", false, CompletionAction::Settings),
+            item(
+                IconAll::Settings,
+                "/settings".into(),
+                "打开设置",
+                false,
+                CompletionAction::Settings,
+            ),
         ));
         out
     }
 
     /// 接受第 `i` 项：`@文件` 把触发词换成路径；指令先把那一行指令删掉再执行。
     fn accept_completion(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(c) = self.completion.open.take() else { return };
-        let Some(item) = c.items.get(i).cloned() else { return };
+        let Some(c) = self.completion.open.take() else {
+            return;
+        };
+        let Some(item) = c.items.get(i).cloned() else {
+            return;
+        };
         let replacement = match &item.action {
             CompletionAction::Mention(path) => format!("@{path} "),
             _ => String::new(),
@@ -217,7 +233,6 @@ impl ChatApp {
                 self.focus_input(window, cx);
             }
             CompletionAction::Mode(i) => self.choose_mode(i, cx),
-            CompletionAction::Model(model) => self.choose_model(model, cx),
             CompletionAction::View(view) => self.set_view_mode(view, cx),
             CompletionAction::Compact => self.compact_session(cx),
             CompletionAction::Export => self.share_session(window, cx),
@@ -247,7 +262,11 @@ impl ChatApp {
     }
 
     /// 输入框卡片上挂的键盘接管（见模块说明）。
-    pub(super) fn with_completion_keys(&self, card: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+    pub(super) fn with_completion_keys(
+        &self,
+        card: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         card.capture_action(cx.listener(|this, _: &MoveUp, _, cx| this.step_completion(-1, cx)))
             .capture_action(cx.listener(|this, _: &MoveDown, _, cx| this.step_completion(1, cx)))
             .capture_action(cx.listener(|this, action: &Enter, window, cx| {
@@ -257,7 +276,9 @@ impl ChatApp {
                 }
                 this.accept_selected(window, cx);
             }))
-            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| this.accept_selected(window, cx)))
+            .capture_action(
+                cx.listener(|this, _: &IndentInline, window, cx| this.accept_selected(window, cx)),
+            )
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
                 if this.completion.open.take().is_some() {
                     this.completion.dismissed = Some(this.input.read(cx).value().to_string());
@@ -268,7 +289,9 @@ impl ChatApp {
     }
 
     fn step_completion(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(c) = self.completion.open.as_mut() else { return };
+        let Some(c) = self.completion.open.as_mut() else {
+            return;
+        };
         let n = c.items.len() as isize;
         c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
         cx.stop_propagation();
@@ -276,7 +299,9 @@ impl ChatApp {
     }
 
     fn accept_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(selected) = self.completion.open.as_ref().map(|c| c.selected) else { return };
+        let Some(selected) = self.completion.open.as_ref().map(|c| c.selected) else {
+            return;
+        };
         cx.stop_propagation();
         self.accept_completion(selected, window, cx);
     }
@@ -323,7 +348,11 @@ impl ChatApp {
                     .cursor_pointer()
                     .when(selected, |d| d.bg(rgb(SELECTED)))
                     .when(!selected, |d| d.hover(|d| d.bg(rgb(HOVER))))
-                    .on_click(cx.listener(move |this, _, window, cx| this.accept_completion(i, window, cx)))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.accept_completion(i, window, cx)
+                        }),
+                    )
                     .child(Icon::new(item.icon).size_4().text_color(rgb(INK_SOFT)))
                     .child(
                         div()

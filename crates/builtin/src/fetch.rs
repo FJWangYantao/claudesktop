@@ -5,8 +5,8 @@
 
 use crate::tools::ToolOutput;
 use std::sync::mpsc;
-use ureq::ResponseExt as _;
 use std::time::Duration;
+use ureq::ResponseExt as _;
 
 /// 一次返回给模型的最多字符数；更长的用 `offset` 分页
 pub const FETCH_PAGE_CHARS: usize = 20_000;
@@ -20,11 +20,7 @@ pub fn normalize_url(raw: &str) -> Result<String, String> {
     if url.is_empty() {
         return Err("web_fetch: `url` is empty".into());
     }
-    let url = if url.contains("://") {
-        url.to_string()
-    } else {
-        format!("https://{url}")
-    };
+    let url = if url.contains("://") { url.to_string() } else { format!("https://{url}") };
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return Err("web_fetch: only http and https URLs are supported".into());
@@ -82,12 +78,19 @@ fn get(url: &str) -> Result<Page, String> {
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_global(Some(FETCH_TIMEOUT))
-        .user_agent(concat!("Mozilla/5.0 (compatible; claudesktop/", env!("CARGO_PKG_VERSION"), ")"))
+        .user_agent(concat!(
+            "Mozilla/5.0 (compatible; claudesktop/",
+            env!("CARGO_PKG_VERSION"),
+            ")"
+        ))
         .build()
         .new_agent();
     let mut resp = agent
         .get(url)
-        .header("Accept", "text/html,application/xhtml+xml,text/markdown;q=0.9,text/plain;q=0.8,*/*;q=0.5")
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,text/markdown;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+        )
         .call()
         .map_err(|e| e.to_string())?;
     let final_url = resp.get_uri().to_string();
@@ -103,12 +106,7 @@ fn get(url: &str) -> Result<Page, String> {
         .limit(FETCH_MAX_BYTES)
         .read_to_vec()
         .map_err(|e| e.to_string())?;
-    Ok(Page {
-        status: resp.status().as_u16(),
-        final_url,
-        content_type,
-        body,
-    })
+    Ok(Page { status: resp.status().as_u16(), final_url, content_type, body })
 }
 
 /// 响应 → 工具结果：HTML 转文本，其他文本原样，二进制拒绝。
@@ -119,7 +117,8 @@ fn render(url: &str, page: Page, offset: usize) -> ToolOutput {
         let s = String::from_utf8_lossy(head).trim_start().to_ascii_lowercase();
         s.starts_with("<!doctype html") || s.starts_with("<html")
     };
-    let is_html = mime == "text/html" || mime == "application/xhtml+xml" || (mime.is_empty() && sniff_html);
+    let is_html =
+        mime == "text/html" || mime == "application/xhtml+xml" || (mime.is_empty() && sniff_html);
     let is_text = mime.starts_with("text/")
         || mime.ends_with("json")
         || mime.ends_with("xml")
@@ -132,11 +131,8 @@ fn render(url: &str, page: Page, offset: usize) -> ToolOutput {
         );
     }
     let raw = String::from_utf8_lossy(&page.body);
-    let (title, text) = if is_html {
-        html_to_text(&raw, &page.final_url)
-    } else {
-        (None, raw.trim().to_string())
-    };
+    let (title, text) =
+        if is_html { html_to_text(&raw, &page.final_url) } else { (None, raw.trim().to_string()) };
 
     let total = text.chars().count();
     let mut out = format!("URL: {}\n", page.final_url);
@@ -151,7 +147,10 @@ fn render(url: &str, page: Page, offset: usize) -> ToolOutput {
     }
     out.push('\n');
     if offset >= total && total > 0 {
-        return ToolOutput::fail(format!("offset {offset} is past the end ({total} chars)"), "超出范围");
+        return ToolOutput::fail(
+            format!("offset {offset} is past the end ({total} chars)"),
+            "超出范围",
+        );
     }
     let shown: String = text.chars().skip(offset).take(FETCH_PAGE_CHARS).collect();
     let end = offset + shown.chars().count();
@@ -173,7 +172,7 @@ fn fmt_count(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -182,13 +181,29 @@ fn fmt_count(n: usize) -> String {
 }
 
 /// 内容整段丢掉的标签
-const SKIP_TAGS: &[&str] = &[
-    "script", "style", "noscript", "svg", "template", "iframe", "canvas", "select", "button",
-];
+const SKIP_TAGS: &[&str] =
+    &["script", "style", "noscript", "svg", "template", "iframe", "canvas", "select", "button"];
 /// 段落级标签：前后空一行
 const PARA_TAGS: &[&str] = &[
-    "p", "div", "section", "article", "main", "header", "footer", "nav", "aside", "form",
-    "table", "ul", "ol", "dl", "blockquote", "figure", "details", "fieldset", "hr",
+    "p",
+    "div",
+    "section",
+    "article",
+    "main",
+    "header",
+    "footer",
+    "nav",
+    "aside",
+    "form",
+    "table",
+    "ul",
+    "ol",
+    "dl",
+    "blockquote",
+    "figure",
+    "details",
+    "fieldset",
+    "hr",
 ];
 /// 行级标签：前后换行
 const LINE_TAGS: &[&str] = &["br", "tr", "dt", "dd", "figcaption", "summary", "caption"];
@@ -237,9 +252,8 @@ pub fn html_to_text(html: &str, base: &str) -> (Option<String>, String) {
         }
         let closing = inner.starts_with('/');
         let body = inner.trim_start_matches('/');
-        let name_end = body
-            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-            .unwrap_or(body.len());
+        let name_end =
+            body.find(|c: char| c.is_whitespace() || c == '/' || c == '>').unwrap_or(body.len());
         let name = body[..name_end].to_ascii_lowercase();
         if name.is_empty() {
             continue;
@@ -254,17 +268,17 @@ pub fn html_to_text(html: &str, base: &str) -> (Option<String>, String) {
                 if !t.is_empty() {
                     title = Some(t);
                 }
-            } else if name == "head" {
-                if let Some(t) = lower[i..end].find("<title").and_then(|n| {
+            } else if name == "head"
+                && let Some(t) = lower[i..end].find("<title").and_then(|n| {
                     let s = i + n;
                     let open_end = find_tag_end(bytes, s + 1)? + 1;
                     let close = lower[open_end..end].find("</title").map(|m| open_end + m)?;
                     Some(collapse_ws(&decode_entities(&html[open_end..close])))
-                }) {
-                    if title.is_none() && !t.is_empty() {
-                        title = Some(t);
-                    }
-                }
+                })
+                && title.is_none()
+                && !t.is_empty()
+            {
+                title = Some(t);
             }
             i = lower[end..].find('>').map_or(html.len(), |n| end + n + 1);
             continue;
@@ -329,7 +343,10 @@ pub fn html_to_text(html: &str, base: &str) -> (Option<String>, String) {
                 } else {
                     let href = attr(body, "href")
                         .map(|h| decode_entities(&h))
-                        .filter(|h| !h.starts_with('#') && !h.to_ascii_lowercase().starts_with("javascript:"))
+                        .filter(|h| {
+                            !h.starts_with('#')
+                                && !h.to_ascii_lowercase().starts_with("javascript:")
+                        })
                         .map(|h| resolve_url(base, h.trim()));
                     links.push(href.map(|h| {
                         w.text_glue("[");
@@ -338,10 +355,10 @@ pub fn html_to_text(html: &str, base: &str) -> (Option<String>, String) {
                 }
             }
             "img" if !closing => {
-                if let Some(alt) = attr(body, "alt").map(|a| collapse_ws(&decode_entities(&a))) {
-                    if !alt.is_empty() {
-                        w.text(&format!("[image: {alt}]"));
-                    }
+                if let Some(alt) = attr(body, "alt").map(|a| collapse_ws(&decode_entities(&a)))
+                    && !alt.is_empty()
+                {
+                    w.text(&format!("[image: {alt}]"));
                 }
             }
             "td" | "th" if !closing => w.text(" | "),
@@ -593,7 +610,10 @@ mod tests {
         assert!(normalize_url("  ").is_err());
         assert_eq!(host_of("https://User@Docs.RS:443/x?y"), "docs.rs");
         assert_eq!(host_of("http://[::1]:8080/"), "::1");
-        assert_eq!(resolve_url("https://a.com/x/y/z.html?q", "../b.html#h"), "https://a.com/x/b.html#h");
+        assert_eq!(
+            resolve_url("https://a.com/x/y/z.html?q", "../b.html#h"),
+            "https://a.com/x/b.html#h"
+        );
         assert_eq!(resolve_url("https://a.com/x/", "c/"), "https://a.com/x/c/");
         assert_eq!(resolve_url("https://a.com/x/y", "/root"), "https://a.com/root");
         assert_eq!(resolve_url("https://a.com/x/y", "//cdn.com/z"), "https://cdn.com/z");
@@ -645,7 +665,10 @@ mod tests {
         assert!(out.content.contains(&format!("offset={FETCH_PAGE_CHARS}")));
         assert_eq!(out.summary, format!("{} 字", fmt_count(FETCH_PAGE_CHARS + 10)));
         let out = render("https://x.org/a", page("text/plain", &long), FETCH_PAGE_CHARS);
-        assert!(out.content.contains(&format!("showing chars {FETCH_PAGE_CHARS}-{}", FETCH_PAGE_CHARS + 10)));
+        assert!(
+            out.content
+                .contains(&format!("showing chars {FETCH_PAGE_CHARS}-{}", FETCH_PAGE_CHARS + 10))
+        );
 
         let mut missing = page("text/html", "<p>gone</p>");
         missing.status = 404;
@@ -658,7 +681,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_fetch() {
-        let url = std::env::var("CLAUDESKTOP_FETCH_URL").unwrap_or_else(|_| "https://www.rust-lang.org/".into());
+        let url = std::env::var("CLAUDESKTOP_FETCH_URL")
+            .unwrap_or_else(|_| "https://www.rust-lang.org/".into());
         let out = fetch(&normalize_url(&url).unwrap(), 0, &|| false);
         println!("[{}] {}\n{}", out.ok, out.summary, out.content);
         assert!(out.ok);

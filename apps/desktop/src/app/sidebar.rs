@@ -1,10 +1,10 @@
 //! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
 
-use super::chrome::{drag_area, traffic_light_gap, CHROME_H};
-use super::{project_label, ChatApp};
+use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
+use super::{ChatApp, project_label};
 use crate::settings::KernelChoice;
-use crate::theme::*;
 use crate::theme::rgb;
+use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
@@ -62,21 +62,27 @@ impl ChatApp {
                         })),
                     )
                     // 按日期分组时组内总是按最近活动排，排序切换没有意义
-                    .when(!by_date, |d| d.child(
-                        Self::sidebar_icon_button(
-                            "sort-sessions",
-                            IconAll::ArrowDownUp,
-                            if sort_on { "按打开顺序排列" } else { "按最近活动排列" },
-                            sort_on,
+                    .when(!by_date, |d| {
+                        d.child(
+                            Self::sidebar_icon_button(
+                                "sort-sessions",
+                                IconAll::ArrowDownUp,
+                                if sort_on {
+                                    "按打开顺序排列"
+                                } else {
+                                    "按最近活动排列"
+                                },
+                                sort_on,
+                            )
+                            .when(!sort_on, |d| {
+                                d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sessions_by_activity = !this.sessions_by_activity;
+                                cx.notify();
+                            })),
                         )
-                        .when(!sort_on, |d| {
-                            d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sessions_by_activity = !this.sessions_by_activity;
-                            cx.notify();
-                        })),
-                    ))
+                    })
                     .child(
                         Self::sidebar_icon_button(
                             "open-workspace",
@@ -138,23 +144,14 @@ impl ChatApp {
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
                     .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
             )
-            .child(
-                nav_item("plugins", IconAll::Blocks, "插件", false).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.sessions[this.active]
-                            .note("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力");
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(
-                div()
-                    .id("sidebar-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(body),
-            )
+            .child(nav_item("plugins", IconAll::Blocks, "插件", false).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.sessions[this.active]
+                        .note("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力");
+                    cx.notify();
+                },
+            )))
+            .child(div().id("sidebar-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
             .child(
                 // 底部：设置 + 内核状态
                 div()
@@ -172,30 +169,18 @@ impl ChatApp {
                                 }
                             })),
                     )
-                    .child(
-                        div()
-                            .v_flex()
-                            .gap_1()
-                            .px_4()
-                            .pt_1()
-                            .children(
-                                // 可在设置页关掉（「侧栏显示内核状态」）
-                                self.settings
-                                    .sidebar_kernel_status
-                                    .then(|| self.kernel_status_rows())
-                                    .unwrap_or_default(),
-                            ),
-                    ),
+                    .child(div().v_flex().gap_1().px_4().pt_1().children(
+                        // 可在设置页关掉（「侧栏显示内核状态」）
+                        if self.settings.sidebar_kernel_status {
+                            self.kernel_status_rows()
+                        } else {
+                            Default::default()
+                        },
+                    )),
             );
 
         // 侧栏是浮在窗口底色上的圆角面板，四周留一圈窗口底色
-        div()
-            .w(SIDEBAR_W)
-            .flex_shrink_0()
-            .h_full()
-            .pl_2()
-            .py_2()
-            .child(panel)
+        div().w(SIDEBAR_W).flex_shrink_0().h_full().pl_2().py_2().child(panel)
     }
 
     /// 侧栏里的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
@@ -212,11 +197,7 @@ impl ChatApp {
             .cursor_pointer()
             .hover(|d| d.bg(rgb(SELECTED)))
             .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-            .child(
-                Icon::new(icon)
-                    .size_3p5()
-                    .text_color(rgb(if on { CORAL } else { INK_SOFT })),
-            )
+            .child(Icon::new(icon).size_3p5().text_color(rgb(if on { CORAL } else { INK_SOFT })))
     }
 
     /// 每个已启动内核一行：状态点 + 「自研内核 · 已连接」
@@ -257,12 +238,10 @@ impl ChatApp {
     /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
     pub(super) fn session_groups(&self) -> Vec<(SharedString, Vec<usize>)> {
         // 无元信息的会话（刚开、还没落盘）视为最新
-        let activity =
-            |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
+        let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
         if self.settings.sidebar_by_date {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64);
+            let now =
+                SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
             let offset = crate::usage::local_offset_secs();
             let mut buckets: [Vec<usize>; 4] = Default::default();
             for i in 0..self.sessions.len() {
@@ -273,7 +252,7 @@ impl ChatApp {
                 .zip(crate::usage::DAY_BUCKETS)
                 .filter(|(members, _)| !members.is_empty())
                 .map(|(mut members, name)| {
-                    members.sort_by(|a, b| activity(*b).cmp(&activity(*a)));
+                    members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
                     (name.into(), members)
                 })
                 .collect();
@@ -290,7 +269,7 @@ impl ChatApp {
             .enumerate()
             .map(|(g, (cwd, mut members))| {
                 if self.sessions_by_activity {
-                    members.sort_by(|a, b| activity(*b).cmp(&activity(*a)));
+                    members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
                 }
                 let name = if g == 0 { self.project_name.clone() } else { project_label(cwd) };
                 (name, members)
@@ -324,7 +303,9 @@ impl ChatApp {
                     .border_color(rgb(CORAL))
                     .bg(rgb(CARD))
                     .text_size(TEXT_BODY)
-                    .child(Input::new(&self.rename_input).appearance(false).bordered(false).small()),
+                    .child(
+                        Input::new(&self.rename_input).appearance(false).bordered(false).small(),
+                    ),
             );
         }
         // 删除确认
@@ -419,11 +400,7 @@ impl ChatApp {
             )
             .when_some(age, |row, age| {
                 row.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(TEXT_META)
-                        .text_color(rgb(INK_SOFT))
-                        .child(age),
+                    div().flex_shrink_0().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(age),
                 )
             })
             // 悬停时盖在右侧标签上的操作按钮
@@ -478,14 +455,15 @@ impl ChatApp {
             return;
         };
         let text = self.rename_input.read(cx).value().trim().to_string();
-        if let Some(s) = self.sessions.iter_mut().find(|s| s.token == token) {
-            if !text.is_empty() && text != s.title.as_ref() {
-                s.title = text.clone().into();
-                s.renamed = true;
-                if let (Some(store), Some(meta)) = (&self.store, &mut s.meta) {
-                    meta.title = text;
-                    let _ = store.save_meta(meta);
-                }
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.token == token)
+            && !text.is_empty()
+            && text != s.title.as_ref()
+        {
+            s.title = text.clone().into();
+            s.renamed = true;
+            if let (Some(store), Some(meta)) = (&self.store, &mut s.meta) {
+                meta.title = text;
+                let _ = store.save_meta(meta);
             }
         }
         cx.notify();
@@ -517,10 +495,10 @@ impl ChatApp {
         drop(removed);
         if let Some(id) = id {
             self.usage.retain(|t| t.session != id);
-            if let Some(store) = &self.store {
-                if let Err(err) = store.delete(&id) {
-                    log_note(&mut self.sessions, format!("删除会话文件失败：{err}"));
-                }
+            if let Some(store) = &self.store
+                && let Err(err) = store.delete(&id)
+            {
+                log_note(&mut self.sessions, format!("删除会话文件失败：{err}"));
             }
         }
         if self.sessions.is_empty() {
@@ -543,9 +521,7 @@ fn log_note(sessions: &mut [crate::session::Session], text: String) {
 
 /// 「刚刚 / 5 分钟 / 3 小时 / 2 天」
 fn age_label(updated_ms: u64) -> SharedString {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let mins = now.saturating_sub(updated_ms) / 60_000;
     match mins {
         0 => "刚刚".into(),

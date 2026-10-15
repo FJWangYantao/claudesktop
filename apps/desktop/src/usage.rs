@@ -33,13 +33,7 @@ pub fn collect(meta: &SessionMeta, records: &[Record]) -> Vec<TurnStat> {
     for record in records {
         match record {
             Record::User { .. } => pending += 1,
-            Record::Turn {
-                at_ms,
-                model,
-                input_tokens,
-                output_tokens,
-                ..
-            } if pending > 0 => {
+            Record::Turn { at_ms, model, input_tokens, output_tokens, .. } if pending > 0 => {
                 pending -= 1;
                 turns.push(TurnStat {
                     session: meta.id.clone(),
@@ -85,7 +79,12 @@ pub struct Overview {
 
 /// 汇总。`range_days` = None 表示全部；`offset_secs` 是本地时区相对 UTC 的偏移。
 /// 热力图不受范围影响，总是最近 26 周。
-pub fn overview(turns: &[TurnStat], now_ms: u64, offset_secs: i64, range_days: Option<u64>) -> Overview {
+pub fn overview(
+    turns: &[TurnStat],
+    now_ms: u64,
+    offset_secs: i64,
+    range_days: Option<u64>,
+) -> Overview {
     let day_of = |ms: u64| (ms as i64 / 1000 + offset_secs).div_euclid(86_400);
     let hour_of = |ms: u64| ((ms as i64 / 1000 + offset_secs).rem_euclid(86_400) / 3600) as u32;
     let today = day_of(now_ms);
@@ -114,7 +113,9 @@ pub fn overview(turns: &[TurnStat], now_ms: u64, offset_secs: i64, range_days: O
         .filter(|h| hours[*h as usize] > 0)
         .max_by_key(|h| (hours[*h as usize], std::cmp::Reverse(*h)));
     let mut models: Vec<ModelRow> = models.into_values().collect();
-    models.sort_by(|a, b| b.turns.cmp(&a.turns).then(b.tokens.cmp(&a.tokens)).then(a.name.cmp(&b.name)));
+    models.sort_by(|a, b| {
+        b.turns.cmp(&a.turns).then(b.tokens.cmp(&a.tokens)).then(a.name.cmp(&b.name))
+    });
 
     // 热力图：1970-01-01 是周四，周一为 0
     let weekday = |day: i64| (day + 3).rem_euclid(7);
@@ -169,11 +170,7 @@ pub fn compact(n: u64) -> String {
     match n {
         0..10_000 => {
             let s = n.to_string();
-            if s.len() > 3 {
-                format!("{},{}", &s[..s.len() - 3], &s[s.len() - 3..])
-            } else {
-                s
-            }
+            if s.len() > 3 { format!("{},{}", &s[..s.len() - 3], &s[s.len() - 3..]) } else { s }
         }
         10_000..1_000_000 => format!("{:.1}K", n as f64 / 1e3),
         1_000_000..1_000_000_000 => format!("{:.1}M", n as f64 / 1e6),
@@ -229,7 +226,8 @@ pub fn day_bucket(updated_ms: u64, now_ms: u64, offset_secs: i64) -> usize {
 
 /// 命中缓存的比例（%）：没报告（0）或没有输入时为 None。
 pub fn cache_hit_percent(cache_read: u64, input: u64) -> Option<u32> {
-    (cache_read > 0 && input > 0).then(|| ((cache_read.min(input) * 100 + input / 2) / input) as u32)
+    (cache_read > 0 && input > 0)
+        .then(|| ((cache_read.min(input) * 100 + input / 2) / input) as u32)
 }
 
 /// 首页底部那句话：token 换算成《善恶的彼岸》（按一本约 8 万 token）。
@@ -237,10 +235,9 @@ pub fn book_line(tokens: u64) -> String {
     const BOOK: u64 = 80_000;
     match tokens {
         0 => "还没有 token 用量记录（自研内核每轮都会上报，ACP agent 一般不报）。".into(),
-        t if t < BOOK => format!(
-            "你的 Token 用量大约是一本《善恶的彼岸》的 {}%。",
-            (t * 100 / BOOK).max(1)
-        ),
+        t if t < BOOK => {
+            format!("你的 Token 用量大约是一本《善恶的彼岸》的 {}%。", (t * 100 / BOOK).max(1))
+        }
         t => format!("你的 Token 用量相当于 {} 本《善恶的彼岸》。", compact(t / BOOK)),
     }
 }
@@ -270,10 +267,7 @@ mod tests {
     }
 
     fn user() -> Record {
-        Record::User {
-            text: "x".into(),
-            images: Vec::new(),
-        }
+        Record::User { text: "x".into(), images: Vec::new() }
     }
 
     fn turn(at_ms: u64, model: Option<&str>, tokens: u64) -> Record {
@@ -292,7 +286,10 @@ mod tests {
         let records = vec![user(), turn(10, Some("m1"), 5), user(), user()];
         let turns = collect(&meta("builtin:http://x/v1#gem"), &records);
         assert_eq!(turns.len(), 3);
-        assert_eq!((turns[0].at_ms, turns[0].model.as_deref(), turns[0].tokens), (10, Some("m1"), 5));
+        assert_eq!(
+            (turns[0].at_ms, turns[0].model.as_deref(), turns[0].tokens),
+            (10, Some("m1"), 5)
+        );
         // 没有 Turn 记录的：会话更新时间 + 从内核标识里取的模型
         assert_eq!((turns[2].at_ms, turns[2].model.as_deref()), (99, Some("gem")));
         assert_eq!(collect(&meta("node mock.mjs"), &[user()])[0].model, None);
@@ -310,7 +307,7 @@ mod tests {
         };
         let turns = vec![
             t("a", now, Some("m1"), 100),
-            t("a", now - 3600_000, Some("m1"), 50),
+            t("a", now - 3_600_000, Some("m1"), 50),
             t("b", now - 10 * DAY, Some("m2"), 7),
             t("c", now - 400 * DAY, None, 0),
         ];

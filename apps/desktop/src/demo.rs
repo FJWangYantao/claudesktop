@@ -1,6 +1,5 @@
 //! 演示回放脚本（CLAUDESKTOP_KERNEL=demo 或内核启动失败时使用）。
 
-
 pub enum MockAction {
     BeginThinking,
     ThinkChunk(&'static str),
@@ -30,11 +29,7 @@ pub fn stream_steps(
     let mut out = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
-        let n = rest
-            .char_indices()
-            .nth(per)
-            .map(|(i, _)| i)
-            .unwrap_or(rest.len());
+        let n = rest.char_indices().nth(per).map(|(i, _)| i).unwrap_or(rest.len());
         let (chunk, tail) = rest.split_at(n);
         out.push(MockStep(delay, make(chunk)));
         rest = tail;
@@ -46,8 +41,7 @@ pub const DEMO_DIFF_OLD: &str = "pub trait Kernel: Send {
     fn send(&mut self, text: String);
 }
 ";
-pub const DEMO_DIFF_NEW: &str =
-    "pub trait Kernel: Send {
+pub const DEMO_DIFF_NEW: &str = "pub trait Kernel: Send {
     fn send(&mut self, text: String) -> Result<()>;
     fn cancel(&mut self);
 }
@@ -67,34 +61,19 @@ pub fn build_demo_script() -> Vec<MockStep> {
     s.push(MockStep(200, MockAction::EndThinking));
 
     // 2) 读文件
-    s.push(MockStep(
-        450,
-        MockAction::BeginTool("Read", "crates/core/src/lib.rs"),
-    ));
+    s.push(MockStep(450, MockAction::BeginTool("Read", "crates/core/src/lib.rs")));
     s.push(MockStep(
         700,
         MockAction::ToolDone("Read 128 lines · Kernel trait 与 KernelEvent 事件模型"),
     ));
 
     // 3) 改文件 + diff
-    s.push(MockStep(
-        450,
-        MockAction::BeginTool("Edit", "crates/core/src/lib.rs"),
-    ));
-    s.push(MockStep(
-        700,
-        MockAction::ToolDone("Added 2 lines, removed 1 line"),
-    ));
-    s.push(MockStep(
-        150,
-        MockAction::Diff("crates/core/src/lib.rs", DEMO_DIFF_OLD, DEMO_DIFF_NEW),
-    ));
+    s.push(MockStep(450, MockAction::BeginTool("Edit", "crates/core/src/lib.rs")));
+    s.push(MockStep(700, MockAction::ToolDone("Added 2 lines, removed 1 line")));
+    s.push(MockStep(150, MockAction::Diff("crates/core/src/lib.rs", DEMO_DIFF_OLD, DEMO_DIFF_NEW)));
 
     // 4) 跑构建
-    s.push(MockStep(
-        500,
-        MockAction::BeginTool("Bash", "cargo build -p claudesktop"),
-    ));
+    s.push(MockStep(500, MockAction::BeginTool("Bash", "cargo build -p claudesktop")));
     s.push(MockStep(
         950,
         MockAction::ToolDone("Finished `dev` profile in 1.8s · 0 errors, 0 warnings"),
@@ -125,9 +104,6 @@ pub fn build_demo_script() -> Vec<MockStep> {
     s.push(MockStep(250, MockAction::EndAgent));
 
     // 7) 回合小结
-    s.push(MockStep(
-        400,
-        MockAction::Note("演示回合结束 · 内核未连接 · 下一步：ACP 接入"),
-    ));
+    s.push(MockStep(400, MockAction::Note("演示回合结束 · 内核未连接 · 下一步：ACP 接入")));
     s
 }
