@@ -7,10 +7,55 @@ use crate::theme::rgb;
 use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+/// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
+const SETTINGS_TABS: [(IconAll, &str); 3] = [
+    (IconAll::Settings, "通用"),
+    (IconAll::Cpu, "内核与模型"),
+    (IconAll::ShieldCheck, "权限"),
+];
+
+/// 设置项的一行：左边标题 + 灰色说明，右边控件。
+fn setting_row(title: &'static str, desc: &'static str, control: impl IntoElement) -> Div {
+    div()
+        .h_flex()
+        .items_center()
+        .gap_4()
+        .py_4()
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_size(TEXT_BODY)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(INK))
+                        .child(title),
+                )
+                .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc)),
+        )
+        .child(div().flex_none().child(control))
+}
+
+/// 一组设置行，行与行之间细分隔线。
+fn setting_group(rows: impl IntoIterator<Item = Div>) -> Div {
+    let mut group = div().v_flex();
+    for (i, row) in rows.into_iter().enumerate() {
+        group = group.child(
+            row.when(i == 0, |d| d.pt_0())
+                .when(i > 0, |d| d.border_t_1().border_color(rgb(LINE))),
+        );
+    }
+    group
+}
 
 /// 一套档案在表单里的输入框（与 `SettingsForm::profiles` 一一对应）。
 pub struct ProfileInputs {
@@ -52,6 +97,8 @@ pub struct SettingsForm {
     active: usize,
     /// 每套档案的输入框
     inputs: Vec<ProfileInputs>,
+    /// 设置页当前所在的 tab（0 通用 / 1 内核与模型 / 2 权限）
+    tab: usize,
     acp_command: Entity<InputState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
@@ -70,6 +117,7 @@ impl SettingsForm {
             profiles: Vec::new(),
             active: 0,
             inputs: Vec::new(),
+            tab: 0,
             acp_command,
             message: None,
             rules: Vec::new(),
@@ -150,8 +198,14 @@ impl ChatApp {
         self.apply_appearance(window, cx);
     }
 
-    /// 设置页顶部的外观切换（即时生效，不走「保存并应用」）。
-    fn render_appearance(&self, cx: &mut Context<Self>) -> Div {
+    /// 侧栏底部要不要列出内核状态（立即生效，不走「保存并应用」）。
+    pub(crate) fn set_sidebar_kernel_status(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.sidebar_kernel_status = on);
+        cx.notify();
+    }
+
+    /// 「通用」分类：外观、侧栏内核状态（都即时生效，不走「保存并应用」）。
+    fn render_general(&self, cx: &mut Context<Self>) -> Div {
         let current = self.settings.appearance;
         let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
         for (i, a) in Appearance::ALL.into_iter().enumerate() {
@@ -163,23 +217,19 @@ impl ChatApp {
                     .child(Self::seg(a.label(), a == current)),
             );
         }
-        div()
-            .v_flex()
-            .gap_2()
-            .child(div().text_size(TEXT_BODY).font_weight(FontWeight::MEDIUM).child("外观"))
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_3()
-                    .child(segs)
-                    .child(
-                        div()
-                            .text_size(TEXT_SMALL)
-                            .text_color(rgb(INK_SOFT))
-                            .child("立即生效，不用点保存"),
-                    ),
-            )
+        setting_group([
+            setting_row("外观", "跟随系统，或固定用浅色 / 深色；立即生效", segs),
+            setting_row(
+                "侧栏显示内核状态",
+                "在侧栏底部列出每个已启动内核的连接状态；关掉不影响内核运行",
+                Switch::new("sidebar-kernel-status")
+                    .checked(self.settings.sidebar_kernel_status)
+                    .color(rgb(CORAL))
+                    .on_change(cx.listener(|this, checked, _, cx| {
+                        this.set_sidebar_kernel_status(*checked, cx)
+                    })),
+            ),
+        ])
     }
 
     fn form_settings(&self, cx: &App) -> Settings {
@@ -400,9 +450,6 @@ impl ChatApp {
         let mut section = div()
             .v_flex()
             .gap_2()
-            .pt_4()
-            .border_t_1()
-            .border_color(rgb(LINE))
             .child(
                 div()
                     .text_size(TEXT_BODY)
@@ -895,7 +942,7 @@ impl ChatApp {
             .settings_path
             .as_ref()
             .map_or_else(|| "（数据目录不可用，设置不会保存）".to_string(), |p| p.display().to_string());
-        body = body
+        let kernel_tab = body
             .child(
                 div()
                     .h_flex()
@@ -920,30 +967,68 @@ impl ChatApp {
                     )),
             );
 
+        // 左侧分类导航：通用 / 内核与模型 / 权限
+        let mut nav = div().v_flex().w(SETTINGS_NAV_W).flex_none().px_3().gap_0p5();
+        for (i, (icon, label)) in SETTINGS_TABS.into_iter().enumerate() {
+            let active = i == f.tab;
+            nav = nav.child(
+                div()
+                    .id(("settings-tab", i))
+                    .h_flex()
+                    .items_center()
+                    .gap_2p5()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .text_size(TEXT_BODY)
+                    .text_color(rgb(INK))
+                    .when(active, |d| d.bg(rgb(SELECTED)))
+                    .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER))))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.settings_form.tab != i {
+                            this.settings_form.tab = i;
+                            cx.notify();
+                        }
+                    }))
+                    .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
+                    .child(label),
+            );
+        }
+        let tab_content: Div = match f.tab {
+            1 => kernel_tab,
+            2 => self.render_rules(cx),
+            _ => self.render_general(cx),
+        };
+
         div()
-            .id("settings-scroll")
+            .id("settings")
             // 焦点锚：设置页里点空白处也留在 ChatApp 键上下文里（Esc 关设置页）
             .track_focus(&self.settings_focus)
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .v_flex()
             .child(
                 div()
                     .v_flex()
-                    .max_w(FORM_W)
-                    .mx_auto()
+                    .flex_1()
+                    .min_h_0()
                     .w_full()
-                    .px_6()
-                    .py_8()
-                    .gap_6()
+                    .max_w(SETTINGS_NAV_W + FORM_W)
+                    .mx_auto()
+                    // 标题行：「设置」与导航项文字左对齐，关闭按钮在右
                     .child(
                         div()
                             .h_flex()
                             .items_center()
+                            .flex_none()
+                            .px_6()
+                            .pt_6()
+                            .pb_4()
                             .child(
                                 div()
                                     .flex_1()
-                                    .text_size(TEXT_TITLE)
+                                    .text_size(TEXT_HEADING)
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(rgb(INK))
                                     .child("设置"),
@@ -962,9 +1047,23 @@ impl ChatApp {
                                     .child(Icon::new(IconAll::X).size_4().text_color(rgb(INK_SOFT))),
                             ),
                     )
-                    .child(self.render_appearance(cx))
-                    .child(body)
-                    .child(self.render_rules(cx)),
+                    // 导航固定，只滚右侧内容
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .child(nav)
+                            .child(
+                                div()
+                                    .id("settings-scroll")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_y_scroll()
+                                    // pt_2：首行文字与导航第一项的文字对齐
+                                    .child(div().v_flex().px_8().pt_2().pb_8().child(tab_content)),
+                            ),
+                    ),
             )
     }
 }

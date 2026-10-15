@@ -140,6 +140,8 @@ pub const LEADING: DefiniteLength = relative(1.6);
 pub const READING_W: Pixels = px(760.);
 /// 设置页内容最大宽度
 pub const FORM_W: Pixels = px(720.);
+/// 设置页左侧分类导航宽度
+pub const SETTINGS_NAV_W: Pixels = px(200.);
 /// 首页用量概览面板宽度
 pub const OVERVIEW_W: Pixels = px(724.);
 /// 侧栏宽度（含外圈留白）

@@ -174,7 +174,7 @@ pub struct AcpSettings {
     pub command: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// None = 从没选过：配好了自研内核就用它，否则 ACP
@@ -185,6 +185,28 @@ pub struct Settings {
     pub view_mode: ViewMode,
     /// 外观（跟随系统 / 浅色 / 深色），设置页切换后立即生效并写回
     pub appearance: Appearance,
+    /// 侧栏底部列出各内核状态（「自研内核 · 已连接」），设置页切换后立即生效并写回。
+    /// 默认显示：老设置文件里没有这一项时也保持原样（容器级 `#[serde(default)]`
+    /// 会用下面的 `Default` 实现补齐缺失字段）。
+    pub sidebar_kernel_status: bool,
+}
+
+/// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
+fn yes() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            kernel: None,
+            builtin: BuiltinSettings::default(),
+            acp: AcpSettings::default(),
+            view_mode: ViewMode::default(),
+            appearance: Appearance::default(),
+            sidebar_kernel_status: yes(),
+        }
+    }
 }
 
 /// 外观偏好。
@@ -395,12 +417,16 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn ui_prefs_default_and_parse() {
-        // 旧设置文件没有这两项：跟随系统 + 标准视图
+        // 旧设置文件没有这几项：跟随系统 + 标准视图 + 侧栏显示内核状态
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::System, ViewMode::Normal));
-        let s: Settings =
-            serde_json::from_str(r#"{"appearance":"dark","view_mode":"verbose"}"#).unwrap();
+        assert!(s.sidebar_kernel_status);
+        let s: Settings = serde_json::from_str(
+            r#"{"appearance":"dark","view_mode":"verbose","sidebar_kernel_status":false}"#,
+        )
+        .unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::Dark, ViewMode::Verbose));
+        assert!(!s.sidebar_kernel_status);
     }
 
     #[core::prelude::v1::test]

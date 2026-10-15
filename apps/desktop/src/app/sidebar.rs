@@ -161,7 +161,13 @@ impl ChatApp {
                             .gap_1()
                             .px_4()
                             .pt_1()
-                            .children(self.kernel_status_rows()),
+                            .children(
+                                // 可在设置页关掉（「侧栏显示内核状态」）
+                                self.settings
+                                    .sidebar_kernel_status
+                                    .then(|| self.kernel_status_rows())
+                                    .unwrap_or_default(),
+                            ),
                     ),
             );
 
