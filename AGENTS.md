@@ -85,6 +85,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 文件对话框与系统联动：`cx.prompt_for_paths(PathPromptOptions)`（注意有 `prompt`
   字段）、`cx.prompt_for_new_path(dir, name)`，均返回 oneshot，配 `cx.spawn_in` +
   `this.update_in` 回 UI；`cx.reveal_path(&path)` 在资源管理器中打开。
+- **`gap_2p5` / `px_5` / `py_2p5` 这类"分数后缀"helper 确实存在**，只是全在宏里生成，
+  静态搜索（grep 源码）找不到定义：`gpui-pre-macros` 的 `padding_style_methods!` /
+  `margin_style_methods!` 按 `BoxStyleSuffix` 表展开，`2p5` = `rems(0.625)` = 10px、
+  `5` = `rems(1.25)` = 20px（表在 `gpui-pre-macros-*/src/styles.rs`）。
+  它们按 **rem** 取值，`0.5` 档是 8px 而非 4px——算间距时注意基准不是 16px 的整数倍。
+  不要再把"搜不到定义"当成渲染塌陷的证据：早先正是据此误判顶栏渲染坏了，
+  实际是探针里的 `top_bar()` 从未被 `render()` 调用（死代码）。
 
 ## 其他
 

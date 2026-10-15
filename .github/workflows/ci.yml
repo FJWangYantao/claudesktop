@@ -13,7 +13,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # 让 clippy 输出指向 CI 日志的注解
+  # 本仓库自己的代码不留警告（依赖 crate 的警告由 --cap-lints 豁免）
   RUSTFLAGS: -Dwarnings
 
 jobs:
