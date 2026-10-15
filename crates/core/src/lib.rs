@@ -115,6 +115,9 @@ pub enum KernelEvent {
         status: Option<String>,
         /// 输出摘要：能从结构化输出里取到文本就取文本，否则是 JSON 文本；已截断
         raw_output: Option<String>,
+        /// 输出正文预览（界面点开工具行时显示），见 [`output_preview`]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// 工具调用涉及的文件改动（可能在执行前作为预览发出，同一路径再次发出时替换）
     ToolCallDiff { id: String, diff: DiffView },
@@ -142,11 +145,40 @@ pub enum KernelEvent {
         output_tokens: u64,
         /// 其中思考消耗的 token（不报告为 0）
         reasoning_tokens: u64,
+        /// 本轮最后一次请求结束时上下文里的 token（输入 + 输出），即下一轮大约要带上的量；
+        /// 0 = 不知道
+        #[serde(default)]
+        context_tokens: u64,
+        /// 本轮输入里命中提示缓存的部分（包含在 `input_tokens` 里；不报告为 0）
+        #[serde(default)]
+        cache_read_tokens: u64,
     },
     /// 创建会话失败（`session/new` 报错）；连接仍然可用
     SessionFailed { token: u64, message: String },
     /// 本轮提示失败（如未登录、模型报错）；连接仍然可用
     PromptFailed { message: String },
+    /// 端点返回瞬态错误（限流 / 5xx），内核等 `delay_ms` 后自动第 `attempt` 次重试；
+    /// 本轮还在进行，界面据此显示倒计时
+    Retrying {
+        /// HTTP 状态码（429 为限流）
+        status: u16,
+        attempt: usize,
+        delay_ms: u64,
+        /// 上一次的错误（「HTTP 429: …」）
+        reason: String,
+    },
+    /// 开始压缩上下文（把较早的对话总结成摘要）：自动压缩发生在一轮中间，手动压缩自成一轮
+    Compacting,
+    /// 压缩完成：之后的请求带摘要而不是原来的对话
+    Compacted {
+        /// 模型写的摘要（Markdown）
+        summary: String,
+        /// 压缩后上下文的估算 token（输入框旁的用量随之回落）；0 = 不知道
+        #[serde(default)]
+        context_tokens: u64,
+    },
+    /// 压缩失败；自动压缩时这一轮照常继续
+    CompactFailed { message: String },
     /// 内核致命错误（连接断开、初始化失败等，内核不再可用）
     Fatal(String),
 }
@@ -173,9 +205,94 @@ impl KernelEvent {
             Self::UsageUpdated { .. } => "usage_updated",
             Self::SessionFailed { .. } => "session_failed",
             Self::PromptFailed { .. } => "prompt_failed",
+            Self::Retrying { .. } => "retrying",
+            Self::Compacting => "compacting",
+            Self::Compacted { .. } => "compacted",
+            Self::CompactFailed { .. } => "compact_failed",
             Self::Fatal(_) => "fatal",
         }
     }
+}
+
+/// 错误信息看起来是「超出模型的上下文长度」（各家网关说法不一，按关键词认）。
+pub fn is_context_overflow(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    [
+        "context length",
+        "context_length",
+        "context window",
+        "maximum context",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "exceeds the context",
+        "上下文长度",
+        "超出上下文",
+        "超过上下文",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+}
+
+/// 工具输出预览最多保留的行数
+pub const OUTPUT_PREVIEW_LINES: usize = 40;
+/// 工具输出预览最多保留的字符数（防止少数几行超长）
+const OUTPUT_PREVIEW_CHARS: usize = 4000;
+/// 预览里单行最多保留的字符数
+const OUTPUT_PREVIEW_LINE_CHARS: usize = 240;
+
+/// 工具输出 → 给界面看的预览：去掉首尾空行，制表符按 4 列制表位展开，去掉各行共同的
+/// 行首缩进（读文件结果的行号列右对齐补空格，不去掉整段会往右空出一截），最多
+/// [`OUTPUT_PREVIEW_LINES`] 行，超长行截断；截掉了内容时末尾注明还剩多少行。
+/// 只给人看，不回给模型（模型拿到的是完整输出）。
+pub fn output_preview(text: &str) -> String {
+    let lines: Vec<&str> = text.trim_matches(['\n', '\r']).lines().collect();
+    let mut rows: Vec<String> = Vec::new();
+    let mut chars = 0;
+    for line in &lines {
+        if rows.len() == OUTPUT_PREVIEW_LINES || chars >= OUTPUT_PREVIEW_CHARS {
+            break;
+        }
+        let line = expand_tabs(line.trim_end());
+        let line = match line.char_indices().nth(OUTPUT_PREVIEW_LINE_CHARS) {
+            Some((cut, _)) => format!("{}…", &line[..cut]),
+            None => line,
+        };
+        chars += line.chars().count();
+        rows.push(line);
+    }
+    let indent = rows
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| r.len() - r.trim_start_matches(' ').len())
+        .min()
+        .unwrap_or(0);
+    let mut out = rows
+        .iter()
+        .map(|r| r.get(indent..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if rows.len() < lines.len() {
+        out.push_str(&format!("\n… 其余 {} 行未显示", lines.len() - rows.len()));
+    }
+    out
+}
+
+/// 制表符展开到下一个 4 列制表位（按字符数算列，不管中文宽度）。
+fn expand_tabs(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut col = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            let n = 4 - col % 4;
+            out.extend(std::iter::repeat_n(' ', n));
+            col += n;
+        } else {
+            out.push(c);
+            col += 1;
+        }
+    }
+    out
 }
 
 /// 带会话归属的事件：一条连接上可以同时有多个会话。
@@ -286,6 +403,67 @@ pub trait Kernel: Send + Sync {
         let _ = (session, model);
         anyhow::bail!("当前内核不支持切换模型")
     }
+    /// 更新各模型的上下文窗口（模型 ID → token；界面取到模型列表后推过来，自动压缩用）。默认忽略。
+    fn set_context_windows(&self, windows: std::collections::HashMap<String, u64>) {
+        let _ = windows;
+    }
+    /// 把某会话较早的对话压缩成摘要（手动压缩，会话空闲时）：经 `Compacting` →
+    /// `Compacted` / `CompactFailed` → `TurnEnded` 回报。默认不支持。
+    fn compact(&self, session: &str) -> anyhow::Result<()> {
+        let _ = session;
+        anyhow::bail!("当前内核不支持压缩上下文")
+    }
     /// 关闭内核。
     fn shutdown(&self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_context_overflow() {
+        assert!(is_context_overflow(
+            "HTTP 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."
+        ));
+        assert!(is_context_overflow("HTTP 400: prompt is too long: 210000 tokens > 200000 maximum"));
+        assert!(is_context_overflow("HTTP 400: 输入超出上下文长度限制"));
+        assert!(!is_context_overflow("HTTP 429: Resource has been exhausted"));
+    }
+
+    #[test]
+    fn output_preview_keeps_short_output() {
+        assert_eq!(output_preview("\n     1\tfn main() {}  \n\n"), "1  fn main() {}");
+        assert_eq!(output_preview(""), "");
+    }
+
+    #[test]
+    fn output_preview_strips_common_indent() {
+        // 读文件的行号列：右对齐 + 制表符，去掉共同缩进后行号仍然右对齐
+        let read = "     9\tlet a = 1;\n    10\t\tb();\n    11\t";
+        assert_eq!(output_preview(read), " 9  let a = 1;\n10      b();\n11");
+        // 空行不参与计算共同缩进
+        assert_eq!(output_preview("  a\n\n    b"), "a\n\n  b");
+    }
+
+    #[test]
+    fn output_preview_clips_lines() {
+        let text: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let out = output_preview(&text);
+        let rows: Vec<&str> = out.lines().collect();
+        assert_eq!(rows.len(), OUTPUT_PREVIEW_LINES + 1);
+        assert_eq!(rows[OUTPUT_PREVIEW_LINES - 1], format!("line {OUTPUT_PREVIEW_LINES}"));
+        assert_eq!(rows[OUTPUT_PREVIEW_LINES], format!("… 其余 {} 行未显示", 100 - OUTPUT_PREVIEW_LINES));
+    }
+
+    #[test]
+    fn output_preview_clips_long_lines_and_total_size() {
+        let out = output_preview(&"中".repeat(1000));
+        assert_eq!(out.chars().count(), OUTPUT_PREVIEW_LINE_CHARS + 1);
+        // 每行都很长时按总字符数提前收住
+        let text = vec!["x".repeat(500); 30].join("\n");
+        let out = output_preview(&text);
+        assert!(out.chars().count() < OUTPUT_PREVIEW_CHARS + 2 * OUTPUT_PREVIEW_LINE_CHARS, "{}", out.len());
+        assert!(out.ends_with("行未显示"), "{out}");
+    }
 }

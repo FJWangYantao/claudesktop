@@ -583,16 +583,16 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
             status: wire_name(&call.status),
             kind: wire_name(&call.kind),
         }),
-        SessionUpdate::ToolCallUpdate(update) => Some(KernelEvent::ToolCallUpdated {
-            id: update.tool_call_id.to_string(),
-            title: update.fields.title.clone(),
-            status: update.fields.status.as_ref().map(wire_name),
-            raw_output: update
-                .fields
-                .raw_output
-                .as_ref()
-                .map(|v| truncate(&output_text(v), 2000)),
-        }),
+        SessionUpdate::ToolCallUpdate(update) => {
+            let text = update.fields.raw_output.as_ref().map(output_text);
+            Some(KernelEvent::ToolCallUpdated {
+                id: update.tool_call_id.to_string(),
+                title: update.fields.title.clone(),
+                status: update.fields.status.as_ref().map(wire_name),
+                raw_output: text.as_deref().map(|t| truncate(t, 2000)),
+                output: text.as_deref().map(crate::output_preview),
+            })
+        }
         SessionUpdate::Plan(plan) => Some(KernelEvent::PlanReplaced {
             entries: plan
                 .entries

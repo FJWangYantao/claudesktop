@@ -50,8 +50,9 @@ pub enum Record {
     Event { event: KernelEvent },
     /// 用户对某条权限请求的应答（展示名，如「Yes」「已取消」）
     PermissionResolved { id: u64, label: String },
-    /// 一轮结束时的统计：时间、模型、token 用量（首页用量概览用，重放时忽略）。
-    /// 内核没报告模型 / 用量时对应字段为空 / 0
+    /// 一轮结束时的统计：时间、模型、token 用量、这一轮用了多久
+    /// （首页用量概览用；重放时挂到这一轮的回复下面）。
+    /// 内核没报告模型 / 用量时对应字段为空 / 0；旧日志没有用时
     Turn {
         at_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,7 +61,14 @@ pub enum Record {
         input_tokens: u64,
         #[serde(default)]
         output_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        /// 这一轮结束时上下文里的 token（输入框旁的上下文用量；内核不报告时为空）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u64>,
     },
+    /// 一段思考想了多久（思考收尾时记下；重放时挂到它前面最近的思考块上）
+    Thought { elapsed_ms: u64 },
 }
 
 impl Record {
@@ -76,6 +84,9 @@ impl Record {
                 | KernelEvent::PermissionAuto { .. }
                 | KernelEvent::PermissionRequest { .. }
                 | KernelEvent::PromptFailed { .. }
+                | KernelEvent::Compacting
+                | KernelEvent::Compacted { .. }
+                | KernelEvent::CompactFailed { .. }
                 | KernelEvent::TurnEnded { .. }
         )
     }
@@ -381,10 +392,27 @@ mod tests {
             model: None,
             input_tokens: 1,
             output_tokens: 2,
+            elapsed_ms: None,
+            context_tokens: None,
         };
         let line = serde_json::to_string(&turn).unwrap();
         assert_eq!(line, r#"{"t":"turn","at_ms":5,"input_tokens":1,"output_tokens":2}"#);
         assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), turn);
+        let timed = Record::Turn {
+            at_ms: 5,
+            model: None,
+            input_tokens: 1,
+            output_tokens: 2,
+            elapsed_ms: Some(1500),
+            context_tokens: Some(3),
+        };
+        let line = serde_json::to_string(&timed).unwrap();
+        assert!(line.ends_with(r#""elapsed_ms":1500,"context_tokens":3}"#));
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), timed);
+        let thought = Record::Thought { elapsed_ms: 1200 };
+        let line = serde_json::to_string(&thought).unwrap();
+        assert_eq!(line, r#"{"t":"thought","elapsed_ms":1200}"#);
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), thought);
 
         store.delete(&a.id).unwrap();
         assert_eq!(store.list().len(), 1);
