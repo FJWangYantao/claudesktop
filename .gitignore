@@ -1,4 +1,5 @@
 /target
+/target-test
 *.log
 .DS_Store
 
