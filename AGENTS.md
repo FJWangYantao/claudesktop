@@ -7,6 +7,9 @@
 **先查现成组件再动手写 div 链**——组件清单包括 Button / Popover / Modal / Dropdown /
 Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模块。
 
+视觉与交互的取舍依据（色彩 / 圆角 / 层级 / 文案 / 反模式）见
+[设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md)，第七章是对照本项目的落地清单。
+
 ### 已沉淀的封装与惯例
 
 - **下拉 / 浮层菜单**：一律用 `app/menu.rs` 的 `menu_popover()`（trigger chip 用
