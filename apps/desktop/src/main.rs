@@ -40,6 +40,7 @@ fn main() {
         .run(move |cx| {
             let t_gpui_run = t0.elapsed();
             gpui_kit::init(cx);
+            app::keys::bind(cx);
             fonts::register(cx);
             let t_fonts = t0.elapsed();
 

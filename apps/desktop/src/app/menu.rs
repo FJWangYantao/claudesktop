@@ -59,9 +59,9 @@ impl RenderOnce for MenuChip {
             )
             .child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
         if self.open {
-            chip.bg(rgb(SAND))
+            chip.bg(rgb(HOVER))
         } else {
-            chip.hover(|d| d.bg(rgb(SAND)))
+            chip.hover(|d| d.bg(rgb(HOVER)))
         }
     }
 }

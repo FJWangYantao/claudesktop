@@ -350,7 +350,7 @@ impl ChatApp {
                 div()
                     .py_2()
                     .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_FAINT))
+                    .text_color(rgb(INK_SOFT))
                     .child("还没有规则"),
             );
         }
@@ -406,7 +406,7 @@ impl ChatApp {
                                 .p_1()
                                 .rounded_md()
                                 .cursor_pointer()
-                                .hover(|d| d.bg(rgb(SAND)))
+                                .hover(|d| d.bg(rgb(HOVER)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.remove_rule(p.clone(), r.clone(), cx)
                                 }))
@@ -489,16 +489,16 @@ impl ChatApp {
             .cursor_pointer()
             .text_size(TEXT_BODY)
             .when(primary, |d| {
-                d.bg(rgb(CORAL))
+                d.bg(rgb(CORAL_DEEP))
                     .text_color(rgb(WHITE))
-                    .hover(|d| d.opacity(0.9))
+                    .hover(|d| d.bg(rgb(CORAL_DEEP_HOVER)))
             })
             .when(!primary, |d| {
                 d.border_1()
                     .border_color(rgb(LINE))
                     .bg(rgb(CARD))
                     .text_color(rgb(INK))
-                    .hover(|d| d.bg(rgb(SAND)))
+                    .hover(|d| d.bg(rgb(HOVER)))
             })
             .child(label.into())
     }
@@ -529,7 +529,7 @@ impl ChatApp {
                 .border_color(rgb(if active { CORAL } else { LINE }))
                 .bg(rgb(CARD))
                 .cursor_pointer()
-                .hover(|d| d.bg(rgb(PAPER)))
+                .hover(|d| d.bg(rgb(HOVER)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.settings_form.kernel = kind;
                     this.settings_form.message = None;
@@ -610,7 +610,7 @@ impl ChatApp {
                             .border_color(rgb(if active { CORAL } else { LINE }))
                             .bg(rgb(if active { SAND } else { CARD }))
                             .cursor_pointer()
-                            .hover(|d| d.bg(rgb(SAND)))
+                            .hover(|d| d.bg(rgb(HOVER)))
                             .text_size(TEXT_SMALL)
                             .text_color(rgb(INK))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -621,9 +621,9 @@ impl ChatApp {
                                 div()
                                     .id(("profile-remove", i))
                                     .p(px(1.))
-                                    .rounded(px(4.))
+                                    .rounded_sm()
                                     .cursor_pointer()
-                                    .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                                    .hover(|d| d.bg(rgb(SELECTED)))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.remove_form_profile(i, cx);
                                     }))
@@ -647,7 +647,7 @@ impl ChatApp {
                         .border_1()
                         .border_color(rgb(LINE))
                         .cursor_pointer()
-                        .hover(|d| d.bg(rgb(SAND)))
+                        .hover(|d| d.bg(rgb(HOVER)))
                         .text_size(TEXT_SMALL)
                         .text_color(rgb(INK_SOFT))
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -671,7 +671,7 @@ impl ChatApp {
                             .border_1()
                             .border_color(rgb(LINE))
                             .cursor_pointer()
-                            .hover(|d| d.bg(rgb(SAND)))
+                            .hover(|d| d.bg(rgb(HOVER)))
                             .text_size(TEXT_SMALL)
                             .text_color(rgb(INK))
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -699,7 +699,7 @@ impl ChatApp {
                             .border_color(rgb(if active { CORAL } else { LINE }))
                             .bg(rgb(if active { SAND } else { CARD }))
                             .cursor_pointer()
-                            .hover(|d| d.bg(rgb(SAND)))
+                            .hover(|d| d.bg(rgb(HOVER)))
                             .text_size(TEXT_SMALL)
                             .text_color(rgb(INK))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -738,7 +738,7 @@ impl ChatApp {
                                 .border_color(rgb(if active { CORAL } else { LINE }))
                                 .bg(rgb(if active { SAND } else { CARD }))
                                 .cursor_pointer()
-                                .hover(|d| d.bg(rgb(SAND)))
+                                .hover(|d| d.bg(rgb(HOVER)))
                                 .text_size(TEXT_SMALL)
                                 .font_family(MONO)
                                 .text_color(rgb(INK))
@@ -843,7 +843,7 @@ impl ChatApp {
             .child(
                 div()
                     .text_size(TEXT_META)
-                    .text_color(rgb(INK_FAINT))
+                    .text_color(rgb(INK_SOFT))
                     .child(format!(
                         "保存在 {path}（API Key 为明文）。启动时环境变量优先于这里的设置。只重启配置变了的内核，它上面进行中的对话会中断，下次发消息时自动续接。"
                     )),
@@ -851,13 +851,15 @@ impl ChatApp {
 
         div()
             .id("settings-scroll")
+            // 焦点锚：设置页里点空白处也留在 ChatApp 键上下文里（Esc 关设置页）
+            .track_focus(&self.settings_focus)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .child(
                 div()
                     .v_flex()
-                    .max_w(px(720.))
+                    .max_w(FORM_W)
                     .mx_auto()
                     .w_full()
                     .px_6()
@@ -881,7 +883,7 @@ impl ChatApp {
                                     .p_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .hover(|d| d.bg(rgb(SAND)))
+                                    .hover(|d| d.bg(rgb(HOVER)))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.settings_open = false;
                                         cx.notify();

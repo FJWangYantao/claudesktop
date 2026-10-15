@@ -35,7 +35,7 @@ impl ChatApp {
             .py_1()
             .rounded_md()
             .text_size(TEXT_SMALL)
-            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(CLEAR) })
+            .bg(if active { rgb(SELECTED) } else { rgba(CLEAR) })
             .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
             .child(text)
     }

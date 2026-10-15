@@ -112,7 +112,8 @@ impl ChatApp {
             .justify_center()
             .items_center()
             .cursor_pointer()
-            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+            // 沙色侧栏和纸色顶栏上都会出现，取深的一档两边都看得见
+            .hover(|d| d.bg(rgb(SELECTED)))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
@@ -189,6 +190,14 @@ impl ChatApp {
             .map(|n| SharedString::from(n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| self.project_name.clone());
 
+        // 发送按钮三态：空（淡、不可点）/ 可发送（赤陶）/ 忙（深色停止方块，同 Esc）
+        let can_send = !self.input.read(cx).value().trim().is_empty() || !self.pending.is_empty();
+        let send_bg = match (busy, can_send) {
+            (true, _) => INK,
+            (false, true) => CORAL,
+            (false, false) => SAND,
+        };
+
         // 输入框：右侧发送；忙时换成停止（方块）；粘贴图片转成附件
         let card = div()
             .id("composer")
@@ -222,26 +231,32 @@ impl ChatApp {
                     .size(px(28.))
                     .flex_shrink_0()
                     .rounded_lg()
-                    .bg(rgb(if busy { INK } else { CORAL }))
+                    .bg(rgb(send_bg))
                     .flex()
                     .justify_center()
                     .items_center()
-                    .cursor_pointer()
+                    .when(busy || can_send, |d| d.cursor_pointer())
                     .tooltip(move |window, cx| {
-                        Tooltip::new(if busy { "停止" } else { "发送（回车）" }).build(window, cx)
+                        Tooltip::new(match (busy, can_send) {
+                            (true, _) => "停止（Esc）",
+                            (false, true) => "发送（回车）",
+                            (false, false) => "先输入内容或附上图片",
+                        })
+                        .build(window, cx)
                     })
                     .child(if busy {
-                        div().size(px(9.)).rounded(px(2.)).bg(rgb(WHITE)).into_any_element()
+                        div().size(px(9.)).rounded_xs().bg(rgb(WHITE)).into_any_element()
                     } else {
                         Icon::new(IconAll::ArrowUp)
                             .size_4()
-                            .text_color(rgb(WHITE))
+                            .text_color(rgb(if can_send { WHITE } else { INK_FAINT }))
                             .into_any_element()
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.session().busy {
                             this.stop(cx);
                         } else {
+                            // 空输入时 send 自己会忽略
                             this.send(window, cx);
                         }
                     })),
@@ -249,7 +264,7 @@ impl ChatApp {
 
         div()
             .v_flex()
-            .max_w(px(760.))
+            .max_w(READING_W)
             .mx_auto()
             .w_full()
             .gap_2()
@@ -306,7 +321,7 @@ impl ChatApp {
                             .justify_center()
                             .items_center()
                             .cursor_pointer()
-                            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                            .hover(|d| d.bg(rgb(HOVER)))
                             .tooltip(|window, cx| Tooltip::new("添加文件").build(window, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx)))
                             .child(Icon::new(IconAll::Plus).size_4().text_color(rgb(INK_SOFT))),
@@ -321,7 +336,7 @@ impl ChatApp {
                             .justify_center()
                             .items_center()
                             .cursor_pointer()
-                            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                            .hover(|d| d.bg(rgb(HOVER)))
                             .tooltip(|window, cx| {
                                 Tooltip::new("附加图片（也可直接粘贴）").build(window, cx)
                             })
@@ -439,7 +454,7 @@ fn mode_menu_items(
                 .py_2()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|d| d.bg(rgb(SAND)))
+                .hover(|d| d.bg(rgb(HOVER)))
                 .on_click(menu_action!(handle, popover, |this, cx| {
                     this.choose_mode(i, cx);
                 }))
@@ -530,7 +545,7 @@ fn kernel_menu_items(
                 .rounded_md()
                 .when(usable, |d| {
                     d.cursor_pointer()
-                        .hover(|d| d.bg(rgb(SAND)))
+                        .hover(|d| d.bg(rgb(HOVER)))
                         .on_click(menu_action!(handle, popover, |this, cx| {
                             match first_prompt {
                                 Some(item) => this.rerun_on(item, kind, cx),
@@ -622,7 +637,7 @@ fn model_menu_items(
                 .py_1p5()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|d| d.bg(rgb(SAND)))
+                .hover(|d| d.bg(rgb(HOVER)))
                 .on_click(menu_action!(handle, popover, |this, cx| {
                     this.choose_model(m.clone(), cx);
                 }))
@@ -652,7 +667,7 @@ fn model_menu_items(
             .border_t_1()
             .border_color(rgb(LINE))
             .cursor_pointer()
-            .hover(|d| d.bg(rgb(SAND)))
+            .hover(|d| d.bg(rgb(HOVER)))
             .text_size(TEXT_SMALL)
             .text_color(rgb(INK_SOFT))
             .on_click(move |_, _, cx| {
@@ -691,7 +706,7 @@ fn profile_menu_items(
                 .py_1p5()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|d| d.bg(rgb(SAND)))
+                .hover(|d| d.bg(rgb(HOVER)))
                 .on_click(menu_action!(handle, popover, |this, cx| {
                     this.switch_profile(i, cx);
                 }))
@@ -731,7 +746,7 @@ fn profile_menu_items(
             .px_2p5()
             .py_1p5()
             .text_size(TEXT_SMALL)
-            .text_color(rgb(INK_FAINT))
+            .text_color(rgb(INK_SOFT))
             .child("切换会重启自研内核，进行中的对话下次发消息时续接"),
     )
 }

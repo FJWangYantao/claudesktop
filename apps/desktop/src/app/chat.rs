@@ -159,7 +159,7 @@ impl ChatApp {
                         .text_ellipsis()
                         .whitespace_nowrap()
                         .px_1p5()
-                        .rounded(px(4.))
+                        .rounded_sm()
                         .bg(rgb(CODE_BG))
                         .font_family(MONO)
                         .text_size(TEXT_SMALL)
@@ -192,7 +192,7 @@ impl ChatApp {
                     .font_family(MONO)
                     .text_size(TEXT_SMALL)
                     .line_height(LEADING)
-                    .text_color(rgb(INK_FAINT))
+                    .text_color(rgb(INK_SOFT))
                     .child("└")
                     .child(div().flex_1().min_w_0().child(card.result.clone())),
             );
@@ -286,12 +286,16 @@ impl ChatApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_size(TEXT_BODY)
-                            .when(primary, |d| d.bg(rgb(CORAL)).text_color(rgb(WHITE)))
+                            .when(primary, |d| {
+                                d.bg(rgb(CORAL_DEEP))
+                                    .text_color(rgb(WHITE))
+                                    .hover(|d| d.bg(rgb(CORAL_DEEP_HOVER)))
+                            })
                             .when(!primary, |d| {
                                 d.border_1()
                                     .border_color(rgb(LINE))
                                     .bg(rgb(CARD))
-                                    .hover(|d| d.bg(rgb(SAND)))
+                                    .hover(|d| d.bg(rgb(HOVER)))
                                     .text_color(rgb(if allow { INK } else { RED }))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -383,7 +387,7 @@ impl ChatApp {
                     .px_3()
                     .py_1()
                     .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_FAINT))
+                    .text_color(rgb(INK_SOFT))
                     .child("改动过大，其余部分未显示"),
             );
         }
@@ -410,7 +414,7 @@ impl ChatApp {
                     .child(diff.path.clone()),
             );
         if diff.created {
-            header = header.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_FAINT)).child("新文件"));
+            header = header.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("新文件"));
         }
         header = header
             .child(
@@ -457,7 +461,7 @@ impl ChatApp {
                     .child(div().text_color(rgb(INK_SOFT)).child("计划"))
                     .child(
                         div()
-                            .text_color(rgb(INK_FAINT))
+                            .text_color(rgb(INK_SOFT))
                             .child(format!("{done}/{}", rows.len())),
                     ),
             )
@@ -519,7 +523,7 @@ impl ChatApp {
                     .py_0p5()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|d| d.bg(rgb(SAND)))
+                    .hover(|d| d.bg(rgb(HOVER)))
                     .on_click(cx.listener(move |this, _, _, cx| this.rerun_on(idx, kind, cx)))
                     .child(Icon::new(IconAll::RefreshCw).size_3().text_color(rgb(INK_SOFT)))
                     .child(
@@ -539,7 +543,7 @@ impl ChatApp {
                     .max_w(relative(0.85))
                     .bg(rgb(SAND))
                     .text_color(rgb(INK))
-                    .rounded(px(14.))
+                    .rounded_2xl()
                     .px_4()
                     .py_2p5()
                     .text_size(TEXT_LARGE)
@@ -630,7 +634,7 @@ impl ChatApp {
                 div().h_flex().justify_center().pt_1().child(
                     div()
                         .text_size(TEXT_META)
-                        .text_color(rgb(INK_FAINT))
+                        .text_color(rgb(INK_SOFT))
                         .child(text.clone()),
                 )
             }

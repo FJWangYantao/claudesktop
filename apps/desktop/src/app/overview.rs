@@ -63,7 +63,7 @@ impl ChatApp {
         for row in 0..HEAT_ROWS {
             let mut line = div().h_flex().w_full().gap(px(3.));
             for col in 0..HEAT_COLS {
-                let cell = div().flex_1().h(px(14.)).rounded(px(3.));
+                let cell = div().flex_1().h(px(14.)).rounded_sm();
                 line = line.child(match o.heat[row * HEAT_COLS + col] {
                     Some(v) => cell.bg(rgb(Self::heat_color(v))),
                     None => cell,
@@ -87,7 +87,7 @@ impl ChatApp {
 
     /// 模型页签：每个模型的轮数和 token，条形按轮数
     fn render_usage_models(o: &Overview) -> Div {
-        let mut list = div().v_flex().gap_2().w(px(684.));
+        let mut list = div().v_flex().gap_2().w_full();
         if o.models.is_empty() {
             return list.child(
                 div()
@@ -211,7 +211,7 @@ impl ChatApp {
                 div()
                     .v_flex()
                     .gap_4()
-                    .w(px(724.))
+                    .w(OVERVIEW_W)
                     .p_5()
                     .rounded_xl()
                     .bg(rgb(SAND))

@@ -1,5 +1,5 @@
-//! 对话流末尾的运行状态行：本轮在干什么、跑了多久、用了多少 token
-//! （对照官方「✳ 5s · ↓ 3.5k tokens」）。只在当前会话忙时出现；
+//! 对话流末尾的运行状态行：本轮在干什么、跑了多久、用了多少 token、怎么停
+//! （对照官方「✳ 5s · ↓ 3.5k tokens · esc to interrupt」）。只在当前会话忙时出现；
 //! 数据来自 `Session::activity` / `turn_usage` / `turn_started`。
 
 use super::ChatApp;
@@ -51,6 +51,8 @@ impl ChatApp {
         };
         let mut meta: Vec<String> = s.turn_started.map(|t| elapsed_label(t.elapsed())).into_iter().collect();
         meta.extend(usage_label(&s.turn_usage));
+        // 顺带告诉用户怎么停（Esc 见 keys.rs）
+        meta.push("Esc 停止".into());
 
         Some(
             div()
@@ -73,7 +75,7 @@ impl ChatApp {
                 .children(meta.into_iter().map(|text| {
                     div()
                         .flex_shrink_0()
-                        .text_color(rgb(INK_FAINT))
+                        .text_color(rgb(INK_SOFT))
                         .child(format!("· {text}"))
                 })),
         )

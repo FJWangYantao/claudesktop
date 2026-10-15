@@ -93,8 +93,8 @@ impl ChatApp {
                 .py(px(5.))
                 .rounded_md()
                 .cursor_pointer()
-                .when(active, |d| d.bg(rgb(SAND_ACTIVE)))
-                .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                .when(active, |d| d.bg(rgb(SELECTED)))
+                .hover(|d| d.bg(rgb(SELECTED)))
                 .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
                 .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(label))
         };
@@ -166,7 +166,7 @@ impl ChatApp {
 
         // 侧栏是浮在窗口底色上的圆角面板，四周留一圈窗口底色
         div()
-            .w(px(256.))
+            .w(SIDEBAR_W)
             .flex_shrink_0()
             .h_full()
             .pl_2()
@@ -186,7 +186,7 @@ impl ChatApp {
             .p(px(3.))
             .rounded_md()
             .cursor_pointer()
-            .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+            .hover(|d| d.bg(rgb(SELECTED)))
             .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
             .child(
                 Icon::new(icon)
@@ -231,7 +231,7 @@ impl ChatApp {
 
     /// 侧栏分组：(组名, 会话下标)。当前工作目录一组在最前；
     /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
-    fn session_groups(&self) -> Vec<(SharedString, Vec<usize>)> {
+    pub(super) fn session_groups(&self) -> Vec<(SharedString, Vec<usize>)> {
         let mut groups: Vec<(&Path, Vec<usize>)> = vec![(self.cwd.as_path(), Vec::new())];
         for (i, s) in self.sessions.iter().enumerate() {
             match groups.iter_mut().find(|(cwd, _)| *cwd == s.cwd.as_path()) {
@@ -279,7 +279,7 @@ impl ChatApp {
             .px_2()
             .py(px(5.))
             .rounded_md()
-            .bg(if active { rgb(SAND_ACTIVE) } else { rgba(CLEAR) });
+            .bg(if active { rgb(SELECTED) } else { rgba(CLEAR) });
 
         // 重命名中：标题换成输入框
         if self.renaming == Some(s.token) {
@@ -355,12 +355,12 @@ impl ChatApp {
                 .p(px(3.))
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|d| d.bg(rgb(LINE)))
+                .hover(|d| d.bg(rgb(HOVER_STRONG)))
                 .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
         };
         row.group(group.clone())
             .cursor_pointer()
-            .when(!active, |d| d.hover(|d| d.bg(rgb(SAND_ACTIVE))))
+            .when(!active, |d| d.hover(|d| d.bg(rgb(SELECTED))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = i;
                 this.settings_open = false;
@@ -392,7 +392,7 @@ impl ChatApp {
                     div()
                         .flex_shrink_0()
                         .text_size(TEXT_META)
-                        .text_color(rgb(INK_FAINT))
+                        .text_color(rgb(INK_SOFT))
                         .child(age),
                 )
             })
@@ -408,7 +408,7 @@ impl ChatApp {
                     .gap_0p5()
                     .pl_2()
                     .rounded_md()
-                    .bg(rgb(SAND_ACTIVE))
+                    .bg(rgb(SELECTED))
                     .opacity(0.)
                     .group_hover(group, |d| d.opacity(1.))
                     .child(icon_button("session-rename", IconAll::SquarePen).on_click(cx.listener(

@@ -4,6 +4,7 @@
 mod chat;
 mod chrome;
 mod composer;
+pub(crate) mod keys;
 mod menu;
 mod overview;
 mod settings_view;
@@ -71,6 +72,8 @@ pub struct ChatApp {
     settings: Settings,
     settings_path: Option<PathBuf>,
     settings_open: bool,
+    /// 设置页的焦点锚（设置页没有输入框可以兜底，快捷键靠它留在 `ChatApp` 键上下文里）
+    settings_focus: FocusHandle,
     settings_form: SettingsForm,
     /// 正在后台获取模型列表
     fetching_models: bool,
@@ -121,12 +124,20 @@ impl ChatApp {
              event: &InputEvent,
              window: &mut Window,
              cx: &mut Context<ChatApp>| {
-                if let InputEvent::PressEnter { .. } = event {
-                    this.send(window, cx);
+                match event {
+                    InputEvent::PressEnter { .. } => this.send(window, cx),
+                    // 发送按钮随输入框空 / 非空换样式
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
                 }
             },
         )
         .detach();
+        // 快捷键挂在根视图的键上下文上，要求焦点在界面里：启动时给输入框，
+        // 聚焦的元素被移出界面时（关设置页、重命名提交、菜单关闭）再找回来
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.on_focus_lost(window, |this: &mut ChatApp, window, cx| this.restore_focus(window, cx))
+            .detach();
 
 
         // 内核与配置：设置文件 + 环境变量覆盖（见 settings.rs）；
@@ -214,6 +225,7 @@ impl ChatApp {
             settings,
             settings_path,
             settings_open: false,
+            settings_focus: cx.focus_handle(),
             settings_form,
             fetching_models: false,
             usage: Vec::new(),
@@ -720,6 +732,8 @@ impl ChatApp {
         let s = &mut self.sessions[self.active];
         s.cancel_token += 1;
         s.busy = false;
+        // 正在流式的思考块收起，不然停下后还挂着「思考中…」
+        s.finish_thinking();
         s.cancel_pending_permissions(kernel.as_ref());
         match (&kernel, s.acp_id.clone()) {
             (Some(kernel), Some(id)) => {
@@ -980,7 +994,7 @@ impl Render for ChatApp {
                 cx.processor(|this, ix: usize, _window, cx| {
                     let s = &this.sessions[this.active];
                     let n = s.transcript.len();
-                    let row = div().max_w(px(760.)).mx_auto().w_full().px_6();
+                    let row = div().max_w(READING_W).mx_auto().w_full().px_6();
                     let content = match s.transcript.get(ix) {
                         Some(item) => row
                             .pt(px(if ix == 0 { 16. } else { 0. }))
@@ -1009,14 +1023,17 @@ impl Render for ChatApp {
         // 中文回退字体：根上设一次，子元素换 font_family 时继承
         root.text_style().font_fallbacks = Some(cjk_fallbacks());
         // 不用系统标题栏：侧栏顶到窗口顶，会话区顶栏兼做拖拽区与窗口按钮（见 chrome.rs）
-        root.h_flex()
+        let root = root
+            .h_flex()
             .size_full()
             .font_family(SANS)
             .text_size(TEXT_LARGE)
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
             .when(self.sidebar_open, |d| d.child(self.render_sidebar(cx)))
-            .child(main)
+            .child(main);
+        // 快捷键（见 keys.rs）
+        self.with_key_actions(root, cx)
     }
 }
 

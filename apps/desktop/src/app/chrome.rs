@@ -51,7 +51,7 @@ pub(super) fn window_controls(window: &Window) -> Option<Div> {
             .items_center()
             .text_color(rgb(INK_SOFT))
             .when(close, |d| d.hover(|d| d.bg(rgb(RED)).text_color(rgb(WHITE))))
-            .when(!close, |d| d.hover(|d| d.bg(rgb(SAND_ACTIVE)).text_color(rgb(INK))))
+            .when(!close, |d| d.hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK))))
             .window_control_area(area)
             .when(!cfg!(target_os = "windows"), |d| {
                 d.on_click(move |_, window, _| match area {
@@ -138,7 +138,7 @@ impl ChatApp {
                         .justify_center()
                         .items_center()
                         .cursor_pointer()
-                        .hover(|d| d.bg(rgb(SAND_ACTIVE)))
+                        .hover(|d| d.bg(rgb(HOVER)))
                         .tooltip(|window, cx| Tooltip::new("导出为 Markdown").build(window, cx))
                         .on_click(cx.listener(|this, _, window, cx| this.share_session(window, cx)))
                         .child(Icon::new(IconAll::Share).size_4().text_color(rgb(INK_SOFT))),

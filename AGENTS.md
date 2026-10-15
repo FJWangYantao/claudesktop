@@ -22,10 +22,20 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **按钮**：新按钮优先 `gpui-component` 的 `Button`（变体齐全）；确需特殊样式再
   手写 div，但成组出现时应抽成 `app/widgets.rs` 的 helper。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
+  - 交互态：纸底 / 卡片上悬停用 `HOVER`，选中态和沙色底上悬停用 `SELECTED`，已选中行里再叠一层用
+    `HOVER_STRONG`；不要拿 `LINE` / `PAPER` / 透明度当悬停。
+  - 带文字的主按钮底色用 `CORAL_DEEP`（悬停 `CORAL_DEEP_HOVER`）；`CORAL` 上白字只有 3.1:1，只给图标按钮。
+  - `INK_FAINT` 只给占位、禁用、分隔符和装饰（纸底上 2.05:1），承载信息的文字用 `INK_SOFT`。
+- **圆角 / 宽度**：圆角只用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
+  不写 `rounded(px(..))`；阅读列 / 设置页 / 概览 / 侧栏宽度用 `READING_W` / `FORM_W` / `OVERVIEW_W` / `SIDEBAR_W`。
 - **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯（12/13/14/15/17/20/28）和
   `LEADING`，不要写 `text_size(px(..))`。正文一律无衬线（对照官方 Code 桌面端；
   衬线拉丁字母会和回退的雅黑混排）。中文回退字体在根视图统一设置。
 - **界面文案**：一律中文（含占位符、模式名、问候语）；agent 自己上报的名称除外。
+- **快捷键**：全局快捷键集中在 `app/keys.rs`（`actions!` + `KeyBinding`，键上下文 `ChatApp`），
+  新快捷键加在那里；处理函数没事可做时 `cx.propagate()`，让给外层（gpui-kit Root 的 Tab 焦点切换等）。
+  快捷键依赖焦点在界面里：**别在根视图上 `track_focus`**（按下鼠标时会把焦点从输入框抢走），
+  焦点丢失由 `restore_focus` 兜底（输入框，设置页开着时是设置页的焦点锚）。
 - **加载 / 进行中动效**：先用 `Spinner`、`ShimmerText`（组件自带动画并尊重系统减少动效），
   别急着手写 `with_animation`。
 
