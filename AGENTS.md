@@ -46,10 +46,14 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   - `INK_FAINT` 只给占位、禁用、分隔符和装饰（纸底上 2.05:1），承载信息的文字用 `INK_SOFT`。
 - **圆角 / 宽度**：圆角只用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
   不写 `rounded(px(..))`；阅读列 / 设置页 / 概览 / 侧栏宽度用 `READING_W` / `FORM_W` / `OVERVIEW_W` / `SIDEBAR_W`。
-- **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯（12/13/14/15/17/20/28）和
-  `LEADING`，不要写 `text_size(px(..))`。正文一律无衬线（对照官方 Code 桌面端；
-  衬线拉丁字母会和回退的雅黑混排）。中文回退字体在根视图统一设置。
-  会跳动的数字（用时、token、计数）加 `.font_features(tabular_nums())`，位数不变时宽度不变。
+- **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯。**它们是 `Rems` 不是 `Pixels`**——
+  字号、间距、圆角、图标全按窗口 rem 换算，而 `gpui-component` 的 Root 每帧把
+  `Theme::font_size` 写进 `window.set_rem_size()`，所以设置页改一个字号的缩放，
+  整套界面（含间距和圆角）等比变。新写的尺寸/间距也别用 `px(..)`，除非它**不该**跟着缩放
+  （窗口框架、固定图标格、按像素算的 diff 行高）。
+  标题这类只收 `Pixels` 的接口用 `.to_pixels(crate::theme::root_font_size())` 换算。
+  正文一律无衬线；字体族用 `theme::sans()`（设置页可换，没选过时是内嵌的 Inter），
+  代码用 `MONO`。会跳动的数字（用时、token、计数）加 `.font_features(tabular_nums())`。
 - **界面文案**：一律中文（含占位符、模式名、问候语）；agent 自己上报的名称除外。
 - **快捷键**：全局快捷键集中在 `app/keys.rs`（`actions!` + `KeyBinding`，键上下文 `ChatApp`），
   新快捷键加在那里；处理函数没事可做时 `cx.propagate()`，让给外层（gpui-kit Root 的 Tab 焦点切换等）。

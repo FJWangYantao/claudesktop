@@ -29,6 +29,7 @@ use claudesktop_core::{
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -95,6 +96,8 @@ pub struct ChatApp {
     window_active: bool,
     /// 发出去还没撤的系统通知标签（回到窗口时撤掉）
     notified: Vec<SharedString>,
+    /// 设置页的字号滑杆（拖动时即时生效）
+    pub(crate) font_slider: Entity<SliderState>,
 }
 
 /// 一种内核的运行状态。
@@ -231,6 +234,28 @@ impl ChatApp {
         .detach();
 
         let settings_form = SettingsForm::new(window, cx);
+        // 字号滑杆：85% ~ 140%，步进 5%
+        let font_slider = cx.new(|_| {
+            SliderState::new()
+                .min(FONT_SCALE_MIN * 100.)
+                .max(FONT_SCALE_MAX * 100.)
+                .step(FONT_SCALE_STEP)
+                .default_value(settings.font_scale * 100.)
+        });
+        // 字号滑杆：事件由 SliderState 自己 emit（组件没有 on_change 链式回调）
+        cx.subscribe(&font_slider, |this: &mut ChatApp, state, event: &SliderEvent, cx| {
+            let value = match event {
+                SliderEvent::Change(v) | SliderEvent::Release(v) => *v,
+            };
+            let scale = value.end() / 100.;
+            // 拖动时值经常没变，不必每帧写文件
+            if (scale - this.settings.font_scale).abs() > 1e-4 {
+                this.set_font_scale(scale, cx);
+            }
+            let _ = state;
+        })
+        .detach();
+
         let mut app = Self {
             input,
             pending: Vec::new(),
@@ -264,6 +289,7 @@ impl ChatApp {
             frame_log: None,
             window_active: true,
             notified: Vec::new(),
+            font_slider,
         };
         // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
@@ -369,6 +395,11 @@ impl ChatApp {
     /// 第 `idx` 个会话绑定的内核
     pub(crate) fn session_kernel(&self, idx: usize) -> Option<Arc<dyn Kernel>> {
         self.kernel_of(self.sessions[idx].kernel)
+    }
+
+    /// 系统已装字体族（设置页的字体下拉用）。枚举一次要上百毫秒，缓存在 `theme` 里。
+    pub(crate) fn system_fonts(&self) -> &'static [String] {
+        crate::theme::cached_fonts()
     }
 
     pub(crate) fn session(&self) -> &Session {
@@ -1182,7 +1213,7 @@ impl Render for ChatApp {
         let root = root
             .h_flex()
             .size_full()
-            .font_family(SANS)
+            .font_family(sans())
             .text_size(TEXT_LARGE)
             .bg(rgb(PAPER))
             .text_color(rgb(INK))

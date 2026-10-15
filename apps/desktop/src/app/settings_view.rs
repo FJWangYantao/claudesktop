@@ -1,12 +1,15 @@
 //! 设置页（内核 / provider 档案 / 模型）与输入框旁的模型下拉。
 
 use super::ChatApp;
+use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
 use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::base::PopoverState;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::slider::Slider;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::*;
@@ -132,6 +135,11 @@ fn value(input: &Entity<InputState>, cx: &App) -> String {
 
 impl ChatApp {
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 字体下拉要系统的字体清单，先热一次缓存（首次枚举要上百毫秒）
+        crate::theme::installed_fonts(cx);
+        // 滑杆位置跟上当前设置（可能在别处被改过）
+        let scale = self.settings.font_scale * 100.;
+        self.font_slider.update(cx, |state, cx| state.set_value(scale, window, cx));
         let s = self.settings.clone();
         self.settings_form.kernel = s.kernel();
         self.settings_form.message = None;
@@ -185,7 +193,37 @@ impl ChatApp {
         if Theme::global(cx).mode != mode {
             Theme::change(mode, None, cx);
         }
+        // 外观之后再套字号 / 字体：`Theme::change` 会载入主题文件里的字号，盖掉我们设的值
+        self.apply_font(cx);
         cx.notify();
+    }
+
+    /// 把字号缩放与字体族装进组件主题。Root 每帧读 `Theme::font_size` 写进窗口的 rem，
+    /// 所以这里改完，下一帧整套界面（字号 / 间距 / 圆角 / 图标）等比缩放。
+    pub(crate) fn apply_font(&mut self, cx: &mut Context<Self>) {
+        crate::theme::set_font_scale(self.settings.font_scale);
+        // 没装的字体族会被忽略（GPUI 排版找不到字体族时会 panic）
+        if let Some(name) = self.settings.font_family_or_default()
+            && !crate::theme::installed_fonts(cx).iter().any(|f| f == name.as_ref())
+        {
+            self.settings.font_family = String::new();
+        }
+        crate::theme::set_font_family(cx, self.settings.font_family_or_default());
+        Theme::update(cx, crate::theme::apply_to_theme);
+        cx.notify();
+    }
+
+    /// 设置页调字号（拖动和松手都走这里）：立即生效，并只把这一项写回文件。
+    pub(crate) fn set_font_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.font_scale = scale);
+        self.apply_font(cx);
+    }
+
+    /// 设置页换界面字体族；None = 回到内嵌的 Inter。
+    pub(crate) fn set_font_family(&mut self, family: Option<SharedString>, cx: &mut Context<Self>) {
+        let value = family.map(|f| f.to_string()).unwrap_or_default();
+        self.save_ui_pref(move |s| s.font_family = value.clone());
+        self.apply_font(cx);
     }
 
     pub(crate) fn set_appearance(
@@ -204,7 +242,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 「通用」分类：外观、侧栏内核状态、系统通知（都即时生效，不走「保存并应用」）。
+    /// 「通用」分类：外观、字号、字体、侧栏内核状态、系统通知（都即时生效，不走「保存并应用」）。
     fn render_general(&self, cx: &mut Context<Self>) -> Div {
         let current = self.settings.appearance;
         let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
@@ -221,6 +259,8 @@ impl ChatApp {
         }
         setting_group([
             setting_row("外观", "跟随系统，或固定用浅色 / 深色；立即生效", segs),
+            self.font_scale_row(),
+            self.font_family_row(cx),
             setting_row(
                 "侧栏显示内核状态",
                 "在侧栏底部列出每个已启动内核的连接状态；关掉不影响内核运行",
@@ -244,6 +284,52 @@ impl ChatApp {
                     })),
             ),
         ])
+    }
+
+    /// 字号滑杆：右边带当前百分比。事件订阅在 `ChatApp::new`（`SliderState` 自己 emit），
+    /// 拖动与松手都即时生效。
+    fn font_scale_row(&self) -> Div {
+        let percent = (self.settings.font_scale * 100.).round();
+        let slider = div()
+            .h_flex()
+            .items_center()
+            .gap_3()
+            .w(px(240.))
+            .child(div().flex_1().min_w_0().child(Slider::new(&self.font_slider)))
+            .child(
+                // 宽度用 rem：字号放大后「140%」也不会折成两行
+                div()
+                    .w(rems(3.))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .text_right()
+                    .font_features(tabular_nums())
+                    .child(format!("{percent:.0}%")),
+            );
+        setting_row(
+            "界面字号",
+            "整界面等比缩放（文字、间距、圆角一起变）；也可用 Ctrl+= / Ctrl+- 调整",
+            slider,
+        )
+    }
+
+    /// 字体族下拉：内嵌的 Inter + 系统已装字体（下拉里可搜索）。
+    fn font_family_row(&self, cx: &mut Context<Self>) -> Div {
+        let app = cx.entity();
+        let label: SharedString =
+            self.settings.font_family_or_default().unwrap_or_else(|| "Inter（内嵌）".into());
+        setting_row(
+            "界面字体",
+            "界面文字用哪套字体；代码块始终用等宽的 JetBrains Mono",
+            menu_popover(
+                "font-family-menu",
+                Anchor::BottomRight,
+                px(280.),
+                &app,
+                MenuChip::new(IconAll::ALargeSmall, label),
+                font_family_menu_items,
+            ),
+        )
     }
 
     fn form_settings(&self, cx: &App) -> Settings {
@@ -1102,4 +1188,59 @@ fn rule_label(rule: &str) -> String {
     } else {
         rule.to_string()
     }
+}
+
+/// 界面字体下拉的条目：第一项是内嵌的 Inter，后面跟系统已装字体（可滚动，最多列一批）。
+/// 当前项打勾；列不完的靠「还有 N 款」提示，需要的话在设置文件里手写字体名。
+fn font_family_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> Stateful<Div> {
+    const MAX_SYSTEM_FONTS: usize = 60;
+    let current = app.settings.font_family_or_default();
+    let mut menu =
+        div().id("font-family-list").max_h(px(360.)).overflow_y_scroll().v_flex().gap_0p5();
+
+    // 内嵌的 Inter：字体族为空即表示用它
+    {
+        let (handle, popover) = (handle.clone(), popover.clone());
+        menu = menu.child(
+            menu_item(
+                "font-embedded",
+                IconAll::ALargeSmall,
+                "Inter（内嵌）",
+                "随应用分发，中文由系统字体回退",
+                current.is_none(),
+            )
+            .on_click(menu_action!(handle, popover, |this, cx| {
+                this.set_font_family(None, cx);
+            })),
+        );
+    }
+
+    let fonts = app.system_fonts();
+    for (i, name) in fonts.iter().take(MAX_SYSTEM_FONTS).enumerate() {
+        let active = current.as_deref() == Some(name.as_str());
+        let picked: SharedString = name.clone().into();
+        let (handle, popover) = (handle.clone(), popover.clone());
+        menu = menu.child(
+            menu_item(("font-item", i), IconAll::Type, name.clone(), "", active).on_click(
+                menu_action!(handle, popover, |this, cx| {
+                    this.set_font_family(Some(picked.clone()), cx);
+                }),
+            ),
+        );
+    }
+    if fonts.len() > MAX_SYSTEM_FONTS {
+        menu = menu.child(
+            div()
+                .px_2p5()
+                .py_1p5()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(format!("还有 {} 款未列出", fonts.len() - MAX_SYSTEM_FONTS)),
+        );
+    }
+    menu
 }

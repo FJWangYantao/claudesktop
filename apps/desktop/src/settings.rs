@@ -12,6 +12,7 @@
 use crate::model::ViewMode;
 use claudesktop_builtin::{BuiltinConfig, ModelInfo, Protocol, ProviderConfig, RequestParams};
 use claudesktop_core::AcpKernelConfig;
+use gpui_kit::SharedString;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -216,6 +217,10 @@ pub struct Settings {
     pub sidebar_by_date: bool,
     /// 窗口不在前台时，回复完成 / 等待授权 / 出错发系统通知；默认开
     pub notifications: bool,
+    /// 界面缩放倍率（1.0 = 标准），设置页即时生效并写回
+    pub font_scale: f32,
+    /// 界面字体族；空串 = 用内嵌的 Inter（默认）
+    pub font_family: String,
 }
 
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
@@ -235,6 +240,8 @@ impl Default for Settings {
             workspace: None,
             sidebar_by_date: false,
             notifications: yes(),
+            font_scale: crate::theme::FONT_SCALE_DEFAULT,
+            font_family: String::new(),
         }
     }
 }
@@ -275,10 +282,31 @@ impl Settings {
         match std::fs::read_to_string(path) {
             Err(_) => (Self::default(), None),
             Ok(text) => match serde_json::from_str(&text) {
-                Ok(s) => (s, None),
+                Ok(mut s) => {
+                    Self::normalize(&mut s);
+                    (s, None)
+                }
                 Err(e) => (Self::default(), Some(format!("设置文件损坏，已用默认值：{e}"))),
             },
         }
+    }
+
+    /// 夹住不可能的值：手改过设置文件时也别让界面缩放到看不见或写坏的字体名。
+    fn normalize(s: &mut Self) {
+        if !s.font_scale.is_finite() {
+            s.font_scale = crate::theme::FONT_SCALE_DEFAULT;
+        }
+        s.font_scale =
+            s.font_scale.clamp(crate::theme::FONT_SCALE_MIN, crate::theme::FONT_SCALE_MAX);
+        if s.font_family.trim().is_empty() {
+            s.font_family = String::new();
+        }
+    }
+
+    /// 界面字体族：空串表示用内嵌的默认字体。
+    pub fn font_family_or_default(&self) -> Option<SharedString> {
+        let name = self.font_family.trim();
+        (!name.is_empty()).then(|| SharedString::from(name.to_string()))
     }
 
     /// 原子写入（先写临时文件再改名）。
@@ -556,6 +584,37 @@ mod tests {
         b.current_mut().model = "m".into();
         assert_eq!(b.profiles.len(), 1);
         assert!(b.is_configured());
+    }
+
+    /// 字号 / 字体族：旧设置文件没有这两项时用标准档 + 内嵌字体；
+    /// 越界或写坏的值在读取时被夹住。
+    #[core::prelude::v1::test]
+    fn font_prefs_default_clamp_and_roundtrip() {
+        // 旧文件缺字段：标准档 + 空字体族（= 内嵌 Inter）
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.font_scale, crate::theme::FONT_SCALE_DEFAULT);
+        assert_eq!(s.font_family_or_default(), None);
+
+        let dir = std::env::temp_dir().join(format!("claudesktop-font-{}", std::process::id()));
+        let path = dir.join("settings.json");
+
+        let s = Settings {
+            font_scale: 1.25,
+            font_family: "Microsoft YaHei UI".into(),
+            ..Default::default()
+        };
+        s.save(&path).unwrap();
+        let back = Settings::load(Some(&path)).0;
+        assert_eq!(back.font_scale, 1.25);
+        assert_eq!(back.font_family_or_default().as_deref(), Some("Microsoft YaHei UI"));
+
+        // 手改坏了：超大倍率被夹住、非有限值回到默认、空白字体族当成没选
+        std::fs::write(&path, r#"{"font_scale":99.0,"font_family":"   "}"#).unwrap();
+        let (back, err) = Settings::load(Some(&path));
+        assert!(err.is_none());
+        assert_eq!(back.font_scale, crate::theme::FONT_SCALE_MAX);
+        assert_eq!(back.font_family_or_default(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[core::prelude::v1::test]

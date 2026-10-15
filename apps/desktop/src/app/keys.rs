@@ -31,6 +31,12 @@ actions!(
         PrevSession,
         /// 循环切换视图模式（摘要 / 标准 / 详细）
         CycleView,
+        /// 界面放大一档
+        ZoomIn,
+        /// 界面缩小一档
+        ZoomOut,
+        /// 界面字号回到标准档
+        ZoomReset,
     ]
 );
 
@@ -45,6 +51,11 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", PrevSession, Some(CONTEXT)),
         // 与官方一致，macOS 上也是 Ctrl+O
         KeyBinding::new("ctrl-o", CycleView, Some(CONTEXT)),
+        // 界面缩放：和浏览器一致的 Ctrl + 加号 / 减号 / 0
+        KeyBinding::new("secondary-=", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new("secondary-+", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new("secondary--", ZoomOut, Some(CONTEXT)),
+        KeyBinding::new("secondary-0", ZoomReset, Some(CONTEXT)),
     ]);
 }
 
@@ -86,6 +97,24 @@ impl ChatApp {
             .on_action(cx.listener(|this, _: &CycleView, _, cx| {
                 this.set_view_mode(this.settings.view_mode.next(), cx)
             }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(-1, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| {
+                this.set_font_scale(crate::theme::FONT_SCALE_DEFAULT, cx)
+            }))
+    }
+
+    /// 界面缩放按档走（步进 5%）：`step` 为 +1 放大、-1 缩小；到边界就不动。
+    fn zoom_by(&mut self, step: isize, cx: &mut Context<Self>) {
+        let current = self.settings.font_scale;
+        let delta = step as f32 * crate::theme::FONT_SCALE_STEP / 100.;
+        let next =
+            (current + delta).clamp(crate::theme::FONT_SCALE_MIN, crate::theme::FONT_SCALE_MAX);
+        if (next - current).abs() > 1e-4 {
+            self.set_font_scale(next, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     fn on_stop_turn(&mut self, _: &StopTurn, window: &mut Window, cx: &mut Context<Self>) {

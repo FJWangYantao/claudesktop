@@ -82,17 +82,21 @@ fn tool_status_icon(card: &ToolCard) -> AnyElement {
 fn markdown_style() -> TextViewStyle {
     TextViewStyle::default()
         .paragraph_gap(rems(0.75))
-        .heading_font_size(|level, _| match level {
-            1 => TEXT_HEADING,
-            2 => TEXT_LEAD,
-            _ => TEXT_LARGE,
+        // 标题接口只收 Pixels，所以按当前缩放换算一次
+        .heading_font_size(|level, _| {
+            match level {
+                1 => TEXT_HEADING,
+                2 => TEXT_LEAD,
+                _ => TEXT_LARGE,
+            }
+            .to_pixels(crate::theme::root_font_size())
         })
         .inline_code(HighlightStyle {
             background_color: Some(rgb(CODE_BG).into()),
             ..Default::default()
         })
-        // 顶部多留一截给右上角的语言名 + 复制按钮，免得压住第一行代码
-        .code_block(StyleRefinement::default().bg(rgb(SAND)).pt(px(32.)))
+        // 顶部多留一截给右上角的语言名 + 复制按钮，免得压住第一行代码（2rem = 32px）
+        .code_block(StyleRefinement::default().bg(rgb(SAND)).pt(rems(2.)))
 }
 
 /// 代码块右上角的一组：语言名（有的话）+ 「复制」按钮。
@@ -111,7 +115,7 @@ fn code_block_header(
         .bg(rgb(SAND))
         .text_size(TEXT_META)
         .text_color(rgb(INK_SOFT))
-        .font_family(SANS)
+        .font_family(sans())
         .children(lang.filter(|l| !l.is_empty()).map(|l| div().px_1().child(l)))
         .child(
             div()
@@ -860,7 +864,7 @@ impl ChatApp {
                 div()
                     .px_3()
                     .py_1()
-                    .font_family(SANS)
+                    .font_family(sans())
                     .text_color(rgb(INK_SOFT))
                     .child("改动过大，其余部分未显示"),
             );
