@@ -37,10 +37,16 @@ actions!(
         ZoomOut,
         /// 界面字号回到标准档
         ZoomReset,
+        /// 打开命令面板
+        OpenPalette,
     ]
 );
 
 // 界面上用 `Kbd` 提示的键：绑定和提示读同一个常量，改键只改这里。
+/// 新会话 / 显示隐藏侧栏 / 命令面板
+pub(super) const NEW_SESSION_KEY: &str = "secondary-n";
+pub(super) const TOGGLE_SIDEBAR_KEY: &str = "secondary-b";
+pub(super) const PALETTE_KEY: &str = "secondary-k";
 /// 循环切换视图模式（与官方一致，macOS 上也是 Ctrl+O）
 pub(super) const CYCLE_VIEW_KEY: &str = "ctrl-o";
 /// 界面放大 / 缩小一档（和浏览器一致）
@@ -52,8 +58,9 @@ pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", StopTurn, Some(CONTEXT)),
         KeyBinding::new("shift-tab", CycleMode, Some(CONTEXT)),
-        KeyBinding::new("secondary-n", NewSession, Some(CONTEXT)),
-        KeyBinding::new("secondary-b", ToggleSidebar, Some(CONTEXT)),
+        KeyBinding::new(NEW_SESSION_KEY, NewSession, Some(CONTEXT)),
+        KeyBinding::new(TOGGLE_SIDEBAR_KEY, ToggleSidebar, Some(CONTEXT)),
+        KeyBinding::new(PALETTE_KEY, OpenPalette, Some(CONTEXT)),
         KeyBinding::new("ctrl-tab", NextSession, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PrevSession, Some(CONTEXT)),
         KeyBinding::new(CYCLE_VIEW_KEY, CycleView, Some(CONTEXT)),
@@ -94,6 +101,9 @@ impl ChatApp {
                 this.add_session(cx);
                 this.focus_input(window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
@@ -193,7 +203,14 @@ mod tests {
     /// 界面提示用的按键串都能解析（`ChatApp::kbd` 解析失败会 panic）。
     #[core::prelude::v1::test]
     fn hint_keys_parse() {
-        for key in [CYCLE_VIEW_KEY, ZOOM_IN_KEY, ZOOM_OUT_KEY] {
+        for key in [
+            CYCLE_VIEW_KEY,
+            ZOOM_IN_KEY,
+            ZOOM_OUT_KEY,
+            NEW_SESSION_KEY,
+            TOGGLE_SIDEBAR_KEY,
+            PALETTE_KEY,
+        ] {
             assert!(Keystroke::parse(key).is_ok(), "{key}");
         }
     }

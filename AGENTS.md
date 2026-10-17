@@ -66,6 +66,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **提示消息**：不属于某个对话的（导出结果、设置 / 文件读写失败、输入限制）用 `ChatApp::toast`
   （gpui-kit `Notification`，应用内）；会话自己的事（内核错误、停止、续接）才用 `Session::note` 进对话流。
   系统通知走 `notify.rs` 的 `notify_attention`：它注册的点击回调顶掉了 gpui-kit 的，所以别用 `Notification::system()`。
+- **命令面板**（Ctrl+K，`app/palette.rs`）：新的全局操作顺手在 `palette_groups` 里加一条。
+  条目确认走 `on_confirm` 回调改 `ChatApp`，不用 `CommandItem::action`：对话框在 Root 浮层里，
+  不在 `ChatApp` 键上下文下，派发的动作收不到。
 - **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
 - **加载 / 进行中动效**：先用 `Spinner`、`ShimmerText`（组件自带动画并尊重系统减少动效），
   别急着手写 `with_animation`。
@@ -75,7 +78,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **`use gpui_kit::*` 的文件里写单元测试必须用 `#[core::prelude::v1::test]`**，
   裸 `#[test]` 会被 glob 导入的 gpui `test` 宏劫持，展开时无限递归
   （报 "recursion limit reached while expanding #[test]"，提高 recursion_limit 没用）。
-- **`TabBar` 的高度 / 内边距写死 px，不随界面缩放**，分段切换用 `widgets.rs` 的 `seg()`。
+- **`TabBar` 和 `PopupMenu`（`ContextMenu` / `DropdownMenu` 的底层）的高度 / 内边距写死 px，不随界面缩放**：
+  分段切换用 `widgets.rs` 的 `seg()`，菜单用 `menu_popover()`。`Command`、`Button`、`Dialog` 内容是 rem，可用。
   `Button` 的尺寸是 rem，圆角取 `Theme::radius`（`theme::apply_to_theme` 按根字号换算）；
   它默认 `cursor_default`，helper 里补了 `cursor_pointer`。
 - `overflow_y_scroll()` 在 `StatefulInteractiveElement` 上——链式调用前必须先 `.id(...)`。

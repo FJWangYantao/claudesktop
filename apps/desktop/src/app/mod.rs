@@ -9,6 +9,7 @@ pub(crate) mod keys;
 mod menu;
 mod notify;
 mod overview;
+mod palette;
 mod settings_view;
 mod sidebar;
 mod status;
