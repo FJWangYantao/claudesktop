@@ -1,6 +1,6 @@
 //! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
 
-use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
+use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::widgets::Surface;
 use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
@@ -216,8 +216,9 @@ impl ChatApp {
             .child(menu_popover(
                 "mode-menu",
                 Anchor::BottomLeft,
-                px(300.),
+                rems(20.),
                 &app,
+                &self.menu_focus,
                 MenuChip::plain(mode_name),
                 mode_menu_items,
             ))
@@ -231,6 +232,7 @@ impl ChatApp {
             .children(self.render_context_gauge())
             .child(model_menu_popover(
                 &app,
+                &self.menu_focus,
                 "model-menu",
                 Anchor::BottomRight,
                 MenuChip::plain(self.session().model_label.clone()),
@@ -295,8 +297,9 @@ impl ChatApp {
                 menu_popover(
                     "workspace-menu",
                     Anchor::BottomLeft,
-                    px(320.),
+                    rems(20.),
                     &app,
+                    &self.menu_focus,
                     MenuChip::new(IconAll::Folder, project).filled(),
                     workspace_menu_items,
                 ),
@@ -538,12 +541,13 @@ fn paste_to_attachments(
 /// 打开时若自研内核还没有模型列表，顺手获取一次。
 fn model_menu_popover(
     handle: &Entity<ChatApp>,
+    focus: &FocusHandle,
     id: &'static str,
     anchor: Anchor,
     chip: MenuChip,
 ) -> Popover {
     let fetch = handle.clone();
-    menu_popover(id, anchor, px(280.), handle, chip, model_menu_items).on_open_change(
+    menu_popover(id, anchor, rems(17.5), handle, focus, chip, model_menu_items).on_open_change(
         move |open, _, cx| {
             if *open {
                 fetch.update(cx, |app, cx| app.fetch_models_for_menu(cx));
@@ -555,17 +559,18 @@ fn model_menu_popover(
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
 
 /// 权限模式条目：图标 + 名称（+说明），当前项打勾。
-fn mode_menu_items(app: &ChatApp, handle: &Entity<ChatApp>, popover: &Entity<PopoverState>) -> Div {
+fn mode_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
     let session = app.session();
-    let mut menu = div().v_flex().gap_0p5();
+    let mut menu = MenuList::new("mode-menu-list", handle, popover);
     for (i, mode) in session.modes.iter().enumerate() {
         let active = session.permission_mode == i;
-        let (handle, popover) = (handle.clone(), popover.clone());
-        menu = menu.child(
-            menu_item(("mode-item", i), mode.icon, mode.name.clone(), mode.desc.clone(), active)
-                .on_click(menu_action!(handle, popover, |this, cx| {
-                    this.choose_mode(i, cx);
-                })),
+        menu = menu.pick(
+            menu_item(("mode-item", i), mode.icon, mode.name.clone(), mode.desc.clone(), active),
+            move |this, cx| this.choose_mode(i, cx),
         );
     }
     menu
@@ -576,26 +581,21 @@ fn workspace_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
-) -> Div {
+) -> MenuList {
     let current = &app.session().cwd;
-    let mut menu = div().v_flex().gap_0p5();
+    let mut menu = MenuList::new("workspace-menu-list", handle, popover);
     for (i, dir) in app.recent_workspaces().into_iter().enumerate() {
         let active = dir == *current;
         let path = short_path(&dir);
-        let (handle, popover) = (handle.clone(), popover.clone());
-        menu = menu.child(
-            menu_item(("workspace-item", i), IconAll::Folder, project_label(&dir), path, active)
-                .on_click(menu_action!(handle, popover, |this, cx| {
-                    this.switch_workspace(dir.clone(), cx);
-                })),
+        let label = project_label(&dir);
+        menu = menu.pick(
+            menu_item(("workspace-item", i), IconAll::Folder, label, path, active),
+            move |this, cx| this.switch_workspace(dir.clone(), cx),
         );
     }
-    let (handle, popover) = (handle.clone(), popover.clone());
-    menu.child(
-        div().mt_0p5().pt_0p5().border_t_1().border_color(rgb(LINE)).child(
-            menu_item("workspace-pick", IconAll::FolderOpen, "选择文件夹…", "", false)
-                .on_click(menu_action!(handle, popover, |this, cx| this.pick_workspace(cx))),
-        ),
+    menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick(
+        menu_item("workspace-pick", IconAll::FolderOpen, "选择文件夹…", "", false),
+        |this, cx| this.pick_workspace(cx),
     )
 }
 
@@ -604,13 +604,12 @@ fn model_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
-) -> Stateful<Div> {
+) -> MenuList {
     let hint = |text: SharedString| {
         div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
     };
     let builtin = app.session().kernel == KernelChoice::Builtin;
-    let mut menu =
-        div().id("model-menu-list").max_h(px(380.)).overflow_y_scroll().v_flex().gap_0p5();
+    let mut menu = MenuList::new("model-menu-list", handle, popover).scroll(rems(24.));
     if !builtin {
         return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
     }
@@ -626,8 +625,7 @@ fn model_menu_items(
     for (i, model) in models.iter().enumerate() {
         let active = current.as_ref() == model.as_str();
         let m = model.clone();
-        let (handle, popover) = (handle.clone(), popover.clone());
-        menu = menu.child(
+        menu = menu.pick(
             div()
                 .id(("model-item", i))
                 .h_flex()
@@ -638,9 +636,6 @@ fn model_menu_items(
                 .rounded_md()
                 .cursor_pointer()
                 .hover(|d| d.bg(rgb(HOVER)))
-                .on_click(menu_action!(handle, popover, |this, cx| {
-                    this.choose_model(m.clone(), cx);
-                }))
                 .child(
                     div()
                         .flex_1()
@@ -653,6 +648,7 @@ fn model_menu_items(
                 .when(active, |d| {
                     d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
                 }),
+            move |this, cx| this.choose_model(m.clone(), cx),
         );
     }
     let handle = handle.clone();

@@ -90,6 +90,8 @@ pub struct ChatApp {
     settings_open: bool,
     /// 设置页的焦点锚（设置页没有输入框可以兜底，快捷键靠它留在 `ChatApp` 键上下文里）
     settings_focus: FocusHandle,
+    /// 下拉菜单打开时的焦点（同一时间只开一个菜单，共用；见 menu.rs）
+    menu_focus: FocusHandle,
     settings_form: SettingsForm,
     /// 正在后台获取模型列表
     fetching_models: bool,
@@ -140,6 +142,12 @@ pub struct ChatApp {
     rewind_overwrite: bool,
     /// 命令面板里按正文搜到的消息（查询变了才重搜，见 search.rs）
     palette_hits: Vec<search::MessageHit>,
+    /// 上一次（已排上节拍的）搜索关键词，小写、去过首尾空白
+    palette_query: String,
+    /// 面板每关 / 开一次 +1：排在节拍里的搜索回来时靠它判断结果是否已经过期
+    palette_generation: u64,
+    /// 待执行的那次搜索（防抖用的定时任务，见 `ChatApp::search_palette`）
+    palette_timer: Option<Task<()>>,
     /// 刚从搜索结果跳过去的消息：(会话令牌, 行号, 跳过去的时刻)，那一行闪一下底色
     flash: Option<(u64, usize, Instant)>,
 }
@@ -324,6 +332,7 @@ impl ChatApp {
             settings_path,
             settings_open: false,
             settings_focus: cx.focus_handle(),
+            menu_focus: cx.focus_handle(),
             settings_form,
             fetching_models: false,
             context_probed: false,
@@ -351,6 +360,9 @@ impl ChatApp {
             rewind: None,
             rewind_overwrite: false,
             palette_hits: Vec::new(),
+            palette_query: String::new(),
+            palette_generation: 0,
+            palette_timer: None,
             flash: None,
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
@@ -574,6 +586,16 @@ impl ChatApp {
         self.settings_open = false;
         self.probe_context_window(i, cx);
         cx.notify();
+    }
+
+    /// 失败卡片上的「继续」：这一轮已经做了一部分，发一句「继续」让模型接着做
+    /// （上下文里有做过的步骤和失败记录），不把整轮重来。
+    pub(crate) fn resume_turn(&mut self, cx: &mut Context<Self>) {
+        let idx = self.active;
+        if self.sessions[idx].busy {
+            return;
+        }
+        self.submit_to(idx, UserPrompt { text: "继续".into(), images: Vec::new() }, cx);
     }
 
     /// 失败卡片上的「重试」：把第 `failed_idx` 行所在这一轮的用户消息原样再发一遍。

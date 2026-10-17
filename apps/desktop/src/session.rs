@@ -350,19 +350,25 @@ impl Session {
             self.measured_busy = self.busy;
             self.list.remeasure_items(n..n + 1);
         }
-        // 行数到位之后再滚，否则会被截到末尾
+        // 行数到位之后再滚，否则会被截到末尾；再往上让一点，别让顶上的渐隐盖住这一行
         if let Some(ix) = self.reveal.take().filter(|&ix| ix < n) {
             self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
+            self.list.scroll_by(-px(24.));
         }
     }
 
-    /// 一行的测量指纹：内容指纹 + 视图模式 + 是否回合末尾（回合末尾的回复下面多一行操作）
-    /// + 分组结果（组头、折叠、行距）。
+    /// 一行的测量指纹：内容指纹 + 视图模式 + 会不会跟着状态改行高（回合末尾的回复下面多一行
+    /// 操作、失败卡片的按钮组会多出「继续」）+ 分组结果（组头、折叠、行距）。
     fn row_key(&self, i: usize, view: ViewMode) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let layout = self.layout.get(i).copied().unwrap_or_default();
-        (self.transcript[i].fingerprint(), view, self.is_turn_end(i), layout).hash(&mut h);
+        let live = if matches!(self.transcript[i], ChatItem::Failed { .. }) {
+            self.failure_resume(i)
+        } else {
+            self.is_turn_end(i)
+        };
+        (self.transcript[i].fingerprint(), view, live, layout).hash(&mut h);
         h.finish()
     }
 
@@ -507,6 +513,17 @@ impl Session {
         }
     }
 
+    /// `ix` 所在这一轮（上一条用户消息之后、下一条之前）改过的文件。
+    pub fn turn_files(&self, ix: usize) -> Vec<TurnFile> {
+        let is_user = |i: &ChatItem| matches!(i, ChatItem::User { .. });
+        let start = self.transcript[..ix].iter().rposition(is_user).map_or(0, |p| p + 1);
+        let end = self.transcript[ix..]
+            .iter()
+            .position(is_user)
+            .map_or(self.transcript.len(), |p| ix + p);
+        turn_files(&self.transcript[start..end], start)
+    }
+
     /// 一轮回复里的全部正文（从上一条用户消息到 `ix`），段与段之间空一行；「复制」用。
     pub fn turn_text(&self, ix: usize) -> String {
         let start = self.transcript[..ix]
@@ -599,8 +616,8 @@ impl Session {
     /// 本轮失败：对话流里放一张带「重试」的卡片（超出上下文的另给「新开会话」）。
     pub fn fail(&mut self, message: impl Into<String>) {
         let message = message.into();
-        let overflow = is_context_overflow(&message);
-        self.transcript.push(ChatItem::Failed { message: message.into(), overflow });
+        let kind = FailureKind::of(&message);
+        self.transcript.push(ChatItem::Failed { message: message.into(), kind });
     }
 
     /// 最近一条进行中的压缩行收尾（完成 / 失败）；没有进行中的就什么都不做。
@@ -613,6 +630,28 @@ impl Session {
         {
             *state = result;
         }
+    }
+
+    /// 第 `ix` 行（失败卡片）所在这一轮在失败前有没有进展（说了话，或者有工具做完了）。
+    /// 有的话「重试」会把做过的事再做一遍，失败卡片改给「继续」。
+    pub fn turn_progressed(&self, ix: usize) -> bool {
+        let start = self.turn_prompt(ix).map_or(0, |u| u + 1);
+        self.transcript[start..ix.min(self.transcript.len())].iter().any(|i| match i {
+            ChatItem::Agent(text) => !text.trim().is_empty(),
+            ChatItem::Tool(card) => card.phase == ToolPhase::Done,
+            _ => false,
+        })
+    }
+
+    /// 第 `ix` 行（失败卡片）要不要给「继续」：得是最近一轮（后面没有用户消息了，
+    /// 更早的失败卡片后面已经接着聊过）而且失败前有进展。
+    /// 卡片上的按钮组受它影响，所以 `row_key` 也读它。
+    pub fn failure_resume(&self, ix: usize) -> bool {
+        if !matches!(self.transcript.get(ix), Some(ChatItem::Failed { .. })) {
+            return false;
+        }
+        let latest = !self.transcript[ix..].iter().any(|i| matches!(i, ChatItem::User { .. }));
+        latest && self.turn_progressed(ix)
     }
 
     /// 第 `ix` 行（失败卡片）所在这一轮的用户消息：往前找最近的一条。
@@ -1174,6 +1213,51 @@ mod tests {
         assert!(md.contains("README.md"));
         assert!(md.contains("- [ ] 第一步"));
         assert!(md.contains("一条备注"));
+    }
+
+    /// 失败卡片只在「最近一轮 + 失败前有进展」时给「继续」；更早的失败后面已经接着聊过了。
+    #[core::prelude::v1::test]
+    fn failure_resume_needs_progress_and_latest_turn() {
+        let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("C:/proj"));
+        let user = |t: &str| ChatItem::User { text: t.into(), images: Vec::new() };
+        let tool = || {
+            ChatItem::Tool(ToolCard {
+                id: None,
+                kind: "edit".into(),
+                name: "Edit".into(),
+                arg: "a.rs".into(),
+                result: "ok".into(),
+                output: SharedString::default(),
+                phase: ToolPhase::Done,
+                diffs: Vec::new(),
+                expanded: false,
+            })
+        };
+        s.transcript = vec![
+            user("改一下"),
+            tool(),
+            ChatItem::Failed {
+                message: "读取流失败: reset".into(),
+                kind: crate::model::FailureKind::Interrupted,
+            },
+        ];
+        // 最近一轮、有进展 → 给「继续」
+        assert!(s.failure_resume(2));
+        // 后面又聊过了 → 不给
+        s.transcript.push(user("再来"));
+        assert!(!s.failure_resume(2));
+        // 失败前什么都没做 → 不给（那会儿该「重试」）
+        let mut fresh = Session::new(2, KernelChoice::Demo, PathBuf::from("C:/proj"));
+        fresh.transcript = vec![
+            user("改一下"),
+            ChatItem::Failed {
+                message: "HTTP 500".into(),
+                kind: crate::model::FailureKind::Server,
+            },
+        ];
+        assert!(!fresh.failure_resume(1));
+        // 不是失败卡片 → 不给
+        assert!(!fresh.failure_resume(0));
     }
 
     fn meta() -> SessionMeta {

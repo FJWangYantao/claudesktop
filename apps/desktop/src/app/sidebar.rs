@@ -11,7 +11,7 @@
 //! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
-use super::menu::{menu_action, menu_item};
+use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
 use super::{ChatApp, project_label};
@@ -501,30 +501,25 @@ impl ChatApp {
             Self::sidebar_icon_button("sidebar-filter", IconAll::ListFilter, "筛选会话", on, cx)
                 .when(!on, |d| d.opacity(0.).group_hover("group-header", |d| d.opacity(1.)));
         let handle = cx.entity();
-        Popover::new("sidebar-filter-menu")
+        let focus = self.menu_focus.clone();
+        menu_panel(Popover::new("sidebar-filter-menu"), &self.menu_focus)
             .anchor(Anchor::TopRight)
-            .w(px(260.))
+            .w(rems(16.25))
             .trigger(trigger)
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(LINE))
-            .rounded_lg()
-            .p_1()
             .content(move |_, _, cx| {
                 let popover = cx.entity();
                 let current = handle.read(cx).sidebar_filter;
-                let mut menu = div().v_flex().gap_0p5();
+                let mut menu = MenuList::new("filter-menu-list", &handle, &popover);
                 for (i, f) in SidebarFilter::ALL.into_iter().enumerate() {
-                    let (handle, popover) = (handle.clone(), popover.clone());
-                    menu = menu.child(
-                        menu_item(("filter-item", i), f.icon(), f.label(), f.desc(), f == current)
-                            .on_click(menu_action!(handle, popover, move |this, cx| {
-                                this.sidebar_filter = f;
-                                cx.notify();
-                            })),
+                    menu = menu.pick(
+                        menu_item(("filter-item", i), f.icon(), f.label(), f.desc(), f == current),
+                        move |this, cx| {
+                            this.sidebar_filter = f;
+                            cx.notify();
+                        },
                     );
                 }
-                menu
+                menu.finish(&focus)
             })
     }
 

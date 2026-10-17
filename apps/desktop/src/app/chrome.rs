@@ -5,7 +5,7 @@
 
 use super::ChatApp;
 use super::keys::CYCLE_VIEW_KEY;
-use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
+use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::widgets::Surface;
 use crate::model::ViewMode;
 use crate::theme::rgb;
@@ -134,8 +134,9 @@ impl ChatApp {
                 d.child(div().mr_1().child(menu_popover(
                     "view-menu",
                     Anchor::TopRight,
-                    px(280.),
+                    rems(17.5),
                     &cx.entity(),
+                    &self.menu_focus,
                     MenuChip::new(view.icon(), view.label()),
                     view_menu_items,
                 )))
@@ -155,14 +156,17 @@ impl ChatApp {
 }
 
 /// 视图模式条目：摘要 / 标准 / 详细，末尾提示快捷键。
-fn view_menu_items(app: &ChatApp, handle: &Entity<ChatApp>, popover: &Entity<PopoverState>) -> Div {
+fn view_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
     let current = app.settings.view_mode;
-    let mut menu = div().v_flex().gap_0p5();
+    let mut menu = MenuList::new("view-menu-list", handle, popover);
     for (i, mode) in ViewMode::ALL.into_iter().enumerate() {
-        let (handle, popover) = (handle.clone(), popover.clone());
-        menu = menu.child(
-            menu_item(("view-item", i), mode.icon(), mode.label(), mode.desc(), mode == current)
-                .on_click(menu_action!(handle, popover, |this, cx| this.set_view_mode(mode, cx))),
+        menu = menu.pick(
+            menu_item(("view-item", i), mode.icon(), mode.label(), mode.desc(), mode == current),
+            move |this, cx| this.set_view_mode(mode, cx),
         );
     }
     menu.child(

@@ -19,6 +19,8 @@ const MAX_HITS: usize = 30;
 /// 摘要里命中处前面留几个字、一共最多多少字
 const SNIPPET_BEFORE: usize = 12;
 const SNIPPET_LEN: usize = 60;
+/// 查询变了之后隔多久才真去搜（见 `ChatApp::search_palette`）
+const SEARCH_DEBOUNCE_MS: u64 = 150;
 /// 跳过去后那条消息的底色先停一会儿，再淡掉
 const FLASH_HOLD: Duration = Duration::from_millis(1200);
 const FLASH_FADE: Duration = Duration::from_millis(600);
@@ -84,7 +86,8 @@ fn snippet(text: &str, needle: &str) -> Option<String> {
     if start > 0 {
         out.insert(0, '…');
     }
-    if text.chars().count() - start > SNIPPET_LEN {
+    // 命中处后面还有内容才补尾巴的省略号（`start` 是字符下标，不会超过字符总数）
+    if text.chars().count().saturating_sub(start) > SNIPPET_LEN {
         out.push('…');
     }
     Some(out)
@@ -92,14 +95,53 @@ fn snippet(text: &str, needle: &str) -> Option<String> {
 
 impl ChatApp {
     /// 面板里的查询变了：重新搜正文（面板每次重画都读这份结果，不在重画时搜）。
-    pub(super) fn search_palette(&mut self, query: &str) {
-        let order: Vec<usize> =
-            self.session_groups().into_iter().flat_map(|(_, members)| members).collect();
-        self.palette_hits = search_messages(&self.sessions, &order, query);
+    ///
+    /// 排到下一次节拍再搜：`on_query` 每敲一个字都会来，而在 UI 线程上把上百个会话的
+    /// 正文整段小写化一遍是实打实的开销。查询变了才搜（连按两次同一个字只搜一次），
+    /// 面板那时已经重画过一次，列表跟着更新。
+    pub(super) fn search_palette(&mut self, query: &str, cx: &mut Context<Self>) {
+        let query = query.trim().to_lowercase();
+        if query == self.palette_query {
+            return;
+        }
+        self.palette_query = query;
+        let generation = self.palette_generation;
+        // 150ms 防抖：还没到点又敲下一个字时，旧的那个 `timer` 掉了就自行取消
+        self.palette_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS))
+                .await;
+            this.update(cx, |this, cx| {
+                // 面板关了或者又敲了字：这次的结果已经过期
+                if this.palette_generation != generation {
+                    return;
+                }
+                let query = this.palette_query.clone();
+                let order: Vec<usize> =
+                    this.session_groups().into_iter().flat_map(|(_, members)| members).collect();
+                this.palette_hits = search_messages(&this.sessions, &order, &query);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// 面板关掉 / 重新打开：清掉上一次的查询和待搜的节拍。
+    pub(super) fn reset_palette_search(&mut self) {
+        self.palette_query.clear();
+        self.palette_generation += 1;
+        self.palette_timer = None;
+        self.palette_hits.clear();
     }
 
     /// 从搜索结果跳到一条消息：切会话、滚过去（`Session::reveal`，列表同步时生效）、闪一下底色。
+    /// 结果缓存在 `palette_hits` 上、是上次查询的快照，下标可能已经过期（会话被删 / 回退过），
+    /// 一律先检查再动手。
     pub(super) fn reveal_message(&mut self, session: usize, item: usize, cx: &mut Context<Self>) {
+        let Some(s) = self.sessions.get(session) else { return };
+        if item >= s.transcript.len() {
+            return;
+        }
         self.settings_open = false;
         self.activate_session(session, cx);
         let s = &mut self.sessions[session];
@@ -107,8 +149,39 @@ impl ChatApp {
         self.flash = Some((s.token, item, Instant::now()));
     }
 
-    /// 第 `ix` 行刚从搜索结果跳过来：返回底色（先停一会儿再淡掉），走完为 None。
-    pub(super) fn flash_bg(&self, ix: usize, window: &mut Window, cx: &App) -> Option<Rgba> {
+    /// 第 `ix` 行刚跳过来：给这一行套上高亮（先停一会儿再淡掉）。只换颜色、不动行高
+    /// （虚拟列表不会重测）。消息铺一层底色；diff 卡片自己有底色，盖不住，改成沿卡片描一圈
+    /// （`card` = 卡片下面留的行距，描边不框进去）。
+    pub(super) fn with_flash(
+        &self,
+        row: Div,
+        ix: usize,
+        card: Option<Pixels>,
+        window: &mut Window,
+        cx: &App,
+    ) -> Div {
+        let Some(alpha) = self.flash_alpha(ix, window, cx) else { return row };
+        if let Some(gap) = card {
+            let ring = rgb(CORAL);
+            row.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom(gap)
+                    .rounded_lg()
+                    .border_2()
+                    .border_color(Rgba { a: ring.a * alpha, ..ring }),
+            )
+        } else {
+            let tint = rgb(SELECTED);
+            row.bg(Rgba { a: tint.a * alpha, ..tint }).rounded_xl()
+        }
+    }
+
+    /// 第 `ix` 行的高亮还剩多少（1 = 正停着，往 0 淡），走完为 None。
+    fn flash_alpha(&self, ix: usize, window: &mut Window, cx: &App) -> Option<f32> {
         let (token, item, at) = self.flash?;
         if token != self.session().token || item != ix {
             return None;
@@ -118,13 +191,11 @@ impl ChatApp {
             return None;
         }
         window.request_animation_frame();
-        let alpha = if age < FLASH_HOLD || cx.reduce_motion() {
+        Some(if age < FLASH_HOLD || cx.reduce_motion() {
             1.
         } else {
             1. - (age - FLASH_HOLD).as_secs_f32() / FLASH_FADE.as_secs_f32()
-        };
-        let tint = rgb(SELECTED);
-        Some(Rgba { a: tint.a * alpha, ..tint })
+        })
     }
 }
 

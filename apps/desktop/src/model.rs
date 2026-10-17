@@ -156,6 +156,59 @@ pub fn plan_progress(rows: &[PlanRow]) -> (usize, usize, Option<&PlanRow>) {
     (done, rows.len(), current)
 }
 
+/// 同一个文件的两条路径：Windows 上大小写和分隔符都不保证统一（`C:\a\B.rs` / `c:/a/b.rs`）。
+fn same_path(a: &str, b: &str) -> bool {
+    fn norm(p: &str) -> String {
+        p.replace('\\', "/").to_lowercase()
+    }
+    a == b || norm(a) == norm(b)
+}
+
+/// 一轮里改过的一个文件（回复末尾「改动 N 个文件」的列表）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFile {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+    /// 这一轮新建的
+    pub created: bool,
+    /// 最后一次改它的工具行（点了跳过去）
+    pub item: usize,
+}
+
+/// `items`（一轮的对话行，下标从 `offset` 起算）里改过的文件：按第一次出现的顺序，
+/// 同一文件改了几次就把增删行数加起来（`created` 取最后一次：先建后改就成了普通修改）。
+/// 没改成的（失败、还在等授权）不算。
+/// 同一个文件的路径大小写可能不一样（Windows 上工具回报的路径不保证规范），按忽略大小写合并。
+pub fn turn_files(items: &[ChatItem], offset: usize) -> Vec<TurnFile> {
+    let mut files: Vec<TurnFile> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let ChatItem::Tool(card) = item else { continue };
+        if card.phase != ToolPhase::Done {
+            continue;
+        }
+        for diff in &card.diffs {
+            match files.iter_mut().find(|f| same_path(&f.path, &diff.path)) {
+                Some(f) => {
+                    f.added += diff.added;
+                    f.removed += diff.removed;
+                    // 后面又整份写过一次就不算「新文件」了（`created` 只认最后一次的状态）
+                    f.created = diff.created;
+                    f.item = offset + i;
+                }
+                None => files.push(TurnFile {
+                    path: diff.path.clone(),
+                    added: diff.added,
+                    removed: diff.removed,
+                    created: diff.created,
+                    item: offset + i,
+                }),
+            }
+        }
+    }
+    files
+}
+
 /// 过程组的一行摘要（「读取 5 个文件，搜索 3 次，运行 2 条命令」）和失败的步数。
 /// 读文件按路径去重；只有思考时说「已思考」。
 pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (String, usize) {
@@ -268,11 +321,10 @@ pub enum ChatItem {
     Plan(Vec<PlanRow>),
     Agent(String),
     Note(SharedString),
-    /// 本轮失败（发送失败或内核报错）：卡片写明原因，带「重试」；
-    /// `overflow` = 超出模型的上下文长度，另给「新开会话」
+    /// 本轮失败（发送失败或内核报错）：卡片按原因写标题和建议，带「重试」等按钮
     Failed {
         message: SharedString,
-        overflow: bool,
+        kind: FailureKind,
     },
     /// 上下文压缩（自研内核）：一条分隔线，完成后可以点开看摘要
     Compaction {
@@ -442,7 +494,7 @@ impl ChatItem {
             }
             Self::Agent(t) => (6u8, t.len()).hash(&mut h),
             Self::Note(t) => (7u8, t.len()).hash(&mut h),
-            Self::Failed { message, overflow } => (9u8, message.len(), overflow).hash(&mut h),
+            Self::Failed { message, kind } => (9u8, message.len(), kind).hash(&mut h),
             Self::Compaction { state, open } => {
                 let (phase, len) = match state {
                     CompactState::Running => (0u8, 0),
@@ -582,6 +634,113 @@ pub fn summarize_output(raw: &str) -> String {
 
 pub use claudesktop_core::is_context_overflow;
 
+/// 一轮失败的原因（按报错文字认，各内核、网关说法不一，认不出的归 `Other`），
+/// 决定失败卡片的标题、建议和按钮。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FailureKind {
+    /// 超出模型的上下文长度
+    Overflow,
+    /// 401 / 403：API Key 不对或没有权限
+    Auth,
+    /// 429：太频繁或额度用完
+    RateLimit,
+    /// 5xx：服务端的问题（自研内核已经退避重试过）
+    Server,
+    /// 请求没发出去：连不上、超时、证书
+    Network,
+    /// 回复到一半流断了
+    Interrupted,
+    Other,
+}
+
+impl FailureKind {
+    pub fn of(message: &str) -> Self {
+        // 先看状态码：5xx / 429 的响应体里也可能捎带 "context length" 字样，
+        // 那会儿真正该修的是服务端或额度，不是「新开会话」
+        if let Some(status) = http_status(message) {
+            return match status {
+                401 | 403 => Self::Auth,
+                429 => Self::RateLimit,
+                500..=599 => Self::Server,
+                // 4xx 里剩下的才可能是「请求本身太长」
+                _ if is_context_overflow(message) => Self::Overflow,
+                _ => Self::Other,
+            };
+        }
+        if is_context_overflow(message) {
+            return Self::Overflow;
+        }
+        // 自研内核的两种传输错误（见 builtin 的 provider.rs）
+        if message.starts_with("读取流失败") {
+            Self::Interrupted
+        } else if message.starts_with("请求 ") && message.contains(" 失败: ") {
+            Self::Network
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Overflow => "超出了模型的上下文长度",
+            Self::Auth => "模型服务拒绝了请求",
+            Self::RateLimit => "请求太频繁或额度用完了",
+            Self::Server => "模型服务出错了",
+            Self::Network => "连不上模型服务",
+            Self::Interrupted => "回复中途断开了",
+            Self::Other => "本轮失败",
+        }
+    }
+
+    /// 标题下面一句该怎么办；`Other` 没有（只看原文）。
+    pub fn hint(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Overflow => {
+                "这个会话已经长到模型装不下了。新开一个会话接着做，或者换一个上下文更大的模型再重试。"
+            }
+            Self::Auth => "API Key 不对、过期了，或者没有这个模型的权限。到设置里检查服务商配置。",
+            Self::RateLimit => "等一会儿再试，或者到服务商那边看看额度。",
+            // 自研内核会自己退避重试几次，ACP 内核的重试策略由 agent 决定，这里不断言
+            Self::Server => "是服务端的问题，不是这个会话的错。稍后再试通常就好。",
+            Self::Network => "检查网络、代理和服务地址。",
+            Self::Interrupted => "连接在输出途中断了，已经做完的步骤都还在。",
+            Self::Other => return None,
+        })
+    }
+}
+
+/// 报错里的 HTTP 状态码（「HTTP 429: …」）。
+///
+/// 按「独立成词」找 `HTTP`：`error_message` 会把服务端 body 原样带进来，里面引用的
+/// 地址（`https://x/HTTP 404`）或状态码片段都可能误伤，所以要求 `HTTP` 前面不是字母 /
+/// 数字 / `/`、后面正好跟三位状态码，找不到再往后接着找。
+fn http_status(message: &str) -> Option<u16> {
+    const TAG: &str = "HTTP ";
+    let mut from = 0;
+    while let Some(found) = message[from..].find(TAG) {
+        let at = from + found;
+        from = at + TAG.len();
+        let boundary = message[..at].chars().next_back().is_none_or(|c| {
+            !(c.is_ascii_alphanumeric() || c == '/' || c == ':' || c == '_' || c == '-')
+        });
+        if !boundary {
+            continue;
+        }
+        let digits = message.get(from..from + 3)?;
+        let rest = message[from + 3..].chars().next();
+        // 后面不能再跟数字（「HTTP 4001」不是状态码），否则往后接着找
+        if rest.is_some_and(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(status) = digits.parse::<u16>()
+            && (100..600).contains(&status)
+        {
+            return Some(status);
+        }
+    }
+    None
+}
+
 /// 首条消息 → 会话标题：换行和连续空白并成一个空格（标题只占一行），取前 18 个字符。
 pub fn title_from_prompt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(18).collect()
@@ -692,6 +851,124 @@ mod tests {
             diffs: Vec::new(),
             expanded: false,
         })
+    }
+
+    #[core::prelude::v1::test]
+    fn failures_are_classified_by_message() {
+        let cases = [
+            ("HTTP 401: invalid api key", FailureKind::Auth),
+            ("HTTP 429: rate limited", FailureKind::RateLimit),
+            ("HTTP 529: overloaded", FailureKind::Server),
+            ("HTTP 400: prompt is too long", FailureKind::Overflow),
+            ("HTTP 404: no such model", FailureKind::Other),
+            // 5xx 的响应体里带上 context 字样时仍按服务端错误处理（先修的该是服务端）
+            ("HTTP 500: upstream context length exceeded?", FailureKind::Server),
+            ("HTTP 429: too many tokens per minute", FailureKind::RateLimit),
+            ("请求 https://x/v1/chat 失败: Connection refused", FailureKind::Network),
+            ("读取流失败: connection reset", FailureKind::Interrupted),
+            ("agent 崩了", FailureKind::Other),
+        ];
+        for (message, kind) in cases {
+            assert_eq!(FailureKind::of(message), kind, "{message}");
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn http_status_ignores_lookalikes() {
+        assert_eq!(http_status("HTTP 429: rate limited"), Some(429));
+        assert_eq!(http_status("upstream said HTTP 503: busy"), Some(503));
+        // 引用的地址里带 HTTP 字样不算（前面的 `/` 说明它是路径的一部分）
+        assert_eq!(http_status("请求 https://x/HTTP 404 失败"), None);
+        // 跳过这个之后再找到真正的状态码
+        assert_eq!(
+            http_status("见 https://x/HTTP 404 ，本次失败: HTTP 502 Bad Gateway"),
+            Some(502)
+        );
+        assert_eq!(http_status("GET /a HTTP 4001"), None);
+        assert_eq!(http_status("HTTP X00"), None);
+        assert_eq!(http_status("no status here"), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn turn_files_merge_edits_and_skip_failures() {
+        let edit = |path: &str, added, removed, phase| {
+            let mut item = tool("edit", "Edit", path, phase);
+            if let ChatItem::Tool(card) = &mut item {
+                card.diffs.push(DiffView {
+                    path: path.into(),
+                    created: added == 9,
+                    added,
+                    removed,
+                    lines: Vec::new(),
+                    truncated: false,
+                });
+            }
+            item
+        };
+        let items = [
+            edit("a.rs", 2, 1, ToolPhase::Done),
+            edit("new.rs", 9, 0, ToolPhase::Done),
+            ChatItem::Agent("改好了".into()),
+            edit("a.rs", 3, 0, ToolPhase::Done),
+            edit("b.rs", 5, 5, ToolPhase::Failed),
+        ];
+        let files = turn_files(&items, 10);
+        let got: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.added, f.removed, f.created, f.item))
+            .collect();
+        assert_eq!(got, [("a.rs", 5, 1, false, 13), ("new.rs", 9, 0, true, 11)]);
+    }
+
+    /// 新建之后又整份改写过：算普通修改（`created` 只看最后一次）。
+    #[core::prelude::v1::test]
+    fn turn_files_created_follows_the_last_edit() {
+        let edit = |created: bool, added| {
+            let mut item = tool("edit", "Edit", "a.rs", ToolPhase::Done);
+            if let ChatItem::Tool(card) = &mut item {
+                card.diffs.push(DiffView {
+                    path: "a.rs".into(),
+                    created,
+                    added,
+                    removed: 0,
+                    lines: Vec::new(),
+                    truncated: false,
+                });
+            }
+            item
+        };
+        let items = [edit(true, 9), edit(false, 2)];
+        let files = turn_files(&items, 0);
+        assert_eq!((files[0].added, files[0].created), (11, false));
+    }
+
+    /// 同一个文件的两条路径大小写 / 分隔符不一样（Windows 上工具回报的不保证统一）要算一个文件。
+    #[core::prelude::v1::test]
+    fn turn_files_merge_paths_ignoring_case_and_separators() {
+        let edit = |path: &str, added| {
+            let mut item = tool("edit", "Edit", path, ToolPhase::Done);
+            if let ChatItem::Tool(card) = &mut item {
+                card.diffs.push(DiffView {
+                    path: path.into(),
+                    created: false,
+                    added,
+                    removed: 0,
+                    lines: Vec::new(),
+                    truncated: false,
+                });
+            }
+            item
+        };
+        let items = [
+            edit(r"C:\Proj\src\Main.rs", 2),
+            edit("c:/proj/src/main.rs", 3),
+            edit(r"C:\Proj\SRC\main.rs", 1),
+            edit(r"C:\Proj\src\other.rs", 7),
+        ];
+        let files = turn_files(&items, 0);
+        let got: Vec<_> = files.iter().map(|f| (f.path.as_str(), f.added)).collect();
+        // 保留第一次出现的写法，行数合起来
+        assert_eq!(got, [(r"C:\Proj\src\Main.rs", 6), (r"C:\Proj\src\other.rs", 7)]);
     }
 
     #[core::prelude::v1::test]

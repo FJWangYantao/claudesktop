@@ -376,7 +376,7 @@ fn names(files: &[&FileRestore]) -> String {
     text
 }
 
-fn file_name(path: &str) -> String {
+pub(super) fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
         .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned())

@@ -2,7 +2,7 @@
 
 use super::ChatApp;
 use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
-use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
+use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::widgets::Surface;
 use crate::settings::*;
 use crate::theme::rgb;
@@ -103,8 +103,8 @@ pub struct SettingsForm {
     active: usize,
     /// 每套档案的输入框
     inputs: Vec<ProfileInputs>,
-    /// 设置页当前所在的 tab（0 通用 / 1 内核与模型 / 2 权限）
-    tab: usize,
+    /// 设置页当前所在的 tab（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP）
+    pub(super) tab: usize,
     acp_command: Entity<InputState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
@@ -142,6 +142,19 @@ fn value(input: &Entity<InputState>, cx: &App) -> String {
 
 impl ChatApp {
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 记住上次看的 tab（打开时不动它），要指定 tab 的走 `open_settings_at`
+        let tab = self.settings_form.tab;
+        self.open_settings_at(tab, window, cx);
+    }
+
+    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP）。
+    /// 失败卡片的「打开设置」用它直接落到服务商配置。
+    pub(crate) fn open_settings_at(
+        &mut self,
+        tab: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 字体下拉要系统的字体清单，先热一次缓存（首次枚举要上百毫秒）
         crate::theme::installed_fonts(cx);
         // 滑杆位置跟上当前设置（可能在别处被改过）
@@ -163,6 +176,7 @@ impl ChatApp {
         self.settings_form
             .acp_command
             .update(cx, |state, cx| state.set_value(s.acp.command.clone(), window, cx));
+        self.settings_form.tab = tab;
         self.settings_open = true;
         cx.notify();
     }
@@ -369,8 +383,9 @@ impl ChatApp {
             menu_popover(
                 "font-family-menu",
                 Anchor::BottomRight,
-                px(280.),
+                rems(17.5),
                 &app,
+                &self.menu_focus,
                 MenuChip::new(IconAll::ALargeSmall, label),
                 font_family_menu_items,
             ),
@@ -1225,40 +1240,30 @@ fn font_family_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
-) -> Stateful<Div> {
+) -> MenuList {
     const MAX_SYSTEM_FONTS: usize = 60;
     let current = app.settings.font_family_or_default();
-    let mut menu =
-        div().id("font-family-list").max_h(px(360.)).overflow_y_scroll().v_flex().gap_0p5();
+    let mut menu = MenuList::new("font-family-list", handle, popover).scroll(rems(22.5));
 
     // 内嵌的 Inter：字体族为空即表示用它
-    {
-        let (handle, popover) = (handle.clone(), popover.clone());
-        menu = menu.child(
-            menu_item(
-                "font-embedded",
-                IconAll::ALargeSmall,
-                "Inter（内嵌）",
-                "随应用分发，中文由系统字体回退",
-                current.is_none(),
-            )
-            .on_click(menu_action!(handle, popover, |this, cx| {
-                this.set_font_family(None, cx);
-            })),
-        );
-    }
+    menu = menu.pick(
+        menu_item(
+            "font-embedded",
+            IconAll::ALargeSmall,
+            "Inter（内嵌）",
+            "随应用分发，中文由系统字体回退",
+            current.is_none(),
+        ),
+        |this, cx| this.set_font_family(None, cx),
+    );
 
     let fonts = app.system_fonts();
     for (i, name) in fonts.iter().take(MAX_SYSTEM_FONTS).enumerate() {
         let active = current.as_deref() == Some(name.as_str());
         let picked: SharedString = name.clone().into();
-        let (handle, popover) = (handle.clone(), popover.clone());
-        menu = menu.child(
-            menu_item(("font-item", i), IconAll::Type, name.clone(), "", active).on_click(
-                menu_action!(handle, popover, |this, cx| {
-                    this.set_font_family(Some(picked.clone()), cx);
-                }),
-            ),
+        menu = menu.pick(
+            menu_item(("font-item", i), IconAll::Type, name.clone(), "", active),
+            move |this, cx| this.set_font_family(Some(picked.clone()), cx),
         );
     }
     if fonts.len() > MAX_SYSTEM_FONTS {

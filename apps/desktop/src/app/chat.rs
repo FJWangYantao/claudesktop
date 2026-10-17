@@ -4,7 +4,9 @@
 //! 连续的几步收进可折叠的组（分组规则在 `Session::compute_layout`）。
 
 use super::ChatApp;
+use super::menu::{MenuChip, MenuList, diff_stat, menu_item, menu_popover};
 use super::motion::{self, Reveal};
+use super::rewind::file_name;
 use super::widgets::Surface;
 use crate::model::*;
 use crate::session::{RowLayout, Session, StepGroup};
@@ -16,6 +18,7 @@ use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::motion::{Presence, Transition};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Position;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
@@ -28,7 +31,7 @@ use std::time::{Duration, Instant};
 /// 同组相邻两步之间的行距
 const STEP_GAP: Pixels = px(6.);
 /// 块与块之间的行距
-const BLOCK_GAP: Pixels = px(16.);
+pub(super) const BLOCK_GAP: Pixels = px(16.);
 /// 步骤行左侧的图标格宽度；组内细线对着它的中线
 const ICON_COL: Pixels = px(16.);
 /// 图标格 + 间距：步骤的展开内容（思考正文等）缩进到文字起点
@@ -222,7 +225,15 @@ impl ChatApp {
             });
         }
         // 正在收起、自己已不显示的步骤不留块间距（组头那行会留）
-        col.when(!layout.tight && (layout.body || layout.head.is_some()), |d| d.pb(BLOCK_GAP))
+        let gap = Self::row_gap(layout);
+        col.when(gap > px(0.), |d| d.pb(gap))
+    }
+
+    /// 这一行底下留多高的块间距：`content.rs` 里给高亮描边留位置也要用同一个值，
+    /// 所以判断只放在这里（别再抄一份条件过去）。
+    pub(super) fn row_gap(layout: RowLayout) -> Pixels {
+        // 正在收起、自己已不显示的步骤不留块间距（组头那行会留）
+        if !layout.tight && (layout.body || layout.head.is_some()) { BLOCK_GAP } else { px(0.) }
     }
 
     /// 过程组的组头：一行摘要（读了几个文件、跑了几条命令…），点开 / 收起；详细视图总是展开、不给开关。
@@ -640,13 +651,27 @@ impl ChatApp {
         &self,
         idx: usize,
         message: &SharedString,
-        overflow: bool,
+        kind: FailureKind,
         cx: &mut Context<Self>,
     ) -> Div {
-        let busy = self.session().busy;
-        let title = if overflow { "超出了模型的上下文长度" } else { "本轮失败" };
+        let s = self.session();
+        let busy = s.busy;
+        // 失败前已经有进展时给「继续」（接着做），「重试」会把做过的再做一遍
+        // （判断在 Session 里：虚拟列表的测量指纹也要读它，见 `Session::row_key`）
+        let resume = s.failure_resume(idx);
+        // 主操作只占一个，按「先解决根因、再接着做」排：
+        // 上下文溢出只能新开会话，Key 不对只能去改设置，其它情况有进展就继续、没进展就重试
+        let primary = if kind == FailureKind::Overflow {
+            "fail-new"
+        } else if kind == FailureKind::Auth {
+            "fail-settings"
+        } else if resume {
+            "fail-resume"
+        } else {
+            "fail-retry"
+        };
         // 卡片自带边框，按钮不再描边：主操作赤陶实底，其余沙色实底（悬停 SELECTED）
-        let button = |id: &'static str, icon: IconAll, label: &'static str, primary: bool| {
+        let button = |id: &'static str, icon: IconAll, label: &'static str| {
             Button::new((id, idx))
                 .small()
                 .px_3()
@@ -654,7 +679,7 @@ impl ChatApp {
                 .label(label)
                 .cursor_pointer()
                 .disabled(busy)
-                .with_variant(if primary {
+                .with_variant(if id == primary {
                     ButtonVariant::Primary
                 } else {
                     ButtonVariant::Secondary
@@ -680,17 +705,12 @@ impl ChatApp {
                             .text_size(TEXT_BODY)
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(INK))
-                            .child(title),
+                            .child(kind.title()),
                     ),
             )
-            .when(overflow, |d| {
-                d.child(
-                    div()
-                        .text_size(TEXT_BODY)
-                        .text_color(rgb(INK))
-                        .child("这个会话已经长到模型装不下了。新开一个会话接着做，或者换一个上下文更大的模型再重试。"),
-                )
-            })
+            .children(
+                kind.hint().map(|hint| div().text_size(TEXT_BODY).text_color(rgb(INK)).child(hint)),
+            )
             // 原文：网关 / 模型报的错，最多四行
             .child(
                 div()
@@ -704,17 +724,31 @@ impl ChatApp {
                     .h_flex()
                     .gap_2()
                     .pt_1()
-                    .when(overflow, |d| {
-                        d.child(button("fail-new", IconAll::MessageSquarePlus, "新开会话", true).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.add_session(cx);
-                                this.focus_input(window, cx);
-                            }),
+                    .when(kind == FailureKind::Overflow, |d| {
+                        d.child(
+                            button("fail-new", IconAll::MessageSquarePlus, "新开会话").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.add_session(cx);
+                                    this.focus_input(window, cx);
+                                }),
+                            ),
+                        )
+                    })
+                    .when(kind == FailureKind::Auth, |d| {
+                        d.child(button("fail-settings", IconAll::Settings, "打开设置").on_click(
+                            cx.listener(|this, _, window, cx| this.open_settings_at(1, window, cx)),
                         ))
                     })
-                    .child(button("fail-retry", IconAll::RotateCcw, "重试", false).on_click(
-                        cx.listener(move |this, _, _, cx| this.retry_turn(idx, cx)),
-                    )),
+                    .when(resume, |d| {
+                        d.child(
+                            button("fail-resume", IconAll::Play, "继续")
+                                .on_click(cx.listener(|this, _, _, cx| this.resume_turn(cx))),
+                        )
+                    })
+                    .child(
+                        button("fail-retry", IconAll::RotateCcw, "重试")
+                            .on_click(cx.listener(move |this, _, _, cx| this.retry_turn(idx, cx))),
+                    ),
             )
     }
 
@@ -834,6 +868,56 @@ impl ChatApp {
                     ),
             )
             .child(div().pl(STEP_INDENT).child(buttons))
+    }
+
+    /// 回复末尾「改动 N 个文件 +a −b」：点开列出这一轮改过的文件，选一个跳到它的 diff。
+    fn turn_files_menu(&self, idx: usize, files: Vec<TurnFile>, cx: &mut Context<Self>) -> Popover {
+        let (added, removed) = files.iter().fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+        let label = match files.as_slice() {
+            [one] => format!("改动 {}", file_name(&one.path)),
+            many => format!("改动 {} 个文件", many.len()),
+        };
+        // Popover 的展开状态按 id 存在 window 上（`use_keyed_state`），不跟着外层
+        // `div().id(("transcript", token))` 隔离：id 里带上会话 token，免得一个会话里
+        // 开着的菜单在另一个会话同一行号上「继承」成打开状态
+        let token = self.session().token;
+        let id = SharedString::from(format!("turn-files-{token}-{idx}"));
+        menu_popover(
+            id.clone(),
+            Anchor::BottomLeft,
+            rems(24.),
+            &cx.entity(),
+            &self.menu_focus,
+            MenuChip::new(IconAll::FileDiff, label).stat(added, removed),
+            move |_, handle, popover| {
+                let mut menu =
+                    MenuList::new(SharedString::from(format!("{id}-list")), handle, popover)
+                        .scroll(rems(22.5));
+                for (i, f) in files.iter().enumerate() {
+                    let item = f.item;
+                    let name = file_name(&f.path);
+                    let desc =
+                        if f.created { format!("新文件 · {}", f.path) } else { f.path.clone() };
+                    menu = menu.pick(
+                        menu_item(("turn-file", i), IconAll::FileText, name, desc, false)
+                            .child(diff_stat(f.added, f.removed)),
+                        move |this, cx| this.reveal_change(item, cx),
+                    );
+                }
+                menu
+            },
+        )
+    }
+
+    /// 从「改动 N 个文件」跳到某个文件的 diff：摘要视图里 diff 卡片是收起的。
+    /// 只在内存里换回标准视图——这是「为看一眼」的临时切换，不能当成偏好写回设置文件
+    /// （见 [`Self::set_view_mode`]）。
+    fn reveal_change(&mut self, item: usize, cx: &mut Context<Self>) {
+        if self.settings.view_mode == ViewMode::Summary {
+            self.settings.view_mode = ViewMode::Normal;
+            self.view_changed(cx);
+        }
+        self.reveal_message(self.active, item, cx);
     }
 
     /// 一个文件的 diff 卡片；`preview` = 默认露出的行数（None = 全部）。
@@ -1062,7 +1146,17 @@ impl ChatApp {
         if self.settings.view_mode == mode {
             return;
         }
+        // 视图菜单 / 命令面板里两项都勾在内存里的那一项上，切完得让根视图重画
+        // （列表那边由 sync_list 的测量指纹自己跟上）
         self.save_ui_pref(move |s| s.view_mode = mode, cx);
+        self.view_changed(cx);
+    }
+
+    /// 视图模式换过之后：重算对话列表的分组 / 测量指纹（`Session::sync_list` 才看得到新模式）。
+    pub(super) fn view_changed(&mut self, cx: &mut Context<Self>) {
+        let view = self.settings.view_mode;
+        let active = self.active;
+        self.sessions[active].sync_list(view);
         cx.notify();
     }
 
@@ -1436,6 +1530,7 @@ impl ChatApp {
                 let fade = (!latest)
                     .then(|| motion::hover_opacity(("agent-actions", idx), hovered, window, cx));
                 let meta = s.turn_summary(idx).and_then(super::status::turn_meta);
+                let files = s.turn_files(idx);
                 let actions = div()
                     .h_flex()
                     .items_center()
@@ -1452,6 +1547,7 @@ impl ChatApp {
                             .font_features(tabular_nums())
                             .child(m)
                     }))
+                    .when(!files.is_empty(), |d| d.child(self.turn_files_menu(idx, files, cx)))
                     .when_some(fade, |d, opacity| d.opacity(opacity));
                 div().child(
                     div()
@@ -1465,9 +1561,7 @@ impl ChatApp {
                         .child(actions),
                 )
             }
-            ChatItem::Failed { message, overflow } => {
-                self.render_failed(idx, message, *overflow, cx)
-            }
+            ChatItem::Failed { message, kind } => self.render_failed(idx, message, *kind, cx),
             ChatItem::Compaction { state, open } => {
                 Self::render_compaction(idx, state, *open, window, cx)
             }

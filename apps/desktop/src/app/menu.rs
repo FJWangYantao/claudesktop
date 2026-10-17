@@ -3,6 +3,10 @@
 //! open 状态由 gpui-kit `Popover` 自己持有（点外面 / Esc 关闭），ChatApp 不再
 //! 存菜单 bool；条目动作经 `Entity<ChatApp>` 回到根视图，选中后调
 //! `PopoverState::dismiss` 收起面板。
+//!
+//! 条目用 [`MenuList`] 组：前 9 个可选条目右侧标上数字，面板开着时按数字键直接选。
+//! 按键要落在焦点链上，所以面板打开时焦点给 `ChatApp::menu_focus`（挂在条目列表外层），
+//! 而不是 Popover 自己的外壳（列表是外壳的子元素，不在它的按键分发路径上）。
 
 use super::ChatApp;
 use crate::theme::rgb;
@@ -13,6 +17,7 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::rc::Rc;
 
 /// 下拉 trigger chip：图标 + 文字 + 展开箭头，或只有文字，弹层打开时高亮。
 /// 实现 [`Selectable`] 以便作为 `Popover::trigger` 使用。
@@ -24,22 +29,44 @@ pub(super) struct MenuChip {
     plain: bool,
     /// 沙色实底，和输入框上方那排静态 chip 同款
     filled: bool,
+    /// 文字后面跟着的增删行数（绿 +N、红 −M）
+    stat: Option<(u32, u32)>,
     open: bool,
 }
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self { icon: Some(icon), label: label.into(), plain: false, filled: false, open: false }
+        Self {
+            icon: Some(icon),
+            label: label.into(),
+            plain: false,
+            filled: false,
+            stat: None,
+            open: false,
+        }
     }
 
     /// 只有文字，不带展开箭头（输入框下方的权限模式 / 模型）。
     pub(super) fn plain(label: impl Into<SharedString>) -> Self {
-        Self { icon: None, label: label.into(), plain: true, filled: false, open: false }
+        Self {
+            icon: None,
+            label: label.into(),
+            plain: true,
+            filled: false,
+            stat: None,
+            open: false,
+        }
     }
 
     /// 沙色实底（输入框上方的项目目录），与旁边的「本地」chip 并排不突兀。
     pub(super) fn filled(mut self) -> Self {
         self.filled = true;
+        self
+    }
+
+    /// 文字后面跟上增删行数（回复末尾的「改动 N 个文件」）。
+    pub(super) fn stat(mut self, added: u32, removed: u32) -> Self {
+        self.stat = Some((added, removed));
         self
     }
 }
@@ -70,6 +97,9 @@ impl RenderOnce for MenuChip {
             // chip 一律次要字号，与输入框上方的环境 / 项目 chip 同档
             div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(self.label),
         );
+        if let Some((added, removed)) = self.stat {
+            chip = chip.child(diff_stat(added, removed));
+        }
         if !self.plain {
             chip = chip.child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
         }
@@ -79,19 +109,101 @@ impl RenderOnce for MenuChip {
     }
 }
 
-/// 条目点击的公共收尾：执行动作后收起面板。
-macro_rules! menu_action {
-    ($handle:expr, $popover:expr, $body:expr) => {
-        move |_, window, cx: &mut App| {
-            $handle.update(cx, $body);
-            $popover.update(cx, |s, cx| s.dismiss(window, cx));
-        }
-    };
+/// 增删行数：绿 +N、红 −M，等宽数字。
+pub(super) fn diff_stat(added: u32, removed: u32) -> Div {
+    div()
+        .flex_shrink_0()
+        .h_flex()
+        .gap_1p5()
+        .text_size(TEXT_SMALL)
+        .font_features(tabular_nums())
+        .child(div().text_color(rgb(DIFF_ADD_FG)).child(format!("+{added}")))
+        .child(div().text_color(rgb(DIFF_DEL_FG)).child(format!("−{removed}")))
 }
-pub(super) use menu_action;
+
+/// 选中一个条目：执行动作后收起面板。点击和数字键共用。
+type Pick = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// 最多几个条目能按数字键选
+const MAX_KEYED: usize = 9;
+
+/// 菜单面板里的条目列表。[`pick`](Self::pick) 加可选条目（点了执行动作并收起面板，
+/// 前 9 个标数字），[`child`](Self::child) 加别的内容（提示、不收起面板的操作）。
+pub(super) struct MenuList {
+    handle: Entity<ChatApp>,
+    popover: Entity<PopoverState>,
+    body: Stateful<Div>,
+    picks: Vec<Pick>,
+}
+
+impl MenuList {
+    pub(super) fn new(
+        id: impl Into<ElementId>,
+        handle: &Entity<ChatApp>,
+        popover: &Entity<PopoverState>,
+    ) -> Self {
+        Self {
+            handle: handle.clone(),
+            popover: popover.clone(),
+            body: div().id(id).v_flex().gap_0p5(),
+            picks: Vec::new(),
+        }
+    }
+
+    /// 条目多时限高滚动。
+    pub(super) fn scroll(mut self, max_h: Rems) -> Self {
+        self.body = self.body.max_h(max_h).overflow_y_scroll();
+        self
+    }
+
+    /// 可选条目：`row` 一般是 [`menu_item`]，`action` 在根视图上执行，之后收起面板。
+    pub(super) fn pick(
+        mut self,
+        row: Stateful<Div>,
+        action: impl Fn(&mut ChatApp, &mut Context<ChatApp>) + 'static,
+    ) -> Self {
+        let (handle, popover) = (self.handle.clone(), self.popover.clone());
+        let pick: Pick = Rc::new(move |window, cx| {
+            handle.update(cx, |this, cx| action(this, cx));
+            popover.update(cx, |s, cx| s.dismiss(window, cx));
+        });
+        let n = self.picks.len() + 1;
+        let on_click = pick.clone();
+        self.picks.push(pick);
+        // 键帽样式，免得和条目里的数字（如增删行数）连成一串
+        let row = row
+            .on_click(move |_, window, cx| on_click(window, cx))
+            .when(n <= MAX_KEYED, |d| d.child(ChatApp::kbd(&n.to_string())));
+        self.body = self.body.child(row);
+        self
+    }
+
+    pub(super) fn child(mut self, child: impl IntoElement) -> Self {
+        self.body = self.body.child(child);
+        self
+    }
+
+    /// 收尾：外层挂上 `focus`（面板打开时焦点在这里），数字键选对应条目。
+    pub(super) fn finish(self, focus: &FocusHandle) -> Div {
+        let picks = self.picks;
+        div().track_focus(focus).child(self.body).on_key_down(move |event, window, cx| {
+            let keys = &event.keystroke;
+            // 只放行 Shift：AZERTY 等布局上打数字要按住 Shift，`key` 仍是 "1"。
+            // Ctrl / Alt 要留给 Ctrl+K、Alt+1..4 这些快捷键
+            if keys.modifiers.control || keys.modifiers.alt || keys.modifiers.platform {
+                return;
+            }
+            let n = keys.key.parse::<usize>().ok().filter(|n| (1..=MAX_KEYED).contains(n));
+            if let Some(pick) = n.and_then(|n| picks.get(n - 1)) {
+                pick(window, cx);
+                cx.stop_propagation();
+            }
+        })
+    }
+}
 
 /// 两行式菜单条目：图标 + 名称（+ 灰色说明，空串不显示），当前项右侧打赤陶色对勾。
-/// 点击动作由调用方链 `.on_click(menu_action!(..))`。
+/// 交给 [`MenuList::pick`]，点击动作由它挂。
 pub(super) fn menu_item(
     id: impl Into<ElementId>,
     icon: IconAll,
@@ -126,29 +238,29 @@ pub(super) fn menu_item(
 }
 
 /// 组一个下拉菜单：`chip` 是 trigger，面板锚在 chip 上按 `anchor` 方向展开，
-/// 宽 `width`。`items` 每次渲染面板时调用——`app` 是当前状态快照（读数据），
-/// `handle` 用来在条目点击里更新根视图，`popover` 用来在选中后收起面板。
+/// 宽 `width`（rem，跟着界面字号缩放，否则放大字号后说明文字挤得折行）。`items` 每次渲染面板时调用——`app` 是当前状态快照（读数据），
+/// `handle` / `popover` 交给 [`MenuList::new`]。`focus` 传 `ChatApp::menu_focus`。
 /// 返回的 `Popover` 还可以继续链 `.on_open_change` 等配置。
-pub(super) fn menu_popover<E: IntoElement + 'static>(
-    id: &'static str,
+pub(super) fn menu_popover(
+    id: impl Into<ElementId>,
     anchor: Anchor,
-    width: Pixels,
+    width: Rems,
     handle: &Entity<ChatApp>,
+    focus: &FocusHandle,
     chip: MenuChip,
-    items: impl Fn(&ChatApp, &Entity<ChatApp>, &Entity<PopoverState>) -> E + 'static,
+    items: impl Fn(&ChatApp, &Entity<ChatApp>, &Entity<PopoverState>) -> MenuList + 'static,
 ) -> Popover {
     let handle = handle.clone();
-    Popover::new(id)
-        .anchor(anchor)
-        .w(width)
-        .trigger(chip)
-        .bg(rgb(CARD))
-        .border_1()
-        .border_color(rgb(LINE))
-        .rounded_lg()
-        .p_1()
-        .content(move |_, _, cx| {
+    let list_focus = focus.clone();
+    menu_panel(Popover::new(id), focus).anchor(anchor).w(width).trigger(chip).content(
+        move |_, _, cx| {
             let popover = cx.entity();
-            items(handle.read(cx), &handle, &popover)
-        })
+            items(handle.read(cx), &handle, &popover).finish(&list_focus)
+        },
+    )
+}
+
+/// 菜单面板的外观和焦点（trigger 不是 [`MenuChip`] 的菜单自己组 Popover 时也用它）。
+pub(super) fn menu_panel(popover: Popover, focus: &FocusHandle) -> Popover {
+    popover.track_focus(focus).bg(rgb(CARD)).border_1().border_color(rgb(LINE)).rounded_lg().p_1()
 }

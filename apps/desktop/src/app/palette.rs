@@ -178,15 +178,22 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         })
         .collect();
 
-    // 正文命中的消息：摘要做名字（含查询词，面板自己的过滤也留得住），会话名做说明
+    // 正文命中的消息：摘要做名字（含查询词，面板自己的过滤也留得住），会话名做说明。
+    // 结果来自上一次（防抖后）的搜索，会话可能已经不在了、消息可能被回退掉了，跳过对不上的
     let messages = app
         .palette_hits
         .iter()
-        .map(|hit| {
+        .filter_map(|hit| {
+            let session = app.sessions.get(hit.session)?;
+            if hit.item >= session.transcript.len() {
+                return None;
+            }
             let icon = if hit.from_user { IconAll::User } else { IconAll::Sparkles };
-            Entry::new(icon, hit.snippet.clone(), PaletteCmd::Message(hit.session, hit.item))
-                .desc(app.sessions[hit.session].title.clone())
-                .stacked()
+            Some(
+                Entry::new(icon, hit.snippet.clone(), PaletteCmd::Message(hit.session, hit.item))
+                    .desc(session.title.clone())
+                    .stacked(),
+            )
         })
         .collect();
 
@@ -248,7 +255,7 @@ impl ChatApp {
         }
         let state = cx.new(|cx| CommandState::new(window, cx));
         let app = cx.entity();
-        self.palette_hits.clear();
+        self.reset_palette_search();
         let palette = state.clone();
         window.open_dialog(cx, move |dialog, _, cx| {
             let groups = palette_groups(app.read(cx));
@@ -275,13 +282,10 @@ impl ChatApp {
                     .map(|(_, entries)| entries.into_iter().map(|e| e.cmd).collect())
                     .collect(),
             );
-            // 查询变了才按正文重搜；结果存在 ChatApp 上，通知后面板重画时读
+            // 查询变了才按正文重搜（防抖后搜，结果存在 ChatApp 上，面板重画时读）
             let searcher = app.clone();
             command = command.on_query(move |query, _, cx| {
-                searcher.update(cx, |this, cx| {
-                    this.search_palette(query);
-                    cx.notify();
-                });
+                searcher.update(cx, |this, cx| this.search_palette(query, cx));
             });
             let app = app.clone();
             command = command.on_confirm(move |ix, window, cx| {
