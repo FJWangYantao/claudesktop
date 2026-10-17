@@ -48,11 +48,22 @@ impl ChatApp {
         let active = self.active;
         // 还没发过消息的会话显示首页（与官方空会话一致，输入框在底部）
         if !self.sessions[active].has_user_message() {
+            // 放大字号后放不下时整页往下长、可以滚（min_h 而不是 h：定高时居中的内容会从上下两头溢出，
+            // 问候语顶到顶栏下面）；上下渐隐同对话区
+            let paper = rgb(PAPER);
+            let clear = Rgba { a: 0., ..paper };
             return div()
-                .id("home-scroll")
+                .relative()
                 .size_full()
-                .overflow_y_scroll()
-                .child(div().h_full().v_flex().child(self.render_overview(cx)))
+                .child(
+                    div()
+                        .id("home-scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .child(div().min_h_full().py_4().v_flex().child(self.render_overview(cx))),
+                )
+                .child(edge_fade(px(16.), paper, clear).top_0())
+                .child(edge_fade(px(24.), clear, paper).bottom_0())
                 .into_any_element();
         }
 
@@ -108,13 +119,6 @@ impl ChatApp {
         // 状态行下边距，滚到头时不遮内容；覆盖层不挂事件，不挡点击和滚轮
         let paper = rgb(PAPER);
         let clear = Rgba { a: 0., ..paper };
-        let fade = |h: Pixels, from: Rgba, to: Rgba| {
-            div().absolute().left_0().right_0().h(h).bg(linear_gradient(
-                180.,
-                linear_color_stop(from, 0.),
-                linear_color_stop(to, 1.),
-            ))
-        };
         // 滚轮平滑：capture 阶段截住滚轮记成目标（见 `ChatApp::wheel_by`），列表自己在 bubble 阶段
         // 一格硬跳 60px 的处理就不跑了。只有横向（Shift+滚轮）时放行。
         // 命中区不挡悬停；弹层、对话框盖在上面时 `should_handle_scroll` 为 false，不抢它们的滚轮
@@ -148,9 +152,18 @@ impl ChatApp {
             .v_flex()
             .child(scroll)
             .child(wheel)
-            .child(fade(px(16.), paper, clear).top_0())
-            .child(fade(px(24.), clear, paper).bottom_0())
+            .child(edge_fade(px(16.), paper, clear).top_0())
+            .child(edge_fade(px(24.), clear, paper).bottom_0())
             .children(self.render_jump_to_bottom(window, cx))
             .into_any_element()
     }
+}
+
+/// 滚动区上下边缘的渐隐条（从 `from` 渐变到 `to`），不挂事件，不挡点击和滚轮。
+fn edge_fade(h: Pixels, from: Rgba, to: Rgba) -> Div {
+    div().absolute().left_0().right_0().h(h).bg(linear_gradient(
+        180.,
+        linear_color_stop(from, 0.),
+        linear_color_stop(to, 1.),
+    ))
 }

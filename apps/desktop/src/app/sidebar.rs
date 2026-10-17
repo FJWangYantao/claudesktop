@@ -438,7 +438,30 @@ impl ChatApp {
                     this.toast("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力", cx);
                 },
             )))
-            .child(div().id("sidebar-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .child(
+                // 列表滚到底部「设置」上面时渐隐，不是一刀切（同对话区的下边缘）；
+                // 列表底下留出渐隐的高度，滚到头时最后一行不被盖住
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .v_flex()
+                    .child(
+                        div()
+                            .id("sidebar-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(div().pb_4().child(body)),
+                    )
+                    .child(div().absolute().left_0().right_0().bottom_0().h(px(16.)).bg(
+                        linear_gradient(
+                            180.,
+                            linear_color_stop(Rgba { a: 0., ..rgb(SAND) }, 0.),
+                            linear_color_stop(rgb(SAND), 1.),
+                        ),
+                    )),
+            )
             .child(
                 // 底部：设置 + 内核状态
                 div()
@@ -607,7 +630,8 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let s = &self.sessions[i];
-        let active = self.active == i;
+        // 设置页开着时选中的是「设置」，当前会话不再同时高亮
+        let active = self.active == i && !self.settings_open;
         let row = div()
             .id(("session", i))
             .relative()
@@ -756,7 +780,7 @@ impl ChatApp {
                     div().flex_shrink_0().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(age),
                 )
             })
-            // 悬停时盖在右侧标签上的操作按钮
+            // 悬停时盖在右侧标签上的操作按钮；左边先渐隐一段，盖住标题时不是从字中间一刀切
             .child(
                 div()
                     .absolute()
@@ -764,26 +788,35 @@ impl ChatApp {
                     .top_0()
                     .bottom_0()
                     .h_flex()
-                    .items_center()
-                    .gap_0p5()
-                    .pl_2()
-                    .rounded_md()
-                    .bg(rgb(SELECTED))
                     .opacity(actions)
-                    .child(icon_button("session-rename", IconAll::SquarePen).on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.start_rename(i, window, cx);
-                        },
+                    .child(div().w_6().h_full().bg(linear_gradient(
+                        90.,
+                        linear_color_stop(Rgba { a: 0., ..rgb(SELECTED) }, 0.),
+                        linear_color_stop(rgb(SELECTED), 1.),
                     )))
-                    .child(icon_button("session-delete", IconAll::X).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.renaming = None;
-                            this.confirm_delete = Some(this.sessions[i].token);
-                            cx.notify();
-                        },
-                    ))),
+                    .child(
+                        div()
+                            .h_flex()
+                            .h_full()
+                            .items_center()
+                            .gap_0p5()
+                            .rounded_r_md()
+                            .bg(rgb(SELECTED))
+                            .child(icon_button("session-rename", IconAll::SquarePen).on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.start_rename(i, window, cx);
+                                }),
+                            ))
+                            .child(icon_button("session-delete", IconAll::X).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.renaming = None;
+                                    this.confirm_delete = Some(this.sessions[i].token);
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
             )
     }
 

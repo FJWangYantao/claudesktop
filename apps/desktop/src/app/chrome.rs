@@ -101,13 +101,33 @@ impl ChatApp {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.project_name.to_string());
+            // 顶栏窄到放不下「项目 / 标题」时只留标题（项目名在侧栏分组里也有）：
+            // 带省略号的文字缩不到零，留着项目名会把标题挤没
+            let sidebar = if self.sidebar_open { SIDEBAR_W } else { px(0.) };
+            let compact =
+                window.viewport_size().width - sidebar < rems(25.).to_pixels(window.rem_size());
             crumb
-                .child(Icon::new(IconAll::Folder).size_3p5().text_color(rgb(INK_SOFT)))
-                .child(div().flex_shrink_0().text_color(rgb(INK_SOFT)).child(project))
-                .child(div().flex_shrink_0().text_color(rgb(INK_FAINT)).child("/"))
+                .when(!compact, |crumb| {
+                    crumb
+                        .child(Icon::new(IconAll::Folder).size_3p5().text_color(rgb(INK_SOFT)))
+                        // 宽度不够时先缩标题（至少留几个字），标题缩到头了再缩项目名
+                        .child(
+                            div()
+                                .min_w_0()
+                                .map(|mut d| {
+                                    d.style().flex_shrink = Some(0.01);
+                                    d
+                                })
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_color(rgb(INK_SOFT))
+                                .child(project),
+                        )
+                        .child(div().flex_shrink_0().text_color(rgb(INK_FAINT)).child("/"))
+                })
                 .child(
                     div()
-                        .min_w_0()
+                        .min_w(rems(5.))
                         .overflow_hidden()
                         .text_ellipsis()
                         .text_color(rgb(INK))

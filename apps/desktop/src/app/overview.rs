@@ -36,7 +36,9 @@ impl ChatApp {
         div()
             .v_flex()
             .gap_1()
-            .w(px(220.))
+            // 等分整行（不按内容宽），两行卡片上下对齐成列
+            .flex_1()
+            .min_w_0()
             .p_3()
             .rounded_lg()
             .bg(rgb(CARD))

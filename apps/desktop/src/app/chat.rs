@@ -342,7 +342,7 @@ impl ChatApp {
         // 和标题之间的空隙算在正文里，收到底时不剩一截
         let progress = motion::reveal_progress(("think", idx), open, window, cx);
         if progress > 0. && has_text {
-            let text = if streaming { close_dangling_code(text) } else { Cow::Borrowed(text) };
+            let text = if streaming { close_dangling_markup(text) } else { Cow::Borrowed(text) };
             // 字号 / 颜色要设在 TextView 自己身上（它按主题取默认值，不继承外层）
             let body = div().pt_1().pl(STEP_INDENT).child(
                 TextView::markdown(("think-md", idx), SharedString::from(text.trim().to_string()))
@@ -1536,7 +1536,7 @@ impl ChatApp {
                 let s = self.session();
                 let streaming = s.busy && idx + 1 == s.transcript.len();
                 let text =
-                    if streaming { close_dangling_code(text).into_owned() } else { text.clone() };
+                    if streaming { close_dangling_markup(text).into_owned() } else { text.clone() };
                 // 代码块右上角：语言名 + 「复制」（点完短暂变对勾，和消息下方的复制同一套状态）
                 let token = s.token;
                 let copied_block = match self.copied {
@@ -1639,9 +1639,9 @@ fn distance_to_end(list: &ListState) -> Pixels {
     (list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y).max(px(0.))
 }
 
-/// 流式输出停在半截代码标记上时（`` `foo `` 或没收尾的 ``` 围栏），渲染前临时补齐，
-/// 免得反引号原样露出来、等收尾后整段又跳成代码样式。
-fn close_dangling_code(text: &str) -> Cow<'_, str> {
+/// 流式输出停在半截标记上时（`` `foo `` 或没收尾的 ``` 围栏、`**粗体`），渲染前临时补齐，
+/// 免得标记原样露出来、等收尾后整段又跳成代码 / 粗体样式。
+fn close_dangling_markup(text: &str) -> Cow<'_, str> {
     let mut in_fence = false;
     // 当前段落（围栏外）里的反引号个数；行内代码不跨段落
     let mut ticks = 0;
@@ -1662,7 +1662,31 @@ fn close_dangling_code(text: &str) -> Cow<'_, str> {
     } else if ticks % 2 == 1 {
         Cow::Owned(format!("{text}`"))
     } else {
-        Cow::Borrowed(text)
+        close_dangling_bold(text)
+    }
+}
+
+/// 最后一行里没收尾的 `**`：后面已经有字就补上收尾（先去掉末尾空白，否则不算收尾），
+/// 后面还没字（`- **`）就先不显示这个标记。只看最后一行，行内代码里的星号不算。
+fn close_dangling_bold(text: &str) -> Cow<'_, str> {
+    let start = text.rfind('\n').map_or(0, |i| i + 1);
+    // 按反引号切开，偶数段在行内代码外
+    let (mut count, mut open, mut at) = (0, None, start);
+    for (i, part) in text[start..].split('`').enumerate() {
+        if i % 2 == 0 {
+            for (j, _) in part.match_indices("**") {
+                count += 1;
+                open = Some(at + j);
+            }
+        }
+        at += part.len() + 1;
+    }
+    match open {
+        Some(open) if count % 2 == 1 && text[open + 2..].trim().is_empty() => {
+            Cow::Borrowed(&text[..open])
+        }
+        Some(_) if count % 2 == 1 => Cow::Owned(format!("{}**", text.trim_end())),
+        _ => Cow::Borrowed(text),
     }
 }
 
@@ -1672,11 +1696,24 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn dangling_code_is_closed_while_streaming() {
-        assert_eq!(close_dangling_code("事件来自 ACP 的 `sess"), "事件来自 ACP 的 `sess`");
-        assert_eq!(close_dangling_code("用 `a` 和 `b`"), "用 `a` 和 `b`");
-        assert_eq!(close_dangling_code("```rust\nfn a() {"), "```rust\nfn a() {\n```");
+        assert_eq!(close_dangling_markup("事件来自 ACP 的 `sess"), "事件来自 ACP 的 `sess`");
+        assert_eq!(close_dangling_markup("用 `a` 和 `b`"), "用 `a` 和 `b`");
+        assert_eq!(close_dangling_markup("```rust\nfn a() {"), "```rust\nfn a() {\n```");
         // 上一段的单个反引号不影响下一段
-        assert_eq!(close_dangling_code("a ` b\n\nc"), "a ` b\n\nc");
-        assert_eq!(close_dangling_code("```\n`\n```\nok"), "```\n`\n```\nok");
+        assert_eq!(close_dangling_markup("a ` b\n\nc"), "a ` b\n\nc");
+        assert_eq!(close_dangling_markup("```\n`\n```\nok"), "```\n`\n```\nok");
+    }
+
+    #[core::prelude::v1::test]
+    fn dangling_bold_is_closed_or_hidden_while_streaming() {
+        assert_eq!(close_dangling_markup("- **思考"), "- **思考**");
+        assert_eq!(close_dangling_markup("- **思考 "), "- **思考**");
+        // 标记后面还没字：先藏起来
+        assert_eq!(close_dangling_markup("说明：\n- **"), "说明：\n- ");
+        assert_eq!(close_dangling_markup("**a** 和 **b"), "**a** 和 **b**");
+        assert_eq!(close_dangling_markup("**a** 和 **b**"), "**a** 和 **b**");
+        // 行内代码里的星号、上一行的星号不算
+        assert_eq!(close_dangling_markup("用 `**` 表示粗体"), "用 `**` 表示粗体");
+        assert_eq!(close_dangling_markup("**a\nb"), "**a\nb");
     }
 }

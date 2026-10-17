@@ -303,9 +303,9 @@ impl ChatApp {
             );
         }
         let motion_desc = if motion == MotionPref::System && self.system_reduce_motion {
-            "展开收起、转圈等过渡；跟随 Windows「动画效果」（当前已关闭）"
+            "展开收起、转圈等过渡；Windows 里已关闭"
         } else {
-            "展开收起、转圈等过渡；跟随系统时看 Windows「动画效果」"
+            "展开收起、转圈等过渡；可跟随 Windows 设置"
         };
         setting_group([
             setting_row("外观", "跟随系统，或固定用浅色 / 深色；立即生效", segs),
@@ -324,7 +324,7 @@ impl ChatApp {
             ),
             setting_row(
                 "系统通知",
-                "窗口不在前台时，回复完成、等你授权或出错会弹系统通知；点通知回到那个会话",
+                "窗口在后台时，回复完成、等授权或出错会弹通知；点通知回到该会话",
                 Switch::new("notifications")
                     .checked(self.settings.notifications)
                     .color(rgb(CORAL))

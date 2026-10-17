@@ -106,7 +106,7 @@ fn retry_label(status: u16, attempt: usize, remaining: Duration) -> String {
     }
 }
 
-/// 一轮结束后挂在回复末尾的「用时 1m 05s · ↑ 1.2k ↓ 340 token」；什么都没记到时为 None。
+/// 一轮结束后挂在回复末尾的「用时 1 分 05 秒 · ↑ 1.2k ↓ 340 token」；什么都没记到时为 None。
 pub(super) fn turn_meta(t: &TurnSummary) -> Option<String> {
     let parts: Vec<String> = t
         .elapsed_ms
@@ -117,13 +117,13 @@ pub(super) fn turn_meta(t: &TurnSummary) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-/// `23s` / `1m 05s` / `1h 02m`
+/// `23 秒` / `1 分 05 秒` / `1 小时 02 分`
 fn elapsed_label(d: Duration) -> String {
     let secs = d.as_secs();
     match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
-        _ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+        0..60 => format!("{secs} 秒"),
+        60..3600 => format!("{} 分 {:02} 秒", secs / 60, secs % 60),
+        _ => format!("{} 小时 {:02} 分", secs / 3600, secs % 3600 / 60),
     }
 }
 
@@ -157,9 +157,9 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn elapsed_label_scales_units() {
-        assert_eq!(elapsed_label(Duration::from_secs(23)), "23s");
-        assert_eq!(elapsed_label(Duration::from_secs(65)), "1m 05s");
-        assert_eq!(elapsed_label(Duration::from_secs(3720)), "1h 02m");
+        assert_eq!(elapsed_label(Duration::from_secs(23)), "23 秒");
+        assert_eq!(elapsed_label(Duration::from_secs(65)), "1 分 05 秒");
+        assert_eq!(elapsed_label(Duration::from_secs(3720)), "1 小时 02 分");
     }
 
     #[core::prelude::v1::test]
@@ -175,11 +175,11 @@ mod tests {
     fn turn_meta_joins_what_is_known() {
         let usage = TurnUsage { input: 5, output: 1, reasoning: 0 };
         let t = TurnSummary { elapsed_ms: Some(65_000), usage };
-        assert_eq!(turn_meta(&t).unwrap(), "用时 1m 05s · ↑ 5 ↓ 1 token");
+        assert_eq!(turn_meta(&t).unwrap(), "用时 1 分 05 秒 · ↑ 5 ↓ 1 token");
         // 旧日志没有用时；演示回放没有用量
         assert_eq!(turn_meta(&TurnSummary { elapsed_ms: None, usage }).unwrap(), "↑ 5 ↓ 1 token");
         let t = TurnSummary { elapsed_ms: Some(3_000), usage: TurnUsage::default() };
-        assert_eq!(turn_meta(&t).unwrap(), "用时 3s");
+        assert_eq!(turn_meta(&t).unwrap(), "用时 3 秒");
         let t = TurnSummary { elapsed_ms: None, usage: TurnUsage::default() };
         assert_eq!(turn_meta(&t), None);
     }
