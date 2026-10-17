@@ -6,7 +6,8 @@
 //! 启动时环境变量优先于文件，方便脚本和调试：`CLAUDESKTOP_KERNEL` /
 //! `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`（key 也认 `OPENAI_API_KEY`）
 //! / `CLAUDESKTOP_PROTOCOL` / `CLAUDESKTOP_TEMPERATURE` / `CLAUDESKTOP_MAX_TOKENS` /
-//! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）以及 `ACP_AGENT`。
+//! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）/ `CLAUDESKTOP_MAX_STEPS`（一轮最多几步）
+//! 以及 `ACP_AGENT`。
 //! 设置页保存时写下的是当时界面上的值。
 
 use crate::model::ViewMode;
@@ -219,6 +220,9 @@ pub struct Settings {
     pub sidebar_folded: Vec<String>,
     /// 启用了的插件（按插件名）；插件目录里新放进来的不在这里 = 停用，在设置页「插件」里打开
     pub plugins_enabled: Vec<String>,
+    /// 自研内核一轮里最多请求模型的次数（工具循环上限，默认 200）；
+    /// 越界的值读取时夹进 [`claudesktop_builtin::MIN_MAX_STEPS`] .. [`claudesktop_builtin::MAX_MAX_STEPS`]
+    pub max_steps: usize,
     /// 窗口不在前台时，回复完成 / 等待授权 / 出错发系统通知；默认开
     pub notifications: bool,
     /// 界面缩放倍率（1.0 = 标准），设置页即时生效并写回
@@ -247,6 +251,7 @@ impl Default for Settings {
             sidebar_by_date: false,
             sidebar_folded: Vec::new(),
             plugins_enabled: Vec::new(),
+            max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
             notifications: yes(),
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
@@ -332,6 +337,10 @@ impl Settings {
         if s.font_family.trim().is_empty() {
             s.font_family = String::new();
         }
+        // 手改坏了：步数上限夹进允许范围（0 或天文数字都别让工具循环停不下来 / 走一步就断）
+        s.max_steps = s
+            .max_steps
+            .clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS);
     }
 
     /// 界面字体族：空串表示用内嵌的默认字体。
@@ -392,6 +401,10 @@ impl Settings {
         if let Some(v) = var("ACP_AGENT") {
             self.acp.command = v;
         }
+        if let Some(v) = var("CLAUDESKTOP_MAX_STEPS").and_then(|v| v.parse::<usize>().ok()) {
+            self.max_steps =
+                v.clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS);
+        }
         self
     }
 
@@ -415,6 +428,7 @@ impl Settings {
         let mut config = BuiltinConfig::new(p.provider_config(), cwd);
         // 自动压缩要知道窗口多大
         config.context_windows = p.context_windows.clone().into_iter().collect();
+        config.max_steps = self.max_steps;
         Ok(config)
     }
 
@@ -508,6 +522,36 @@ mod tests {
         .unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::Dark, ViewMode::Verbose));
         assert!(!s.sidebar_kernel_status);
+    }
+
+    /// 步数上限：旧设置文件缺这项时用默认 200；手改成越界的值读取时夹住；
+    /// 值原样进自研内核配置。
+    #[core::prelude::v1::test]
+    fn max_steps_default_clamp_and_roundtrip() {
+        let default = claudesktop_builtin::DEFAULT_MAX_STEPS;
+        assert_eq!(default, 200);
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.max_steps, default);
+
+        let dir = std::env::temp_dir().join(format!("claudesktop-steps-{}", std::process::id()));
+        let path = dir.join("settings.json");
+
+        // 配好了内核才能拿到 `BuiltinConfig`
+        let mut s = Settings::default();
+        s.builtin.current_mut().base_url = "http://x/v1".into();
+        s.builtin.current_mut().model = "m".into();
+        s.max_steps = 30;
+        s.save(&path).unwrap();
+        let back = Settings::load(Some(&path)).0;
+        assert_eq!(back.max_steps, 30);
+        assert_eq!(back.builtin_config(PathBuf::from(".")).unwrap().max_steps, 30);
+
+        // 手改坏了：0 抬到下限，天文数字压到上限
+        std::fs::write(&path, r#"{"max_steps":0}"#).unwrap();
+        assert_eq!(Settings::load(Some(&path)).0.max_steps, claudesktop_builtin::MIN_MAX_STEPS);
+        std::fs::write(&path, r#"{"max_steps":999999}"#).unwrap();
+        assert_eq!(Settings::load(Some(&path)).0.max_steps, claudesktop_builtin::MAX_MAX_STEPS);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[core::prelude::v1::test]

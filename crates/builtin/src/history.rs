@@ -98,6 +98,8 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
             }
             Record::Event { event } => match event {
                 KernelEvent::AgentMessageChunk { text } => assistant.text(text),
+                // 子任务里的调用是子会话的事，主会话只看 task 那一行的结果
+                KernelEvent::ToolCallStarted { parent: Some(_), .. } => {}
                 KernelEvent::ToolCallStarted { id, title, status, .. } => {
                     assistant.segments.push(Segment::Tool {
                         id: id.clone(),
@@ -228,6 +230,7 @@ mod tests {
                 title: "Read notes.txt".into(),
                 status: "pending".into(),
                 kind: "read".into(),
+                parent: None,
             }),
             ev(KernelEvent::ToolCallUpdated {
                 id: "c1".into(),
@@ -244,6 +247,7 @@ mod tests {
                 title: "Write a.txt".into(),
                 status: "pending".into(),
                 kind: "edit".into(),
+                parent: None,
             }),
             ev(KernelEvent::TurnEnded { stop_reason: "cancelled".into() }),
             Record::user("算了"),
@@ -300,6 +304,38 @@ mod tests {
         ]);
         assert_eq!(r.summary.as_deref(), Some("摘要2"));
         assert_eq!(texts(&r), ["三", "c"]);
+    }
+
+    #[test]
+    fn subagent_calls_stay_out_of_the_main_context() {
+        let started = |id: &str, title: &str, parent: Option<&str>| {
+            ev(KernelEvent::ToolCallStarted {
+                id: id.into(),
+                title: title.into(),
+                status: "pending".into(),
+                kind: "read".into(),
+                parent: parent.map(Into::into),
+            })
+        };
+        let done = |id: &str, summary: &str| {
+            ev(KernelEvent::ToolCallUpdated {
+                id: id.into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: Some(summary.into()),
+                output: None,
+            })
+        };
+        let records = vec![
+            Record::user("找一下"),
+            started("t1", "Task 找秘密", None),
+            started("t1/c1", "Read notes.txt", Some("t1")),
+            done("t1/c1", "1 行"),
+            done("t1", "秘密是 42"),
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+        ];
+        let msgs = rebuild(&records).messages;
+        assert_eq!(msgs[1].text().unwrap(), "[tool] Task 找秘密 → completed：秘密是 42");
     }
 
     #[test]

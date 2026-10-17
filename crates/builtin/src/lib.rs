@@ -13,6 +13,7 @@
 //! - MCP：数据目录 `mcp.json` 里配的工具服务器，工具和内置工具一起交给模型（见 `mcp` 模块）
 //! - 插件（`claudesktop_core::plugin`）：MCP 服务并进上面那批；技能列进系统提示词；
 //!   钩子在会话开始、提交消息、执行工具前后、一轮结束时跑（退出码 2 = 拦下）
+//! - 子 agent：`task` 工具开子会话跑子任务，角色内置一个通用的、其余来自插件（见 `subagent` 模块）
 //!
 //! 线程模型：每轮对话一个线程（阻塞读 SSE 流、执行工具、等权限应答）；
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
@@ -27,6 +28,7 @@ mod openai;
 mod permissions;
 mod provider;
 mod sse;
+mod subagent;
 mod tools;
 
 pub use anthropic::AnthropicProvider;
@@ -51,7 +53,7 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
     }
 }
 
-use claudesktop_core::plugin::{self, HookEvent, HookOutcome, Plugin, Skill};
+use claudesktop_core::plugin::{self, AgentDef, HookEvent, HookOutcome, Plugin, Skill};
 use claudesktop_core::{
     EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, Record, RoutedEvent, checkpoint,
 };
@@ -63,8 +65,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tools::{Access, Action, ToolOutput};
 
-/// 一轮里最多请求模型的次数（防止工具循环停不下来）
-const MAX_STEPS: usize = 50;
+/// 一轮里最多请求模型的次数的默认值（防止工具循环停不下来）。
+/// 可经 [`BuiltinConfig::max_steps`] 配置，设置页「内核与模型」里改。
+pub const DEFAULT_MAX_STEPS: usize = 200;
+/// 可配置步数的下限：再小的话稍长一点的任务都会被拦腰截断。
+pub const MIN_MAX_STEPS: usize = 1;
+/// 上限：防止手滑填个天文数字，工具循环真的停不下来。
+pub const MAX_MAX_STEPS: usize = 5_000;
 /// 同一步里最多同时执行几个只读工具
 const PARALLEL_TOOLS: usize = 8;
 
@@ -90,6 +97,9 @@ pub struct BuiltinConfig {
     pub mcp_config: Option<PathBuf>,
     /// 启用的插件（之后经 `Kernel::set_plugins` 更新）
     pub plugins: Vec<Plugin>,
+    /// 一轮里最多请求模型的次数（工具循环的上限，默认 [`DEFAULT_MAX_STEPS`]）；
+    /// 超界的值读取时夹回 [MIN_MAX_STEPS, MAX_MAX_STEPS]
+    pub max_steps: usize,
 }
 
 impl BuiltinConfig {
@@ -103,6 +113,7 @@ impl BuiltinConfig {
             context_windows: HashMap::new(),
             mcp_config: default_mcp_config(),
             plugins: Vec::new(),
+            max_steps: DEFAULT_MAX_STEPS,
         }
     }
 
@@ -136,6 +147,11 @@ impl BuiltinConfig {
     /// 写进会话元信息的内核标识（见 [`ProviderConfig::identity`]）。
     pub fn identity(&self) -> String {
         self.provider.identity()
+    }
+
+    /// 夹回允许范围的步数上限（设置文件被手改时也守住）。
+    pub fn clamped_max_steps(&self) -> usize {
+        self.max_steps.clamp(MIN_MAX_STEPS, MAX_MAX_STEPS)
     }
 }
 
@@ -172,8 +188,10 @@ struct SessionState {
     summary: Option<String>,
     /// 端点最近一次报告的上下文大小：(token, 当时覆盖到的历史条数)；压缩后清空
     measured: Option<(u64, usize)>,
-    /// 进行中的一轮的取消标志
+    /// 进行中的一轮的取消标志（子会话用主会话这一轮的）
     turn: Option<Arc<AtomicBool>>,
+    /// 子会话的角色（`task` 开的，ID 是 `主会话/调用 ID`）；主会话为 None
+    agent: Option<AgentDef>,
 }
 
 impl SessionState {
@@ -185,6 +203,7 @@ impl SessionState {
             &self.instructions,
             &self.skills,
             self.summary.as_deref(),
+            self.agent.as_ref(),
         )
     }
 
@@ -202,6 +221,8 @@ struct Inner {
     agent_name: String,
     default_cwd: PathBuf,
     user_instructions: Option<PathBuf>,
+    /// 一轮里最多请求模型的次数（见 [`BuiltinConfig::max_steps`]）
+    max_steps: usize,
     /// 见 [`BuiltinConfig::context_windows`]；界面取到模型列表后经 `set_context_windows` 更新
     context_windows: Mutex<HashMap<String, u64>>,
     sessions: Mutex<HashMap<String, SessionState>>,
@@ -221,6 +242,33 @@ pub fn default_mcp_config() -> Option<PathBuf> {
     claudesktop_core::default_data_dir().ok().map(|d| d.join("mcp.json"))
 }
 
+/// 一步要发给模型的东西（[`Inner::snapshot`]）。
+struct Snapshot {
+    messages: Vec<ChatMessage>,
+    mode: String,
+    cwd: PathBuf,
+    model: String,
+    /// 子会话的角色
+    agent: Option<AgentDef>,
+}
+
+/// 工具循环（[`run_steps`]）怎么结束的。
+enum Steps {
+    /// 模型不再调用工具（或到了步数上限）
+    Done {
+        stop: String,
+        usage: Option<Usage>,
+        /// 最后一次请求时的上下文大小
+        context_tokens: u64,
+        /// 最后一段非空的回复
+        reply: String,
+    },
+    /// 请求失败（超限时已经压缩重试过），已报给界面的只有压缩的结果
+    Failed(String),
+    /// 被取消，或会话没了
+    Stopped,
+}
+
 /// 权限判定结果
 enum Verdict {
     Allow,
@@ -230,12 +278,38 @@ enum Verdict {
 
 impl Inner {
     fn emit(&self, session: Option<&str>, event: KernelEvent) {
+        // 子会话的事件转到主会话（转哪些见 subagent::forward）
+        if let Some((parent, call)) = session.and_then(subagent::split_id) {
+            if let Some(event) = subagent::forward(call, event) {
+                self.emit(Some(parent), event);
+            }
+            return;
+        }
         (self.sink)(RoutedEvent { session: session.map(str::to_owned), event });
     }
 
     /// 启用的插件提供的全部技能。
     fn skills(&self) -> Vec<Skill> {
         self.plugins.lock().unwrap().iter().flat_map(|p| p.skills.iter().cloned()).collect()
+    }
+
+    /// 可用的子 agent 角色：插件提供的，加上内置的通用角色（插件里没有同名的时候）。
+    fn agents(&self) -> Vec<AgentDef> {
+        let mut agents: Vec<AgentDef> =
+            self.plugins.lock().unwrap().iter().flat_map(|p| p.agents.iter().cloned()).collect();
+        if !agents.iter().any(|a| a.name == subagent::GENERAL) {
+            agents.insert(0, subagent::general());
+        }
+        agents
+    }
+
+    /// 这个会话能不能用这个工具（子会话按角色的工具清单）。
+    fn tool_allowed(&self, session: &str, tool: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .get(session)
+            .and_then(|s| s.agent.as_ref())
+            .is_none_or(|agent| subagent::allows(agent, tool))
     }
 
     /// 依次跑某个时机的钩子（工具类时机按 matcher 只跑管这个工具的），返回
@@ -359,12 +433,25 @@ impl Inner {
     }
 
     /// 本步要发给模型的消息、当前模式、工作目录与模型；会话已不存在返回 None。
-    fn snapshot(&self, session: &str) -> Option<(Vec<ChatMessage>, String, PathBuf, String)> {
-        let sessions = self.sessions.lock().unwrap();
+    fn snapshot(&self, session: &str) -> Option<Snapshot> {
+        let mut sessions = self.sessions.lock().unwrap();
+        // 子会话跟着主会话当前的模式（用户中途可能换了）
+        if let Some((parent, _)) = subagent::split_id(session)
+            && let Some(mode) = sessions.get(parent).map(|p| p.mode.clone())
+            && let Some(state) = sessions.get_mut(session)
+        {
+            state.mode = mode;
+        }
         let state = sessions.get(session)?;
         let mut messages = vec![ChatMessage::new("system", state.system_prompt())];
         messages.extend(state.history.iter().cloned());
-        Some((messages, state.mode.clone(), state.cwd.clone(), state.model.clone()))
+        Some(Snapshot {
+            messages,
+            mode: state.mode.clone(),
+            cwd: state.cwd.clone(),
+            model: state.model.clone(),
+            agent: state.agent.clone(),
+        })
     }
 
     /// 模型的上下文窗口；对不上完整 ID 时按最后一段找（`provider/name` → `name`）。
@@ -512,6 +599,8 @@ impl Inner {
     }
 
     fn mode(&self, session: &str) -> String {
+        // 子会话用主会话的模式
+        let session = subagent::split_id(session).map_or(session, |(parent, _)| parent);
         self.sessions
             .lock()
             .unwrap()
@@ -549,8 +638,9 @@ impl Inner {
         call: &ToolCall,
         stopped: &dyn Fn() -> bool,
     ) -> ToolOutput {
-        // 待办清单不碰文件、不用授权，也不占一行工具：直接换掉界面上的计划
-        if call.function.name == tools::TODO_WRITE {
+        // 待办清单不碰文件、不用授权，也不占一行工具：直接换掉界面上的计划（子会话没有这个工具）
+        if call.function.name == tools::TODO_WRITE && self.tool_allowed(session, tools::TODO_WRITE)
+        {
             return match tools::parse_todos(&call.function.arguments) {
                 Ok(entries) => {
                     let summary = tools::todo_summary(&entries);
@@ -623,7 +713,9 @@ impl Inner {
         call: &ToolCall,
     ) -> (Result<Action, String>, String) {
         let name = &call.function.name;
-        let action = if mcp::is_mcp_tool(name) {
+        let action = if !self.tool_allowed(session, name) {
+            Err(format!("Tool `{name}` is not available to this subagent"))
+        } else if mcp::is_mcp_tool(name) {
             self.mcp_action(name, &call.function.arguments)
         } else {
             Action::parse(name, &call.function.arguments, cwd)
@@ -639,6 +731,7 @@ impl Inner {
                 title: title.clone(),
                 status: "pending".into(),
                 kind: kind.into(),
+                parent: None,
             },
         );
         // 改动预览：先于权限请求发出，用户能看着 diff 决定是否放行
@@ -733,10 +826,14 @@ impl Inner {
                             output: None,
                         },
                     );
-                    if let Action::Mcp { server, tool, arguments, .. } = &action {
-                        self.mcp.call(server, tool, arguments.clone(), stopped)
-                    } else {
-                        self.run_checkpointed(session, &action, stopped)
+                    match &action {
+                        Action::Mcp { server, tool, arguments, .. } => {
+                            self.mcp.call(server, tool, arguments.clone(), stopped)
+                        }
+                        Action::Task { prompt, agent, .. } => {
+                            self.run_task(session, cwd, &call.id, prompt, agent.as_deref())
+                        }
+                        _ => self.run_checkpointed(session, &action, stopped),
                     }
                 }
                 Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),
@@ -768,6 +865,91 @@ impl Inner {
             );
         }
         output
+    }
+
+    /// 子任务：开子会话跑完，最后一段回复当结果（见 `subagent` 模块）。在主会话这一轮的线程里阻塞着跑，
+    /// 取消标志用主会话这一轮的。
+    fn run_task(
+        &self,
+        session: &str,
+        cwd: &Path,
+        call_id: &str,
+        prompt: &str,
+        agent: Option<&str>,
+    ) -> ToolOutput {
+        let name = agent.unwrap_or(subagent::GENERAL);
+        let agents = self.agents();
+        let Some(agent) = agents.iter().find(|a| a.name == name).cloned() else {
+            let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+            return ToolOutput::fail(
+                format!("Unknown subagent_type `{name}`. Available: {}", names.join(", ")),
+                "没有这个角色",
+            );
+        };
+        let child = format!("{session}/{call_id}");
+        let flag = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let Some((flag, state)) = sessions.get(session).and_then(|parent| {
+                let flag = parent.turn.clone()?;
+                let state = SessionState {
+                    cwd: parent.cwd.clone(),
+                    model: agent.model.clone().unwrap_or_else(|| parent.model.clone()),
+                    history: vec![ChatMessage::new("user", prompt)],
+                    mode: parent.mode.clone(),
+                    restored: false,
+                    instructions: parent.instructions.clone(),
+                    skills: parent.skills.clone(),
+                    started: true,
+                    summary: None,
+                    measured: None,
+                    turn: Some(flag.clone()),
+                    agent: Some(agent.clone()),
+                };
+                Some((flag, state))
+            }) else {
+                return ToolOutput::fail("cancelled", "已中断");
+            };
+            sessions.insert(child.clone(), state);
+            flag
+        };
+        let result = run_steps(self, &child, &flag);
+        self.sessions.lock().unwrap().remove(&child);
+        match result {
+            Steps::Stopped => ToolOutput::fail("cancelled", "已中断"),
+            Steps::Failed(message) => {
+                ToolOutput::fail(format!("The subagent failed: {message}"), "子任务出错")
+            }
+            Steps::Done { stop, usage, reply, .. } => {
+                // 子会话的用量算进主会话这一轮（上下文大小是主会话自己的，不报）
+                if let Some(u) = usage {
+                    self.emit(
+                        Some(session),
+                        KernelEvent::UsageUpdated {
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                            reasoning_tokens: u.reasoning_tokens,
+                            context_tokens: 0,
+                            cache_read_tokens: u.cache_read_tokens,
+                        },
+                    );
+                }
+                self.run_hooks(
+                    session,
+                    cwd,
+                    HookEvent::SubagentStop,
+                    None,
+                    json!({"subagent_type": agent.name, "stop_reason": stop}),
+                );
+                if reply.trim().is_empty() {
+                    return ToolOutput::fail(
+                        format!("The subagent stopped ({stop}) without a final report."),
+                        "子任务没有给出结果",
+                    );
+                }
+                let summary = subagent::summary(&reply);
+                ToolOutput::ok(reply, summary)
+            }
+        }
     }
 
     /// 读工具直接放行；其余按模式 → 已保存规则 → 询问用户。
@@ -881,6 +1063,7 @@ impl BuiltinKernel {
     /// 创建内核。进程内无握手，立即报告 `Connected`。
     pub fn spawn(config: BuiltinConfig, sink: EventSink) -> anyhow::Result<Self> {
         let agent_name = format!("builtin · {}", config.provider.model);
+        let max_steps = config.clamped_max_steps();
         let mcp = {
             let sink = sink.clone();
             mcp::McpHub::new(config.mcp_config, config.cwd.clone(), move |servers| {
@@ -895,6 +1078,7 @@ impl BuiltinKernel {
             agent_name: agent_name.clone(),
             default_cwd: config.cwd,
             user_instructions: config.user_instructions,
+            max_steps,
             context_windows: Mutex::new(config.context_windows),
             sessions: Mutex::default(),
             next_session: AtomicU64::new(1),
@@ -934,6 +1118,7 @@ impl BuiltinKernel {
                 summary: history.summary,
                 measured: None,
                 turn: None,
+                agent: None,
             },
         );
         self.inner.emit(
@@ -958,7 +1143,14 @@ fn system_prompt(
     project: &[instructions::Instruction],
     skills: &[Skill],
     summary: Option<&str>,
+    agent: Option<&AgentDef>,
 ) -> String {
+    // 子会话没有待办清单（计划是主会话的）
+    let todo = if agent.is_none() {
+        "For tasks with several steps, track progress with todo_write. "
+    } else {
+        ""
+    };
     let mut prompt = format!(
         "You are a coding agent running inside claudesktop, a desktop agent harness, \
          working on the user's machine.\n\
@@ -968,13 +1160,17 @@ fn system_prompt(
          (rather than shell commands), read files before editing them, \
          request independent reads and searches together in one step (they run in parallel), \
          prefer edit_file for small changes, read URLs the user gives with web_fetch, and verify your work (e.g. build or run tests) \
-         when it makes sense. For tasks with several steps, track progress with todo_write. \
+         when it makes sense. {todo}\
          Tool calls that change things may need the user's approval; \
          if one is denied, do not retry it and ask the user instead.\n\
          Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
         cwd.display(),
         std::env::consts::OS,
     );
+    if let Some(agent) = agent {
+        prompt.push_str("\n\n");
+        prompt.push_str(&subagent::prompt_section(agent));
+    }
     if restored {
         prompt.push_str(
             "\n\nThis conversation was restored from a saved log. Earlier tool calls appear as \
@@ -1032,152 +1228,27 @@ fn transcript_budget(window: Option<u64>) -> usize {
     })
 }
 
-/// 一轮对话（在独立线程里运行）：请求模型 → 执行工具 → 再请求，直到不再调用工具。
+/// 一轮对话（在独立线程里运行）：先跑提交消息的钩子，再走工具循环，最后报告用量和结束。
 fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
-    let stopped = || flag.load(Ordering::SeqCst);
     if !inner.prompt_hooks(&session, &flag) {
         return;
     }
-    let mut usage: Option<Usage> = None;
-    // 最后一次请求的输入 + 输出 = 此刻上下文的大小（之前各步都包含在这次的输入里）
-    let mut context_tokens = 0;
-    let mut stop = "max_turn_requests".to_string();
-    // 上一步刚压缩过（不连着压两次）/ 这一轮已经因为超限报错压缩过（只压一次）
-    let mut just_compacted = false;
-    let mut overflow_compacted = false;
-
-    for _ in 0..MAX_STEPS {
-        // 用量快到窗口：先压缩再请求
-        if !just_compacted {
-            if let Some((model, window)) =
-                inner.model_of(&session).and_then(|m| inner.window(&m).map(|w| (m, w)))
-                && inner.context_estimate(&session) * 100 >= window * compact::AUTO_COMPACT_PERCENT
-            {
-                match inner.compact(
-                    &session,
-                    &flag,
-                    &model,
-                    false,
-                    window * compact::KEEP_PERCENT / 100,
-                    transcript_budget(Some(window)),
-                ) {
-                    Ok(Some(u)) => usage.get_or_insert_default().add(u),
-                    Ok(None) => {}
-                    // 压缩失败（已报给界面）就带着原样的上下文接着请求
-                    Err(_) if !stopped() => {}
-                    Err(_) => return,
-                }
-                just_compacted = true;
-            }
-        } else {
-            just_compacted = false;
-        }
-        let Some((messages, mode, cwd, model)) = inner.snapshot(&session) else {
-            return;
-        };
-        let mut specs = tools::specs(mode != MODE_PLAN);
-        specs.extend(inner.mcp.specs(mode != MODE_PLAN));
-        let mut text = String::new();
-        let result =
-            inner.provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
-                if stopped() {
-                    return;
-                }
-                match event {
-                    StreamEvent::Text(t) => {
-                        text.push_str(&t);
-                        inner.emit(Some(&session), KernelEvent::AgentMessageChunk { text: t });
-                    }
-                    StreamEvent::Reasoning(t) => {
-                        inner.emit(Some(&session), KernelEvent::AgentThoughtChunk { text: t })
-                    }
-                    StreamEvent::Retrying { status, attempt, delay_ms, reason } => inner.emit(
-                        Some(&session),
-                        KernelEvent::Retrying { status, attempt, delay_ms, reason },
-                    ),
-                }
-            });
-        if stopped() {
-            return; // cancel() 已经报告过 TurnEnded
-        }
-        let outcome = match result {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                let mut message = format!("{err:#}");
-                // 超出上下文：压缩一次再重发这一步
-                if !overflow_compacted && claudesktop_core::is_context_overflow(&message) {
-                    overflow_compacted = true;
-                    let window = inner.window(&model);
-                    let keep = window.unwrap_or_else(|| compact::estimate_tokens(&messages))
-                        * compact::KEEP_PERCENT
-                        / 100;
-                    match inner.compact(
-                        &session,
-                        &flag,
-                        &model,
-                        false,
-                        keep,
-                        transcript_budget(window),
-                    ) {
-                        Ok(Some(u)) => {
-                            usage.get_or_insert_default().add(u);
-                            just_compacted = true;
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(_) if stopped() => return,
-                        Err(e) => message.push_str(&format!("\n（自动压缩上下文也失败了：{e:#}）")),
-                    }
-                }
-                // 和从日志重建的历史一致（见 history::rebuild）：失败也占一条 assistant 消息，
-                // 用户点「重试」重发时不会出现两条连着的用户消息（Anthropic 要求交替）
-                inner.commit(
-                    &session,
-                    &flag,
-                    vec![ChatMessage::new("assistant", format!("[turn failed: {message}]"))],
-                );
-                inner.finish(&session, &flag);
-                inner.emit(Some(&session), KernelEvent::PromptFailed { message });
-                return;
-            }
-        };
-        let mut step_tokens = 0;
-        if let Some(u) = outcome.usage {
-            usage.get_or_insert_default().add(u);
-            step_tokens = u.input_tokens + u.output_tokens;
-            context_tokens = step_tokens;
-        }
-
-        if outcome.tool_calls.is_empty() {
-            if !text.is_empty() {
-                inner.commit(&session, &flag, vec![ChatMessage::new("assistant", text)]);
-            }
-            inner.measure(&session, step_tokens, 0);
-            stop = stop_reason(outcome.finish_reason.as_deref());
-            break;
-        }
-
-        // 同一步的多个调用执行完（连续的只读调用并行）；assistant 消息和全部结果一起写进历史，
-        // 保证 tool_calls 后面总跟着对应的 tool 消息
-        let Some(outputs) = inner.run_tools(&session, &cwd, &outcome.tool_calls, &stopped) else {
-            return;
-        };
-        let results: Vec<_> = outcome
-            .tool_calls
-            .iter()
-            .zip(outputs)
-            .map(|(call, output)| ChatMessage::tool_result(call.id.clone(), output.content))
-            .collect();
-        let mut step = Vec::with_capacity(results.len() + 1);
-        let unmeasured = results.len();
-        step.push(ChatMessage::assistant_tool_calls(text, outcome.tool_calls));
-        step.extend(results);
-        if !inner.commit(&session, &flag, step) {
+    let (stop, usage, context_tokens) = match run_steps(&inner, &session, &flag) {
+        Steps::Stopped => return, // cancel() 已经报告过 TurnEnded
+        Steps::Failed(message) => {
+            // 和从日志重建的历史一致（见 history::rebuild）：失败也占一条 assistant 消息，
+            // 用户点「重试」重发时不会出现两条连着的用户消息（Anthropic 要求交替）
+            inner.commit(
+                &session,
+                &flag,
+                vec![ChatMessage::new("assistant", format!("[turn failed: {message}]"))],
+            );
+            inner.finish(&session, &flag);
+            inner.emit(Some(&session), KernelEvent::PromptFailed { message });
             return;
         }
-        // 工具结果还没被端点数过
-        inner.measure(&session, step_tokens, unmeasured);
-    }
+        Steps::Done { stop, usage, context_tokens, .. } => (stop, usage, context_tokens),
+    };
 
     inner.finish(&session, &flag);
     if let Some(u) = usage {
@@ -1198,6 +1269,152 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     if let Some(cwd) = cwd {
         inner.run_hooks(&session, &cwd, HookEvent::Stop, None, json!({"stop_reason": stop}));
     }
+}
+
+/// 工具循环：请求模型 → 执行工具 → 再请求，直到不再调用工具。主会话的一轮和子任务（子会话）都走这里。
+fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
+    let stopped = || flag.load(Ordering::SeqCst);
+    let mut usage: Option<Usage> = None;
+    // 最后一次请求的输入 + 输出 = 此刻上下文的大小（之前各步都包含在这次的输入里）
+    let mut context_tokens = 0;
+    let mut stop = "max_turn_requests".to_string();
+    let mut reply = String::new();
+    // 上一步刚压缩过（不连着压两次）/ 这一轮已经因为超限报错压缩过（只压一次）
+    let mut just_compacted = false;
+    let mut overflow_compacted = false;
+
+    for _ in 0..inner.max_steps {
+        // 用量快到窗口：先压缩再请求
+        if !just_compacted {
+            if let Some((model, window)) =
+                inner.model_of(session).and_then(|m| inner.window(&m).map(|w| (m, w)))
+                && inner.context_estimate(session) * 100 >= window * compact::AUTO_COMPACT_PERCENT
+            {
+                match inner.compact(
+                    session,
+                    flag,
+                    &model,
+                    false,
+                    window * compact::KEEP_PERCENT / 100,
+                    transcript_budget(Some(window)),
+                ) {
+                    Ok(Some(u)) => usage.get_or_insert_default().add(u),
+                    Ok(None) => {}
+                    // 压缩失败（已报给界面）就带着原样的上下文接着请求
+                    Err(_) if !stopped() => {}
+                    Err(_) => return Steps::Stopped,
+                }
+                just_compacted = true;
+            }
+        } else {
+            just_compacted = false;
+        }
+        let Some(Snapshot { messages, mode, cwd, model, agent }) = inner.snapshot(session) else {
+            return Steps::Stopped;
+        };
+        let mut specs = tools::specs(mode != MODE_PLAN);
+        specs.extend(inner.mcp.specs(mode != MODE_PLAN));
+        match &agent {
+            // 主会话能派子任务；子会话按角色的工具清单筛（不嵌套）
+            None => specs.push(subagent::spec(&inner.agents())),
+            Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
+        }
+        let mut text = String::new();
+        let result =
+            inner.provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
+                if stopped() {
+                    return;
+                }
+                match event {
+                    StreamEvent::Text(t) => {
+                        text.push_str(&t);
+                        inner.emit(Some(session), KernelEvent::AgentMessageChunk { text: t });
+                    }
+                    StreamEvent::Reasoning(t) => {
+                        inner.emit(Some(session), KernelEvent::AgentThoughtChunk { text: t })
+                    }
+                    StreamEvent::Retrying { status, attempt, delay_ms, reason } => inner.emit(
+                        Some(session),
+                        KernelEvent::Retrying { status, attempt, delay_ms, reason },
+                    ),
+                }
+            });
+        if stopped() {
+            return Steps::Stopped;
+        }
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let mut message = format!("{err:#}");
+                // 超出上下文：压缩一次再重发这一步
+                if !overflow_compacted && claudesktop_core::is_context_overflow(&message) {
+                    overflow_compacted = true;
+                    let window = inner.window(&model);
+                    let keep = window.unwrap_or_else(|| compact::estimate_tokens(&messages))
+                        * compact::KEEP_PERCENT
+                        / 100;
+                    match inner.compact(
+                        session,
+                        flag,
+                        &model,
+                        false,
+                        keep,
+                        transcript_budget(window),
+                    ) {
+                        Ok(Some(u)) => {
+                            usage.get_or_insert_default().add(u);
+                            just_compacted = true;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(_) if stopped() => return Steps::Stopped,
+                        Err(e) => message.push_str(&format!("\n（自动压缩上下文也失败了：{e:#}）")),
+                    }
+                }
+                return Steps::Failed(message);
+            }
+        };
+        let mut step_tokens = 0;
+        if let Some(u) = outcome.usage {
+            usage.get_or_insert_default().add(u);
+            step_tokens = u.input_tokens + u.output_tokens;
+            context_tokens = step_tokens;
+        }
+        if !text.trim().is_empty() {
+            reply = text.clone();
+        }
+
+        if outcome.tool_calls.is_empty() {
+            if !text.is_empty() {
+                inner.commit(session, flag, vec![ChatMessage::new("assistant", text)]);
+            }
+            inner.measure(session, step_tokens, 0);
+            stop = stop_reason(outcome.finish_reason.as_deref());
+            break;
+        }
+
+        // 同一步的多个调用执行完（连续的只读调用并行）；assistant 消息和全部结果一起写进历史，
+        // 保证 tool_calls 后面总跟着对应的 tool 消息
+        let Some(outputs) = inner.run_tools(session, &cwd, &outcome.tool_calls, &stopped) else {
+            return Steps::Stopped;
+        };
+        let results: Vec<_> = outcome
+            .tool_calls
+            .iter()
+            .zip(outputs)
+            .map(|(call, output)| ChatMessage::tool_result(call.id.clone(), output.content))
+            .collect();
+        let mut step = Vec::with_capacity(results.len() + 1);
+        let unmeasured = results.len();
+        step.push(ChatMessage::assistant_tool_calls(text, outcome.tool_calls));
+        step.extend(results);
+        if !inner.commit(session, flag, step) {
+            return Steps::Stopped;
+        }
+        // 工具结果还没被端点数过
+        inner.measure(session, step_tokens, unmeasured);
+    }
+    Steps::Done { stop, usage, context_tokens, reply }
 }
 
 /// 一条消息里的文字部分（给钩子看用户说了什么）。

@@ -118,7 +118,7 @@ impl ChatApp {
                 .child(Icon::new(IconAll::Info).size_3p5().flex_shrink_0().mt_0p5())
                 // 文字单独包一层可收缩的块，长了才会折行（直接挂在 h_flex 上会撑出页面）
                 .child(div().flex_1().min_w_0().child(
-                    "自研内核：指令、技能、MCP 工具、钩子都生效。ACP agent（如 Claude Code）：\
+                    "自研内核：指令、技能、子 agent、MCP 工具、钩子都生效。ACP agent（如 Claude Code）：\
                      指令和 MCP 服务生效，对之后新开的会话起作用。",
                 )),
         )
@@ -146,6 +146,11 @@ impl ChatApp {
             let names: Vec<&str> = p.skills.iter().map(|s| s.name.as_str()).collect();
             contents = contents.child(line("技能", names.join("、")));
         }
+        // 子 agent：工具清单写出来（没写 = 全部工具），看得出它能不能改文件、跑命令
+        for a in &p.agents {
+            let tools = a.tools.as_ref().map_or_else(|| "全部工具".to_string(), |t| t.join(", "));
+            contents = contents.child(line("子 agent", format!("{}：{tools}", a.name)));
+        }
         for s in &p.mcp_servers {
             let command = std::iter::once(s.command.as_str())
                 .chain(s.args.iter().map(String::as_str))
@@ -162,6 +167,7 @@ impl ChatApp {
         }
         let empty = p.commands.is_empty()
             && p.skills.is_empty()
+            && p.agents.is_empty()
             && p.mcp_servers.is_empty()
             && p.hooks.is_empty();
         div()

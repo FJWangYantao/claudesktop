@@ -582,6 +582,7 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification) {
             title: call.title.clone(),
             status: wire_name(&call.status),
             kind: wire_name(&call.kind),
+            parent: None,
         }),
         SessionUpdate::ToolCallUpdate(update) => {
             let text = update.fields.raw_output.as_ref().map(output_text);

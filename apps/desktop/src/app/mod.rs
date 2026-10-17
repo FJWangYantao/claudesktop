@@ -678,6 +678,7 @@ impl ChatApp {
                     phase: ToolPhase::Done,
                     diffs: Vec::new(),
                     expanded: false,
+                    sub: false,
                 }),
                 _ => ChatItem::Note(format!("备注 {i}").into()),
             });

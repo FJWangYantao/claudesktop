@@ -120,6 +120,13 @@ pub enum Action {
         arguments: Value,
         read_only: bool,
     },
+    /// 派子 agent 跑一个子任务（由内核开子会话执行，不走 [`Action::run`]，见 `subagent` 模块）
+    Task {
+        description: String,
+        prompt: String,
+        /// 角色名；None = 通用
+        agent: Option<String>,
+    },
 }
 
 /// 工具执行结果：`content` 回给模型，`summary` 显示在 UI 工具行。
@@ -515,6 +522,17 @@ impl Action {
                     offset: a.offset.unwrap_or(0),
                 }
             }
+            crate::subagent::TASK => {
+                let a: crate::subagent::TaskArgs = de(name, args)?;
+                if a.prompt.trim().is_empty() {
+                    return Err("task: `prompt` is empty".into());
+                }
+                Self::Task {
+                    description: a.description.trim().to_string(),
+                    prompt: a.prompt,
+                    agent: a.subagent_type.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+                }
+            }
             other => return Err(format!("Unknown tool `{other}`")),
         })
     }
@@ -529,9 +547,12 @@ impl Action {
 
     pub fn access(&self) -> Access {
         match self {
-            Self::Read { .. } | Self::List { .. } | Self::Glob { .. } | Self::Grep { .. } => {
-                Access::Read
-            }
+            // 子任务本身不用授权：它里面的每个调用照常问
+            Self::Read { .. }
+            | Self::List { .. }
+            | Self::Glob { .. }
+            | Self::Grep { .. }
+            | Self::Task { .. } => Access::Read,
             Self::Write { .. } | Self::Edit { .. } => Access::Edit,
             Self::Shell { .. } => Access::Exec,
             Self::Fetch { .. } => Access::Fetch,
@@ -548,6 +569,7 @@ impl Action {
             Self::Shell { .. } => "execute",
             Self::Fetch { .. } => "fetch",
             Self::Mcp { .. } => "other",
+            Self::Task { .. } => "think",
         }
     }
 
@@ -560,6 +582,12 @@ impl Action {
             Self::Edit { path, .. } => format!("Edit {}", display(cwd, path)),
             Self::Shell { command, .. } => format!("`{}`", command.trim()),
             Self::Fetch { url, .. } => format!("Fetch {url}"),
+            Self::Task { description, agent, .. } => match agent {
+                Some(agent) if agent != crate::subagent::GENERAL => {
+                    format!("Task {description}（{agent}）")
+                }
+                _ => format!("Task {description}"),
+            },
             // `github:search_issues {"q":"bug"}`：参数压成一行、截短
             Self::Mcp { server, tool, arguments, .. } => {
                 let args = arguments.to_string();
@@ -650,6 +678,7 @@ impl Action {
             Self::Mcp { .. } => {
                 ToolOutput::fail("MCP tool was not routed to its server", "内部错误")
             }
+            Self::Task { .. } => ToolOutput::fail("task was not routed to a subagent", "内部错误"),
         }
     }
 }

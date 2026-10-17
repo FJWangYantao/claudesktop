@@ -208,6 +208,7 @@ mod tests {
                 title: "t".into(),
                 status: "pending".into(),
                 kind: kind.into(),
+                parent: None,
             },
         };
         let records =

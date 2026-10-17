@@ -154,11 +154,38 @@ impl Harness {
         Self::build(provider, cwd, HashMap::new(), Some(mcp_config))
     }
 
+    /// 指定一轮最多几步（工具循环上限）。
+    fn with_steps(base_url: String, max_steps: usize) -> Self {
+        let provider = ProviderConfig {
+            base_url,
+            api_key: Some("test-key".into()),
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        Self::build_steps(provider, std::env::temp_dir(), HashMap::new(), None, max_steps)
+    }
+
     fn build(
         provider: ProviderConfig,
         cwd: PathBuf,
         context_windows: HashMap<String, u64>,
         mcp_config: Option<PathBuf>,
+    ) -> Self {
+        Self::build_steps(
+            provider,
+            cwd,
+            context_windows,
+            mcp_config,
+            claudesktop_builtin::DEFAULT_MAX_STEPS,
+        )
+    }
+
+    fn build_steps(
+        provider: ProviderConfig,
+        cwd: PathBuf,
+        context_windows: HashMap<String, u64>,
+        mcp_config: Option<PathBuf>,
+        max_steps: usize,
     ) -> Self {
         let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
         let sink: EventSink = {
@@ -174,6 +201,7 @@ impl Harness {
                 context_windows,
                 mcp_config,
                 plugins: Vec::new(),
+                max_steps,
             },
             sink,
         )
@@ -544,7 +572,8 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
             "web_fetch",
             "write_file",
             "edit_file",
-            "shell"
+            "shell",
+            "task"
         ]
     );
     let second = body(&bodies, 1);
@@ -798,7 +827,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch"]);
+    assert_eq!(names, ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "task"]);
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -952,6 +981,42 @@ fn todo_write_replaces_the_plan_without_a_tool_row() {
     let last = second["messages"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["tool_call_id"], "t1");
     assert!(last["content"].as_str().unwrap().contains("[>] 改代码"), "{last}");
+}
+
+#[test]
+fn step_limit_stops_the_tool_loop() {
+    // 模型一直要工具：两步之后到上限，这一轮按 `max_turn_requests` 结束，不再请求模型
+    let (base, bodies) = serve(vec![
+        tool_call("t1", "read_file", serde_json::json!({ "path": "a.txt" })),
+        tool_call("t2", "read_file", serde_json::json!({ "path": "b.txt" })),
+        // 多备一条：限了步就不该发出去
+        happy_stream("不该到这里"),
+    ]);
+    let h = Harness::with_steps(base, 2);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("一直读")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "max_turn_requests")),
+        1
+    );
+    // 两步 = 两次请求 + 两次工具
+    assert_eq!(bodies.lock().unwrap().len(), 2);
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { .. })), 2);
+}
+
+#[test]
+fn max_steps_is_clamped() {
+    let make = |max_steps: usize| BuiltinConfig {
+        max_steps,
+        ..BuiltinConfig::new(provider("http://127.0.0.1:1/v1".into()), std::env::temp_dir())
+    };
+    assert_eq!(
+        make(claudesktop_builtin::DEFAULT_MAX_STEPS).clamped_max_steps(),
+        claudesktop_builtin::DEFAULT_MAX_STEPS
+    );
+    assert_eq!(make(0).clamped_max_steps(), claudesktop_builtin::MIN_MAX_STEPS);
+    assert_eq!(make(usize::MAX).clamped_max_steps(), claudesktop_builtin::MAX_MAX_STEPS);
 }
 
 // ---------- 上下文压缩 ----------
@@ -1570,5 +1635,116 @@ fn prompt_hook_can_block_the_turn() {
     );
     // 请求根本没发出去
     assert!(bodies.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- 子 agent ----------
+
+/// 带一个子 agent 角色的插件
+fn agent_plugin(dir: &std::path::Path) -> claudesktop_core::Plugin {
+    let root = dir.join("scout-kit");
+    std::fs::create_dir_all(root.join("agents")).unwrap();
+    std::fs::write(
+        root.join("agents/scout.md"),
+        "---\nname: scout\ndescription: finds things\ntools: Read, Grep\n---\nYou are a scout.",
+    )
+    .unwrap();
+    claudesktop_core::plugin::load(&root)
+}
+
+fn tool_names(body: &serde_json::Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn task_runs_a_subagent_and_returns_its_report() {
+    let dir = workdir("subagent");
+    std::fs::write(dir.join("notes.txt"), "secret = 42").unwrap();
+    let (base, bodies) = serve(vec![
+        tool_call(
+            "t1",
+            "task",
+            serde_json::json!({ "description": "找秘密", "prompt": "Find the secret in notes.txt", "subagent_type": "scout" }),
+        ),
+        // 子会话：读文件，然后交报告
+        tool_call("c1", "read_file", serde_json::json!({ "path": "notes.txt" })),
+        happy_stream("秘密是 42"),
+        // 回到主会话
+        happy_stream("子任务说秘密是 42。"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    h.kernel.set_plugins(vec![agent_plugin(&dir)]);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("秘密是什么")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 子会话的事件都转到主会话：工具行带前缀和 parent，文字不转
+    assert!(h.events.lock().unwrap().iter().all(|r| r.session.as_deref().is_none_or(|s| s == sid)));
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::ToolCallStarted { id, parent: Some(p), .. } if id == "t1/c1" && p == "t1")),
+        1
+    );
+    assert_eq!(h.tool_status("t1/c1").as_deref(), Some("completed"));
+    assert_eq!(h.tool_status("t1").as_deref(), Some("completed"));
+    assert_eq!(h.text(false), "我先看看。子任务说秘密是 42。");
+    // 子会话的用量另报一次（不带上下文大小），主会话结束时再报自己的
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::UsageUpdated { context_tokens: 0, .. })), 1);
+
+    // 子会话的请求：角色的系统提示词、只有清单里的工具、上下文里只有任务本身
+    let child = body(&bodies, 1);
+    let msgs = child["messages"].as_array().unwrap();
+    let system = msgs[0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("subagent (`scout`)") && system.contains("You are a scout."),
+        "{system}"
+    );
+    assert!(!system.contains("todo_write"), "{system}");
+    assert_eq!(msgs.len(), 2);
+    assert!(msgs[1]["content"].to_string().contains("Find the secret"));
+    assert_eq!(tool_names(&child), ["read_file", "grep"]);
+    // 主会话的任务工具说明里列着角色
+    let main = body(&bodies, 0);
+    let task = main["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "task");
+    let task_doc = task.unwrap()["function"]["description"].as_str().unwrap();
+    assert!(task_doc.contains("- scout: finds things") && task_doc.contains("- general-purpose:"));
+    // 报告作为 task 的结果回给主模型
+    let last = body(&bodies, 3);
+    let result = last["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(result["role"], "tool");
+    assert_eq!(result["content"], "秘密是 42");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subagent_asks_in_the_main_session_and_stops_with_it() {
+    let dir = workdir("subagent-stop");
+    let (base, _bodies) = serve(vec![
+        tool_call(
+            "t1",
+            "task",
+            serde_json::json!({ "description": "跑命令", "prompt": "Run echo hi" }),
+        ),
+        tool_call("c1", "shell", serde_json::json!({ "command": "echo hi" })),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("派个子任务")).unwrap();
+    h.permission(1);
+    let titled = h.count(|e| {
+        matches!(e, KernelEvent::PermissionRequest { title, .. } if title.starts_with("子任务 · "))
+    });
+    assert_eq!(titled, 1);
+    // 停下主会话的这一轮，子会话一起停；之后马上能发下一条
+    h.kernel.cancel(&sid).unwrap();
+    h.wait(
+        "cancelled",
+        |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "cancelled"),
+    );
+    assert!(h.kernel.send_prompt(&sid, UserPrompt::text("再来")).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
 }

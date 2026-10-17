@@ -5,6 +5,7 @@
 //!   .claude-plugin/plugin.json   清单：name / version / description（可以没有，名字取文件夹名）
 //!   commands/*.md                斜杠命令：正文是提示词模板（$ARGUMENTS / $1 $2 …），frontmatter 里写说明
 //!   skills/<技能>/SKILL.md       技能：frontmatter 写 name / description，模型用到时再读全文
+//!   agents/*.md                  子 agent：frontmatter 写 name / description / tools / model，正文是它的系统提示词
 //!   .mcp.json                    MCP 服务（格式同数据目录的 mcp.json）
 //!   hooks/hooks.json             钩子：在提交消息、执行工具前后等时机跑的命令
 //! ```
@@ -14,7 +15,7 @@
 //!
 //! 哪些插件启用由界面决定（设置里记着），这里只负责读：[`discover`] 列出全部插件，
 //! 读坏了的也列出来、带上原因。斜杠命令的展开（[`expand_command`]）在界面发消息时做，
-//! 所有内核都能用；技能、钩子目前只有自研内核接，MCP 服务自研内核和 ACP agent 都接。
+//! 所有内核都能用；技能、子 agent、钩子目前只有自研内核接，MCP 服务自研内核和 ACP agent 都接。
 
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -41,6 +42,7 @@ pub struct Plugin {
     pub root: PathBuf,
     pub commands: Vec<PluginCommand>,
     pub skills: Vec<Skill>,
+    pub agents: Vec<AgentDef>,
     pub mcp_servers: Vec<PluginMcpServer>,
     pub hooks: Vec<Hook>,
     /// 读的时候出的问题（清单 / 配置文件格式不对等）；有问题的部分跳过，其余照常可用
@@ -68,6 +70,22 @@ pub struct Skill {
     pub path: PathBuf,
 }
 
+/// 子 agent：主模型用 task 工具把子任务交给它，它在独立的上下文里跑完、把结果交回来。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentDef {
+    pub name: String,
+    /// 什么时候该用它（主模型据此挑选）
+    pub description: String,
+    /// 能用的工具（frontmatter 的 `tools`，逗号分开；Claude Code 的叫法和内置工具名都认）；None = 全部
+    pub tools: Option<Vec<String>>,
+    /// 用哪个模型；None = 跟主会话（`inherit` 和 Claude Code 的 sonnet / opus / haiku 别名也按跟主会话）
+    pub model: Option<String>,
+    /// 正文：它的系统提示词
+    pub prompt: String,
+    /// 来自哪个插件（内置的为空）
+    pub plugin: String,
+}
+
 /// 插件提供的 MCP 服务（只支持本地命令方式，占位符已替换）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginMcpServer {
@@ -90,15 +108,18 @@ pub enum HookEvent {
     PostToolUse,
     /// 一轮结束后；只是通知，结果不影响这一轮
     Stop,
+    /// 子 agent 跑完、结果交回主会话前；只是通知
+    SubagentStop,
 }
 
 impl HookEvent {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::SessionStart,
         Self::UserPromptSubmit,
         Self::PreToolUse,
         Self::PostToolUse,
         Self::Stop,
+        Self::SubagentStop,
     ];
 
     /// hooks.json 里的键名
@@ -109,6 +130,7 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::Stop => "Stop",
+            Self::SubagentStop => "SubagentStop",
         }
     }
 
@@ -120,6 +142,7 @@ impl HookEvent {
             Self::PreToolUse => "执行工具前",
             Self::PostToolUse => "执行工具后",
             Self::Stop => "一轮结束",
+            Self::SubagentStop => "子任务结束",
         }
     }
 }
@@ -188,6 +211,7 @@ pub fn load(root: &Path) -> Plugin {
 
     plugin.commands = load_commands(&root.join("commands"));
     plugin.skills = load_skills(&root.join("skills"));
+    plugin.agents = load_agents(&root.join("agents"), &plugin.name);
 
     // MCP：清单里的 mcpServers（对象或文件路径），否则根目录的 .mcp.json
     let mcp = match manifest.get("mcpServers") {
@@ -318,6 +342,41 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+fn load_agents(dir: &Path, plugin: &str) -> Vec<AgentDef> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut agents: Vec<AgentDef> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            let (front, body) = split_frontmatter(&text);
+            let name = front.get("name").cloned().filter(|n| !n.is_empty()).unwrap_or_else(|| {
+                path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            });
+            let tools = front.get("tools").map(|t| {
+                t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            });
+            let model = front
+                .get("model")
+                .map(|m| m.trim().to_string())
+                .filter(|m| !matches!(m.as_str(), "" | "inherit" | "sonnet" | "opus" | "haiku"));
+            Some(AgentDef {
+                name,
+                description: front.get("description").cloned().unwrap_or_default(),
+                tools,
+                model,
+                prompt: body.trim().to_string(),
+                plugin: plugin.to_string(),
+            })
+        })
+        .collect();
+    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    agents
 }
 
 /// 拆出开头的 `---` frontmatter（只认单行的 `键: 值`，值的引号去掉），返回 (键值, 正文)。
@@ -478,6 +537,7 @@ fn claude_tool_name(tool: &str) -> Option<&'static str> {
         "grep" => "Grep",
         "web_fetch" => "WebFetch",
         "todo_write" => "TodoWrite",
+        "task" => "Task",
         _ => return None,
     })
 }
@@ -494,6 +554,12 @@ pub fn hook_matches(matcher: &str, tool: &str) -> bool {
         Some(alternatives) => names.into_iter().any(|n| alternatives.iter().any(|a| a == n)),
         None => false,
     }
+}
+
+/// 子 agent 的工具清单里有没有这个工具（内置工具名和 Claude Code 的叫法都算）。
+pub fn tool_listed(tools: &[String], tool: &str) -> bool {
+    let alias = claude_tool_name(tool);
+    tools.iter().any(|t| t == tool || Some(t.as_str()) == alias)
 }
 
 /// 只认 `A|B|C` 这种整词的多选一（Claude Code 插件里最常见的写法），带别的正则符号的不认。
@@ -682,6 +748,11 @@ mod tests {
             "---\nname: pdf-tools\ndescription: 处理 PDF\n---\n全文",
         );
         write(
+            &root.join("agents/reviewer.md"),
+            "---\nname: code-reviewer\ndescription: 审查代码\ntools: Read, Grep, glob\nmodel: sonnet\n---\n你是审查员。\n",
+        );
+        write(&root.join("agents/scout.md"), "---\nmodel: fast-model\n---\n侦察");
+        write(
             &root.join(".mcp.json"),
             r#"{"mcpServers": {"db": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/db", "args": ["--root", "${CLAUDE_PLUGIN_ROOT}"]},
                 "remote": {"url": "https://x"}}}"#,
@@ -703,6 +774,19 @@ mod tests {
         assert_eq!(review.argument_hint.as_deref(), Some("<文件>"));
         assert_eq!(review.body, "请审查 $ARGUMENTS");
         assert_eq!(p.skills[0].name, "pdf-tools");
+        let reviewer = &p.agents[0];
+        assert_eq!(reviewer.name, "code-reviewer");
+        let tools = reviewer.tools.clone().unwrap();
+        assert_eq!(tools, ["Read", "Grep", "glob"]);
+        // Claude Code 的模型别名按跟主会话；正文是提示词
+        assert_eq!((reviewer.model.as_deref(), reviewer.prompt.as_str()), (None, "你是审查员。"));
+        assert!(tool_listed(&tools, "read_file"));
+        assert!(tool_listed(&tools, "glob"));
+        assert!(!tool_listed(&tools, "shell"));
+        // 没写名字取文件名；没写工具 = 全部
+        let scout = &p.agents[1];
+        assert_eq!((scout.name.as_str(), scout.tools.is_none()), ("scout", true));
+        assert_eq!((scout.model.as_deref(), scout.plugin.as_str()), (Some("fast-model"), "review"));
         assert_eq!(p.mcp_servers.len(), 1);
         let root_text = root.to_string_lossy().replace('\\', "/");
         assert_eq!(p.mcp_servers[0].command, format!("{root_text}/bin/db"));

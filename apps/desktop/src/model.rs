@@ -81,6 +81,8 @@ pub struct ToolCard {
     /// 带 diff：已展开全部行（默认只显示前 [`DIFF_PREVIEW_ROWS`] 行）；
     /// 不带 diff：工具行已点开，显示输出预览
     pub expanded: bool,
+    /// 子 agent 的调用：再缩进一层，挂在派出它的 Task 那一行下面
+    pub sub: bool,
 }
 
 /// 折叠状态下每个 diff 最多显示的行数
@@ -97,6 +99,10 @@ impl ToolCard {
 
     /// 工具种类（read / search / execute / …）；内核没给（演示脚本）时按工具名猜。
     pub fn kind_key(&self) -> &str {
+        // 派子 agent 的那一行（自研内核和 Claude Code 都叫 Task）
+        if self.name.as_ref() == "Task" {
+            return "task";
+        }
         if !self.kind.is_empty() {
             return &self.kind;
         }
@@ -122,6 +128,7 @@ pub fn tool_icon(kind: &str) -> IconAll {
         "move" => IconAll::ArrowRightLeft,
         "fetch" => IconAll::Globe,
         "think" => IconAll::Brain,
+        "task" => IconAll::Bot,
         _ => IconAll::Wrench,
     }
 }
@@ -215,6 +222,7 @@ pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (Stri
     let mut read_args: Vec<&str> = Vec::new();
     let (mut search, mut exec, mut edit, mut fetch, mut other, mut auto, mut think, mut failed) =
         (0, 0, 0, 0, 0, 0, 0, 0);
+    let mut tasks = 0;
     // 思考总用时；有一段不知道（旧日志）就整体不报
     let mut think_ms = Some(0);
     for item in items {
@@ -233,6 +241,7 @@ pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (Stri
                     "execute" => exec += 1,
                     "edit" => edit += 1,
                     "fetch" => fetch += 1,
+                    "task" => tasks += 1,
                     _ => other += 1,
                 }
             }
@@ -250,6 +259,7 @@ pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (Stri
             parts.push(text);
         }
     };
+    push(tasks, format!("派出 {tasks} 个子任务"));
     push(read_args.len(), format!("读取 {} 个文件", read_args.len()));
     push(search, format!("搜索 {search} 次"));
     push(exec, format!("运行 {exec} 条命令"));
@@ -481,6 +491,7 @@ impl ChatItem {
                 c.phase,
                 c.expanded,
                 c.diffs.iter().map(|d| d.lines.len() + 1).sum::<usize>(),
+                c.sub,
             )
                 .hash(&mut h),
             Self::Permission { title, options, resolved, .. } => {
@@ -823,6 +834,7 @@ mod tests {
                     Vec::new()
                 },
                 expanded: false,
+                sub: false,
             })
         };
         let thinking = thought("t", None);
@@ -850,6 +862,7 @@ mod tests {
             phase,
             diffs: Vec::new(),
             expanded: false,
+            sub: false,
         })
     }
 

@@ -946,7 +946,7 @@ impl Session {
                     self.transcript.push(ChatItem::thinking(text, started));
                 }
             },
-            KernelEvent::ToolCallStarted { id, title, status, kind } => {
+            KernelEvent::ToolCallStarted { id, title, status, kind, parent } => {
                 self.finish_thinking();
                 let (name, arg) = tool_label(&kind, &title);
                 self.transcript.push(ChatItem::Tool(ToolCard {
@@ -959,6 +959,7 @@ impl Session {
                     phase: tool_phase(&status),
                     diffs: Vec::new(),
                     expanded: false,
+                    sub: parent.is_some(),
                 }));
             }
             KernelEvent::ToolCallUpdated { id, title, status, raw_output, output } => {
@@ -1115,6 +1116,7 @@ impl Session {
                     phase: ToolPhase::Running,
                     diffs: Vec::new(),
                     expanded: false,
+                    sub: false,
                 }));
             }
             MockAction::ToolDone(result) => {
@@ -1216,6 +1218,7 @@ mod tests {
             phase: ToolPhase::Done,
             diffs: Vec::new(),
             expanded: false,
+            sub: false,
         };
         let tool = ChatItem::Tool(card);
         let row = PlanRow { status: PlanStatus::Pending, text: "第一步".into() };
@@ -1250,6 +1253,7 @@ mod tests {
                 phase: ToolPhase::Done,
                 diffs: Vec::new(),
                 expanded: false,
+                sub: false,
             })
         };
         s.transcript = vec![
@@ -1322,6 +1326,7 @@ mod tests {
                 title: "Read README.md".into(),
                 status: "in_progress".into(),
                 kind: "read".into(),
+                parent: None,
             }),
             // 思考的用时记在收尾它的那条事件后面
             Record::Thought { elapsed_ms: 4_200 },
@@ -1407,6 +1412,7 @@ mod tests {
             title: "Edit a.txt".into(),
             status: "pending".into(),
             kind: "edit".into(),
+            parent: None,
         });
         let diff = |new: &str| {
             ev(KernelEvent::ToolCallDiff {
@@ -1541,6 +1547,7 @@ mod tests {
             phase: ToolPhase::Running,
             diffs: Vec::new(),
             expanded: false,
+            sub: false,
         }));
         // 用户停下：等内核回结束，期间工具行不该一直转圈
         s.busy = false;
@@ -1612,6 +1619,7 @@ mod tests {
                 title: "Read a".into(),
                 status: "in_progress".into(),
                 kind: "read".into(),
+                parent: None,
             },
             None,
         );
@@ -1638,6 +1646,7 @@ mod tests {
                 title: "Read a".into(),
                 status: "in_progress".into(),
                 kind: "read".into(),
+                parent: None,
             },
             None,
         );
@@ -1655,6 +1664,7 @@ mod tests {
                 title: "Bash cargo test".into(),
                 status: "in_progress".into(),
                 kind: "execute".into(),
+                parent: None,
             },
             None,
         );
@@ -1731,6 +1741,7 @@ mod tests {
             title: format!("Read {id}.rs"),
             status: "completed".into(),
             kind: "read".into(),
+            parent: None,
         }
     }
 
@@ -1797,6 +1808,7 @@ mod tests {
                 title: "Edit a.rs".into(),
                 status: "pending".into(),
                 kind: "edit".into(),
+                parent: None,
             },
             None,
         );

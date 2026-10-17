@@ -202,6 +202,12 @@ impl ChatApp {
         }
         if layout.body || reveal > 0. && layout.member {
             let body = self.render_item(ix, item, layout, window, cx);
+            // 子 agent 的调用：在组内再缩进一层，挂在 Task 那一行下面
+            let body = if matches!(item, ChatItem::Tool(card) if card.sub) {
+                div().ml(px(7.)).pl(px(16.)).border_l_1().border_color(rgb(LINE)).child(body)
+            } else {
+                body
+            };
             // 正在收起的步骤按展开时的样子画（缩进、挂细线、和下一步收紧）
             let (nested, tight) =
                 if layout.body { (layout.nested, layout.tight) } else { (true, true) };

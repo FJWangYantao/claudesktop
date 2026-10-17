@@ -33,7 +33,7 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
   - [x] **图片输入**：输入框可直接粘贴截图（读剪贴板里的图片或图片文件）或点「附加图片」选文件，缩略图排在输入框上方可逐张删除（一轮最多 8 张）；发送时图片落到 `<sessions>/<id>.assets/`，历史重建时读回；OpenAI 兼容走 `image_url` 的 data URI，Anthropic 走 `source.base64`
   - [x] 桌面端接入：`CLAUDESKTOP_KERNEL=builtin`，配置走 `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`
   - [x] 真实端点实测：Antigravity Tools 本地网关（`http://127.0.0.1:8045/v1`）的 `gemini-3.8-flash`，单测与桌面端均跑通
-  - [x] 工具调用循环：`read_file` / `list_dir` / `write_file` / `edit_file`（精确替换，兼容 CRLF）/ `shell`（Windows 用 pwsh，超时、取消连子进程一起结束）；一轮最多 50 步
+  - [x] 工具调用循环：`read_file` / `list_dir` / `write_file` / `edit_file`（精确替换，兼容 CRLF）/ `shell`（Windows 用 pwsh，超时、取消连子进程一起结束）；一轮最多 200 步（设置页「内核与模型」可改，`CLAUDESKTOP_MAX_STEPS` 可覆盖）
   - [x] 权限：读工具直接放行；写和命令按模式（Manual / Accept edits / Plan 只读 / Bypass）→ 已保存规则 → 弹卡片询问（允许一次 / 总是允许 / 拒绝）。「总是允许」按项目存到数据目录的 `permissions.json`（编辑 = `edit`，命令 = `shell:<程序> [子命令]` 前缀，复合命令不提供）；工作目录外的写入永远询问
   - [x] 工具循环实测：gemini-3.8-flash 读 → 写（弹权限）→ 回答，桌面端工具行与权限卡片正常
   - [x] 历史会话续聊：用本地日志重建上下文（工具调用以 `[tool] 标题 → 状态：摘要` 行并入，总量超 20 万字符从最早的轮次丢）；换了端点 / 模型也能续接；上次没完成的工具调用恢复为「已中断」

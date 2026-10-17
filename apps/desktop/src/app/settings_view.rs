@@ -110,6 +110,8 @@ pub struct SettingsForm {
     /// 设置页当前所在的 tab（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP）
     pub(super) tab: usize,
     acp_command: Entity<InputState>,
+    /// 一轮最多几步（自研内核的工具循环上限）
+    max_steps: Entity<InputState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
     /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
@@ -120,6 +122,10 @@ impl SettingsForm {
     pub fn new(window: &mut Window, cx: &mut Context<ChatApp>) -> Self {
         let acp_command =
             cx.new(|cx| InputState::new(window, cx).placeholder("留空 = 内置 mock agent"));
+        let max_steps = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(claudesktop_builtin::DEFAULT_MAX_STEPS.to_string())
+        });
         Self {
             kernel: KernelChoice::default(),
             profiles: Vec::new(),
@@ -127,6 +133,7 @@ impl SettingsForm {
             inputs: Vec::new(),
             tab: 0,
             acp_command,
+            max_steps,
             message: None,
             rules: Vec::new(),
         }
@@ -142,6 +149,18 @@ impl SettingsForm {
 
 fn value(input: &Entity<InputState>, cx: &App) -> String {
     input.read(cx).value().trim().to_string()
+}
+
+/// 设置页的「一轮最多几步」输入 → 实际值：空着或写了非数字就用默认值，
+/// 超出范围夹回允许区间（和读设置文件时的夹法一致）。
+fn parse_max_steps(text: &str) -> usize {
+    let text = text.trim();
+    if text.is_empty() {
+        return claudesktop_builtin::DEFAULT_MAX_STEPS;
+    }
+    text.parse::<usize>()
+        .unwrap_or(claudesktop_builtin::DEFAULT_MAX_STEPS)
+        .clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS)
 }
 
 impl ChatApp {
@@ -168,6 +187,18 @@ impl ChatApp {
         self.settings_form.kernel = s.kernel();
         self.settings_form.message = None;
         self.settings_form.rules = PermissionRules::load(default_rules_path()).list();
+        // 步数上限：默认值留空时显示实际生效的数（占位符就是默认值）
+        self.settings_form.max_steps.update(cx, |state, cx| {
+            state.set_value(
+                if s.max_steps == claudesktop_builtin::DEFAULT_MAX_STEPS {
+                    String::new()
+                } else {
+                    s.max_steps.to_string()
+                },
+                window,
+                cx,
+            )
+        });
         // 档案：一份都没有时给一套空的可直接填
         let mut profiles = s.builtin.profiles.clone();
         if profiles.is_empty() {
@@ -410,6 +441,7 @@ impl ChatApp {
         s.builtin.profiles = profiles;
         s.builtin.active = f.active.min(s.builtin.profiles.len().saturating_sub(1));
         s.acp.command = value(&f.acp_command, cx);
+        s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
         s
     }
 
@@ -438,7 +470,8 @@ impl ChatApp {
             }
             b
         };
-        let restart_builtin = builtin_key(&new) != builtin_key(&self.settings);
+        let restart_builtin = builtin_key(&new) != builtin_key(&self.settings)
+            || new.max_steps != self.settings.max_steps;
         let restart_acp = new.acp != self.settings.acp;
         let default = new.kernel();
         let default_changed = default != self.settings.kernel();
@@ -1075,6 +1108,15 @@ impl ChatApp {
                         ))
                         .when(!p.models.is_empty(), |d| d.child(chips));
                 }
+                // 内核级配置，不属于某一套档案
+                builtin_body = builtin_body.child(Self::field(
+                    "一轮最多几步",
+                    Some(
+                        "一轮里最多请求模型几次（工具循环上限，默认 200）；\
+                         调大能跑更长的任务，耗 token 也更多",
+                    ),
+                    div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
+                ));
                 body = body.child(builtin_body);
             }
             KernelChoice::Acp => {

@@ -112,6 +112,9 @@ pub enum KernelEvent {
         status: String,
         /// 工具种类（read / edit / execute / search / fetch / other …）
         kind: String,
+        /// 子 agent 的调用：派出它的那个 task 调用的 ID（界面缩进在它下面；不进重建的上下文）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
     },
     /// 工具调用更新（状态推进、原始输出）
     ToolCallUpdated {

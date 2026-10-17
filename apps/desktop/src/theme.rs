@@ -375,6 +375,8 @@ pub const SETTINGS_NAV_W: Pixels = px(200.);
 pub const OVERVIEW_W: Pixels = px(724.);
 /// 侧栏宽度（含外圈留白）
 pub const SIDEBAR_W: Pixels = px(256.);
+/// 设置页里填数字的小输入框（步数上限这类）
+pub const NUMBER_INPUT_W: Pixels = px(120.);
 
 #[cfg(test)]
 mod tests {
