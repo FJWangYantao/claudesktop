@@ -510,7 +510,9 @@ impl ChatApp {
                 header
             };
             body = body.child(header);
-            if members.is_empty() {
+            // 筛完一个不剩时的提示。「全部」下没有提示（折叠的组、空的当前项目组），
+            // 别画空行：空串的行照样占着内边距和行高
+            if members.is_empty() && !filter.empty_hint().is_empty() {
                 body = body.child(
                     div()
                         .px_4()
