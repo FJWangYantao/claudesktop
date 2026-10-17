@@ -290,8 +290,9 @@ pub fn specs(writable: bool) -> Vec<Value> {
             format!(
                 "Run a command in {} with the working directory as cwd. stdin is closed; \
                  do not run interactive programs. Timeout defaults to {SHELL_TIMEOUT_DEFAULT}s (max {SHELL_TIMEOUT_MAX}s). \
-                 Returns stdout, stderr and the exit code.",
-                shell_name()
+                 Returns stdout, stderr and the exit code.{}",
+                shell_name(),
+                DETACH_HINT,
             ),
             json!({
                 "type": "object",
@@ -1100,6 +1101,19 @@ fn read_for_preview(path: &Path) -> Result<Option<String>, ()> {
         Ok(_) => std::fs::read_to_string(path).map(Some).map_err(|_| ()),
     }
 }
+
+/// shell 工具说明的补充：Windows 上应用退出时会连带结束它拉起的整棵进程树
+/// （`claudesktop_core::process_guard`），`start` 出去的也逃不掉。要比应用活得久的常驻服务
+/// （隧道、本地网关）得用 WMI 拉起，不然用户关掉应用重编译时服务跟着断。
+const DETACH_HINT: &str = if cfg!(windows) {
+    " Every process started here, including ones launched with `start` or `Start-Process`, is \
+     ended when claudesktop exits. To start a long-running service that must outlive the app \
+     (an SSH tunnel, a local server the user keeps using), launch it outside the app's process \
+     tree with WMI: `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments \
+     @{ CommandLine = '<command>' }`."
+} else {
+    ""
+};
 
 /// 给模型看的 shell 名称
 fn shell_name() -> &'static str {
