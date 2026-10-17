@@ -276,9 +276,18 @@ impl ChatApp {
                 }
                 this.accept_selected(window, cx);
             }))
-            .capture_action(
-                cx.listener(|this, _: &IndentInline, window, cx| this.accept_selected(window, cx)),
-            )
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                // 首页空输入框里的建议提示词：Tab 填入（见 overview.rs）
+                if this.completion.open.is_none()
+                    && this.input.read(cx).value().is_empty()
+                    && let Some(prompt) = this.ghost_prompt()
+                {
+                    cx.stop_propagation();
+                    this.fill_prompt(prompt, window, cx);
+                    return;
+                }
+                this.accept_selected(window, cx)
+            }))
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
                 if this.completion.open.take().is_some() {
                     this.completion.dismissed = Some(this.input.read(cx).value().to_string());

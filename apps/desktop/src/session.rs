@@ -78,6 +78,8 @@ pub struct Session {
     thought_done: Option<u64>,
     /// 端点限流 / 出错，内核正等着自动重试（下一个实质事件到达时清掉）
     pub retry: Option<Retry>,
+    /// 不在眼前时这一轮结束了（回复完 / 出错），用户还没切过来看；侧栏标点、可按它筛选。只在内存里
+    pub unread: bool,
     /// 最近一轮输入命中提示缓存的比例（%）；端点没报告时为 None
     pub cache_hit: Option<u32>,
     /// 收到过的内容事件个数，和 `seen_seq` 比较判断往上翻的时候底下有没有来新内容
@@ -209,6 +211,7 @@ impl Session {
             replaying: false,
             thought_done: None,
             retry: None,
+            unread: false,
             cache_hit: None,
             content_seq: 0,
             seen_seq: 0,

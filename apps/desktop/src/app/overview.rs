@@ -1,4 +1,5 @@
-//! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs）。
+//! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs），
+//! 输入框下方一排建议入口、空输入框里的建议提示词（Tab 填入，见 `complete_view.rs`）。
 
 use super::ChatApp;
 use crate::model::*;
@@ -6,9 +7,25 @@ use crate::theme::rgb;
 use crate::theme::*;
 use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::input::Position;
 use gpui_kit::component::*;
 use gpui_kit::*;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 首页的建议：(图标, 入口上的短名, 填进输入框的提示词)
+const SUGGESTIONS: [(IconAll, &str, &str); 4] = [
+    (IconAll::FolderTree, "梳理项目结构", "梳理这个项目的结构：主要模块、入口和它们之间的关系"),
+    (IconAll::Bug, "排查潜在问题", "通读最近改动的代码，找出可能的 bug 和没处理的边界情况"),
+    (IconAll::FlaskConical, "补单元测试", "给核心逻辑补上单元测试，先列出要覆盖的情况再写"),
+    (
+        IconAll::GitCommitHorizontal,
+        "总结最近改动",
+        "看看 git log 和还没提交的改动，总结最近做了什么",
+    ),
+];
+
+/// 输入框平时的占位文字
+const PLACEHOLDER: &str = "描述要做的事，回车发送，Shift+回车换行";
 
 impl ChatApp {
     pub(super) fn heat_color(v: u8) -> Color {
@@ -268,6 +285,73 @@ impl ChatApp {
                             .child(usage::book_line(o.tokens)),
                     ),
             )
+    }
+}
+
+impl ChatApp {
+    /// 当前会话是首页（还没发过消息）。
+    pub(super) fn on_home(&self) -> bool {
+        !self.settings_open && !self.session().has_user_message()
+    }
+
+    /// 首页空输入框里建议的提示词：每个会话固定一条（按会话令牌轮换）。
+    pub(super) fn ghost_prompt(&self) -> Option<&'static str> {
+        self.on_home().then(|| SUGGESTIONS[self.session().token as usize % SUGGESTIONS.len()].2)
+    }
+
+    /// 输入框的占位文字：首页是建议的提示词，其余是操作提示。变了才写进输入框（每帧调一次）。
+    pub(super) fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text: SharedString = match self.ghost_prompt() {
+            Some(prompt) => format!("试试：{prompt}（Tab 填入）").into(),
+            None => PLACEHOLDER.into(),
+        };
+        if text != self.placeholder {
+            self.placeholder = text.clone();
+            self.input.update(cx, |state, cx| state.set_placeholder(text, window, cx));
+        }
+    }
+
+    /// 把建议的提示词填进输入框（光标放到末尾），不直接发送：用户可以先改。
+    pub(super) fn fill_prompt(
+        &mut self,
+        prompt: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let column = prompt.chars().count() as u32;
+        self.input.update(cx, |state, cx| {
+            state.set_value(prompt.to_string(), window, cx);
+            state.set_cursor_position(Position::new(0, column), window, cx);
+            state.focus(window, cx);
+        });
+        self.refresh_composer(cx);
+    }
+
+    /// 首页输入框下方的一排建议入口，点了把提示词填进输入框。
+    pub(super) fn render_suggestions(&self, cx: &mut Context<Self>) -> Div {
+        div().h_flex().flex_wrap().justify_center().gap_2().pt_1().children(
+            SUGGESTIONS.iter().enumerate().map(|(i, &(icon, label, prompt))| {
+                div()
+                    .id(("suggestion", i))
+                    .h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2p5()
+                    .py_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(HOVER)).border_color(rgb(LINE_STRONG)))
+                    .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
+                    .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(label))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.fill_prompt(prompt, window, cx)
+                        }),
+                    )
+            }),
+        )
     }
 }
 

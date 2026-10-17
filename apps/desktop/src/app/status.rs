@@ -10,6 +10,8 @@ use crate::theme::*;
 use crate::usage;
 use gpui_kit::component::*;
 use gpui_kit::*;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 impl ChatApp {
@@ -19,7 +21,7 @@ impl ChatApp {
             return None;
         }
         let activity = s.activity();
-        // 等授权要用户处理：静止红点、红字；其余转圈。
+        // 等授权要用户处理：静止红点、红字；其余是 ✻ 字形（减少动态效果时是静止的转圈图标）。
         // 只分三档：具体在跑哪一步看上面的过程组，这里不跟着每个工具来回切
         let (indicator, label) = match activity {
             Activity::WaitingPermission => (
@@ -28,21 +30,21 @@ impl ChatApp {
             ),
             // 限流 / 5xx：内核自己会重发，告诉用户在等什么、还要等多久（不然看着像卡死）
             Activity::Retrying => (
-                super::motion::spinner().into_any_element(),
+                super::motion::star().into_any_element(),
                 div().child(s.retry.as_ref().map_or_else(String::new, |r| {
                     retry_label(r.status, r.attempt, r.at.saturating_duration_since(Instant::now()))
                 })),
             ),
             Activity::Compacting => {
-                (super::motion::spinner().into_any_element(), div().child("正在压缩上下文"))
+                (super::motion::star().into_any_element(), div().child("正在压缩上下文"))
             }
-            Activity::Working | Activity::Replying => (
-                super::motion::spinner().into_any_element(),
-                div().child(if activity == Activity::Replying {
-                    "正在回复"
-                } else {
-                    "工作中"
-                }),
+            Activity::Replying => {
+                (super::motion::star().into_any_element(), div().child("正在回复"))
+            }
+            // 一轮里固定一个动词，下一轮换（按会话和本轮开始的时刻取）
+            Activity::Working => (
+                super::motion::star().into_any_element(),
+                div().child(working_verb((s.token, s.turn_started))),
             ),
         };
         let mut meta: Vec<String> =
@@ -79,6 +81,16 @@ impl ChatApp {
         }
         Some(row)
     }
+}
+
+/// 工作中的状态词（对照官方 CLI 每轮换一个的动词）
+const WORKING_VERBS: [&str; 6] = ["琢磨中", "推敲中", "斟酌中", "酝酿中", "梳理中", "盘算中"];
+
+/// 按 `seed` 从动词池里取一个：同一个 seed 总是同一个词。
+fn working_verb(seed: impl Hash) -> &'static str {
+    let mut h = DefaultHasher::new();
+    seed.hash(&mut h);
+    WORKING_VERBS[(h.finish() % WORKING_VERBS.len() as u64) as usize]
 }
 
 /// 自动重试时状态行的文字：「网关限流，3 秒后第 1 次重试」，倒计时走完是「正在第 1 次重试」。
@@ -135,6 +147,12 @@ mod tests {
     fn retry_label_counts_down() {
         assert_eq!(retry_label(429, 1, Duration::from_millis(2100)), "网关限流，3 秒后第 1 次重试");
         assert_eq!(retry_label(502, 2, Duration::ZERO), "网关出错（HTTP 502），正在第 2 次重试");
+    }
+
+    #[core::prelude::v1::test]
+    fn working_verb_is_stable_per_seed() {
+        assert_eq!(working_verb((1u64, 7u32)), working_verb((1u64, 7u32)));
+        assert!(WORKING_VERBS.contains(&working_verb(42u8)));
     }
 
     #[core::prelude::v1::test]

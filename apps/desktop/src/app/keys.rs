@@ -39,6 +39,8 @@ actions!(
         ZoomReset,
         /// 打开命令面板
         OpenPalette,
+        /// 打开快捷键速查
+        ShowShortcuts,
     ]
 );
 
@@ -47,28 +49,36 @@ actions!(
 pub(super) const NEW_SESSION_KEY: &str = "secondary-n";
 pub(super) const TOGGLE_SIDEBAR_KEY: &str = "secondary-b";
 pub(super) const PALETTE_KEY: &str = "secondary-k";
+pub(super) const SHORTCUTS_KEY: &str = "secondary-/";
+/// 停止 / 循环权限模式 / 前后切会话
+pub(super) const STOP_KEY: &str = "escape";
+pub(super) const CYCLE_MODE_KEY: &str = "shift-tab";
+pub(super) const NEXT_SESSION_KEY: &str = "ctrl-tab";
+pub(super) const PREV_SESSION_KEY: &str = "ctrl-shift-tab";
 /// 循环切换视图模式（与官方一致，macOS 上也是 Ctrl+O）
 pub(super) const CYCLE_VIEW_KEY: &str = "ctrl-o";
 /// 界面放大 / 缩小一档（和浏览器一致）
 pub(super) const ZOOM_IN_KEY: &str = "secondary-=";
 pub(super) const ZOOM_OUT_KEY: &str = "secondary--";
+pub(super) const ZOOM_RESET_KEY: &str = "secondary-0";
 
 /// 注册按键（应用启动时调用一次）。`secondary` 在 macOS 上是 Cmd，其余平台是 Ctrl。
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("escape", StopTurn, Some(CONTEXT)),
-        KeyBinding::new("shift-tab", CycleMode, Some(CONTEXT)),
+        KeyBinding::new(STOP_KEY, StopTurn, Some(CONTEXT)),
+        KeyBinding::new(CYCLE_MODE_KEY, CycleMode, Some(CONTEXT)),
         KeyBinding::new(NEW_SESSION_KEY, NewSession, Some(CONTEXT)),
         KeyBinding::new(TOGGLE_SIDEBAR_KEY, ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new(PALETTE_KEY, OpenPalette, Some(CONTEXT)),
-        KeyBinding::new("ctrl-tab", NextSession, Some(CONTEXT)),
-        KeyBinding::new("ctrl-shift-tab", PrevSession, Some(CONTEXT)),
+        KeyBinding::new(SHORTCUTS_KEY, ShowShortcuts, Some(CONTEXT)),
+        KeyBinding::new(NEXT_SESSION_KEY, NextSession, Some(CONTEXT)),
+        KeyBinding::new(PREV_SESSION_KEY, PrevSession, Some(CONTEXT)),
         KeyBinding::new(CYCLE_VIEW_KEY, CycleView, Some(CONTEXT)),
         // 界面缩放：和浏览器一致的 Ctrl + 加号 / 减号 / 0
         KeyBinding::new(ZOOM_IN_KEY, ZoomIn, Some(CONTEXT)),
         KeyBinding::new("secondary-+", ZoomIn, Some(CONTEXT)),
         KeyBinding::new(ZOOM_OUT_KEY, ZoomOut, Some(CONTEXT)),
-        KeyBinding::new("secondary-0", ZoomReset, Some(CONTEXT)),
+        KeyBinding::new(ZOOM_RESET_KEY, ZoomReset, Some(CONTEXT)),
     ]);
 }
 
@@ -103,6 +113,9 @@ impl ChatApp {
             }))
             .on_action(
                 cx.listener(|this, _: &OpenPalette, window, cx| this.open_palette(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ShowShortcuts, window, cx| this.open_shortcuts(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
@@ -200,18 +213,15 @@ mod tests {
         assert_eq!(neighbor(&[3, 4], 9, 1), Some(3));
     }
 
-    /// 界面提示用的按键串都能解析（`ChatApp::kbd` 解析失败会 panic）。
+    /// 界面提示用的按键串都能解析（`ChatApp::kbd` 解析失败会 panic）：速查表里的全部按键。
     #[core::prelude::v1::test]
     fn hint_keys_parse() {
-        for key in [
-            CYCLE_VIEW_KEY,
-            ZOOM_IN_KEY,
-            ZOOM_OUT_KEY,
-            NEW_SESSION_KEY,
-            TOGGLE_SIDEBAR_KEY,
-            PALETTE_KEY,
-        ] {
-            assert!(Keystroke::parse(key).is_ok(), "{key}");
+        for (_, rows) in super::super::shortcuts::SHORTCUTS {
+            for (_, keys) in *rows {
+                for key in *keys {
+                    assert!(Keystroke::parse(key).is_ok(), "{key}");
+                }
+            }
         }
     }
 }

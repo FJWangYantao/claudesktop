@@ -1,4 +1,5 @@
 //! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
+//! 会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
 //!
 //! 侧栏是独立的缓存 view（[`SidebarView`]）：对话区的转圈、流式输出每帧都在重画 `ChatApp`，
 //! 侧栏几十行会话每行约 0.1ms，一起重画就是好几毫秒。缓存后只在侧栏用到的状态变了时重画
@@ -10,6 +11,7 @@
 //! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
+use super::menu::{menu_action, menu_item};
 use super::motion;
 use super::widgets::Surface;
 use super::{ChatApp, project_label};
@@ -21,6 +23,7 @@ use gpui_kit::base::motion::{Transition, transition};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -30,6 +33,54 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 侧栏只列哪些会话。不写进设置：筛选是一时的（看一眼谁在跑、谁有结果），重启回到全部。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum SidebarFilter {
+    #[default]
+    All,
+    /// 正在跑或等授权
+    Running,
+    /// 等授权，或这一轮在不在眼前时结束了、还没切过去看（`Session::unread`）
+    Unread,
+}
+
+impl SidebarFilter {
+    const ALL: [Self; 3] = [Self::All, Self::Running, Self::Unread];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部会话",
+            Self::Running => "进行中",
+            Self::Unread => "待查看",
+        }
+    }
+
+    fn desc(self) -> &'static str {
+        match self {
+            Self::All => "按项目或日期分组",
+            Self::Running => "正在运行或等你授权",
+            Self::Unread => "等你授权或有新结果",
+        }
+    }
+
+    fn icon(self) -> IconAll {
+        match self {
+            Self::All => IconAll::MessageSquare,
+            Self::Running => IconAll::Loader,
+            Self::Unread => IconAll::BellDot,
+        }
+    }
+
+    /// 筛完一个不剩时列表里的提示
+    fn empty_hint(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Running => "没有正在运行的会话",
+            Self::Unread => "没有待查看的会话",
+        }
+    }
+}
 
 /// 侧栏的缓存 view：内容全由 `ChatApp::render_sidebar` 画，这里只是把它隔成一块单独重画的区域。
 pub(crate) struct SidebarView {
@@ -126,6 +177,11 @@ impl ChatApp {
     /// 比对侧栏的指纹，变了才通知它重画（每帧调一次，在画侧栏之前）。
     /// 指纹要盖住 `render_sidebar` / `render_session_row` 读到的全部状态。
     pub(super) fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
+        // 正看着的会话不算待查看（切过来、关掉设置页时清掉）
+        if !self.settings_open {
+            let active = self.active;
+            self.sessions[active].unread = false;
+        }
         let mut h = DefaultHasher::new();
         // 外观、字号、字体变了全部重画
         (crate::theme::is_dark(), f32::from(root_font_size()).to_bits(), sans()).hash(&mut h);
@@ -144,6 +200,7 @@ impl ChatApp {
             self.renaming,
             self.confirm_delete,
             self.sidebar_hover,
+            self.sidebar_filter,
             self.active,
             &self.cwd,
         )
@@ -153,7 +210,7 @@ impl ChatApp {
         }
         for s in &self.sessions {
             let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
-            (&s.title, s.busy, s.busy && s.waiting_permission(), age).hash(&mut h);
+            (&s.title, s.busy, s.busy && s.waiting_permission(), s.unread, age).hash(&mut h);
         }
         let key = h.finish();
         if key != self.sidebar_key {
@@ -222,9 +279,22 @@ impl ChatApp {
         }
         let mut body = v_flex().gap_0().pb_2();
 
-        // 会话：按工作目录分组，当前项目在前，其余按最近活动排序（或按日期分组）。
-        // 第一组的组名行右侧带分组方式 / 排序切换 / 在资源管理器中打开（悬停才显出来）
-        for (g, (name, members)) in self.session_groups().into_iter().enumerate() {
+        // 会话：按工作目录分组，当前项目在前，其余按最近活动排序（或按日期分组）；
+        // 筛选时按同样的顺序排成一组。第一组的组名行右侧带筛选 / 分组方式 / 排序切换 /
+        // 在资源管理器中打开（悬停才显出来，开着的开关常显）
+        let filter = self.sidebar_filter;
+        let groups = if filter == SidebarFilter::All {
+            self.session_groups()
+        } else {
+            let members: Vec<usize> = self
+                .session_groups()
+                .into_iter()
+                .flat_map(|(_, members)| members)
+                .filter(|&i| self.sidebar_keeps(filter, i))
+                .collect();
+            vec![(format!("{} · {}", filter.label(), members.len()).into(), members)]
+        };
+        for (g, (name, members)) in groups.into_iter().enumerate() {
             let header = div()
                 .id(("group-header", g))
                 .group("group-header")
@@ -245,10 +315,13 @@ impl ChatApp {
                         .text_color(rgb(INK_SOFT))
                         .child(name),
                 );
-            let header = if g == 0 {
+            let header = if g == 0 && filter != SidebarFilter::All {
+                header.child(self.sidebar_filter_menu(cx))
+            } else if g == 0 {
                 let sort_on = self.sessions_by_activity;
                 let by_date = self.settings.sidebar_by_date;
                 header
+                    .child(self.sidebar_filter_menu(cx))
                     .child(
                         Self::sidebar_icon_button(
                             "group-by-date",
@@ -307,6 +380,16 @@ impl ChatApp {
                 header
             };
             body = body.child(header);
+            if members.is_empty() {
+                body = body.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .child(filter.empty_hint()),
+                );
+            }
             for i in members {
                 body = body.child(self.render_session_row(i, window, cx));
             }
@@ -399,6 +482,50 @@ impl ChatApp {
             .xsmall()
             .tooltip(tip)
             .when(on, |b| b.icon(Icon::new(icon).text_color(rgb(CORAL))))
+    }
+
+    /// 第 `i` 个会话在筛选 `filter` 下留不留。
+    fn sidebar_keeps(&self, filter: SidebarFilter, i: usize) -> bool {
+        let s = &self.sessions[i];
+        match filter {
+            SidebarFilter::All => true,
+            SidebarFilter::Running => s.busy,
+            SidebarFilter::Unread => s.unread || (s.busy && s.waiting_permission()),
+        }
+    }
+
+    /// 第一组组名旁的筛选按钮：点开选全部 / 进行中 / 待查看。筛选中时图标高亮、常显。
+    fn sidebar_filter_menu(&self, cx: &mut Context<Self>) -> Popover {
+        let on = self.sidebar_filter != SidebarFilter::All;
+        let trigger =
+            Self::sidebar_icon_button("sidebar-filter", IconAll::ListFilter, "筛选会话", on, cx)
+                .when(!on, |d| d.opacity(0.).group_hover("group-header", |d| d.opacity(1.)));
+        let handle = cx.entity();
+        Popover::new("sidebar-filter-menu")
+            .anchor(Anchor::TopRight)
+            .w(px(260.))
+            .trigger(trigger)
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(LINE))
+            .rounded_lg()
+            .p_1()
+            .content(move |_, _, cx| {
+                let popover = cx.entity();
+                let current = handle.read(cx).sidebar_filter;
+                let mut menu = div().v_flex().gap_0p5();
+                for (i, f) in SidebarFilter::ALL.into_iter().enumerate() {
+                    let (handle, popover) = (handle.clone(), popover.clone());
+                    menu = menu.child(
+                        menu_item(("filter-item", i), f.icon(), f.label(), f.desc(), f == current)
+                            .on_click(menu_action!(handle, popover, move |this, cx| {
+                                this.sidebar_filter = f;
+                                cx.notify();
+                            })),
+                    );
+                }
+                menu
+            })
     }
 
     /// 每个已启动内核一行：状态点 + 「自研内核 · 已连接」
@@ -553,7 +680,7 @@ impl ChatApp {
                 )));
         }
 
-        // 状态标记：等授权红点、运行中转圈，其余空心圈（与官方一样，每行都有个标记位）
+        // 状态标记：等授权红点、运行中转圈、待查看赤陶实心点，其余空心圈（与官方一样，每行都有个标记位）
         let marker = if s.busy && s.waiting_permission() {
             div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
         } else if s.busy {
@@ -572,6 +699,9 @@ impl ChatApp {
             )
             .size(px(12.))
             .into_any_element()
+        } else if s.unread {
+            // 有还没看的新结果：赤陶实心点
+            div().size(px(7.)).rounded_full().bg(rgb(CORAL)).into_any_element()
         } else {
             div()
                 .size(px(9.))

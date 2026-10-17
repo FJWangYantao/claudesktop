@@ -13,6 +13,7 @@ mod notify;
 mod overview;
 mod palette;
 mod settings_view;
+mod shortcuts;
 mod sidebar;
 mod status;
 mod widgets;
@@ -126,6 +127,10 @@ pub struct ChatApp {
     content_view: Entity<ContentView>,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
+    /// 侧栏只列哪些会话（全部 / 进行中 / 待查看）
+    sidebar_filter: sidebar::SidebarFilter,
+    /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
+    placeholder: SharedString,
 }
 
 /// 一种内核的运行状态。
@@ -158,12 +163,8 @@ impl Drop for ChatApp {
 impl ChatApp {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 多行、随内容长高（最多 10 行后出滚动条）；回车发送，Shift+回车换行
-        let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 10)
-                .submit_on_enter(true)
-                .placeholder("描述要做的事，回车发送，Shift+回车换行")
-        });
+        let input =
+            cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 10).submit_on_enter(true));
 
         cx.subscribe_in(
             &input,
@@ -332,6 +333,8 @@ impl ChatApp {
             sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             sidebar_hover: None,
+            sidebar_filter: Default::default(),
+            placeholder: SharedString::default(),
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
         cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
@@ -1106,6 +1109,9 @@ impl ChatApp {
                     }
                     if turn_over {
                         self.probe_context_window(idx, cx);
+                        if attention.is_some() {
+                            self.mark_unread(idx);
+                        }
                     }
                     if let Some(body) = attention {
                         self.notify_attention(idx, body, cx);
@@ -1211,6 +1217,13 @@ impl ChatApp {
         }
     }
 
+    /// 第 `idx` 个会话这一轮结束了：不在眼前就标成待查看（侧栏标点，切过去时清掉，见 `sync_sidebar`）。
+    fn mark_unread(&mut self, idx: usize) {
+        if idx != self.active || self.settings_open {
+            self.sessions[idx].unread = true;
+        }
+    }
+
     pub(crate) fn start_demo(&mut self, idx: usize, token: u64, cx: &mut Context<Self>) {
         let script = build_demo_script();
         // 按会话令牌找（中途删了别的会话，下标会变）
@@ -1234,9 +1247,11 @@ impl ChatApp {
                 }
             }
             let _ = this.update(cx, |app, cx| {
-                if let Some(s) = app.sessions.iter_mut().find(|s| s.token == session) {
+                if let Some(idx) = app.sessions.iter().position(|s| s.token == session) {
+                    let s = &mut app.sessions[idx];
                     s.busy = false;
                     s.close_turn();
+                    app.mark_unread(idx);
                 }
                 cx.notify();
             });
@@ -1277,6 +1292,7 @@ impl Render for ChatApp {
 
         // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
         self.sync_sidebar(cx);
+        self.sync_placeholder(window, cx);
 
         // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
         let body =

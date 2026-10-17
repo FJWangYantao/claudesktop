@@ -314,6 +314,8 @@ impl ChatApp {
                     ))
                     .child(toolbar),
             )
+            // 首页：输入框下方一排建议入口（见 overview.rs）
+            .when(!self.session().has_user_message(), |d| d.child(self.render_suggestions(cx)))
     }
 }
 

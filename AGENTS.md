@@ -60,7 +60,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   代码用 `MONO`。会跳动的数字（用时、token、计数）加 `.font_features(tabular_nums())`。
 - **界面文案**：一律中文（含占位符、模式名、问候语）；agent 自己上报的名称除外。
 - **快捷键**：全局快捷键集中在 `app/keys.rs`（`actions!` + `KeyBinding`，键上下文 `ChatApp`），
-  新快捷键加在那里；处理函数没事可做时 `cx.propagate()`，让给外层（gpui-kit Root 的 Tab 焦点切换等）。
+  新快捷键加在那里，并在 `app/shortcuts.rs` 的速查表（Ctrl+/）里补一行；处理函数没事可做时 `cx.propagate()`，让给外层（gpui-kit Root 的 Tab 焦点切换等）。
   快捷键依赖焦点在界面里：**别在根视图上 `track_focus`**（按下鼠标时会把焦点从输入框抢走），
   焦点丢失由 `restore_focus` 兜底（输入框，设置页开着时是设置页的焦点锚）。
 - **提示消息**：不属于某个对话的（导出结果、设置 / 文件读写失败、输入限制）用 `ChatApp::toast`
@@ -71,7 +71,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   不在 `ChatApp` 键上下文下，派发的动作收不到。
 - **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
 - **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
-  - 转圈 / 扫光用 `motion::spinner()` / `shimmer_text()`，**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
+  - 运行状态行用品牌字形 `motion::star()`（✻ 系字形循环，字体钉在 `SYMBOL`，否则 ✳ 落到彩色 emoji）；
+    其余转圈 / 扫光用 `motion::spinner()` / `shimmer_text()`，**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
     动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
     motion 版相位按全局时钟算，由节拍器每两帧重画一次（约 30 帧）。
   - 展开 / 收起：`reveal_progress(id, open, ..)` 拿弹簧进度，内容 `progress > 0` 时包进 `Reveal::new(id, progress, ..)`；

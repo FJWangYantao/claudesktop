@@ -5,7 +5,7 @@
 //! 行内容用 `.child()` 自绘（图标、名称、灰色说明、快捷键 / 对勾），`.label()` / `.keywords()` 只管搜索。
 
 use super::ChatApp;
-use super::keys::{NEW_SESSION_KEY, TOGGLE_SIDEBAR_KEY};
+use super::keys::{NEW_SESSION_KEY, SHORTCUTS_KEY, TOGGLE_SIDEBAR_KEY};
 use super::project_label;
 use crate::model::ViewMode;
 use crate::settings::KernelChoice;
@@ -29,6 +29,7 @@ enum PaletteCmd {
     ToggleSidebar,
     PickWorkspace,
     OpenSettings,
+    Shortcuts,
     Export,
     Compact,
     Session(usize),
@@ -135,6 +136,7 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         .key(TOGGLE_SIDEBAR_KEY),
         Entry::new(IconAll::FolderOpen, "切换工作目录…", PaletteCmd::PickWorkspace),
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
+        Entry::new(IconAll::Keyboard, "键盘快捷键", PaletteCmd::Shortcuts).key(SHORTCUTS_KEY),
     ];
     if s.has_user_message() {
         actions.push(Entry::new(IconAll::Share, "导出为 Markdown", PaletteCmd::Export));
@@ -256,6 +258,10 @@ impl ChatApp {
             PaletteCmd::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             PaletteCmd::PickWorkspace => self.pick_workspace(cx),
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
+            // 面板的对话框刚关，同一帧里还算开着：等下一帧再开速查
+            PaletteCmd::Shortcuts => {
+                cx.defer_in(window, |this, window, cx| this.open_shortcuts(window, cx));
+            }
             PaletteCmd::Export => self.share_session(window, cx),
             PaletteCmd::Compact => self.compact_session(cx),
             PaletteCmd::Session(i) => {

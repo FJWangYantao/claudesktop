@@ -120,6 +120,30 @@ pub(super) fn spinner() -> Div {
         .when(!reduced, |d| d.child(ticker()))
 }
 
+/// 等待字形：✻ 系字形一格格变大再变小（对照官方 CLI 的 `·✢✳✶✻✽`）
+const STAR_FRAMES: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
+/// 字形走一个来回的时长（10 步，每步 120ms）
+const STAR_PERIOD: Duration = Duration::from_millis(1200);
+
+/// 品牌等待动效（运行状态行）：赤陶色 ✻ 系字形来回循环，节拍器重画（约 30 帧）。
+/// 减少动态效果时退回静止的 [`spinner`]。
+pub(super) fn star() -> Div {
+    if REDUCED.load(Ordering::Relaxed) {
+        return spinner();
+    }
+    let steps = 2 * (STAR_FRAMES.len() - 1);
+    let step = (loop_phase(STAR_PERIOD) * steps as f32) as usize % steps;
+    let frame = if step < STAR_FRAMES.len() { step } else { steps - step };
+    div()
+        .flex_shrink_0()
+        .font_family(SYMBOL)
+        .text_size(TEXT_BODY)
+        .line_height(rems(1.))
+        .text_color(rgb(CORAL))
+        .child(STAR_FRAMES[frame])
+        .child(ticker())
+}
+
 /// 扫光文字（「思考中…」）：`base` 色的字上一道 `highlight` 色的高光从左扫到右，约 30 帧。
 /// 按字着色（`StyledText` 高亮），减少动态效果时整段都是 `base` 色。
 pub(super) fn shimmer_text(text: impl Into<SharedString>, base: Color, highlight: Color) -> Div {
