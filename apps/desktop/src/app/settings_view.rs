@@ -1,6 +1,7 @@
 //! 设置页（内核 / provider 档案 / 模型）与输入框旁的模型下拉。
 
 use super::ChatApp;
+use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
 use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
 use crate::settings::*;
 use crate::theme::rgb;
@@ -9,6 +10,7 @@ use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rul
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::theme::{Theme, ThemeMode};
@@ -21,7 +23,7 @@ const SETTINGS_TABS: [(IconAll, &str); 3] =
     [(IconAll::Settings, "通用"), (IconAll::Cpu, "内核与模型"), (IconAll::ShieldCheck, "权限")];
 
 /// 设置项的一行：左边标题 + 灰色说明，右边控件。
-fn setting_row(title: &'static str, desc: &'static str, control: impl IntoElement) -> Div {
+fn setting_row(title: &'static str, desc: impl IntoElement, control: impl IntoElement) -> Div {
     div()
         .h_flex()
         .items_center()
@@ -163,14 +165,20 @@ impl ChatApp {
     /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
     /// 视图模式、外观这类即时生效的偏好：改内存里的设置，并只把这一项写回盘上的设置文件
     /// （内存里的设置合并过环境变量，不能整份写回；文件坏了就不碰，免得用默认值盖掉）。
-    pub(crate) fn save_ui_pref(&mut self, edit: impl Fn(&mut Settings)) {
+    pub(crate) fn save_ui_pref(&mut self, edit: impl Fn(&mut Settings), cx: &mut Context<Self>) {
+        /// 保存失败提示的 id：拖字号滑杆时每一下都会存，同一条提示原地替换，不堆叠
+        struct SavePrefFailed;
+
         edit(&mut self.settings);
         if let Some(path) = &self.settings_path {
             let (mut on_disk, broken) = Settings::load(Some(path));
             if broken.is_none() {
                 edit(&mut on_disk);
                 if let Err(err) = on_disk.save(path) {
-                    self.sessions[self.active].note(format!("设置没能保存：{err}"));
+                    self.toast(
+                        Notification::error(format!("设置没能保存：{err}")).id::<SavePrefFailed>(),
+                        cx,
+                    );
                 }
             }
         }
@@ -215,14 +223,14 @@ impl ChatApp {
 
     /// 设置页调字号（拖动和松手都走这里）：立即生效，并只把这一项写回文件。
     pub(crate) fn set_font_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
-        self.save_ui_pref(move |s| s.font_scale = scale);
+        self.save_ui_pref(move |s| s.font_scale = scale, cx);
         self.apply_font(cx);
     }
 
     /// 设置页换界面字体族；None = 回到内嵌的 Inter。
     pub(crate) fn set_font_family(&mut self, family: Option<SharedString>, cx: &mut Context<Self>) {
         let value = family.map(|f| f.to_string()).unwrap_or_default();
-        self.save_ui_pref(move |s| s.font_family = value.clone());
+        self.save_ui_pref(move |s| s.font_family = value.clone(), cx);
         self.apply_font(cx);
     }
 
@@ -232,13 +240,13 @@ impl ChatApp {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        self.save_ui_pref(move |s| s.appearance = a);
+        self.save_ui_pref(move |s| s.appearance = a, cx);
         self.apply_appearance(window, cx);
     }
 
     /// 侧栏底部要不要列出内核状态（立即生效，不走「保存并应用」）。
     pub(crate) fn set_sidebar_kernel_status(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.save_ui_pref(move |s| s.sidebar_kernel_status = on);
+        self.save_ui_pref(move |s| s.sidebar_kernel_status = on, cx);
         cx.notify();
     }
 
@@ -279,7 +287,7 @@ impl ChatApp {
                     .color(rgb(CORAL))
                     .on_change(cx.listener(|this, checked, _, cx| {
                         let on = *checked;
-                        this.save_ui_pref(move |s| s.notifications = on);
+                        this.save_ui_pref(move |s| s.notifications = on, cx);
                         cx.notify();
                     })),
             ),
@@ -306,11 +314,19 @@ impl ChatApp {
                     .font_features(tabular_nums())
                     .child(format!("{percent:.0}%")),
             );
-        setting_row(
-            "界面字号",
-            "整界面等比缩放（文字、间距、圆角一起变）；也可用 Ctrl+= / Ctrl+- 调整",
-            slider,
-        )
+        let desc =
+            div().v_flex().gap_1p5().child("整界面等比缩放（文字、间距、圆角一起变）").child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Self::kbd(ZOOM_IN_KEY))
+                    .child("放大")
+                    .child(div().w_1())
+                    .child(Self::kbd(ZOOM_OUT_KEY))
+                    .child("缩小"),
+            );
+        setting_row("界面字号", desc, slider)
     }
 
     /// 字体族下拉：内嵌的 Inter + 系统已装字体（下拉里可搜索）。
@@ -548,7 +564,7 @@ impl ChatApp {
                         if from_form {
                             app.settings_form.message = Some((true, text));
                         } else if !quiet {
-                            app.sessions[app.active].note(text);
+                            app.toast(Notification::error(text), cx);
                         }
                     }
                 }

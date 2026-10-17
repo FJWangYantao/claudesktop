@@ -1,9 +1,10 @@
-//! 小组件（chip / 顶部 tab / 分段按钮 / 消息操作按钮）。
+//! 小组件（chip / 顶部 tab / 分段按钮 / 消息操作按钮 / 快捷键提示）。
 
 use super::ChatApp;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
@@ -49,5 +50,10 @@ impl ChatApp {
             .bg(if active { rgb(SELECTED) } else { rgba(CLEAR) })
             .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
             .child(text)
+    }
+
+    /// 快捷键提示（gpui-kit `Kbd`）：按键串传 `keys.rs` 的常量，和绑定同源，改键不用改文案。
+    pub(super) fn kbd(key: &str) -> Kbd {
+        Kbd::new(Keystroke::parse(key).expect("keys.rs 里的按键串应能解析"))
     }
 }

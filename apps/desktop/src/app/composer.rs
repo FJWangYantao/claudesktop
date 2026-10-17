@@ -9,6 +9,7 @@ use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::input::Textarea;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::progress::ProgressCircle;
 use gpui_kit::component::tooltip::Tooltip;
@@ -29,11 +30,10 @@ impl ChatApp {
             if let Ok(Ok(Some(path))) = rx.await {
                 let _ = this.update_in(cx, |app, _, cx| {
                     let note = match std::fs::write(&path, &markdown) {
-                        Ok(()) => format!("会话已导出：{}", path.display()),
-                        Err(err) => format!("导出失败：{err}"),
+                        Ok(()) => Notification::success(format!("会话已导出：{}", path.display())),
+                        Err(err) => Notification::error(format!("导出失败：{err}")),
                     };
-                    app.sessions[app.active].note(note);
-                    cx.notify();
+                    app.toast(note, cx);
                 });
             }
         })

@@ -40,6 +40,13 @@ actions!(
     ]
 );
 
+// 界面上用 `Kbd` 提示的键：绑定和提示读同一个常量，改键只改这里。
+/// 循环切换视图模式（与官方一致，macOS 上也是 Ctrl+O）
+pub(super) const CYCLE_VIEW_KEY: &str = "ctrl-o";
+/// 界面放大 / 缩小一档（和浏览器一致）
+pub(super) const ZOOM_IN_KEY: &str = "secondary-=";
+pub(super) const ZOOM_OUT_KEY: &str = "secondary--";
+
 /// 注册按键（应用启动时调用一次）。`secondary` 在 macOS 上是 Cmd，其余平台是 Ctrl。
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
@@ -49,12 +56,11 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("secondary-b", ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new("ctrl-tab", NextSession, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PrevSession, Some(CONTEXT)),
-        // 与官方一致，macOS 上也是 Ctrl+O
-        KeyBinding::new("ctrl-o", CycleView, Some(CONTEXT)),
+        KeyBinding::new(CYCLE_VIEW_KEY, CycleView, Some(CONTEXT)),
         // 界面缩放：和浏览器一致的 Ctrl + 加号 / 减号 / 0
-        KeyBinding::new("secondary-=", ZoomIn, Some(CONTEXT)),
+        KeyBinding::new(ZOOM_IN_KEY, ZoomIn, Some(CONTEXT)),
         KeyBinding::new("secondary-+", ZoomIn, Some(CONTEXT)),
-        KeyBinding::new("secondary--", ZoomOut, Some(CONTEXT)),
+        KeyBinding::new(ZOOM_OUT_KEY, ZoomOut, Some(CONTEXT)),
         KeyBinding::new("secondary-0", ZoomReset, Some(CONTEXT)),
     ]);
 }
@@ -182,5 +188,13 @@ mod tests {
         assert_eq!(neighbor(&[], 0, 1), None);
         // 当前会话不在列表里：取第一个
         assert_eq!(neighbor(&[3, 4], 9, 1), Some(3));
+    }
+
+    /// 界面提示用的按键串都能解析（`ChatApp::kbd` 解析失败会 panic）。
+    #[core::prelude::v1::test]
+    fn hint_keys_parse() {
+        for key in [CYCLE_VIEW_KEY, ZOOM_IN_KEY, ZOOM_OUT_KEY] {
+            assert!(Keystroke::parse(key).is_ok(), "{key}");
+        }
     }
 }

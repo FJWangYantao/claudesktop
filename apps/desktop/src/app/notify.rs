@@ -2,6 +2,8 @@
 //! 点通知回到那个会话；回到窗口时撤掉发过的通知。要不要提醒由 `Session::attention` 判断。
 
 use super::ChatApp;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
 /// 通知标签：每个会话一个，同一会话的新通知替换旧的。
@@ -46,6 +48,19 @@ impl ChatApp {
                     }
                 });
             });
+        });
+    }
+
+    /// 应用内提示（右上角 toast）：导出结果、设置 / 会话文件读写失败这类不属于某个对话的消息。
+    /// 会话自己的事（内核错误、停止、续接）仍用 `Session::note` 记进对话流。
+    /// 只推应用内的：gpui-kit 的 `.system()` 投递靠它自己的通知点击回调，
+    /// 而上面注册的回调把它顶掉了，系统通知一律走 `notify_attention`。
+    pub(crate) fn toast(&self, note: impl Into<Notification>, cx: &mut Context<Self>) {
+        let note = note.into();
+        let handle = self.window_handle;
+        // 推迟到这次更新之后：事件处理中窗口正被占用，直接 update 窗口会失败
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| window.push_notification(note, cx));
         });
     }
 

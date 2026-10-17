@@ -61,6 +61,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   新快捷键加在那里；处理函数没事可做时 `cx.propagate()`，让给外层（gpui-kit Root 的 Tab 焦点切换等）。
   快捷键依赖焦点在界面里：**别在根视图上 `track_focus`**（按下鼠标时会把焦点从输入框抢走），
   焦点丢失由 `restore_focus` 兜底（输入框，设置页开着时是设置页的焦点锚）。
+- **提示消息**：不属于某个对话的（导出结果、设置 / 文件读写失败、输入限制）用 `ChatApp::toast`
+  （gpui-kit `Notification`，应用内）；会话自己的事（内核错误、停止、续接）才用 `Session::note` 进对话流。
+  系统通知走 `notify.rs` 的 `notify_attention`：它注册的点击回调顶掉了 gpui-kit 的，所以别用 `Notification::system()`。
+- **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
 - **加载 / 进行中动效**：先用 `Spinner`、`ShimmerText`（组件自带动画并尊重系统减少动效），
   别急着手写 `with_animation`。
 

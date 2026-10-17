@@ -7,6 +7,7 @@ use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Input;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
@@ -57,7 +58,7 @@ impl ChatApp {
                             d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.save_ui_pref(move |s| s.sidebar_by_date = !by_date);
+                            this.save_ui_pref(move |s| s.sidebar_by_date = !by_date, cx);
                             cx.notify();
                         })),
                     )
@@ -146,9 +147,7 @@ impl ChatApp {
             )
             .child(nav_item("plugins", IconAll::Blocks, "插件", false).on_click(cx.listener(
                 |this, _, _, cx| {
-                    this.sessions[this.active]
-                        .note("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力");
-                    cx.notify();
+                    this.toast("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力", cx);
                 },
             )))
             .child(div().id("sidebar-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
@@ -498,7 +497,7 @@ impl ChatApp {
             if let Some(store) = &self.store
                 && let Err(err) = store.delete(&id)
             {
-                log_note(&mut self.sessions, format!("删除会话文件失败：{err}"));
+                self.toast(Notification::error(format!("删除会话文件失败：{err}")), cx);
             }
         }
         if self.sessions.is_empty() {
@@ -509,13 +508,6 @@ impl ChatApp {
             self.active = self.active.saturating_sub(1);
         }
         cx.notify();
-    }
-}
-
-/// 删除失败之类的提示：放进第一个会话（总是存在）。
-fn log_note(sessions: &mut [crate::session::Session], text: String) {
-    if let Some(s) = sessions.first_mut() {
-        s.note(text);
     }
 }
 

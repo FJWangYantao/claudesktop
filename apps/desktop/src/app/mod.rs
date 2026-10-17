@@ -29,6 +29,7 @@ use claudesktop_core::{
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -96,6 +97,8 @@ pub struct ChatApp {
     window_active: bool,
     /// 发出去还没撤的系统通知标签（回到窗口时撤掉）
     notified: Vec<SharedString>,
+    /// 本窗口（推应用内提示用，见 `toast`）
+    window_handle: AnyWindowHandle,
     /// 设置页的字号滑杆（拖动时即时生效）
     pub(crate) font_slider: Entity<SliderState>,
 }
@@ -289,14 +292,16 @@ impl ChatApp {
             frame_log: None,
             window_active: true,
             notified: Vec::new(),
+            window_handle: window.window_handle(),
             font_slider,
         };
         // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
         let cwd = app.cwd.clone();
         app.open_session(app.settings.kernel(), cwd);
+        // 启动时的问题不自动消失：用户可能还没看窗口
         if let Some(err) = settings_error {
-            app.sessions[0].note(err);
+            app.toast(Notification::error(err).autohide(false), cx);
         }
         // 从磁盘恢复历史会话（演示回放模式下新会话不落盘，但历史照常显示）
         match SessionStore::open_default() {
@@ -312,7 +317,9 @@ impl ChatApp {
                 }
                 app.store = Some(store);
             }
-            Err(err) => app.sessions[0].note(format!("会话历史不可用：{err}")),
+            Err(err) => {
+                app.toast(Notification::error(format!("会话历史不可用：{err}")).autohide(false), cx)
+            }
         }
         app.apply_appearance(window, cx);
         app.init_notifications(window, cx);
@@ -716,8 +723,13 @@ impl ChatApp {
             return;
         }
         if images.len() > room {
-            self.sessions[self.active]
-                .note(format!("一轮最多附 {} 张图片，多出的没有加上", Self::MAX_PENDING_IMAGES));
+            self.toast(
+                Notification::warning(format!(
+                    "一轮最多附 {} 张图片，多出的没有加上",
+                    Self::MAX_PENDING_IMAGES
+                )),
+                cx,
+            );
         }
         self.pending.extend(images.into_iter().take(room));
         cx.notify();

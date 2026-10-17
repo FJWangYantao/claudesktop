@@ -1018,7 +1018,7 @@ impl ChatApp {
         if self.settings.view_mode == mode {
             return;
         }
-        self.save_ui_pref(move |s| s.view_mode = mode);
+        self.save_ui_pref(move |s| s.view_mode = mode, cx);
         cx.notify();
     }
 

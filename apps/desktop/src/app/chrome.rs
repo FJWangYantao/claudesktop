@@ -4,6 +4,7 @@
 //! 一律收不到点击。所以拖拽区只能是按钮的**兄弟**（填空白的 flex_1），不能当容器。
 
 use super::ChatApp;
+use super::keys::CYCLE_VIEW_KEY;
 use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
 use crate::model::ViewMode;
 use crate::theme::rgb;
@@ -174,10 +175,14 @@ fn view_menu_items(app: &ChatApp, handle: &Entity<ChatApp>, popover: &Entity<Pop
     }
     menu.child(
         div()
+            .h_flex()
+            .items_center()
+            .gap_1p5()
             .px_2p5()
             .py_1p5()
             .text_size(TEXT_META)
             .text_color(rgb(INK_SOFT))
-            .child("Ctrl+O 循环切换"),
+            .child(ChatApp::kbd(CYCLE_VIEW_KEY))
+            .child("循环切换"),
     )
 }
