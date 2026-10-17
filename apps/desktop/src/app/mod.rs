@@ -14,6 +14,7 @@ mod notify;
 mod overview;
 mod palette;
 mod rewind;
+mod search;
 mod settings_view;
 mod shortcuts;
 mod sidebar;
@@ -137,6 +138,10 @@ pub struct ChatApp {
     rewind: Option<rewind::RewindPreview>,
     /// 浮层里「冲突的文件也覆盖」勾上了
     rewind_overwrite: bool,
+    /// 命令面板里按正文搜到的消息（查询变了才重搜，见 search.rs）
+    palette_hits: Vec<search::MessageHit>,
+    /// 刚从搜索结果跳过去的消息：(会话令牌, 行号, 跳过去的时刻)，那一行闪一下底色
+    flash: Option<(u64, usize, Instant)>,
 }
 
 /// 一种内核的运行状态。
@@ -345,6 +350,8 @@ impl ChatApp {
             placeholder: SharedString::default(),
             rewind: None,
             rewind_overwrite: false,
+            palette_hits: Vec::new(),
+            flash: None,
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
         cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))

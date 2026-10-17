@@ -85,6 +85,8 @@ pub struct Session {
     /// 用户按了停止、内核还没回这一轮的结束：这期间发的消息先排队，等结束到了再发
     /// （不然迟到的「已取消」会落在新的一轮头上，把它提前收掉）
     pub stopping: bool,
+    /// 下次同步列表时滚到这一行（从搜索结果跳过来）
+    pub reveal: Option<usize>,
     /// 刚在权限卡上「拒绝并说明」：输入框的占位文字请用户说要怎么改，下一条消息发出时清掉
     pub steering: bool,
     /// 最近一轮输入命中提示缓存的比例（%）；端点没报告时为 None
@@ -220,6 +222,7 @@ impl Session {
             retry: None,
             unread: false,
             queued: Vec::new(),
+            reveal: None,
             stopping: false,
             steering: false,
             cache_hit: None,
@@ -346,6 +349,10 @@ impl Session {
         if self.busy != self.measured_busy {
             self.measured_busy = self.busy;
             self.list.remeasure_items(n..n + 1);
+        }
+        // 行数到位之后再滚，否则会被截到末尾
+        if let Some(ix) = self.reveal.take().filter(|&ix| ix < n) {
+            self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
         }
     }
 

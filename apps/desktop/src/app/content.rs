@@ -11,6 +11,7 @@ use super::{ChatApp, motion};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 内容区的缓存 view：内容全由 `ChatApp::render_content` 画，这里只是把它隔成一块单独重画的区域。
@@ -85,6 +86,8 @@ impl ChatApp {
                     }
                     (Some(item), Some(&layout)) => row
                         .pt(px(if ix == 0 { 16. } else { 0. }))
+                        // 刚从搜索结果跳过来的那条：闪一下底色（只换底色，不动行高：虚拟列表不会重测）
+                        .when_some(this.flash_bg(ix, window, cx), |d, bg| d.bg(bg).rounded_xl())
                         .child(this.render_row(ix, item, layout, reveal, window, cx)),
                     (None, _) if ix == n => row.pb_6().children(this.render_turn_status()),
                     _ => row,

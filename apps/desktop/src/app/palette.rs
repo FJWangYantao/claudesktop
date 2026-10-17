@@ -1,4 +1,5 @@
-//! 命令面板（Ctrl+K）：对话框里放 gpui-kit `Command`，搜操作、会话、视图、权限模式和模型。
+//! 命令面板（Ctrl+K）：对话框里放 gpui-kit `Command`，搜操作、会话、视图、权限模式和模型；
+//! 打字时还按正文搜已载入会话里的消息（「消息」组，见 search.rs）。
 //!
 //! 条目不挂 `.action()`：对话框在 gpui-kit Root 的浮层里、不在 `ChatApp` 的键上下文下，
 //! 派发出去的动作到不了 `keys.rs` 的处理函数。确认统一走 `on_confirm`，按下标找回 `PaletteCmd`。
@@ -33,6 +34,8 @@ enum PaletteCmd {
     Export,
     Compact,
     Session(usize),
+    /// 跳到某会话的某条消息（会话下标, 行号）
+    Message(usize, usize),
     View(ViewMode),
     Mode(usize),
     Model(String),
@@ -46,6 +49,8 @@ struct Entry {
     key: Option<&'static str>,
     checked: bool,
     mono: bool,
+    /// 说明另起一行（消息摘要很长，和会话名挤一行会把会话名挤没）
+    stacked: bool,
     cmd: PaletteCmd,
 }
 
@@ -58,6 +63,7 @@ impl Entry {
             key: None,
             checked: false,
             mono: false,
+            stacked: false,
             cmd,
         }
     }
@@ -82,11 +88,41 @@ impl Entry {
         self
     }
 
+    fn stacked(mut self) -> Self {
+        self.stacked = true;
+        self
+    }
+
     /// 面板里的一行：图标 + 名称 + 灰色说明，右端快捷键或当前项对勾。
     fn item(&self) -> CommandItem {
         let (icon, label, desc) = (self.icon, self.label.clone(), self.desc.clone());
-        let (key, checked, mono) = (self.key, self.checked, self.mono);
+        let (key, checked, mono, stacked) = (self.key, self.checked, self.mono, self.stacked);
         CommandItem::new().label(label.clone()).keywords([desc.clone()]).child(move |_, _| {
+            let name = div()
+                .min_w_0()
+                .truncate()
+                .text_size(TEXT_BODY)
+                .text_color(rgb(INK))
+                .when(mono, |d| d.font_family(MONO))
+                .child(label.clone());
+            let note = div().min_w_0().truncate().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT));
+            if stacked {
+                return div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2p5()
+                    .w_full()
+                    .min_w_0()
+                    .child(Icon::new(icon).size_4().flex_shrink_0().text_color(rgb(INK_SOFT)))
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(name)
+                            .child(note.child(desc.clone())),
+                    );
+            }
             div()
                 .h_flex()
                 .items_center()
@@ -94,25 +130,8 @@ impl Entry {
                 .w_full()
                 .min_w_0()
                 .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(TEXT_BODY)
-                        .text_color(rgb(INK))
-                        .when(mono, |d| d.font_family(MONO))
-                        .child(label.clone()),
-                )
-                .when(!desc.is_empty(), |d| {
-                    d.child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(TEXT_SMALL)
-                            .text_color(rgb(INK_SOFT))
-                            .child(desc.clone()),
-                    )
-                })
+                .child(name)
+                .when(!desc.is_empty(), |d| d.child(note.child(desc.clone())))
                 .child(div().flex_1())
                 .when_some(key, |d, k| d.child(ChatApp::kbd(k)))
                 .when(checked, |d| {
@@ -159,6 +178,18 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         })
         .collect();
 
+    // 正文命中的消息：摘要做名字（含查询词，面板自己的过滤也留得住），会话名做说明
+    let messages = app
+        .palette_hits
+        .iter()
+        .map(|hit| {
+            let icon = if hit.from_user { IconAll::User } else { IconAll::Sparkles };
+            Entry::new(icon, hit.snippet.clone(), PaletteCmd::Message(hit.session, hit.item))
+                .desc(app.sessions[hit.session].title.clone())
+                .stacked()
+        })
+        .collect();
+
     let views = ViewMode::ALL
         .into_iter()
         .map(|m| {
@@ -196,10 +227,17 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         Vec::new()
     };
 
-    [("操作", actions), ("会话", sessions), ("视图", views), ("权限模式", modes), ("模型", models)]
-        .into_iter()
-        .filter(|(_, entries)| !entries.is_empty())
-        .collect()
+    [
+        ("操作", actions),
+        ("会话", sessions),
+        ("消息", messages),
+        ("视图", views),
+        ("权限模式", modes),
+        ("模型", models),
+    ]
+    .into_iter()
+    .filter(|(_, entries)| !entries.is_empty())
+    .collect()
 }
 
 impl ChatApp {
@@ -210,11 +248,12 @@ impl ChatApp {
         }
         let state = cx.new(|cx| CommandState::new(window, cx));
         let app = cx.entity();
+        self.palette_hits.clear();
         let palette = state.clone();
         window.open_dialog(cx, move |dialog, _, cx| {
             let groups = palette_groups(app.read(cx));
             let mut command = Command::new(&palette)
-                .placeholder("搜索命令、会话、模型…")
+                .placeholder("搜索命令、会话、消息、模型…")
                 .bordered(false)
                 .empty(|_, _, _| {
                     div()
@@ -236,6 +275,14 @@ impl ChatApp {
                     .map(|(_, entries)| entries.into_iter().map(|e| e.cmd).collect())
                     .collect(),
             );
+            // 查询变了才按正文重搜；结果存在 ChatApp 上，通知后面板重画时读
+            let searcher = app.clone();
+            command = command.on_query(move |query, _, cx| {
+                searcher.update(cx, |this, cx| {
+                    this.search_palette(query);
+                    cx.notify();
+                });
+            });
             let app = app.clone();
             command = command.on_confirm(move |ix, window, cx| {
                 let Some(cmd) = cmds.get(ix.section).and_then(|g| g.get(ix.row)).cloned() else {
@@ -268,6 +315,7 @@ impl ChatApp {
                 self.settings_open = false;
                 self.activate_session(i, cx);
             }
+            PaletteCmd::Message(i, item) => self.reveal_message(i, item, cx),
             PaletteCmd::View(mode) => self.set_view_mode(mode, cx),
             PaletteCmd::Mode(i) => self.choose_mode(i, cx),
             PaletteCmd::Model(model) => self.choose_model(model, cx),
