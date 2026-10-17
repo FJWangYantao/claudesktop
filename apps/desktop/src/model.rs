@@ -513,8 +513,18 @@ pub fn split_tool_title(title: &str) -> (SharedString, SharedString) {
     if t.starts_with('`') {
         return ("Bash".into(), t.trim_matches('`').to_string().into());
     }
+    // MCP 工具：`服务器:工具 {参数}`（自研内核的标题）
+    let is_mcp = |w: &str| {
+        w.split_once(':').is_some_and(|(server, tool)| {
+            let ok = |s: &str| {
+                !s.is_empty()
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            };
+            ok(server) && ok(tool)
+        })
+    };
     if let Some((head, rest)) = t.split_once(' ')
-        && is_name(head)
+        && (is_name(head) || is_mcp(head))
     {
         return (head.to_string().into(), rest.trim().to_string().into());
     }
@@ -602,6 +612,8 @@ mod tests {
         assert_eq!((n.as_ref(), a.as_ref()), ("Bash", "cargo build -p x"));
         let (n, a) = split_tool_title("Edit");
         assert_eq!((n.as_ref(), a.as_ref()), ("Edit", ""));
+        let (n, a) = split_tool_title(r#"github:search_issues {"q":"bug"}"#);
+        assert_eq!((n.as_ref(), a.as_ref()), ("github:search_issues", r#"{"q":"bug"}"#));
         let (n, a) = split_tool_title("读取 file.mjs");
         assert_eq!((n.as_ref(), a.as_ref()), ("Tool", "读取 file.mjs"));
     }

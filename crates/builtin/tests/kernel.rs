@@ -4,7 +4,7 @@
 //! `CLAUDESKTOP_BASE_URL=… CLAUDESKTOP_MODEL=… CLAUDESKTOP_API_KEY=… cargo test -p claudesktop-builtin -- --ignored`
 
 use claudesktop_builtin::{BuiltinConfig, BuiltinKernel, Protocol, ProviderConfig};
-use claudesktop_core::{EventSink, Kernel, KernelEvent, Record, RoutedEvent, UserPrompt};
+use claudesktop_core::{EventSink, Kernel, KernelEvent, McpState, Record, RoutedEvent, UserPrompt};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -140,6 +140,26 @@ impl Harness {
         cwd: PathBuf,
         context_windows: HashMap<String, u64>,
     ) -> Self {
+        Self::build(provider, cwd, context_windows, None)
+    }
+
+    /// 接上 MCP 配置文件。
+    fn with_mcp(base_url: String, cwd: PathBuf, mcp_config: PathBuf) -> Self {
+        let provider = ProviderConfig {
+            base_url,
+            api_key: Some("test-key".into()),
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        Self::build(provider, cwd, HashMap::new(), Some(mcp_config))
+    }
+
+    fn build(
+        provider: ProviderConfig,
+        cwd: PathBuf,
+        context_windows: HashMap<String, u64>,
+        mcp_config: Option<PathBuf>,
+    ) -> Self {
         let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
         let sink: EventSink = {
             let events = events.clone();
@@ -152,6 +172,7 @@ impl Harness {
                 rules_path: None,
                 user_instructions: None,
                 context_windows,
+                mcp_config,
             },
             sink,
         )
@@ -1363,5 +1384,98 @@ fn anthropic_image_prompt_reaches_wire() {
     assert_eq!(content[1]["source"]["data"], "QUJD");
     // 原生协议把 max_tokens 放在顶层（必填）
     assert!(first["max_tokens"].as_u64().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// mock MCP 服务器：`tools/mock-mcp-server.mjs`，写一份指向它的 mcp.json。
+fn mock_mcp_config(dir: &std::path::Path) -> PathBuf {
+    // 不 canonicalize：Windows 上会加上 node 不认的长路径前缀
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/mock-mcp-server.mjs");
+    let config = serde_json::json!({
+        "mcpServers": {
+            "mock": { "command": "node", "args": [script.to_string_lossy()] },
+            "off": { "command": "node", "disabled": true },
+        }
+    });
+    let path = dir.join("mcp.json");
+    std::fs::write(&path, config.to_string()).unwrap();
+    path
+}
+
+fn mcp_ready(e: &KernelEvent) -> bool {
+    matches!(e, KernelEvent::McpStatus { servers }
+        if servers.iter().any(|s| s.name == "mock" && s.state == McpState::Ready))
+}
+
+#[test]
+fn mcp_tools_are_offered_asked_and_called() {
+    let dir = workdir("mcp");
+    let config = mock_mcp_config(&dir);
+    let (base, bodies) = serve(vec![
+        tool_call("m1", "mcp__mock__echo", serde_json::json!({ "text": "你好" })),
+        happy_stream("它说你好"),
+        tool_call("m2", "mcp__mock__boom", serde_json::json!({})),
+        happy_stream("失败了"),
+    ]);
+    let h = Harness::with_mcp(base, dir.clone(), config);
+    h.wait("mcp ready", mcp_ready);
+    // 禁用的服务器也列出来
+    let off_listed = |e: &KernelEvent| {
+        matches!(e, KernelEvent::McpStatus { servers }
+            if servers.iter().any(|s| s.name == "off" && s.state == McpState::Disabled))
+    };
+    assert_eq!(h.count(off_listed), h.count(|e| matches!(e, KernelEvent::McpStatus { .. })));
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("调 echo")).unwrap();
+    // MCP 工具一律要问；「总是允许」按服务器 + 工具记
+    let (req, options) = h.permission(1);
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+    h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
+    h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.tool_status("m1").as_deref(), Some("completed"));
+    let echo_row = |e: &KernelEvent| matches!(e, KernelEvent::ToolCallStarted { title, .. } if title.starts_with("mock:echo "));
+    assert_eq!(h.count(echo_row), 1);
+    // 工具定义里有 MCP 工具；结果回给了模型
+    let names = body(&bodies, 0)["tools"].to_string();
+    assert!(names.contains("mcp__mock__echo"), "{names}");
+    assert!(body(&bodies, 1).to_string().contains("echo: 你好"));
+
+    // isError 的结果算失败
+    h.kernel.send_prompt(&sid, UserPrompt::text("调 boom")).unwrap();
+    let (req, _) = h.permission(2);
+    h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.tool_status("m2").as_deref(), Some("failed"));
+    assert!(body(&bodies, 3).to_string().contains("boom failed"));
+    h.kernel.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mcp_read_only_tools_survive_plan_mode_and_list_changes() {
+    let dir = workdir("mcp-plan");
+    let config = mock_mcp_config(&dir);
+    let (base, bodies) = serve(vec![
+        tool_call("p1", "mcp__mock__echo", serde_json::json!({ "text": "relist" })),
+        happy_stream("好"),
+    ]);
+    let h = Harness::with_mcp(base, dir.clone(), config);
+    h.wait("mcp ready", mcp_ready);
+    let sid = h.start();
+    h.kernel.set_mode(&sid, "plan").unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看")).unwrap();
+    let (req, _) = h.permission(1);
+    h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
+    h.wait("turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.tool_status("p1").as_deref(), Some("completed"));
+    // Plan 模式只给只读的 MCP 工具
+    let names = body(&bodies, 0)["tools"].to_string();
+    assert!(names.contains("mcp__mock__echo") && !names.contains("mcp__mock__boom"), "{names}");
+    // 服务器说工具变了：重新列，多出 extra
+    h.wait("relist", |e| {
+        matches!(e, KernelEvent::McpStatus { servers }
+            if servers.iter().any(|s| s.name == "mock" && s.tools == 3))
+    });
+    h.kernel.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

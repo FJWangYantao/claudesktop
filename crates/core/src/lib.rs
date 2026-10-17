@@ -185,6 +185,28 @@ pub enum KernelEvent {
     /// 内核改了一个文件：改之前 / 之后的完整内容（None = 文件不存在）。
     /// 给 UI 存检查点用（见 [`checkpoint`]）；内容可能很大，不原样进日志，由 UI 转成 `Record::FileChanged`
     FileChanged { path: String, before: Option<String>, after: Option<String> },
+    /// MCP 服务器的连接状态（连接级事件，配置变了 / 某个服务器状态变了就整份重发）
+    McpStatus { servers: Vec<McpServerView> },
+}
+
+/// 一个 MCP 服务器在界面上的样子。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerView {
+    pub name: String,
+    pub state: McpState,
+    /// 提供几个工具（连上之后才有）
+    pub tools: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum McpState {
+    Connecting,
+    Ready,
+    /// 起不来、握手失败或中途退出：原因（含服务器 stderr 的最后几行）
+    Failed(String),
+    /// 配置里写了 `"disabled": true`
+    Disabled,
 }
 
 impl KernelEvent {
@@ -215,6 +237,7 @@ impl KernelEvent {
             Self::CompactFailed { .. } => "compact_failed",
             Self::Fatal(_) => "fatal",
             Self::FileChanged { .. } => "file_changed",
+            Self::McpStatus { .. } => "mcp_status",
         }
     }
 }
@@ -414,6 +437,8 @@ pub trait Kernel: Send + Sync {
         let _ = (session, history);
         anyhow::bail!("当前内核不支持回退对话")
     }
+    /// 重新读 MCP 配置、重连全部服务器；结果经 `McpStatus` 回报。默认没有 MCP。
+    fn reload_mcp(&self) {}
     /// 关闭内核。
     fn shutdown(&self);
 }

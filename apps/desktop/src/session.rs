@@ -998,7 +998,8 @@ impl Session {
             | KernelEvent::UserMessageChunk { .. }
             | KernelEvent::FsRead { .. }
             | KernelEvent::FsWrite { .. }
-            | KernelEvent::FileChanged { .. } => {}
+            | KernelEvent::FileChanged { .. }
+            | KernelEvent::McpStatus { .. } => {}
             KernelEvent::UsageUpdated {
                 input_tokens,
                 output_tokens,

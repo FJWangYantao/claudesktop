@@ -20,8 +20,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
-const SETTINGS_TABS: [(IconAll, &str); 3] =
-    [(IconAll::Settings, "通用"), (IconAll::Cpu, "内核与模型"), (IconAll::ShieldCheck, "权限")];
+const SETTINGS_TABS: [(IconAll, &str); 4] = [
+    (IconAll::Settings, "通用"),
+    (IconAll::Cpu, "内核与模型"),
+    (IconAll::ShieldCheck, "权限"),
+    (IconAll::Plug, "MCP"),
+];
 
 /// 设置项的一行：左边标题 + 灰色说明，右边控件。
 fn setting_row(title: &'static str, desc: impl IntoElement, control: impl IntoElement) -> Div {
@@ -1132,6 +1136,7 @@ impl ChatApp {
         let tab_content: Div = match f.tab {
             1 => kernel_tab,
             2 => self.render_rules(cx),
+            3 => self.render_mcp(cx),
             _ => self.render_general(cx),
         };
 
@@ -1205,6 +1210,8 @@ fn rule_label(rule: &str) -> String {
         format!("运行以「{prefix}」开头的命令")
     } else if let Some(host) = rule.strip_prefix("fetch:") {
         format!("访问网站 {host}")
+    } else if let Some(tool) = rule.strip_prefix("mcp:") {
+        format!("调用 MCP 工具 {}", tool.replacen(':', " 的 ", 1))
     } else if rule == "edit" {
         "编辑项目内的文件".into()
     } else {

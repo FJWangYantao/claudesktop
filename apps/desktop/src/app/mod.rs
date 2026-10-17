@@ -7,6 +7,7 @@ mod complete_view;
 mod composer;
 mod content;
 pub(crate) mod keys;
+mod mcp_view;
 mod menu;
 mod motion;
 mod notify;
@@ -153,6 +154,8 @@ pub(crate) struct KernelSlot {
     status: SharedString,
     /// 内核标识（写进会话元信息，续接时比对）
     agent_cmd: String,
+    /// MCP 服务器的状态（只有自研内核有；设置页「MCP」显示）
+    mcp: Vec<claudesktop_core::McpServerView>,
 }
 
 impl Drop for ChatApp {
@@ -419,6 +422,7 @@ impl ChatApp {
         slot.kernel = kernel;
         slot.status = status;
         slot.agent_cmd = agent_cmd;
+        slot.mcp.clear();
     }
 
     /// 还没启动过就启动。
@@ -1179,6 +1183,7 @@ impl ChatApp {
                     s.note(format!("创建会话失败：{message}"));
                 }
             }
+            KernelEvent::McpStatus { servers } => slot.mcp = servers,
             KernelEvent::Fatal(message) => {
                 slot.ready = false;
                 slot.error = true;

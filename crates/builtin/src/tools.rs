@@ -61,6 +61,10 @@ pub enum Access {
     Exec,
     /// 联网（只读，但会把网址发出去，所以要问）
     Fetch,
+    /// MCP 服务器的工具：副作用不知道，一律要问；服务器标了只读的 Plan 模式下也能用
+    Mcp {
+        read_only: bool,
+    },
 }
 
 /// 解析好的一次工具调用。
@@ -108,6 +112,13 @@ pub enum Action {
     Fetch {
         url: String,
         offset: usize,
+    },
+    /// MCP 服务器的工具（由内核交给 `McpHub::call` 执行，不走 [`Action::run`]）
+    Mcp {
+        server: String,
+        tool: String,
+        arguments: Value,
+        read_only: bool,
     },
 }
 
@@ -523,6 +534,7 @@ impl Action {
             Self::Write { .. } | Self::Edit { .. } => Access::Edit,
             Self::Shell { .. } => Access::Exec,
             Self::Fetch { .. } => Access::Fetch,
+            Self::Mcp { read_only, .. } => Access::Mcp { read_only: *read_only },
         }
     }
 
@@ -534,6 +546,7 @@ impl Action {
             Self::Write { .. } | Self::Edit { .. } => "edit",
             Self::Shell { .. } => "execute",
             Self::Fetch { .. } => "fetch",
+            Self::Mcp { .. } => "other",
         }
     }
 
@@ -546,6 +559,16 @@ impl Action {
             Self::Edit { path, .. } => format!("Edit {}", display(cwd, path)),
             Self::Shell { command, .. } => format!("`{}`", command.trim()),
             Self::Fetch { url, .. } => format!("Fetch {url}"),
+            // `github:search_issues {"q":"bug"}`：参数压成一行、截短
+            Self::Mcp { server, tool, arguments, .. } => {
+                let args = arguments.to_string();
+                let args: String = if args.chars().count() > 80 {
+                    args.chars().take(80).collect::<String>() + "…"
+                } else {
+                    args
+                };
+                format!("{server}:{tool} {args}")
+            }
             Self::Glob { pattern, root, cwd } => match display(cwd, root).as_str() {
                 "." => format!("Glob {pattern}"),
                 dir => format!("Glob {pattern} in {dir}"),
@@ -576,11 +599,13 @@ impl Action {
     /// - 编辑：`edit`（仅工作目录内）
     /// - shell：`shell:<程序> [子命令]`，含管道 / 重定向 / 串联等的复合命令不提供
     /// - 抓网页：`fetch:<主机名>`
+    /// - MCP 工具：`mcp:<服务器>:<工具>`
     pub fn rule(&self, cwd: &Path) -> Option<String> {
         match self {
             Self::Write { .. } | Self::Edit { .. } => self.inside(cwd).then(|| "edit".to_string()),
             Self::Shell { command, .. } => shell_rule(command).map(|r| format!("shell:{r}")),
             Self::Fetch { url, .. } => Some(format!("fetch:{}", crate::fetch::host_of(url))),
+            Self::Mcp { server, tool, .. } => Some(format!("mcp:{server}:{tool}")),
             _ => None,
         }
     }
@@ -621,6 +646,9 @@ impl Action {
                 should_stop,
             ),
             Self::Fetch { url, offset } => crate::fetch::fetch(url, *offset, should_stop),
+            Self::Mcp { .. } => {
+                ToolOutput::fail("MCP tool was not routed to its server", "内部错误")
+            }
         }
     }
 }
@@ -1121,7 +1149,7 @@ fn shell_command(command: &str) -> Command {
 }
 
 /// 连同子孙进程一起结束（Windows 上 `kill` 只结束 shell 本身）
-fn kill_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;

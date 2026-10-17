@@ -10,6 +10,7 @@
 //! - 续接：用本地会话日志重建上下文（见 `history` 模块）
 //! - 项目说明：AGENTS.md / CLAUDE.md 读进系统提示词（见 `instructions` 模块）
 //! - 上下文压缩：快满时 / 超限报错后把较早的对话总结成摘要（见 `compact` 模块）
+//! - MCP：数据目录 `mcp.json` 里配的工具服务器，工具和内置工具一起交给模型（见 `mcp` 模块）
 //!
 //! 线程模型：每轮对话一个线程（阻塞读 SSE 流、执行工具、等权限应答）；
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
@@ -19,6 +20,7 @@ mod compact;
 mod fetch;
 mod history;
 mod instructions;
+pub mod mcp;
 mod openai;
 mod permissions;
 mod provider;
@@ -28,6 +30,7 @@ mod tools;
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 pub use permissions::{PermissionRules, default_rules_path};
+
 pub use provider::{
     ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, Protocol, ProviderConfig,
     RequestParams, StreamEvent, StreamOutcome, ToolCall, Usage,
@@ -79,6 +82,8 @@ pub struct BuiltinConfig {
     /// 端点报告的上下文窗口（模型 ID → token）：用量快到窗口时自动压缩；
     /// 查不到窗口的模型只在端点报「超出上下文」后压缩
     pub context_windows: HashMap<String, u64>,
+    /// MCP 服务器配置文件（默认数据目录的 `mcp.json`）；None = 不接 MCP
+    pub mcp_config: Option<PathBuf>,
 }
 
 impl BuiltinConfig {
@@ -90,6 +95,7 @@ impl BuiltinConfig {
             rules_path: default_rules_path(),
             user_instructions: instructions::default_user_file(),
             context_windows: HashMap::new(),
+            mcp_config: default_mcp_config(),
         }
     }
 
@@ -189,9 +195,16 @@ struct Inner {
     sessions: Mutex<HashMap<String, SessionState>>,
     next_session: AtomicU64,
     rules: Mutex<PermissionRules>,
+    /// MCP 服务器（所有会话共用）
+    mcp: Arc<mcp::McpHub>,
     /// 等待 UI 应答的权限请求：请求 ID → 应答通道
     pending: Mutex<HashMap<u64, mpsc::Sender<Option<String>>>>,
     next_request: AtomicU64,
+}
+
+/// 默认 MCP 配置文件：数据目录下的 `mcp.json`。
+pub fn default_mcp_config() -> Option<PathBuf> {
+    claudesktop_core::default_data_dir().ok().map(|d| d.join("mcp.json"))
 }
 
 /// 权限判定结果
@@ -470,7 +483,12 @@ impl Inner {
         cwd: &Path,
         call: &ToolCall,
     ) -> (Result<Action, String>, String) {
-        let action = Action::parse(&call.function.name, &call.function.arguments, cwd);
+        let name = &call.function.name;
+        let action = if mcp::is_mcp_tool(name) {
+            self.mcp_action(name, &call.function.arguments)
+        } else {
+            Action::parse(name, &call.function.arguments, cwd)
+        };
         let (title, kind) = match &action {
             Ok(a) => (a.title(cwd), a.kind()),
             Err(_) => (call.function.name.clone(), "other"),
@@ -489,6 +507,37 @@ impl Inner {
             self.emit(Some(session), KernelEvent::ToolCallDiff { id: call.id.clone(), diff });
         }
         (action, title)
+    }
+
+    /// 执行内置工具；写文件 / 改文件前后各读一次，交给 UI 存检查点（回退时还原）。
+    fn run_checkpointed(
+        &self,
+        session: &str,
+        action: &Action,
+        stopped: &dyn Fn() -> bool,
+    ) -> ToolOutput {
+        let target = action.written_path().map(Path::to_path_buf);
+        let before = target.as_deref().and_then(checkpoint::read_snapshot);
+        let output = action.run(stopped);
+        if let (Some(path), Some(before)) = (target, before)
+            && let Some(after) = checkpoint::read_snapshot(&path)
+            && before != after
+        {
+            let path = path.to_string_lossy().into_owned();
+            self.emit(Some(session), KernelEvent::FileChanged { path, before, after });
+        }
+        output
+    }
+
+    /// 模型调的 MCP 工具 → 动作；服务器没连上或没有这个工具时的错误回给模型。
+    fn mcp_action(&self, name: &str, arguments: &str) -> Result<Action, String> {
+        let (server, tool) = self.mcp.lookup(name).ok_or_else(|| {
+            format!("Unknown tool `{name}` (its MCP server may have disconnected)")
+        })?;
+        let args = if arguments.trim().is_empty() { "{}" } else { arguments };
+        let arguments: serde_json::Value =
+            serde_json::from_str(args).map_err(|e| format!("Invalid arguments for {name}: {e}"))?;
+        Ok(Action::Mcp { server, tool: tool.name, arguments, read_only: tool.read_only })
     }
 
     /// 授权、执行，并报告结果。
@@ -518,18 +567,11 @@ impl Inner {
                             output: None,
                         },
                     );
-                    // 检查点：改文件前后各读一次，交给 UI 存下来（回退时还原）
-                    let target = action.written_path().map(Path::to_path_buf);
-                    let before = target.as_deref().and_then(checkpoint::read_snapshot);
-                    let output = action.run(stopped);
-                    if let (Some(path), Some(before)) = (target, before)
-                        && let Some(after) = checkpoint::read_snapshot(&path)
-                        && before != after
-                    {
-                        let path = path.to_string_lossy().into_owned();
-                        self.emit(Some(session), KernelEvent::FileChanged { path, before, after });
+                    if let Action::Mcp { server, tool, arguments, .. } = &action {
+                        self.mcp.call(server, tool, arguments.clone(), stopped)
+                    } else {
+                        self.run_checkpointed(session, &action, stopped)
                     }
-                    output
                 }
                 Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),
             },
@@ -565,7 +607,7 @@ impl Inner {
         }
         let mode = self.mode(session);
         match mode.as_str() {
-            MODE_PLAN if access != Access::Fetch => {
+            MODE_PLAN if !matches!(access, Access::Fetch | Access::Mcp { read_only: true }) => {
                 return Verdict::Deny(
                     "Plan mode is active: writing files and running commands are not allowed. \
                      Investigate with read-only tools and present a plan instead."
@@ -597,6 +639,8 @@ impl Inner {
                 format!("总是允许 `{prefix}` 开头的命令")
             } else if let Some(host) = rule.strip_prefix("fetch:") {
                 format!("本项目内总是允许访问 {host}")
+            } else if let Some(tool) = rule.strip_prefix("mcp:") {
+                format!("本项目内总是允许 {}", tool.replacen(':', " 的 ", 1))
             } else {
                 "本项目内总是允许编辑".into()
             };
@@ -658,6 +702,12 @@ impl BuiltinKernel {
     /// 创建内核。进程内无握手，立即报告 `Connected`。
     pub fn spawn(config: BuiltinConfig, sink: EventSink) -> anyhow::Result<Self> {
         let agent_name = format!("builtin · {}", config.provider.model);
+        let mcp = {
+            let sink = sink.clone();
+            mcp::McpHub::new(config.mcp_config, config.cwd.clone(), move |servers| {
+                sink(RoutedEvent { session: None, event: KernelEvent::McpStatus { servers } })
+            })
+        };
         let inner = Arc::new(Inner {
             provider: make_provider(&config.provider),
             default_model: Mutex::new(config.provider.model.clone()),
@@ -669,11 +719,14 @@ impl BuiltinKernel {
             sessions: Mutex::default(),
             next_session: AtomicU64::new(1),
             rules: Mutex::new(PermissionRules::load(config.rules_path)),
+            mcp,
             pending: Mutex::default(),
             next_request: AtomicU64::new(1),
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
+        // MCP 服务器在后台连，连上之前的轮次没有它们的工具
+        inner.mcp.reload();
         Ok(Self { inner })
     }
 
@@ -818,7 +871,8 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
         let Some((messages, mode, cwd, model)) = inner.snapshot(&session) else {
             return;
         };
-        let specs = tools::specs(mode != MODE_PLAN);
+        let mut specs = tools::specs(mode != MODE_PLAN);
+        specs.extend(inner.mcp.specs(mode != MODE_PLAN));
         let mut text = String::new();
         let result =
             inner.provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
@@ -1125,11 +1179,16 @@ impl Kernel for BuiltinKernel {
         Ok(())
     }
 
+    fn reload_mcp(&self) {
+        self.inner.mcp.reload();
+    }
+
     fn shutdown(&self) {
         for state in self.inner.sessions.lock().unwrap().values_mut() {
             if let Some(flag) = state.turn.take() {
                 flag.store(true, Ordering::SeqCst);
             }
         }
+        self.inner.mcp.stop();
     }
 }
