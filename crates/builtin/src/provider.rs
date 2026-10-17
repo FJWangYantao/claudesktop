@@ -365,21 +365,48 @@ pub(crate) fn debug_http(make: impl FnOnce() -> String) {
     }
 }
 
+/// 一条流是怎么结束的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SseEnd {
+    /// 被 `should_stop` 叫停
+    Stopped,
+    /// 收到 `[DONE]`
+    Done,
+    /// 连接关了，没有 `[DONE]`
+    Eof,
+}
+
 /// 逐条读取 SSE 事件直到流结束（共享 [`crate::sse::read_events`] 的取消语义）。
 pub(crate) fn read_sse(
     reader: impl BufRead,
     should_stop: &dyn Fn() -> bool,
     on_data: &mut dyn FnMut(&str) -> Result<(), String>,
-) -> anyhow::Result<bool> {
-    crate::sse::read_events(reader, should_stop, |event| {
-        if let crate::sse::SseEvent::Data(payload) = event
-            && let Err(message) = on_data(&payload)
-        {
-            return Err(std::io::Error::other(message));
+) -> anyhow::Result<SseEnd> {
+    let mut done = false;
+    let finished = crate::sse::read_events(reader, should_stop, |event| match event {
+        crate::sse::SseEvent::Data(payload) => on_data(&payload).map_err(std::io::Error::other),
+        crate::sse::SseEvent::Done => {
+            done = true;
+            Ok(())
         }
-        Ok(())
     })
-    .map_err(|e| anyhow::anyhow!("读取流失败: {e}"))
+    .map_err(|e| anyhow::anyhow!("读取流失败: {e}"))?;
+    Ok(match (finished, done) {
+        (false, _) => SseEnd::Stopped,
+        (true, true) => SseEnd::Done,
+        (true, false) => SseEnd::Eof,
+    })
+}
+
+/// 读完流的收尾：返回 `StreamOutcome::completed`（叫停为 false）。连接在没有任何结束标记
+/// （`[DONE]`、finish_reason / stop_reason）时就关了，算中途断开报错——
+/// 否则截断的回复会被当成说完了，界面上看不出来。
+pub(crate) fn finish_stream(end: SseEnd, finish_reason: bool) -> anyhow::Result<bool> {
+    match end {
+        SseEnd::Stopped => Ok(false),
+        SseEnd::Eof if !finish_reason => anyhow::bail!("读取流失败: 连接在回复结束前断开了"),
+        _ => Ok(true),
+    }
 }
 
 #[cfg(test)]

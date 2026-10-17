@@ -7,7 +7,8 @@
 
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, RequestParams, StreamEvent, StreamOutcome, ToolCall,
-    Usage, debug_http, error_message, parse_model_list, post_sse_with_retry, read_sse,
+    Usage, debug_http, error_message, finish_stream, parse_model_list, post_sse_with_retry,
+    read_sse,
 };
 use serde_json::Value;
 
@@ -80,7 +81,7 @@ impl ChatProvider for OpenAiProvider {
 
         let mut outcome = StreamOutcome::default();
         let mut calls = ToolCallAccumulator::default();
-        let completed = read_sse(reader, should_stop, &mut |payload| match parse_chunk(payload) {
+        let end = read_sse(reader, should_stop, &mut |payload| match parse_chunk(payload) {
             Ok(chunk) => {
                 for event in chunk.events {
                     on_event(event);
@@ -101,7 +102,7 @@ impl ChatProvider for OpenAiProvider {
                 Err(message)
             }
         })?;
-        outcome.completed = completed;
+        outcome.completed = finish_stream(end, outcome.finish_reason.is_some())?;
         outcome.tool_calls = calls.finish();
         Ok(outcome)
     }

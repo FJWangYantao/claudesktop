@@ -6,7 +6,7 @@
 
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, ProviderConfig, StreamEvent, StreamOutcome, ToolCall,
-    debug_http, error_message, parse_model_list, post_sse_with_retry, read_sse,
+    debug_http, error_message, finish_stream, parse_model_list, post_sse_with_retry, read_sse,
 };
 use serde_json::{Value, json};
 
@@ -104,7 +104,7 @@ impl ChatProvider for AnthropicProvider {
         let mut usage = crate::provider::Usage::default();
         let mut usage_seen = false;
         let mut blocks = ToolBlocks::default();
-        let completed = read_sse(reader, should_stop, &mut |payload| match parse_event(
+        let end = read_sse(reader, should_stop, &mut |payload| match parse_event(
             payload,
             &mut blocks,
             &mut usage,
@@ -121,7 +121,7 @@ impl ChatProvider for AnthropicProvider {
                 Err(message)
             }
         })?;
-        outcome.completed = completed;
+        outcome.completed = finish_stream(end, outcome.finish_reason.is_some())?;
         outcome.usage = usage_seen.then_some(usage);
         outcome.tool_calls = blocks.finish();
         Ok(outcome)

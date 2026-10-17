@@ -368,6 +368,21 @@ fn non_retryable_error_fails_the_turn() {
 }
 
 #[test]
+fn stream_cut_before_the_end_fails_the_turn() {
+    // 吐了一半，没有 finish_reason 也没有 [DONE] 连接就关了：不能当成说完了
+    let (base, _) =
+        serve(vec![Reply::Sse { lines: vec![delta("content", "第一点是")], gap_ms: 5 }]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("x")).unwrap();
+    h.wait(
+        "prompt failed",
+        |e| matches!(e, KernelEvent::PromptFailed { message } if message.starts_with("读取流失败")),
+    );
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::TurnEnded { .. })), 0);
+}
+
+#[test]
 fn retry_after_failure_keeps_roles_alternating() {
     let (base, bodies) = serve(vec![
         Reply::Status(400, r#"{"error":{"message":"bad request"}}"#),
