@@ -1,5 +1,8 @@
 //! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
 //! 会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
+//! 会话多了不占地方：点组名折叠整组（记进设置），每组默认只列最近活动的几个
+//! （[`visible_members`]），当前 / 运行中 / 待查看的会话折叠了也照常露出来。
+//! 用不着又不想删的会话可以归档：收进列表末尾的「已归档」组（默认收起，元信息里记 `archived`）。
 //!
 //! 侧栏是独立的缓存 view（[`SidebarView`]）：对话区的转圈、流式输出每帧都在重画 `ChatApp`，
 //! 侧栏几十行会话每行约 0.1ms，一起重画就是好几毫秒。缓存后只在侧栏用到的状态变了时重画
@@ -24,15 +27,57 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 侧栏的一组会话（同一工作目录，或按日期分组时的同一天）。
+pub(crate) struct SessionGroup {
+    /// 记折叠 / 展开用：`dir:<工作目录>` 或 `date:<日期组名>`
+    pub key: String,
+    pub name: SharedString,
+    pub members: Vec<usize>,
+}
+
+/// 「已归档」组的 [`SessionGroup::key`]
+pub(crate) const ARCHIVED_KEY: &str = "archived";
+
+/// 一组默认列出几个会话，其余收进「显示其余 N 个」
+const GROUP_PREVIEW: usize = 5;
+
+/// 一组在侧栏里列出哪些会话、藏起来几个，列出的保持组内原来的顺序。
+/// 折叠时只列要紧的（`keep`：当前、运行中、待查看）；没点「显示全部」时列最近活动的
+/// [`GROUP_PREVIEW`] 个加上要紧的。只多出一两个时不值得收，全列。
+fn visible_members(
+    members: &[usize],
+    folded: bool,
+    show_all: bool,
+    keep: impl Fn(usize) -> bool,
+    activity: impl Fn(usize) -> u64,
+) -> (Vec<usize>, usize) {
+    if !folded && (show_all || members.len() <= GROUP_PREVIEW + 2) {
+        return (members.to_vec(), 0);
+    }
+    let recent: HashSet<usize> = if folded {
+        HashSet::new()
+    } else {
+        let mut by_activity = members.to_vec();
+        by_activity.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
+        by_activity.into_iter().take(GROUP_PREVIEW).collect()
+    };
+    let shown: Vec<usize> =
+        members.iter().copied().filter(|&i| recent.contains(&i) || keep(i)).collect();
+    let hidden = members.len() - shown.len();
+    (shown, hidden)
+}
 
 /// 侧栏只列哪些会话。不写进设置：筛选是一时的（看一眼谁在跑、谁有结果），重启回到全部。
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
@@ -185,12 +230,15 @@ impl ChatApp {
         let mut h = DefaultHasher::new();
         // 外观、字号、字体变了全部重画
         (crate::theme::is_dark(), f32::from(root_font_size()).to_bits(), sans()).hash(&mut h);
-        for (name, members) in self.session_groups() {
-            name.hash(&mut h);
-            for i in members {
+        for group in self.session_groups() {
+            (&group.key, &group.name).hash(&mut h);
+            for i in group.members {
                 (i, self.sessions[i].token).hash(&mut h);
             }
         }
+        let mut expanded: Vec<&String> = self.sidebar_expanded.iter().collect();
+        expanded.sort();
+        (&self.settings.sidebar_folded, expanded).hash(&mut h);
         (
             self.settings.sidebar_by_date,
             self.sessions_by_activity,
@@ -210,7 +258,9 @@ impl ChatApp {
         }
         for s in &self.sessions {
             let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
-            (&s.title, s.busy, s.busy && s.waiting_permission(), s.unread, age).hash(&mut h);
+            let archived = s.meta.as_ref().is_some_and(|m| m.archived);
+            (&s.title, s.busy, s.busy && s.waiting_permission(), s.unread, age, archived)
+                .hash(&mut h);
         }
         let key = h.finish();
         if key != self.sidebar_key {
@@ -289,12 +339,100 @@ impl ChatApp {
             let members: Vec<usize> = self
                 .session_groups()
                 .into_iter()
-                .flat_map(|(_, members)| members)
+                .flat_map(|g| g.members)
                 .filter(|&i| self.sidebar_keeps(filter, i))
                 .collect();
-            vec![(format!("{} · {}", filter.label(), members.len()).into(), members)]
+            let name = format!("{} · {}", filter.label(), members.len()).into();
+            vec![SessionGroup { key: String::new(), name, members }]
         };
-        for (g, (name, members)) in groups.into_iter().enumerate() {
+        let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
+        let keep = |i: usize| {
+            let s = &self.sessions[i];
+            i == self.active || s.busy || s.unread
+        };
+        for (g, SessionGroup { key, name, members }) in groups.into_iter().enumerate() {
+            // 筛选时不折叠、不收（筛出来的本来就少）
+            let foldable = filter == SidebarFilter::All;
+            // 已归档组默认收起、点开就全列，开合只记在内存里（`sidebar_expanded`）
+            let archive = key == ARCHIVED_KEY;
+            let folded = foldable
+                && if archive {
+                    !self.sidebar_expanded.contains(&key)
+                } else {
+                    self.settings.sidebar_folded.contains(&key)
+                };
+            let show_all = archive || self.sidebar_expanded.contains(&key);
+            let total = members.len();
+            let more_key = key.clone();
+            let (members, hidden) = if foldable {
+                visible_members(&members, folded, show_all, keep, activity)
+            } else {
+                (members, 0)
+            };
+            // 组名：点了折叠 / 展开整组；折叠时后面带上会话数（单独一块，组名截短时也留着），
+            // 箭头常显（展开时悬停才显出来）
+            let label = div()
+                .min_w_0()
+                .h_flex()
+                .gap_1()
+                .whitespace_nowrap()
+                .text_size(TEXT_META)
+                .text_color(rgb(INK_SOFT))
+                .child(div().min_w_0().overflow_hidden().text_ellipsis().child(name))
+                .when(folded, |d| {
+                    d.child(
+                        div()
+                            .flex_shrink_0()
+                            .font_features(tabular_nums())
+                            .child(format!("· {total}")),
+                    )
+                });
+            let title = div().id(("group-title", g)).relative().flex_1().min_w_0().h_flex();
+            let title = if foldable {
+                let chevron =
+                    Icon::new(if folded { IconAll::ChevronRight } else { IconAll::ChevronDown })
+                        .size_3()
+                        .text_color(rgb(INK_SOFT));
+                // 箭头放在组名左边的留白里（绝对定位），不占组名的宽度：第一组右侧还排着几个按钮
+                title
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(rems(-0.875))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .when(!folded, |d| {
+                                d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
+                            })
+                            .child(chevron),
+                    )
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let key = key.clone();
+                        if key == ARCHIVED_KEY {
+                            if !this.sidebar_expanded.remove(&key) {
+                                this.sidebar_expanded.insert(key);
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        this.save_ui_pref(
+                            move |s| match s.sidebar_folded.iter().position(|k| *k == key) {
+                                Some(at) => {
+                                    s.sidebar_folded.remove(at);
+                                }
+                                None => s.sidebar_folded.push(key.clone()),
+                            },
+                            cx,
+                        );
+                        cx.notify();
+                    }))
+            } else {
+                title.child(label)
+            };
             let header = div()
                 .id(("group-header", g))
                 .group("group-header")
@@ -304,18 +442,10 @@ impl ChatApp {
                 .px_4()
                 .pt(px(if g == 0 { 10. } else { 16. }))
                 .pb_1()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_size(TEXT_META)
-                        .text_color(rgb(INK_SOFT))
-                        .child(name),
-                );
-            let header = if g == 0 && filter != SidebarFilter::All {
+                .child(title);
+            // 折叠了的第一组只留筛选按钮：排序 / 分组方式 / 打开目录用不上，
+            // 悬停才显的按钮不显时也占宽度，留着会把组名和会话数挤成省略号
+            let header = if g == 0 && (filter != SidebarFilter::All || folded) {
                 header.child(self.sidebar_filter_menu(cx))
             } else if g == 0 {
                 let sort_on = self.sessions_by_activity;
@@ -392,6 +522,39 @@ impl ChatApp {
             }
             for i in members {
                 body = body.child(self.render_session_row(i, window, cx));
+            }
+            // 「显示其余 N 个」/「收起」：只在内存里记，重启回到只列最近几个
+            let more = if hidden > 0 && !folded {
+                Some(format!("显示其余 {hidden} 个"))
+            } else if foldable && !archive && !folded && show_all && total > GROUP_PREVIEW + 2 {
+                Some("收起".to_string())
+            } else {
+                None
+            };
+            if let Some(text) = more {
+                let key = more_key.clone();
+                body = body.child(
+                    div()
+                        .id(("group-more", g))
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .mx_2()
+                        .px_2()
+                        .py(px(5.))
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(SELECTED)))
+                        // 和会话行的状态标记同宽，文字对齐会话标题
+                        .child(div().size(px(14.)).flex_shrink_0())
+                        .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.sidebar_expanded.remove(&key) {
+                                this.sidebar_expanded.insert(key.clone());
+                            }
+                            cx.notify();
+                        })),
+                );
             }
         }
 
@@ -582,7 +745,24 @@ impl ChatApp {
 
     /// 侧栏分组：(组名, 会话下标)。当前工作目录一组在最前；
     /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
-    pub(super) fn session_groups(&self) -> Vec<(SharedString, Vec<usize>)> {
+    pub(super) fn session_groups(&self) -> Vec<SessionGroup> {
+        let archived = |i: usize| self.sessions[i].meta.as_ref().is_some_and(|m| m.archived);
+        let mut groups = self.active_session_groups(|i| !archived(i));
+        let members: Vec<usize> = (0..self.sessions.len()).filter(|&i| archived(i)).collect();
+        if !members.is_empty() {
+            let mut members = members;
+            // 最近归档 / 用过的在前
+            members.sort_by_key(|&i| {
+                std::cmp::Reverse(self.sessions[i].meta.as_ref().map_or(0, |m| m.updated_ms))
+            });
+            groups
+                .push(SessionGroup { key: ARCHIVED_KEY.into(), name: "已归档".into(), members });
+        }
+        groups
+    }
+
+    /// 没归档的会话（`listed`）按工作目录或日期分组。
+    fn active_session_groups(&self, listed: impl Fn(usize) -> bool) -> Vec<SessionGroup> {
         // 无元信息的会话（刚开、还没落盘）视为最新
         let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
         if self.settings.sidebar_by_date {
@@ -590,7 +770,7 @@ impl ChatApp {
                 SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
             let offset = crate::usage::local_offset_secs();
             let mut buckets: [Vec<usize>; 4] = Default::default();
-            for i in 0..self.sessions.len() {
+            for i in (0..self.sessions.len()).filter(|&i| listed(i)) {
                 buckets[crate::usage::day_bucket(activity(i).min(now), now, offset)].push(i);
             }
             return buckets
@@ -599,12 +779,12 @@ impl ChatApp {
                 .filter(|(members, _)| !members.is_empty())
                 .map(|(mut members, name)| {
                     members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
-                    (name.into(), members)
+                    SessionGroup { key: format!("date:{name}"), name: name.into(), members }
                 })
                 .collect();
         }
         let mut groups: Vec<(&Path, Vec<usize>)> = vec![(self.cwd.as_path(), Vec::new())];
-        for (i, s) in self.sessions.iter().enumerate() {
+        for (i, s) in self.sessions.iter().enumerate().filter(|&(i, _)| listed(i)) {
             match groups.iter_mut().find(|(cwd, _)| *cwd == s.cwd.as_path()) {
                 Some((_, members)) => members.push(i),
                 None => groups.push((s.cwd.as_path(), vec![i])),
@@ -618,7 +798,7 @@ impl ChatApp {
                     members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
                 }
                 let name = if g == 0 { self.project_name.clone() } else { project_label(cwd) };
-                (name, members)
+                SessionGroup { key: format!("dir:{}", cwd.display()), name, members }
             })
             .collect()
     }
@@ -737,15 +917,18 @@ impl ChatApp {
             window,
             cx,
         );
-        let icon_button = |id: &'static str, icon: IconAll| {
+        let icon_button = |id: &'static str, icon: IconAll, tip: &'static str| {
             div()
                 .id((id, i))
                 .p(px(3.))
                 .rounded_md()
                 .cursor_pointer()
                 .hover(|d| d.bg(rgb(HOVER_STRONG)))
+                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
                 .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
         };
+        // 还没落盘的会话（没发过消息）没东西可留，只给删除
+        let archived = s.meta.as_ref().map(|m| m.archived);
         row.cursor_pointer()
             .when(!active, |d| d.hover(|d| d.bg(rgb(SELECTED))))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -802,13 +985,27 @@ impl ChatApp {
                             .gap_0p5()
                             .rounded_r_md()
                             .bg(rgb(SELECTED))
-                            .child(icon_button("session-rename", IconAll::SquarePen).on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.start_rename(i, window, cx);
-                                }),
-                            ))
-                            .child(icon_button("session-delete", IconAll::X).on_click(
+                            .child(
+                                icon_button("session-rename", IconAll::SquarePen, "重命名")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.start_rename(i, window, cx);
+                                    })),
+                            )
+                            .when_some(archived, |d, archived| {
+                                let (icon, tip) = if archived {
+                                    (IconAll::ArchiveRestore, "取消归档")
+                                } else {
+                                    (IconAll::Archive, "归档")
+                                };
+                                d.child(icon_button("session-archive", icon, tip).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.set_archived(i, !archived, cx);
+                                    }),
+                                ))
+                            })
+                            .child(icon_button("session-delete", IconAll::X, "删除").on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.renaming = None;
@@ -831,6 +1028,27 @@ impl ChatApp {
             state.focus(window, cx);
             state.select_all(window, cx);
         });
+        cx.notify();
+    }
+
+    /// 归档 / 取消归档第 `idx` 个会话（写进元信息）。归档的是正看着的会话时换走：
+    /// 有还没发过消息的新会话就切过去，没有就开一个，免得它留在眼前像没归档成功。
+    pub(crate) fn set_archived(&mut self, idx: usize, archived: bool, cx: &mut Context<Self>) {
+        let Some(meta) = self.sessions.get_mut(idx).and_then(|s| s.meta.as_mut()) else {
+            return;
+        };
+        meta.archived = archived;
+        if let Some(store) = &self.store
+            && let Err(err) = store.save_meta(meta)
+        {
+            self.toast(Notification::error(format!("保存会话失败：{err}")), cx);
+        }
+        if archived && idx == self.active {
+            match self.sessions.iter().position(|s| !s.has_user_message()) {
+                Some(fresh) => self.activate_session(fresh, cx),
+                None => self.add_session(cx),
+            }
+        }
         cx.notify();
     }
 
@@ -906,5 +1124,29 @@ fn age_label(updated_ms: u64) -> SharedString {
         m if m < 60 => format!("{m} 分钟").into(),
         m if m < 60 * 24 => format!("{} 小时", m / 60).into(),
         m => format!("{} 天", m / (60 * 24)).into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 会话 i 的最近活动时间就是 i（越大越新）
+    fn shown(n: usize, folded: bool, show_all: bool, keep: &[usize]) -> (Vec<usize>, usize) {
+        let members: Vec<usize> = (0..n).collect();
+        visible_members(&members, folded, show_all, |i| keep.contains(&i), |i| i as u64)
+    }
+
+    #[core::prelude::v1::test]
+    fn groups_list_recent_sessions_and_keep_the_important_ones() {
+        // 只多出一两个：全列
+        assert_eq!(shown(7, false, false, &[]), ((0..7).collect(), 0));
+        // 多了：最近的 5 个按原顺序，加上要紧的
+        assert_eq!(shown(10, false, false, &[]), (vec![5, 6, 7, 8, 9], 5));
+        assert_eq!(shown(10, false, false, &[1]), (vec![1, 5, 6, 7, 8, 9], 4));
+        assert_eq!(shown(10, false, true, &[]), ((0..10).collect(), 0));
+        // 折叠：只剩要紧的，「显示全部」也不管用
+        assert_eq!(shown(3, true, false, &[]), (vec![], 3));
+        assert_eq!(shown(10, true, true, &[2, 8]), (vec![2, 8], 8));
     }
 }

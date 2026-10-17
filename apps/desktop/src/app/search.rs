@@ -118,7 +118,7 @@ impl ChatApp {
                 }
                 let query = this.palette_query.clone();
                 let order: Vec<usize> =
-                    this.session_groups().into_iter().flat_map(|(_, members)| members).collect();
+                    this.session_groups().into_iter().flat_map(|g| g.members).collect();
                 this.palette_hits = search_messages(&this.sessions, &order, &query);
                 cx.notify();
             })

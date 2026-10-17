@@ -215,6 +215,8 @@ pub struct Settings {
     pub workspace: Option<PathBuf>,
     /// 侧栏按日期（今天 / 昨天 / 最近 7 天 / 更早）而不是按工作目录分组，侧栏组名旁的按钮切换后写回
     pub sidebar_by_date: bool,
+    /// 侧栏里折叠起来的组（`SessionGroup::key`：`dir:<工作目录>` 或 `date:<日期组名>`），点组名切换后写回
+    pub sidebar_folded: Vec<String>,
     /// 窗口不在前台时，回复完成 / 等待授权 / 出错发系统通知；默认开
     pub notifications: bool,
     /// 界面缩放倍率（1.0 = 标准），设置页即时生效并写回
@@ -241,6 +243,7 @@ impl Default for Settings {
             sidebar_kernel_status: yes(),
             workspace: None,
             sidebar_by_date: false,
+            sidebar_folded: Vec::new(),
             notifications: yes(),
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),

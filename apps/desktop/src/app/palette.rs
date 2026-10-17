@@ -169,7 +169,7 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
     let sessions = app
         .session_groups()
         .into_iter()
-        .flat_map(|(_, members)| members)
+        .flat_map(|g| g.members)
         .map(|i| {
             let session = &app.sessions[i];
             Entry::new(IconAll::MessageSquare, session.title.clone(), PaletteCmd::Session(i))

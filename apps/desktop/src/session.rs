@@ -1283,6 +1283,7 @@ mod tests {
             kernel_session_id: Some("acp-1".into()),
             created_ms: 0,
             updated_ms: 0,
+            archived: false,
         }
     }
 

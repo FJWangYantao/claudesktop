@@ -134,6 +134,8 @@ pub struct ChatApp {
     sidebar_hover: Option<u64>,
     /// 侧栏只列哪些会话（全部 / 进行中 / 待查看）
     sidebar_filter: sidebar::SidebarFilter,
+    /// 侧栏里点了「显示其余 N 个」的组（`SessionGroup::key`）。只在内存里，重启回到只列最近几个
+    sidebar_expanded: std::collections::HashSet<String>,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
     placeholder: SharedString,
     /// 「回退到这里」浮层开着时算好的预览（打开时算一次，见 rewind.rs）
@@ -356,6 +358,7 @@ impl ChatApp {
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             sidebar_hover: None,
             sidebar_filter: Default::default(),
+            sidebar_expanded: Default::default(),
             placeholder: SharedString::default(),
             rewind: None,
             rewind_overwrite: false,

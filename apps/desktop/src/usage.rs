@@ -263,6 +263,7 @@ mod tests {
             kernel_session_id: None,
             created_ms: 0,
             updated_ms: 99,
+            archived: false,
         }
     }
 

@@ -206,7 +206,12 @@ impl ChatApp {
 
     /// 按侧栏的显示顺序前后切换会话（首尾相接）。
     fn step_session(&mut self, step: isize, cx: &mut Context<Self>) {
-        let order = session_order(self.session_groups().into_iter().map(|(_, members)| members));
+        let order = session_order(
+            self.session_groups()
+                .into_iter()
+                .filter(|g| g.key != super::sidebar::ARCHIVED_KEY)
+                .map(|g| g.members),
+        );
         if let Some(next) = neighbor(&order, self.active, step) {
             self.activate_session(next, cx);
         }
