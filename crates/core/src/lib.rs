@@ -13,6 +13,7 @@
 //! （内核线程调用），指令经 channel（UI 线程投递）。
 
 mod acp;
+pub mod checkpoint;
 mod diff;
 mod process_guard;
 mod store;
@@ -20,7 +21,7 @@ mod store;
 pub use acp::{AcpKernel, AcpKernelConfig};
 pub use diff::{DiffLineView, DiffView};
 pub use process_guard::kill_children_on_exit;
-pub use store::{Record, SessionLog, SessionMeta, SessionStore, default_data_dir};
+pub use store::{Record, SessionLog, SessionMeta, SessionStore, default_data_dir, effective};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -181,6 +182,9 @@ pub enum KernelEvent {
     CompactFailed { message: String },
     /// 内核致命错误（连接断开、初始化失败等，内核不再可用）
     Fatal(String),
+    /// 内核改了一个文件：改之前 / 之后的完整内容（None = 文件不存在）。
+    /// 给 UI 存检查点用（见 [`checkpoint`]）；内容可能很大，不原样进日志，由 UI 转成 `Record::FileChanged`
+    FileChanged { path: String, before: Option<String>, after: Option<String> },
 }
 
 impl KernelEvent {
@@ -210,6 +214,7 @@ impl KernelEvent {
             Self::Compacted { .. } => "compacted",
             Self::CompactFailed { .. } => "compact_failed",
             Self::Fatal(_) => "fatal",
+            Self::FileChanged { .. } => "file_changed",
         }
     }
 }
@@ -398,6 +403,16 @@ pub trait Kernel: Send + Sync {
     fn compact(&self, session: &str) -> anyhow::Result<()> {
         let _ = session;
         anyhow::bail!("当前内核不支持压缩上下文")
+    }
+    /// 能不能回退对话（[`Kernel::rewind`]）。上下文在 agent 进程里的内核不能。
+    fn supports_rewind(&self) -> bool {
+        false
+    }
+    /// 把会话上下文换成 `history`（本地日志）折算出的样子：回退到某条用户消息之前用。
+    /// 会话空闲时才调用。默认不支持。
+    fn rewind(&self, session: &str, history: &[Record]) -> anyhow::Result<()> {
+        let _ = (session, history);
+        anyhow::bail!("当前内核不支持回退对话")
     }
     /// 关闭内核。
     fn shutdown(&self);

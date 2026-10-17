@@ -1245,7 +1245,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 用户消息气泡；悬停时下方淡入「复制 / 编辑 / 在另一个内核上重跑」。刚发出的一条从下方淡入升起。
+    /// 用户消息气泡；悬停时下方淡入「复制 / 编辑 / 回退 / 在另一个内核上重跑」。刚发出的一条从下方淡入升起。
     fn render_user(
         &self,
         idx: usize,
@@ -1254,8 +1254,14 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let fade =
-            motion::hover_opacity(("user-actions", idx), self.hovered_msg == Some(idx), window, cx);
+        // 回退浮层开着时操作行常显（鼠标移到浮层上就离开了这条消息）
+        let rewinding = self.rewind.as_ref().is_some_and(|p| p.item() == idx);
+        let fade = motion::hover_opacity(
+            ("user-actions", idx),
+            self.hovered_msg == Some(idx) || rewinding,
+            window,
+            cx,
+        );
         let current = self.session().kernel;
         let others = KernelChoice::ALL.into_iter().filter(|k| {
             *k != current
@@ -1284,7 +1290,8 @@ impl ChatApp {
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.edit_message(idx, window, cx)),
                     ),
-            );
+            )
+            .child(self.rewind_action(idx, cx));
         for kind in others {
             actions = actions.child(
                 Self::message_action(

@@ -4,7 +4,7 @@
 //! `CLAUDESKTOP_BASE_URL=… CLAUDESKTOP_MODEL=… CLAUDESKTOP_API_KEY=… cargo test -p claudesktop-builtin -- --ignored`
 
 use claudesktop_builtin::{BuiltinConfig, BuiltinKernel, Protocol, ProviderConfig};
-use claudesktop_core::{EventSink, Kernel, KernelEvent, RoutedEvent, UserPrompt};
+use claudesktop_core::{EventSink, Kernel, KernelEvent, Record, RoutedEvent, UserPrompt};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -271,6 +271,46 @@ fn history_carries_into_next_turn() {
         })
         .collect();
     assert_eq!(roles[1..], ["user:第一问", "assistant:第一答", "user:第二问"]);
+}
+
+#[test]
+fn rewind_replaces_the_context() {
+    let (base, bodies) =
+        serve(vec![happy_stream("第一答"), happy_stream("第二答"), happy_stream("重来答")]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
+    h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    h.kernel.send_prompt(&sid, UserPrompt::text("第二问")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 日志里回退到第二问之前：第二轮从上下文里消失
+    let ev = |event| Record::Event { event };
+    let user = |text: &str| Record::User { text: text.into(), images: Vec::new() };
+    let ended = || ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
+    let log = vec![
+        user("第一问"),
+        ev(KernelEvent::AgentMessageChunk { text: "第一答".into() }),
+        ended(),
+        user("第二问"),
+        ev(KernelEvent::AgentMessageChunk { text: "第二答".into() }),
+        ended(),
+        Record::Rewind { turn: 1, conversation: true, files: 0, prompt: "第二问".into() },
+    ];
+    assert!(h.kernel.supports_rewind());
+    h.kernel.rewind(&sid, &log).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("重来问")).unwrap();
+    h.wait_n("turn 3", 3, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let texts: Vec<String> = body(&bodies, 2)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|m| m.to_string())
+        .collect();
+    assert_eq!(texts.len(), 3, "{texts:?}");
+    assert!(
+        texts[0].contains("第一问") && texts[1].contains("第一答") && texts[2].contains("重来问")
+    );
 }
 
 #[test]
@@ -587,6 +627,15 @@ fn write_asks_permission_and_allow_always_is_remembered() {
     h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(std::fs::read_to_string(dir.join("out/a.txt")).unwrap(), "A");
     assert_eq!(h.tool_status("w1").as_deref(), Some("completed"));
+    // 检查点：新建的文件，改之前不存在
+    assert_eq!(
+        h.count(|e| matches!(
+            e,
+            KernelEvent::FileChanged { path, before: None, after: Some(a) }
+                if path.ends_with("a.txt") && a == "A"
+        )),
+        1
+    );
 
     // 第二轮：规则已生效，不再询问
     h.kernel.send_prompt(&sid, UserPrompt::text("写 b")).unwrap();

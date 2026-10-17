@@ -12,6 +12,7 @@ mod motion;
 mod notify;
 mod overview;
 mod palette;
+mod rewind;
 mod settings_view;
 mod shortcuts;
 mod sidebar;
@@ -131,6 +132,10 @@ pub struct ChatApp {
     sidebar_filter: sidebar::SidebarFilter,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
     placeholder: SharedString,
+    /// 「回退到这里」浮层开着时算好的预览（打开时算一次，见 rewind.rs）
+    rewind: Option<rewind::RewindPreview>,
+    /// 浮层里「冲突的文件也覆盖」勾上了
+    rewind_overwrite: bool,
 }
 
 /// 一种内核的运行状态。
@@ -335,6 +340,8 @@ impl ChatApp {
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             placeholder: SharedString::default(),
+            rewind: None,
+            rewind_overwrite: false,
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
         cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
@@ -1193,6 +1200,14 @@ impl ChatApp {
                     }),
                 };
                 if let Some(idx) = idx {
+                    // 检查点：内容存成 blob、日志里记哈希，不进对话
+                    let event = match event {
+                        KernelEvent::FileChanged { path, before, after } => {
+                            self.record_file_change(idx, path, before, after);
+                            return;
+                        }
+                        event => event,
+                    };
                     let turn_over = matches!(
                         event,
                         KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. }
@@ -1277,6 +1292,33 @@ impl ChatApp {
         self.ensure_log(idx);
         if let Some(log) = &mut self.sessions[idx].log {
             let _ = log.append(record);
+        }
+    }
+
+    /// 内核改了文件：改动前后的内容存成 blob，日志里记哈希（回退时还原，见 rewind.rs）。
+    /// 存储不可用时不记，回退时就没有这个文件。
+    fn record_file_change(
+        &mut self,
+        idx: usize,
+        path: String,
+        before: Option<String>,
+        after: Option<String>,
+    ) {
+        if self.store.is_none() {
+            return;
+        }
+        self.ensure_log(idx);
+        let (Some(store), Some(meta)) = (&self.store, &self.sessions[idx].meta) else {
+            return;
+        };
+        let save = |text: Option<String>| text.map(|t| store.save_blob(&meta.id, &t)).transpose();
+        match (save(before), save(after)) {
+            (Ok(before), Ok(after)) => {
+                self.persist(idx, Record::FileChanged { path, before, after })
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                self.sessions[idx].note(format!("检查点没存上（回退时还原不了 {path}）：{err}"))
+            }
         }
     }
 

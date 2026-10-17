@@ -69,10 +69,23 @@ pub enum Record {
     },
     /// 一段思考想了多久（思考收尾时记下；重放时挂到它前面最近的思考块上）
     Thought { elapsed_ms: u64 },
+    /// 内核改了一个文件（检查点）：改之前 / 之后的内容存成 blob（[`SessionStore::save_blob`]），
+    /// 这里只记哈希，None = 文件不存在。它前面最近的一条 `User` 就是它所属的那一轮
+    FileChanged {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// 回退到第 `turn` 条用户消息（从 0 数，按当时的有效记录）之前。`conversation` 为真时
+    /// 从那条消息起的记录作废（见 [`effective`]）；`files` 是还原了几个文件，`prompt` 是那条消息
+    /// （重放时显示成一行备注）
+    Rewind { turn: usize, conversation: bool, files: usize, prompt: String },
 }
 
 impl Record {
-    /// 只持久化重放时有意义的事件；状态 / 连接 / fs 诊断等不记。
+    /// 只持久化重放时有意义的事件；状态 / 连接 / fs 诊断等不记（文件改动另记成 `FileChanged`）。
     pub fn worth_keeping(event: &KernelEvent) -> bool {
         matches!(
             event,
@@ -177,8 +190,9 @@ impl SessionStore {
 
     pub fn delete(&self, id: &str) -> io::Result<()> {
         let _ = fs::remove_file(self.log_path(id));
-        // 图片附件目录一并清掉（没有附件时目录不存在，忽略）
+        // 图片附件、检查点目录一并清掉（没有时目录不存在，忽略）
         let _ = fs::remove_dir_all(self.assets_dir(id));
+        let _ = fs::remove_dir_all(self.checkpoints_dir(id));
         fs::remove_file(self.meta_path(id))
     }
 
@@ -194,6 +208,30 @@ impl SessionStore {
         let path = dir.join(format!("{}.{ext}", new_id(now_ms())));
         fs::write(&path, bytes)?;
         Ok(path)
+    }
+
+    /// 会话的检查点目录：`<dir>/<id>.checkpoints/<sha256>`，文件内容按哈希存一份
+    fn checkpoints_dir(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.checkpoints"))
+    }
+
+    /// 存一份文件内容（同样的内容只存一次），返回它的哈希。
+    pub fn save_blob(&self, id: &str, text: &str) -> io::Result<String> {
+        let hash = crate::checkpoint::content_hash(text);
+        let dir = self.checkpoints_dir(id);
+        let path = dir.join(&hash);
+        if !path.exists() {
+            fs::create_dir_all(&dir)?;
+            let tmp = dir.join(format!("{hash}.tmp"));
+            fs::write(&tmp, text)?;
+            fs::rename(&tmp, &path)?;
+        }
+        Ok(hash)
+    }
+
+    /// 取回 [`SessionStore::save_blob`] 存的内容。
+    pub fn load_blob(&self, id: &str, hash: &str) -> io::Result<String> {
+        fs::read_to_string(self.checkpoints_dir(id).join(hash))
     }
 
     fn meta_path(&self, id: &str) -> PathBuf {
@@ -263,6 +301,26 @@ impl Drop for SessionLog {
     fn drop(&mut self) {
         let _ = self.flush();
     }
+}
+
+/// 折算回退：返回仍然有效的记录。遇到回退对话的 `Rewind` 时，把已收下的记录截到第 `turn` 条
+/// 用户消息之前，`Rewind` 本身留着（重放时显示成备注）。日志只追加，读的时候才折算。
+pub fn effective(records: &[Record]) -> Vec<Record> {
+    let mut out: Vec<Record> = Vec::with_capacity(records.len());
+    for record in records {
+        if let Record::Rewind { turn, conversation: true, .. } = record
+            && let Some(cut) = out
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| matches!(r, Record::User { .. }))
+                .nth(*turn)
+                .map(|(i, _)| i)
+        {
+            out.truncate(cut);
+        }
+        out.push(record.clone());
+    }
+    out
 }
 
 fn is_chunk(event: &KernelEvent) -> bool {

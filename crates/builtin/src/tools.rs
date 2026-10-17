@@ -507,6 +507,14 @@ impl Action {
         })
     }
 
+    /// 写文件 / 改文件的目标路径（检查点在执行前后各读一次）；其余工具为 None。
+    pub fn written_path(&self) -> Option<&Path> {
+        match self {
+            Self::Write { path, .. } | Self::Edit { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
     pub fn access(&self) -> Access {
         match self {
             Self::Read { .. } | Self::List { .. } | Self::Glob { .. } | Self::Grep { .. } => {

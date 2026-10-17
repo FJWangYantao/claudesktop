@@ -81,12 +81,14 @@ pub struct Rebuilt {
 
 /// 日志 → 对话历史。
 pub fn rebuild(records: &[Record]) -> Rebuilt {
+    // 回退过的轮次不进上下文
+    let records = claudesktop_core::effective(records);
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut summary = None;
     let mut assistant = Assistant::default();
     // 有进行中的一轮（最后一条用户消息之后还没结束）
     let mut in_turn = false;
-    for record in records {
+    for record in &records {
         match record {
             Record::User { text, images } => {
                 messages.extend(assistant.take());
@@ -153,7 +155,11 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
                 // 思考、权限请求不进上下文
                 _ => {}
             },
-            Record::PermissionResolved { .. } | Record::Turn { .. } | Record::Thought { .. } => {}
+            Record::PermissionResolved { .. }
+            | Record::Turn { .. }
+            | Record::Thought { .. }
+            | Record::FileChanged { .. }
+            | Record::Rewind { .. } => {}
         }
     }
     messages.extend(assistant.take());

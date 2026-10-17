@@ -235,7 +235,8 @@ impl Session {
         s.title = meta.title.clone().into();
         s.restored = true;
         s.replaying = true;
-        for record in records {
+        // 回退过的轮次不显示（日志只追加，读的时候折算）
+        for record in claudesktop_core::effective(&records) {
             match record {
                 Record::User { text, images } => s.transcript.push(ChatItem::User {
                     text: text.into(),
@@ -283,6 +284,11 @@ impl Session {
                         *resolved = Some(label.into());
                     }
                 }
+                Record::Rewind { conversation, files, prompt, .. } => {
+                    s.note(rewind_note(conversation, files, &prompt))
+                }
+                // 检查点只在回退时用，界面上不显示
+                Record::FileChanged { .. } => {}
             }
         }
         // 上次退出时还在进行的东西一律收尾
@@ -733,6 +739,17 @@ impl Session {
         }
     }
 
+    /// 回退对话：对话截到第 `idx` 行之前（那条用户消息起都不要了），挂在这些行上的状态一并清掉。
+    pub fn truncate_to(&mut self, idx: usize) {
+        self.transcript.truncate(idx);
+        self.turn_summaries.retain(|&i, _| i < idx);
+        self.open_groups.retain(|&i| i < idx);
+        self.plan_folded = false;
+        // 上下文变短了，用量等下一轮结束时内核再报
+        self.context_tokens = 0;
+        self.cache_hit = None;
+    }
+
     /// 这一轮停了 / 断了，还在转圈的工具行收成「已中断」（内核不会再报它们的结果）。
     pub fn interrupt_running_tools(&mut self) {
         for item in &mut self.transcript {
@@ -980,7 +997,8 @@ impl Session {
             | KernelEvent::Status(_)
             | KernelEvent::UserMessageChunk { .. }
             | KernelEvent::FsRead { .. }
-            | KernelEvent::FsWrite { .. } => {}
+            | KernelEvent::FsWrite { .. }
+            | KernelEvent::FileChanged { .. } => {}
             KernelEvent::UsageUpdated {
                 input_tokens,
                 output_tokens,
@@ -1096,6 +1114,16 @@ fn preview_line(text: &str) -> Option<String> {
         Some((at, _)) => format!("{}…", &line[..at]),
         None => line,
     })
+}
+
+/// 回退后对话里的那行备注（实时回退和重放日志共用）。
+pub fn rewind_note(conversation: bool, files: usize, prompt: &str) -> String {
+    let prompt = crate::model::title_from_prompt(prompt);
+    match (conversation, files) {
+        (true, 0) => format!("已回退到「{prompt}」之前"),
+        (true, n) => format!("已回退到「{prompt}」之前，还原了 {n} 个文件"),
+        (false, n) => format!("已把 {n} 个文件还原到「{prompt}」之前的样子"),
+    }
 }
 
 #[cfg(test)]
@@ -1706,6 +1734,26 @@ mod tests {
         s.busy = false;
         assert_eq!(s.pinned_plan(), None);
         assert!(!s.compute_layout(ViewMode::Normal)[1].compact);
+    }
+
+    #[core::prelude::v1::test]
+    fn replay_drops_rewound_turns() {
+        let records = vec![
+            Record::User { text: "第一问".into(), images: Vec::new() },
+            ev(KernelEvent::AgentMessageChunk { text: "答".into() }),
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+            Record::User { text: "第二问".into(), images: Vec::new() },
+            Record::FileChanged { path: "a.rs".into(), before: None, after: Some("h".into()) },
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+            Record::Rewind { turn: 1, conversation: true, files: 1, prompt: "第二问".into() },
+        ];
+        let s = Session::from_records(1, meta(), records);
+        let users = s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count();
+        assert_eq!(users, 1);
+        assert!(matches!(
+            s.transcript.last(),
+            Some(ChatItem::Note(t)) if t.as_ref() == "已回退到「第二问」之前，还原了 1 个文件"
+        ));
     }
 
     #[core::prelude::v1::test]

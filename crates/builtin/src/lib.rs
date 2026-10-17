@@ -47,7 +47,7 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
 }
 
 use claudesktop_core::{
-    EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, Record, RoutedEvent,
+    EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, Record, RoutedEvent, checkpoint,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -518,7 +518,18 @@ impl Inner {
                             output: None,
                         },
                     );
-                    action.run(stopped)
+                    // 检查点：改文件前后各读一次，交给 UI 存下来（回退时还原）
+                    let target = action.written_path().map(Path::to_path_buf);
+                    let before = target.as_deref().and_then(checkpoint::read_snapshot);
+                    let output = action.run(stopped);
+                    if let (Some(path), Some(before)) = (target, before)
+                        && let Some(after) = checkpoint::read_snapshot(&path)
+                        && before != after
+                    {
+                        let path = path.to_string_lossy().into_owned();
+                        self.emit(Some(session), KernelEvent::FileChanged { path, before, after });
+                    }
+                    output
                 }
                 Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),
             },
@@ -1046,6 +1057,26 @@ impl Kernel for BuiltinKernel {
     }
 
     /// 手动压缩：自成一轮（占着 `turn`，期间不能发消息、可以取消），全部对话进摘要。
+    fn supports_rewind(&self) -> bool {
+        true
+    }
+
+    /// 回退：上下文换成日志折算出的样子（工具调用只剩摘要，和续接历史会话一样）。
+    fn rewind(&self, session: &str, history: &[Record]) -> anyhow::Result<()> {
+        let rebuilt = history::rebuild(history);
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        let state =
+            sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+        if state.turn.is_some() {
+            anyhow::bail!("这一轮还没结束");
+        }
+        state.history = rebuilt.messages;
+        state.summary = rebuilt.summary;
+        state.restored = true;
+        state.measured = None;
+        Ok(())
+    }
+
     fn compact(&self, session: &str) -> anyhow::Result<()> {
         let (flag, model) = {
             let mut sessions = self.inner.sessions.lock().unwrap();
