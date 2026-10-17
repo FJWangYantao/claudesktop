@@ -6,12 +6,12 @@
 use super::ChatApp;
 use super::keys::CYCLE_VIEW_KEY;
 use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
+use super::widgets::Surface;
 use crate::model::ViewMode;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -142,20 +142,12 @@ impl ChatApp {
             })
             .when(can_export, |d| {
                 d.child(
-                    div()
-                        .id("share-session")
-                        .size(px(28.))
+                    Self::quiet_button("share-session", IconAll::Share, Surface::Paper, cx)
                         .mr_2()
-                        .flex_shrink_0()
-                        .rounded_md()
-                        .flex()
-                        .justify_center()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(rgb(HOVER)))
-                        .tooltip(|window, cx| Tooltip::new("导出为 Markdown").build(window, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.share_session(window, cx)))
-                        .child(Icon::new(IconAll::Share).size_4().text_color(rgb(INK_SOFT))),
+                        .tooltip("导出为 Markdown")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.share_session(window, cx)),
+                        ),
                 )
             })
             .children(window_controls(window))

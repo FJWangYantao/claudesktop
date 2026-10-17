@@ -1,6 +1,7 @@
 //! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
 
 use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
+use super::widgets::Surface;
 use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
 use crate::settings::KernelChoice;
@@ -8,6 +9,7 @@ use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Textarea;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
@@ -77,23 +79,14 @@ impl ChatApp {
 
     // ---------- 输入区 ----------
     /// 侧栏开关：展开时在侧栏头部，收起时在会话区顶栏最左（同一时刻只出现一个）。
-    pub(super) fn sidebar_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
-        div()
-            .id(id)
-            .size(px(28.))
-            .flex_shrink_0()
-            .rounded_md()
-            .flex()
-            .justify_center()
-            .items_center()
-            .cursor_pointer()
-            // 沙色侧栏和纸色顶栏上都会出现，取深的一档两边都看得见
-            .hover(|d| d.bg(rgb(SELECTED)))
+    pub(super) fn sidebar_toggle(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
+        // 沙色侧栏和纸色顶栏上都会出现，取深的一档（SELECTED）两边都看得见
+        Self::quiet_button(id, IconAll::PanelLeft, Surface::Sand, cx)
+            .tooltip(if self.sidebar_open { "收起侧栏" } else { "展开侧栏" })
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
             }))
-            .child(Icon::new(IconAll::PanelLeft).size_4().text_color(rgb(INK_SOFT)))
     }
 
     /// 权限模式菜单里选了一项：会话立即生效，已建立的内核会话同步 set_mode。
@@ -223,19 +216,10 @@ impl ChatApp {
                 mode_menu_items,
             ))
             .child(
-                div()
-                    .id("attach-files")
-                    .size(px(26.))
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)))
-                    .tooltip(|window, cx| Tooltip::new("添加文件").build(window, cx))
-                    .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx)))
-                    .child(Icon::new(IconAll::Plus).size_4().text_color(rgb(INK_SOFT))),
+                Self::quiet_button("attach-files", IconAll::Plus, Surface::Paper, cx)
+                    .small()
+                    .tooltip("添加文件")
+                    .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))),
             )
             .child(div().flex_1())
             .children(self.render_context_gauge())

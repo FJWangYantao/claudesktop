@@ -3,6 +3,7 @@
 use super::ChatApp;
 use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
 use super::menu::{MenuChip, menu_action, menu_item, menu_popover};
+use super::widgets::Surface;
 use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
@@ -645,16 +646,12 @@ impl ChatApp {
                                 .child(rule_label(rule)),
                         )
                         .child(
-                            div()
-                                .id(("rule-remove", n))
-                                .p_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|d| d.bg(rgb(HOVER)))
+                            Self::quiet_button(("rule-remove", n), IconAll::X, Surface::Paper, cx)
+                                .small()
+                                .tooltip("删除这条规则")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.remove_rule(p.clone(), r.clone(), cx)
-                                }))
-                                .child(Icon::new(IconAll::X).size_3p5().text_color(rgb(INK_SOFT))),
+                                })),
                         ),
                 );
                 n += 1;
@@ -723,27 +720,6 @@ impl ChatApp {
             .when_some(hint, |d, h| {
                 d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(h))
             })
-    }
-
-    fn button(id: &'static str, label: impl Into<SharedString>, primary: bool) -> Stateful<Div> {
-        div()
-            .id(id)
-            .px_3p5()
-            .py_1p5()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(TEXT_BODY)
-            .when(primary, |d| {
-                d.bg(rgb(CORAL_DEEP)).text_color(rgb(WHITE)).hover(|d| d.bg(rgb(CORAL_DEEP_HOVER)))
-            })
-            .when(!primary, |d| {
-                d.border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(CARD))
-                    .text_color(rgb(INK))
-                    .hover(|d| d.bg(rgb(HOVER)))
-            })
-            .child(label.into())
     }
 
     fn text_input(state: &Entity<InputState>) -> Div {
@@ -854,18 +830,19 @@ impl ChatApp {
                             }))
                             .child(label)
                             .child(
-                                div()
-                                    .id(("profile-remove", i))
-                                    .p(px(1.))
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(rgb(SELECTED)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                Self::quiet_button(
+                                    ("profile-remove", i),
+                                    IconAll::X,
+                                    Surface::Sand,
+                                    cx,
+                                )
+                                .xsmall()
+                                .tooltip("删除这套档案")
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.remove_form_profile(i, cx);
-                                    }))
-                                    .child(
-                                        Icon::new(IconAll::X).size_3().text_color(rgb(INK_SOFT)),
-                                    ),
+                                    },
+                                )),
                             ),
                     );
                 }
@@ -944,22 +921,27 @@ impl ChatApp {
                             }))
                             .child(label)
                     };
-                    let fetch_label =
-                        if self.fetching_models { "获取中…" } else { "获取模型列表" };
-                    let mut model_row =
-                        div()
-                            .h_flex()
-                            .gap_2()
-                            .child(div().flex_1().child(Self::text_input(&inputs.model)))
-                            .child(Self::button("fetch-models", fetch_label, false).on_click(
-                                cx.listener(|this, _, _, cx| this.fetch_models(true, cx)),
-                            ));
+                    let mut model_row = div()
+                        .h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Self::text_input(&inputs.model)))
+                        .child(
+                            Self::text_button("fetch-models", "获取模型列表", false)
+                                .loading(self.fetching_models)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.fetch_models(true, cx)),
+                                ),
+                        );
                     if antigravity_gateway().is_some() {
                         model_row = model_row.child(
-                            Self::button("import-antigravity", "从 Antigravity Tools 导入", false)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.import_antigravity(window, cx)
-                                })),
+                            Self::text_button(
+                                "import-antigravity",
+                                "从 Antigravity Tools 导入",
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.import_antigravity(window, cx),
+                            )),
                         );
                     }
                     let current_model = value(&inputs.model, cx);
@@ -1076,10 +1058,10 @@ impl ChatApp {
                     .h_flex()
                     .gap_2()
                     .child(
-                        Self::button("settings-save", "保存并应用", true)
+                        Self::text_button("settings-save", "保存并应用", true)
                             .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
                     )
-                    .child(Self::button("settings-cancel", "取消", false).on_click(cx.listener(
+                    .child(Self::text_button("settings-cancel", "取消", false).on_click(cx.listener(
                         |this, _, _, cx| {
                             this.settings_open = false;
                             cx.notify();
@@ -1162,19 +1144,19 @@ impl ChatApp {
                                     .child("设置"),
                             )
                             .child(
-                                div()
-                                    .id("settings-close")
-                                    .p_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(rgb(HOVER)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                Self::quiet_button(
+                                    "settings-close",
+                                    IconAll::X,
+                                    Surface::Paper,
+                                    cx,
+                                )
+                                .tooltip("关闭设置")
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.settings_open = false;
                                         cx.notify();
-                                    }))
-                                    .child(
-                                        Icon::new(IconAll::X).size_4().text_color(rgb(INK_SOFT)),
-                                    ),
+                                    },
+                                )),
                             ),
                     )
                     // 导航固定，只滚右侧内容

@@ -4,6 +4,7 @@
 //! 连续的几步收进可折叠的组（分组规则在 `Session::compute_layout`）。
 
 use super::ChatApp;
+use super::widgets::Surface;
 use crate::model::*;
 use crate::session::{RowLayout, Session, StepGroup};
 use crate::settings::KernelChoice;
@@ -11,6 +12,7 @@ use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Position;
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
@@ -105,6 +107,7 @@ fn code_block_header(
     lang: Option<SharedString>,
     copied: bool,
     on_copy: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> Div {
     let (icon, label) =
         if copied { (IconAll::Check, "已复制") } else { (IconAll::Copy, "复制") };
@@ -118,18 +121,10 @@ fn code_block_header(
         .font_family(sans())
         .children(lang.filter(|l| !l.is_empty()).map(|l| div().px_1().child(l)))
         .child(
-            div()
-                .id("copy-code")
-                .h_flex()
-                .items_center()
-                .gap_1()
+            ChatApp::quiet_button("copy-code", icon, Surface::Sand, cx)
+                .xsmall()
                 .px_1p5()
-                .py_0p5()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(SELECTED)))
-                .child(Icon::new(icon).size_3())
-                .child(label)
+                .label(label)
                 .on_click(on_copy),
         )
 }
@@ -630,31 +625,20 @@ impl ChatApp {
     ) -> Div {
         let busy = self.session().busy;
         let title = if overflow { "超出了模型的上下文长度" } else { "本轮失败" };
+        // 卡片自带边框，按钮不再描边：主操作赤陶实底，其余沙色实底（悬停 SELECTED）
         let button = |id: &'static str, icon: IconAll, label: &'static str, primary: bool| {
-            div()
-                .id((id, idx))
-                .h_flex()
-                .items_center()
-                .gap_1p5()
+            Button::new((id, idx))
+                .small()
                 .px_3()
-                .py_1()
-                .rounded_lg()
-                .text_size(TEXT_BODY)
-                .map(|d| match (primary, busy) {
-                    (_, true) => d.bg(rgb(SAND)).text_color(rgb(INK_FAINT)),
-                    (true, false) => d
-                        .bg(rgb(CORAL_DEEP))
-                        .text_color(rgb(WHITE))
-                        .cursor_pointer()
-                        .hover(|d| d.bg(rgb(CORAL_DEEP_HOVER))),
-                    (false, false) => d
-                        .bg(rgb(SAND))
-                        .text_color(rgb(INK))
-                        .cursor_pointer()
-                        .hover(|d| d.bg(rgb(SELECTED))),
+                .icon(icon)
+                .label(label)
+                .cursor_pointer()
+                .disabled(busy)
+                .with_variant(if primary {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Secondary
                 })
-                .child(Icon::new(icon).size_3p5())
-                .child(label)
         };
         div()
             .v_flex()
@@ -1077,11 +1061,11 @@ impl ChatApp {
         idx: usize,
         cx: &mut Context<Self>,
         text: impl Fn(&Session, usize) -> String + 'static,
-    ) -> Stateful<Div> {
+    ) -> Button {
         let copied = self.copied == Some((self.session().token, idx, None));
         let (icon, label) =
             if copied { (IconAll::Check, "已复制") } else { (IconAll::Copy, "复制") };
-        Self::message_action(id, icon, label).on_click(cx.listener(move |this, _, _, cx| {
+        Self::message_action(id, icon, label, cx).on_click(cx.listener(move |this, _, _, cx| {
             let content = text(this.session(), idx);
             this.copy_to_clipboard(idx, None, content, cx);
         }))
@@ -1160,8 +1144,8 @@ impl ChatApp {
                 }
             }))
             .child(
-                Self::message_action(("edit-user", idx), IconAll::Pencil, "编辑")
-                    .tooltip(move |window, cx| Tooltip::new(edit_tip).build(window, cx))
+                Self::message_action(("edit-user", idx), IconAll::Pencil, "编辑", cx)
+                    .tooltip(edit_tip)
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.edit_message(idx, window, cx)),
                     ),
@@ -1172,6 +1156,7 @@ impl ChatApp {
                     ("rerun", idx * 4 + kind.index()),
                     IconAll::RefreshCw,
                     format!("在「{}」上重跑", kind.label()),
+                    cx,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.rerun_on(idx, kind, cx))),
             );
@@ -1260,7 +1245,7 @@ impl ChatApp {
                     TextView::markdown(("agent", idx), SharedString::from(text))
                         .style(markdown_style())
                         .stream_fade(true)
-                        .code_block_actions(move |block, _, _| {
+                        .code_block_actions(move |block, _, cx| {
                             let start = block.span.map(|span| span.start).unwrap_or(0);
                             let code = block.code();
                             let app = app.clone();
@@ -1277,6 +1262,7 @@ impl ChatApp {
                                         )
                                     });
                                 },
+                                cx,
                             )
                         }),
                 );

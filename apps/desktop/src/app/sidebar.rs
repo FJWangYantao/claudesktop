@@ -1,15 +1,16 @@
 //! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
+use super::widgets::Surface;
 use super::{ChatApp, project_label};
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -53,6 +54,7 @@ impl ChatApp {
                             IconAll::CalendarDays,
                             if by_date { "按项目分组" } else { "按日期分组" },
                             by_date,
+                            cx,
                         )
                         .when(!by_date, |d| {
                             d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
@@ -74,6 +76,7 @@ impl ChatApp {
                                     "按最近活动排列"
                                 },
                                 sort_on,
+                                cx,
                             )
                             .when(!sort_on, |d| {
                                 d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
@@ -90,6 +93,7 @@ impl ChatApp {
                             IconAll::FolderOpen,
                             "在资源管理器中打开",
                             false,
+                            cx,
                         )
                         .opacity(0.)
                         .group_hover("group-header", |d| d.opacity(1.))
@@ -182,21 +186,18 @@ impl ChatApp {
         div().w(SIDEBAR_W).flex_shrink_0().h_full().pl_2().py_2().child(panel)
     }
 
-    /// 侧栏里的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
+    /// 侧栏分组标题上的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
     fn sidebar_icon_button(
         id: &'static str,
         icon: IconAll,
         tip: &'static str,
         on: bool,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .p(px(3.))
-            .rounded_md()
-            .cursor_pointer()
-            .hover(|d| d.bg(rgb(SELECTED)))
-            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-            .child(Icon::new(icon).size_3p5().text_color(rgb(if on { CORAL } else { INK_SOFT })))
+        cx: &App,
+    ) -> Button {
+        Self::quiet_button(id, icon, Surface::Sand, cx)
+            .xsmall()
+            .tooltip(tip)
+            .when(on, |b| b.icon(Icon::new(icon).text_color(rgb(CORAL))))
     }
 
     /// 每个已启动内核一行：状态点 + 「自研内核 · 已连接」

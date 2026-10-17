@@ -28,8 +28,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，
   动作经 `Entity<ChatApp>.update(cx, |this, cx| ...)` 回根视图；参照
   `composer.rs` 里 `mode_menu_items` 等菜单条目函数的写法（`menu_action!` 宏在 `menu.rs`）。
-- **按钮**：新按钮优先 `gpui-component` 的 `Button`（变体齐全）；确需特殊样式再
-  手写 div，但成组出现时应抽成 `app/widgets.rs` 的 helper。
+- **按钮**：用 `widgets.rs` 的 helper（都是 gpui-kit `Button`，键盘可达、按下不抢输入框焦点）：
+  文字按钮 `text_button`（primary 赤陶实底 / 默认卡片底细边，`.loading()` 表示进行中），
+  透明底图标按钮 `quiet_button`（`Surface::Paper` / `Sand` 决定悬停色，`.small()` / `.xsmall()` 调尺寸，
+  `.tooltip(..)` 直接给文字）。只有发送、回到底部这类特殊样式才手写 div；列表行、chip 不算按钮。
   带边框的容器（卡片、权限卡、输入框）里的按钮不再描边（单层边框）：次级用 `SAND` 实底
   （悬停 `SELECTED`），拒绝 / 危险项只留 `RED` 字、悬停出底色（红字在 `SAND` 上只有 4.0:1）。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
@@ -73,6 +75,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **`use gpui_kit::*` 的文件里写单元测试必须用 `#[core::prelude::v1::test]`**，
   裸 `#[test]` 会被 glob 导入的 gpui `test` 宏劫持，展开时无限递归
   （报 "recursion limit reached while expanding #[test]"，提高 recursion_limit 没用）。
+- **`TabBar` 的高度 / 内边距写死 px，不随界面缩放**，分段切换用 `widgets.rs` 的 `seg()`。
+  `Button` 的尺寸是 rem，圆角取 `Theme::radius`（`theme::apply_to_theme` 按根字号换算）；
+  它默认 `cursor_default`，helper 里补了 `cursor_pointer`。
 - `overflow_y_scroll()` 在 `StatefulInteractiveElement` 上——链式调用前必须先 `.id(...)`。
 - trigger 要作为 `Popover::trigger` 使用需实现 `gpui_kit::base::Selectable`（平凡
   builder trait，见 `MenuChip`）。
