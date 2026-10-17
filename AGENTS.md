@@ -17,7 +17,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `PopoverState::dismiss`），**不要**在 `ChatApp` 根 struct 里加 `*_open` bool、
   手摆 `absolute()` 坐标或手写互斥——那是 2026-10 之前的老写法，已清除。
 - **菜单条目**：两行式（图标 + 名称 + 灰色说明 + 当前项对勾）用 `menu.rs` 的 `menu_item()`，
-  点击收尾用同文件导出的 `menu_action!`。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
+  装进 `MenuList::pick(row, action)`（点了执行并收起，前 9 个自动标键帽、按数字直接选）；
+  不收起面板的内容用 `MenuList::child`。面板宽度用 rem。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
   `widgets.rs` 的 `message_action()`。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
@@ -26,8 +27,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **Markdown（`TextView`）**：字号、颜色、行高要直接设在 `TextView` 上（它实现了 `Styled`），
   设在外层 div 上不生效。
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，
-  动作经 `Entity<ChatApp>.update(cx, |this, cx| ...)` 回根视图；参照
-  `composer.rs` 里 `mode_menu_items` 等菜单条目函数的写法（`menu_action!` 宏在 `menu.rs`）。
+  动作经 `Entity<ChatApp>.update(cx, |this, cx| ...)` 回根视图（`MenuList::pick` 已包好）；参照
+  `composer.rs` 里 `mode_menu_items` 的写法。菜单打开时焦点在 `ChatApp::menu_focus`（数字键靠它），
+  trigger 不是 `MenuChip` 的菜单自己组 Popover 时套 `menu_panel()`。
 - **按钮**：用 `widgets.rs` 的 helper（都是 gpui-kit `Button`，键盘可达、按下不抢输入框焦点）：
   文字按钮 `text_button`（primary 赤陶实底 / 默认卡片底细边，`.loading()` 表示进行中），
   透明底图标按钮 `quiet_button`（`Surface::Paper` / `Sand` 决定悬停色，`.small()` / `.xsmall()` 调尺寸，
