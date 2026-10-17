@@ -584,6 +584,7 @@ impl ChatApp {
     pub(crate) fn activate_session(&mut self, i: usize, cx: &mut Context<Self>) {
         self.active = i;
         self.settings_open = false;
+        self.sessions[i].wheel = None;
         self.probe_context_window(i, cx);
         cx.notify();
     }

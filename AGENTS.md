@@ -81,6 +81,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     和标题之间的空隙算进内容（`pt_1` 而不是外层 `gap`），收到底才不剩一截。过程组里的步骤在列表那层
     （`RowLayout::member`）统一处理。悬停才出现的操作用 `hover_opacity`；刚出现的内容用 `entering`。
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
+  - 对话列表的滚轮在 `content.rs` 的 capture 阶段截住，走 `ChatApp::wheel_by` / `step_wheel` 平滑滑动
+    （gpui `List` 自己一格硬跳 60px）；新的程序化滚动（跳转、跟随底部）要清掉 `Session::wheel`，否则两边抢。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
   否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。
 - **输入框上方的内容区也是缓存 view**（`ContentView`，见 `content.rs`）：`ChatApp` 每次 `cx.notify()` 都让它重画，

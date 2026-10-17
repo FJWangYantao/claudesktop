@@ -87,6 +87,8 @@ pub struct Session {
     pub stopping: bool,
     /// 下次同步列表时滚到这一行（从搜索结果跳过来）
     pub reveal: Option<usize>,
+    /// 滚轮平滑滚动进行中（见 `ChatApp::step_wheel`）；跳转、回到底部时清掉，免得两边抢
+    pub wheel: Option<WheelScroll>,
     /// 刚在权限卡上「拒绝并说明」：输入框的占位文字请用户说要怎么改，下一条消息发出时清掉
     pub steering: bool,
     /// 最近一轮输入命中提示缓存的比例（%）；端点没报告时为 None
@@ -109,6 +111,15 @@ pub struct Retry {
 
 /// 进行中的过程组露出最近几步，其余收在组头里
 pub const LIVE_TAIL: usize = 3;
+
+/// 滚轮平滑滚动：滚轮只推进 `target`（离列表顶部的像素），实际位置每帧往它逼近一步。
+#[derive(Clone, Copy, Debug)]
+pub struct WheelScroll {
+    pub target: Pixels,
+    /// 这一串滚轮的最后一格何时到的（滑太久就放弃，防止目标够不着时一直排帧）
+    pub started: Instant,
+    pub last: Instant,
+}
 
 /// 对话记录里一行在当前视图下怎么画。连续的过程步骤（[`ChatItem::is_step`]）合成一组：
 /// 组头画在组里第一行的顶上，组内各步缩进在组头下面，折叠时不画。
@@ -223,6 +234,7 @@ impl Session {
             unread: false,
             queued: Vec::new(),
             reveal: None,
+            wheel: None,
             stopping: false,
             steering: false,
             cache_hit: None,
@@ -352,6 +364,7 @@ impl Session {
         }
         // 行数到位之后再滚，否则会被截到末尾；再往上让一点，别让顶上的渐隐盖住这一行
         if let Some(ix) = self.reveal.take().filter(|&ix| ix < n) {
+            self.wheel = None;
             self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
             self.list.scroll_by(-px(24.));
         }
@@ -542,7 +555,8 @@ impl Session {
     }
 
     /// 发消息时重新跟到底部（哪怕之前往上翻过）
-    pub fn follow_tail(&self) {
+    pub fn follow_tail(&mut self) {
+        self.wheel = None;
         self.list.set_follow_mode(FollowMode::Tail);
     }
 

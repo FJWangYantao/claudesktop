@@ -9,7 +9,7 @@ use super::motion::{self, Reveal};
 use super::rewind::file_name;
 use super::widgets::Surface;
 use crate::model::*;
-use crate::session::{RowLayout, Session, StepGroup};
+use crate::session::{RowLayout, Session, StepGroup, WheelScroll};
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
@@ -1219,7 +1219,8 @@ impl ChatApp {
     /// 点「回到底部」：离得远（超过一屏半）先跳到离底一屏的地方，剩下的一屏滑下去，
     /// 到底后恢复自动跟随。减少动态效果时直接到底。
     pub(super) fn start_jump_to_bottom(&mut self, cx: &mut Context<Self>) {
-        let s = self.session();
+        let s = &mut self.sessions[self.active];
+        s.wheel = None;
         let remaining = distance_to_end(&s.list);
         if cx.reduce_motion() || remaining <= px(1.) {
             s.follow_tail();
@@ -1241,7 +1242,7 @@ impl ChatApp {
         let Some(mut anim) = self.jump.take() else {
             return;
         };
-        let s = &self.sessions[self.active];
+        let s = &mut self.sessions[self.active];
         if anim.token != s.token || s.list.is_following_tail() {
             return;
         }
@@ -1256,6 +1257,57 @@ impl ChatApp {
         let k = 1. - (-dt / motion::JUMP_TAU).exp();
         s.list.scroll_by((remaining * k).max(px(1.)).min(remaining));
         self.jump = Some(anim);
+        window.request_animation_frame();
+    }
+
+    /// 滚轮往末尾滚了 `delta`（负 = 往开头）：只推进目标，由 [`Self::step_wheel`] 每帧滑过去，
+    /// 一格不再硬跳 60px。触控板的精确位移本来就连续，和减少动态效果时一样直接滚到位。
+    /// 只通知内容区：滚动不影响输入区。
+    pub(super) fn wheel_by(&mut self, delta: Pixels, precise: bool, cx: &mut Context<Self>) {
+        self.jump = None;
+        let s = &mut self.sessions[self.active];
+        let top = scroll_top(&s.list);
+        let max = s.list.max_offset_for_scrollbar().y.max(px(0.));
+        if precise || cx.reduce_motion() {
+            s.wheel = None;
+            s.list.scroll_by((top + delta).clamp(px(0.), max) - top);
+        } else {
+            // 接着上一格没滑完的目标往前推；反过来滚时从当前位置算，不先把剩下那段走完
+            let base = match s.wheel {
+                Some(w) if (w.target > top) == (delta > px(0.)) => w.target,
+                _ => top,
+            };
+            let now = Instant::now();
+            // 新的一串从「上一帧」算起，第一帧就走一帧的量，不是从零起步
+            let last = s.wheel.map_or(now.checked_sub(FRAME).unwrap_or(now), |w| w.last);
+            s.wheel =
+                Some(WheelScroll { target: (base + delta).clamp(px(0.), max), started: now, last });
+        }
+        self.content_view.update(cx, |_, cx| cx.notify());
+    }
+
+    /// 滚轮平滑的一帧（`render_content` 开头调）：剩下的距离按指数衰减地滑过去。
+    pub(super) fn step_wheel(&mut self, window: &mut Window) {
+        let s = &mut self.sessions[self.active];
+        let Some(mut w) = s.wheel.take() else {
+            return;
+        };
+        if w.started.elapsed() > motion::WHEEL_MAX {
+            return;
+        }
+        let now = Instant::now();
+        let dt = (now - w.last).as_secs_f32().min(0.1);
+        w.last = now;
+        // 期间有行重测过，可滚的范围会变：目标跟着收进去，免得够不着一直排帧
+        w.target = w.target.min(s.list.max_offset_for_scrollbar().y.max(px(0.)));
+        let rest = w.target - scroll_top(&s.list);
+        let step = rest * (1. - (-dt / motion::WHEEL_TAU).exp());
+        if (rest - step).abs() < px(0.5) {
+            s.list.scroll_by(rest);
+            return;
+        }
+        s.list.scroll_by(step);
+        s.wheel = Some(w);
         window.request_animation_frame();
     }
 
@@ -1575,6 +1627,14 @@ impl ChatApp {
 }
 
 /// 列表离底部还有多远（按已量过的行高估）。
+/// 一帧的时长（滚轮平滑起步时用）
+const FRAME: Duration = Duration::from_millis(16);
+
+/// 列表当前滚到离顶部多远（像素）。
+fn scroll_top(list: &ListState) -> Pixels {
+    -list.scroll_px_offset_for_scrollbar().y
+}
+
 fn distance_to_end(list: &ListState) -> Pixels {
     (list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y).max(px(0.))
 }

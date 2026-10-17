@@ -57,6 +57,7 @@ impl ChatApp {
         }
 
         self.step_jump_to_bottom(window);
+        self.step_wheel(window);
         // 虚拟列表：只布局 / 绘制视口附近的行；最后一行是运行状态行（见 Session::sync_list）
         let view = self.settings.view_mode;
         self.sessions[active].sync_list(view);
@@ -114,6 +115,31 @@ impl ChatApp {
                 linear_color_stop(to, 1.),
             ))
         };
+        // 滚轮平滑：capture 阶段截住滚轮记成目标（见 `ChatApp::wheel_by`），列表自己在 bubble 阶段
+        // 一格硬跳 60px 的处理就不跑了。只有横向（Shift+滚轮）时放行。
+        // 命中区不挡悬停；弹层、对话框盖在上面时 `should_handle_scroll` 为 false，不抢它们的滚轮
+        let app = cx.entity().downgrade();
+        let line = rems(1.25).to_pixels(window.rem_size());
+        let wheel = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |_, hitbox, window, _| {
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                    if !phase.capture() || !hitbox.should_handle_scroll(window) {
+                        return;
+                    }
+                    // gpui 的 delta.y 正 = 往开头
+                    let dy = event.delta.pixel_delta(line).y;
+                    if dy == px(0.) {
+                        return;
+                    }
+                    let precise = event.delta.precise();
+                    app.update(cx, |this, cx| this.wheel_by(-dy, precise, cx)).ok();
+                    cx.stop_propagation();
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
         // 按会话划开元素状态：展开进度、悬停淡入这些按行号记的状态不串到别的会话
         div()
             .id(("transcript", self.sessions[active].token))
@@ -121,6 +147,7 @@ impl ChatApp {
             .size_full()
             .v_flex()
             .child(scroll)
+            .child(wheel)
             .child(fade(px(16.), paper, clear).top_0())
             .child(fade(px(24.), clear, paper).bottom_0())
             .children(self.render_jump_to_bottom(window, cx))

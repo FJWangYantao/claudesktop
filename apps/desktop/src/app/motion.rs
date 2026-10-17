@@ -97,6 +97,11 @@ pub(super) const JUMP_TAU: f32 = 0.06;
 /// 平滑回到底部最多滑这么久，之后直接交给自动跟随（流式输出时底部一直在长）
 pub(super) const JUMP_MAX: Duration = Duration::from_millis(500);
 
+/// 滚轮平滑：剩下的距离每过这么久衰减到 1/e（比回到底部干脆，滚轮要跟手）
+pub(super) const WHEEL_TAU: f32 = 0.05;
+/// 一串滚轮最后一格之后最多再滑这么久（正常 4 倍 TAU 就到了，这是兜底）
+pub(super) const WHEEL_MAX: Duration = Duration::from_millis(600);
+
 /// 「回到底部」的平滑滚动进行中：哪个会话、何时开始、上一帧的时刻。
 #[derive(Clone, Copy)]
 pub(super) struct JumpAnim {
