@@ -1,6 +1,6 @@
 //! 对话记录的数据模型、模式表与工具行辅助函数（UI 无关逻辑）。
 
-use claudesktop_core::{DiffView, PermissionOptionView};
+use claudesktop_core::{DiffView, PermissionOptionView, PromptImage, UserPrompt};
 use gpui_kit::SharedString;
 use gpui_kit::assets::IconName as IconAll;
 use std::time::Instant;
@@ -333,6 +333,34 @@ impl PendingImage {
     }
 }
 
+/// 一轮还在跑时用户又发的一条消息：先排队，这一轮正常结束后再发。
+/// 附件原样留着（不转成 `PromptImage`），退回输入框时还有预览。
+pub struct QueuedPrompt {
+    pub text: String,
+    pub images: Vec<PendingImage>,
+}
+
+impl QueuedPrompt {
+    pub fn into_prompt(self) -> UserPrompt {
+        let images = self
+            .images
+            .into_iter()
+            .map(|p| PromptImage { media_type: p.media_type, data: p.data })
+            .collect();
+        UserPrompt { text: self.text, images }
+    }
+
+    /// 队列里一行显示的文字：换行压成空格；只有图片时写「N 张图片」。
+    pub fn summary(&self) -> String {
+        let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        match (text.is_empty(), self.images.len()) {
+            (true, n) => format!("{n} 张图片"),
+            (false, 0) => text,
+            (false, n) => format!("{text}（附 {n} 张图片）"),
+        }
+    }
+}
+
 impl ChatItem {
     /// 新开一段流式中的思考（默认收起）；`started` 为 None 时不计时（重放历史）。
     pub fn thinking(text: impl Into<String>, started: Option<Instant>) -> Self {
@@ -557,6 +585,13 @@ mod tests {
     fn title_is_one_line() {
         assert_eq!(title_from_prompt("  修一下\n\n  这个报错 "), "修一下 这个报错");
         assert_eq!(title_from_prompt(&"字".repeat(30)).chars().count(), 18);
+    }
+
+    #[core::prelude::v1::test]
+    fn queued_summary_is_one_line() {
+        let q = QueuedPrompt { text: "先别改\n  测试\n".into(), images: Vec::new() };
+        assert_eq!(q.summary(), "先别改 测试");
+        assert_eq!(q.into_prompt(), UserPrompt::text("先别改\n  测试\n"));
     }
 
     #[core::prelude::v1::test]

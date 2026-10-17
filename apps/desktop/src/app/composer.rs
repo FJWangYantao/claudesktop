@@ -182,7 +182,7 @@ impl ChatApp {
             .when(busy || can_send, |d| d.cursor_pointer())
             .tooltip(move |window, cx| {
                 Tooltip::new(match (busy, can_send) {
-                    (true, _) => "停止（Esc）",
+                    (true, _) => "停止（Esc）；回车把输入排进队列",
                     (false, true) => "发送（回车）",
                     (false, false) => "先输入内容或附上图片",
                 })
@@ -199,7 +199,7 @@ impl ChatApp {
             })
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.session().busy {
-                    this.stop(cx);
+                    this.stop(window, cx);
                 } else {
                     // 空输入时 send 自己会忽略
                     this.send(window, cx);
@@ -306,6 +306,7 @@ impl ChatApp {
                     .v_flex()
                     .gap_1()
                     .children(self.render_context_warning(cx))
+                    .children(self.render_queue(cx))
                     // `/`、`@` 补全列表浮在卡片正上方，盖住对话而不是把输入框往下挤
                     .child(div().relative().child(self.with_completion_keys(card, cx)).children(
                         self.render_completion(cx).map(|list| {
@@ -381,6 +382,82 @@ impl ChatApp {
                     },
                 ))),
         )
+    }
+
+    /// 输入框正上方的排队消息（`Session::queued`）：一条一行，可以退回输入框改、删掉；
+    /// 上一轮没有正常结束（停了 / 出错）时队列不自己走，每行多一个「现在发送」。
+    fn render_queue(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let s = self.session();
+        if s.queued.is_empty() {
+            return None;
+        }
+        let busy = s.busy;
+        let hint = if busy {
+            format!("排队 {} 条 · 这一轮结束后依次发出", s.queued.len())
+        } else if s.stopping {
+            format!("排队 {} 条 · 停稳后发出", s.queued.len())
+        } else {
+            format!("排队 {} 条 · 上一轮没有正常结束，先不自动发", s.queued.len())
+        };
+        let mut card = div()
+            .v_flex()
+            .gap_0p5()
+            .pl_3()
+            .pr_1()
+            .py_1()
+            .rounded_lg()
+            .bg(rgb(SAND))
+            .text_size(TEXT_SMALL)
+            .text_color(rgb(INK_SOFT))
+            .child(div().py_0p5().font_features(tabular_nums()).child(hint));
+        for (i, item) in s.queued.iter().enumerate() {
+            let text: SharedString = item.summary().into();
+            card = card.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Icon::new(IconAll::CornerDownRight).size_3p5().flex_shrink_0())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(rgb(INK))
+                            .child(text),
+                    )
+                    .when(!busy, |d| {
+                        d.child(
+                            Self::quiet_button(
+                                ("queue-send", i),
+                                IconAll::ArrowUp,
+                                Surface::Sand,
+                                cx,
+                            )
+                            .xsmall()
+                            .tooltip("现在发送")
+                            .on_click(cx.listener(move |this, _, _, cx| this.send_queued(i, cx))),
+                        )
+                    })
+                    .child(
+                        Self::quiet_button(("queue-edit", i), IconAll::Pencil, Surface::Sand, cx)
+                            .xsmall()
+                            .tooltip("退回输入框修改")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.unqueue(Some(i), window, cx)
+                            })),
+                    )
+                    .child(
+                        Self::quiet_button(("queue-remove", i), IconAll::X, Surface::Sand, cx)
+                            .xsmall()
+                            .tooltip("不发了")
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove_queued(i, cx))),
+                    ),
+            );
+        }
+        Some(card)
     }
 
     /// 模型名左边的上下文用量：小圆环 + 百分比，悬停看具体数字；端点没报窗口大小时只写用了多少。

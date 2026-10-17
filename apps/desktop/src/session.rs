@@ -80,6 +80,13 @@ pub struct Session {
     pub retry: Option<Retry>,
     /// 不在眼前时这一轮结束了（回复完 / 出错），用户还没切过来看；侧栏标点、可按它筛选。只在内存里
     pub unread: bool,
+    /// 这一轮跑着时用户又发的消息（先进先出）：这一轮正常结束就发出第一条，见 `ChatApp::dispatch_queued`。只在内存里
+    pub queued: Vec<QueuedPrompt>,
+    /// 用户按了停止、内核还没回这一轮的结束：这期间发的消息先排队，等结束到了再发
+    /// （不然迟到的「已取消」会落在新的一轮头上，把它提前收掉）
+    pub stopping: bool,
+    /// 刚在权限卡上「拒绝并说明」：输入框的占位文字请用户说要怎么改，下一条消息发出时清掉
+    pub steering: bool,
     /// 最近一轮输入命中提示缓存的比例（%）；端点没报告时为 None
     pub cache_hit: Option<u32>,
     /// 收到过的内容事件个数，和 `seen_seq` 比较判断往上翻的时候底下有没有来新内容
@@ -212,6 +219,9 @@ impl Session {
             thought_done: None,
             retry: None,
             unread: false,
+            queued: Vec::new(),
+            stopping: false,
+            steering: false,
             cache_hit: None,
             content_seq: 0,
             seen_seq: 0,
@@ -522,7 +532,14 @@ impl Session {
 
     /// 有还没应答的权限请求
     pub fn waiting_permission(&self) -> bool {
-        self.transcript.iter().any(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
+        self.pending_permission().is_some()
+    }
+
+    /// 最早一条还没应答的权限请求（Alt+数字键应答的就是它）
+    pub fn pending_permission(&self) -> Option<usize> {
+        self.transcript
+            .iter()
+            .position(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
     }
 
     /// 第 `idx` 条是刚发出去、这一轮还在跑的用户消息：返回发出的时刻（入场动画用）。
@@ -716,6 +733,20 @@ impl Session {
         }
     }
 
+    /// 这一轮停了 / 断了，还在转圈的工具行收成「已中断」（内核不会再报它们的结果）。
+    pub fn interrupt_running_tools(&mut self) {
+        for item in &mut self.transcript {
+            if let ChatItem::Tool(card) = item
+                && card.phase == ToolPhase::Running
+            {
+                card.phase = ToolPhase::Failed;
+                if card.result.is_empty() {
+                    card.result = "已中断".into();
+                }
+            }
+        }
+    }
+
     /// 内核要换了：收尾进行中的一轮，断开与旧内核会话的关联。
     /// 有对话的会话变成「历史会话」，下次发消息时在新内核上续接。
     pub fn detach_kernel(&mut self, kernel: Option<&Arc<dyn Kernel>>) {
@@ -724,18 +755,10 @@ impl Session {
         if self.busy {
             self.busy = false;
             self.finish_thinking();
-            for item in &mut self.transcript {
-                if let ChatItem::Tool(card) = item
-                    && card.phase == ToolPhase::Running
-                {
-                    card.phase = ToolPhase::Failed;
-                    if card.result.is_empty() {
-                        card.result = "已中断".into();
-                    }
-                }
-            }
+            self.interrupt_running_tools();
             self.note("内核已切换，这一轮已中断");
         }
+        self.stopping = false;
         self.acp_id = None;
         self.requested = false;
         self.resuming = false;
@@ -747,6 +770,7 @@ impl Session {
     /// 内核致命错误：这个会话不再可用。
     pub fn on_fatal(&mut self, message: &str, kernel: Option<&Arc<dyn Kernel>>) {
         self.busy = false;
+        self.stopping = false;
         self.ready = false;
         self.cancel_pending_permissions(kernel);
         self.note(format!("内核错误：{message}"));
@@ -930,7 +954,9 @@ impl Session {
                 self.settle_compaction(CompactState::Failed("已中断".into()));
                 self.finish_thinking();
                 self.busy = false;
+                self.stopping = false;
                 self.cancel_pending_permissions(kernel);
+                self.interrupt_running_tools();
                 self.fail(message);
             }
             KernelEvent::TurnEnded { stop_reason } => {
@@ -939,8 +965,11 @@ impl Session {
                 ));
                 self.finish_thinking();
                 self.busy = false;
+                // 用户停下的：「已请求停止」已经说过了，不再补一行「本轮结束：cancelled」
+                let stopped = std::mem::take(&mut self.stopping) && stop_reason == "cancelled";
                 self.cancel_pending_permissions(kernel);
-                if stop_reason != "end_turn" {
+                self.interrupt_running_tools();
+                if stop_reason != "end_turn" && !stopped {
                     self.note(format!("本轮结束：{stop_reason}"));
                 }
             }
@@ -1351,6 +1380,32 @@ mod tests {
         s.apply_event(KernelEvent::AgentMessageChunk { text: "好".into() }, None);
         assert!(s.retry.is_none());
         assert_eq!(s.activity(), Activity::Replying);
+    }
+
+    #[core::prelude::v1::test]
+    fn cancelled_turn_settles_tools_and_stopping() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.transcript.push(ChatItem::User { text: "跑一下".into(), images: Vec::new() });
+        s.begin_turn();
+        s.transcript.push(ChatItem::Tool(ToolCard {
+            id: None,
+            kind: "execute".into(),
+            name: "Bash".into(),
+            arg: "echo hi".into(),
+            result: SharedString::default(),
+            output: SharedString::default(),
+            phase: ToolPhase::Running,
+            diffs: Vec::new(),
+            expanded: false,
+        }));
+        // 用户停下：等内核回结束，期间工具行不该一直转圈
+        s.busy = false;
+        s.stopping = true;
+        s.apply_event(KernelEvent::TurnEnded { stop_reason: "cancelled".into() }, None);
+        assert!(!s.stopping);
+        assert!(!s.transcript.iter().any(|i| matches!(i, ChatItem::Note(_))));
+        let Some(ChatItem::Tool(card)) = s.transcript.get(1) else { panic!() };
+        assert!(card.phase == ToolPhase::Failed && card.result.as_ref() == "已中断");
     }
 
     #[core::prelude::v1::test]

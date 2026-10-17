@@ -33,7 +33,8 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
     (
         "对话",
         &[
-            ("停止这一轮", &[STOP_KEY]),
+            ("停止这一轮（排队的消息退回输入框）", &[STOP_KEY]),
+            ("按权限卡上的按钮", &PERMISSION_KEYS),
             ("切换权限模式", &[CYCLE_MODE_KEY]),
             ("切换视图（摘要 / 标准 / 详细）", &[CYCLE_VIEW_KEY]),
         ],
@@ -42,7 +43,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
     (
         "输入框",
         &[
-            ("发送", &["enter"]),
+            ("发送（这一轮还在跑时排队）", &["enter"]),
             ("换行", &["shift-enter"]),
             ("指令 / 引用文件", &["/", "@"]),
             ("填入建议的提示词", &["tab"]),

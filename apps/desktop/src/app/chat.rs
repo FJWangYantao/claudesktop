@@ -718,11 +718,14 @@ impl ChatApp {
             )
     }
 
+    /// 权限卡：内核给的选项按钮之后是「拒绝并说明」。`keyed` = 这是最早一条待定的请求，
+    /// 按钮上带 Alt+数字提示（见 keys.rs 的 `answer_key`）。
     pub(super) fn render_permission(
         idx: usize,
         title: &SharedString,
         options: &[PermissionOptionView],
         resolved: &Option<SharedString>,
+        keyed: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         if let Some(label) = resolved {
@@ -732,6 +735,12 @@ impl ChatApp {
                 .child(div().flex_shrink_0().child(format!("· {label}")));
         }
 
+        // 按钮文字后面淡淡跟一个按键提示（不画 Kbd 底框：主按钮是赤陶实底）
+        let key_hint = |n: usize| {
+            super::keys::PERMISSION_KEYS.get(n).filter(|_| keyed).map(|key| {
+                div().text_size(TEXT_META).opacity(0.7).child(Self::kbd(key).appearance(false))
+            })
+        };
         let mut buttons = div().h_flex().flex_wrap().gap_2();
         for (n, opt) in options.iter().enumerate() {
             let allow = opt.kind.starts_with("allow");
@@ -740,6 +749,9 @@ impl ChatApp {
             buttons = buttons.child(
                 div()
                     .id(("perm", idx * 16 + n))
+                    .h_flex()
+                    .items_center()
+                    .gap_1p5()
                     .px_3()
                     .py_1p5()
                     .rounded_lg()
@@ -759,9 +771,30 @@ impl ChatApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.resolve_permission(idx, Some((id.clone(), name.clone())), cx);
                     }))
-                    .child(opt.name.clone()),
+                    .child(opt.name.clone())
+                    .children(key_hint(n)),
             );
         }
+        // 拒绝并说明：停下这一轮，请用户在输入框里说要怎么改（输入框里已经写了就直接发）
+        buttons = buttons.child(
+            div()
+                .id(("perm-steer", idx))
+                .h_flex()
+                .items_center()
+                .gap_1p5()
+                .px_3()
+                .py_1p5()
+                .rounded_lg()
+                .cursor_pointer()
+                .text_size(TEXT_BODY)
+                .text_color(rgb(INK_SOFT))
+                .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.reject_and_steer(idx, window, cx);
+                }))
+                .child("拒绝并说明…")
+                .children(key_hint(options.len())),
+        );
 
         div()
             .v_flex()
@@ -1342,7 +1375,8 @@ impl ChatApp {
                 Self::render_auto_approved(idx, title, chosen)
             }
             ChatItem::Permission { title, options, resolved, .. } => {
-                Self::render_permission(idx, title, options, resolved, cx)
+                let keyed = self.session().pending_permission() == Some(idx);
+                Self::render_permission(idx, title, options, resolved, keyed, cx)
             }
             ChatItem::Plan(rows) => Self::render_plan(rows, layout.compact),
             ChatItem::Agent(text) => {

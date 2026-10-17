@@ -299,9 +299,13 @@ impl ChatApp {
         self.on_home().then(|| SUGGESTIONS[self.session().token as usize % SUGGESTIONS.len()].2)
     }
 
-    /// 输入框的占位文字：首页是建议的提示词，其余是操作提示。变了才写进输入框（每帧调一次）。
+    /// 输入框的占位文字：首页是建议的提示词，跑着时说明回车会排队，刚拒绝了权限时请用户说要怎么改，
+    /// 其余是操作提示。变了才写进输入框（每帧调一次）。
     pub(super) fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let s = self.session();
         let text: SharedString = match self.ghost_prompt() {
+            _ if s.steering => "说说要它怎么改，回车发送".into(),
+            _ if s.busy || s.stopping => "回车排队，这一轮结束后自动发出".into(),
             Some(prompt) => format!("试试：{prompt}（Tab 填入）").into(),
             None => PLACEHOLDER.into(),
         };
@@ -318,10 +322,12 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let column = prompt.chars().count() as u32;
+        // 光标放到最后一行行尾（退回输入框的排队消息可能有好几行）
+        let line = prompt.matches('\n').count() as u32;
+        let column = prompt.rsplit('\n').next().unwrap_or_default().chars().count() as u32;
         self.input.update(cx, |state, cx| {
             state.set_value(prompt.to_string(), window, cx);
-            state.set_cursor_position(Position::new(0, column), window, cx);
+            state.set_cursor_position(Position::new(line, column), window, cx);
             state.focus(window, cx);
         });
         self.refresh_composer(cx);

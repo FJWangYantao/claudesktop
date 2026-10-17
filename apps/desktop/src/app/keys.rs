@@ -41,6 +41,11 @@ actions!(
         OpenPalette,
         /// 打开快捷键速查
         ShowShortcuts,
+        /// 应答最早一条待定的权限请求：选第 1 / 2 / 3 / 4 个按钮
+        AnswerPermission1,
+        AnswerPermission2,
+        AnswerPermission3,
+        AnswerPermission4,
     ]
 );
 
@@ -61,6 +66,8 @@ pub(super) const CYCLE_VIEW_KEY: &str = "ctrl-o";
 pub(super) const ZOOM_IN_KEY: &str = "secondary-=";
 pub(super) const ZOOM_OUT_KEY: &str = "secondary--";
 pub(super) const ZOOM_RESET_KEY: &str = "secondary-0";
+/// 权限卡上的第 n 个按钮。带 Alt：焦点总在输入框里，裸数字键会和打字（排队消息）抢
+pub(super) const PERMISSION_KEYS: [&str; 4] = ["alt-1", "alt-2", "alt-3", "alt-4"];
 
 /// 注册按键（应用启动时调用一次）。`secondary` 在 macOS 上是 Cmd，其余平台是 Ctrl。
 pub(crate) fn bind(cx: &mut App) {
@@ -79,6 +86,10 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new("secondary-+", ZoomIn, Some(CONTEXT)),
         KeyBinding::new(ZOOM_OUT_KEY, ZoomOut, Some(CONTEXT)),
         KeyBinding::new(ZOOM_RESET_KEY, ZoomReset, Some(CONTEXT)),
+        KeyBinding::new(PERMISSION_KEYS[0], AnswerPermission1, Some(CONTEXT)),
+        KeyBinding::new(PERMISSION_KEYS[1], AnswerPermission2, Some(CONTEXT)),
+        KeyBinding::new(PERMISSION_KEYS[2], AnswerPermission3, Some(CONTEXT)),
+        KeyBinding::new(PERMISSION_KEYS[3], AnswerPermission4, Some(CONTEXT)),
     ]);
 }
 
@@ -131,6 +142,31 @@ impl ChatApp {
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| {
                 this.set_font_scale(crate::theme::FONT_SCALE_DEFAULT, cx)
             }))
+            .on_action(cx.listener(|this, _: &AnswerPermission1, w, cx| this.answer_key(0, w, cx)))
+            .on_action(cx.listener(|this, _: &AnswerPermission2, w, cx| this.answer_key(1, w, cx)))
+            .on_action(cx.listener(|this, _: &AnswerPermission3, w, cx| this.answer_key(2, w, cx)))
+            .on_action(cx.listener(|this, _: &AnswerPermission4, w, cx| this.answer_key(3, w, cx)))
+    }
+
+    /// Alt+数字：按下权限卡上的第 `n` 个按钮（最早一条待定的请求；按钮顺序见 `chat.rs` 的
+    /// `render_permission`，内核给的选项之后是「拒绝并说明」）。没有可按的就放行。
+    fn answer_key(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let s = self.session();
+        let target =
+            s.pending_permission().filter(|_| !self.settings_open).and_then(|idx| {
+                match &s.transcript[idx] {
+                    crate::model::ChatItem::Permission { options, .. } => Some((idx, options)),
+                    _ => None,
+                }
+            });
+        match target {
+            Some((idx, options)) if n < options.len() => {
+                let choice = (options[n].id.clone(), options[n].name.clone());
+                self.resolve_permission(idx, Some(choice), cx);
+            }
+            Some((idx, options)) if n == options.len() => self.reject_and_steer(idx, window, cx),
+            _ => cx.propagate(),
+        }
     }
 
     /// 界面缩放按档走（步进 5%）：`step` 为 +1 放大、-1 缩小；到边界就不动。
@@ -152,7 +188,7 @@ impl ChatApp {
             self.focus_input(window, cx);
             cx.notify();
         } else if self.session().busy {
-            self.stop(cx);
+            self.stop(window, cx);
         } else {
             cx.propagate();
         }

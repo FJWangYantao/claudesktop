@@ -819,22 +819,93 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 发出输入框里的内容；这一轮还在跑时先排队（输入框上方的队列），这一轮正常结束后自动发出。
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session().busy {
-            return;
-        }
         let text = self.input.read(cx).value().to_string();
-        let images = self
-            .pending
-            .iter()
-            .map(|p| PromptImage { media_type: p.media_type.clone(), data: p.data.clone() })
-            .collect::<Vec<_>>();
-        if text.trim().is_empty() && images.is_empty() {
+        if text.trim().is_empty() && self.pending.is_empty() {
             return;
         }
         self.input.update(cx, |state, cx| state.set_value("", window, cx));
-        self.pending.clear();
-        self.submit_to(self.active, UserPrompt { text, images }, cx);
+        let queued = QueuedPrompt { text, images: std::mem::take(&mut self.pending) };
+        let active = self.active;
+        if self.sessions[active].busy || self.sessions[active].stopping {
+            self.sessions[active].queued.push(queued);
+            cx.notify();
+            return;
+        }
+        self.submit_to(active, queued.into_prompt(), cx);
+    }
+
+    /// 第 `idx` 个会话这一轮结束（正常结束，或用户停下后内核确认了）：发出排队的第一条，
+    /// 其余等它这一轮结束再发。
+    fn dispatch_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let s = &mut self.sessions[idx];
+        if s.busy || s.stopping || s.queued.is_empty() {
+            return;
+        }
+        let queued = s.queued.remove(0);
+        self.submit_to(idx, queued.into_prompt(), cx);
+    }
+
+    /// 把当前会话排队的消息退回输入框：`only` 给了只退这一条，否则全部（按 Esc 停下时）。
+    /// 文字按排队顺序接在一起，输入框里已经写的放在最后；附件放回待发送。
+    pub(crate) fn unqueue(
+        &mut self,
+        only: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active;
+        let queue = &mut self.sessions[active].queued;
+        let items = match only {
+            Some(i) if i < queue.len() => vec![queue.remove(i)],
+            Some(_) => return,
+            None => std::mem::take(queue),
+        };
+        if items.is_empty() {
+            return;
+        }
+        let mut parts = Vec::new();
+        for item in items {
+            if !item.text.trim().is_empty() {
+                parts.push(item.text);
+            }
+            self.pending.extend(item.images);
+        }
+        let draft = self.input.read(cx).value().to_string();
+        if !draft.trim().is_empty() {
+            parts.push(draft);
+        }
+        self.fill_prompt(
+            &parts.join(
+                "
+
+",
+            ),
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 队列里的「现在发送」：上一轮没有正常结束（停了 / 出错）时队列不会自己走，由用户决定。
+    pub(crate) fn send_queued(&mut self, i: usize, cx: &mut Context<Self>) {
+        let active = self.active;
+        let s = &mut self.sessions[active];
+        if s.busy || i >= s.queued.len() {
+            return;
+        }
+        let queued = s.queued.remove(i);
+        self.submit_to(active, queued.into_prompt(), cx);
+    }
+
+    /// 队列里的「不发了」。
+    pub(crate) fn remove_queued(&mut self, i: usize, cx: &mut Context<Self>) {
+        let active = self.active;
+        if i < self.sessions[active].queued.len() {
+            self.sessions[active].queued.remove(i);
+            cx.notify();
+        }
     }
 
     // ---------- 图片附件 ----------
@@ -933,6 +1004,7 @@ impl ChatApp {
                 cx.notify();
                 return;
             }
+            s.steering = false;
             if !s.has_user_message() && !s.renamed {
                 s.title = crate::model::title_from_prompt(&prompt.text).into();
             }
@@ -994,6 +1066,34 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 权限卡上的「拒绝并说明」：按拒绝应答，停下这一轮，请用户在输入框里说要怎么改
+    /// （对照 CLI 的 "No, and tell Claude what to do differently"）。输入框里已经写好了就直接发出。
+    pub(crate) fn reject_and_steer(
+        &mut self,
+        item_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let reject = match self.session().transcript.get(item_idx) {
+            Some(ChatItem::Permission { options, resolved: None, .. }) => options
+                .iter()
+                .find(|o| o.kind == "reject_once")
+                .or_else(|| options.iter().find(|o| o.kind.starts_with("reject")))
+                .map(|o| (o.id.clone(), o.name.clone())),
+            _ => return,
+        };
+        // 内核没给拒绝项时按取消应答
+        self.resolve_permission(item_idx, reject, cx);
+        if self.session().busy {
+            self.stop(window, cx);
+        }
+        let active = self.active;
+        self.sessions[active].steering = true;
+        self.send(window, cx);
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
     /// 手动压缩当前会话的上下文（自研内核、空闲时）：自成一轮，进度和结果作为一行出现在对话里。
     pub(crate) fn compact_session(&mut self, cx: &mut Context<Self>) {
         let active = self.active;
@@ -1015,7 +1115,8 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
+    /// 停下当前会话这一轮。排队的消息退回输入框（对照 CLI：停下来通常是要改主意）。
+    pub(crate) fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.active;
         let kernel = self.session_kernel(active);
         let s = &mut self.sessions[active];
@@ -1023,12 +1124,14 @@ impl ChatApp {
         s.busy = false;
         // 正在流式的思考块收起，不然停下后还挂着「思考中…」；压缩到一半的那行也收尾
         s.finish_thinking();
+        s.interrupt_running_tools();
         s.settle_compaction(CompactState::Failed("已停止".into()));
         let thought = s.take_thought_done();
         s.cancel_pending_permissions(kernel.as_ref());
         match (&kernel, s.acp_id.clone()) {
             (Some(kernel), Some(id)) => {
-                let _ = kernel.cancel(&id);
+                // 等内核回这一轮的结束（见 Session::stopping）；发取消失败就不等了
+                s.stopping = kernel.cancel(&id).is_ok();
                 s.note("已请求停止");
             }
             _ => s.note("已停止（演示回放）"),
@@ -1037,6 +1140,7 @@ impl ChatApp {
         if let (Some(ms), Some(_)) = (thought, &kernel) {
             self.persist(active, Record::Thought { elapsed_ms: ms });
         }
+        self.unqueue(None, window, cx);
         cx.notify();
     }
 
@@ -1093,6 +1197,12 @@ impl ChatApp {
                         event,
                         KernelEvent::TurnEnded { .. } | KernelEvent::PromptFailed { .. }
                     );
+                    // 正常结束才接着发排队的消息，出错、被取消时先停着，由用户决定；
+                    // 用户停下以后才排的（停止期间发的、「拒绝并说明」的理由）等停稳了就发
+                    let clean_end = matches!(
+                        &event,
+                        KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn"
+                    ) || (turn_over && self.sessions[idx].stopping);
                     // 先看（record_turn 会清掉手动压缩的标记）
                     let attention = self.sessions[idx].attention(&event);
                     if Record::worth_keeping(&event) {
@@ -1118,6 +1228,9 @@ impl ChatApp {
                     }
                     if let Some(prompt) = prompt {
                         self.submit_to(idx, prompt, cx);
+                    }
+                    if clean_end {
+                        self.dispatch_queued(idx, cx);
                     }
                 }
             }
@@ -1252,6 +1365,7 @@ impl ChatApp {
                     s.busy = false;
                     s.close_turn();
                     app.mark_unread(idx);
+                    app.dispatch_queued(idx, cx);
                 }
                 cx.notify();
             });
