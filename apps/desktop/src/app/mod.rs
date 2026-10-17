@@ -5,6 +5,7 @@ mod chat;
 mod chrome;
 mod complete_view;
 mod composer;
+mod content;
 pub(crate) mod keys;
 mod menu;
 mod motion;
@@ -28,15 +29,17 @@ use claudesktop_core::{
     AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PromptImage, Record, RoutedEvent,
     SessionStore, UserPrompt,
 };
+use content::ContentView;
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use settings_view::SettingsForm;
-use sidebar::{SharedSpots, SidebarView};
+use sidebar::{SharedSpots, SidebarSpinners, SidebarView};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -101,6 +104,8 @@ pub struct ChatApp {
     usage: Vec<TurnStat>,
     /// 压测钩子：每次 render 的时刻（None = 不记录）
     pub(crate) frame_log: Option<Vec<std::time::Instant>>,
+    /// 压测钩子：每帧从 render 开始到整棵树画完用了多少毫秒（只在记 `frame_log` 时记）
+    frame_work: std::rc::Rc<std::cell::RefCell<Vec<f64>>>,
     /// 窗口在前台：激活且没最小化（不在前台时才发系统通知，见 `notify.rs`）
     window_active: bool,
     /// 发出去还没撤的系统通知标签（回到窗口时撤掉）
@@ -114,8 +119,11 @@ pub struct ChatApp {
     /// 侧栏的缓存 view 与它上次画时的指纹（见 `sidebar.rs` 的 `sync_sidebar`）
     sidebar_view: Entity<SidebarView>,
     sidebar_key: u64,
-    /// 侧栏里运行中会话的转圈位置（侧栏记、`ChatApp` 叠在上面画，见 `sidebar.rs`）
+    /// 侧栏里运行中会话的转圈位置（侧栏记、叠在上面的 `SidebarSpinners` 画，见 `sidebar.rs`）
     sidebar_spinners: SharedSpots,
+    sidebar_spinners_view: Entity<SidebarSpinners>,
+    /// 输入框上方的内容区（缓存 view，`ChatApp` 每次通知都让它重画，见 `content.rs`）
+    content_view: Entity<ContentView>,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
 }
@@ -169,13 +177,13 @@ impl ChatApp {
                     // Shift+回车已由输入框插入换行，同样会发这个事件，要排除
                     InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
                     InputEvent::PressEnter { .. } => {}
-                    // 打字时刷新 `/`、`@` 补全
+                    // 打字时刷新 `/`、`@` 补全。只重画输入区，不碰对话（见 content.rs）
                     InputEvent::Change => {
                         this.update_completion(cx);
-                        cx.notify();
+                        this.refresh_composer(cx);
                     }
                     // 发送按钮随输入框空 / 非空换样式；输入框卡片随聚焦换边框
-                    InputEvent::Focus | InputEvent::Blur => cx.notify(),
+                    InputEvent::Focus | InputEvent::Blur => this.refresh_composer(cx),
                 }
             },
         )
@@ -311,6 +319,7 @@ impl ChatApp {
             jump: None,
             usage: Vec::new(),
             frame_log: None,
+            frame_work: Default::default(),
             window_active: true,
             notified: Vec::new(),
             window_handle: window.window_handle(),
@@ -320,8 +329,13 @@ impl ChatApp {
             sidebar_view: cx.new(|_| SidebarView::new(weak.clone())),
             sidebar_key: 0,
             sidebar_spinners: Default::default(),
+            sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
+            content_view: cx.new(|_| ContentView::new(weak.clone())),
             sidebar_hover: None,
         };
+        // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
+        cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
+            .detach();
         // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
         let cwd = app.cwd.clone();
@@ -641,10 +655,38 @@ impl ChatApp {
         });
     }
 
+    /// 压测钩子：逐帧往输入框里打一个字（300 帧，每 40 字换一行），走完清空输入框出统计。
+    /// 和真打字走同一条路：输入框改内容 + 刷新补全 + 只重画输入区。
+    pub(crate) fn debug_type_frames(
+        &mut self,
+        step: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const STEPS: usize = 300;
+        if step >= STEPS {
+            self.stress_report();
+            self.input.update(cx, |s, cx| s.set_value("", window, cx));
+            return;
+        }
+        let ch = if step % 40 == 39 { "\n" } else { "字" };
+        self.input.update(cx, |s, cx| s.insert(ch, window, cx));
+        self.update_completion(cx);
+        self.refresh_composer(cx);
+        let this = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            let _ = this.update(cx, |app, cx| app.debug_type_frames(step + 1, window, cx));
+        });
+    }
+
     /// 压测钩子：把记下的帧时刻整理成「帧数、每秒帧数、帧间隔 p50 / p95 / max」，
     /// 写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）。
     pub(crate) fn stress_report(&mut self) {
         let log = self.frame_log.take().unwrap_or_default();
+        let mut work = std::mem::take(&mut *self.frame_work.borrow_mut());
+        work.sort_by(|a, b| a.total_cmp(b));
+        let wpct =
+            |p: f64| work.get(((work.len() as f64 - 1.) * p) as usize).copied().unwrap_or(0.);
         let mut gaps: Vec<f64> =
             log.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1000.).collect();
         gaps.sort_by(|a, b| a.total_cmp(b));
@@ -655,13 +697,16 @@ impl ChatApp {
         };
         let fps = if span > 0. { (log.len() as f64 - 1.) / span } else { 0. };
         let report = format!(
-            "rows={} frames={} fps={fps:.1} p50={:.1}ms p95={:.1}ms max={:.1}ms
+            "rows={} frames={} fps={fps:.1} p50={:.1}ms p95={:.1}ms max={:.1}ms work p50={:.2}ms p95={:.2}ms max={:.2}ms
 ",
             self.session().transcript.len(),
             log.len(),
             pct(0.5),
             pct(0.95),
-            pct(1.0)
+            pct(1.0),
+            wpct(0.5),
+            wpct(0.95),
+            wpct(1.0)
         );
         match std::env::var("CLAUDESKTOP_STRESS_OUT") {
             Ok(path) => {
@@ -1217,102 +1262,27 @@ impl Render for ChatApp {
                 std::process::exit(0);
             }
         }
-        if let Some(log) = &mut self.frame_log {
-            log.push(std::time::Instant::now());
-        }
+        // 压测：记帧时刻，并在根上最后画一个 canvas，量这一帧 render → paint 的工作量
+        let frame_probe = self.frame_log.as_mut().map(|log| {
+            let t0 = std::time::Instant::now();
+            log.push(t0);
+            let work = self.frame_work.clone();
+            canvas(
+                |_, _, _| {},
+                move |_, _, _, _| work.borrow_mut().push(t0.elapsed().as_secs_f64() * 1000.),
+            )
+            .absolute()
+            .size_0()
+        });
 
         // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
         self.sync_sidebar(cx);
-        self.step_jump_to_bottom(window);
 
-        let active = self.active;
-        // 还没发过消息的会话显示首页（问候 + 概览）
-        let home = !self.sessions[active].has_user_message();
-
-        let composer_area = div().px_6().pb_4().pt_2().child(self.render_composer(window, cx));
-
-        let body = if self.settings_open {
-            v_flex().flex_1().min_h_0().child(self.render_settings(cx))
-        } else if home {
-            // 首页：问候 + 用量概览居中，输入框在底部（与官方空会话一致）
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .id("home-scroll")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .child(div().h_full().v_flex().child(self.render_overview(cx))),
-                )
-                .child(composer_area)
-        } else {
-            // 虚拟列表：只布局 / 绘制视口附近的行；最后一行是运行状态行（见 Session::sync_list）
-            let view = self.settings.view_mode;
-            self.sessions[active].sync_list(view);
-            let state = self.sessions[active].list.clone();
-            let scroll = list(
-                state,
-                cx.processor(|this, ix: usize, window, cx| {
-                    let s = &this.sessions[this.active];
-                    let n = s.transcript.len();
-                    let row = div().max_w(READING_W).mx_auto().w_full().px_6();
-                    // 过程组里的一步：展开 / 收起走弹簧，收起没走完之前照样画、按进度裁切
-                    // （每帧都要问一次进度，状态才留得住）
-                    let reveal = match s.layout.get(ix) {
-                        Some(layout) if layout.member => {
-                            motion::reveal_progress(("step", ix), layout.body, window, cx)
-                        }
-                        _ => 1.,
-                    };
-                    let content = match (s.transcript.get(ix), s.layout.get(ix)) {
-                        // 收起的组内步骤、当前视图不显示的行：零高度（分组结果在测量指纹里，变了就重测）
-                        (Some(_), Some(layout))
-                            if !layout.body
-                                && layout.head.is_none()
-                                && (!layout.member || reveal <= 0.) =>
-                        {
-                            div()
-                        }
-                        (Some(item), Some(&layout)) => row
-                            .pt(px(if ix == 0 { 16. } else { 0. }))
-                            .child(this.render_row(ix, item, layout, reveal, window, cx)),
-                        (None, _) if ix == n => row.pb_6().children(this.render_turn_status()),
-                        _ => row,
-                    };
-                    div().w_full().child(content).into_any_element()
-                }),
-            )
-            .flex_1()
-            .min_h_0();
-
-            // 上下边缘渐隐：内容滚到顶栏 / 输入区下面时淡出，不是一刀切。高度不超过首行上边距和
-            // 状态行下边距，滚到头时不遮内容；覆盖层不挂事件，不挡点击和滚轮
-            let paper = rgb(PAPER);
-            let clear = Rgba { a: 0., ..paper };
-            let fade = |h: Pixels, from: Rgba, to: Rgba| {
-                div().absolute().left_0().right_0().h(h).bg(linear_gradient(
-                    180.,
-                    linear_color_stop(from, 0.),
-                    linear_color_stop(to, 1.),
-                ))
-            };
-            // 按会话划开元素状态：展开进度、悬停淡入这些按行号记的状态不串到别的会话
-            let transcript = div()
-                .id(("transcript", self.sessions[active].token))
-                .relative()
-                .flex_1()
-                .min_h_0()
-                .v_flex()
-                .child(scroll)
-                .child(fade(px(16.), paper, clear).top_0())
-                .child(fade(px(24.), clear, paper).bottom_0())
-                .children(self.render_jump_to_bottom(window, cx));
-
-            v_flex().flex_1().min_h_0().child(transcript).child(composer_area)
-        };
-
+        // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
+        let body =
+            v_flex().flex_1().min_h_0().child(self.content_slot()).when(!self.settings_open, |d| {
+                d.child(div().px_6().pb_4().pt_2().child(self.render_composer(window, cx)))
+            });
         let main =
             v_flex().flex_1().min_w_0().h_full().child(self.render_header(window, cx)).child(body);
 
@@ -1330,7 +1300,8 @@ impl Render for ChatApp {
             .relative()
             .children(self.render_sidebar_slot(window, cx))
             .child(main)
-            .children(self.render_sidebar_spinners());
+            .child(self.sidebar_spinners_view.clone())
+            .children(frame_probe);
         // 快捷键（见 keys.rs）
         self.with_key_actions(root, cx)
     }

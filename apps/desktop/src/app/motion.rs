@@ -2,7 +2,7 @@
 //!
 //! gpui 的动画每一帧都要重画它所在的整个 view（`request_animation_frame` 通知当前 view，
 //! 祖先一并变脏），所以常驻的循环动画（转圈、扫光）不用 `with_animation`：相位按全局时钟算，
-//! 由一个共用的节拍器每隔约 33ms（60Hz 下每两帧）让 `ChatApp` 重画一次（[`request_loop_tick`]）。
+//! 由一个共用的节拍器每隔约 33ms（60Hz 下每两帧）让画着它们的 view 重画一次（[`request_loop_tick`]）。
 //! 不用 `Animation::with_max_fps`：它靠计时器排下一帧，Windows 计时器按 15.6ms 一档取整，
 //! 再等一次垂直同步，实测只剩 21~25 帧，还和别的动画错开、多出重画。
 //! 一次性的过渡（展开、淡入、侧栏）很短，满帧跑。时长和曲线取 gpui-kit 主题的 motion tokens
@@ -18,7 +18,7 @@ use gpui_kit::base::motion::{Transition, spring, transition};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::panic::Location;
 use std::sync::OnceLock;
@@ -38,8 +38,8 @@ const SHIMMER_PERIOD: Duration = Duration::from_millis(1600);
 static REDUCED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    /// 已经排了一拍、还没到点
-    static TICK_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// 这一拍到点时要重画的 view（非空 = 已经排了一拍、还没到点）
+    static TICK_VIEWS: RefCell<Vec<EntityId>> = const { RefCell::new(Vec::new()) };
 }
 
 /// 循环动画在这一刻的相位（0..1），所有转圈 / 扫光共用一个时钟，彼此同步。
@@ -49,23 +49,34 @@ fn loop_phase(period: Duration) -> f32 {
     (t % period.as_secs_f64() / period.as_secs_f64()) as f32
 }
 
-/// 约 33ms 后让当前 view 重画一次（prepaint 里调；同一拍里多次调用只排一次）。
+/// 约 33ms 后让当前 view 重画一次（prepaint 里调）。各个 view 共用一拍：同一拍里
+/// 多次调用只排一次，到点时把这期间登记过的 view 一起通知（同一帧里重画）。
 /// 靠 `on_next_frame` 逐帧数时间，不走计时器：拍子落在垂直同步上，和别的重画对齐。
 fn request_loop_tick(window: &mut Window) {
-    if REDUCED.load(Ordering::Relaxed) || TICK_PENDING.get() {
+    if REDUCED.load(Ordering::Relaxed) {
         return;
     }
-    TICK_PENDING.set(true);
-    wait_for_tick(window.current_view(), Instant::now(), window);
+    let view = window.current_view();
+    let first = TICK_VIEWS.with_borrow_mut(|views| {
+        let first = views.is_empty();
+        if !views.contains(&view) {
+            views.push(view);
+        }
+        first
+    });
+    if first {
+        wait_for_tick(Instant::now(), window);
+    }
 }
 
-fn wait_for_tick(view: EntityId, since: Instant, window: &Window) {
+fn wait_for_tick(since: Instant, window: &Window) {
     window.on_next_frame(move |window, cx| {
         if since.elapsed() + TICK_SLACK >= LOOP_INTERVAL {
-            TICK_PENDING.set(false);
-            cx.notify(view);
+            for view in TICK_VIEWS.take() {
+                cx.notify(view);
+            }
         } else {
-            wait_for_tick(view, since, window);
+            wait_for_tick(since, window);
         }
     });
 }

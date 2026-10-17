@@ -76,7 +76,7 @@ impl ChatApp {
         let was = self.completion.open.as_ref().map(|c| c.trigger.kind);
         let Some(trigger) = complete::trigger_at(&text, cursor) else {
             self.completion.open = None;
-            cx.notify();
+            self.refresh_composer(cx);
             return;
         };
         let items: Vec<CompletionItem> = match trigger.kind {
@@ -128,7 +128,7 @@ impl ChatApp {
             };
             Completion { trigger, items, selected }
         });
-        cx.notify();
+        self.refresh_composer(cx);
     }
 
     /// 可用的 `/指令`：(匹配用的英文关键字, 候选项)。模式来自当前 agent；模型不在这里，
@@ -283,7 +283,7 @@ impl ChatApp {
                 if this.completion.open.take().is_some() {
                     this.completion.dismissed = Some(this.input.read(cx).value().to_string());
                     cx.stop_propagation();
-                    cx.notify();
+                    this.refresh_composer(cx);
                 }
             }))
     }
@@ -295,7 +295,7 @@ impl ChatApp {
         let n = c.items.len() as isize;
         c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
         cx.stop_propagation();
-        cx.notify();
+        self.refresh_composer(cx);
     }
 
     fn accept_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -6,8 +6,8 @@
 //! 新加侧栏要显示的状态时，记得把它并进 `sync_sidebar` 的指纹，否则侧栏不会跟着变。
 //!
 //! 运行中那行的转圈不画在侧栏里（它每拍都要重画，会把整个侧栏一起带上——缓存 view 重画时
-//! 里面嵌套的缓存 view 也不复用），而是行里只留个占位、记下位置，由 `ChatApp` 叠在上面画
-//! （[`ChatApp::render_sidebar_spinners`]）。
+//! 里面嵌套的缓存 view 也不复用），而是行里只留个占位、记下位置，由叠在上面的小 view
+//! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
 use super::motion;
@@ -50,6 +50,24 @@ impl Render for SidebarView {
             }
             None => div().into_any_element(),
         }
+    }
+}
+
+/// 侧栏转圈的覆盖层：铺满窗口、不挂事件，按 [`SpinnerSpots`] 记下的位置画转圈。
+pub(crate) struct SidebarSpinners {
+    app: WeakEntity<ChatApp>,
+}
+
+impl SidebarSpinners {
+    pub(super) fn new(app: WeakEntity<ChatApp>) -> Self {
+        Self { app }
+    }
+}
+
+impl Render for SidebarSpinners {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let spinners = self.app.upgrade().map(|app| app.read(cx).render_sidebar_spinners());
+        div().absolute().top_0().left_0().size_full().children(spinners.into_iter().flatten())
     }
 }
 

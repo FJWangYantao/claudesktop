@@ -106,18 +106,22 @@ fn main() {
                     });
                     // 压测钩子：CLAUDESKTOP_STRESS=<行数>，灌数据后逐帧滚动（先往上 150 帧再往下 150 帧，
                     // 每帧画完才滚下一段，量的是真实帧间隔；不用计时器驱动，Windows 计时器按 15.6ms 一档）。
-                    // 加 CLAUDESKTOP_STRESS_BUSY=1 则不滚，置忙 5 秒看转圈常驻时每秒重绘几次。
+                    // 加 CLAUDESKTOP_STRESS_BUSY=1 则不滚，置忙 5 秒看转圈常驻时每秒重绘几次；
+                    // 加 CLAUDESKTOP_STRESS_TYPE=1 则改成逐帧往输入框里打字。
                     // 统计写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）
                     if let Some(n) = std::env::var("CLAUDESKTOP_STRESS")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                     {
                         let busy = std::env::var_os("CLAUDESKTOP_STRESS_BUSY").is_some();
+                        let typing = std::env::var_os("CLAUDESKTOP_STRESS_TYPE").is_some();
                         let _ = this.update(cx, |app, cx| app.debug_stress(n, busy, cx));
                         cx.background_executor().timer(Duration::from_millis(1500)).await;
                         let _ = this.update_in(cx, |app, window, cx| {
                             app.frame_log = Some(Vec::new());
-                            if !busy {
+                            if typing {
+                                app.debug_type_frames(0, window, cx);
+                            } else if !busy {
                                 app.debug_scroll_frames(0, window, cx);
                             }
                         });

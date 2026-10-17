@@ -80,8 +80,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
   否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。
-- **性能压测**：`CLAUDESKTOP_STRESS=<行数>` 逐帧滚动出帧间隔；再加 `CLAUDESKTOP_STRESS_BUSY=1` 改成置忙 5 秒，
-  看转圈常驻时每秒重画几次（CPU 在外面量）。动画相关的改动前后各跑一次。
+- **输入框上方的内容区也是缓存 view**（`ContentView`，见 `content.rs`）：`ChatApp` 每次 `cx.notify()` 都让它重画，
+  打字时只有输入区重画。所以**只影响输入区的刷新**（补全、发送键、聚焦边框）用 `ChatApp::refresh_composer`，
+  不用 `cx.notify()`；画在 `ChatApp` 里的循环动画要包成单独的小 view（如侧栏转圈的 `SidebarSpinners`），
+  否则节拍器每拍通知 `ChatApp`，内容区跟着重画。
+- **性能压测**：`CLAUDESKTOP_STRESS=<行数>` 逐帧滚动出帧间隔和每帧工作量（`work`，render 到画完）；
+  再加 `CLAUDESKTOP_STRESS_BUSY=1` 改成置忙 5 秒，看转圈常驻时每秒重画几次（CPU 在外面量）；
+  加 `CLAUDESKTOP_STRESS_TYPE=1` 改成逐帧往输入框打字。动画 / 重画范围相关的改动前后各跑一次。
 
 ### gpui-kit 踩坑备忘
 

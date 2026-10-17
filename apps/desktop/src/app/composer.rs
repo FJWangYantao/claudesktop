@@ -142,6 +142,12 @@ impl ChatApp {
             )
     }
 
+    /// 只重画输入区：通知输入框的 view，它的祖先 `ChatApp` 跟着重画，内容区的缓存不动（见 content.rs）。
+    /// 打字、补全、聚焦这类只影响输入区的变化用它；用 `cx.notify()` 会连对话一起重画。
+    pub(super) fn refresh_composer(&self, cx: &mut App) {
+        self.input.update(cx, |_, cx| cx.notify());
+    }
+
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
         let busy = self.session().busy;
