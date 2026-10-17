@@ -8,7 +8,6 @@ use crate::session::{Activity, TurnSummary, TurnUsage};
 use crate::theme::rgb;
 use crate::theme::*;
 use crate::usage;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::*;
 use gpui_kit::*;
 use std::time::{Duration, Instant};
@@ -29,17 +28,16 @@ impl ChatApp {
             ),
             // 限流 / 5xx：内核自己会重发，告诉用户在等什么、还要等多久（不然看着像卡死）
             Activity::Retrying => (
-                Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element(),
+                super::motion::spinner().into_any_element(),
                 div().child(s.retry.as_ref().map_or_else(String::new, |r| {
                     retry_label(r.status, r.attempt, r.at.saturating_duration_since(Instant::now()))
                 })),
             ),
-            Activity::Compacting => (
-                Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element(),
-                div().child("正在压缩上下文"),
-            ),
+            Activity::Compacting => {
+                (super::motion::spinner().into_any_element(), div().child("正在压缩上下文"))
+            }
             Activity::Working | Activity::Replying => (
-                Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element(),
+                super::motion::spinner().into_any_element(),
                 div().child(if activity == Activity::Replying {
                     "正在回复"
                 } else {

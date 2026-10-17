@@ -7,6 +7,7 @@ mod complete_view;
 mod composer;
 pub(crate) mod keys;
 mod menu;
+mod motion;
 mod notify;
 mod overview;
 mod palette;
@@ -33,12 +34,12 @@ use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use settings_view::SettingsForm;
+use sidebar::{SharedSpots, SidebarView};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 启动时最多恢复的历史会话数（最近更新的优先）。
 const MAX_RESTORED: usize = 100;
@@ -90,6 +91,12 @@ pub struct ChatApp {
     /// 刚点了「复制」的地方（会话令牌, 记录下标, 代码块在 Markdown 里的起点；整条消息为 None），
     /// 1.5 秒内按钮显示「已复制」
     copied: Option<(u64, usize, Option<usize>)>,
+    /// 点「复制」的时刻（对勾的入场动画）
+    copied_at: Option<Instant>,
+    /// 鼠标停在对话里第几条消息上（当前会话；消息下方的操作按钮淡入淡出）
+    hovered_msg: Option<usize>,
+    /// 「回到底部」的平滑滚动进行中（见 `chat.rs` 的 `step_jump_to_bottom`）
+    jump: Option<motion::JumpAnim>,
     /// 所有会话的每轮统计（首页用量概览）
     usage: Vec<TurnStat>,
     /// 压测钩子：每次 render 的时刻（None = 不记录）
@@ -102,6 +109,15 @@ pub struct ChatApp {
     window_handle: AnyWindowHandle,
     /// 设置页的字号滑杆（拖动时即时生效）
     pub(crate) font_slider: Entity<SliderState>,
+    /// 系统「动画效果」的最近一次读数（gpui-base 写进减少动态效果开关的值，见 `apply_motion_pref`）
+    system_reduce_motion: bool,
+    /// 侧栏的缓存 view 与它上次画时的指纹（见 `sidebar.rs` 的 `sync_sidebar`）
+    sidebar_view: Entity<SidebarView>,
+    sidebar_key: u64,
+    /// 侧栏里运行中会话的转圈位置（侧栏记、`ChatApp` 叠在上面画，见 `sidebar.rs`）
+    sidebar_spinners: SharedSpots,
+    /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
+    sidebar_hover: Option<u64>,
 }
 
 /// 一种内核的运行状态。
@@ -260,6 +276,7 @@ impl ChatApp {
         })
         .detach();
 
+        let weak = cx.entity().downgrade();
         let mut app = Self {
             input,
             pending: Vec::new(),
@@ -289,12 +306,21 @@ impl ChatApp {
             fetching_models: false,
             context_probed: false,
             copied: None,
+            copied_at: None,
+            hovered_msg: None,
+            jump: None,
             usage: Vec::new(),
             frame_log: None,
             window_active: true,
             notified: Vec::new(),
             window_handle: window.window_handle(),
             font_slider,
+            // gpui_kit::init 已按系统「动画效果」写好开关；之后按设置页的「动画」覆盖
+            system_reduce_motion: cx.reduce_motion(),
+            sidebar_view: cx.new(|_| SidebarView::new(weak.clone())),
+            sidebar_key: 0,
+            sidebar_spinners: Default::default(),
+            sidebar_hover: None,
         };
         // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
@@ -323,6 +349,7 @@ impl ChatApp {
             }
         }
         app.apply_appearance(window, cx);
+        app.apply_motion_pref(cx);
         app.init_notifications(window, cx);
         app
     }
@@ -559,7 +586,7 @@ impl ChatApp {
     }
 
     /// 压测钩子：往当前会话灌 `n` 行混合内容（用户消息 / markdown 回复 / 工具行 / 备注）。
-    pub(crate) fn debug_stress(&mut self, n: usize, cx: &mut Context<Self>) {
+    pub(crate) fn debug_stress(&mut self, n: usize, busy: bool, cx: &mut Context<Self>) {
         let s = &mut self.sessions[self.active];
         for i in 0..n {
             s.transcript.push(match i % 4 {
@@ -585,13 +612,63 @@ impl ChatApp {
             });
         }
         s.title = format!("压测 {n} 行").into();
+        // 置忙：状态行和侧栏的转圈常驻（只看重绘频率，不会真的有内核事件来收尾）
+        if busy {
+            s.begin_turn();
+        }
         cx.notify();
     }
 
-    /// 压测钩子：当前会话的列表滚动一段距离（正数向下）。
-    pub(crate) fn debug_scroll(&mut self, dy: f32, cx: &mut Context<Self>) {
+    /// 压测钩子：逐帧滚动（先往上 150 帧再往下 150 帧，每帧 400px），走完出统计。
+    /// 每帧画完（`on_next_frame`）才滚下一段，量到的帧间隔就是真实的一帧有多长。
+    pub(crate) fn debug_scroll_frames(
+        &mut self,
+        step: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const STEPS: usize = 300;
+        if step >= STEPS {
+            self.stress_report();
+            return;
+        }
+        let dy = if step < STEPS / 2 { -400. } else { 400. };
         self.sessions[self.active].list.scroll_by(px(dy));
         cx.notify();
+        let this = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            let _ = this.update(cx, |app, cx| app.debug_scroll_frames(step + 1, window, cx));
+        });
+    }
+
+    /// 压测钩子：把记下的帧时刻整理成「帧数、每秒帧数、帧间隔 p50 / p95 / max」，
+    /// 写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）。
+    pub(crate) fn stress_report(&mut self) {
+        let log = self.frame_log.take().unwrap_or_default();
+        let mut gaps: Vec<f64> =
+            log.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1000.).collect();
+        gaps.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f64| gaps.get(((gaps.len() as f64 - 1.) * p) as usize).copied().unwrap_or(0.);
+        let span = match (log.first(), log.last()) {
+            (Some(a), Some(b)) => (*b - *a).as_secs_f64(),
+            _ => 0.,
+        };
+        let fps = if span > 0. { (log.len() as f64 - 1.) / span } else { 0. };
+        let report = format!(
+            "rows={} frames={} fps={fps:.1} p50={:.1}ms p95={:.1}ms max={:.1}ms
+",
+            self.session().transcript.len(),
+            log.len(),
+            pct(0.5),
+            pct(0.95),
+            pct(1.0)
+        );
+        match std::env::var("CLAUDESKTOP_STRESS_OUT") {
+            Ok(path) => {
+                let _ = std::fs::write(path, report);
+            }
+            Err(_) => eprint!("{report}"),
+        }
     }
 
     /// 调试钩子：把当前会话的首条提示词放到 `kind` 上重跑。
@@ -1144,6 +1221,10 @@ impl Render for ChatApp {
             log.push(std::time::Instant::now());
         }
 
+        // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
+        self.sync_sidebar(cx);
+        self.step_jump_to_bottom(window);
+
         let active = self.active;
         // 还没发过消息的会话显示首页（问候 + 概览）
         let home = !self.sessions[active].has_user_message();
@@ -1173,16 +1254,30 @@ impl Render for ChatApp {
             let state = self.sessions[active].list.clone();
             let scroll = list(
                 state,
-                cx.processor(|this, ix: usize, _window, cx| {
+                cx.processor(|this, ix: usize, window, cx| {
                     let s = &this.sessions[this.active];
                     let n = s.transcript.len();
                     let row = div().max_w(READING_W).mx_auto().w_full().px_6();
+                    // 过程组里的一步：展开 / 收起走弹簧，收起没走完之前照样画、按进度裁切
+                    // （每帧都要问一次进度，状态才留得住）
+                    let reveal = match s.layout.get(ix) {
+                        Some(layout) if layout.member => {
+                            motion::reveal_progress(("step", ix), layout.body, window, cx)
+                        }
+                        _ => 1.,
+                    };
                     let content = match (s.transcript.get(ix), s.layout.get(ix)) {
                         // 收起的组内步骤、当前视图不显示的行：零高度（分组结果在测量指纹里，变了就重测）
-                        (Some(_), Some(layout)) if !layout.body && layout.head.is_none() => div(),
+                        (Some(_), Some(layout))
+                            if !layout.body
+                                && layout.head.is_none()
+                                && (!layout.member || reveal <= 0.) =>
+                        {
+                            div()
+                        }
                         (Some(item), Some(&layout)) => row
                             .pt(px(if ix == 0 { 16. } else { 0. }))
-                            .child(this.render_row(ix, item, layout, cx)),
+                            .child(this.render_row(ix, item, layout, reveal, window, cx)),
                         (None, _) if ix == n => row.pb_6().children(this.render_turn_status()),
                         _ => row,
                     };
@@ -1203,7 +1298,9 @@ impl Render for ChatApp {
                     linear_color_stop(to, 1.),
                 ))
             };
+            // 按会话划开元素状态：展开进度、悬停淡入这些按行号记的状态不串到别的会话
             let transcript = div()
+                .id(("transcript", self.sessions[active].token))
                 .relative()
                 .flex_1()
                 .min_h_0()
@@ -1211,7 +1308,7 @@ impl Render for ChatApp {
                 .child(scroll)
                 .child(fade(px(16.), paper, clear).top_0())
                 .child(fade(px(24.), clear, paper).bottom_0())
-                .children(self.render_jump_to_bottom(cx));
+                .children(self.render_jump_to_bottom(window, cx));
 
             v_flex().flex_1().min_h_0().child(transcript).child(composer_area)
         };
@@ -1230,8 +1327,10 @@ impl Render for ChatApp {
             .text_size(TEXT_LARGE)
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
-            .when(self.sidebar_open, |d| d.child(self.render_sidebar(cx)))
-            .child(main);
+            .relative()
+            .children(self.render_sidebar_slot(window, cx))
+            .child(main)
+            .children(self.render_sidebar_spinners());
         // 快捷键（见 keys.rs）
         self.with_key_actions(root, cx)
     }

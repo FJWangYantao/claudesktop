@@ -25,6 +25,10 @@ impl ChatApp {
                 for tag in this.notified.drain(..) {
                     cx.dismiss_system_notification(&tag);
                 }
+                // 系统「动画效果」改了不会通知，回到窗口时重读一次（「跟随系统」时）
+                if this.settings.motion == crate::settings::MotionPref::System {
+                    this.apply_motion_pref(cx);
+                }
             }
         }
         self.window_active = in_front(window);

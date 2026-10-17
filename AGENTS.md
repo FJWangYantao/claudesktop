@@ -70,8 +70,18 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   条目确认走 `on_confirm` 回调改 `ChatApp`，不用 `CommandItem::action`：对话框在 Root 浮层里，
   不在 `ChatApp` 键上下文下，派发的动作收不到。
 - **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
-- **加载 / 进行中动效**：先用 `Spinner`、`ShimmerText`（组件自带动画并尊重系统减少动效），
-  别急着手写 `with_animation`。
+- **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
+  - 转圈 / 扫光用 `motion::spinner()` / `shimmer_text()`，**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
+    动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
+    motion 版相位按全局时钟算，由节拍器每两帧重画一次（约 30 帧）。
+  - 展开 / 收起：`reveal_progress(id, open, ..)` 拿弹簧进度，内容 `progress > 0` 时包进 `Reveal::new(id, progress, ..)`；
+    和标题之间的空隙算进内容（`pt_1` 而不是外层 `gap`），收到底才不剩一截。过程组里的步骤在列表那层
+    （`RowLayout::member`）统一处理。悬停才出现的操作用 `hover_opacity`；刚出现的内容用 `entering`。
+  - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
+- **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
+  否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。
+- **性能压测**：`CLAUDESKTOP_STRESS=<行数>` 逐帧滚动出帧间隔；再加 `CLAUDESKTOP_STRESS_BUSY=1` 改成置忙 5 秒，
+  看转圈常驻时每秒重画几次（CPU 在外面量）。动画相关的改动前后各跑一次。
 
 ### gpui-kit 踩坑备忘
 
@@ -82,6 +92,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   分段切换用 `widgets.rs` 的 `seg()`，菜单用 `menu_popover()`。`Command`、`Button`、`Dialog` 内容是 rem，可用。
   `Button` 的尺寸是 rem，圆角取 `Theme::radius`（`theme::apply_to_theme` 按根字号换算）；
   它默认 `cursor_default`，helper 里补了 `cursor_pointer`。
+- **重画的范围是 view**：`request_animation_frame` 通知当前 view，祖先 view 一并变脏重画；
+  `.cached()` 的 view 在自己重画时会让里面嵌套的缓存 view 全部重画（`window.refreshing`），**嵌套缓存没用**。
+  缓存 view 要定尺寸（从 style 排版，不按内容量），按内容长高的区域（输入框）缓存不了。
+- **`Animation::with_max_fps` 在 Windows 上不准**：靠计时器排下一帧，计时器按 15.6ms 一档取整再等垂直同步，
+  要 30 帧实际 21~25 帧，还和别的动画错开多出重画。限帧用 `motion.rs` 的节拍器（`on_next_frame` 数帧）。
+- `MotionReveal`（gpui-base）首次出现、还没量过高度时按 0 高排一帧，在虚拟列表里会跳；用 `motion::Reveal`。
 - `overflow_y_scroll()` 在 `StatefulInteractiveElement` 上——链式调用前必须先 `.id(...)`。
 - trigger 要作为 `Popover::trigger` 使用需实现 `gpui_kit::base::Selectable`（平凡
   builder trait，见 `MenuChip`）。

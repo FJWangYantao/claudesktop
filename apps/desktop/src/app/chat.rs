@@ -4,6 +4,7 @@
 //! 连续的几步收进可折叠的组（分组规则在 `Session::compute_layout`）。
 
 use super::ChatApp;
+use super::motion::{self, Reveal};
 use super::widgets::Surface;
 use crate::model::*;
 use crate::session::{RowLayout, Session, StepGroup};
@@ -12,10 +13,9 @@ use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::{DiffView, PermissionOptionView};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::base::motion::{Presence, Transition};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Position;
-use gpui_kit::component::shimmer::ShimmerText;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
@@ -23,7 +23,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 同组相邻两步之间的行距
 const STEP_GAP: Pixels = px(6.);
@@ -69,7 +69,7 @@ fn ellipsis(id: impl Into<ElementId>, text: SharedString) -> Stateful<Div> {
 /// 工具的状态图标：进行中转圈，失败红叉，完成显示种类图标。
 fn tool_status_icon(card: &ToolCard) -> AnyElement {
     match card.phase {
-        ToolPhase::Running => Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element(),
+        ToolPhase::Running => motion::spinner().into_any_element(),
         ToolPhase::Failed => {
             Icon::new(IconAll::CircleX).size_3p5().text_color(rgb(RED)).into_any_element()
         }
@@ -105,12 +105,14 @@ fn markdown_style() -> TextViewStyle {
 /// 叠在代码块的沙色底上，按钮悬停用 `SELECTED`。
 fn code_block_header(
     lang: Option<SharedString>,
-    copied: bool,
+    copied: Option<Instant>,
     on_copy: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    window: &mut Window,
     cx: &App,
 ) -> Div {
     let (icon, label) =
-        if copied { (IconAll::Check, "已复制") } else { (IconAll::Copy, "复制") };
+        if copied.is_some() { (IconAll::Check, "已复制") } else { (IconAll::Copy, "复制") };
+    let pop = copied.and_then(|t| motion::enter(t.elapsed(), window, cx));
     div()
         .h_flex()
         .items_center()
@@ -125,6 +127,7 @@ fn code_block_header(
                 .xsmall()
                 .px_1p5()
                 .label(label)
+                .when_some(pop, |b, (opacity, _)| b.opacity(opacity))
                 .on_click(on_copy),
         )
 }
@@ -176,11 +179,15 @@ fn plan_header(rows: &[PlanRow]) -> Div {
 
 impl ChatApp {
     /// 对话里的一行：可能先画过程组的组头，再画自己（组内步骤缩进、挂细线），最后留行距。
+    /// `reveal` 是组内步骤的展开进度（不在组里的行恒为 1）：收起没走完时 `layout.body` 已经是
+    /// false，但还要按进度裁切着画完。
     pub(super) fn render_row(
         &self,
         ix: usize,
         item: &ChatItem,
         layout: RowLayout,
+        reveal: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let mut col = div().v_flex();
@@ -190,9 +197,12 @@ impl ChatApp {
             col =
                 col.child(self.render_group_head(ix, group, cx).when(follows, |d| d.pb(STEP_GAP)));
         }
-        if layout.body {
-            let body = self.render_item(ix, item, layout, cx);
-            col = col.child(if layout.nested {
+        if layout.body || reveal > 0. && layout.member {
+            let body = self.render_item(ix, item, layout, window, cx);
+            // 正在收起的步骤按展开时的样子画（缩进、挂细线、和下一步收紧）
+            let (nested, tight) =
+                if layout.body { (layout.nested, layout.tight) } else { (true, true) };
+            let body = if nested {
                 // 组内步骤：缩进到组头文字下面，左侧一条细线串起来；
                 // 行距算在细线里面，相邻两行的线才连得上
                 div()
@@ -200,13 +210,19 @@ impl ChatApp {
                     .pl(px(16.))
                     .border_l_1()
                     .border_color(rgb(LINE))
-                    .when(layout.tight, |d| d.pb(STEP_GAP))
+                    .when(tight, |d| d.pb(STEP_GAP))
                     .child(body)
             } else {
                 body
+            };
+            col = col.child(if reveal < 1. {
+                Reveal::new(("step-body", ix), reveal, body).into_any_element()
+            } else {
+                body.into_any_element()
             });
         }
-        col.when(!layout.tight, |d| d.pb(BLOCK_GAP))
+        // 正在收起、自己已不显示的步骤不留块间距（组头那行会留）
+        col.when(!layout.tight && (layout.body || layout.head.is_some()), |d| d.pb(BLOCK_GAP))
     }
 
     /// 过程组的组头：一行摘要（读了几个文件、跑了几条命令…），点开 / 收起；详细视图总是展开、不给开关。
@@ -273,6 +289,7 @@ impl ChatApp {
         open: bool,
         elapsed_ms: Option<u64>,
         verbose: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let has_text = !text.trim().is_empty();
@@ -293,11 +310,8 @@ impl ChatApp {
                 ))
             })
             .child(if streaming {
-                // 流式中高光扫过；系统开了「减少动画」时组件自己退回静态文字
-                ShimmerText::new("思考中…")
-                    .id(("think-shimmer", idx))
-                    .highlight_color(rgb(INK))
-                    .into_any_element()
+                // 流式中高光扫过；减少动态效果时停在静态文字
+                motion::shimmer_text("思考中…", INK_SOFT, INK).into_any_element()
             } else {
                 // 用时是会变的数字：等宽，免得和别的思考块对不齐
                 div()
@@ -312,22 +326,21 @@ impl ChatApp {
                 )
             });
 
-        let mut col = div().v_flex().gap_1().child(header);
-        if open {
+        let mut col = div().v_flex().child(header);
+        // 展开 / 收起走弹簧；收起没走完之前正文照样画、按进度裁切。
+        // 和标题之间的空隙算在正文里，收到底时不剩一截
+        let progress = motion::reveal_progress(("think", idx), open, window, cx);
+        if progress > 0. && has_text {
             let text = if streaming { close_dangling_code(text) } else { Cow::Borrowed(text) };
             // 字号 / 颜色要设在 TextView 自己身上（它按主题取默认值，不继承外层）
-            col = col.child(
-                div().pl(STEP_INDENT).child(
-                    TextView::markdown(
-                        ("think-md", idx),
-                        SharedString::from(text.trim().to_string()),
-                    )
+            let body = div().pt_1().pl(STEP_INDENT).child(
+                TextView::markdown(("think-md", idx), SharedString::from(text.trim().to_string()))
                     .style(markdown_style().paragraph_gap(rems(0.5)))
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
                     .line_height(LEADING),
-                ),
             );
+            col = col.child(Reveal::new(("think-body", idx), progress, body));
         }
         col
     }
@@ -338,6 +351,7 @@ impl ChatApp {
         text: &str,
         open: bool,
         verbose: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let open = open || verbose;
@@ -362,17 +376,18 @@ impl ChatApp {
                         .size_3(),
                 )
             });
-        let mut col = div().v_flex().gap_1().child(header);
-        if open {
-            col = col.child(
-                div()
-                    .pl(STEP_INDENT)
-                    .text_size(TEXT_SMALL)
-                    .font_family(MONO)
-                    .text_color(rgb(INK_SOFT))
-                    .line_height(LEADING)
-                    .child(text.trim().to_string()),
-            );
+        let mut col = div().v_flex().child(header);
+        let progress = motion::reveal_progress(("info", idx), open, window, cx);
+        if progress > 0. {
+            let body = div()
+                .pt_1()
+                .pl(STEP_INDENT)
+                .text_size(TEXT_SMALL)
+                .font_family(MONO)
+                .text_color(rgb(INK_SOFT))
+                .line_height(LEADING)
+                .child(text.trim().to_string());
+            col = col.child(Reveal::new(("info-body", idx), progress, body));
         }
         col
     }
@@ -382,16 +397,19 @@ impl ChatApp {
         idx: usize,
         card: &ToolCard,
         verbose: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         if card.diffs.is_empty() {
-            return Self::render_tool_plain(idx, card, verbose, cx);
+            return Self::render_tool_plain(idx, card, verbose, window, cx);
         }
-        // 文件改动：默认每份只显示前若干行，超出给一个展开开关
-        let limit = (!card.expanded && !verbose).then_some(DIFF_PREVIEW_ROWS);
+        // 文件改动：默认每份只显示前若干行，超出的部分展开 / 收起走弹簧
+        let preview = (!verbose).then_some(DIFF_PREVIEW_ROWS);
+        let rest = motion::reveal_progress(("diff", idx), card.expanded || verbose, window, cx);
         let mut col = div().v_flex().gap_2();
-        for diff in &card.diffs {
-            col = col.child(Self::render_diff(diff, limit, Some(card)));
+        for (k, diff) in card.diffs.iter().enumerate() {
+            let rest = (ElementId::from(("diff-rest", idx * 64 + k)), rest);
+            col = col.child(Self::render_diff(diff, preview, Some(rest), Some(card)));
         }
         // diff 已经说明了改了什么；结果摘要只在失败时有用（为什么没改成）
         if card.phase == ToolPhase::Failed && !card.result.is_empty() {
@@ -439,6 +457,7 @@ impl ChatApp {
         idx: usize,
         card: &ToolCard,
         verbose: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let has_output = !card.output.trim().is_empty();
@@ -462,28 +481,28 @@ impl ChatApp {
                     ),
                 )
         });
-        let mut col = div().v_flex().gap_1().child(line);
-        if open {
-            col = col.child(
-                div().pl(STEP_INDENT).child(
-                    div()
-                        .v_flex()
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .bg(rgb(CARD))
-                        .font_family(MONO)
-                        .text_size(TEXT_SMALL)
-                        .line_height(LEADING)
-                        .text_color(rgb(INK_SOFT))
-                        // 空行给个空格占住行高
-                        .children(card.output.lines().map(|l| {
-                            div().child(if l.is_empty() { " ".to_string() } else { l.to_string() })
-                        })),
-                ),
+        let mut col = div().v_flex().child(line);
+        let progress = motion::reveal_progress(("tool", idx), open, window, cx);
+        if progress > 0. && has_output {
+            let body = div().pt_1().pl(STEP_INDENT).child(
+                div()
+                    .v_flex()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(CARD))
+                    .font_family(MONO)
+                    .text_size(TEXT_SMALL)
+                    .line_height(LEADING)
+                    .text_color(rgb(INK_SOFT))
+                    // 空行给个空格占住行高
+                    .children(card.output.lines().map(|l| {
+                        div().child(if l.is_empty() { " ".to_string() } else { l.to_string() })
+                    })),
             );
+            col = col.child(Reveal::new(("tool-body", idx), progress, body));
         }
         col
     }
@@ -544,14 +563,14 @@ impl ChatApp {
         idx: usize,
         state: &CompactState,
         open: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let done = matches!(state, CompactState::Done(_));
         let (indicator, label): (AnyElement, SharedString) = match state {
-            CompactState::Running => (
-                Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element(),
-                "正在压缩上下文…".into(),
-            ),
+            CompactState::Running => {
+                (motion::spinner().into_any_element(), "正在压缩上下文…".into())
+            }
             CompactState::Done(_) => (
                 Icon::new(IconAll::ListCollapse).size_3p5().into_any_element(),
                 "上下文已压缩，较早的对话换成了摘要".into(),
@@ -591,10 +610,10 @@ impl ChatApp {
             });
         let mut col = div()
             .v_flex()
-            .gap_2()
             .child(div().h_flex().items_center().gap_3().child(rule()).child(center).child(rule()));
-        if let (true, CompactState::Done(summary)) = (open, state) {
-            col = col.child(
+        let progress = motion::reveal_progress(("compaction", idx), open && done, window, cx);
+        if let (true, CompactState::Done(summary)) = (progress > 0., state) {
+            let body = div().pt_2().child(
                 div()
                     .px_4()
                     .py_3()
@@ -610,6 +629,7 @@ impl ChatApp {
                             .line_height(LEADING),
                     ),
             );
+            col = col.child(Reveal::new(("compaction-body", idx), progress, body));
         }
         col
     }
@@ -783,75 +803,82 @@ impl ChatApp {
             .child(div().pl(STEP_INDENT).child(buttons))
     }
 
-    /// 一个文件的 diff 卡片；`limit` = 最多显示的行数（None = 全部）。
+    /// 一个文件的 diff 卡片；`preview` = 默认露出的行数（None = 全部）。
+    /// 超出的部分由 `rest`（元素 id, 展开进度）决定：进度 > 0 时按进度裁切着画出来。
     /// `tool` 给了时表头带上工具的状态图标和名称（兼当工具行）。
     pub(super) fn render_diff(
         diff: &DiffView,
-        limit: Option<usize>,
+        preview: Option<usize>,
+        rest: Option<(ElementId, f32)>,
         tool: Option<&ToolCard>,
     ) -> Div {
-        let shown = limit.map_or(diff.lines.len(), |n| n.min(diff.lines.len()));
-        let mut body =
-            div().v_flex().py_1().font_family(MONO).text_size(TEXT_SMALL).line_height(LEADING);
-        for line in &diff.lines[..shown] {
+        let line_el = |line: &claudesktop_core::DiffLineView| {
             if line.tag == '~' {
-                body = body.child(
-                    div()
-                        .h(px(18.))
-                        .pl(px(40.))
-                        .text_size(TEXT_META)
-                        .text_color(rgb(INK_FAINT))
-                        .bg(rgb(SAND))
-                        .child("⋯"),
-                );
-                continue;
+                return div()
+                    .h(px(18.))
+                    .pl(px(40.))
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_FAINT))
+                    .bg(rgb(SAND))
+                    .child("⋯");
             }
             let (bg, fg) = match line.tag {
                 '+' => (Some(DIFF_ADD_BG), DIFF_ADD_FG),
                 '-' => (Some(DIFF_DEL_BG), DIFF_DEL_FG),
                 _ => (None, INK_SOFT),
             };
-            body = body.child(
-                div()
-                    .h_flex()
-                    .items_start()
-                    .when_some(bg, |d, c| d.bg(rgb(c)))
-                    .child(
-                        div()
-                            .w(px(40.))
-                            .flex_shrink_0()
-                            .pr_2()
-                            .flex()
-                            .justify_end()
-                            .text_color(rgb(INK_FAINT))
-                            .child(format!("{}", line.no)),
-                    )
-                    .child(
-                        div()
-                            .w(px(14.))
-                            .flex_shrink_0()
-                            .text_color(rgb(fg))
-                            .child(line.tag.to_string()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .pr_3()
-                            .text_color(rgb(if bg.is_some() { fg } else { INK }))
-                            .child(line.text.clone()),
-                    ),
-            );
-        }
-        if diff.truncated && shown == diff.lines.len() {
-            body = body.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .font_family(sans())
-                    .text_color(rgb(INK_SOFT))
-                    .child("改动过大，其余部分未显示"),
-            );
+            div()
+                .h_flex()
+                .items_start()
+                .when_some(bg, |d, c| d.bg(rgb(c)))
+                .child(
+                    div()
+                        .w(px(40.))
+                        .flex_shrink_0()
+                        .pr_2()
+                        .flex()
+                        .justify_end()
+                        .text_color(rgb(INK_FAINT))
+                        .child(format!("{}", line.no)),
+                )
+                .child(
+                    div()
+                        .w(px(14.))
+                        .flex_shrink_0()
+                        .text_color(rgb(fg))
+                        .child(line.tag.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pr_3()
+                        .text_color(rgb(if bg.is_some() { fg } else { INK }))
+                        .child(line.text.clone()),
+                )
+        };
+        let shown = preview.map_or(diff.lines.len(), |n| n.min(diff.lines.len()));
+        let truncated = diff.truncated.then(|| {
+            div()
+                .px_3()
+                .py_1()
+                .font_family(sans())
+                .text_color(rgb(INK_SOFT))
+                .child("改动过大，其余部分未显示")
+        });
+        let mut body = div()
+            .v_flex()
+            .py_1()
+            .font_family(MONO)
+            .text_size(TEXT_SMALL)
+            .line_height(LEADING)
+            .children(diff.lines[..shown].iter().map(line_el));
+        let hidden = &diff.lines[shown..];
+        if hidden.is_empty() {
+            body = body.children(truncated);
+        } else if let Some((id, progress)) = rest.filter(|(_, p)| *p > 0.) {
+            let more = div().v_flex().children(hidden.iter().map(line_el)).children(truncated);
+            body = body.child(Reveal::new(id, progress, more));
         }
         let icon = match tool {
             Some(card) => tool_status_icon(card),
@@ -1008,11 +1035,20 @@ impl ChatApp {
 
     /// 往上翻过之后，对话区底部居中的「回到底部」圆钮；底下来了新内容时右上角带个赤陶点。
     /// 点一下跳回底部并恢复自动跟随。
-    pub(super) fn render_jump_to_bottom(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn render_jump_to_bottom(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         let s = self.session();
-        if !s.scrolled_away() {
+        // 出现 / 消失淡入淡出、略微升起（每帧都要采样，状态才留得住）
+        let presence = Presence::new("jump-to-bottom", s.scrolled_away())
+            .transition(Transition::new(cx.theme().motion_tokens().duration_fast))
+            .sample(window, cx);
+        if !presence.should_render() {
             return None;
         }
+        let shown = presence.progress;
         let unseen = s.has_unseen();
         let button = div()
             .id("jump-to-bottom")
@@ -1032,10 +1068,9 @@ impl ChatApp {
                 Tooltip::new(if unseen { "有新内容，回到底部" } else { "回到底部" })
                     .build(window, cx)
             })
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.session().follow_tail();
-                cx.notify();
-            }))
+            .opacity(shown)
+            .top(px(6.) * (1. - shown))
+            .on_click(cx.listener(|this, _, _, cx| this.start_jump_to_bottom(cx)))
             .child(Icon::new(IconAll::ArrowDown).size_4().text_color(rgb(INK_SOFT)))
             .when(unseen, |d| {
                 d.child(
@@ -1054,21 +1089,85 @@ impl ChatApp {
         Some(div().absolute().bottom_3().left_0().right_0().flex().justify_center().child(button))
     }
 
+    /// 点「回到底部」：离得远（超过一屏半）先跳到离底一屏的地方，剩下的一屏滑下去，
+    /// 到底后恢复自动跟随。减少动态效果时直接到底。
+    pub(super) fn start_jump_to_bottom(&mut self, cx: &mut Context<Self>) {
+        let s = self.session();
+        let remaining = distance_to_end(&s.list);
+        if cx.reduce_motion() || remaining <= px(1.) {
+            s.follow_tail();
+            cx.notify();
+            return;
+        }
+        let viewport = s.list.viewport_bounds().size.height;
+        if remaining > viewport * 1.5 {
+            s.list.scroll_by(remaining - viewport);
+        }
+        let now = Instant::now();
+        self.jump = Some(motion::JumpAnim { token: s.token, started: now, last: now });
+        cx.notify();
+    }
+
+    /// 平滑回到底部的一帧（`render` 开头调）：剩下的距离按指数衰减地滑过去，
+    /// 够近了或走了太久就交给自动跟随。切走会话、用户自己滚到底了就停。
+    pub(super) fn step_jump_to_bottom(&mut self, window: &mut Window) {
+        let Some(mut anim) = self.jump.take() else {
+            return;
+        };
+        let s = &self.sessions[self.active];
+        if anim.token != s.token || s.list.is_following_tail() {
+            return;
+        }
+        let remaining = distance_to_end(&s.list);
+        if remaining <= px(1.) || anim.started.elapsed() > motion::JUMP_MAX {
+            s.follow_tail();
+            return;
+        }
+        let now = Instant::now();
+        let dt = (now - anim.last).as_secs_f32();
+        anim.last = now;
+        let k = 1. - (-dt / motion::JUMP_TAU).exp();
+        s.list.scroll_by((remaining * k).max(px(1.)).min(remaining));
+        self.jump = Some(anim);
+        window.request_animation_frame();
+    }
+
+    /// 鼠标进出对话里的一条消息（下方操作按钮的淡入淡出跟着它）。
+    fn set_hovered_msg(&mut self, idx: usize, hovered: bool, cx: &mut Context<Self>) {
+        let next = if hovered {
+            Some(idx)
+        } else if self.hovered_msg == Some(idx) {
+            None
+        } else {
+            self.hovered_msg
+        };
+        if next != self.hovered_msg {
+            self.hovered_msg = next;
+            cx.notify();
+        }
+    }
+
     /// 「复制」按钮：点了把 `text(当前会话, idx)` 放进剪贴板，图标短暂变成对勾、文字变「已复制」。
     fn copy_action(
         &self,
         id: impl Into<ElementId>,
         idx: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
         text: impl Fn(&Session, usize) -> String + 'static,
     ) -> Button {
         let copied = self.copied == Some((self.session().token, idx, None));
         let (icon, label) =
             if copied { (IconAll::Check, "已复制") } else { (IconAll::Copy, "复制") };
-        Self::message_action(id, icon, label, cx).on_click(cx.listener(move |this, _, _, cx| {
-            let content = text(this.session(), idx);
-            this.copy_to_clipboard(idx, None, content, cx);
-        }))
+        // 变成对勾时淡入一下，确认点上了
+        let pop =
+            self.copied_at.filter(|_| copied).and_then(|t| motion::enter(t.elapsed(), window, cx));
+        Self::message_action(id, icon, label, cx)
+            .when_some(pop, |b, (opacity, _)| b.opacity(opacity))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let content = text(this.session(), idx);
+                this.copy_to_clipboard(idx, None, content, cx);
+            }))
     }
 
     /// 写剪贴板并记下「刚复制的是哪条（哪个代码块）」，1.5 秒后自动清掉对勾。
@@ -1082,6 +1181,7 @@ impl ChatApp {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         let key = (self.session().token, idx, block);
         self.copied = Some(key);
+        self.copied_at = Some(Instant::now());
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(1500)).await;
@@ -1112,15 +1212,17 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 用户消息气泡；悬停时下方出现「复制 / 编辑 / 在另一个内核上重跑」。
+    /// 用户消息气泡；悬停时下方淡入「复制 / 编辑 / 在另一个内核上重跑」。刚发出的一条从下方淡入升起。
     fn render_user(
         &self,
         idx: usize,
         text: &SharedString,
         images: &[PathBuf],
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let group: SharedString = format!("user-{idx}").into();
+        let fade =
+            motion::hover_opacity(("user-actions", idx), self.hovered_msg == Some(idx), window, cx);
         let current = self.session().kernel;
         let others = KernelChoice::ALL.into_iter().filter(|k| {
             *k != current
@@ -1136,8 +1238,8 @@ impl ChatApp {
             .h_flex()
             .justify_end()
             .gap_1()
-            .opacity(0.)
-            .child(self.copy_action(("copy-user", idx), idx, cx, |s, idx| {
+            .opacity(fade)
+            .child(self.copy_action(("copy-user", idx), idx, window, cx, |s, idx| {
                 match &s.transcript[idx] {
                     ChatItem::User { text, .. } => text.to_string(),
                     _ => String::new(),
@@ -1197,14 +1299,18 @@ impl ChatApp {
                 }),
             ))
         };
-        div()
-            .group(group.clone())
+        let block = div()
+            .id(("user-msg", idx))
             .v_flex()
             .items_end()
             .gap_1()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.set_hovered_msg(idx, *hovered, cx)
+            }))
             .children(thumbs)
             .children(bubble)
-            .child(actions.group_hover(group, |s| s.opacity(1.)))
+            .child(actions);
+        motion::entering(block, self.session().fresh_user(idx), window, cx)
     }
 
     pub(super) fn render_item(
@@ -1212,16 +1318,26 @@ impl ChatApp {
         idx: usize,
         item: &ChatItem,
         layout: RowLayout,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let verbose = self.settings.view_mode == ViewMode::Verbose;
         match item {
-            ChatItem::User { text, images } => self.render_user(idx, text, images, cx),
-            ChatItem::Thinking { text, streaming, open, elapsed_ms, .. } => {
-                Self::render_thinking(idx, text, *streaming, *open, *elapsed_ms, verbose, cx)
+            ChatItem::User { text, images } => self.render_user(idx, text, images, window, cx),
+            ChatItem::Thinking { text, streaming, open, elapsed_ms, .. } => Self::render_thinking(
+                idx,
+                text,
+                *streaming,
+                *open,
+                *elapsed_ms,
+                verbose,
+                window,
+                cx,
+            ),
+            ChatItem::Info { text, open } => {
+                Self::render_info(idx, text, *open, verbose, window, cx)
             }
-            ChatItem::Info { text, open } => Self::render_info(idx, text, *open, verbose, cx),
-            ChatItem::Tool(card) => Self::render_tool(idx, card, verbose, cx),
+            ChatItem::Tool(card) => Self::render_tool(idx, card, verbose, window, cx),
             ChatItem::AutoApproved { title, chosen } => {
                 Self::render_auto_approved(idx, title, chosen)
             }
@@ -1240,18 +1356,19 @@ impl ChatApp {
                     Some((t, i, block)) if t == token && i == idx => block,
                     _ => None,
                 };
+                let copied_at = self.copied_at;
                 let app = cx.entity().downgrade();
                 let body = div().min_w_0().text_size(TEXT_LARGE).line_height(LEADING).child(
                     TextView::markdown(("agent", idx), SharedString::from(text))
                         .style(markdown_style())
                         .stream_fade(true)
-                        .code_block_actions(move |block, _, cx| {
+                        .code_block_actions(move |block, window, cx| {
                             let start = block.span.map(|span| span.start).unwrap_or(0);
                             let code = block.code();
                             let app = app.clone();
                             code_block_header(
                                 block.lang(),
-                                copied_block == Some(start),
+                                copied_at.filter(|_| copied_block == Some(start)),
                                 move |_, _, cx| {
                                     let _ = app.update(cx, |this, cx| {
                                         this.copy_to_clipboard(
@@ -1262,6 +1379,7 @@ impl ChatApp {
                                         )
                                     });
                                 },
+                                window,
                                 cx,
                             )
                         }),
@@ -1270,19 +1388,21 @@ impl ChatApp {
                     return body;
                 }
                 // 一轮回复的末尾挂「复制」和这一轮的用时 / 用量：最后一轮常显，
-                // 更早的悬停才出现（只切透明度，不挤布局）
-                let group: SharedString = format!("agent-{idx}").into();
+                // 更早的悬停才淡入（只改透明度，不挤布局）
                 let latest =
                     !s.transcript[idx + 1..].iter().any(|i| matches!(i, ChatItem::User { .. }));
+                let hovered = self.hovered_msg == Some(idx);
+                let fade = (!latest)
+                    .then(|| motion::hover_opacity(("agent-actions", idx), hovered, window, cx));
                 let meta = s.turn_summary(idx).and_then(super::status::turn_meta);
                 let actions = div()
                     .h_flex()
                     .items_center()
                     .gap_2()
                     .pt_2()
-                    .child(
-                        self.copy_action(("copy-agent", idx), idx, cx, |s, idx| s.turn_text(idx)),
-                    )
+                    .child(self.copy_action(("copy-agent", idx), idx, window, cx, |s, idx| {
+                        s.turn_text(idx)
+                    }))
                     .children(meta.map(|m| {
                         // 和运行中的状态行同一套数字字形，一轮结束换过来时不变样
                         div()
@@ -1291,13 +1411,25 @@ impl ChatApp {
                             .font_features(tabular_nums())
                             .child(m)
                     }))
-                    .when(!latest, |d| d.opacity(0.).group_hover(group.clone(), |d| d.opacity(1.)));
-                div().group(group).v_flex().min_w_0().child(body).child(actions)
+                    .when_some(fade, |d, opacity| d.opacity(opacity));
+                div().child(
+                    div()
+                        .id(("agent-msg", idx))
+                        .v_flex()
+                        .min_w_0()
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            this.set_hovered_msg(idx, *hovered, cx)
+                        }))
+                        .child(body)
+                        .child(actions),
+                )
             }
             ChatItem::Failed { message, overflow } => {
                 self.render_failed(idx, message, *overflow, cx)
             }
-            ChatItem::Compaction { state, open } => Self::render_compaction(idx, state, *open, cx),
+            ChatItem::Compaction { state, open } => {
+                Self::render_compaction(idx, state, *open, window, cx)
+            }
             // 一轮层面的提示（续接、停止…）：和正文左对齐，图标打头
             ChatItem::Note(text) => {
                 step_line(Icon::new(IconAll::Info).size_3p5().text_color(rgb(INK_SOFT)))
@@ -1305,6 +1437,11 @@ impl ChatApp {
             }
         }
     }
+}
+
+/// 列表离底部还有多远（按已量过的行高估）。
+fn distance_to_end(list: &ListState) -> Pixels {
+    (list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y).max(px(0.))
 }
 
 /// 流式输出停在半截代码标记上时（`` `foo `` 或没收尾的 ``` 围栏），渲染前临时补齐，

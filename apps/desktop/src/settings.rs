@@ -221,6 +221,8 @@ pub struct Settings {
     pub font_scale: f32,
     /// 界面字体族；空串 = 用内嵌的 Inter（默认）
     pub font_family: String,
+    /// 动画（跟随系统的「动画效果」/ 总是播放 / 关闭），设置页切换后立即生效并写回
+    pub motion: MotionPref,
 }
 
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
@@ -242,6 +244,7 @@ impl Default for Settings {
             notifications: yes(),
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
+            motion: MotionPref::default(),
         }
     }
 }
@@ -264,6 +267,28 @@ impl Appearance {
             Appearance::System => "跟随系统",
             Appearance::Light => "浅色",
             Appearance::Dark => "深色",
+        }
+    }
+}
+
+/// 动画偏好：系统「动画效果」关掉时 gpui-kit 会停掉所有动效，这里可以单独给本应用打开或关掉。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionPref {
+    #[default]
+    System,
+    On,
+    Off,
+}
+
+impl MotionPref {
+    pub const ALL: [MotionPref; 3] = [MotionPref::System, MotionPref::On, MotionPref::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MotionPref::System => "跟随系统",
+            MotionPref::On => "开",
+            MotionPref::Off => "关",
         }
     }
 }

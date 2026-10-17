@@ -1,24 +1,207 @@
 //! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
+//!
+//! 侧栏是独立的缓存 view（[`SidebarView`]）：对话区的转圈、流式输出每帧都在重画 `ChatApp`，
+//! 侧栏几十行会话每行约 0.1ms，一起重画就是好几毫秒。缓存后只在侧栏用到的状态变了时重画
+//! （`ChatApp::render` 每帧比一次指纹，见 [`ChatApp::sync_sidebar`]）。
+//! 新加侧栏要显示的状态时，记得把它并进 `sync_sidebar` 的指纹，否则侧栏不会跟着变。
+//!
+//! 运行中那行的转圈不画在侧栏里（它每拍都要重画，会把整个侧栏一起带上——缓存 view 重画时
+//! 里面嵌套的缓存 view 也不复用），而是行里只留个占位、记下位置，由 `ChatApp` 叠在上面画
+//! （[`ChatApp::render_sidebar_spinners`]）。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
+use super::motion;
 use super::widgets::Surface;
 use super::{ChatApp, project_label};
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::base::motion::{Transition, transition};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// 侧栏的缓存 view：内容全由 `ChatApp::render_sidebar` 画，这里只是把它隔成一块单独重画的区域。
+pub(crate) struct SidebarView {
+    app: WeakEntity<ChatApp>,
+}
+
+impl SidebarView {
+    pub(super) fn new(app: WeakEntity<ChatApp>) -> Self {
+        Self { app }
+    }
+}
+
+impl Render for SidebarView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.app.upgrade() {
+            Some(app) => {
+                app.update(cx, |app, cx| app.render_sidebar(window, cx)).into_any_element()
+            }
+            None => div().into_any_element(),
+        }
+    }
+}
+
+/// 侧栏里一个运行中会话的转圈该画在哪：占位格的位置和它所在的裁切范围（窗口坐标）。
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct SpinnerSpot {
+    token: u64,
+    bounds: Bounds<Pixels>,
+    clip: Bounds<Pixels>,
+}
+
+/// 侧栏这次和上次重画时记下的转圈位置。侧栏复用缓存时不重画、也不重记，位置照旧有效。
+#[derive(Default)]
+pub(super) struct SpinnerSpots {
+    now: Vec<SpinnerSpot>,
+    before: Vec<SpinnerSpot>,
+}
+
+pub(super) type SharedSpots = Rc<RefCell<SpinnerSpots>>;
+
 impl ChatApp {
-    pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    /// 侧栏的位置：宽度随开合在 180ms 里滑动（收到 0 后不画），里面是缓存的侧栏 view。
+    pub(super) fn render_sidebar_slot(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let (duration, easing) = {
+            let motion = cx.theme().motion_tokens();
+            (motion.duration_normal, motion.easing_move.clone())
+        };
+        let target = if self.sidebar_open { SIDEBAR_W } else { px(0.) };
+        let width = transition(
+            "sidebar-width",
+            target,
+            Transition::new(duration).easing(easing),
+            window,
+            cx,
+        );
+        if width <= px(0.) {
+            // 完全收起时侧栏不画，记下的转圈位置作废
+            self.sidebar_spinners.borrow_mut().now.clear();
+        }
+        // 侧栏按全宽画、整块从左边滑进滑出（外层裁切），开合过程中它自己的尺寸不变
+        (width > px(0.)).then(|| {
+            div().w(width).h_full().flex_shrink_0().overflow_hidden().child(
+                div().relative().left(width - SIDEBAR_W).h_full().child(
+                    self.sidebar_view
+                        .clone()
+                        .cached(StyleRefinement::default().w(SIDEBAR_W).h_full()),
+                ),
+            )
+        })
+    }
+
+    /// 比对侧栏的指纹，变了才通知它重画（每帧调一次，在画侧栏之前）。
+    /// 指纹要盖住 `render_sidebar` / `render_session_row` 读到的全部状态。
+    pub(super) fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
+        let mut h = DefaultHasher::new();
+        // 外观、字号、字体变了全部重画
+        (crate::theme::is_dark(), f32::from(root_font_size()).to_bits(), sans()).hash(&mut h);
+        for (name, members) in self.session_groups() {
+            name.hash(&mut h);
+            for i in members {
+                (i, self.sessions[i].token).hash(&mut h);
+            }
+        }
+        (
+            self.settings.sidebar_by_date,
+            self.sessions_by_activity,
+            self.settings.sidebar_kernel_status,
+            self.settings_open,
+            self.sidebar_open,
+            self.renaming,
+            self.confirm_delete,
+            self.sidebar_hover,
+            self.active,
+            &self.cwd,
+        )
+            .hash(&mut h);
+        for k in &self.kernels {
+            (k.started, k.ready, k.error, &k.status).hash(&mut h);
+        }
+        for s in &self.sessions {
+            let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
+            (&s.title, s.busy, s.busy && s.waiting_permission(), age).hash(&mut h);
+        }
+        let key = h.finish();
+        if key != self.sidebar_key {
+            self.sidebar_key = key;
+            self.sidebar_view.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    /// 侧栏里运行中会话的转圈：叠在侧栏上、画在各行占位格记下的位置（见文件头）。
+    /// 侧栏这一帧重画、行挪了位置时，占位格会要下一帧，这里跟着挪过去。
+    pub(super) fn render_sidebar_spinners(&self) -> Vec<Div> {
+        let spots = self.sidebar_spinners.borrow();
+        spots
+            .now
+            .iter()
+            .filter(|spot| {
+                self.sessions
+                    .iter()
+                    .any(|s| s.token == spot.token && s.busy && !s.waiting_permission())
+            })
+            .map(|spot| {
+                let (b, clip) = (spot.bounds, spot.clip);
+                div()
+                    .absolute()
+                    .left(clip.origin.x)
+                    .top(clip.origin.y)
+                    .w(clip.size.width)
+                    .h(clip.size.height)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(b.origin.x - clip.origin.x)
+                            .top(b.origin.y - clip.origin.y)
+                            .w(b.size.width)
+                            .h(b.size.height)
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .child(motion::spinner()),
+                    )
+            })
+            .collect()
+    }
+
+    /// 鼠标进出侧栏的一行会话（行右侧操作按钮的淡入淡出跟着它）。
+    fn set_sidebar_hover(&mut self, token: u64, hovered: bool, cx: &mut Context<Self>) {
+        let next = if hovered {
+            Some(token)
+        } else if self.sidebar_hover == Some(token) {
+            None
+        } else {
+            self.sidebar_hover
+        };
+        if next != self.sidebar_hover {
+            self.sidebar_hover = next;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        // 这一遍重新记转圈的位置（各行的占位格在 prepaint 时记）
+        {
+            let mut spots = self.sidebar_spinners.borrow_mut();
+            spots.before = std::mem::take(&mut spots.now);
+        }
         let mut body = v_flex().gap_0().pb_2();
 
         // 会话：按工作目录分组，当前项目在前，其余按最近活动排序（或按日期分组）。
@@ -107,7 +290,7 @@ impl ChatApp {
             };
             body = body.child(header);
             for i in members {
-                body = body.child(self.render_session_row(i, cx));
+                body = body.child(self.render_session_row(i, window, cx));
             }
         }
 
@@ -277,7 +460,12 @@ impl ChatApp {
             .collect()
     }
 
-    fn render_session_row(&self, i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_session_row(
+        &self,
+        i: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let s = &self.sessions[i];
         let active = self.active == i;
         let row = div()
@@ -351,7 +539,21 @@ impl ChatApp {
         let marker = if s.busy && s.waiting_permission() {
             div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
         } else if s.busy {
-            Spinner::new().xsmall().color(rgb(CORAL).into()).into_any_element()
+            // 转圈由 ChatApp 叠在这里画（见文件头）：这里只记位置，挪了位置就要下一帧让它跟上
+            let (spots, token) = (self.sidebar_spinners.clone(), s.token);
+            canvas(
+                move |bounds, window, _| {
+                    let spot = SpinnerSpot { token, bounds, clip: window.content_mask().bounds };
+                    let mut spots = spots.borrow_mut();
+                    if spots.before.get(spots.now.len()) != Some(&spot) {
+                        window.request_animation_frame();
+                    }
+                    spots.now.push(spot);
+                },
+                |_, _, _, _| {},
+            )
+            .size(px(12.))
+            .into_any_element()
         } else {
             div()
                 .size(px(9.))
@@ -361,7 +563,13 @@ impl ChatApp {
                 .into_any_element()
         };
         let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
-        let group: SharedString = format!("session-row-{i}").into();
+        let token = s.token;
+        let actions = motion::hover_opacity(
+            ("row-actions", token as usize),
+            self.sidebar_hover == Some(token),
+            window,
+            cx,
+        );
         let icon_button = |id: &'static str, icon: IconAll| {
             div()
                 .id((id, i))
@@ -371,9 +579,11 @@ impl ChatApp {
                 .hover(|d| d.bg(rgb(HOVER_STRONG)))
                 .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
         };
-        row.group(group.clone())
-            .cursor_pointer()
+        row.cursor_pointer()
             .when(!active, |d| d.hover(|d| d.bg(rgb(SELECTED))))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.set_sidebar_hover(token, *hovered, cx)
+            }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_session(i, cx);
             }))
@@ -416,8 +626,7 @@ impl ChatApp {
                     .pl_2()
                     .rounded_md()
                     .bg(rgb(SELECTED))
-                    .opacity(0.)
-                    .group_hover(group, |d| d.opacity(1.))
+                    .opacity(actions)
                     .child(icon_button("session-rename", IconAll::SquarePen).on_click(cx.listener(
                         move |this, _, window, cx| {
                             cx.stop_propagation();

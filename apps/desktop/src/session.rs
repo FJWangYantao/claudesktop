@@ -111,6 +111,8 @@ pub struct RowLayout {
     pub nested: bool,
     /// 下面紧跟同组的下一行（行距收紧，细线连上）
     pub tight: bool,
+    /// 属于一个多步过程组（不管这会儿露不露出来）：展开 / 收起时按弹簧进度裁切
+    pub member: bool,
     /// 计划正钉在输入框上方：这里只留一行进度
     pub compact: bool,
 }
@@ -378,6 +380,9 @@ impl Session {
                     };
                     out[start].head = Some(StepGroup { end: i, live, open });
                     out[start].tight = !shown.is_empty();
+                    for &s in &steps {
+                        out[s].member = true;
+                    }
                     for (k, &s) in shown.iter().enumerate() {
                         out[s].body = true;
                         out[s].nested = true;
@@ -515,6 +520,11 @@ impl Session {
     /// 有还没应答的权限请求
     pub fn waiting_permission(&self) -> bool {
         self.transcript.iter().any(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
+    }
+
+    /// 第 `idx` 条是刚发出去、这一轮还在跑的用户消息：返回发出的时刻（入场动画用）。
+    pub fn fresh_user(&self, idx: usize) -> Option<Instant> {
+        (self.busy && self.last_user() == Some(idx)).then_some(self.turn_started).flatten()
     }
 
     /// 一轮开始：置忙并开始计时。
@@ -1555,6 +1565,9 @@ mod tests {
         assert!(!l[1].head.unwrap().live);
         assert!((1..7).all(|i| !l[i].body) && !l[1].tight);
         assert!(l[7].body);
+        // 收起了也还记着是组里的一步（收起动画要按进度画完）；空思考和正文不算
+        let members: Vec<usize> = (0..8).filter(|&i| l[i].member).collect();
+        assert_eq!(members, [1, 3, 4, 5, 6]);
 
         // 点开：除了空思考全都露出来
         s.toggle_group(1);

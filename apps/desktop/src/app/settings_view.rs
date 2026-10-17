@@ -245,6 +245,13 @@ impl ChatApp {
         self.apply_appearance(window, cx);
     }
 
+    /// 设置页切「动画」：立即生效并写回。
+    pub(crate) fn set_motion_pref(&mut self, pref: MotionPref, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.motion = pref, cx);
+        self.apply_motion_pref(cx);
+        cx.notify();
+    }
+
     /// 侧栏底部要不要列出内核状态（立即生效，不走「保存并应用」）。
     pub(crate) fn set_sidebar_kernel_status(&mut self, on: bool, cx: &mut Context<Self>) {
         self.save_ui_pref(move |s| s.sidebar_kernel_status = on, cx);
@@ -266,8 +273,25 @@ impl ChatApp {
                     .child(Self::seg(a.label(), a == current)),
             );
         }
+        let motion = self.settings.motion;
+        let mut motion_segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
+        for (i, m) in MotionPref::ALL.into_iter().enumerate() {
+            motion_segs = motion_segs.child(
+                div()
+                    .id(("motion", i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_motion_pref(m, cx)))
+                    .child(Self::seg(m.label(), m == motion)),
+            );
+        }
+        let motion_desc = if motion == MotionPref::System && self.system_reduce_motion {
+            "展开收起、转圈等过渡；跟随 Windows「动画效果」（当前已关闭）"
+        } else {
+            "展开收起、转圈等过渡；跟随系统时看 Windows「动画效果」"
+        };
         setting_group([
             setting_row("外观", "跟随系统，或固定用浅色 / 深色；立即生效", segs),
+            setting_row("动画", motion_desc, motion_segs),
             self.font_scale_row(),
             self.font_family_row(cx),
             setting_row(
