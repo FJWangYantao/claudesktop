@@ -361,7 +361,17 @@ fn run_kernel(
                 async move |request: WriteTextFileRequest, responder, _connection| {
                     let session = request.session_id.to_string();
                     let path = request.path.to_string_lossy().into_owned();
+                    // 检查点：写盘的是我们，前后各读一次交给 UI（回退时还原）。
+                    // agent 自己直接写盘的看不见
+                    let before = crate::checkpoint::read_snapshot(&request.path);
                     let ok = std::fs::write(&request.path, &request.content).is_ok();
+                    if let Some(before) = before
+                        && let Some(after) = crate::checkpoint::read_snapshot(&request.path)
+                        && before != after
+                    {
+                        let change = KernelEvent::FileChanged { path: path.clone(), before, after };
+                        emit(&sink_fs_write, Some(session.clone()), change);
+                    }
                     emit(&sink_fs_write, Some(session), KernelEvent::FsWrite { path, ok });
                     responder.respond(WriteTextFileResponse::new())
                 },

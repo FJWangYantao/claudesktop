@@ -415,3 +415,40 @@ fn resume_falls_back_to_new_session() {
     assert_ne!(sid, "old-session-42");
     assert!(!resumed);
 }
+
+/// 检查点：agent 经客户端 `fs/write_text_file` 写的文件，前后内容作为 `FileChanged` 上报。
+#[test]
+fn client_writes_report_file_changes() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
+    };
+    let dir = std::env::temp_dir().join(format!("claudesktop-acp-write-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "旧").unwrap();
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: mock_command(),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+        },
+        sink,
+    )
+    .expect("spawn kernel");
+    let sid = start_session(&kernel, &events);
+    let prompt = format!("write:{}:新", file.display());
+    kernel.send_prompt(&sid, UserPrompt::text(prompt)).expect("send prompt");
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "新");
+    let changed = events.lock().unwrap().iter().find_map(|e| match e {
+        KernelEvent::FileChanged { before, after, .. } => Some((before.clone(), after.clone())),
+        _ => None,
+    });
+    assert_eq!(changed, Some((Some("旧".into()), Some("新".into()))));
+    let _ = std::fs::remove_dir_all(&dir);
+}

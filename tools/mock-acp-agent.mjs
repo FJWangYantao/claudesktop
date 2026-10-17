@@ -3,7 +3,9 @@
 //
 // 用途：在不接真实 LLM 的前提下，端到端验证 claudesktop-core 的
 // AcpKernel 协议实现（initialize / session/new / session/prompt /
-// session/update 全变体 / session/request_permission / fs/read_text_file）。
+// session/update 全变体 / session/request_permission / fs/read_text_file / fs/write_text_file）。
+//
+// 提示词以 `write:<路径>:<内容>` 开头时只经客户端写一个文件就结束这一轮（检查点测试用）。
 //
 // 传输：stdio 上的换行分隔 JSON-RPC 2.0。
 import readline from 'node:readline';
@@ -151,6 +153,16 @@ rl.on('line', (line) => {
         .filter((b) => b?.type === 'text')
         .map((b) => b.text)
         .join('');
+      if (text.startsWith('write:')) {
+        // 路径里可能有盘符的冒号：按最后一个冒号切
+        const rest = text.slice('write:'.length);
+        const cut = rest.lastIndexOf(':');
+        const path = rest.slice(0, cut);
+        const content = rest.slice(cut + 1);
+        request('fs/write_text_file', { sessionId: params?.sessionId, path, content })
+          .then(() => reply(id, { stopReason: 'end_turn' }));
+        break;
+      }
       runTurn(id, params?.sessionId, text).catch((err) => {
         console.error('[mock] turn failed:', err);
         send({ jsonrpc: '2.0', id, error: { code: -32603, message: String(err) } });
