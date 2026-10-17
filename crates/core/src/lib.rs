@@ -15,6 +15,7 @@
 mod acp;
 pub mod checkpoint;
 mod diff;
+pub mod plugin;
 mod process_guard;
 mod store;
 
@@ -23,6 +24,7 @@ pub use diff::{DiffLineView, DiffView};
 pub use process_guard::kill_children_on_exit;
 pub use store::{Record, SessionLog, SessionMeta, SessionStore, default_data_dir, effective};
 
+pub use plugin::Plugin;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,6 +71,8 @@ pub struct PermissionOptionView {
 pub enum KernelEvent {
     /// 生命周期 / 诊断文本（连接建立、协议协商结果等）
     Status(String),
+    /// 会话里显示的一行提示（插件钩子出错等）；不进日志
+    Notice(String),
     /// 与 agent 的连接已建立（`initialize` 完成），可以开始创建会话
     Connected {
         /// agent 自报的名称（`agentInfo.name`）
@@ -196,6 +200,9 @@ pub struct McpServerView {
     pub state: McpState,
     /// 提供几个工具（连上之后才有）
     pub tools: usize,
+    /// 来自哪个插件；None = 数据目录的 mcp.json
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +221,7 @@ impl KernelEvent {
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Status(_) => "status",
+            Self::Notice(_) => "notice",
             Self::Connected { .. } => "connected",
             Self::Started { .. } => "started",
             Self::AgentMessageChunk { .. } => "agent_message_chunk",
@@ -439,6 +447,10 @@ pub trait Kernel: Send + Sync {
     }
     /// 重新读 MCP 配置、重连全部服务器；结果经 `McpStatus` 回报。默认没有 MCP。
     fn reload_mcp(&self) {}
+
+    /// 换一批启用的插件（启用 / 停用之后）：自研内核接它们的 MCP 服务、技能和钩子，
+    /// ACP 内核在之后新开 / 续接的会话里把插件的 MCP 服务交给 agent。
+    fn set_plugins(&self, _plugins: Vec<plugin::Plugin>) {}
     /// 关闭内核。
     fn shutdown(&self);
 }

@@ -173,6 +173,7 @@ impl Harness {
                 user_instructions: None,
                 context_windows,
                 mcp_config,
+                plugins: Vec::new(),
             },
             sink,
         )
@@ -306,7 +307,7 @@ fn rewind_replaces_the_context() {
     h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
     // 日志里回退到第二问之前：第二轮从上下文里消失
     let ev = |event| Record::Event { event };
-    let user = |text: &str| Record::User { text: text.into(), images: Vec::new() };
+    let user = |text: &str| Record::user(text);
     let ended = || ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
     let log = vec![
         user("第一问"),
@@ -1180,7 +1181,7 @@ fn resume_rebuilds_context_from_log() {
     let (base, bodies) = serve(vec![happy_stream("记得，是 42。")]);
     let h = Harness::new(base);
     let log = vec![
-        Record::User { text: "秘密是 42，记住".into(), images: Vec::new() },
+        Record::user("秘密是 42，记住"),
         Record::Event {
             event: KernelEvent::AgentMessageChunk { text: "好的，记住了。".into() }
         },
@@ -1492,5 +1493,82 @@ fn mcp_read_only_tools_survive_plan_mode_and_list_changes() {
             if servers.iter().any(|s| s.name == "mock" && s.tools == 3))
     });
     h.kernel.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 写一个带技能和钩子的插件，读出来
+fn hook_plugin(dir: &std::path::Path, hooks: serde_json::Value) -> claudesktop_core::Plugin {
+    let root = dir.join("plugin-kit");
+    std::fs::create_dir_all(root.join("skills/pdf")).unwrap();
+    std::fs::create_dir_all(root.join("hooks")).unwrap();
+    std::fs::write(
+        root.join("skills/pdf/SKILL.md"),
+        "---\nname: pdf-tools\ndescription: work with PDF files\n---\nsteps",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hooks/hooks.json"),
+        serde_json::json!({ "hooks": hooks }).to_string(),
+    )
+    .unwrap();
+    claudesktop_core::plugin::load(&root)
+}
+
+#[test]
+fn plugin_skills_and_hooks_reach_the_model() {
+    let dir = workdir("plugin-hooks");
+    let plugin = hook_plugin(
+        &dir,
+        serde_json::json!({
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "echo today is friday" }] }],
+            "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo no shell today 1>&2; exit 2" }] }],
+        }),
+    );
+    let (base, bodies) = serve(vec![
+        tool_call("call_1", "shell", serde_json::json!({ "command": "echo hi" })),
+        happy_stream("好的。"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    h.kernel.set_plugins(vec![plugin]);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("跑一下")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 被「执行工具前」钩子拦下：不问权限，原因回给模型
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
+    assert_eq!(h.tool_status("call_1").as_deref(), Some("failed"));
+    let first = body(&bodies, 0);
+    let msgs = first["messages"].as_array().unwrap();
+    // 技能列进系统提示词，「提交消息」钩子的输出接在用户消息后面
+    let system = msgs[0]["content"].as_str().unwrap();
+    assert!(system.contains("pdf-tools: work with PDF files"), "{system}");
+    let user = msgs.last().unwrap()["content"].to_string();
+    assert!(user.contains("today is friday") && user.contains("plugin-hook-context"), "{user}");
+    let second = body(&bodies, 1);
+    let tool = second["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+    assert!(tool.contains("Blocked by a plugin hook: no shell today"), "{tool}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prompt_hook_can_block_the_turn() {
+    let dir = workdir("plugin-block");
+    let plugin = hook_plugin(
+        &dir,
+        serde_json::json!({
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "echo no secrets 1>&2; exit 2" }] }],
+        }),
+    );
+    let (base, bodies) = serve(vec![happy_stream("不该到这里")]);
+    let h = Harness::with_cwd(base, dir.clone());
+    h.kernel.set_plugins(vec![plugin]);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("密码是 123")).unwrap();
+    h.wait(
+        "prompt failed",
+        |e| matches!(e, KernelEvent::PromptFailed { message } if message.contains("no secrets")),
+    );
+    // 请求根本没发出去
+    assert!(bodies.lock().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

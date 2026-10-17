@@ -244,6 +244,7 @@ impl ChatApp {
             self.sessions_by_activity,
             self.settings.sidebar_kernel_status,
             self.settings_open,
+            self.settings_form.tab,
             self.sidebar_open,
             self.renaming,
             self.confirm_delete,
@@ -577,6 +578,9 @@ impl ChatApp {
                 .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(label))
         };
 
+        // 设置页开在「插件」分类时，高亮的是侧栏的「插件」而不是「设置」
+        let plugins_open =
+            self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
         let panel = v_flex()
             .size_full()
             .rounded_xl()
@@ -598,11 +602,11 @@ impl ChatApp {
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
                     .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
             )
-            .child(nav_item("plugins", IconAll::Blocks, "插件", false).on_click(cx.listener(
-                |this, _, _, cx| {
-                    this.toast("插件系统尚未开放；当前通过输入区的内核下拉切换 agent 能力", cx);
-                },
-            )))
+            .child(nav_item("plugins", IconAll::Blocks, "插件", plugins_open).on_click(
+                cx.listener(|this, _, window, cx| {
+                    this.open_settings_at(super::settings_view::PLUGINS_TAB, window, cx)
+                }),
+            ))
             .child(
                 // 列表滚到底部「设置」上面时渐隐，不是一刀切（同对话区的下边缘）；
                 // 列表底下留出渐隐的高度，滚到头时最后一行不被盖住
@@ -634,15 +638,20 @@ impl ChatApp {
                     .gap_1()
                     .pb_3()
                     .child(
-                        nav_item("open-settings", IconAll::Settings, "设置", self.settings_open)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if this.settings_open {
-                                    this.settings_open = false;
-                                    cx.notify();
-                                } else {
-                                    this.open_settings(window, cx);
-                                }
-                            })),
+                        nav_item(
+                            "open-settings",
+                            IconAll::Settings,
+                            "设置",
+                            self.settings_open && !plugins_open,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if this.settings_open {
+                                this.settings_open = false;
+                                cx.notify();
+                            } else {
+                                this.open_settings(window, cx);
+                            }
+                        })),
                     )
                     .child(div().v_flex().gap_1().px_4().pt_1().children(
                         // 可在设置页关掉（「侧栏显示内核状态」）

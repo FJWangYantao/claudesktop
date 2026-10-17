@@ -1,0 +1,231 @@
+//! 设置页「插件」：数据目录 `plugins/` 下的插件，看里面有什么、启用 / 停用。
+//!
+//! 插件的读取和格式在 `claudesktop_core::plugin`；启用了哪些记在设置的 `plugins_enabled` 里
+//! （新放进来的默认停用：钩子和 MCP 服务会在本机跑插件作者写的命令，看过再开）。
+//! 启用状态一变就经 `Kernel::set_plugins` 交给已经起来的内核，没起来的内核启动时带上。
+//! 斜杠命令在发消息时由界面展开（`submit_to`），所以对所有内核都管用。
+
+use super::ChatApp;
+use crate::theme::rgb;
+use crate::theme::*;
+use claudesktop_core::plugin::{self, Plugin};
+use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+impl ChatApp {
+    /// 启用了的插件（按名字记，插件目录里找不到的名字忽略）。
+    pub(crate) fn enabled_plugins(&self) -> Vec<Plugin> {
+        self.plugins
+            .iter()
+            .filter(|p| self.settings.plugins_enabled.contains(&p.name))
+            .cloned()
+            .collect()
+    }
+
+    /// 重新扫一遍插件目录，结果交给内核。
+    pub(crate) fn rescan_plugins(&mut self, cx: &mut Context<Self>) {
+        self.plugins =
+            plugin::default_plugins_dir().map(|d| plugin::discover(&d)).unwrap_or_default();
+        self.push_plugins();
+        cx.notify();
+    }
+
+    /// 把启用的插件交给已经起来的内核（没起来的启动时自己带上，见 `spawn_kernel`）。
+    pub(crate) fn push_plugins(&self) {
+        let enabled = self.enabled_plugins();
+        for kernel in self.kernels.iter().filter_map(|k| k.kernel.as_ref()) {
+            kernel.set_plugins(enabled.clone());
+        }
+    }
+
+    fn set_plugin_enabled(&mut self, name: String, on: bool, cx: &mut Context<Self>) {
+        self.save_ui_pref(
+            move |s| {
+                s.plugins_enabled.retain(|n| *n != name);
+                if on {
+                    s.plugins_enabled.push(name.clone());
+                }
+            },
+            cx,
+        );
+        self.push_plugins();
+        cx.notify();
+    }
+
+    /// 在资源管理器里打开插件目录（还没有就建一个）。
+    fn open_plugins_dir(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = plugin::default_plugins_dir() else {
+            self.toast(Notification::error("找不到数据目录"), cx);
+            return;
+        };
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.toast(Notification::error(format!("建不了 {}：{err}", dir.display())), cx);
+            return;
+        }
+        cx.open_with_system(&dir);
+    }
+
+    pub(super) fn render_plugins(&self, cx: &mut Context<Self>) -> Div {
+        let dir = plugin::default_plugins_dir()
+            .map_or_else(|| "plugins".into(), |p| p.display().to_string());
+        let header = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div().flex_1().text_size(TEXT_BODY).font_weight(FontWeight::MEDIUM).child("插件"),
+            )
+            .child(
+                Self::text_button("plugins-open", "打开插件目录", false)
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.open_plugins_dir(cx))),
+            )
+            .child(
+                Self::text_button("plugins-rescan", "重新扫描", false)
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.rescan_plugins(cx))),
+            );
+        let section = div()
+            .v_flex()
+            .gap_2()
+            .child(header)
+            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(format!(
+            "每个插件是 {dir} 下的一个文件夹，格式兼容 Claude Code 的插件。新放进来的插件默认停用：\
+                 钩子和 MCP 服务会在你的电脑上运行插件里写的命令，看过下面列出的内容再启用。"
+        )));
+        if self.plugins.is_empty() {
+            return section.child(
+                div().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
+                    "还没有插件。点「打开插件目录」，把插件文件夹放进去，再点「重新扫描」。",
+                ),
+            );
+        }
+        let mut list = div().v_flex().gap_2();
+        for (i, p) in self.plugins.iter().enumerate() {
+            list = list.child(self.plugin_card(i, p, cx));
+        }
+        section.child(list).child(
+            div()
+                .h_flex()
+                .items_start()
+                .gap_1p5()
+                .text_size(TEXT_META)
+                .text_color(rgb(INK_SOFT))
+                .child(Icon::new(IconAll::Info).size_3p5().flex_shrink_0().mt_0p5())
+                // 文字单独包一层可收缩的块，长了才会折行（直接挂在 h_flex 上会撑出页面）
+                .child(div().flex_1().min_w_0().child(
+                    "自研内核：指令、技能、MCP 工具、钩子都生效。ACP agent（如 Claude Code）：\
+                     指令和 MCP 服务生效，对之后新开的会话起作用。",
+                )),
+        )
+    }
+
+    /// 一个插件：名字、版本、开关、说明，下面逐项列出它带来的东西（钩子和 MCP 要跑的命令写全）。
+    fn plugin_card(&self, i: usize, p: &Plugin, cx: &mut Context<Self>) -> Div {
+        let on = self.settings.plugins_enabled.contains(&p.name);
+        let name = p.name.clone();
+        let line = |label: &'static str, text: String| {
+            div()
+                .h_flex()
+                .items_start()
+                .gap_2()
+                .text_size(TEXT_SMALL)
+                .child(div().w(rems(4.5)).flex_shrink_0().text_color(rgb(INK_SOFT)).child(label))
+                .child(div().flex_1().min_w_0().text_color(rgb(INK)).child(text))
+        };
+        let mut contents = div().v_flex().gap_1();
+        if !p.commands.is_empty() {
+            let names: Vec<String> = p.commands.iter().map(|c| format!("/{}", c.name)).collect();
+            contents = contents.child(line("指令", names.join("  ")));
+        }
+        if !p.skills.is_empty() {
+            let names: Vec<&str> = p.skills.iter().map(|s| s.name.as_str()).collect();
+            contents = contents.child(line("技能", names.join("、")));
+        }
+        for s in &p.mcp_servers {
+            let command = std::iter::once(s.command.as_str())
+                .chain(s.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            contents = contents.child(line("MCP", format!("{}：{command}", s.name)));
+        }
+        for h in &p.hooks {
+            let when = match h.matcher.trim() {
+                "" | "*" => h.event.label().to_string(),
+                m => format!("{}（{m}）", h.event.label()),
+            };
+            contents = contents.child(line("钩子", format!("{when}：{}", h.command)));
+        }
+        let empty = p.commands.is_empty()
+            && p.skills.is_empty()
+            && p.mcp_servers.is_empty()
+            && p.hooks.is_empty();
+        div()
+            .v_flex()
+            .gap_2()
+            .px_3()
+            .py_2p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CARD))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconAll::Blocks).size_4().text_color(rgb(INK_SOFT)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(TEXT_BODY)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(INK))
+                            .child(p.name.clone()),
+                    )
+                    .when_some(p.version.clone(), |d, v| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(TEXT_SMALL)
+                                .text_color(rgb(INK_SOFT))
+                                .child(format!("v{v}")),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Switch::new(("plugin-enabled", i)).checked(on).color(rgb(CORAL)).on_change(
+                            cx.listener(move |this, checked: &bool, _, cx| {
+                                this.set_plugin_enabled(name.clone(), *checked, cx)
+                            }),
+                        ),
+                    ),
+            )
+            .when(!p.description.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .child(p.description.clone()),
+                )
+            })
+            .child(if empty {
+                div()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK_SOFT))
+                    .child("没找到指令、技能、MCP 服务或钩子")
+            } else {
+                contents
+            })
+            .children(p.problems.iter().map(|problem| {
+                div().text_size(TEXT_SMALL).text_color(rgb(RED)).child(problem.clone())
+            }))
+    }
+}

@@ -25,12 +25,13 @@ use std::thread::JoinHandle;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities, ImageContent,
-    Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionModeState, SessionNotification, SetSessionModeRequest,
-    TextContent, ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
+    CancelNotification, ClientCapabilities, ContentBlock, EnvVariable, FileSystemCapabilities,
+    ImageContent, Implementation, InitializeRequest, LoadSessionRequest, McpServer, McpServerStdio,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionModeState,
+    SessionNotification, SetSessionModeRequest, TextContent, ToolCallContent, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
 use futures::StreamExt;
@@ -49,6 +50,9 @@ fn emit(sink: &EventSink, session: Option<String>, event: KernelEvent) {
 
 /// 等待 UI 应答的权限请求：请求 ID → 唤醒发送端（`None` = 取消）。
 type PendingPermissions = Arc<Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>>;
+
+/// 启用的插件带来的 MCP 服务：新开 / 续接会话时交给 agent（`set_plugins` 更新，之后开的会话生效）。
+type PluginServers = Arc<Mutex<Vec<McpServer>>>;
 
 /// ACP 内核配置。
 #[derive(Debug, Clone)]
@@ -117,6 +121,7 @@ fn default_agent_command() -> String {
 pub struct AcpKernel {
     command_tx: UnboundedSender<KernelCommand>,
     pending: PendingPermissions,
+    plugin_servers: PluginServers,
 }
 
 impl AcpKernel {
@@ -128,14 +133,16 @@ impl AcpKernel {
         let (tx, rx) = unbounded::<KernelCommand>();
         let pending: PendingPermissions = Arc::default();
         let pending_for_thread = pending.clone();
+        let plugin_servers: PluginServers = Arc::default();
+        let servers_for_thread = plugin_servers.clone();
         emit(&sink, None, KernelEvent::Status(format!("启动 ACP 内核: {}", config.command)));
 
         let _handle: JoinHandle<()> = std::thread::Builder::new()
             .name("acp-kernel".into())
-            .spawn(move || run_kernel(config, rx, sink, pending_for_thread))
+            .spawn(move || run_kernel(config, rx, sink, pending_for_thread, servers_for_thread))
             .map_err(|e| anyhow::anyhow!("spawn acp-kernel thread: {e}"))?;
 
-        Ok(Self { command_tx: tx, pending })
+        Ok(Self { command_tx: tx, pending, plugin_servers })
     }
 
     fn send_command(&self, command: KernelCommand) -> anyhow::Result<()> {
@@ -156,6 +163,21 @@ impl Kernel for AcpKernel {
 
     fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()> {
         self.send_command(KernelCommand::NewSession { token, cwd })
+    }
+
+    fn set_plugins(&self, plugins: Vec<crate::plugin::Plugin>) {
+        *self.plugin_servers.lock().unwrap() = plugins
+            .iter()
+            .flat_map(|p| p.mcp_servers.iter())
+            .map(|s| {
+                let env = s.env.iter().map(|(k, v)| EnvVariable::new(k, v)).collect();
+                McpServer::Stdio(
+                    McpServerStdio::new(s.name.clone(), s.command.clone())
+                        .args(s.args.clone())
+                        .env(env),
+                )
+            })
+            .collect();
     }
 
     fn resume_session(
@@ -209,6 +231,7 @@ fn run_kernel(
     mut cmd_rx: futures::channel::mpsc::UnboundedReceiver<KernelCommand>,
     sink: EventSink,
     pending: PendingPermissions,
+    plugin_servers: PluginServers,
 ) {
     let sink_fatal = sink.clone();
     let result = smol::block_on(async move {
@@ -414,17 +437,20 @@ fn run_kernel(
                     match command {
                         KernelCommand::NewSession { token, cwd } => {
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
-                            let opened = open_new_session(&connection, cwd).await;
+                            let servers = plugin_servers.lock().unwrap().clone();
+                            let opened = open_new_session(&connection, cwd, servers).await;
                             report_started(&sink, &agent_name, token, opened, false);
                         }
                         KernelCommand::ResumeSession { token, session_id, cwd } => {
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
+                            // 先拷出来再放锁：锁不能跨 await 拿着（界面线程 set_plugins 会被卡住）
+                            let servers = plugin_servers.lock().unwrap().clone();
                             let restored = if can_resume {
                                 connection
-                                    .send_request(ResumeSessionRequest::new(
-                                        session_id.clone(),
-                                        cwd.clone(),
-                                    ))
+                                    .send_request(
+                                        ResumeSessionRequest::new(session_id.clone(), cwd.clone())
+                                            .mcp_servers(servers.clone()),
+                                    )
                                     .block_task()
                                     .await
                                     .map(|r| OpenedSession {
@@ -436,10 +462,10 @@ fn run_kernel(
                             } else if can_load {
                                 replaying.lock().unwrap().insert(session_id.clone());
                                 let loaded = connection
-                                    .send_request(LoadSessionRequest::new(
-                                        session_id.clone(),
-                                        cwd.clone(),
-                                    ))
+                                    .send_request(
+                                        LoadSessionRequest::new(session_id.clone(), cwd.clone())
+                                            .mcp_servers(servers.clone()),
+                                    )
                                     .block_task()
                                     .await;
                                 if loaded.is_err() {
@@ -467,7 +493,7 @@ fn run_kernel(
                                             "无法续接会话 {session_id}，改为新会话：{reason}"
                                         )),
                                     );
-                                    let opened = open_new_session(&connection, cwd).await;
+                                    let opened = open_new_session(&connection, cwd, servers).await;
                                     report_started(&sink, &agent_name, token, opened, false);
                                 }
                             }
@@ -619,9 +645,10 @@ struct OpenedSession {
 async fn open_new_session(
     connection: &ConnectionTo<Agent>,
     cwd: PathBuf,
+    mcp_servers: Vec<McpServer>,
 ) -> Result<OpenedSession, String> {
     connection
-        .send_request(NewSessionRequest::new(cwd))
+        .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
         .block_task()
         .await
         .map(|session| OpenedSession {

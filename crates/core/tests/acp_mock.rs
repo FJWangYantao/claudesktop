@@ -452,3 +452,38 @@ fn client_writes_report_file_changes() {
     assert_eq!(changed, Some((Some("旧".into()), Some("新".into()))));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 启用的插件带的 MCP 服务在开会话时交给 agent。
+#[test]
+fn plugin_mcp_servers_are_passed_to_new_sessions() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
+    };
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: mock_command(),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+        },
+        sink,
+    )
+    .expect("spawn kernel");
+    kernel.set_plugins(vec![claudesktop_core::Plugin {
+        name: "kit".into(),
+        mcp_servers: vec![claudesktop_core::plugin::PluginMcpServer {
+            name: "db".into(),
+            command: "node".into(),
+            args: vec!["server.js".into()],
+            env: Default::default(),
+        }],
+        ..Default::default()
+    }]);
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text("mcp?")).expect("send prompt");
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    assert_eq!(assistant_text(&events.lock().unwrap()), "mcp servers: db");
+}

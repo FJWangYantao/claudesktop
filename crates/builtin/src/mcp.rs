@@ -58,6 +58,23 @@ pub struct ServerConfig {
     pub disabled: bool,
     /// 配置了但用不了的原因（HTTP / SSE 服务器、缺 command）
     pub unsupported: Option<String>,
+    /// 来自哪个插件；None = mcp.json
+    pub plugin: Option<String>,
+}
+
+impl ServerConfig {
+    /// 插件提供的服务（插件那边已经只留了本地命令方式的）。
+    pub fn from_plugin(plugin: &str, s: &claudesktop_core::plugin::PluginMcpServer) -> Self {
+        Self {
+            name: s.name.clone(),
+            command: s.command.clone(),
+            args: s.args.clone(),
+            env: s.env.clone(),
+            disabled: false,
+            unsupported: None,
+            plugin: Some(plugin.to_string()),
+        }
+    }
 }
 
 /// 读 `mcp.json`：文件不存在 = 没有服务器；格式不对返回原因。
@@ -108,6 +125,7 @@ fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
                     .unwrap_or_default(),
                 disabled: s.get("disabled").and_then(Value::as_bool).unwrap_or(false),
                 unsupported,
+                plugin: None,
             }
         })
         .collect())
@@ -152,6 +170,8 @@ pub struct McpHub {
     cwd: PathBuf,
     on_status: StatusSink,
     servers: Mutex<Vec<Arc<Server>>>,
+    /// 启用的插件带来的服务，和 mcp.json 里的一起连
+    extra: Mutex<Vec<ServerConfig>>,
     /// 每次重新加载 +1；旧一代的连接线程连上了也不再上报
     generation: AtomicU64,
 }
@@ -167,8 +187,19 @@ impl McpHub {
             cwd,
             on_status: Arc::new(on_status),
             servers: Mutex::new(Vec::new()),
+            extra: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
         })
+    }
+
+    /// 换插件带来的服务；和原来一样返回 false（不用重连）。
+    pub fn set_extra(&self, servers: Vec<ServerConfig>) -> bool {
+        let mut extra = self.extra.lock().unwrap();
+        if *extra == servers {
+            return false;
+        }
+        *extra = servers;
+        true
     }
 
     /// 重新读配置、断开旧连接、在后台逐个连接（不阻塞调用方）。
@@ -178,6 +209,16 @@ impl McpHub {
             Some(path) => load_config(path),
             None => Ok(Vec::new()),
         };
+        // 插件的服务接在后面；和 mcp.json 里的重名就不连（工具名会撞）
+        let configs = configs.map(|mut configs| {
+            for mut server in self.extra.lock().unwrap().iter().cloned() {
+                if configs.iter().any(|c| c.name == server.name) {
+                    server.unsupported = Some("和已有的 MCP 服务重名，没有连接".into());
+                }
+                configs.push(server);
+            }
+            configs
+        });
         let servers: Vec<Arc<Server>> = match configs {
             Ok(configs) => configs
                 .into_iter()
@@ -204,6 +245,7 @@ impl McpHub {
                     env: BTreeMap::new(),
                     disabled: false,
                     unsupported: Some(reason.clone()),
+                    plugin: None,
                 },
                 state: Mutex::new(McpState::Failed(reason)),
                 tools: Mutex::new(Vec::new()),
@@ -249,6 +291,7 @@ impl McpHub {
                 name: s.config.name.clone(),
                 state: s.state.lock().unwrap().clone(),
                 tools: s.tools.lock().unwrap().len(),
+                plugin: s.config.plugin.clone(),
             })
             .collect()
     }

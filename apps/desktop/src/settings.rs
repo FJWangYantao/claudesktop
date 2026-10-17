@@ -217,6 +217,8 @@ pub struct Settings {
     pub sidebar_by_date: bool,
     /// 侧栏里折叠起来的组（`SessionGroup::key`：`dir:<工作目录>` 或 `date:<日期组名>`），点组名切换后写回
     pub sidebar_folded: Vec<String>,
+    /// 启用了的插件（按插件名）；插件目录里新放进来的不在这里 = 停用，在设置页「插件」里打开
+    pub plugins_enabled: Vec<String>,
     /// 窗口不在前台时，回复完成 / 等待授权 / 出错发系统通知；默认开
     pub notifications: bool,
     /// 界面缩放倍率（1.0 = 标准），设置页即时生效并写回
@@ -244,6 +246,7 @@ impl Default for Settings {
             workspace: None,
             sidebar_by_date: false,
             sidebar_folded: Vec::new(),
+            plugins_enabled: Vec::new(),
             notifications: yes(),
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),

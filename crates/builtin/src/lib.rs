@@ -6,11 +6,13 @@
 //! - OpenAI 兼容 provider：流式文本 / 思考 / 用量 / 工具调用
 //! - 工具循环：模型请求工具 → 按模式与规则判断权限（必要时发 `PermissionRequest`
 //!   等 UI 应答）→ 执行 → 结果回给模型，直到模型不再调用工具
-//! - 模式：Manual / Accept edits / Plan（只读）/ Bypass；「总是允许」规则按项目落盘
+//! - 模式：逐项确认 / 自动接受编辑 / 计划模式（只读）/ 全部允许；「总是允许」规则按项目落盘
 //! - 续接：用本地会话日志重建上下文（见 `history` 模块）
 //! - 项目说明：AGENTS.md / CLAUDE.md 读进系统提示词（见 `instructions` 模块）
 //! - 上下文压缩：快满时 / 超限报错后把较早的对话总结成摘要（见 `compact` 模块）
 //! - MCP：数据目录 `mcp.json` 里配的工具服务器，工具和内置工具一起交给模型（见 `mcp` 模块）
+//! - 插件（`claudesktop_core::plugin`）：MCP 服务并进上面那批；技能列进系统提示词；
+//!   钩子在会话开始、提交消息、执行工具前后、一轮结束时跑（退出码 2 = 拦下）
 //!
 //! 线程模型：每轮对话一个线程（阻塞读 SSE 流、执行工具、等权限应答）；
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
@@ -49,9 +51,11 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
     }
 }
 
+use claudesktop_core::plugin::{self, HookEvent, HookOutcome, Plugin, Skill};
 use claudesktop_core::{
     EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, Record, RoutedEvent, checkpoint,
 };
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -84,6 +88,8 @@ pub struct BuiltinConfig {
     pub context_windows: HashMap<String, u64>,
     /// MCP 服务器配置文件（默认数据目录的 `mcp.json`）；None = 不接 MCP
     pub mcp_config: Option<PathBuf>,
+    /// 启用的插件（之后经 `Kernel::set_plugins` 更新）
+    pub plugins: Vec<Plugin>,
 }
 
 impl BuiltinConfig {
@@ -96,6 +102,7 @@ impl BuiltinConfig {
             user_instructions: instructions::default_user_file(),
             context_windows: HashMap::new(),
             mcp_config: default_mcp_config(),
+            plugins: Vec::new(),
         }
     }
 
@@ -157,6 +164,10 @@ struct SessionState {
     restored: bool,
     /// 用户级和项目里的说明（每轮开始时重读）
     instructions: Vec<instructions::Instruction>,
+    /// 启用的插件提供的技能（每轮开始时重取）
+    skills: Vec<Skill>,
+    /// 「会话开始」钩子跑过了（第一轮开始时跑一次）
+    started: bool,
     /// 较早对话的摘要（压缩过才有，进系统提示词）
     summary: Option<String>,
     /// 端点最近一次报告的上下文大小：(token, 当时覆盖到的历史条数)；压缩后清空
@@ -172,6 +183,7 @@ impl SessionState {
             &self.mode,
             self.restored,
             &self.instructions,
+            &self.skills,
             self.summary.as_deref(),
         )
     }
@@ -197,6 +209,8 @@ struct Inner {
     rules: Mutex<PermissionRules>,
     /// MCP 服务器（所有会话共用）
     mcp: Arc<mcp::McpHub>,
+    /// 启用的插件（技能、钩子；它们的 MCP 服务在 `mcp` 里）
+    plugins: Mutex<Arc<Vec<Plugin>>>,
     /// 等待 UI 应答的权限请求：请求 ID → 应答通道
     pending: Mutex<HashMap<u64, mpsc::Sender<Option<String>>>>,
     next_request: AtomicU64,
@@ -217,6 +231,131 @@ enum Verdict {
 impl Inner {
     fn emit(&self, session: Option<&str>, event: KernelEvent) {
         (self.sink)(RoutedEvent { session: session.map(str::to_owned), event });
+    }
+
+    /// 启用的插件提供的全部技能。
+    fn skills(&self) -> Vec<Skill> {
+        self.plugins.lock().unwrap().iter().flat_map(|p| p.skills.iter().cloned()).collect()
+    }
+
+    /// 依次跑某个时机的钩子（工具类时机按 matcher 只跑管这个工具的），返回
+    /// (各钩子的输出, 拦下的原因)。出错的钩子在会话里提示一行、不影响流程；有一个拦下就不再跑后面的。
+    fn run_hooks(
+        &self,
+        session: &str,
+        cwd: &Path,
+        event: HookEvent,
+        tool: Option<&str>,
+        mut input: Value,
+    ) -> (Vec<String>, Option<String>) {
+        let hooks: Vec<plugin::Hook> = self
+            .plugins
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|p| p.hooks.iter())
+            .filter(|h| {
+                h.event == event && tool.is_none_or(|t| plugin::hook_matches(&h.matcher, t))
+            })
+            .cloned()
+            .collect();
+        let mut outputs = Vec::new();
+        if hooks.is_empty() {
+            return (outputs, None);
+        }
+        if let Some(m) = input.as_object_mut() {
+            m.insert("session_id".into(), session.into());
+            m.insert("hook_event_name".into(), event.key().into());
+            m.insert("cwd".into(), cwd.display().to_string().into());
+        }
+        for hook in hooks {
+            match plugin::run_hook(&hook, &input, cwd) {
+                HookOutcome::Ok(out) if !out.is_empty() => outputs.push(out),
+                HookOutcome::Ok(_) => {}
+                HookOutcome::Block(reason) => {
+                    let reason = if reason.is_empty() {
+                        format!("插件「{}」的钩子没有说明原因", hook.plugin)
+                    } else {
+                        reason
+                    };
+                    return (outputs, Some(reason));
+                }
+                HookOutcome::Error(e) => self.emit(
+                    Some(session),
+                    KernelEvent::Notice(format!(
+                        "插件「{}」的{}钩子出错：{e}",
+                        hook.plugin,
+                        event.label()
+                    )),
+                ),
+            }
+        }
+        (outputs, None)
+    }
+
+    /// 一轮开始前的钩子：会话第一轮先跑「会话开始」，每轮跑「提交消息」。
+    /// 它们的输出当补充上下文接在这条用户消息后面；被拦下时这一轮按失败结束，返回 false。
+    fn prompt_hooks(&self, session: &str, flag: &AtomicBool) -> bool {
+        let Some((cwd, first, prompt)) = ({
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.get_mut(session).map(|state| {
+                let first = !std::mem::replace(&mut state.started, true);
+                let prompt = state.history.last().map(message_text).unwrap_or_default();
+                (state.cwd.clone(), first, prompt)
+            })
+        }) else {
+            return false;
+        };
+        let mut context = Vec::new();
+        if first {
+            let (out, _) = self.run_hooks(
+                session,
+                &cwd,
+                HookEvent::SessionStart,
+                None,
+                json!({"source": "startup"}),
+            );
+            context.extend(out);
+        }
+        let (out, blocked) = self.run_hooks(
+            session,
+            &cwd,
+            HookEvent::UserPromptSubmit,
+            None,
+            json!({"prompt": prompt}),
+        );
+        context.extend(out);
+        if flag.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(reason) = blocked {
+            let message = format!("插件钩子拦下了这条消息：{reason}");
+            self.commit(
+                session,
+                flag,
+                vec![ChatMessage::new("assistant", format!("[turn failed: {message}]"))],
+            );
+            self.finish(session, &Arc::new(AtomicBool::new(false)));
+            self.emit(Some(session), KernelEvent::PromptFailed { message });
+            return false;
+        }
+        if !context.is_empty()
+            && let Some(state) = self.sessions.lock().unwrap().get_mut(session)
+            && let Some(last) = state.history.last_mut()
+        {
+            let extra = format!(
+                "\n\n<plugin-hook-context>\n{}\n</plugin-hook-context>",
+                context.join("\n\n")
+            );
+            match last.parts.iter_mut().find_map(|p| match p {
+                ContentPart::Text(t) => Some(t),
+                _ => None,
+            }) {
+                Some(text) => text.push_str(&extra),
+                None => last.parts.push(ContentPart::Text(extra)),
+            }
+        }
+        true
     }
 
     /// 本步要发给模型的消息、当前模式、工作目录与模型；会话已不存在返回 None。
@@ -550,8 +689,35 @@ impl Inner {
         title: &str,
         stopped: &dyn Fn() -> bool,
     ) -> ToolOutput {
-        let output = match action {
+        let tool_input: Value =
+            serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        let hook_input = |extra: Option<(&str, Value)>| {
+            let mut input = json!({"tool_name": call.function.name, "tool_input": tool_input});
+            if let Some((key, value)) = extra {
+                input[key] = value;
+            }
+            input
+        };
+        // 插件的「执行工具前」钩子在授权之前：被拦下就不问用户了
+        let blocked = match &action {
+            Ok(_) => {
+                self.run_hooks(
+                    session,
+                    cwd,
+                    HookEvent::PreToolUse,
+                    Some(&call.function.name),
+                    hook_input(None),
+                )
+                .1
+            }
+            Err(_) => None,
+        };
+        let mut output = match action {
             Err(message) => ToolOutput::fail(message, "参数无效"),
+            Ok(_) if blocked.is_some() => ToolOutput::fail(
+                format!("Blocked by a plugin hook: {}", blocked.unwrap_or_default()),
+                "插件钩子拦下",
+            ),
             Ok(action) => match self.authorize(session, cwd, &action, title, stopped) {
                 Verdict::Allow => {
                     if stopped() {
@@ -576,6 +742,19 @@ impl Inner {
                 Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),
             },
         };
+        // 「执行工具后」钩子：退出码 2 的原因追加到结果里给模型看
+        if output.ok && !stopped() {
+            let response = json!({"content": output.content});
+            if let (_, Some(feedback)) = self.run_hooks(
+                session,
+                cwd,
+                HookEvent::PostToolUse,
+                Some(&call.function.name),
+                hook_input(Some(("tool_response", response))),
+            ) {
+                output.content.push_str(&format!("\n\nPlugin hook feedback: {feedback}"));
+            }
+        }
         if !stopped() {
             self.emit(
                 Some(session),
@@ -708,6 +887,7 @@ impl BuiltinKernel {
                 sink(RoutedEvent { session: None, event: KernelEvent::McpStatus { servers } })
             })
         };
+        mcp.set_extra(plugin_servers(&config.plugins));
         let inner = Arc::new(Inner {
             provider: make_provider(&config.provider),
             default_model: Mutex::new(config.provider.model.clone()),
@@ -720,6 +900,7 @@ impl BuiltinKernel {
             next_session: AtomicU64::new(1),
             rules: Mutex::new(PermissionRules::load(config.rules_path)),
             mcp,
+            plugins: Mutex::new(Arc::new(config.plugins)),
             pending: Mutex::default(),
             next_request: AtomicU64::new(1),
         });
@@ -737,6 +918,7 @@ impl BuiltinKernel {
         let cwd = cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
         let resumed = !history.messages.is_empty() || history.summary.is_some();
         let instructions = instructions::load(&cwd, self.inner.user_instructions.as_deref());
+        let skills = self.inner.skills();
         let model = self.inner.default_model.lock().unwrap().clone();
         self.inner.sessions.lock().unwrap().insert(
             session_id.clone(),
@@ -747,6 +929,8 @@ impl BuiltinKernel {
                 mode: MODE_DEFAULT.into(),
                 restored: resumed,
                 instructions,
+                skills,
+                started: false,
                 summary: history.summary,
                 measured: None,
                 turn: None,
@@ -772,6 +956,7 @@ fn system_prompt(
     mode: &str,
     restored: bool,
     project: &[instructions::Instruction],
+    skills: &[Skill],
     summary: Option<&str>,
 ) -> String {
     let mut prompt = format!(
@@ -800,6 +985,22 @@ fn system_prompt(
     if let Some(section) = instructions::prompt_section(project) {
         prompt.push_str("\n\n");
         prompt.push_str(&section);
+    }
+    if !skills.is_empty() {
+        prompt.push_str(
+            "\n\n# Skills\n\
+             The user's plugins provide these skills: instructions for specific kinds of tasks. \
+             When a task matches a skill's description, read its file with read_file before starting \
+             and follow it; paths it mentions are relative to the skill's folder.",
+        );
+        for skill in skills {
+            prompt.push_str(&format!(
+                "\n- {}: {} ({})",
+                skill.name,
+                skill.description,
+                skill.path.display()
+            ));
+        }
     }
     if let Some(summary) = summary {
         prompt.push_str("\n\n");
@@ -834,6 +1035,9 @@ fn transcript_budget(window: Option<u64>) -> usize {
 /// 一轮对话（在独立线程里运行）：请求模型 → 执行工具 → 再请求，直到不再调用工具。
 fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     let stopped = || flag.load(Ordering::SeqCst);
+    if !inner.prompt_hooks(&session, &flag) {
+        return;
+    }
     let mut usage: Option<Usage> = None;
     // 最后一次请求的输入 + 输出 = 此刻上下文的大小（之前各步都包含在这次的输入里）
     let mut context_tokens = 0;
@@ -988,7 +1192,33 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
             },
         );
     }
-    inner.emit(Some(&session), KernelEvent::TurnEnded { stop_reason: stop });
+    let cwd = inner.sessions.lock().unwrap().get(&session).map(|s| s.cwd.clone());
+    inner.emit(Some(&session), KernelEvent::TurnEnded { stop_reason: stop.clone() });
+    // 「一轮结束」钩子只是通知：这一轮已经结束了，结果不影响什么
+    if let Some(cwd) = cwd {
+        inner.run_hooks(&session, &cwd, HookEvent::Stop, None, json!({"stop_reason": stop}));
+    }
+}
+
+/// 一条消息里的文字部分（给钩子看用户说了什么）。
+fn message_text(message: &ChatMessage) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 插件带来的 MCP 服务。
+fn plugin_servers(plugins: &[Plugin]) -> Vec<mcp::ServerConfig> {
+    plugins
+        .iter()
+        .flat_map(|p| p.mcp_servers.iter().map(|s| mcp::ServerConfig::from_plugin(&p.name, s)))
+        .collect()
 }
 
 impl Kernel for BuiltinKernel {
@@ -1032,6 +1262,7 @@ impl Kernel for BuiltinKernel {
             // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
             state.instructions =
                 instructions::load(&state.cwd, self.inner.user_instructions.as_deref());
+            state.skills = self.inner.skills();
             // 文本 + 图片附件合成一条多段用户消息
             let mut parts = vec![ContentPart::Text(prompt.text)];
             for image in prompt.images {
@@ -1181,6 +1412,15 @@ impl Kernel for BuiltinKernel {
 
     fn reload_mcp(&self) {
         self.inner.mcp.reload();
+    }
+
+    fn set_plugins(&self, plugins: Vec<Plugin>) {
+        let servers = plugin_servers(&plugins);
+        *self.inner.plugins.lock().unwrap() = Arc::new(plugins);
+        // 只在插件的 MCP 服务变了时重连（重连会断掉 mcp.json 里的服务一下）
+        if self.inner.mcp.set_extra(servers) {
+            self.inner.mcp.reload();
+        }
     }
 
     fn shutdown(&self) {

@@ -13,6 +13,7 @@ mod motion;
 mod notify;
 mod overview;
 mod palette;
+mod plugins_view;
 mod rewind;
 mod search;
 mod settings_view;
@@ -136,6 +137,8 @@ pub struct ChatApp {
     sidebar_filter: sidebar::SidebarFilter,
     /// 侧栏里点了「显示其余 N 个」的组（`SessionGroup::key`）。只在内存里，重启回到只列最近几个
     sidebar_expanded: std::collections::HashSet<String>,
+    /// 插件目录里的全部插件（启动时和设置页「重新扫描」时读；启用哪些见 `enabled_plugins`）
+    plugins: Vec<claudesktop_core::Plugin>,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
     placeholder: SharedString,
     /// 「回退到这里」浮层开着时算好的预览（打开时算一次，见 rewind.rs）
@@ -359,6 +362,9 @@ impl ChatApp {
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),
+            plugins: claudesktop_core::plugin::default_plugins_dir()
+                .map(|d| claudesktop_core::plugin::discover(&d))
+                .unwrap_or_default(),
             placeholder: SharedString::default(),
             rewind: None,
             rewind_overwrite: false,
@@ -413,11 +419,14 @@ impl ChatApp {
         let sink: EventSink = Arc::new(move |event| {
             let _ = tx.unbounded_send((kind, generation, event));
         });
+        // 启用的插件：自研内核启动时就带上（MCP 只连一次），ACP 内核起来后交给它
+        let plugins = self.enabled_plugins();
         let (kernel, status, agent_cmd): (Option<Arc<dyn Kernel>>, SharedString, String) =
             match kind {
                 KernelChoice::Demo => (None, "未连接内核".into(), String::new()),
                 KernelChoice::Builtin => {
-                    match self.settings.builtin_config(self.cwd.clone()).and_then(|config| {
+                    match self.settings.builtin_config(self.cwd.clone()).and_then(|mut config| {
+                        config.plugins = plugins;
                         let identity = config.identity();
                         BuiltinKernel::spawn(config, sink).map(|k| (k, identity))
                     }) {
@@ -432,6 +441,7 @@ impl ChatApp {
                     let agent_cmd = config.command.clone();
                     match AcpKernel::spawn(config, sink) {
                         Ok(k) => {
+                            k.set_plugins(plugins);
                             (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), agent_cmd)
                         }
                         Err(err) => (None, format!("启动失败：{err}").into(), agent_cmd),
@@ -1062,9 +1072,21 @@ impl ChatApp {
                 text: SharedString::from(prompt.text.clone()),
                 images: image_paths,
             });
+            // 插件的斜杠命令：对话里显示原样的「/命令 参数」，发给内核的是展开后的模板
+            let enabled = self.enabled_plugins();
+            let sent = claudesktop_core::plugin::find_command(&enabled, &prompt.text).map(
+                |(_, command, args)| claudesktop_core::plugin::expand_command(&command.body, &args),
+            );
             if kernel.is_some() {
-                self.persist(idx, Record::User { text: prompt.text.clone(), images: stored });
+                self.persist(
+                    idx,
+                    Record::User { text: prompt.text.clone(), images: stored, sent: sent.clone() },
+                );
             }
+            let prompt = match sent {
+                Some(text) => UserPrompt { text, ..prompt },
+                None => prompt,
+            };
             let s = &mut self.sessions[idx];
             s.begin_turn();
             s.follow_tail();

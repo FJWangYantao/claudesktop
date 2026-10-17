@@ -71,7 +71,7 @@ impl ChatApp {
             );
         let section = div().v_flex().gap_2().child(header).child(
             div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(format!(
-                "自研内核可以调用 MCP 服务器提供的工具（只支持本地命令）。配置写在 {path}，格式同 Claude Code 的 .mcp.json；改完点「重新加载」。工具调用照常弹权限卡。"
+                "自研内核可以调用 MCP 服务器提供的工具（只支持本地命令）。配置写在 {path}，格式同 Claude Code 的 .mcp.json；改完点「重新加载」。启用的插件带的服务也列在这里。工具调用照常弹权限卡。"
             )),
         );
 
@@ -88,6 +88,7 @@ impl ChatApp {
                     name: c.name,
                     state: if c.disabled { McpState::Disabled } else { McpState::Connecting },
                     tools: 0,
+                    plugin: None,
                 })
                 .collect()
         };
@@ -133,6 +134,16 @@ impl ChatApp {
                                     .text_color(rgb(INK))
                                     .child(server.name.clone()),
                             )
+                            // 插件带来的服务：注明来源（不在 mcp.json 里，要去插件页停用）
+                            .when_some(server.plugin.clone(), |d, plugin| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(TEXT_SMALL)
+                                        .text_color(rgb(INK_SOFT))
+                                        .child(format!("插件 {plugin}")),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex_shrink_0()

@@ -90,9 +90,10 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
     let mut in_turn = false;
     for record in &records {
         match record {
-            Record::User { text, images } => {
+            Record::User { text, images, sent } => {
                 messages.extend(assistant.take());
-                messages.push(user_message(text, images));
+                // 插件命令展开过的，模型当时看到的是展开后的全文
+                messages.push(user_message(sent.as_deref().unwrap_or(text), images));
                 in_turn = true;
             }
             Record::Event { event } => match event {
@@ -218,7 +219,7 @@ mod tests {
     #[test]
     fn rebuilds_turns_with_tool_summaries() {
         let records = vec![
-            Record::User { text: "读一下 notes".into(), images: Vec::new() },
+            Record::user("读一下 notes"),
             ev(KernelEvent::AgentThoughtChunk { text: "想想".into() }),
             ev(KernelEvent::AgentMessageChunk { text: "我先".into() }),
             ev(KernelEvent::AgentMessageChunk { text: "看看。".into() }),
@@ -237,7 +238,7 @@ mod tests {
             }),
             ev(KernelEvent::AgentMessageChunk { text: "秘密是 42。".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
-            Record::User { text: "再写进文件".into(), images: Vec::new() },
+            Record::user("再写进文件"),
             ev(KernelEvent::ToolCallStarted {
                 id: "c2".into(),
                 title: "Write a.txt".into(),
@@ -245,7 +246,7 @@ mod tests {
                 kind: "edit".into(),
             }),
             ev(KernelEvent::TurnEnded { stop_reason: "cancelled".into() }),
-            Record::User { text: "算了".into(), images: Vec::new() },
+            Record::user("算了"),
         ];
         let msgs = rebuild(&records).messages;
         let got: Vec<_> =
@@ -264,7 +265,7 @@ mod tests {
 
     #[test]
     fn compaction_keeps_the_running_turn_or_drops_everything() {
-        let user = |t: &str| Record::User { text: t.into(), images: Vec::new() };
+        let user = |t: &str| Record::user(t);
         let reply = |t: &str| ev(KernelEvent::AgentMessageChunk { text: t.into() });
         let end = || ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
         let compacted =
@@ -305,9 +306,9 @@ mod tests {
     fn trims_oldest_turns_and_starts_with_user() {
         let big = "x".repeat(HISTORY_MAX_CHARS / 2 + 10);
         let records = vec![
-            Record::User { text: big.clone(), images: Vec::new() },
+            Record::user(big.clone()),
             ev(KernelEvent::AgentMessageChunk { text: big.clone() }),
-            Record::User { text: "新问题".into(), images: Vec::new() },
+            Record::user("新问题"),
             ev(KernelEvent::AgentMessageChunk { text: "新回答".into() }),
         ];
         let msgs = rebuild(&records).messages;

@@ -48,6 +48,10 @@ pub enum Record {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
+        /// 实际发给内核的文字（插件的斜杠命令展开后的全文）；和 `text` 一样时不记。
+        /// 界面显示 `text`，重建上下文用 [`Record::sent_text`]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent: Option<String>,
     },
     /// 内核事件（只记对话内容相关的，见 [`Record::worth_keeping`]）
     Event { event: KernelEvent },
@@ -88,6 +92,19 @@ pub enum Record {
 }
 
 impl Record {
+    /// 用户消息（不带附件、发出去的就是原文）。
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User { text: text.into(), images: Vec::new(), sent: None }
+    }
+
+    /// 用户消息实际发给内核的文字（命令展开后的全文，没展开过就是原文）；不是用户消息时为 None。
+    pub fn sent_text(&self) -> Option<&str> {
+        match self {
+            Self::User { text, sent, .. } => Some(sent.as_deref().unwrap_or(text)),
+            _ => None,
+        }
+    }
+
     /// 只持久化重放时有意义的事件；状态 / 连接 / fs 诊断等不记（文件改动另记成 `FileChanged`）。
     pub fn worth_keeping(event: &KernelEvent) -> bool {
         matches!(
@@ -392,7 +409,7 @@ mod tests {
     fn roundtrip_and_coalesce() {
         let store = temp_store("roundtrip");
         let (meta, mut log) = store.create("标题", "C:/proj".into(), "mock").unwrap();
-        log.append(Record::User { text: "你好".into(), images: Vec::new() }).unwrap();
+        log.append(Record::user("你好")).unwrap();
         for piece in ["你", "好", "！"] {
             log.append(chunk(piece)).unwrap();
         }
@@ -408,7 +425,7 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                Record::User { text: "你好".into(), images: Vec::new() },
+                Record::user("你好"),
                 chunk("你好！"),
                 Record::Event { event: KernelEvent::AgentThoughtChunk { text: "想".into() } },
                 Record::Event { event: KernelEvent::TurnEnded { stop_reason: "end_turn".into() } },
@@ -428,7 +445,7 @@ mod tests {
         fs::write(store.dir().join("broken.json"), b"{not json").unwrap();
         // 末尾半行：应被跳过而不是让整个会话读不出来
         let mut log = store.append_log(&b.id).unwrap();
-        log.append(Record::User { text: "x".into(), images: Vec::new() }).unwrap();
+        log.append(Record::user("x")).unwrap();
         drop(log);
         OpenOptions::new()
             .append(true)
@@ -489,21 +506,27 @@ mod tests {
         assert!(path.to_string_lossy().ends_with(".png"));
         // 旧日志没有 images 字段：能解析，默认为空
         let legacy = r#"{"t":"user","text":"旧记录"}"#;
-        assert_eq!(
-            serde_json::from_str::<Record>(legacy).unwrap(),
-            Record::User { text: "旧记录".into(), images: Vec::new() }
-        );
+        assert_eq!(serde_json::from_str::<Record>(legacy).unwrap(), Record::user("旧记录"));
         // 新记录带附件路径，可往返
         let record = Record::User {
             text: "看图".into(),
             images: vec![path.to_string_lossy().into_owned()],
+            sent: None,
         };
         let line = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), record);
+        // 展开过的命令：两样都存，重建上下文用发出去的全文；没展开过不写 sent 键
+        let command = Record::User {
+            text: "/review a.rs".into(),
+            images: Vec::new(),
+            sent: Some("请审查 a.rs".into()),
+        };
+        let line = serde_json::to_string(&command).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap().sent_text(), Some("请审查 a.rs"));
+        assert!(!serde_json::to_string(&Record::user("x")).unwrap().contains("sent"));
+        assert_eq!(Record::user("x").sent_text(), Some("x"));
         // 没有附件时不写 images 键（日志不膨胀）
-        let plain =
-            serde_json::to_string(&Record::User { text: "纯文本".into(), images: Vec::new() })
-                .unwrap();
+        let plain = serde_json::to_string(&Record::user("纯文本")).unwrap();
         assert!(!plain.contains("images"));
         let _ = fs::remove_dir_all(store.dir());
     }

@@ -268,7 +268,7 @@ mod tests {
     }
 
     fn user() -> Record {
-        Record::User { text: "x".into(), images: Vec::new() }
+        Record::user("x")
     }
 
     fn turn(at_ms: u64, model: Option<&str>, tokens: u64) -> Record {

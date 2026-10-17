@@ -22,6 +22,8 @@ const RESUME_MODE =
 
 // 一条连接上可有多个会话：每个会话各自一个 sessionId，事件按它路由。
 let sessionCount = 0;
+// 会话 → 开会话时客户端交过来的 MCP 服务名
+const mcpServers = new Map();
 let nextId = 0;
 /** @type {Map<number, (result: any) => void>} */
 const pending = new Map();
@@ -133,9 +135,13 @@ rl.on('line', (line) => {
     case 'authenticate':
       reply(id, {});
       break;
-    case 'session/new':
-      reply(id, { sessionId: `mock-session-${Date.now()}-${++sessionCount}` });
+    case 'session/new': {
+      const sid = `mock-session-${Date.now()}-${++sessionCount}`;
+      // 记下客户端交过来的 MCP 服务（插件带的），「mcp?」时回给客户端看
+      mcpServers.set(sid, (params?.mcpServers ?? []).map((s) => s.name));
+      reply(id, { sessionId: sid });
       break;
+    }
     case 'session/resume':
       // 不回放历史，直接续用原 sessionId
       reply(id, {});
@@ -153,6 +159,15 @@ rl.on('line', (line) => {
         .filter((b) => b?.type === 'text')
         .map((b) => b.text)
         .join('');
+      if (text === 'mcp?') {
+        const names = mcpServers.get(params?.sessionId) ?? [];
+        update(params?.sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `mcp servers: ${names.join(',')}` },
+        });
+        reply(id, { stopReason: 'end_turn' });
+        break;
+      }
       if (text.startsWith('write:')) {
         // 路径里可能有盘符的冒号：按最后一个冒号切
         const rest = text.slice('write:'.length);

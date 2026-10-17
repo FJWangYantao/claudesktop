@@ -20,12 +20,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
-const SETTINGS_TABS: [(IconAll, &str); 4] = [
+const SETTINGS_TABS: [(IconAll, &str); 5] = [
     (IconAll::Settings, "通用"),
     (IconAll::Cpu, "内核与模型"),
     (IconAll::ShieldCheck, "权限"),
     (IconAll::Plug, "MCP"),
+    (IconAll::Blocks, "插件"),
 ];
+
+/// 设置页「插件」分类的下标（侧栏的「插件」入口直接打开它）
+pub(super) const PLUGINS_TAB: usize = 4;
 
 /// 设置项的一行：左边标题 + 灰色说明，右边控件。
 fn setting_row(title: &'static str, desc: impl IntoElement, control: impl IntoElement) -> Div {
@@ -147,7 +151,7 @@ impl ChatApp {
         self.open_settings_at(tab, window, cx);
     }
 
-    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP）。
+    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP / 4 插件）。
     /// 失败卡片的「打开设置」用它直接落到服务商配置。
     pub(crate) fn open_settings_at(
         &mut self,
@@ -1152,6 +1156,7 @@ impl ChatApp {
             1 => kernel_tab,
             2 => self.render_rules(cx),
             3 => self.render_mcp(cx),
+            PLUGINS_TAB => self.render_plugins(cx),
             _ => self.render_general(cx),
         };
 

@@ -253,7 +253,7 @@ impl Session {
         // 回退过的轮次不显示（日志只追加，读的时候折算）
         for record in claudesktop_core::effective(&records) {
             match record {
-                Record::User { text, images } => s.transcript.push(ChatItem::User {
+                Record::User { text, images, .. } => s.transcript.push(ChatItem::User {
                     text: text.into(),
                     images: images.iter().map(PathBuf::from).collect(),
                 }),
@@ -870,6 +870,7 @@ impl Session {
             event,
             KernelEvent::Retrying { .. }
                 | KernelEvent::Status(_)
+                | KernelEvent::Notice(_)
                 | KernelEvent::UsageUpdated { .. }
         ) {
             self.retry = None;
@@ -1052,6 +1053,8 @@ impl Session {
                     self.note(format!("本轮结束：{stop_reason}"));
                 }
             }
+            // 插件钩子出错等：会话里提示一行
+            KernelEvent::Notice(text) => self.note(text),
             // 连接级事件由 ChatApp 处理；其余（状态、fs、回显）界面不展示
             KernelEvent::Connected { .. }
             | KernelEvent::SessionFailed { .. }
@@ -1312,7 +1315,7 @@ mod tests {
     #[core::prelude::v1::test]
     fn replay_rebuilds_transcript() {
         let records = vec![
-            Record::User { text: "读 README".into(), images: Vec::new() },
+            Record::user("读 README"),
             ev(KernelEvent::AgentThoughtChunk { text: "想一想".into() }),
             ev(KernelEvent::ToolCallStarted {
                 id: "t1".into(),
@@ -1347,7 +1350,7 @@ mod tests {
                 context_tokens: Some(520),
             },
             // 上次退出时没应答的请求；前面那段思考没记用时（旧日志）
-            Record::User { text: "再写个文件".into(), images: Vec::new() },
+            Record::user("再写个文件"),
             ev(KernelEvent::AgentThoughtChunk { text: "旧的".into() }),
             permission(2),
         ];
@@ -1419,7 +1422,7 @@ mod tests {
             })
         };
         let records = vec![
-            Record::User { text: "改".into(), images: Vec::new() },
+            Record::user("改"),
             started,
             diff(
                 "y
@@ -1852,10 +1855,10 @@ mod tests {
     #[core::prelude::v1::test]
     fn replay_drops_rewound_turns() {
         let records = vec![
-            Record::User { text: "第一问".into(), images: Vec::new() },
+            Record::user("第一问"),
             ev(KernelEvent::AgentMessageChunk { text: "答".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
-            Record::User { text: "第二问".into(), images: Vec::new() },
+            Record::user("第二问"),
             Record::FileChanged { path: "a.rs".into(), before: None, after: Some("h".into()) },
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Rewind { turn: 1, conversation: true, files: 1, prompt: "第二问".into() },
@@ -1872,7 +1875,7 @@ mod tests {
     #[core::prelude::v1::test]
     fn replay_attaches_turn_summary() {
         let records = vec![
-            Record::User { text: "q".into(), images: Vec::new() },
+            Record::user("q"),
             ev(KernelEvent::AgentMessageChunk { text: "a".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Turn {
@@ -1895,7 +1898,7 @@ mod tests {
         // 重开的会话在内核连上（Started）之前也显示真模型名，
         // 上下文用量才能按它查到窗口大小显示百分比
         let records = vec![
-            Record::User { text: "q".into(), images: Vec::new() },
+            Record::user("q"),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Turn {
                 at_ms: 1,
@@ -1905,7 +1908,7 @@ mod tests {
                 elapsed_ms: None,
                 context_tokens: Some(1508),
             },
-            Record::User { text: "再问".into(), images: Vec::new() },
+            Record::user("再问"),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Turn {
                 at_ms: 2,
@@ -1922,7 +1925,7 @@ mod tests {
         assert_eq!(s.context_tokens, 2000);
 
         let first = vec![
-            Record::User { text: "q".into(), images: Vec::new() },
+            Record::user("q"),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Turn {
                 at_ms: 1,
@@ -1938,7 +1941,7 @@ mod tests {
 
         // 旧日志没记模型：维持「默认模型」
         let none = vec![
-            Record::User { text: "q".into(), images: Vec::new() },
+            Record::user("q"),
             Record::Turn {
                 at_ms: 1,
                 model: None,

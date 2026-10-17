@@ -124,7 +124,7 @@ mod tests {
     use crate::store::effective;
 
     fn user(text: &str) -> Record {
-        Record::User { text: text.into(), images: Vec::new() }
+        Record::user(text)
     }
 
     fn changed(path: &str, before: Option<&str>, after: Option<&str>) -> Record {
