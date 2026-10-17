@@ -198,7 +198,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 把字号缩放与字体族装进组件主题。Root 每帧读 `Theme::font_size` 写进窗口的 rem，
+    /// 把字号缩放、字体族和色板装进组件主题。Root 每帧读 `Theme::font_size` 写进窗口的 rem，
     /// 所以这里改完，下一帧整套界面（字号 / 间距 / 圆角 / 图标）等比缩放。
     pub(crate) fn apply_font(&mut self, cx: &mut Context<Self>) {
         crate::theme::set_font_scale(self.settings.font_scale);

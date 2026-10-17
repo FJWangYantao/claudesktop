@@ -102,6 +102,8 @@ pub const DIFF_ADD_BG: Color = c(0xE4F3DE, 0x243222);
 pub const DIFF_ADD_FG: Color = c(0x3C6B2E, 0x9FCC8C);
 pub const DIFF_DEL_BG: Color = c(0xFBE3DF, 0x3A2422);
 pub const DIFF_DEL_FG: Color = c(0xA4443A, 0xF19B90);
+/// 文字选区底色（输入框、Markdown）：淡赤陶（浅色上墨色字 12:1，深色上 8.9:1）
+pub const SELECTION: Color = c(0xF3D9CD, 0x5C3B2E);
 
 /// 中文回退字体（内嵌字体只含拉丁字形）。按顺序取第一个装了的；都没有时交给系统回退。
 /// 不定死的话 DirectWrite 会按系统区域挑，可能落到宋体或日文字形。
@@ -205,7 +207,7 @@ pub fn root_font_size() -> Pixels {
     px(BASE_FONT_SIZE * font_scale())
 }
 
-/// 把字号缩放与字体族装进 gpui-kit 的主题。
+/// 把字号缩放、字体族和色板装进 gpui-kit 的主题（经 `Theme::update` 调用）。
 ///
 /// `gpui-component` 的 Root 每帧把 `Theme::font_size` 写进 `window.set_rem_size()`，
 /// 所以这里改完 `font_size`，下一次渲染整套界面（含间距、圆角、图标）就等比缩放。
@@ -214,6 +216,128 @@ pub fn apply_to_theme(theme: &mut gpui_kit::component::theme::Theme) {
     // 字体族每次都写：换回内嵌的 Inter 时，组件主题里还留着上一套，
     // 不覆盖的话输入框 / 开关会和根视图用两种字体
     theme.font_family = sans();
+    // `Theme::change` 切外观时会重新载入 gpui-kit 自带主题，配色要在它之后每次重写
+    let dark = theme.mode.is_dark();
+    apply_colors(&mut theme.colors, dark);
+}
+
+/// 把色板写进 gpui-kit 组件主题的语义色，让 `Button` / `TabBar` / `Kbd` / 弹层 / 滚动条
+/// 这些组件直接用就是纸底 + 赤陶橙，不用再逐个覆盖颜色。
+///
+/// 字段语义沿用 shadcn（见 `gpui-component` 的 `theme/default-theme.json`）。
+/// `button_*` 这类派生色在 gpui-kit 里只在载入主题文件时从 `primary` 等推出来，
+/// 这里改完基色不会自动跟着变，所以要一并写。
+/// 色板里没有对应物的（图表、info / warning / success、基础色相、拖放）保留 gpui-kit 默认。
+fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, dark: bool) {
+    let p = |color: Color| -> gpui_kit::Hsla {
+        gpui_kit::rgb(if dark { color.dark } else { color.light }).into()
+    };
+
+    // 底、文字、边框
+    t.background = p(PAPER);
+    t.foreground = p(INK);
+    t.border = p(LINE);
+    t.input = p(LINE);
+    t.ring = p(INK_FAINT);
+    t.caret = p(INK);
+    t.selection = p(SELECTION);
+    t.muted = p(SAND);
+    t.muted_foreground = p(INK_SOFT);
+    t.accent = p(HOVER);
+    t.accent_foreground = p(INK);
+    t.popover = p(CARD);
+    t.popover_foreground = p(INK);
+    t.link = p(INK);
+    t.link_hover = p(INK_SOFT);
+    t.link_active = p(INK);
+    t.window_border = p(LINE);
+
+    // 主按钮：带文字的用 CORAL_DEEP（CORAL 上白字只有 3.1:1）
+    t.primary = p(CORAL_DEEP);
+    t.primary_hover = p(CORAL_DEEP_HOVER);
+    t.primary_active = p(CORAL_DEEP_HOVER);
+    t.primary_foreground = p(WHITE);
+    t.button_primary = t.primary;
+    t.button_primary_hover = t.primary_hover;
+    t.button_primary_active = t.primary_active;
+    t.button_primary_foreground = t.primary_foreground;
+
+    // 次级按钮：沙色实底，悬停 SELECTED
+    t.secondary = p(SAND);
+    t.secondary_hover = p(SELECTED);
+    t.secondary_active = p(SELECTED);
+    t.secondary_foreground = p(INK);
+    t.button_secondary = t.secondary;
+    t.button_secondary_hover = t.secondary_hover;
+    t.button_secondary_active = t.secondary_active;
+    t.button_secondary_foreground = t.secondary_foreground;
+
+    // 默认按钮：卡片底 + 描边（描边取 `input`）
+    t.button = p(CARD);
+    t.button_hover = p(HOVER);
+    t.button_active = p(SELECTED);
+    t.button_foreground = p(INK);
+
+    // 危险：实色按钮底用 DANGER（RED 是前景色，深色下提亮，不当底）
+    t.danger = p(DANGER);
+    t.danger_hover = p(DANGER);
+    t.danger_active = p(DANGER);
+    t.danger_foreground = p(WHITE);
+    t.button_danger = t.danger;
+    t.button_danger_hover = t.danger_hover;
+    t.button_danger_active = t.danger_active;
+    t.button_danger_foreground = t.danger_foreground;
+
+    // 列表 / 菜单条目（Select、List、Command）：放在弹层的卡片底上
+    t.list = p(CARD);
+    t.list_hover = p(HOVER);
+    t.list_active = p(SELECTED);
+    t.list_active_border = p(LINE_STRONG);
+    t.list_even = p(PAPER);
+    t.list_head = p(SAND);
+
+    // 表格
+    t.table = p(CARD);
+    t.table_hover = p(HOVER);
+    t.table_active = p(SELECTED);
+    t.table_active_border = p(LINE_STRONG);
+    t.table_even = p(PAPER);
+    t.table_head = p(SAND);
+    t.table_head_foreground = p(INK_SOFT);
+    t.table_row_border = p(LINE);
+
+    // 标签页：沙色条上浮起卡片色的当前项
+    t.tab_bar = p(SAND);
+    t.tab_bar_segmented = p(SAND);
+    t.tab_active = p(CARD);
+    t.tab_foreground = p(INK_SOFT);
+    t.tab_active_foreground = p(INK);
+
+    // 开关 / 滑杆 / 进度 / 骨架屏
+    t.switch = p(LINE_STRONG);
+    t.switch_thumb = p(WHITE);
+    t.slider_bar = p(CORAL);
+    t.slider_thumb = p(WHITE);
+    t.progress_bar = p(CORAL);
+    t.skeleton = p(SAND);
+
+    // 滚动条滑块：装饰性，用 INK_FAINT，悬停加深
+    t.scrollbar_thumb = p(INK_FAINT);
+    t.scrollbar_thumb_hover = p(INK_SOFT);
+
+    // 侧栏 / 分组 / 折叠面板 / 描述列表
+    t.sidebar = p(SAND);
+    t.sidebar_foreground = p(INK);
+    t.sidebar_border = p(LINE);
+    t.sidebar_accent = p(SELECTED);
+    t.sidebar_accent_foreground = p(INK);
+    t.sidebar_primary = p(CORAL_DEEP);
+    t.sidebar_primary_foreground = p(WHITE);
+    t.group_box = p(SAND);
+    t.group_box_foreground = p(INK);
+    t.accordion = p(CARD);
+    t.description_list_label = p(SAND);
+    t.description_list_label_foreground = p(INK_SOFT);
 }
 
 /// 直接写字体族状态（不过「是否装了」的校验）；单测用。
@@ -281,6 +405,26 @@ mod tests {
         set_font_scale(0.1);
         assert_eq!(font_scale(), FONT_SCALE_MIN);
         set_font_scale(1.0);
+    }
+
+    /// 组件主题的配色按外观取色板，派生的按钮色跟着基色走。
+    #[core::prelude::v1::test]
+    fn component_colors_follow_palette() {
+        let hsla = |v: u32| -> gpui_kit::Hsla { gpui_kit::rgb(v).into() };
+        let mut t = gpui_kit::component::theme::ThemeColor::default();
+
+        apply_colors(&mut t, false);
+        assert_eq!(t.background, hsla(PAPER.light));
+        assert_eq!(t.primary, hsla(CORAL_DEEP.light));
+        assert_eq!(t.button_primary, t.primary);
+        assert_eq!(t.button_primary_foreground, hsla(WHITE.light));
+        assert_eq!(t.button_secondary_hover, hsla(SELECTED.light));
+
+        apply_colors(&mut t, true);
+        assert_eq!(t.background, hsla(PAPER.dark));
+        assert_eq!(t.foreground, hsla(INK.dark));
+        assert_eq!(t.danger, hsla(DANGER.dark));
+        assert_eq!(t.button_danger, t.danger);
     }
 
     /// 字体族：没选过时回到内嵌 Inter；`cached_fonts` 在没枚举过时返回空表而不是 panic。
