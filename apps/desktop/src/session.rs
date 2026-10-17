@@ -377,9 +377,9 @@ impl Session {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         let layout = self.layout.get(i).copied().unwrap_or_default();
         let live = if matches!(self.transcript[i], ChatItem::Failed { .. }) {
-            self.failure_resume(i)
+            (self.failure_is_latest(i), self.failure_resume(i))
         } else {
-            self.is_turn_end(i)
+            (self.is_turn_end(i), false)
         };
         (self.transcript[i].fingerprint(), view, live, layout).hash(&mut h);
         h.finish()
@@ -657,15 +657,17 @@ impl Session {
         })
     }
 
-    /// 第 `ix` 行（失败卡片）要不要给「继续」：得是最近一轮（后面没有用户消息了，
-    /// 更早的失败卡片后面已经接着聊过）而且失败前有进展。
+    /// 第 `ix` 行（失败卡片）是不是最近一轮的：后面没有用户消息了。更早的失败卡片后面
+    /// 已经接着聊过，不再给按钮（「重试」会把那一轮的提问在末尾再发一遍，容易误点）。
     /// 卡片上的按钮组受它影响，所以 `row_key` 也读它。
+    pub fn failure_is_latest(&self, ix: usize) -> bool {
+        matches!(self.transcript.get(ix), Some(ChatItem::Failed { .. }))
+            && !self.transcript[ix..].iter().any(|i| matches!(i, ChatItem::User { .. }))
+    }
+
+    /// 第 `ix` 行（失败卡片）要不要给「继续」：得是最近一轮而且失败前有进展。
     pub fn failure_resume(&self, ix: usize) -> bool {
-        if !matches!(self.transcript.get(ix), Some(ChatItem::Failed { .. })) {
-            return false;
-        }
-        let latest = !self.transcript[ix..].iter().any(|i| matches!(i, ChatItem::User { .. }));
-        latest && self.turn_progressed(ix)
+        self.failure_is_latest(ix) && self.turn_progressed(ix)
     }
 
     /// 第 `ix` 行（失败卡片）所在这一轮的用户消息：往前找最近的一条。
@@ -1257,9 +1259,13 @@ mod tests {
         ];
         // 最近一轮、有进展 → 给「继续」
         assert!(s.failure_resume(2));
-        // 后面又聊过了 → 不给
+        assert!(s.failure_is_latest(2));
+        // 后面又聊过了 → 不给「继续」，卡片上也不再有按钮
         s.transcript.push(user("再来"));
         assert!(!s.failure_resume(2));
+        assert!(!s.failure_is_latest(2));
+        // 不是失败卡片
+        assert!(!s.failure_is_latest(0));
         // 失败前什么都没做 → 不给（那会儿该「重试」）
         let mut fresh = Session::new(2, KernelChoice::Demo, PathBuf::from("C:/proj"));
         fresh.transcript = vec![

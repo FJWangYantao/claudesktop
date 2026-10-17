@@ -139,10 +139,10 @@ fn modes() -> Vec<ModeView> {
         description: Some(desc.into()),
     };
     vec![
-        m(MODE_DEFAULT, "Manual", "写文件和执行命令前先询问"),
-        m(MODE_ACCEPT_EDITS, "Accept edits", "自动允许项目内的文件编辑，命令仍询问"),
-        m(MODE_PLAN, "Plan", "只读：不写文件、不执行命令"),
-        m(MODE_BYPASS, "Bypass", "全部自动允许（谨慎）"),
+        m(MODE_DEFAULT, "逐项确认", "写文件和执行命令前先询问"),
+        m(MODE_ACCEPT_EDITS, "自动接受编辑", "自动允许项目内的文件编辑，命令仍询问"),
+        m(MODE_PLAN, "计划模式", "只读：不写文件、不执行命令"),
+        m(MODE_BYPASS, "全部允许", "全部自动允许（谨慎）"),
     ]
 }
 

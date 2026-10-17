@@ -659,6 +659,8 @@ impl ChatApp {
         // 失败前已经有进展时给「继续」（接着做），「重试」会把做过的再做一遍
         // （判断在 Session 里：虚拟列表的测量指纹也要读它，见 `Session::row_key`）
         let resume = s.failure_resume(idx);
+        // 已经翻篇的失败卡片只留说明和原文，不给按钮
+        let latest = s.failure_is_latest(idx);
         // 主操作只占一个，按「先解决根因、再接着做」排：
         // 上下文溢出只能新开会话，Key 不对只能去改设置，其它情况有进展就继续、没进展就重试
         let primary = if kind == FailureKind::Overflow {
@@ -719,37 +721,43 @@ impl ChatApp {
                     .line_clamp(4)
                     .child(message.clone()),
             )
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .pt_1()
-                    .when(kind == FailureKind::Overflow, |d| {
-                        d.child(
-                            button("fail-new", IconAll::MessageSquarePlus, "新开会话").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.add_session(cx);
-                                    this.focus_input(window, cx);
-                                }),
+            .when(latest, |card| {
+                card.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .pt_1()
+                        .when(kind == FailureKind::Overflow, |d| {
+                            d.child(
+                                button("fail-new", IconAll::MessageSquarePlus, "新开会话")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_session(cx);
+                                        this.focus_input(window, cx);
+                                    })),
+                            )
+                        })
+                        .when(kind == FailureKind::Auth, |d| {
+                            d.child(
+                                button("fail-settings", IconAll::Settings, "打开设置").on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.open_settings_at(1, window, cx)
+                                    }),
+                                ),
+                            )
+                        })
+                        .when(resume, |d| {
+                            d.child(
+                                button("fail-resume", IconAll::Play, "继续")
+                                    .on_click(cx.listener(|this, _, _, cx| this.resume_turn(cx))),
+                            )
+                        })
+                        .child(
+                            button("fail-retry", IconAll::RotateCcw, "重试").on_click(
+                                cx.listener(move |this, _, _, cx| this.retry_turn(idx, cx)),
                             ),
-                        )
-                    })
-                    .when(kind == FailureKind::Auth, |d| {
-                        d.child(button("fail-settings", IconAll::Settings, "打开设置").on_click(
-                            cx.listener(|this, _, window, cx| this.open_settings_at(1, window, cx)),
-                        ))
-                    })
-                    .when(resume, |d| {
-                        d.child(
-                            button("fail-resume", IconAll::Play, "继续")
-                                .on_click(cx.listener(|this, _, _, cx| this.resume_turn(cx))),
-                        )
-                    })
-                    .child(
-                        button("fail-retry", IconAll::RotateCcw, "重试")
-                            .on_click(cx.listener(move |this, _, _, cx| this.retry_turn(idx, cx))),
-                    ),
-            )
+                        ),
+                )
+            })
     }
 
     /// 权限卡：内核给的选项按钮之后是「拒绝并说明」。`keyed` = 这是最早一条待定的请求，
