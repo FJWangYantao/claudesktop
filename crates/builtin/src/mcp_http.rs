@@ -9,6 +9,7 @@
 //!
 //! 收到的消息、发不出去的请求、断线都交给 [`Sink`]（`mcp.rs` 的 `Client`），JSON-RPC 的配对在那边做。
 
+use crate::mcp_oauth::Auth;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -28,6 +29,15 @@ pub(crate) trait Sink: Send + Sync + 'static {
     fn closed(&self, reason: String);
 }
 
+/// 连接失败的原因，分成两种：一种该走 OAuth，一种只能报给用户。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenError {
+    /// 服务器回了 401 且给了 Bearer 挑战：先授权再连
+    NeedsAuth(String),
+    /// 别的原因（连不上、404、配置错……）
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Streamable,
@@ -39,8 +49,12 @@ pub(crate) struct Http {
     agent: ureq::Agent,
     url: String,
     headers: BTreeMap<String, String>,
+    /// OAuth 拿到的令牌（`headers` 里有 Authorization 时为 None，那时一直用固定头）
+    auth: Option<Arc<Auth>>,
     /// Streamable：服务器给的会话 ID（POST 线程里写，所以包一层 Arc）
     session: Arc<Mutex<Option<String>>>,
+    /// 最近一次 401 的 `WWW-Authenticate`：`establish` 据此决定要不要走 OAuth
+    challenge: Arc<Mutex<Option<String>>>,
     /// 旧版：服务器给的 POST 地址
     endpoint: Option<String>,
 }
@@ -51,8 +65,10 @@ impl Http {
         kind: Kind,
         url: &str,
         headers: BTreeMap<String, String>,
+        auth: Option<Arc<Auth>>,
         sink: Weak<dyn Sink>,
-    ) -> Result<Self, String> {
+        challenge: Arc<Mutex<Option<String>>>,
+    ) -> Result<Self, OpenError> {
         let agent = ureq::Agent::config_builder()
             // 非 2xx 也要读响应体拿错误信息
             .http_status_as_error(false)
@@ -64,7 +80,9 @@ impl Http {
             agent,
             url: url.to_string(),
             headers,
+            auth,
             session: Arc::new(Mutex::new(None)),
+            challenge,
             endpoint: None,
         };
         if kind == Kind::Legacy {
@@ -74,16 +92,30 @@ impl Http {
     }
 
     /// 旧版：GET 事件流，后台线程读它；返回 `endpoint` 事件给的 POST 地址。
-    fn open_event_stream(&self, sink: Weak<dyn Sink>) -> Result<String, String> {
+    fn open_event_stream(&self, sink: Weak<dyn Sink>) -> Result<String, OpenError> {
         let mut request = self.agent.get(&self.url).header("Accept", "text/event-stream");
         for (k, v) in &self.headers {
             request = request.header(k.as_str(), v.as_str());
         }
-        let response = request.call().map_err(|e| format!("连不上 {}：{e}", self.url))?;
+        if let Some(auth) = &self.auth {
+            request = request.header("Authorization", format!("Bearer {}", auth.access_token()));
+        }
+        let response =
+            request.call().map_err(|e| OpenError::Failed(format!("连不上 {}：{e}", self.url)))?;
         let status = response.status().as_u16();
+        if status == 401 {
+            let challenge = response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            *self.challenge.lock().unwrap() = Some(challenge.clone());
+            return Err(OpenError::NeedsAuth(challenge));
+        }
         if !(200..300).contains(&status) {
             let text = response.into_body().read_to_string().unwrap_or_default();
-            return Err(status_reason(status, &text));
+            return Err(OpenError::Failed(status_reason(status, &text)));
         }
         let reader = BufReader::new(response.into_body().into_reader());
         let (tx, rx) = mpsc::channel();
@@ -110,7 +142,7 @@ impl Http {
             }
         });
         rx.recv_timeout(ENDPOINT_TIMEOUT)
-            .map_err(|_| "服务器没给出 POST 地址（endpoint 事件）".to_string())
+            .map_err(|_| OpenError::Failed("服务器没给出 POST 地址（endpoint 事件）".to_string()))
     }
 
     /// 发一条消息。在后台线程里 POST（响应可能是一段很长的流），结果经 `sink` 回来。
@@ -123,34 +155,71 @@ impl Http {
             Kind::Streamable => self.url.clone(),
             Kind::Legacy => self.endpoint.clone().unwrap_or_default(),
         };
-        let mut request = self
-            .agent
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
-        for (k, v) in &self.headers {
-            request = request.header(k.as_str(), v.as_str());
-        }
         let had_session = self.session.lock().unwrap().clone();
-        if let Some(s) = &had_session {
-            request = request.header("Mcp-Session-Id", s.as_str());
-        }
-        if method != Some("initialize") {
-            request = request.header("MCP-Protocol-Version", crate::mcp::PROTOCOL_VERSION);
-        }
+        let agent = self.agent.clone();
+        let headers = self.headers.clone();
         let body = msg.to_string();
         let kind = self.kind;
+        let method = method.map(str::to_string);
         let session = self.session.clone();
+        let auth = self.auth.clone();
+        let challenge = self.challenge.clone();
+        // 刷新失败时要按它忘掉令牌，所以取服务器地址（不是 POST 地址）
+        let resource = self.url.clone();
         let _ = std::thread::Builder::new().name("mcp-post".into()).spawn(move || {
             let fail = |reason: String| {
                 if let Some(id) = id.filter(|_| expects_reply) {
                     sink.fail(id, reason)
                 }
             };
-            let response = match request.send(&body) {
+            // 重发时要重新取一次令牌（刚刷新过），所以请求现拼
+            let build = || {
+                let mut request = agent
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream");
+                for (k, v) in &headers {
+                    request = request.header(k.as_str(), v.as_str());
+                }
+                if let Some(s) = &had_session {
+                    request = request.header("Mcp-Session-Id", s.as_str());
+                }
+                if method.as_deref() != Some("initialize") {
+                    request = request.header("MCP-Protocol-Version", crate::mcp::PROTOCOL_VERSION);
+                }
+                match &auth {
+                    Some(auth) => {
+                        request.header("Authorization", format!("Bearer {}", auth.access_token()))
+                    }
+                    None => request,
+                }
+            };
+            let mut response = match build().send(&body) {
                 Ok(r) => r,
                 Err(e) => return fail(format!("请求 {url} 失败：{e}")),
             };
+            // 401：先把挑战记下来（上层据此决定走不走 OAuth），再考虑刷新
+            if response.status().as_u16() == 401
+                && let Some(value) =
+                    response.headers().get("www-authenticate").and_then(|v| v.to_str().ok())
+            {
+                *challenge.lock().unwrap() = Some(value.to_string());
+            }
+            // 令牌过期：换一次再重发（每个请求最多一次，不放大）
+            if response.status().as_u16() == 401
+                && let Some(auth) = &auth
+            {
+                if auth.refresh().is_err() {
+                    crate::mcp_oauth::forget(&resource);
+                    let reason = "登录状态过期了，需要重新登录".to_string();
+                    // 还没握手完（没有会话 id）：交给 establish 重新走授权，别当断线
+                    return if had_session.is_some() { sink.closed(reason) } else { fail(reason) };
+                }
+                match build().send(&body) {
+                    Ok(r) => response = r,
+                    Err(e) => return fail(format!("请求 {url} 失败：{e}")),
+                }
+            }
             let status = response.status().as_u16();
             if status == 404 && had_session.is_some() && kind == Kind::Streamable {
                 return sink.closed("服务器那边的会话过期了".into());

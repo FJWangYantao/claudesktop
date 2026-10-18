@@ -26,6 +26,7 @@ mod history;
 mod instructions;
 pub mod mcp;
 mod mcp_http;
+mod mcp_oauth;
 mod openai;
 mod permissions;
 mod provider;

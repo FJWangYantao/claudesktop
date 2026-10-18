@@ -29,8 +29,13 @@ struct Remote(Child, u16);
 
 impl Remote {
     fn start(mode: &str, token: &str) -> Self {
+        Self::start_with(mode, token, &[])
+    }
+
+    fn start_with(mode: &str, token: &str, extra: &[&str]) -> Self {
         let mut child = Command::new("node")
             .args([script().as_str(), mode, token])
+            .args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -195,6 +200,92 @@ fn unauthorized_servers_fail_with_a_hint_and_can_be_retried() {
     h.wait("failed again", "web", |s| matches!(s.state, McpState::Failed(_)));
     assert!(matches!(h.state("web"), Some(McpState::Failed(_))));
     h.hub.stop();
+}
+
+/// OAuth：401 → 出现「登录」→（测试里扮演浏览器）跟一次授权 → 连上；令牌过期静默刷新，
+/// 刷新也被作废时回到「需要登录」。
+#[test]
+fn oauth_servers_authorize_refresh_and_ask_again() {
+    let remote = Remote::start_with("--http", "", &["--oauth"]);
+    // 独立的 token 目录，不和真实数据混
+    let dir = workdir("oauth-data");
+    unsafe { std::env::set_var("CLAUDESKTOP_DATA_DIR", &dir) };
+    let base = format!("http://127.0.0.1:{}", remote.1);
+    let h = Hub::new(
+        "oauth",
+        serde_json::json!({ "web": { "type": "http", "url": format!("{base}/mcp") } }),
+    );
+
+    // 1. 需要登录：地址里有 PKCE 和 resource
+    let s = h.wait("needs auth", "web", |s| matches!(s.state, McpState::NeedsAuth { .. }));
+    let McpState::NeedsAuth { url } = s.state else { unreachable!() };
+    assert!(url.starts_with(&format!("{base}/authorize?")), "{url}");
+    assert!(url.contains("code_challenge=") && url.contains("code_challenge_method=S256"), "{url}");
+    assert!(
+        url.contains("resource=") && url.contains(&format!("{base}/mcp"))
+            || url.contains("resource=http"),
+        "{url}"
+    );
+    assert!(s.retry, "「需要登录」也要能重新连接");
+
+    // 2. 扮演浏览器：跟一次 302 就回到 client 的回调
+    follow_authorization(&url);
+    h.ready("web", 3);
+    assert_eq!(
+        h.call("web", "echo", serde_json::json!({ "text": "authed" })),
+        (true, "echo: authed".into())
+    );
+
+    // 3. access 过期：一次调用内部刷新，用户无感
+    post(&format!("{base}/oauth/expire"));
+    assert_eq!(
+        h.call("web", "echo", serde_json::json!({ "text": "again" })),
+        (true, "echo: again".into())
+    );
+    let log = get(&format!("{base}/oauth/log"));
+    assert!(log.contains("\"refresh\":1"), "{log}");
+
+    // 4. refresh 也作废：回到「需要登录」
+    post(&format!("{base}/oauth/revoke"));
+    let _ = h.call("web", "echo", serde_json::json!({ "text": "gone" }));
+    h.wait("needs auth again", "web", |s| matches!(s.state, McpState::NeedsAuth { .. }));
+    h.hub.stop();
+    unsafe { std::env::remove_var("CLAUDESKTOP_DATA_DIR") };
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 用普通 HTTP 客户端扮演浏览器：GET 授权页，跟 302 到本机回调。
+fn follow_authorization(url: &str) {
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        // 自己跟跳转：要拿 302 的 Location 才知道回调地址
+        .max_redirects(0)
+        .build()
+        .new_agent();
+    let response = agent.get(url).call().expect("授权页");
+    let status = response.status().as_u16();
+    let location = response.headers().get("location").and_then(|v| v.to_str().ok());
+    let Some(location) = location else {
+        panic!("授权页没给 302：HTTP {status}");
+    };
+    let location = location.to_string();
+    let callback = agent.get(&location).call().expect("回调");
+    let body = callback.into_body().read_to_string().unwrap_or_default();
+    assert!(body.contains("授权完成"), "{body}");
+}
+
+fn post(url: &str) -> String {
+    ureq::post(url)
+        .send_empty()
+        .map(|r| r.into_body().read_to_string().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+fn get(url: &str) -> String {
+    ureq::get(url)
+        .call()
+        .map(|r| r.into_body().read_to_string().unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// 真实的远程服务（默认 DeepWiki 的公开 Streamable HTTP 端点，免登录）：握手、列工具、调一次。

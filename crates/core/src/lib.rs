@@ -226,6 +226,11 @@ pub enum McpState {
     Reconnecting(String),
     /// 配置里写了 `"disabled": true`
     Disabled,
+    /// 服务器要求 OAuth 授权：在浏览器里打开 `url` 完成登录。
+    /// 流程只等 10 分钟，过期后再「重新连接」会重新起一轮、换一个新地址
+    NeedsAuth {
+        url: String,
+    },
 }
 
 impl KernelEvent {

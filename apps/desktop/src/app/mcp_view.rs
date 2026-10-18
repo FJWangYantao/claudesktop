@@ -115,17 +115,24 @@ impl ChatApp {
         }
         let mut card = div().v_flex().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD));
         for (i, server) in servers.iter().enumerate() {
-            let (dot, label, detail) = match &server.state {
-                McpState::Ready => (GREEN, format!("{} 个工具", server.tools), None),
+            // 需要 OAuth 登录：给一个「登录」按钮，打开授权页
+            let (dot, label, detail, sign_in) = match &server.state {
+                McpState::Ready => (GREEN, format!("{} 个工具", server.tools), None, None),
                 McpState::Connecting if !running => {
-                    (INK_FAINT, "未连接（自研内核没在运行）".into(), None)
+                    (INK_FAINT, "未连接（自研内核没在运行）".into(), None, None)
                 }
-                McpState::Connecting => (INK_FAINT, "连接中…".into(), None),
-                McpState::Disabled => (INK_FAINT, "已禁用".into(), None),
-                McpState::Failed(reason) => (RED, "没连上".into(), Some(reason.clone())),
+                McpState::Connecting => (INK_FAINT, "连接中…".into(), None, None),
+                McpState::Disabled => (INK_FAINT, "已禁用".into(), None, None),
+                McpState::Failed(reason) => (RED, "没连上".into(), Some(reason.clone()), None),
                 McpState::Reconnecting(detail) => {
-                    (CORAL, "断开了，重连中…".into(), Some(detail.clone()))
+                    (CORAL, "断开了，重连中…".into(), Some(detail.clone()), None)
                 }
+                McpState::NeedsAuth { url } => (
+                    CORAL,
+                    "需要登录".into(),
+                    Some("在浏览器里完成授权，回来后自动连上".into()),
+                    Some(url.clone()),
+                ),
             };
             let retry_name = server.name.clone();
             card = card.child(
@@ -168,6 +175,16 @@ impl ChatApp {
                                     .font_features(tabular_nums())
                                     .child(label),
                             )
+                            // 需要登录时主按钮是「登录」；重新连接照样给（流程过期了要重来一轮）
+                            .when_some(sign_in, |d, url| {
+                                d.child(
+                                    Self::text_button(("mcp-login", i), "登录", true)
+                                        .xsmall()
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.open_url(&url);
+                                        })),
+                                )
+                            })
                             .when(server.retry && running, |d| {
                                 d.child(
                                     Self::text_button(("mcp-retry", i), "重新连接", false)

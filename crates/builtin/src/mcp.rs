@@ -95,6 +95,8 @@ pub struct ServerConfig {
     pub unsupported: Option<String>,
     /// 来自哪个插件；None = mcp.json
     pub plugin: Option<String>,
+    /// OAuth 配置（`mcp.json` 里的 `"oauth"`，可省）
+    pub oauth: crate::mcp_oauth::OAuthConfig,
 }
 
 impl ServerConfig {
@@ -185,9 +187,33 @@ fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
                 disabled: s.get("disabled").and_then(Value::as_bool).unwrap_or(false),
                 unsupported,
                 plugin: None,
+                oauth: oauth_config(s.get("oauth"), &env),
             }
         })
         .collect())
+}
+
+/// 读 `"oauth"` 那一段：`client_id` / `callback_port` / `scope` 都可省。
+fn oauth_config(
+    value: Option<&Value>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> crate::mcp_oauth::OAuthConfig {
+    let Some(v) = value.filter(|v| v.is_object()) else {
+        return crate::mcp_oauth::OAuthConfig::default();
+    };
+    let text = |key: &str| {
+        v.get(key).and_then(Value::as_str).map(|s| expand(s, env)).filter(|s| !s.trim().is_empty())
+    };
+    crate::mcp_oauth::OAuthConfig {
+        client_id: text("client_id"),
+        // 端口写 0 等于不固定：交给系统挑
+        callback_port: v
+            .get("callback_port")
+            .and_then(Value::as_u64)
+            .map(|p| p as u16)
+            .filter(|p| *p > 0),
+        scope: text("scope"),
+    }
 }
 
 /// `${VAR}` / `${VAR:-默认值}` 换成环境变量（没有这个变量时换成默认值或空串），同 Claude Code。
@@ -354,7 +380,10 @@ impl McpHub {
         let Some(server) = server else { return };
         {
             let mut state = server.state.lock().unwrap();
-            let stuck = matches!(*state, McpState::Failed(_) | McpState::Reconnecting(_));
+            let stuck = matches!(
+                *state,
+                McpState::Failed(_) | McpState::Reconnecting(_) | McpState::NeedsAuth { .. }
+            );
             if !stuck || server.config.unsupported.is_some() || server.config.disabled {
                 return;
             }
@@ -382,8 +411,12 @@ impl McpHub {
                 let state = s.state.lock().unwrap().clone();
                 McpServerView {
                     name: s.config.name.clone(),
-                    retry: matches!(state, McpState::Failed(_) | McpState::Reconnecting(_))
-                        && s.config.unsupported.is_none(),
+                    retry: matches!(
+                        state,
+                        McpState::Failed(_)
+                            | McpState::Reconnecting(_)
+                            | McpState::NeedsAuth { .. }
+                    ) && s.config.unsupported.is_none(),
                     state,
                     tools: s.tools.lock().unwrap().len(),
                     plugin: s.config.plugin.clone(),
@@ -517,7 +550,29 @@ fn reconnect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64, mut reason
     }
 }
 
-/// 连一次：起进程 / 建连接 → 握手 → 列工具。
+/// 建连接时先带上的令牌：手填了 Authorization 就完全不碰 OAuth；否则用存着的那份。
+fn initial_auth(config: &ServerConfig) -> Option<Arc<crate::mcp_oauth::Auth>> {
+    let manual = config.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+    if manual {
+        return None;
+    }
+    crate::mcp_oauth::load(&config.url).map(crate::mcp_oauth::Auth::new)
+}
+
+/// 走一遍授权：发现 → 注册 → 等浏览器回调 → 换 token。期间把授权地址报给界面（「登录」按钮）。
+fn authorize(
+    config: &ServerConfig,
+    challenge: &str,
+    on_auth: &mut dyn FnMut(&str),
+) -> Result<Arc<crate::mcp_oauth::Auth>, String> {
+    let pending = crate::mcp_oauth::prepare(&config.url, challenge, &config.oauth)
+        .map_err(|e| format!("这个服务器要求 OAuth 授权，但{e}"))?;
+    on_auth(&pending.url);
+    let token = pending.wait()?;
+    Ok(crate::mcp_oauth::Auth::new(token))
+}
+
+/// 连一次：起进程 / 建连接 → 握手 → 列工具；远程服务要授权时先走一遍 OAuth 再重来。
 fn establish(
     hub: &Weak<McpHub>,
     server: &Arc<Server>,
@@ -525,9 +580,9 @@ fn establish(
 ) -> Result<(Arc<Client>, Vec<McpTool>), String> {
     let cwd = hub.upgrade().ok_or("内核已关闭")?.cwd.clone();
     // 断了：连上过的转去重连；还在握手时断的由握手那边报错
-    let on_exit = {
+    let on_exit: Arc<dyn Fn(String) + Send + Sync> = {
         let (hub, server) = (hub.clone(), Arc::downgrade(server));
-        move |reason: String| {
+        Arc::new(move |reason: String| {
             let (Some(h), Some(server)) = (hub.upgrade(), server.upgrade()) else { return };
             if h.generation.load(Ordering::SeqCst) != generation
                 || *server.state.lock().unwrap() != McpState::Ready
@@ -536,14 +591,16 @@ fn establish(
             }
             server.tools.lock().unwrap().clear();
             server.client.lock().unwrap().take();
+            let who = server.config.name.clone();
+            let (hub, server) = (hub.clone(), server.clone());
             let _ = std::thread::Builder::new()
-                .name(format!("mcp-reconnect-{}", server.config.name))
+                .name(format!("mcp-reconnect-{who}"))
                 .spawn(move || reconnect(hub, server, generation, reason));
-        }
+        })
     };
-    let on_tools_changed = {
+    let on_tools_changed: Arc<dyn Fn() + Send + Sync> = {
         let (hub, server) = (hub.clone(), Arc::downgrade(server));
-        move || {
+        Arc::new(move || {
             let (hub, server) = (hub.clone(), server.clone());
             let _ = std::thread::Builder::new().name("mcp-relist".into()).spawn(move || {
                 let (Some(hub), Some(server)) = (hub.upgrade(), server.upgrade()) else {
@@ -558,17 +615,64 @@ fn establish(
                     hub.report();
                 }
             });
+        })
+    };
+    let mut on_auth = {
+        let (hub, server) = (hub.clone(), server.clone());
+        move |url: &str| {
+            let Some(hub) = hub.upgrade() else { return };
+            if hub.generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            *server.state.lock().unwrap() = McpState::NeedsAuth { url: url.to_string() };
+            hub.report();
         }
     };
-    let client = Client::open(&server.config, &cwd, on_exit, on_tools_changed)?;
-    let init = json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": {},
-        "clientInfo": { "name": "claudesktop", "version": env!("CARGO_PKG_VERSION") },
-    });
-    client
-        .request("initialize", init, INIT_TIMEOUT, &|| false)
-        .map_err(|e| client.with_stderr(format!("握手失败：{e}")))?;
+    let challenge = Arc::new(Mutex::new(None));
+    let mut auth = initial_auth(&server.config);
+    let client = loop {
+        let client = Client::open(
+            &server.config,
+            &cwd,
+            on_exit.clone(),
+            on_tools_changed.clone(),
+            auth.clone(),
+            challenge.clone(),
+        )?;
+        let init = json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "claudesktop", "version": env!("CARGO_PKG_VERSION") },
+        });
+        let init = client
+            .request("initialize", init, INIT_TIMEOUT, &|| false)
+            .map_err(|e| client.with_stderr(format!("握手失败：{e}")));
+        match init {
+            Ok(_) => break client,
+            // 握手时回 401：带 Bearer 挑战就走 OAuth，授权完重连一次
+            Err(reason) => {
+                let Some(challenge) = challenge.lock().unwrap().clone() else {
+                    return Err(reason);
+                };
+                if !challenge.to_ascii_lowercase().contains("bearer") {
+                    return Err(reason);
+                }
+                if let Some(stale) = auth.take() {
+                    drop(stale);
+                    crate::mcp_oauth::forget(&server.config.url);
+                }
+                auth = Some(authorize(&server.config, &challenge, &mut on_auth)?);
+            }
+        }
+    };
+    // 拿到令牌、握手过了：状态回到「连接中」，别把「登录」按钮留着
+    if *server.state.lock().unwrap() != McpState::Connecting
+        && let Some(hub) = hub.upgrade()
+        && hub.generation.load(Ordering::SeqCst) == generation
+    {
+        *server.state.lock().unwrap() = McpState::Connecting;
+        hub.report();
+    }
     client.notify("notifications/initialized", json!({}));
     let tools = list_tools(&client).map_err(|e| client.with_stderr(format!("列工具失败：{e}")))?;
     Ok((client, tools))
@@ -704,8 +808,10 @@ impl Client {
     fn open(
         config: &ServerConfig,
         cwd: &Path,
-        on_exit: impl FnOnce(String) + Send + 'static,
-        on_tools_changed: impl Fn() + Send + Sync + 'static,
+        on_exit: Arc<dyn Fn(String) + Send + Sync>,
+        on_tools_changed: Arc<dyn Fn() + Send + Sync>,
+        auth: Option<Arc<crate::mcp_oauth::Auth>>,
+        challenge: Arc<Mutex<Option<String>>>,
     ) -> Result<Arc<Self>, String> {
         let new = |pipe: Pipe| {
             Arc::new_cyclic(|me| Self {
@@ -715,8 +821,8 @@ impl Client {
                 next_id: AtomicU64::new(1),
                 alive: AtomicBool::new(true),
                 stderr: Mutex::new(StderrLog::default()),
-                on_tools_changed: Box::new(on_tools_changed),
-                on_exit: Mutex::new(Some(Box::new(on_exit))),
+                on_tools_changed: Box::new(move || on_tools_changed()),
+                on_exit: Mutex::new(Some(Box::new(move |reason| on_exit(reason)))),
             })
         };
         let kind = match config.transport {
@@ -727,7 +833,11 @@ impl Client {
         if let Some(kind) = kind {
             let client = new(Pipe::Http(OnceLock::new()));
             let sink: Weak<dyn Sink> = client.me.clone();
-            let http = Http::open(kind, &config.url, config.headers.clone(), sink)?;
+            let http = Http::open(kind, &config.url, config.headers.clone(), auth, sink, challenge)
+                .map_err(|e| match e {
+                    mcp_http::OpenError::NeedsAuth(_) => "服务器要求授权".to_string(),
+                    mcp_http::OpenError::Failed(reason) => reason,
+                })?;
             if let Pipe::Http(slot) = &client.pipe {
                 let _ = slot.set(http);
             }
