@@ -1325,6 +1325,7 @@ mod tests {
             cwd: "C:/proj".into(),
             agent: "mock".into(),
             kernel_session_id: Some("acp-1".into()),
+            kernel_sessions: Vec::new(),
             created_ms: 0,
             updated_ms: 0,
             archived: false,

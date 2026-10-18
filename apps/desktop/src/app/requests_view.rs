@@ -1,0 +1,564 @@
+//! 首页用量卡片的「请求」页签：用量网关记下的每个请求，按「会话的第几轮」归组（归组与汇总见 `requests.rs`）。
+//!
+//! 日志在切到这个页签、换时间范围、点刷新时在后台读；点一轮展开看里面的每次请求（左边一条时间轴，
+//! 看出每次请求落在这一轮的哪一段）。费用按设置里的模型单价估算（`pricing.rs`）。
+//! 自研内核的请求都经过网关；ACP agent 的要在设置里打开「经过用量网关」、agent 认 base URL 才有。
+
+use super::ChatApp;
+use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::widgets::Surface;
+use crate::model::StatCard;
+use crate::pricing::{self, Cost, PeakWindow, Price};
+use crate::requests::{self, SessionRef, TurnRow};
+use crate::theme::rgb;
+use crate::theme::*;
+use crate::usage;
+use claudesktop_builtin::gateway::{self, RequestLog};
+use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// 先列多少轮；「显示更多」每次再多列这么多（首页整页滚动，不另开滚动框）
+const PAGE_ROWS: usize = 20;
+
+/// 「请求」页签的状态。
+#[derive(Default)]
+pub(super) struct RequestsView {
+    /// 读到的日志；None = 还没读
+    logs: Option<Arc<Vec<RequestLog>>>,
+    /// 读的是哪个时间范围（`overview_range`）
+    loaded_range: Option<usize>,
+    loading: bool,
+    /// 点开的轮（`TurnRow::key`）
+    open: HashSet<(String, u64)>,
+    /// 只看某个模型 / 某个会话（`Session::token`）
+    model: Option<String>,
+    session: Option<u64>,
+    /// 多列出来的页数（「显示更多」）
+    more: usize,
+}
+
+impl ChatApp {
+    /// 在「请求」页签上、日志还没按当前范围读过：在后台读。
+    pub(super) fn sync_requests(&mut self, cx: &mut Context<Self>) {
+        let v = &self.requests_view;
+        if self.overview_tab == 2 && !v.loading && v.loaded_range != Some(self.overview_range) {
+            self.load_requests(cx);
+        }
+    }
+
+    fn load_requests(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = gateway::default_dir() else {
+            return;
+        };
+        let range = self.overview_range;
+        let days = match range {
+            1 => Some(30),
+            2 => Some(7),
+            _ => None,
+        };
+        let since = days.map(|d: u64| super::now_ms().saturating_sub(d * 86_400_000));
+        self.requests_view.loading = true;
+        cx.spawn(async move |this, cx| {
+            let logs = cx
+                .background_executor()
+                .spawn(async move { gateway::read_logs(&dir, since) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                let v = &mut app.requests_view;
+                v.logs = Some(Arc::new(logs));
+                v.loaded_range = Some(range);
+                v.loading = false;
+                v.more = 0;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 内核会话 ID → 侧栏里的会话（续接过的会话有好几个 ID）。
+    fn request_names(&self) -> HashMap<String, SessionRef> {
+        let mut names = HashMap::new();
+        for s in &self.sessions {
+            let r = SessionRef { title: s.title.to_string(), token: s.token };
+            let ids = s.meta.iter().flat_map(|m| m.kernel_sessions.iter()).chain(&s.acp_id);
+            for id in ids {
+                names.insert(id.clone(), r.clone());
+            }
+        }
+        names
+    }
+
+    pub(super) fn render_usage_requests(&self, cx: &mut Context<Self>) -> Div {
+        let hint = |text: &'static str| {
+            div().py_6().text_size(TEXT_BODY).text_color(rgb(INK_SOFT)).child(text)
+        };
+        if !self.settings.usage_gateway {
+            return div().child(hint(
+                "用量网关关着，没有请求记录。在 设置 → 内核与模型 里打开后，自研内核的每个请求都会记下来。",
+            ));
+        }
+        let v = &self.requests_view;
+        let Some(logs) = v.logs.clone() else {
+            return div().child(hint("正在读取请求记录…"));
+        };
+        let rows = requests::group(&logs, &self.request_names());
+        // 筛选的候选：模型按出现次数，会话按最近
+        let mut models: Vec<(String, usize)> = Vec::new();
+        let mut sessions: Vec<SessionRef> = Vec::new();
+        for row in &rows {
+            if let Some(m) = &row.model {
+                match models.iter_mut().find(|(n, _)| n == m) {
+                    Some((_, c)) => *c += 1,
+                    None => models.push((m.clone(), 1)),
+                }
+            }
+            if let Some(s) = &row.session
+                && !sessions.iter().any(|x| x.token == s.token)
+            {
+                sessions.push(s.clone());
+            }
+        }
+        models.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let shown: Vec<&TurnRow> = rows
+            .iter()
+            .filter(|r| v.model.as_ref().is_none_or(|m| r.model.as_ref() == Some(m)))
+            .filter(|r| v.session.is_none_or(|t| r.session.as_ref().is_some_and(|s| s.token == t)))
+            .collect();
+        let sum = requests::summarize(&shown);
+        let prices = self.settings.prices();
+        let peaks = self.settings.price_peaks();
+        let cost = Cost::of(&prices, &peaks, shown.iter().flat_map(|r| &r.requests));
+
+        let model_label = v.model.clone().unwrap_or_else(|| "全部模型".into());
+        let session_label = v
+            .session
+            .and_then(|t| sessions.iter().find(|s| s.token == t))
+            .map_or_else(|| "全部会话".to_string(), |s| s.title.clone());
+        let model_items: Vec<String> = models.into_iter().map(|(m, _)| m).take(20).collect();
+        let session_items: Vec<SessionRef> = sessions.into_iter().take(20).collect();
+        let filters = div()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .child(menu_popover(
+                "req-model",
+                Anchor::TopLeft,
+                rems(18.),
+                &cx.entity(),
+                &self.menu_focus,
+                MenuChip::new(IconAll::Cpu, model_label).filled(),
+                move |app, handle, popover| {
+                    let current = app.requests_view.model.clone();
+                    let mut menu = MenuList::new("req-model-list", handle, popover).pick(
+                        menu_item("req-model-all", IconAll::Cpu, "全部模型", "", current.is_none()),
+                        |this, cx| {
+                            this.requests_view.model = None;
+                            this.requests_view.more = 0;
+                            cx.notify();
+                        },
+                    );
+                    for (i, m) in model_items.iter().enumerate() {
+                        let pick = m.clone();
+                        menu = menu.pick(
+                            menu_item(
+                                ("req-model-item", i),
+                                IconAll::Cpu,
+                                m.clone(),
+                                "",
+                                current.as_ref() == Some(m),
+                            ),
+                            move |this, cx| {
+                                this.requests_view.model = Some(pick.clone());
+                                this.requests_view.more = 0;
+                                cx.notify();
+                            },
+                        );
+                    }
+                    menu
+                },
+            ))
+            .child(menu_popover(
+                "req-session",
+                Anchor::TopLeft,
+                rems(20.),
+                &cx.entity(),
+                &self.menu_focus,
+                MenuChip::new(IconAll::MessageSquare, session_label).filled(),
+                move |app, handle, popover| {
+                    let current = app.requests_view.session;
+                    let mut menu = MenuList::new("req-session-list", handle, popover).pick(
+                        menu_item(
+                            "req-session-all",
+                            IconAll::MessageSquare,
+                            "全部会话",
+                            "",
+                            current.is_none(),
+                        ),
+                        |this, cx| {
+                            this.requests_view.session = None;
+                            this.requests_view.more = 0;
+                            cx.notify();
+                        },
+                    );
+                    for (i, s) in session_items.iter().enumerate() {
+                        let token = s.token;
+                        menu = menu.pick(
+                            menu_item(
+                                ("req-session-item", i),
+                                IconAll::MessageSquare,
+                                s.title.clone(),
+                                "",
+                                current == Some(token),
+                            ),
+                            move |this, cx| {
+                                this.requests_view.session = Some(token);
+                                this.requests_view.more = 0;
+                                cx.notify();
+                            },
+                        );
+                    }
+                    menu
+                },
+            ))
+            .child(div().flex_1())
+            .child(
+                Self::quiet_button("req-refresh", IconAll::RefreshCw, Surface::Sand, cx)
+                    .small()
+                    .tooltip("重新读取")
+                    .loading(v.loading)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.load_requests(cx);
+                        cx.notify();
+                    })),
+            );
+
+        let dash = || SharedString::from("—");
+        let stats = [
+            StatCard { label: "请求", value: usage::compact(sum.requests as u64).into() },
+            StatCard { label: "累计输入", value: usage::compact(sum.input).into() },
+            StatCard { label: "输出", value: usage::compact(sum.output).into() },
+        ];
+        // 两种币种各占一行（并排一行放不下）
+        let money = cost.parts();
+        let cost_card = Self::stat_card(&StatCard {
+            label: "估算费用",
+            value: money.first().map_or_else(dash, |m| m.clone().into()),
+        })
+        .children(money.into_iter().skip(1).map(|m| {
+            div()
+                .text_size(TEXT_LEAD)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(INK))
+                .child(m)
+        }));
+        let mut notes = vec![format!("{} 轮", sum.turns)];
+        if let Some(ms) = sum.first_token_ms {
+            notes.push(format!("首字中位 {}", requests::ms_label(ms)));
+        }
+        if let Some(saved) = cost.saved_label() {
+            notes.push(format!("缓存省下约 {saved}"));
+        }
+        if cost.peak > 0 {
+            notes.push(format!("{} 次请求按峰价算", cost.peak));
+        }
+        match cost.unpriced.as_slice() {
+            [] => {}
+            [one] => notes.push(format!("{one} 没有单价")),
+            many => notes.push(format!("{} 个模型没有单价", many.len())),
+        }
+        if sum.retries > 0 {
+            notes.push(format!("重试 {} 次", sum.retries));
+        }
+        if sum.failed > 0 {
+            notes.push(format!("失败 {} 次", sum.failed));
+        }
+
+        let mut list = div().v_flex().gap_1p5();
+        if shown.is_empty() {
+            list = list.child(hint(
+                "这段时间还没有请求记录（自研内核的请求都会记下；ACP agent 的要在设置里打开「经过用量网关」）",
+            ));
+        }
+        let limit = PAGE_ROWS * (v.more + 1);
+        for (i, row) in shown.iter().take(limit).enumerate() {
+            list = list.child(self.request_turn(i, row, &prices, &peaks, cx));
+        }
+        if shown.len() > limit {
+            list = list.child(
+                div().h_flex().justify_center().pt_1().child(
+                    Self::quiet_button("req-more", IconAll::ChevronDown, Surface::Sand, cx)
+                        .small()
+                        .label(format!("再显示 {} 轮", (shown.len() - limit).min(PAGE_ROWS)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.requests_view.more += 1;
+                            cx.notify();
+                        })),
+                ),
+            );
+        }
+
+        div()
+            .v_flex()
+            .gap_3()
+            .child(filters)
+            .child(
+                div()
+                    .h_flex()
+                    // 费用卡可能两行，几张卡一样高
+                    .items_stretch()
+                    .gap_3()
+                    .children(stats.iter().map(Self::stat_card))
+                    .child(cost_card),
+            )
+            .child(
+                meta_line(notes.into_iter().map(|n| (n, INK_SOFT)).collect()).text_size(TEXT_SMALL),
+            )
+            .child(list)
+    }
+
+    /// 一轮：标题、时间，一行用量；点开列出每次请求。
+    fn request_turn(
+        &self,
+        i: usize,
+        row: &TurnRow,
+        prices: &[Price],
+        peaks: &[PeakWindow],
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let open = self.requests_view.open.contains(&row.key);
+        let title = match &row.session {
+            Some(s) => s.title.clone(),
+            None if row.purpose == "models" => "列出模型".into(),
+            None if row.key.1 > 0 && !row.key.0.contains('#') => "已删除的会话".into(),
+            None => requests::purpose_label(&row.purpose).into(),
+        };
+        let mut parts = vec![format!("{} 次请求", row.requests.len())];
+        if row.input > 0 {
+            parts.push(format!("累计输入 {}", usage::compact(row.input)));
+        }
+        // 只有一次请求时上下文就等于累计输入，不重复说
+        if row.context > 0 && row.requests.len() > 1 {
+            parts.push(format!("上下文 {}", usage::compact(row.context)));
+        }
+        if row.output > 0 {
+            parts.push(format!("输出 {}", usage::compact(row.output)));
+        }
+        if let Some(c) = Cost::of(prices, peaks, &row.requests).label() {
+            parts.push(format!("约 {c}"));
+        }
+        parts.push(format!("用时 {}", requests::ms_label(row.elapsed_ms)));
+        if row.subagents > 0 {
+            parts.push(format!("子任务 {} 次请求", row.subagents));
+        }
+        if row.retries > 0 {
+            parts.push(format!("重试 {} 次", row.retries));
+        }
+        if row.cancelled {
+            parts.push("已停止".into());
+        }
+        let key = row.key.clone();
+        let mut card = div()
+            .id(("req-turn", i))
+            .v_flex()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let open = &mut this.requests_view.open;
+                if !open.remove(&key) {
+                    open.insert(key.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(if open { IconAll::ChevronDown } else { IconAll::ChevronRight })
+                            .size_3()
+                            .text_color(rgb(INK_SOFT)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(TEXT_BODY)
+                            .text_color(rgb(INK))
+                            .child(title),
+                    )
+                    .when_some(row.model.clone(), |d, m| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .max_w(rems(10.))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .font_family(MONO)
+                                .text_size(TEXT_META)
+                                .text_color(rgb(INK_SOFT))
+                                .child(m),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK_SOFT))
+                            .font_features(tabular_nums())
+                            .child(match &row.session {
+                                // 同一个会话的几轮靠「第几轮」分开
+                                Some(_) => {
+                                    format!("第 {} 轮 · {}", row.key.1, time_label(row.at_ms))
+                                }
+                                None => time_label(row.at_ms),
+                            }),
+                    ),
+            )
+            .child({
+                let mut parts: Vec<(String, Color)> =
+                    parts.into_iter().map(|p| (p, INK_SOFT)).collect();
+                if row.failed > 0 {
+                    parts.push((format!("失败 {} 次", row.failed), RED));
+                }
+                meta_line(parts).pl(rems(1.25)).text_size(TEXT_SMALL)
+            });
+        if open {
+            let mut detail = div().v_flex().gap_0p5().pt_1().pl(rems(1.25));
+            for (k, r) in row.requests.iter().enumerate() {
+                detail = detail.child(
+                    div().h_flex().items_start().gap_2().child(timeline_bar(row, r)).child(
+                        div().flex_1().min_w_0().child(request_line(
+                            k,
+                            r,
+                            &row.requests[..k],
+                            prices,
+                            peaks,
+                        )),
+                    ),
+                );
+            }
+            card = card.child(detail);
+        }
+        card
+    }
+}
+
+/// 时间轴上的一段：整条是这一轮从第一个请求发出到最后一个结束，亮的那段是这次请求。
+fn timeline_bar(row: &TurnRow, r: &RequestLog) -> Div {
+    let span = row.elapsed_ms.max(1) as f32;
+    let start = (r.at_ms.saturating_sub(row.at_ms) as f32 / span).clamp(0., 1.);
+    let width = (r.total_ms as f32 / span).clamp(0., 1. - start);
+    let color = if r.cancelled {
+        INK_FAINT
+    } else if requests::failed(r) {
+        RED
+    } else if r.purpose == "subagent" {
+        ChatApp::heat_color(2)
+    } else {
+        ChatApp::heat_color(4)
+    };
+    // 和右边第一行字的中线对齐
+    div()
+        .flex_shrink_0()
+        .w(rems(6.))
+        .mt(rems(0.4))
+        .h(px(6.))
+        .rounded_full()
+        .bg(rgb(ChatApp::heat_color(0)))
+        .h_flex()
+        .child(div().w(relative(start)))
+        .child(div().w(relative(width)).min_w(px(3.)).h_full().rounded_full().bg(rgb(color)))
+}
+
+/// 一次请求：用途、状态（失败标红）、第几次尝试、首字 / 全程、用量、费用（峰价标出来）。
+fn request_line(
+    k: usize,
+    r: &RequestLog,
+    before: &[RequestLog],
+    prices: &[Price],
+    peaks: &[PeakWindow],
+) -> Div {
+    let mut parts = vec![format!("{}. {}", k + 1, requests::purpose_label(&r.purpose))];
+    if r.attempt.is_some_and(|a| a > 1) {
+        parts.push(format!("第 {} 次尝试", r.attempt.unwrap_or(1)));
+    }
+    if let Some(ms) = r.first_token_ms {
+        parts.push(format!("首字 {}", requests::ms_label(ms)));
+    }
+    parts.push(format!("共 {}", requests::ms_label(r.total_ms)));
+    if r.input > 0 || r.output > 0 {
+        let cached = if r.cache_read > 0 {
+            format!("（缓存 {}）", usage::compact(r.cache_read))
+        } else {
+            String::new()
+        };
+        parts.push(format!("↑ {}{cached} ↓ {}", usage::compact(r.input), usage::compact(r.output)));
+    }
+    if let Some(m) = r.model.as_deref()
+        && let Some(p) = pricing::find(prices, m)
+        && (r.input > 0 || r.output > 0)
+    {
+        let cost = pricing::request_cost(p, r, peaks);
+        let peak = match pricing::peak_of(p, peaks, r) {
+            Some(true) => "（峰价）",
+            _ => "",
+        };
+        parts.push(format!("约 {}{peak}", pricing::money(cost, p.currency)));
+    }
+    // 模型中途换过才标出来
+    if let Some(m) = &r.model
+        && before.last().is_some_and(|p| p.model.as_ref() != Some(m))
+    {
+        parts.push(m.clone());
+    }
+    let mut parts: Vec<(String, Color)> = parts.into_iter().map(|p| (p, INK_SOFT)).collect();
+    if r.cancelled {
+        parts.push(("已停止".into(), INK_SOFT));
+    } else if requests::failed(r) {
+        let status =
+            if r.status == 0 { "连不上".to_string() } else { format!("HTTP {}", r.status) };
+        parts.push((
+            match &r.error {
+                Some(e) => format!("{status}：{e}"),
+                None => status,
+            },
+            RED,
+        ));
+    }
+    meta_line(parts).text_size(TEXT_META)
+}
+
+/// 用「·」隔开的一行小字：每段是一个整体，放不下时整段换到下一行；太长的一段单行截断。
+fn meta_line(parts: Vec<(String, Color)>) -> Div {
+    div().h_flex().flex_wrap().gap_x_1p5().font_features(tabular_nums()).children(
+        parts.into_iter().enumerate().map(|(i, (text, color))| {
+            div()
+                .max_w_full()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_color(rgb(color))
+                .child(if i == 0 { text } else { format!("· {text}") })
+        }),
+    )
+}
+
+/// 本地时间 `10-18 21:03`。
+fn time_label(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}

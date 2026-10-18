@@ -10,7 +10,8 @@ use crate::theme::*;
 use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::button::{ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::switch::Switch;
@@ -112,6 +113,14 @@ pub struct SettingsForm {
     acp_command: Entity<InputState>,
     /// 一轮最多几步（自研内核的工具循环上限）
     max_steps: Entity<InputState>,
+    /// 用量网关开关（保存才生效，会重启自研内核）
+    usage_gateway: bool,
+    /// ACP agent 的请求也经网关（保存才生效，会重启 ACP 内核）
+    acp_gateway: bool,
+    /// 点了「清空日志」，等再点一次确认
+    confirm_clear_gateway: bool,
+    /// 模型单价表（一行一个模型，格式见 `pricing.rs`）
+    prices: Entity<TextareaState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
     /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
@@ -126,6 +135,7 @@ impl SettingsForm {
             InputState::new(window, cx)
                 .placeholder(claudesktop_builtin::DEFAULT_MAX_STEPS.to_string())
         });
+        let prices = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 12));
         Self {
             kernel: KernelChoice::default(),
             profiles: Vec::new(),
@@ -134,6 +144,10 @@ impl SettingsForm {
             tab: 0,
             acp_command,
             max_steps,
+            usage_gateway: true,
+            acp_gateway: false,
+            confirm_clear_gateway: false,
+            prices,
             message: None,
             rules: Vec::new(),
         }
@@ -186,6 +200,14 @@ impl ChatApp {
         let s = self.settings.clone();
         self.settings_form.kernel = s.kernel();
         self.settings_form.message = None;
+        self.settings_form.usage_gateway = s.usage_gateway;
+        self.settings_form.acp_gateway = s.acp.gateway;
+        self.settings_form.confirm_clear_gateway = false;
+        let prices = crate::pricing::to_text(&crate::pricing::Table {
+            prices: s.prices(),
+            peaks: s.price_peaks(),
+        });
+        self.settings_form.prices.update(cx, |state, cx| state.set_value(prices, window, cx));
         self.settings_form.rules = PermissionRules::load(default_rules_path()).list();
         // 步数上限：默认值留空时显示实际生效的数（占位符就是默认值）
         self.settings_form.max_steps.update(cx, |state, cx| {
@@ -441,11 +463,24 @@ impl ChatApp {
         s.builtin.profiles = profiles;
         s.builtin.active = f.active.min(s.builtin.profiles.len().saturating_sub(1));
         s.acp.command = value(&f.acp_command, cx);
+        s.acp.gateway = f.acp_gateway;
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
+        s.usage_gateway = f.usage_gateway;
+        // 单价表写错了留着原来的（`save_settings` 先报错，不会走到这里）；和内置的一样就不存
+        if let Ok(table) = crate::pricing::parse_text(&f.prices.read(cx).value()) {
+            let defaults = crate::pricing::Table::defaults();
+            s.model_prices = (table.prices != defaults.prices).then_some(table.prices);
+            s.price_peaks = (table.peaks != defaults.peaks).then_some(table.peaks);
+        }
         s
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = crate::pricing::parse_text(&self.settings_form.prices.read(cx).value()) {
+            self.settings_form.message = Some((true, err.into()));
+            cx.notify();
+            return;
+        }
         let new = self.form_settings(cx);
         if new.kernel() == KernelChoice::Builtin
             && let Err(err) = new.builtin_config(self.cwd.clone())
@@ -471,7 +506,8 @@ impl ChatApp {
             b
         };
         let restart_builtin = builtin_key(&new) != builtin_key(&self.settings)
-            || new.max_steps != self.settings.max_steps;
+            || new.max_steps != self.settings.max_steps
+            || new.usage_gateway != self.settings.usage_gateway;
         let restart_acp = new.acp != self.settings.acp;
         let default = new.kernel();
         let default_changed = default != self.settings.kernel();
@@ -804,6 +840,111 @@ impl ChatApp {
             })
     }
 
+    /// 用量网关：开关（随「保存」生效）、打开日志目录、清空日志（再点一次确认）。
+    fn gateway_field(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let confirm = f.confirm_clear_gateway;
+        let row = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Switch::new("usage-gateway").checked(f.usage_gateway).color(rgb(CORAL)).on_change(
+                    cx.listener(|this, checked: &bool, _, cx| {
+                        this.settings_form.usage_gateway = *checked;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(div().flex_1())
+            .child(
+                Self::text_button("gateway-open", "打开日志目录", false)
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| this.open_gateway_dir(cx))),
+            )
+            .child(
+                Self::text_button(
+                    "gateway-clear",
+                    if confirm { "确定清空？" } else { "清空日志" },
+                    false,
+                )
+                .small()
+                .when(confirm, |b| b.with_variant(ButtonVariant::Danger))
+                .on_click(cx.listener(|this, _, _, cx| this.clear_gateway_logs(cx))),
+            );
+        Self::field(
+            "用量网关",
+            Some(
+                "自研内核的每个请求经本地网关转发，记下耗时、用量、重试和停止（不记提示词和 key），\
+                 在首页用量的「请求」页签里看；关掉就直连服务商",
+            ),
+            row,
+        )
+    }
+
+    /// 模型单价表：多行文本框 + 「恢复默认」。
+    fn prices_field(&self, cx: &mut Context<Self>) -> Div {
+        let editor = div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CARD))
+            .px_1()
+            .font_family(MONO)
+            .text_size(TEXT_SMALL)
+            .child(Textarea::new(&self.settings_form.prices).appearance(false).bordered(false));
+        let row = div().v_flex().gap_1p5().child(editor).child(
+            div().h_flex().child(div().flex_1()).child(
+                Self::text_button("prices-reset", "恢复默认", false).small().on_click(cx.listener(
+                    |this, _, window, cx| {
+                        let text = crate::pricing::to_text(&crate::pricing::Table::defaults());
+                        this.settings_form
+                            .prices
+                            .update(cx, |state, cx| state.set_value(text, window, cx));
+                        cx.notify();
+                    },
+                )),
+            ),
+        );
+        Self::field(
+            "模型单价",
+            Some(
+                "估算首页「请求」页签的费用用。一行一个模型：名称 输入 输出 缓存命中，\
+                 按每百万 token，数字前写 $ 或 ¥；名称按包含匹配、取最长的一条。内置的是参考价，以服务商为准。\
+                 分峰谷价的模型在后面写 x2（写的是谷价）；峰时段单独一行：@peak 1-5 09:00-12:00 +08:00",
+            ),
+            row,
+        )
+    }
+
+    pub(super) fn open_gateway_dir(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = claudesktop_builtin::gateway::default_dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        cx.open_with_system(&dir);
+    }
+
+    fn clear_gateway_logs(&mut self, cx: &mut Context<Self>) {
+        if !self.settings_form.confirm_clear_gateway {
+            self.settings_form.confirm_clear_gateway = true;
+            cx.notify();
+            return;
+        }
+        self.settings_form.confirm_clear_gateway = false;
+        let Some(dir) = claudesktop_builtin::gateway::default_dir() else {
+            return;
+        };
+        let text = match claudesktop_builtin::gateway::clear_logs(&dir) {
+            Ok(n) => (false, format!("已清空用量网关日志（{n} 个文件）")),
+            Err(err) => (true, format!("清空失败：{err}")),
+        };
+        self.settings_form.message = Some((text.0, text.1.into()));
+        // 首页「请求」页签下次重读
+        self.requests_view = Default::default();
+        cx.notify();
+    }
+
     fn text_input(state: &Entity<InputState>) -> Div {
         div()
             .rounded_md()
@@ -1119,14 +1260,32 @@ impl ChatApp {
                     ),
                     div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
                 ));
+                builtin_body =
+                    builtin_body.child(self.gateway_field(cx)).child(self.prices_field(cx));
                 body = body.child(builtin_body);
             }
             KernelChoice::Acp => {
-                body = body.child(Self::field(
-                    "启动命令",
-                    Some("例：cmd /c npx -y @agentclientprotocol/claude-agent-acp　或　cmd /c npx -y pi-acp"),
-                    Self::text_input(&f.acp_command),
-                ));
+                body = body
+                    .child(Self::field(
+                        "启动命令",
+                        Some("例：cmd /c npx -y @agentclientprotocol/claude-agent-acp　或　cmd /c npx -y pi-acp"),
+                        Self::text_input(&f.acp_command),
+                    ))
+                    .child(Self::field(
+                        "经过用量网关",
+                        Some(if self.settings.usage_gateway {
+                            "启动 agent 时把它的 ANTHROPIC_BASE_URL / OPENAI_BASE_URL 指到本地网关，它的请求也记进首页「请求」页签\
+                             （Claude Code 能对上会话和轮次）；agent 不认这两个变量时不起作用。保存后重启 agent 生效"
+                        } else {
+                            "用量网关关着（在「自研内核」的设置里打开），这一项不起作用"
+                        }),
+                        Switch::new("acp-gateway").checked(f.acp_gateway).color(rgb(CORAL)).on_change(
+                            cx.listener(|this, checked: &bool, _, cx| {
+                                this.settings_form.acp_gateway = *checked;
+                                cx.notify();
+                            }),
+                        ),
+                    ));
             }
             KernelChoice::Demo => {}
         }

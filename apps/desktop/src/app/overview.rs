@@ -9,6 +9,7 @@ use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Position;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +33,7 @@ impl ChatApp {
         HEAT[(v as usize).min(HEAT.len() - 1)]
     }
 
-    fn stat_card(c: &StatCard) -> Div {
+    pub(super) fn stat_card(c: &StatCard) -> Div {
         div()
             .v_flex()
             .gap_1()
@@ -177,6 +178,8 @@ impl ChatApp {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 set(this);
+                // 切到「请求」页签或换了范围：按需读网关日志
+                this.sync_requests(cx);
                 cx.notify();
             }))
             .child(Self::seg(label, active))
@@ -190,10 +193,10 @@ impl ChatApp {
             _ => None,
         };
         let o = usage::overview(&self.usage, now, usage::local_offset_secs(), range);
-        let body = if self.overview_tab == 1 {
-            Self::render_usage_models(&o)
-        } else {
-            Self::render_usage_cards(&o)
+        let body = match self.overview_tab {
+            1 => Self::render_usage_models(&o),
+            2 => self.render_usage_requests(cx),
+            _ => Self::render_usage_cards(&o),
         };
 
         div()
@@ -248,6 +251,13 @@ impl ChatApp {
                                         self.overview_tab == 1,
                                         cx,
                                         |t| t.overview_tab = 1,
+                                    ))
+                                    .child(self.tab(
+                                        "tab-requests",
+                                        "请求",
+                                        self.overview_tab == 2,
+                                        cx,
+                                        |t| t.overview_tab = 2,
                                     )),
                             )
                             .child(div().flex_1())
@@ -279,13 +289,16 @@ impl ChatApp {
                             ),
                     )
                     .child(body)
-                    .child(
-                        div()
-                            .pt_1()
-                            .text_size(TEXT_SMALL)
-                            .text_color(rgb(INK_SOFT))
-                            .child(usage::book_line(o.tokens)),
-                    ),
+                    // 「请求」页签自己有汇总行，不再挂书本换算
+                    .when(self.overview_tab != 2, |d| {
+                        d.child(
+                            div()
+                                .pt_1()
+                                .text_size(TEXT_SMALL)
+                                .text_color(rgb(INK_SOFT))
+                                .child(usage::book_line(o.tokens)),
+                        )
+                    }),
             )
     }
 }

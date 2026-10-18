@@ -11,6 +11,8 @@ mod complete;
 mod demo;
 mod fonts;
 mod model;
+mod pricing;
+mod requests;
 mod session;
 mod settings;
 mod theme;

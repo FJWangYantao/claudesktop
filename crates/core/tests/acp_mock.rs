@@ -44,6 +44,7 @@ fn mock_agent_full_event_chain() {
             cwd: workspace_root(),
             debug_wire: true,
             auto_approve: true,
+            env: Vec::new(),
         },
         sink,
     )
@@ -178,6 +179,7 @@ fn two_sessions_are_isolated() {
             cwd: workspace_root(),
             debug_wire: false,
             auto_approve: true,
+            env: Vec::new(),
         },
         sink,
     )
@@ -260,6 +262,7 @@ fn run_interactive(choose: &str) -> Vec<KernelEvent> {
             cwd: workspace_root(),
             debug_wire: false,
             auto_approve: false,
+            env: Vec::new(),
         },
         sink,
     )
@@ -366,6 +369,7 @@ fn run_resume(mock_flag: &str) -> (String, bool, String) {
             cwd: workspace_root(),
             debug_wire: false,
             auto_approve: true,
+            env: Vec::new(),
         },
         sink,
     )
@@ -434,6 +438,7 @@ fn client_writes_report_file_changes() {
             cwd: workspace_root(),
             debug_wire: false,
             auto_approve: true,
+            env: Vec::new(),
         },
         sink,
     )
@@ -467,6 +472,7 @@ fn plugin_mcp_servers_are_passed_to_new_sessions() {
             cwd: workspace_root(),
             debug_wire: false,
             auto_approve: true,
+            env: Vec::new(),
         },
         sink,
     )

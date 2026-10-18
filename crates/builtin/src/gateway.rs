@@ -13,9 +13,14 @@
 //! - 不记提示词正文、不记 key；日志按天分文件，超过 [`KEEP_DAYS`] 天或总量超过 [`KEEP_BYTES`] 删最旧的。
 //!
 //! 哪个会话、为什么发的请求由内核在线程上打标记（[`tag`]），provider 发请求时带上（见 [`route`]）。
+//!
+//! **外部 agent**（ACP 内核的子进程）加不了我们的请求头：启动时把它的 `ANTHROPIC_BASE_URL` /
+//! `OPENAI_BASE_URL` 指到 `http://127.0.0.1:<端口>/via/<真实端点的 base64url>`（见 [`agent_env`]），
+//! 网关从路径里取回真实端点，用途记成 `acp`。会话从请求体里认（Claude Code 在 `metadata.user_id`
+//! 里带 `session_<ID>`，和 ACP 会话 ID 一致），第几轮由界面发消息时登记（[`note_turn`]）。
 
 use chrono::{Local, NaiveDate};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -28,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const UPSTREAM: &str = "x-claudesktop-upstream";
 const SESSION: &str = "x-claudesktop-session";
 const PURPOSE: &str = "x-claudesktop-purpose";
+const TURN: &str = "x-claudesktop-turn";
 /// provider 的一次请求（重试共用）和第几次尝试
 pub(crate) const REQUEST: &str = "x-claudesktop-request";
 pub(crate) const ATTEMPT: &str = "x-claudesktop-attempt";
@@ -38,6 +44,8 @@ const KEEP_DAYS: i64 = 30;
 const KEEP_BYTES: u64 = 200 << 20;
 /// 错误响应体最多留多少字节（取错误信息用）
 const ERROR_BODY_MAX: usize = 64 << 10;
+/// 外部 agent 的请求路径前缀：`/via/<真实端点的 base64url>/<原路径>`
+const VIA: &str = "/via/";
 
 /// 跑着的网关。
 pub struct Gateway {
@@ -120,13 +128,13 @@ impl Gateway {
         let Ok(request) = read_request(&client) else {
             return;
         };
-        let mut entry = Entry::new(&request);
-        let Some(upstream) = request.header(UPSTREAM).map(str::to_string) else {
+        let mut entry = RequestLog::new(&request);
+        let Some((upstream, path)) = upstream_of(&request) else {
             let _ = respond(&mut client, 400, &[], b"missing upstream");
             return;
         };
         entry.host = host_of(&upstream);
-        let url = format!("{}{}", upstream.trim_end_matches('/'), request.path);
+        let url = format!("{}{path}", upstream.trim_end_matches('/'));
         let headers = request.headers.iter().filter(|(name, _)| forwarded(name));
         let result = match request.method.as_str() {
             "GET" => {
@@ -220,11 +228,26 @@ impl Gateway {
     }
 
     /// 补上请求体里的模型、消息数、工具数，追加一行到当天的日志。
-    fn write(&self, entry: &Entry, body: &[u8]) {
+    fn write(&self, entry: &RequestLog, body: &[u8]) {
         let mut entry = entry.clone();
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
             entry.model = value.get("model").and_then(Value::as_str).map(str::to_string);
-            entry.messages = value.get("messages").and_then(Value::as_array).map(Vec::len);
+            // 外部 agent：会话从请求体里认，第几轮查界面登记的
+            if entry.session.is_none()
+                && let Some(session) = value
+                    .pointer("/metadata/user_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| id.rsplit_once("session_"))
+                    .map(|(_, s)| s.to_string())
+            {
+                entry.turn = turn_of(&session);
+                entry.session = Some(session);
+            }
+            entry.messages = value
+                .get("messages")
+                .or_else(|| value.get("input"))
+                .and_then(Value::as_array)
+                .map(Vec::len);
             entry.tools = value.get("tools").and_then(Value::as_array).map(Vec::len);
         }
         let Ok(line) = serde_json::to_string(&entry) else {
@@ -263,24 +286,83 @@ pub(crate) fn route(gateway: Option<&GatewayHandle>, base_url: &str, path: &str)
     };
     let mut headers = vec![(UPSTREAM, base.to_string())];
     TAG.with_borrow(|tag| {
-        if let Some((session, purpose)) = tag {
-            headers.push((SESSION, session.clone()));
-            headers.push((PURPOSE, purpose.to_string()));
+        if let Some(tag) = tag {
+            headers.push((SESSION, tag.session.clone()));
+            headers.push((PURPOSE, tag.purpose.to_string()));
+            headers.push((TURN, tag.turn.to_string()));
         }
     });
     Route { url: format!("http://127.0.0.1:{}{path}", g.0.port), real, headers }
 }
 
+/// 外部 agent 的请求经网关要设的环境变量：Anthropic / OpenAI 的 base URL 指向网关，
+/// 真实端点取它原来的设置（没设就是官方地址），编码在路径里。
+pub fn agent_env(gateway: &GatewayHandle) -> Vec<(String, String)> {
+    [
+        ("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+        ("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    ]
+    .into_iter()
+    .map(|(key, default)| {
+        let real = std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+        (key.to_string(), via_url(gateway, real.as_deref().unwrap_or(default)))
+    })
+    .collect()
+}
+
+/// 外部 agent 用的 base URL：经网关转到 `upstream`。
+pub fn via_url(gateway: &GatewayHandle, upstream: &str) -> String {
+    use base64::Engine as _;
+    let encoded =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(upstream.trim_end_matches('/'));
+    format!("http://127.0.0.1:{}{VIA}{encoded}", gateway.0.port)
+}
+
+/// 真实端点和转给它的路径：内核的请求在头里写着，外部 agent 的编码在路径里。
+fn upstream_of(request: &Request) -> Option<(String, String)> {
+    if let Some(upstream) = request.header(UPSTREAM) {
+        return Some((upstream.to_string(), request.path.clone()));
+    }
+    use base64::Engine as _;
+    let rest = request.path.strip_prefix(VIA)?;
+    let (encoded, path) = match rest.find(['/', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let upstream = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    Some((String::from_utf8(upstream).ok()?, path.to_string()))
+}
+
+/// 外部 agent 的会话现在是第几轮（界面每发一条消息登记一次）。
+static TURNS: OnceLock<Mutex<std::collections::HashMap<String, u64>>> = OnceLock::new();
+
+/// 登记外部 agent 的会话 `session` 开始了第 `turn` 轮：之后这个会话的请求都记成这一轮。
+pub fn note_turn(session: &str, turn: u64) {
+    TURNS.get_or_init(Mutex::default).lock().unwrap().insert(session.to_string(), turn);
+}
+
+fn turn_of(session: &str) -> Option<u64> {
+    TURNS.get()?.lock().unwrap().get(session).copied()
+}
+
+/// 线程上的请求标记（见 [`tag`]）。
+struct Tag {
+    session: String,
+    purpose: &'static str,
+    turn: u64,
+}
+
 thread_local! {
-    static TAG: RefCell<Option<(String, &'static str)>> = const { RefCell::new(None) };
+    static TAG: RefCell<Option<Tag>> = const { RefCell::new(None) };
 }
 
-/// 这个线程上接下来的请求属于哪个会话、为什么发（turn / subagent / compact）；guard 析构时恢复之前的。
-pub(crate) fn tag(session: &str, purpose: &'static str) -> TagGuard {
-    TagGuard(TAG.replace(Some((session.to_string(), purpose))))
+/// 这个线程上接下来的请求属于哪个会话的第几轮、为什么发（turn / subagent / compact）；
+/// guard 析构时恢复之前的。
+pub(crate) fn tag(session: &str, purpose: &'static str, turn: u64) -> TagGuard {
+    TagGuard(TAG.replace(Some(Tag { session: session.to_string(), purpose, turn })))
 }
 
-pub(crate) struct TagGuard(Option<(String, &'static str)>);
+pub(crate) struct TagGuard(Option<Tag>);
 
 impl Drop for TagGuard {
     fn drop(&mut self) {
@@ -288,63 +370,83 @@ impl Drop for TagGuard {
     }
 }
 
-/// 日志里的一行。
-#[derive(Debug, Clone, Default, Serialize)]
-struct Entry {
-    at_ms: u64,
+/// 日志里的一行（也是界面读日志时拿到的样子，见 [`read_logs`]）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RequestLog {
+    /// 发出的时刻（Unix 毫秒）
+    pub at_ms: u64,
+    /// provider 的一次请求（重试共用）和第几次尝试
     #[serde(skip_serializing_if = "Option::is_none")]
-    req_id: Option<u64>,
+    pub req_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    attempt: Option<u32>,
+    pub attempt: Option<u32>,
+    /// 内核会话 ID（子任务是 `主会话/调用 ID`）
     #[serde(skip_serializing_if = "Option::is_none")]
-    session: Option<String>,
-    purpose: String,
-    protocol: &'static str,
+    pub session: Option<String>,
+    /// 会话里的第几轮（同一轮的请求归到一起）
     #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    host: String,
-    path: String,
-    method: String,
-    body_bytes: usize,
+    pub turn: Option<u64>,
+    /// turn / subagent / compact / models / other
+    pub purpose: String,
+    /// openai / anthropic
+    pub protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    messages: Option<usize>,
+    pub model: Option<String>,
+    pub host: String,
+    pub path: String,
+    pub method: String,
+    pub body_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<usize>,
+    pub messages: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<usize>,
     /// 上游的 HTTP 状态；连不上为 0
-    status: u16,
+    pub status: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ttfb_ms: Option<u64>,
+    pub ttfb_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    first_token_ms: Option<u64>,
-    total_ms: u64,
-    input: u64,
-    output: u64,
-    reasoning: u64,
-    cache_read: u64,
+    pub first_token_ms: Option<u64>,
+    pub total_ms: u64,
+    pub input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub cache_read: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    finish_reason: Option<String>,
-    cancelled: bool,
+    pub finish_reason: Option<String>,
+    pub cancelled: bool,
 }
 
-impl Entry {
+impl RequestLog {
     fn new(request: &Request) -> Self {
-        let path = request.path.split('?').next().unwrap_or_default().to_string();
+        let via = request.path.starts_with(VIA);
+        // 外部 agent 的路径去掉编码的端点那一段
+        let path = upstream_of(request).map_or_else(|| request.path.clone(), |(_, p)| p);
+        let path = path.split('?').next().unwrap_or_default().to_string();
         let purpose = request.header(PURPOSE).map(str::to_string).unwrap_or_else(|| {
-            if path.ends_with("/models") { "models" } else { "other" }.to_string()
+            if path.ends_with("/models") {
+                "models"
+            } else if via {
+                "acp"
+            } else {
+                "other"
+            }
+            .to_string()
         });
-        Entry {
+        RequestLog {
             at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
             req_id: request.header(REQUEST).and_then(|v| v.parse().ok()),
             attempt: request.header(ATTEMPT).and_then(|v| v.parse().ok()),
             session: request.header(SESSION).map(str::to_string),
             purpose,
-            protocol: if path.ends_with("/messages") { "anthropic" } else { "openai" },
+            turn: request.header(TURN).and_then(|v| v.parse().ok()),
+            protocol: if path.ends_with("/messages") { "anthropic" } else { "openai" }.into(),
             method: request.method.clone(),
             body_bytes: request.body.len(),
             path,
-            ..Entry::default()
+            ..RequestLog::default()
         }
     }
 }
@@ -402,6 +504,20 @@ impl StreamStats {
 
     /// 返回这一块有没有内容（正文、思考、工具调用）。口径同 `openai::parse_chunk`。
     fn openai_chunk(&mut self, value: &Value) -> bool {
+        // Responses API（Codex 这类 agent 用）：用量在 response.completed 里，正文是 *.delta 事件
+        if let Some(kind) = value.get("type").and_then(Value::as_str) {
+            if let Some(usage) = value.pointer("/response/usage").filter(|u| u.is_object()) {
+                let n = |p: &str| usage.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+                self.input = n("/input_tokens");
+                self.output = n("/output_tokens");
+                self.reasoning = n("/output_tokens_details/reasoning_tokens");
+                self.cache_read = n("/input_tokens_details/cached_tokens");
+                if let Some(status) = value.pointer("/response/status").and_then(Value::as_str) {
+                    self.finish_reason = Some(status.to_string());
+                }
+            }
+            return kind.ends_with(".delta");
+        }
         if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
             let n = |p: &str| usage.pointer(p).and_then(Value::as_u64).unwrap_or(0);
             self.input = n("/prompt_tokens");
@@ -451,7 +567,7 @@ impl StreamStats {
         }
     }
 
-    fn fill(&self, entry: &mut Entry) {
+    fn fill(&self, entry: &mut RequestLog) {
         entry.first_token_ms = self.first_token_ms;
         entry.input = self.input;
         entry.output = self.output;
@@ -497,13 +613,41 @@ fn read_request(client: &TcpStream) -> std::io::Result<Request> {
             headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
         }
     }
-    let len = headers
+    let chunked = headers
         .iter()
-        .find(|(n, _)| n == "content-length")
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = vec![0; len];
-    reader.read_exact(&mut body)?;
+        .any(|(n, v)| n == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
+    let body = if chunked {
+        // 外部 agent 可能分块发请求体
+        let mut body = Vec::new();
+        loop {
+            let mut size = String::new();
+            reader.read_line(&mut size)?;
+            let size = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if size == 0 {
+                // 跳过结尾的空行（不支持 trailer）
+                let mut end = String::new();
+                reader.read_line(&mut end)?;
+                break;
+            }
+            let start = body.len();
+            body.resize(start + size, 0);
+            reader.read_exact(&mut body[start..])?;
+            let mut crlf = [0u8; 2];
+            reader.read_exact(&mut crlf)?;
+        }
+        body
+    } else {
+        let len = headers
+            .iter()
+            .find(|(n, _)| n == "content-length")
+            .and_then(|(_, v)| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0; len];
+        reader.read_exact(&mut body)?;
+        body
+    };
+    let headers = headers.into_iter().filter(|(n, _)| n != "transfer-encoding").collect();
     Ok(Request { method, path, headers, body })
 }
 
@@ -563,6 +707,53 @@ fn host_of(url: &str) -> String {
 
 fn millis(d: Duration) -> u64 {
     d.as_millis() as u64
+}
+
+/// 读 `since_ms` 之后（None = 全部）的请求日志，按时间从早到晚。读坏的行跳过。
+pub fn read_logs(dir: &Path, since_ms: Option<u64>) -> Vec<RequestLog> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    // 按文件名的日期先筛一遍（多留一天，时区边上的不丢）
+    let since_day = since_ms.and_then(|ms| {
+        chrono::DateTime::from_timestamp_millis(ms as i64)
+            .map(|t| t.with_timezone(&Local).date_naive() - chrono::Duration::days(1))
+    });
+    let mut files: Vec<(NaiveDate, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            (path.extension()? == "jsonl").then_some(())?;
+            let date = NaiveDate::parse_from_str(path.file_stem()?.to_str()?, "%Y-%m-%d").ok()?;
+            since_day.is_none_or(|d| date >= d).then_some((date, path))
+        })
+        .collect();
+    files.sort();
+    let mut logs: Vec<RequestLog> = files
+        .iter()
+        .flat_map(|(_, path)| {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<RequestLog>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|log| since_ms.is_none_or(|ms| log.at_ms >= ms))
+        .collect();
+    logs.sort_by_key(|log| log.at_ms);
+    logs
+}
+
+/// 删掉全部请求日志，返回删了几个文件。
+pub fn clear_logs(dir: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if entry.path().extension().is_some_and(|e| e == "jsonl") {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// 删掉超过保留期的日志；总量还超就从最旧的删（当天的不删）。
@@ -656,6 +847,41 @@ mod tests {
     }
 
     #[test]
+    fn reads_logs_back_since_a_time() {
+        let dir = std::env::temp_dir().join(format!("cd-gateway-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |at_ms: u64| {
+            serde_json::to_string(&RequestLog {
+                at_ms,
+                purpose: "turn".into(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let day = |ms: u64| {
+            chrono::DateTime::from_timestamp_millis(ms as i64)
+                .unwrap()
+                .with_timezone(&Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let (old, new) = (1_700_000_000_000u64, 1_790_000_000_000u64);
+        std::fs::write(dir.join(format!("{}.jsonl", day(old))), line(old) + "\n").unwrap();
+        std::fs::write(
+            dir.join(format!("{}.jsonl", day(new))),
+            format!("{}\nnot json\n{}\n", line(new + 5), line(new)),
+        )
+        .unwrap();
+        let all = read_logs(&dir, None);
+        assert_eq!(all.iter().map(|l| l.at_ms).collect::<Vec<_>>(), [old, new, new + 5]);
+        assert_eq!(read_logs(&dir, Some(new)).len(), 2);
+        assert_eq!(clear_logs(&dir).unwrap(), 2);
+        assert!(read_logs(&dir, None).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tags_nest_and_restore() {
         let gateway = Gateway::start(
             std::env::temp_dir().join(format!("cd-gateway-tag-{}", std::process::id())),
@@ -665,9 +891,9 @@ mod tests {
             |r: &Route| r.headers.iter().find(|(n, _)| *n == SESSION).map(|(_, v)| v.clone());
         assert_eq!(session(&route(Some(&gateway), "https://x/v1", "/chat/completions")), None);
         {
-            let _outer = tag("s1", "turn");
+            let _outer = tag("s1", "turn", 3);
             {
-                let _inner = tag("s1/t1", "subagent");
+                let _inner = tag("s1/t1", "subagent", 3);
                 assert_eq!(
                     session(&route(Some(&gateway), "https://x/v1", "/a")).as_deref(),
                     Some("s1/t1")

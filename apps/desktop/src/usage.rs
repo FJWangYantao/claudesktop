@@ -295,6 +295,7 @@ mod tests {
             cwd: ".".into(),
             agent: agent.into(),
             kernel_session_id: None,
+            kernel_sessions: Vec::new(),
             created_ms: 0,
             updated_ms: 99,
             archived: false,

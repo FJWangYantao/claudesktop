@@ -6,6 +6,8 @@
 // session/update 全变体 / session/request_permission / fs/read_text_file / fs/write_text_file）。
 //
 // 提示词以 `write:<路径>:<内容>` 开头时只经客户端写一个文件就结束这一轮（检查点测试用）。
+// 提示词以 `llm:` 开头时向 `$ANTHROPIC_BASE_URL/v1/messages` 发一个流式请求（像 Claude Code 那样在
+// metadata.user_id 里带会话 ID），把收到的字原样回给客户端（用量网关接外部 agent 的测试用）。
 //
 // 传输：stdio 上的换行分隔 JSON-RPC 2.0。
 import readline from 'node:readline';
@@ -39,6 +41,31 @@ function request(method, params) {
     pending.set(id, resolve);
     send({ jsonrpc: '2.0', id, method, params });
   });
+}
+
+/** 发一个 Anthropic 流式请求，拼出回答的文字。 */
+async function askLlm(sid, text) {
+  const base = process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com';
+  const res = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY ?? 'mock' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 100,
+      stream: true,
+      metadata: { user_id: `user_mock_account__session_${sid}` },
+      messages: [{ role: 'user', content: text }],
+    }),
+  });
+  let answer = '';
+  for (const line of (await res.text()).split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    try {
+      const event = JSON.parse(line.slice(5));
+      if (event.delta?.type === 'text_delta') answer += event.delta.text;
+    } catch {}
+  }
+  return answer || `HTTP ${res.status}`;
 }
 
 async function runTurn(promptId, sid, text) {
@@ -166,6 +193,15 @@ rl.on('line', (line) => {
           content: { type: 'text', text: `mcp servers: ${names.join(',')}` },
         });
         reply(id, { stopReason: 'end_turn' });
+        break;
+      }
+      if (text.startsWith('llm:')) {
+        askLlm(params?.sessionId, text.slice('llm:'.length))
+          .then((answer) => {
+            update(params?.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: answer } });
+            reply(id, { stopReason: 'end_turn' });
+          })
+          .catch((err) => send({ jsonrpc: '2.0', id, error: { code: -32603, message: String(err) } }));
         break;
       }
       if (text.startsWith('write:')) {

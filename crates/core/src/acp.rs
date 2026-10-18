@@ -69,6 +69,8 @@ pub struct AcpKernelConfig {
     /// true = 权限请求由内核按策略自动批准（无人值守 / 测试）；
     /// false = 发出 [`KernelEvent::PermissionRequest`] 交给 UI 决定。
     pub auto_approve: bool,
+    /// 额外给 agent 子进程的环境变量（如经用量网关时的 `ANTHROPIC_BASE_URL`）
+    pub env: Vec<(String, String)>,
 }
 
 impl AcpKernelConfig {
@@ -89,6 +91,7 @@ impl AcpKernelConfig {
             cwd,
             debug_wire: std::env::var("ACP_DEBUG_WIRE").is_ok_and(|v| v == "1"),
             auto_approve: std::env::var("ACP_AUTO_APPROVE").is_ok_and(|v| v == "1"),
+            env: Vec::new(),
         }
     }
 
@@ -249,6 +252,9 @@ fn run_kernel(
     let result = smol::block_on(async move {
         let mut agent = AcpAgent::from_str(&config.command)
             .map_err(|e| anyhow::anyhow!("parse agent command: {e}"))?;
+        if !config.env.is_empty() {
+            agent = AcpAgent::new(agent.into_config().envs(config.env.iter().cloned()));
+        }
         if config.debug_wire {
             agent = agent.with_debug(|line, dir| eprintln!("[wire {dir:?}] {line}"));
         }

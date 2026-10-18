@@ -1819,6 +1819,8 @@ fn gateway_forwards_the_stream_and_logs_every_attempt() {
     assert_eq!((first["attempt"].as_u64(), second["attempt"].as_u64()), (Some(1), Some(2)));
     assert_eq!(second["session"], sid.as_str());
     assert_eq!(second["purpose"], "turn");
+    // 会话的第一轮：明细页按（会话, 轮）把请求归到一起
+    assert_eq!((first["turn"].as_u64(), second["turn"].as_u64()), (Some(1), Some(1)));
     assert_eq!(second["model"], "mock-model");
     assert_eq!(second["host"], host.as_str());
     assert_eq!(second["path"], "/chat/completions");
@@ -1937,4 +1939,62 @@ fn gateway_stream_timing() {
             if gateway { "网关" } else { "直连" }
         );
     }
+}
+
+#[test]
+fn gateway_routes_external_agents_by_path_and_finds_their_session() {
+    let first = |payload: &str| format!("data: {payload}");
+    let (base, bodies) = serve(vec![Reply::Sse {
+        lines: vec![
+            first(
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":40,"cache_read_input_tokens":60}}}"#,
+            ),
+            first(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            first(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+            ),
+        ],
+        gap_ms: 5,
+    }]);
+    let dir = workdir("gateway-via");
+    let gateway = claudesktop_builtin::gateway::Gateway::start(dir.clone()).unwrap();
+    // 外部 agent 只认 base URL：真实端点编码在路径里
+    let via = claudesktop_builtin::gateway::via_url(&gateway, &base);
+    claudesktop_builtin::gateway::note_turn("acp-s1", 3);
+    let payload = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "metadata": { "user_id": "user_abc_account__session_acp-s1" },
+        "messages": [{ "role": "user", "content": "hi" }],
+    })
+    .to_string();
+    let target = via.trim_start_matches("http://");
+    let (host, path) = target.split_once('/').unwrap();
+    let mut stream = TcpStream::connect(host).unwrap();
+    // 分块发请求体（Node 有时这么发）
+    let (a, b) = payload.split_at(10);
+    write!(
+        stream,
+        "POST /{path}/messages?beta=true HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n",
+        a.len(),
+        b.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.contains("text_delta"), "{response}");
+    // 上游收到的是拼好的原样请求体
+    assert_eq!(body(&bodies, 0)["metadata"]["user_id"], "user_abc_account__session_acp-s1");
+
+    let log = gateway_log(&dir, 1);
+    let entry = &log[0];
+    assert_eq!(entry["purpose"], "acp");
+    assert_eq!(entry["session"], "acp-s1");
+    assert_eq!(entry["turn"], 3);
+    assert_eq!(entry["path"], "/messages");
+    assert_eq!(entry["protocol"], "anthropic");
+    assert_eq!((entry["input"].as_u64(), entry["cache_read"].as_u64()), (Some(100), Some(60)));
+    assert_eq!(entry["output"], 5);
+    let _ = std::fs::remove_dir_all(&dir);
 }

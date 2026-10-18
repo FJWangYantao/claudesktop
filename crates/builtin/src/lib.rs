@@ -193,6 +193,8 @@ struct SessionState {
     measured: Option<(u64, usize)>,
     /// 进行中的一轮的取消标志（子会话用主会话这一轮的）
     turn: Option<Arc<AtomicBool>>,
+    /// 第几轮（每发一条消息、每次手动压缩加一；子会话沿用主会话的）：用量网关的日志按它把请求归到轮
+    turns: u64,
     /// 子会话的角色（`task` 开的，ID 是 `主会话/调用 ID`）；主会话为 None
     agent: Option<AgentDef>,
 }
@@ -560,7 +562,7 @@ impl Inner {
         mut max_bytes: usize,
         stopped: &dyn Fn() -> bool,
     ) -> anyhow::Result<(String, Option<Usage>)> {
-        let _tag = gateway::tag(session, "compact");
+        let _tag = gateway::tag(session, "compact", self.turn_number(session));
         let mut attempt = 0;
         loop {
             let request = compact::summary_request(previous, &compact::transcript(head, max_bytes));
@@ -596,6 +598,11 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// 会话现在是第几轮（见 [`SessionState::turns`]）。
+    fn turn_number(&self, session: &str) -> u64 {
+        self.sessions.lock().unwrap().get(session).map_or(0, |s| s.turns)
     }
 
     fn model_of(&self, session: &str) -> Option<String> {
@@ -907,6 +914,7 @@ impl Inner {
                     summary: None,
                     measured: None,
                     turn: Some(flag.clone()),
+                    turns: parent.turns,
                     agent: Some(agent.clone()),
                 };
                 Some((flag, state))
@@ -1122,6 +1130,7 @@ impl BuiltinKernel {
                 summary: history.summary,
                 measured: None,
                 turn: None,
+                turns: 0,
                 agent: None,
             },
         );
@@ -1280,7 +1289,7 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
     let stopped = || flag.load(Ordering::SeqCst);
     // 用量网关的日志按会话、用途归类（子任务的 ID 是 `主会话/调用 ID`）
     let purpose = if subagent::split_id(session).is_some() { "subagent" } else { "turn" };
-    let _tag = gateway::tag(session, purpose);
+    let _tag = gateway::tag(session, purpose, inner.turn_number(session));
     let mut usage: Option<Usage> = None;
     // 最后一次请求的输入 + 输出 = 此刻上下文的大小（之前各步都包含在这次的输入里）
     let mut context_tokens = 0;
@@ -1495,6 +1504,7 @@ impl Kernel for BuiltinKernel {
             state.history.push(ChatMessage::with_parts("user", parts));
             let flag = Arc::new(AtomicBool::new(false));
             state.turn = Some(flag.clone());
+            state.turns += 1;
             flag
         };
         let inner = self.inner.clone();
@@ -1599,6 +1609,7 @@ impl Kernel for BuiltinKernel {
             }
             let flag = Arc::new(AtomicBool::new(false));
             state.turn = Some(flag.clone());
+            state.turns += 1;
             (flag, state.model.clone())
         };
         let inner = self.inner.clone();

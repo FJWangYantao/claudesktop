@@ -196,6 +196,10 @@ pub fn preset_profiles() -> Vec<ProviderProfile> {
 pub struct AcpSettings {
     /// agent 启动命令；空 = 仓库内 mock agent
     pub command: String,
+    /// agent 的请求也经用量网关（启动时把它的 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 指到网关）；
+    /// 默认关：改的是别的程序的网络设置，agent 不认这两个变量时不起作用。用量网关关着时也不起作用
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gateway: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -226,8 +230,14 @@ pub struct Settings {
     /// 越界的值读取时夹进 [`claudesktop_builtin::MIN_MAX_STEPS`] .. [`claudesktop_builtin::MAX_MAX_STEPS`]
     pub max_steps: usize,
     /// 自研内核的请求经用量网关转发、每个请求记一行日志（数据目录 `gateway/`）；默认开。
-    /// 关掉就直连端点。设置页还没有开关（界面以后再加），先靠设置文件或 `CLAUDESKTOP_GATEWAY`
+    /// 关掉就直连端点。设置页「内核与模型」有开关，`CLAUDESKTOP_GATEWAY` 覆盖它
     pub usage_gateway: bool,
+    /// 估算费用用的模型单价表；None = 没改过，用内置参考价（[`crate::pricing::default_prices`]）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_prices: Option<Vec<crate::pricing::Price>>,
+    /// 峰谷价的时段（本地时间）；None = 没改过，用内置的 [`crate::pricing::default_peaks`]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_peaks: Option<Vec<crate::pricing::PeakWindow>>,
     /// 窗口不在前台时，回复完成 / 等待授权 / 出错发系统通知；默认开
     pub notifications: bool,
     /// 界面缩放倍率（1.0 = 标准），设置页即时生效并写回
@@ -258,6 +268,8 @@ impl Default for Settings {
             plugins_enabled: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
             usage_gateway: yes(),
+            model_prices: None,
+            price_peaks: None,
             notifications: yes(),
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
@@ -311,6 +323,16 @@ impl MotionPref {
 }
 
 impl Settings {
+    /// 生效的模型单价表。
+    pub fn prices(&self) -> Vec<crate::pricing::Price> {
+        self.model_prices.clone().unwrap_or_else(crate::pricing::default_prices)
+    }
+
+    /// 生效的峰谷时段。
+    pub fn price_peaks(&self) -> Vec<crate::pricing::PeakWindow> {
+        self.price_peaks.clone().unwrap_or_else(crate::pricing::default_peaks)
+    }
+
     /// 默认位置：`<数据目录>/settings.json`
     pub fn default_path() -> Option<PathBuf> {
         claudesktop_core::default_data_dir().ok().map(|d| d.join("settings.json"))
@@ -448,10 +470,15 @@ impl Settings {
         self.usage_gateway.then(gateway::default_dir).flatten().and_then(|d| gateway::shared(&d))
     }
 
-    /// ACP 配置：命令为空时沿用默认（mock agent）。
+    /// ACP 配置：命令为空时沿用默认（mock agent）；开了「经过用量网关」就给 agent 设好 base URL。
     pub fn acp_config(&self, mut base: AcpKernelConfig) -> AcpKernelConfig {
         if !self.acp.command.trim().is_empty() {
             base.command = self.acp.command.trim().to_string();
+        }
+        if self.acp.gateway
+            && let Some(gateway) = self.gateway()
+        {
+            base.env.extend(claudesktop_builtin::gateway::agent_env(&gateway));
         }
         base
     }

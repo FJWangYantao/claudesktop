@@ -32,11 +32,26 @@ pub struct SessionMeta {
     /// 内核侧会话 ID（ACP sessionId），续聊（`session/resume` / `session/load`）用
     #[serde(default)]
     pub kernel_session_id: Option<String>,
+    /// 用过的全部内核会话 ID（自研内核每次续接都换一个）：用量网关的日志按它对回这个会话
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kernel_sessions: Vec<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
     /// 归档了：侧栏不列在项目 / 日期分组里，收进末尾的「已归档」
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+}
+
+impl SessionMeta {
+    /// 记下当前的内核会话 ID（也进 [`SessionMeta::kernel_sessions`]）。
+    pub fn set_kernel_session(&mut self, id: Option<String>) {
+        if let Some(id) = &id
+            && !self.kernel_sessions.contains(id)
+        {
+            self.kernel_sessions.push(id.clone());
+        }
+        self.kernel_session_id = id;
+    }
 }
 
 /// 日志里的一条记录。
@@ -175,6 +190,7 @@ impl SessionStore {
             cwd,
             agent: agent.to_string(),
             kernel_session_id: None,
+            kernel_sessions: Vec::new(),
             created_ms: now,
             updated_ms: now,
             archived: false,

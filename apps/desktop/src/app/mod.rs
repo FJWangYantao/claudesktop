@@ -14,6 +14,7 @@ mod notify;
 mod overview;
 mod palette;
 mod plugins_view;
+mod requests_view;
 mod rewind;
 mod search;
 mod settings_view;
@@ -66,7 +67,9 @@ pub struct ChatApp {
     cwd: PathBuf,
     /// 当前项目名（取工作目录名），侧栏分组名与输入框标签用
     project_name: SharedString,
-    overview_tab: usize,   // 0 概览 / 1 模型
+    overview_tab: usize, // 0 概览 / 1 模型 / 2 请求
+    /// 首页「请求」页签：读到的用量网关日志、筛选、点开的轮
+    requests_view: requests_view::RequestsView,
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
     sidebar_open: bool,
     /// 侧栏会话按最近活动排序（否则按打开顺序）
@@ -325,6 +328,7 @@ impl ChatApp {
             cwd,
             project_name,
             overview_tab: 0,
+            requests_view: Default::default(),
             overview_range: 0,
             sidebar_open: true,
             sessions_by_activity: false,
@@ -1097,6 +1101,12 @@ impl ChatApp {
             s.follow_tail();
             match (&kernel, s.acp_id.clone()) {
                 (Some(kernel), Some(id)) => {
+                    // ACP agent 经用量网关时，网关据此把这个会话接下来的请求归到这一轮
+                    if s.kernel == KernelChoice::Acp {
+                        let turn =
+                            s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. }));
+                        claudesktop_builtin::gateway::note_turn(&id, turn.count() as u64);
+                    }
                     if let Err(err) = kernel.send_prompt(&id, prompt) {
                         s.busy = false;
                         s.fail(format!("发送失败：{err}"));
@@ -1333,7 +1343,7 @@ impl ChatApp {
         let opened = match &s.meta {
             Some(meta) => store.append_log(&meta.id),
             None => store.create(&s.title, s.cwd.clone(), &agent_cmd).map(|(mut meta, log)| {
-                meta.kernel_session_id = s.acp_id.clone();
+                meta.set_kernel_session(s.acp_id.clone());
                 let _ = store.save_meta(&meta);
                 s.meta = Some(meta);
                 log
@@ -1431,7 +1441,7 @@ impl ChatApp {
             // 续接到别的 agent 后，会话就归新的 agent 了
             meta.agent = self.kernels[s.kernel.index()].agent_cmd.clone();
             meta.title = s.title.to_string();
-            meta.kernel_session_id = s.acp_id.clone();
+            meta.set_kernel_session(s.acp_id.clone());
             meta.updated_ms = now_ms();
             let _ = store.save_meta(meta);
         }
