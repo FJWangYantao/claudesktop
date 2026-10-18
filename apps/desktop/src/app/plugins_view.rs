@@ -9,6 +9,7 @@
 //! 从 git 装的插件卡片上有「更新」「卸载」，手动放进来的没有。
 
 use super::ChatApp;
+use super::settings_kit::{how_to, note, section};
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::plugin::{self, Plugin};
@@ -201,13 +202,9 @@ impl ChatApp {
     pub(super) fn render_plugins(&self, cx: &mut Context<Self>) -> Div {
         let dir = plugin::default_plugins_dir()
             .map_or_else(|| "plugins".into(), |p| p.display().to_string());
-        let header = div()
+        let actions = div()
             .h_flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div().flex_1().text_size(TEXT_BODY).font_weight(FontWeight::MEDIUM).child("插件"),
-            )
+            .gap_1p5()
             .child(
                 Self::text_button("plugins-open", "打开插件目录", false)
                     .small()
@@ -216,8 +213,10 @@ impl ChatApp {
             .child(
                 Self::text_button("plugins-rescan", "重新扫描", false)
                     .small()
+                    .tooltip("手动往插件目录里放了文件夹后点它")
                     .on_click(cx.listener(|this, _, _, cx| this.rescan_plugins(cx))),
-            );
+            )
+            .into_any_element();
         let busy = self.plugins_form.busy.clone();
         // 从 git 地址装：输入框 + 安装按钮（回车也行）
         let install = div()
@@ -228,7 +227,7 @@ impl ChatApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
                     .border_color(rgb(LINE))
                     .bg(rgb(CARD))
@@ -241,43 +240,45 @@ impl ChatApp {
                     .disabled(busy.is_some())
                     .on_click(cx.listener(|this, _, window, cx| this.install_plugin(window, cx))),
             );
-        let section = div()
-            .v_flex()
-            .gap_2()
-            .child(header)
-            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(format!(
-                "每个插件是 {dir} 下的一个文件夹，格式兼容 Claude Code 的插件（也认插件市场仓库）。\
-                 可以填 git 地址安装，也可以把文件夹直接放进去。新插件默认停用：\
-                 钩子和 MCP 服务会在你的电脑上运行插件里写的命令，看过下面列出的内容再启用。"
-            )))
-            .child(install)
-            .when_some(busy, |d, text| {
+        let mut body = div().v_flex().gap_4().child(
+            div().v_flex().gap_2().child(install).when_some(busy, |d, text| {
                 d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text))
-            });
+            }),
+        );
         if self.plugins.is_empty() {
-            return section.child(
-                div().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
-                    "还没有插件。填上 git 地址安装，或者点「打开插件目录」把插件文件夹放进去，再点「重新扫描」。",
-                ),
-            );
+            body = body.child(how_to(
+                "还没有插件",
+                &[
+                    "在上面填 GitHub 的「作者/仓库」或完整的 git 地址，点「安装」（插件市场仓库也行）",
+                    "或者点「打开插件目录」，把插件文件夹直接放进去，再点「重新扫描」",
+                    "装好的插件列在这里，默认停用；看过它带了什么，再打开右边的开关",
+                ],
+            ));
+        } else {
+            let mut list = div().v_flex().gap_2();
+            for (i, p) in self.plugins.iter().enumerate() {
+                list = list.child(self.plugin_card(i, p, cx));
+            }
+            body = body.child(list);
         }
-        let mut list = div().v_flex().gap_2();
-        for (i, p) in self.plugins.iter().enumerate() {
-            list = list.child(self.plugin_card(i, p, cx));
-        }
-        section.child(list).child(
-            div()
-                .h_flex()
-                .items_start()
-                .gap_1p5()
-                .text_size(TEXT_META)
-                .text_color(rgb(INK_SOFT))
-                .child(Icon::new(IconAll::Info).size_3p5().flex_shrink_0().mt_0p5())
-                // 文字单独包一层可收缩的块，长了才会折行（直接挂在 h_flex 上会撑出页面）
-                .child(div().flex_1().min_w_0().child(
-                    "自研内核：指令、技能、子 agent、MCP 工具、钩子都生效。ACP agent（如 Claude Code）：\
-                     指令和 MCP 服务生效，对之后新开的会话起作用。",
-                )),
+        let notes = div()
+            .v_flex()
+            .gap_1()
+            .child(note(
+                IconAll::ShieldCheck,
+                "新装的插件默认停用：钩子和 MCP 服务会在你的电脑上运行插件作者写的命令，看过再启用",
+            ))
+            .child(note(
+                IconAll::Info,
+                "自研内核里指令、技能、子 agent、MCP 工具、钩子都生效；ACP agent（如 Claude Code）只用指令和 MCP 服务，\
+                 对之后新开的会话起作用",
+            ))
+            .child(note(IconAll::Folder, format!("插件目录：{dir}")));
+        section(
+            "插件",
+            "加斜杠命令、技能、子 agent、MCP 服务和钩子；格式兼容 Claude Code",
+            Some(actions),
+            body.child(notes),
         )
     }
 
@@ -337,7 +338,7 @@ impl ChatApp {
             .gap_2()
             .px_3()
             .py_2p5()
-            .rounded_lg()
+            .rounded_xl()
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
