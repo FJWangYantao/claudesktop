@@ -21,7 +21,26 @@ impl ChatApp {
     pub(super) fn render_turn_status(&self) -> Option<Div> {
         let s = self.session();
         if !s.busy {
-            return None;
+            // 续接历史会话（内核在重建上下文，好了才把消息发出去）：只在这里说一声，接上了就消失
+            return s.resuming.then(|| {
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK_SOFT))
+                    .child(
+                        div()
+                            .size(px(16.))
+                            .flex_shrink_0()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .mr_0p5()
+                            .child(super::motion::breathing_dot()),
+                    )
+                    .child("正在续接会话…")
+            });
         }
         let activity = s.activity();
         // 等授权要用户处理：静止红点、红字；其余是呼吸的赤陶色圆点（减少动态效果时静止）。

@@ -729,14 +729,16 @@ impl ChatApp {
             .children(
                 kind.hint().map(|hint| div().text_size(TEXT_BODY).text_color(rgb(INK)).child(hint)),
             )
-            // 原文：网关 / 模型报的错，最多四行
-            .child(
-                div()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .line_clamp(4)
-                    .child(message.clone()),
-            )
+            // 原文：网关 / 模型报的错，最多四行（自己补的卡片没有原文）
+            .when(!message.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .line_clamp(4)
+                        .child(message.clone()),
+                )
+            })
             .when(latest, |card| {
                 card.child(
                     div()
@@ -1719,6 +1721,15 @@ fn close_dangling_bold(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// 权限请求的标题：内核常把命令写成行内代码（`` `ls -la` ``），这里本来就用等宽字，去掉包着的反引号。
+fn plain_title(title: &SharedString) -> SharedString {
+    let trimmed = title.trim();
+    match trimmed.strip_prefix('`').and_then(|t| t.strip_suffix('`')) {
+        Some(inner) if !inner.is_empty() && !inner.contains('`') => inner.to_string().into(),
+        _ => title.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1744,14 +1755,5 @@ mod tests {
         // 行内代码里的星号、上一行的星号不算
         assert_eq!(close_dangling_markup("用 `**` 表示粗体"), "用 `**` 表示粗体");
         assert_eq!(close_dangling_markup("**a\nb"), "**a\nb");
-    }
-}
-
-/// 权限请求的标题：内核常把命令写成行内代码（`` `ls -la` ``），这里本来就用等宽字，去掉包着的反引号。
-fn plain_title(title: &SharedString) -> SharedString {
-    let trimmed = title.trim();
-    match trimmed.strip_prefix('`').and_then(|t| t.strip_suffix('`')) {
-        Some(inner) if !inner.is_empty() && !inner.contains('`') => inner.to_string().into(),
-        _ => title.clone(),
     }
 }
