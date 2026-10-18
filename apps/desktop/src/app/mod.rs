@@ -180,6 +180,8 @@ pub(crate) struct KernelSlot {
     ready: bool,
     error: bool,
     status: SharedString,
+    /// 内核报的致命错误原文（起不来、agent 退出）；重新启动或连上后清掉
+    fatal: Option<String>,
     /// 内核标识（写进会话元信息，续接时比对）
     agent_cmd: String,
     /// MCP 服务器的状态（只有自研内核有；设置页「MCP」显示）
@@ -469,6 +471,7 @@ impl ChatApp {
         slot.kernel = kernel;
         slot.status = status;
         slot.agent_cmd = agent_cmd;
+        slot.fatal = None;
         slot.mcp.clear();
     }
 
@@ -959,15 +962,28 @@ impl ChatApp {
         if text.trim().is_empty() && self.pending.is_empty() {
             return;
         }
-        self.input.update(cx, |state, cx| state.set_value("", window, cx));
-        let queued = QueuedPrompt { text, images: std::mem::take(&mut self.pending) };
         let active = self.active;
+        // 还没接模型：默认内核起不来，发出去也只会石沉大海。留着输入框里的字，先指去配置
+        if self.settings.needs_setup() && self.sessions[active].kernel != KernelChoice::Demo {
+            self.toast(
+                Notification::warning("还没接上模型，先在上面选一种接法；刚写的内容还在输入框里"),
+                cx,
+            );
+            return;
+        }
+        let queued = QueuedPrompt { text, images: self.pending.clone() };
         if self.sessions[active].busy || self.sessions[active].stopping {
+            self.input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.pending.clear();
             self.sessions[active].queued.push(queued);
             cx.notify();
             return;
         }
-        self.submit_to(active, queued.into_prompt(), cx);
+        // 发不出去（内核不可用、会话还没就绪）就别清空，免得写好的内容丢了
+        if self.submit_to(active, queued.into_prompt(), cx) {
+            self.input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.pending.clear();
+        }
     }
 
     /// 第 `idx` 个会话这一轮结束（正常结束，或用户停下后内核确认了）：发出排队的第一条，
@@ -1103,20 +1119,26 @@ impl ChatApp {
     }
 
     /// 向第 `idx` 个会话发一轮用户消息：有内核走内核，演示回放会话播放演示脚本。
-    pub(crate) fn submit_to(&mut self, idx: usize, prompt: UserPrompt, cx: &mut Context<Self>) {
+    /// 把一条消息发给第 `idx` 个会话。没发出去（会话忙、内核不可用、还没就绪）时返回 false，
+    /// 原因已经告诉用户了。
+    pub(crate) fn submit_to(
+        &mut self,
+        idx: usize,
+        prompt: UserPrompt,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let kind = self.sessions[idx].kernel;
         if self.sessions[idx].busy {
-            return;
+            return false;
         }
         if kind != KernelChoice::Demo {
             // 历史会话的内核可能还没启动
             self.ensure_kernel(kind);
             if self.kernel_of(kind).is_none() {
                 let status = self.kernels[kind.index()].status.clone();
-                self.sessions[idx]
-                    .note(format!("{}不可用：{status}（可在设置里修改）", kind.label()));
-                cx.notify();
-                return;
+                let reason = format!("{}不可用：{status}（可在设置里修改）", kind.label());
+                self.refuse_send(idx, reason, cx);
+                return false;
             }
         }
         let kernel = self.session_kernel(idx);
@@ -1131,12 +1153,19 @@ impl ChatApp {
                 s.note("正在续接会话…");
                 self.request_pending_sessions();
                 cx.notify();
-                return;
+                return true;
             }
             if kernel.is_some() && !s.ready {
-                s.note("会话尚未就绪，请稍候再发送");
-                cx.notify();
-                return;
+                // 内核已经报错退出了（多半是命令找不到）：重新启动一次，用户可能已经把问题修好了
+                // （比如刚装上 Node.js）；还是起不来的话内核会再报错，弹出原因
+                let reason = if self.kernels[kind.index()].fatal.is_some() {
+                    self.restart_kernel(kind, cx);
+                    format!("正在重新启动「{}」，稍等一下再发送", kind.label())
+                } else {
+                    "会话还在连接内核，稍等一下再发送".into()
+                };
+                self.refuse_send(idx, reason, cx);
+                return false;
             }
             s.steering = false;
             if !s.has_user_message() && !s.renamed {
@@ -1195,6 +1224,18 @@ impl ChatApp {
         }
         if let Some(token) = start_demo_token {
             self.start_demo(idx, token, cx);
+        }
+        cx.notify();
+        true
+    }
+
+    /// 消息没发出去：在对话流里说明原因。还没发过消息的会话显示的是首页、看不到对话流，
+    /// 改用应用内提示，不然这句话写进去了也没人看见。
+    fn refuse_send(&mut self, idx: usize, reason: String, cx: &mut Context<Self>) {
+        if self.sessions[idx].has_user_message() {
+            self.sessions[idx].note(reason);
+        } else {
+            self.toast(Notification::warning(reason), cx);
         }
         cx.notify();
     }
@@ -1310,6 +1351,7 @@ impl ChatApp {
             KernelEvent::Connected { agent_name } => {
                 slot.ready = true;
                 slot.error = false;
+                slot.fatal = None;
                 // 去掉 npm 作用域前缀（@scope/name → name），底栏空间有限
                 let short = agent_name.rsplit('/').next().unwrap_or(&agent_name);
                 slot.status = format!("{short} · 已连接").into();
@@ -1329,9 +1371,15 @@ impl ChatApp {
                 slot.ready = false;
                 slot.error = true;
                 slot.status = "内核错误".into();
+                // 多半发生在刚启动时（命令找不到、agent 一起来就退出），这会儿用户常常还在首页，
+                // 对话流里的说明看不到，所以另弹一条提示
+                let text =
+                    crate::model::kernel_failure_text(kind.label(), &slot.agent_cmd, &message);
+                slot.fatal = Some(message.clone());
                 for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
                     s.on_fatal(&message, kernel.as_ref());
                 }
+                self.toast(Notification::error(text), cx);
             }
             event => {
                 // 会话级事件：Started 按令牌认领，其余按 sessionId

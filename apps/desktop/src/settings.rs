@@ -95,6 +95,12 @@ pub struct ProviderProfile {
 }
 
 impl ProviderProfile {
+    /// 给人看的名字：没起名就用端点地址。
+    pub fn display_name(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() { self.base_url.trim() } else { name }
+    }
+
     pub fn is_configured(&self) -> bool {
         !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
     }

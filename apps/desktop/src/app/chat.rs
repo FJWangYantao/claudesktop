@@ -681,7 +681,7 @@ impl ChatApp {
         // 上下文溢出只能新开会话，Key 不对只能去改设置，其它情况有进展就继续、没进展就重试
         let primary = if kind == FailureKind::Overflow {
             "fail-new"
-        } else if kind == FailureKind::Auth {
+        } else if matches!(kind, FailureKind::Auth | FailureKind::Endpoint) {
             "fail-settings"
         } else if resume {
             "fail-resume"
@@ -752,15 +752,12 @@ impl ChatApp {
                                     })),
                             )
                         })
-                        .when(kind == FailureKind::Auth, |d| {
+                        // 配置上的问题：去设置页改（底栏写着该改哪一项）
+                        .when(kind.settings_fix(), |d| {
                             d.child(
                                 button("fail-settings", IconAll::Settings, "打开设置").on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.open_settings_at(
-                                            super::settings_view::KERNEL_TAB,
-                                            window,
-                                            cx,
-                                        )
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.open_settings_for_failure(kind, window, cx)
                                     }),
                                 ),
                             )

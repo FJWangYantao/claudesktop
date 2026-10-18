@@ -6,6 +6,7 @@ use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::motion::{self, Reveal};
 use super::settings_kit::*;
 use super::widgets::{MeasuredWidth, Surface};
+use crate::model::FailureKind;
 use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
@@ -99,6 +100,8 @@ pub struct SettingsForm {
     pub(super) open_help: HashSet<&'static str>,
     /// 内容列的定宽（见 `MeasuredWidth`）
     content_w: MeasuredWidth,
+    /// 上次「获取列表」的结果，显示在模型那一栏下面：(失败了吗, 给人看的话, 服务商的原文)
+    fetch_result: Option<(bool, SharedString, Option<SharedString>)>,
 }
 
 impl SettingsForm {
@@ -128,6 +131,7 @@ impl SettingsForm {
             rules: Vec::new(),
             open_help: HashSet::new(),
             content_w: MeasuredWidth::default(),
+            fetch_result: None,
         }
     }
 
@@ -178,6 +182,7 @@ impl ChatApp {
         let s = self.settings.clone();
         self.settings_form.kernel = s.kernel();
         self.settings_form.message = None;
+        self.settings_form.fetch_result = None;
         self.settings_form.usage_gateway = s.usage_gateway;
         self.settings_form.acp_gateway = s.acp.gateway;
         self.settings_form.confirm_clear_gateway = false;
@@ -485,6 +490,30 @@ impl ChatApp {
         s
     }
 
+    /// 失败卡片上的「打开设置」：落到服务商配置，底栏写着上一轮为什么失败、该改哪一项。
+    pub(crate) fn open_settings_for_failure(
+        &mut self,
+        kind: FailureKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_at(KERNEL_TAB, window, cx);
+        let why = match kind {
+            FailureKind::Auth => {
+                "上一轮被服务商拒绝：检查下面的 API Key，改好后点「获取列表」验证一下"
+            }
+            FailureKind::Endpoint => {
+                "上一轮找不到接口：检查下面的端点地址，改好后点「获取列表」验证一下"
+            }
+            FailureKind::Model => {
+                "上一轮找不到模型：点「获取列表」挑一个能用的；当前会话的模型在输入框右下角换"
+            }
+            FailureKind::Network => "上一轮连不上服务：检查下面的端点地址，以及网络和代理",
+            _ => return,
+        };
+        self.settings_form.message = Some((true, why.into()));
+    }
+
     /// 首页配置引导选了一种接法：打开「内核与模型」并选好那种内核；
     /// ACP 命令还空着时填上 Claude Code 的适配器。
     pub(crate) fn start_setup(
@@ -550,6 +579,10 @@ impl ChatApp {
         if restart_acp {
             self.restart_kernel(KernelChoice::Acp, cx);
         }
+        // 自研内核的配置变了：顺手取一次模型列表，连不上马上告诉用户（不挡保存）
+        if restart_builtin && default == KernelChoice::Builtin {
+            self.start_fetch_models(Fetch::Verify, cx);
+        }
         if default_changed {
             // 默认内核换了：还没对话的会话跟着换，有对话的留在原来的内核上
             for idx in 0..self.sessions.len() {
@@ -572,6 +605,7 @@ impl ChatApp {
     fn select_form_profile(&mut self, i: usize, cx: &mut Context<Self>) {
         if i < self.settings_form.profiles.len() {
             self.settings_form.active = i;
+            self.settings_form.fetch_result = None;
             cx.notify();
         }
     }
@@ -626,6 +660,7 @@ impl ChatApp {
             f.active = f.profiles.len() - 1;
         }
         f.message = None;
+        f.fetch_result = None;
         cx.notify();
     }
 
@@ -650,7 +685,7 @@ impl ChatApp {
 
     /// 后台获取模型列表。`from_form` = 用设置页里正在编辑的档案；否则用生效中的设置。
     pub(crate) fn fetch_models(&mut self, from_form: bool, cx: &mut Context<Self>) {
-        self.start_fetch_models(from_form, false, cx);
+        self.start_fetch_models(if from_form { Fetch::Form } else { Fetch::Menu }, cx);
     }
 
     /// 一轮结束或切到一个会话时：自研内核报告过上下文用量、但还不知道当前模型的窗口大小，
@@ -665,14 +700,14 @@ impl ChatApp {
             return;
         }
         self.context_probed = true;
-        self.start_fetch_models(false, true, cx);
+        self.start_fetch_models(Fetch::Probe, cx);
     }
 
-    /// `quiet`：后台顺手取的，失败不往会话里写提示。
-    fn start_fetch_models(&mut self, from_form: bool, quiet: bool, cx: &mut Context<Self>) {
+    fn start_fetch_models(&mut self, why: Fetch, cx: &mut Context<Self>) {
         if self.fetching_models {
             return;
         }
+        let from_form = why == Fetch::Form;
         let mut config = if from_form {
             let f = &self.settings_form;
             let Some(inputs) = f.inputs.get(f.active) else {
@@ -692,8 +727,8 @@ impl ChatApp {
         config.gateway = self.settings.gateway();
         if config.base_url.is_empty() {
             // 后台探测时自研内核可能已经没配了（只剩历史会话），不往设置页塞错误提示
-            if !quiet {
-                self.settings_form.message = Some((true, "先填端点地址".into()));
+            if from_form {
+                self.settings_form.fetch_result = Some((true, "先填端点地址".into(), None));
                 cx.notify();
             }
             return;
@@ -716,8 +751,22 @@ impl ChatApp {
                             if let Some(p) = app.settings_form.profiles.get_mut(i) {
                                 p.set_models(&models);
                             }
-                            app.settings_form.message =
-                                Some((false, format!("获取到 {n} 个模型").into()));
+                            app.settings_form.fetch_result =
+                                Some((false, format!("连上了，获取到 {n} 个模型").into(), None));
+                        }
+                        if why == Fetch::Verify {
+                            let profile = app.settings.builtin.current();
+                            let (name, model) = (profile.display_name(), profile.model.trim());
+                            // 列表里没有填的模型：多半是模型名写错了（列表为空的服务不算）
+                            let note = if models.is_empty() || models.iter().any(|m| m.id == model)
+                            {
+                                Notification::success(format!("已连上 {name}，可以开始对话了"))
+                            } else {
+                                Notification::warning(format!(
+                                    "已连上 {name}，但它的模型列表里没有「{model}」。检查模型名，或点「获取列表」挑一个"
+                                ))
+                            };
+                            app.toast(note, cx);
                         }
                         // 和生效中的端点一致时，顺便更新下拉用的列表
                         if base_url == app.settings.builtin.base_url().trim() {
@@ -731,11 +780,25 @@ impl ChatApp {
                         }
                     }
                     Err(err) => {
-                        let text: SharedString = format!("获取模型失败：{err}").into();
-                        if from_form {
-                            app.settings_form.message = Some((true, text));
-                        } else if !quiet {
-                            app.toast(Notification::error(text), cx);
+                        let raw = err.to_string();
+                        let text = crate::model::fetch_failure_text(&raw, &base_url);
+                        match why {
+                            Fetch::Form => {
+                                app.settings_form.fetch_result =
+                                    Some((true, text.into(), Some(raw.into())))
+                            }
+                            Fetch::Menu => app.toast(
+                                Notification::error(format!("获取模型失败：{text}（{raw}）")),
+                                cx,
+                            ),
+                            // 保存时顺手测的：已经存了，只是提醒一下
+                            Fetch::Verify => app.toast(
+                                Notification::warning(format!(
+                                    "已保存，但连接测试没通过：{text}（{raw}）"
+                                )),
+                                cx,
+                            ),
+                            Fetch::Probe => {}
                         }
                     }
                 }
@@ -1157,8 +1220,8 @@ impl ChatApp {
         }
 
         let mut body = div().v_flex().gap_4();
-        let blank = f.current().is_none_or(|(_, inputs)| value(&inputs.base_url, cx).is_empty());
-        if f.inputs.len() <= 1 && blank {
+        // 按已保存的设置判断（不看正在填的输入框），免得填第一个字时说明忽然消失、整页往上跳
+        if f.inputs.len() <= 1 && !self.settings.builtin.is_configured() {
             body = body.child(how_to(
                 "三步接上模型",
                 &[
@@ -1211,6 +1274,29 @@ impl ChatApp {
         } else {
             "新会话默认用它；会话里也能在输入框下方换"
         };
+        // 上次「获取列表」的结果代替说明：失败时说清改哪一项，下面带服务商的原文
+        let fetch_result = self.settings_form.fetch_result.clone();
+        let model_hint = fetch_result.is_none().then(|| model_hint.into());
+        let model_row = div().v_flex().gap_1p5().child(model_row).when_some(
+            fetch_result,
+            |d, (error, text, raw)| {
+                d.child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(if error { RED } else { GREEN }))
+                        .child(text),
+                )
+                .when_some(raw, |d, raw| {
+                    d.child(
+                        div()
+                            .text_size(TEXT_META)
+                            .text_color(rgb(INK_SOFT))
+                            .line_clamp(2)
+                            .child(raw),
+                    )
+                })
+            },
+        );
         let mut endpoint = div().v_flex().gap_1p5().child(Self::text_input(&inputs.base_url));
         if antigravity_gateway().is_some() {
             endpoint = endpoint.child(
@@ -1257,7 +1343,7 @@ impl ChatApp {
                     Input::new(&inputs.api_key).appearance(false).bordered(false).mask_toggle(),
                 ),
             ))
-            .child(form_field("模型", Some(model_hint.into()), model_row))
+            .child(form_field("模型", model_hint, model_row))
     }
 
     /// ACP agent：启动命令（带常用命令一键填入）和要不要经用量网关。
@@ -1471,6 +1557,19 @@ impl ChatApp {
                     ),
             )
     }
+}
+
+/// 为什么去取模型列表，决定结果告诉谁。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fetch {
+    /// 设置页的「获取列表」：结果显示在模型那一栏下面
+    Form,
+    /// 输入框旁的模型菜单：失败了弹提示
+    Menu,
+    /// 后台顺手探上下文窗口：失败不吭声
+    Probe,
+    /// 保存后测一下连不连得上：成功、失败都弹提示
+    Verify,
 }
 
 /// 「内核与模型」里默认内核的三种选择。
