@@ -522,7 +522,15 @@ impl ChatApp {
     /// 新建一个会话并切过去（用默认内核）。
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
         let cwd = self.cwd.clone();
-        self.active = self.open_session(self.settings.kernel(), cwd);
+        let kind = self.settings.kernel();
+        // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」
+        let blank = self.sessions.iter().position(|s| {
+            !s.has_user_message() && !s.busy && !s.renamed && s.kernel == kind && s.cwd == cwd
+        });
+        self.active = match blank {
+            Some(idx) => idx,
+            None => self.open_session(kind, cwd),
+        };
         cx.notify();
     }
 
@@ -1150,7 +1158,6 @@ impl ChatApp {
                 s.restored = false;
                 s.resuming = true;
                 s.autoprompt = Some(prompt);
-                s.note("正在续接会话…");
                 self.request_pending_sessions();
                 cx.notify();
                 return true;

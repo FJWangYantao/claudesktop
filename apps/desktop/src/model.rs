@@ -668,6 +668,8 @@ pub enum FailureKind {
     Network,
     /// 回复到一半流断了
     Interrupted,
+    /// 关应用时这一轮还在进行（重放会话时补上，不从报错文字里认）
+    Unfinished,
     Other,
 }
 
@@ -723,6 +725,7 @@ impl FailureKind {
             Self::Endpoint => "找不到模型服务的接口",
             Self::Network => "连不上模型服务",
             Self::Interrupted => "回复中途断开了",
+            Self::Unfinished => "上次关闭时这一轮还没做完",
             Self::Other => "本轮失败",
         }
     }
@@ -748,6 +751,7 @@ impl FailureKind {
             }
             Self::Network => "检查网络、代理，以及设置里的端点地址。",
             Self::Interrupted => "连接在输出途中断了，已经做完的步骤都还在。",
+            Self::Unfinished => "已经做完的步骤都还在，点「继续」接着做。",
             Self::Other => return None,
         })
     }

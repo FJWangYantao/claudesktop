@@ -321,17 +321,29 @@ impl Session {
         // 上次退出时还在进行的东西一律收尾
         s.finish_thinking();
         s.replaying = false;
+        let mut unfinished = s.busy;
         for item in &mut s.transcript {
             match item {
-                ChatItem::Permission { resolved: r @ None, .. } => *r = Some("已取消".into()),
+                ChatItem::Permission { resolved: r @ None, .. } => {
+                    *r = Some("已取消".into());
+                    unfinished = true;
+                }
                 ChatItem::Tool(card) if card.phase == ToolPhase::Running => {
                     card.phase = ToolPhase::Failed;
                     if card.result.is_empty() {
                         card.result = "已中断".into();
                     }
+                    unfinished = true;
                 }
                 _ => {}
             }
+        }
+        // 关应用时这一轮还在跑：补一张卡片说清楚，并给「继续」（不然只剩几行「已中断」，不知道下一步）
+        if unfinished {
+            s.transcript.push(ChatItem::Failed {
+                message: SharedString::default(),
+                kind: FailureKind::Unfinished,
+            });
         }
         s.busy = false;
         // 重放出来的会话不带着「正在流式」的计数
@@ -372,8 +384,10 @@ impl Session {
             // 插在状态行前面
             self.list.splice(old..old, n - old);
         }
-        if self.busy != self.measured_busy {
-            self.measured_busy = self.busy;
+        // 状态行在忙或续接中时出现（见 `render_turn_status`）
+        let status = self.busy || self.resuming;
+        if status != self.measured_busy {
+            self.measured_busy = status;
             self.list.remeasure_items(n..n + 1);
         }
         // 行数到位之后再滚，否则会被截到末尾；再往上让一点，别让顶上的渐隐盖住这一行
@@ -914,12 +928,9 @@ impl Session {
             KernelEvent::Started { session_id, model, modes, current_mode, resumed, .. } => {
                 self.acp_id = Some(session_id);
                 self.ready = true;
-                if std::mem::take(&mut self.resuming) {
-                    self.note(if resumed {
-                        "已续接之前的会话，上下文已恢复"
-                    } else {
-                        "agent 不支持续接：已新开会话，agent 看不到之前的上下文"
-                    });
+                // 续接成功是理所当然的，不往对话里写；接不上才要说（agent 看不到之前的内容了）
+                if std::mem::take(&mut self.resuming) && !resumed {
+                    self.note("agent 不支持续接：已新开会话，agent 看不到之前的上下文");
                 }
                 if let Some(model) = model {
                     // provider/family/name → 只留最后一段，顶栏空间有限
@@ -1427,12 +1438,24 @@ mod tests {
                 ChatItem::Tool(_) => "tool",
                 ChatItem::Permission { .. } => "permission",
                 ChatItem::Agent(_) => "agent",
+                ChatItem::Failed { kind: FailureKind::Unfinished, .. } => "unfinished",
                 _ => "other",
             })
             .collect();
+        // 上次退出时那一轮没做完：末尾补一张「没做完」的卡片
         assert_eq!(
             kinds,
-            ["user", "thinking", "tool", "permission", "agent", "user", "thinking", "permission"]
+            [
+                "user",
+                "thinking",
+                "tool",
+                "permission",
+                "agent",
+                "user",
+                "thinking",
+                "permission",
+                "unfinished"
+            ]
         );
         // 用时从日志还原；重放本身不计时，没记用时的就不知道
         assert!(matches!(
