@@ -354,6 +354,7 @@ pub enum CompactState {
 }
 
 /// 输入框里待发送的一张图片附件（已编好 base64，预览用 gpui Image）。
+#[derive(Clone)]
 pub struct PendingImage {
     /// 原始文件名（悬停提示用）
     pub name: SharedString,
@@ -657,6 +658,10 @@ pub enum FailureKind {
     RateLimit,
     /// 5xx：服务端的问题（自研内核已经退避重试过）
     Server,
+    /// 404 且说的是模型：模型名写错了，或者这个 Key 用不了它
+    Model,
+    /// 其余的 404：多半是端点地址不对（少了 `/v1` 这类）
+    Endpoint,
     /// 请求没发出去：连不上、超时、证书
     Network,
     /// 回复到一半流断了
@@ -672,6 +677,8 @@ impl FailureKind {
             return match status {
                 401 | 403 => Self::Auth,
                 429 => Self::RateLimit,
+                404 if message.to_lowercase().contains("model") => Self::Model,
+                404 => Self::Endpoint,
                 500..=599 => Self::Server,
                 // 4xx 里剩下的才可能是「请求本身太长」
                 _ if is_context_overflow(message) => Self::Overflow,
@@ -691,12 +698,19 @@ impl FailureKind {
         }
     }
 
+    /// 要到设置里改服务商配置才能好（失败卡片上给「打开设置」）。
+    pub fn settings_fix(self) -> bool {
+        matches!(self, Self::Auth | Self::Model | Self::Endpoint | Self::Network)
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Overflow => "超出了模型的上下文长度",
             Self::Auth => "模型服务拒绝了请求",
             Self::RateLimit => "请求太频繁或额度用完了",
             Self::Server => "模型服务出错了",
+            Self::Model => "找不到这个模型",
+            Self::Endpoint => "找不到模型服务的接口",
             Self::Network => "连不上模型服务",
             Self::Interrupted => "回复中途断开了",
             Self::Other => "本轮失败",
@@ -713,10 +727,63 @@ impl FailureKind {
             Self::RateLimit => "等一会儿再试，或者到服务商那边看看额度。",
             // 自研内核会自己退避重试几次，ACP 内核的重试策略由 agent 决定，这里不断言
             Self::Server => "是服务端的问题，不是这个会话的错。稍后再试通常就好。",
-            Self::Network => "检查网络、代理和服务地址。",
+            Self::Model => {
+                "模型名写错了，或者这个 Key 用不了它。点输入框右下角的模型名换一个，再点重试。"
+            }
+            Self::Endpoint => {
+                "端点地址多半不对（很多服务的地址以 /v1 结尾）。到设置里检查服务商的端点地址。"
+            }
+            Self::Network => "检查网络、代理，以及设置里的端点地址。",
             Self::Interrupted => "连接在输出途中断了，已经做完的步骤都还在。",
             Self::Other => return None,
         })
+    }
+}
+
+/// 设置页「获取列表」失败时给人看的话：说清是哪个字段的问题、怎么改，原文另行显示。
+pub fn fetch_failure_text(message: &str, base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    match FailureKind::of(message) {
+        FailureKind::Auth => "API Key 不对，或者没有权限。检查 Key 有没有复制全、是不是这家服务商的".into(),
+        FailureKind::Endpoint | FailureKind::Model if !base.ends_with("/v1") => {
+            format!("端点地址不对：这个地址下没有模型列表。很多服务以 /v1 结尾，试试 {base}/v1")
+        }
+        FailureKind::Endpoint | FailureKind::Model => {
+            "端点地址下没有模型列表。确认地址是服务商文档里的 base URL；有的服务不提供列表，那就直接填模型名"
+                .into()
+        }
+        FailureKind::Network => "连不上这个地址。检查端点地址、网络和代理".into(),
+        FailureKind::RateLimit => "请求太频繁或额度用完了，稍后再试".into(),
+        FailureKind::Server => "服务商那边出错了，稍后再试".into(),
+        _ => "获取失败".into(),
+    }
+}
+
+/// 内核起不来时给人看的话。找不到命令单独说：`npx` / `node` 多半是没装 Node.js。
+pub fn kernel_failure_text(label: &str, command: &str, message: &str) -> String {
+    // 「ACP agent」后面接中文要隔一个空格，「自研内核」不用
+    let label = if label.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+        format!("{label} ")
+    } else {
+        label.to_string()
+    };
+    let missing =
+        ["os error 2", "not found", "No such file", "不是内部或外部命令", "is not recognized"]
+            .iter()
+            .any(|m| message.contains(m));
+    // Windows 上的命令是 `cmd /c npx …`，真正要找的程序在后面
+    let program = command
+        .split_whitespace()
+        .find(|w| !w.eq_ignore_ascii_case("cmd") && !w.eq_ignore_ascii_case("/c"))
+        .unwrap_or_default();
+    match (missing, program) {
+        (true, "npx" | "node" | "npm") => format!(
+            "{label}启动不了：找不到 {program}。先装 Node.js（nodejs.org），装好后再发一次消息；或者到设置里换一种接法"
+        ),
+        (true, _) if !program.is_empty() => {
+            format!("{label}启动不了：找不到命令 {program}。到设置里检查启动命令")
+        }
+        _ => format!("{label}出错了：{message}（可在设置里修改）"),
     }
 }
 
@@ -873,7 +940,9 @@ mod tests {
             ("HTTP 429: rate limited", FailureKind::RateLimit),
             ("HTTP 529: overloaded", FailureKind::Server),
             ("HTTP 400: prompt is too long", FailureKind::Overflow),
-            ("HTTP 404: no such model", FailureKind::Other),
+            ("HTTP 404: no such model", FailureKind::Model),
+            ("HTTP 404: The model `x` does not exist", FailureKind::Model),
+            ("HTTP 404: Not Found: /chat/completions", FailureKind::Endpoint),
             // 5xx 的响应体里带上 context 字样时仍按服务端错误处理（先修的该是服务端）
             ("HTTP 500: upstream context length exceeded?", FailureKind::Server),
             ("HTTP 429: too many tokens per minute", FailureKind::RateLimit),
@@ -884,6 +953,31 @@ mod tests {
         for (message, kind) in cases {
             assert_eq!(FailureKind::of(message), kind, "{message}");
         }
+    }
+
+    #[core::prelude::v1::test]
+    fn fetch_failures_point_at_the_field() {
+        let text = fetch_failure_text("HTTP 404: Not Found: /models", "http://127.0.0.1:8080/");
+        assert!(text.contains("试试 http://127.0.0.1:8080/v1"), "{text}");
+        let text = fetch_failure_text("HTTP 404: Not Found: /models", "https://x.com/v1");
+        assert!(!text.contains("试试"), "{text}");
+        assert!(fetch_failure_text("HTTP 401: bad key", "https://x.com/v1").contains("API Key"));
+        let text = fetch_failure_text("请求 https://x/v1/models 失败: Connection refused", "");
+        assert!(text.contains("连不上"), "{text}");
+    }
+
+    #[core::prelude::v1::test]
+    fn kernel_failures_name_the_missing_program() {
+        let text = kernel_failure_text(
+            "ACP agent",
+            "cmd /c npx -y @agentclientprotocol/claude-agent-acp",
+            "spawn: No such file or directory (os error 2)",
+        );
+        assert!(text.contains("找不到 npx") && text.contains("Node.js"), "{text}");
+        let text = kernel_failure_text("ACP agent", "my-agent --acp", "os error 2");
+        assert!(text.contains("找不到命令 my-agent"), "{text}");
+        let text = kernel_failure_text("ACP agent", "npx x", "agent exited: 1");
+        assert!(text.contains("出错了：agent exited: 1"), "{text}");
     }
 
     #[core::prelude::v1::test]
