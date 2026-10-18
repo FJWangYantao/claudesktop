@@ -3,6 +3,7 @@
 
 use super::ChatApp;
 use crate::model::*;
+use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
 use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
@@ -185,6 +186,88 @@ impl ChatApp {
             .child(Self::seg(label, active))
     }
 
+    /// 新装还没配内核时，首页的用量面板换成两种接法（见 `Settings::needs_setup`）。
+    fn render_setup(&self, cx: &mut Context<Self>) -> Div {
+        let option = |id: &'static str,
+                      icon: IconAll,
+                      title: &'static str,
+                      detail: &'static str,
+                      kind: KernelChoice,
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .h_flex()
+                .gap_3()
+                .p_4()
+                .rounded_lg()
+                .bg(rgb(CARD))
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(HOVER)))
+                .child(Icon::new(icon).size_5().flex_shrink_0().text_color(rgb(CORAL)))
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_0p5()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(TEXT_LARGE)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(INK))
+                                .child(title),
+                        )
+                        .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(detail)),
+                )
+                .child(Icon::new(IconAll::ChevronRight).size_4().text_color(rgb(INK_SOFT)))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.start_setup(kind, window, cx)),
+                )
+        };
+        div()
+            .v_flex()
+            .gap_3()
+            .w(OVERVIEW_W)
+            .p_5()
+            .rounded_xl()
+            .bg(rgb(SAND))
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .pb_1()
+                    .child(
+                        div()
+                            .text_size(TEXT_LEAD)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(INK))
+                            .child("先接上一个模型"),
+                    )
+                    .child(
+                        div()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK_SOFT))
+                            .child("claudesktop 自己不带模型。选一种接法，之后随时能在设置里改。"),
+                    ),
+            )
+            .child(option(
+                "setup-builtin",
+                IconAll::Cpu,
+                "用 API Key",
+                "DeepSeek、Kimi、GLM、Anthropic、OpenAI 等，或本机的 Ollama：选个预设，填上密钥",
+                KernelChoice::Builtin,
+                cx,
+            ))
+            .child(option(
+                "setup-acp",
+                IconAll::SquareTerminal,
+                "接 Claude Code 等 ACP agent",
+                "用 agent 自己的登录和模型；已填好 Claude Code 的适配器（需要 Node.js）",
+                KernelChoice::Acp,
+                cx,
+            ))
+    }
+
     pub(super) fn render_overview(&self, cx: &mut Context<Self>) -> Div {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let range = match self.overview_range {
@@ -193,6 +276,8 @@ impl ChatApp {
             _ => None,
         };
         let o = usage::overview(&self.usage, now, usage::local_offset_secs(), range);
+        let needs_setup = self.settings.needs_setup();
+        let setup = needs_setup.then(|| self.render_setup(cx));
         let body = match self.overview_tab {
             1 => Self::render_usage_models(&o),
             2 => self.render_usage_requests(cx),
@@ -221,85 +306,88 @@ impl ChatApp {
                             .child(greeting()),
                     ),
             )
-            .child(
-                div()
-                    .v_flex()
-                    .gap_4()
-                    .w(OVERVIEW_W)
-                    .p_5()
-                    .rounded_xl()
-                    .bg(rgb(SAND))
-                    .child(
-                        // 顶行：左侧 tabs，右侧范围
-                        div()
-                            .h_flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .gap_1()
-                                    .child(self.tab(
-                                        "tab-overview",
-                                        "概览",
-                                        self.overview_tab == 0,
-                                        cx,
-                                        |t| t.overview_tab = 0,
-                                    ))
-                                    .child(self.tab(
-                                        "tab-model",
-                                        "模型",
-                                        self.overview_tab == 1,
-                                        cx,
-                                        |t| t.overview_tab = 1,
-                                    ))
-                                    .child(self.tab(
-                                        "tab-requests",
-                                        "请求",
-                                        self.overview_tab == 2,
-                                        cx,
-                                        |t| t.overview_tab = 2,
-                                    )),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .gap_1()
-                                    .child(self.tab(
-                                        "range-all",
-                                        "全部",
-                                        self.overview_range == 0,
-                                        cx,
-                                        |t| t.overview_range = 0,
-                                    ))
-                                    .child(self.tab(
-                                        "range-30",
-                                        "30 天",
-                                        self.overview_range == 1,
-                                        cx,
-                                        |t| t.overview_range = 1,
-                                    ))
-                                    .child(self.tab(
-                                        "range-7",
-                                        "7 天",
-                                        self.overview_range == 2,
-                                        cx,
-                                        |t| t.overview_range = 2,
-                                    )),
-                            ),
-                    )
-                    .child(body)
-                    // 「请求」页签自己有汇总行，不再挂书本换算
-                    .when(self.overview_tab != 2, |d| {
-                        d.child(
+            .children(setup)
+            .when(!needs_setup, |d| {
+                d.child(
+                    div()
+                        .v_flex()
+                        .gap_4()
+                        .w(OVERVIEW_W)
+                        .p_5()
+                        .rounded_xl()
+                        .bg(rgb(SAND))
+                        .child(
+                            // 顶行：左侧 tabs，右侧范围
                             div()
-                                .pt_1()
-                                .text_size(TEXT_SMALL)
-                                .text_color(rgb(INK_SOFT))
-                                .child(usage::book_line(o.tokens)),
+                                .h_flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .h_flex()
+                                        .gap_1()
+                                        .child(self.tab(
+                                            "tab-overview",
+                                            "概览",
+                                            self.overview_tab == 0,
+                                            cx,
+                                            |t| t.overview_tab = 0,
+                                        ))
+                                        .child(self.tab(
+                                            "tab-model",
+                                            "模型",
+                                            self.overview_tab == 1,
+                                            cx,
+                                            |t| t.overview_tab = 1,
+                                        ))
+                                        .child(self.tab(
+                                            "tab-requests",
+                                            "请求",
+                                            self.overview_tab == 2,
+                                            cx,
+                                            |t| t.overview_tab = 2,
+                                        )),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .h_flex()
+                                        .gap_1()
+                                        .child(self.tab(
+                                            "range-all",
+                                            "全部",
+                                            self.overview_range == 0,
+                                            cx,
+                                            |t| t.overview_range = 0,
+                                        ))
+                                        .child(self.tab(
+                                            "range-30",
+                                            "30 天",
+                                            self.overview_range == 1,
+                                            cx,
+                                            |t| t.overview_range = 1,
+                                        ))
+                                        .child(self.tab(
+                                            "range-7",
+                                            "7 天",
+                                            self.overview_range == 2,
+                                            cx,
+                                            |t| t.overview_range = 2,
+                                        )),
+                                ),
                         )
-                    }),
-            )
+                        .child(body)
+                        // 「请求」页签自己有汇总行，不再挂书本换算
+                        .when(self.overview_tab != 2, |d| {
+                            d.child(
+                                div()
+                                    .pt_1()
+                                    .text_size(TEXT_SMALL)
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(usage::book_line(o.tokens)),
+                            )
+                        }),
+                )
+            })
     }
 }
 
@@ -311,7 +399,9 @@ impl ChatApp {
 
     /// 首页空输入框里建议的提示词：每个会话固定一条（按会话令牌轮换）。
     pub(super) fn ghost_prompt(&self) -> Option<&'static str> {
-        self.on_home().then(|| SUGGESTIONS[self.session().token as usize % SUGGESTIONS.len()].2)
+        // 还没配内核时不引人发消息（发了也只会报没配置）
+        (self.on_home() && !self.settings.needs_setup())
+            .then(|| SUGGESTIONS[self.session().token as usize % SUGGESTIONS.len()].2)
     }
 
     /// 输入框的占位文字：首页是建议的提示词，跑着时说明回车会排队，刚拒绝了权限时请用户说要怎么改，

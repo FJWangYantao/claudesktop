@@ -439,13 +439,21 @@ impl Settings {
         self
     }
 
-    /// 实际使用的内核。
+    /// 实际使用的内核。从没选过时：填了 ACP 命令（含 `ACP_AGENT`）用 ACP，否则自研。
     pub fn kernel(&self) -> KernelChoice {
-        self.kernel.unwrap_or(if self.builtin.is_configured() {
-            KernelChoice::Builtin
-        } else {
-            KernelChoice::Acp
-        })
+        self.kernel.unwrap_or(
+            if self.acp.command.trim().is_empty() || self.builtin.is_configured() {
+                KernelChoice::Builtin
+            } else {
+                KernelChoice::Acp
+            },
+        )
+    }
+
+    /// 新装、还没配过任何内核：没选过内核，自研内核没填端点 / 模型，ACP 也没填命令。
+    /// 这时不起内核（ACP 空命令是仓库里的 mock agent，装好的程序里没有），首页换成配置引导。
+    pub fn needs_setup(&self) -> bool {
+        self.kernel.is_none() && !self.builtin.is_configured() && self.acp.command.trim().is_empty()
     }
 
     pub fn builtin_config(&self, cwd: PathBuf) -> anyhow::Result<BuiltinConfig> {
@@ -603,12 +611,24 @@ mod tests {
         let path = dir.join("settings.json");
         let (s, err) = Settings::load(Some(&path));
         assert!(err.is_none());
+        // 新装：什么都没配，也没有 ACP 命令 → 自研内核，并且算「还没配过」
+        assert_eq!(s.kernel(), KernelChoice::Builtin);
+        assert!(s.needs_setup());
+
+        // 填了 ACP 命令（含 ACP_AGENT 带进来的）→ 用它
+        let mut s = Settings::default();
+        s.acp.command = "npx agent".into();
         assert_eq!(s.kernel(), KernelChoice::Acp);
+        assert!(!s.needs_setup());
 
         let mut s = Settings::default();
         s.builtin.current_mut().base_url = "http://x/v1".into();
         s.builtin.current_mut().model = "m".into();
         // 没选过内核但配好了自研内核 → 用它
+        assert_eq!(s.kernel(), KernelChoice::Builtin);
+        assert!(!s.needs_setup());
+        // 两个都配了：自研优先，和以前一样
+        s.acp.command = "npx agent".into();
         assert_eq!(s.kernel(), KernelChoice::Builtin);
         s.kernel = Some(KernelChoice::Demo);
         s.save(&path).unwrap();

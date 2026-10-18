@@ -92,7 +92,7 @@ impl ProfileInputs {
         };
         Self {
             name: make(p.name.clone(), "如 DeepSeek（可留空）", false, window, cx),
-            base_url: make(p.base_url.clone(), "http://127.0.0.1:8045/v1", false, window, cx),
+            base_url: make(p.base_url.clone(), "如 https://api.deepseek.com/v1", false, window, cx),
             api_key: make(p.api_key.clone(), "没有可留空", true, window, cx),
             model: make(p.model.clone(), "如 deepseek-chat", false, window, cx),
         }
@@ -475,6 +475,31 @@ impl ChatApp {
         s
     }
 
+    /// 首页配置引导选了一种接法：打开「内核与模型」并选好那种内核；
+    /// ACP 命令还空着时填上 Claude Code 的适配器。
+    pub(crate) fn start_setup(
+        &mut self,
+        kind: KernelChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_at(1, window, cx);
+        self.settings_form.kernel = kind;
+        if kind == KernelChoice::Acp
+            && self.settings_form.acp_command.read(cx).value().trim().is_empty()
+        {
+            let command = if cfg!(windows) {
+                "cmd /c npx -y @agentclientprotocol/claude-agent-acp"
+            } else {
+                "npx -y @agentclientprotocol/claude-agent-acp"
+            };
+            self.settings_form
+                .acp_command
+                .update(cx, |state, cx| state.set_value(command, window, cx));
+        }
+        cx.notify();
+    }
+
     fn save_settings(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::pricing::parse_text(&self.settings_form.prices.read(cx).value()) {
             self.settings_form.message = Some((true, err.into()));
@@ -524,6 +549,13 @@ impl ChatApp {
             for idx in 0..self.sessions.len() {
                 self.rebind_session(idx, default);
             }
+        }
+        // 首次配置：启动时没起内核（见 `open_session`），现在把等着的会话接上
+        if !self.kernels[default.index()].started
+            && self.sessions.iter().any(|s| s.kernel == default && !s.has_user_message())
+        {
+            self.ensure_kernel(default);
+            self.request_pending_sessions();
         }
         cx.notify();
     }

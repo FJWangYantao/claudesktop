@@ -519,7 +519,10 @@ impl ChatApp {
     /// 在某种内核上开一个会话，返回下标。内核没启动就先启动；
     /// 连接已就绪就立刻向内核要会话，否则等 Connected 时补发。
     fn open_session(&mut self, kind: KernelChoice, cwd: PathBuf) -> usize {
-        self.ensure_kernel(kind);
+        // 还没配置时先不起内核，配好保存时再起（见 `save_settings`）
+        if !self.settings.needs_setup() {
+            self.ensure_kernel(kind);
+        }
         let token = self.next_token;
         self.next_token += 1;
         self.sessions.push(Session::new(token, kind, cwd));
