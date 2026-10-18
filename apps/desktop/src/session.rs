@@ -3,6 +3,7 @@
 use crate::demo::*;
 use crate::model::*;
 use crate::settings::KernelChoice;
+use crate::usage::Streamed;
 use claudesktop_core::{DiffView, Kernel, KernelEvent, Record, SessionLog, SessionMeta};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -58,6 +59,9 @@ pub struct Session {
     pub pending_model: Option<String>,
     /// 本轮累计的 token，一轮结束时写进日志后清零
     pub turn_usage: TurnUsage,
+    /// 本轮收到、端点还没数过的输出（正文 + 思考）：流式期间状态行据此估算 token，
+    /// 每次 `UsageUpdated` 到来时清掉（那之前的输出已经被端点数过了）
+    turn_streamed: Streamed,
     /// 本轮开始的时刻（状态条计时用；只在 busy 时有意义）
     pub turn_started: Option<Instant>,
     /// 用户手动改过标题（首条消息不再覆盖）
@@ -165,6 +169,8 @@ pub struct TurnUsage {
     pub output: u64,
     /// 其中思考消耗的部分（包含在 `output` 里；内核不报告时为 0）
     pub reasoning: u64,
+    /// 本轮端点报过用量没有：没报过时状态行上的数字是估的（界面标成 `≈`）
+    pub reported: bool,
 }
 
 /// 进行中的一轮此刻在干什么（状态条的左侧文字）。只分三档：
@@ -221,6 +227,7 @@ impl Session {
             resuming: false,
             pending_model: None,
             turn_usage: TurnUsage::default(),
+            turn_streamed: Streamed::default(),
             turn_started: None,
             renamed: false,
             layout: Vec::new(),
@@ -274,8 +281,13 @@ impl Session {
                         s.model_label = model.into();
                     }
                     if let Some(user) = s.last_user() {
-                        let usage =
-                            TurnUsage { input: input_tokens, output: output_tokens, reasoning: 0 };
+                        // 日志里的用量是准数（写日志前端点报过）
+                        let usage = TurnUsage {
+                            input: input_tokens,
+                            output: output_tokens,
+                            reasoning: 0,
+                            reported: true,
+                        };
                         s.turn_summaries.insert(user, TurnSummary { elapsed_ms, usage });
                     }
                     if let Some(n) = context_tokens {
@@ -322,6 +334,8 @@ impl Session {
             }
         }
         s.busy = false;
+        // 重放出来的会话不带着「正在流式」的计数
+        s.turn_streamed.clear();
         s.meta = Some(meta);
         s
     }
@@ -492,12 +506,19 @@ impl Session {
             .map(|i| i + start)
     }
 
+    /// 本轮输出已经有多少 token：端点上一次的 `UsageUpdated`（已经算准的部分）
+    /// + 之后又流式收到、端点还没数的那部分估算。
+    pub fn live_output_tokens(&self) -> u64 {
+        self.turn_usage.output + self.turn_streamed.tokens()
+    }
+
     /// 一轮结束：取走本轮用量、算出用时，记到这一轮名下（回复末尾显示），也交给调用方写日志。
     pub fn close_turn(&mut self) -> TurnSummary {
         let summary = TurnSummary {
             elapsed_ms: self.turn_started.take().map(|t| t.elapsed().as_millis() as u64),
             usage: std::mem::take(&mut self.turn_usage),
         };
+        self.turn_streamed.clear();
         if let Some(user) = self.last_user() {
             self.turn_summaries.insert(user, summary);
         }
@@ -596,6 +617,7 @@ impl Session {
         self.busy = true;
         self.compact_turn = false;
         self.retry = None;
+        self.turn_streamed.clear();
         self.turn_started = Some(Instant::now());
     }
 
@@ -925,6 +947,7 @@ impl Session {
             }
             KernelEvent::AgentMessageChunk { text } => {
                 self.finish_thinking();
+                self.turn_streamed.push(&text);
                 // 首条提示之前到达的文本是 agent 的启动信息，折叠显示
                 let before_first_prompt = !self.has_user_message();
                 match self.transcript.last_mut() {
@@ -938,14 +961,19 @@ impl Session {
                     _ => self.transcript.push(ChatItem::Agent(text)),
                 }
             }
-            KernelEvent::AgentThoughtChunk { text } => match self.transcript.last_mut() {
-                Some(ChatItem::Thinking { text: buf, streaming: true, .. }) => buf.push_str(&text),
-                // 默认收起：流式时只扫光「思考中…」，不先展开再收回（那样每段思考都会跳一下）
-                _ => {
-                    let started = (!self.replaying).then(Instant::now);
-                    self.transcript.push(ChatItem::thinking(text, started));
+            KernelEvent::AgentThoughtChunk { text } => {
+                self.turn_streamed.push(&text);
+                match self.transcript.last_mut() {
+                    Some(ChatItem::Thinking { text: buf, streaming: true, .. }) => {
+                        buf.push_str(&text)
+                    }
+                    // 默认收起：流式时只扫光「思考中…」，不先展开再收回（那样每段思考都会跳一下）
+                    _ => {
+                        let started = (!self.replaying).then(Instant::now);
+                        self.transcript.push(ChatItem::thinking(text, started));
+                    }
                 }
-            },
+            }
             KernelEvent::ToolCallStarted { id, title, status, kind, parent } => {
                 self.finish_thinking();
                 let (name, arg) = tool_label(&kind, &title);
@@ -1075,6 +1103,9 @@ impl Session {
             } => {
                 // 端点不报缓存时是 0，和「一点没命中」分不开，所以 0 也当不知道
                 self.cache_hit = crate::usage::cache_hit_percent(cache_read_tokens, input_tokens);
+                // 到这里的输出已经被端点数过，估算的那部分清掉（之后新收到的再重新估）
+                self.turn_streamed.clear();
+                self.turn_usage.reported = true;
                 self.turn_usage.input += input_tokens;
                 self.turn_usage.output += output_tokens;
                 self.turn_usage.reasoning += reasoning_tokens;
@@ -1701,7 +1732,10 @@ mod tests {
                 None,
             );
         }
-        assert_eq!(s.turn_usage, TurnUsage { input: 200, output: 60, reasoning: 20 });
+        assert_eq!(
+            s.turn_usage,
+            TurnUsage { input: 200, output: 60, reasoning: 20, reported: true }
+        );
         assert_eq!(s.cache_hit, Some(80));
         // 上下文用量取最近一次报告的，不累加
         assert_eq!(s.context_tokens, 130);
@@ -1714,6 +1748,38 @@ mod tests {
         assert_eq!(s.turn_summary(reply), Some(&summary));
         // 上一轮没有统计
         assert_eq!(s.turn_summary(1), None);
+    }
+
+    /// 状态行上的实时 token：端点报过的 + 之后还在流式（靠字数估）的，端点一报就清掉估算。
+    #[core::prelude::v1::test]
+    fn live_output_tokens_adds_reported_and_streamed() {
+        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
+        s.begin_turn();
+        assert_eq!(s.live_output_tokens(), 0);
+
+        // 端点还什么都没报：英文 8 字节 ≈ 2 token、中文 4 字 = 4 token
+        s.apply_event(KernelEvent::AgentMessageChunk { text: "abcdefgh".into() }, None);
+        s.apply_event(KernelEvent::AgentThoughtChunk { text: "想一想啥".into() }, None);
+        assert_eq!(s.live_output_tokens(), 6);
+
+        // 端点报了一次用量：之前那批算过了，估算从现在重新开始
+        s.apply_event(
+            KernelEvent::UsageUpdated {
+                input_tokens: 100,
+                output_tokens: 12,
+                reasoning_tokens: 0,
+                context_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            None,
+        );
+        assert_eq!(s.live_output_tokens(), 12);
+        s.apply_event(KernelEvent::AgentMessageChunk { text: "再".into() }, None);
+        assert_eq!(s.live_output_tokens(), 13);
+        // 一轮收尾后不再挂着流式估算
+        s.close_turn();
+        assert_eq!(s.live_output_tokens(), 0);
     }
 
     #[core::prelude::v1::test]

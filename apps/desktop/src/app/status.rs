@@ -1,6 +1,9 @@
-//! 对话流末尾的运行状态行：本轮在干什么、跑了多久、用了多少 token、怎么停
+//! 对话流末尾的运行状态行：本轮在干什么、跑了多久、正在下发多少 token、怎么停
 //! （对照官方「✳ 5s · ↓ 3.5k tokens · esc to interrupt」）。只在当前会话忙时出现；
-//! 数据来自 `Session::activity` / `turn_usage` / `turn_started`。
+//! 数据来自 `Session::activity` / `turn_usage` / `turn_started` / `live_output_tokens`
+//! （后者是本轮输出量：端点报过的 + 还在流式、靠字数估的，见 `usage::Streamed`）。
+//! 数出来的和估出来的得分得出来：端点报过用量是实色的 `↓ 1.2k token`，
+//! 还没报过是次要色的 `≈ 1.2k token`（见 [`live_usage_label`]）。
 //! 一轮结束后用时和用量挂到回复末尾（[`turn_meta`]）。
 
 use super::ChatApp;
@@ -47,11 +50,14 @@ impl ChatApp {
                 div().child(working_verb((s.token, s.turn_started))),
             ),
         };
-        let mut meta: Vec<String> =
-            s.turn_started.map(|t| elapsed_label(t.elapsed())).into_iter().collect();
-        meta.extend(usage_label(&s.turn_usage));
+        let mut meta: Vec<(String, Color)> =
+            s.turn_started.map(|t| (elapsed_label(t.elapsed()), INK_SOFT)).into_iter().collect();
+        // 本轮正在下发的 token：端点已经报了的 + 还在流式的估算，一直在涨。
+        // 是估的还是数出来的，看符号和深浅（见 live_usage_label）
+        let live = live_usage_label(s.live_output_tokens(), &s.turn_usage);
+        meta.extend(live);
         // 顺带告诉用户怎么停（Esc 见 keys.rs）
-        meta.push("Esc 停止".into());
+        meta.push(("Esc 停止".into(), INK_SOFT));
 
         // 分隔点单独一格、两侧同宽
         let mut row = div()
@@ -74,10 +80,10 @@ impl ChatApp {
                     .child(indicator),
             )
             .child(label);
-        for text in meta {
+        for (text, color) in meta {
             row = row
                 .child(div().text_color(rgb(INK_FAINT)).child("·"))
-                .child(div().flex_shrink_0().child(text));
+                .child(div().flex_shrink_0().text_color(rgb(color)).child(text));
         }
         Some(row)
     }
@@ -127,6 +133,24 @@ fn elapsed_label(d: Duration) -> String {
     }
 }
 
+/// 运行状态行上的实时用量，两档深浅：
+/// - `↓ 1.2k token`：端点报过用量（[`TurnUsage::reported`]），数出来的准数，用实色 `INK`；
+/// - `≈ 1.2k token`：端点还一次都没报（多数 ACP agent 要等一轮结束才给），靠收到的字数估，
+///   用和旁边的用时同样的 `INK_SOFT`——看着就知道还没准。
+///
+/// 思考也算在输出里，端点报了思考量就一并标出来。一次都还没收到时为 None。
+fn live_usage_label(output: u64, u: &TurnUsage) -> Option<(String, Color)> {
+    if output == 0 {
+        return None;
+    }
+    let n = usage::compact(output);
+    let mut text = if u.reported { format!("↓ {n} token") } else { format!("≈ {n} token") };
+    if u.reasoning > 0 {
+        text += &format!("（思考 {}）", usage::compact(u.reasoning));
+    }
+    Some((text, if u.reported { INK } else { INK_SOFT }))
+}
+
 /// `↑ 1.2k ↓ 340 token（思考 120）`；内核没报用量（演示回放、部分 agent）时不显示。
 fn usage_label(u: &TurnUsage) -> Option<String> {
     if u.input == 0 && u.output == 0 {
@@ -165,15 +189,50 @@ mod tests {
     #[core::prelude::v1::test]
     fn usage_label_hides_empty_and_shows_reasoning() {
         assert_eq!(usage_label(&TurnUsage::default()), None);
-        let u = TurnUsage { input: 1200, output: 340, reasoning: 120 };
+        let u = TurnUsage { input: 1200, output: 340, reasoning: 120, reported: true };
         assert_eq!(usage_label(&u).unwrap(), "↑ 1,200 ↓ 340 token（思考 120）");
-        let u = TurnUsage { input: 5, output: 1, reasoning: 0 };
+        let u = TurnUsage { input: 5, output: 1, reasoning: 0, reported: true };
         assert_eq!(usage_label(&u).unwrap(), "↑ 5 ↓ 1 token");
     }
 
     #[core::prelude::v1::test]
+    fn live_usage_label_counts_what_is_being_streamed() {
+        // 一次都还没收到：不显示
+        assert_eq!(live_usage_label(0, &TurnUsage::default()), None);
+        // 端点还没报过用量：全靠流式估算，是「≈」+ 次要色
+        assert_eq!(
+            live_usage_label(15, &TurnUsage::default()),
+            Some(("≈ 15 token".into(), INK_SOFT))
+        );
+        // 端点报过：准数「↓」+ 实色，之后又流了一点就接着加
+        let reported = TurnUsage { input: 1200, output: 340, reasoning: 120, reported: true };
+        assert_eq!(live_usage_label(340, &reported), Some(("↓ 340 token（思考 120）".into(), INK)));
+        assert_eq!(live_usage_label(420, &reported), Some(("↓ 420 token（思考 120）".into(), INK)));
+        // 只认输出，输入不算进去
+        let only_input = TurnUsage { input: 5000, output: 0, reasoning: 0, reported: true };
+        assert_eq!(live_usage_label(0, &only_input), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn streamed_estimate_follows_ascii_and_wide_chars() {
+        let mut s = crate::usage::Streamed::default();
+        assert_eq!(s.tokens(), 0);
+        // 英文 4 字节约 1 token，零头留着（不每块取整丢成 0）
+        s.push("abc");
+        assert_eq!(s.tokens(), 0);
+        s.push("defgh");
+        assert_eq!(s.tokens(), 2);
+        // 中文按 1 字 1 token
+        s.push("你好");
+        assert_eq!(s.tokens(), 4);
+        // 端点报过之后重新估
+        s.clear();
+        assert_eq!(s.tokens(), 0);
+    }
+
+    #[core::prelude::v1::test]
     fn turn_meta_joins_what_is_known() {
-        let usage = TurnUsage { input: 5, output: 1, reasoning: 0 };
+        let usage = TurnUsage { input: 5, output: 1, reasoning: 0, reported: true };
         let t = TurnSummary { elapsed_ms: Some(65_000), usage };
         assert_eq!(turn_meta(&t).unwrap(), "用时 1 分 05 秒 · ↑ 5 ↓ 1 token");
         // 旧日志没有用时；演示回放没有用量

@@ -230,6 +230,40 @@ pub fn cache_hit_percent(cache_read: u64, input: u64) -> Option<u32> {
         .then(|| ((cache_read.min(input) * 100 + input / 2) / input) as u32)
 }
 
+/// 流式里正在收到、端点还没报过用量的那部分输出，估算它占多少 token。
+///
+/// 端点（尤其 ACP agent）通常要等一轮结束才给 `UsageUpdated`，这之前状态行上的数字靠估算，
+/// 每收到一块正文 / 思考就涨一点：ASCII 按 4 字节 ≈ 1 token（同 [`crate::usage`] 里压缩的估法），
+/// 中文这类宽字符按 1 字符 ≈ 1 token。计数留着原始量、最后才算除法，免得每块都取整丢成 0。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Streamed {
+    ascii_bytes: u64,
+    wide_chars: u64,
+}
+
+impl Streamed {
+    /// 又收到一块文字。
+    pub fn push(&mut self, text: &str) {
+        for c in text.chars() {
+            if c.is_ascii() {
+                self.ascii_bytes += 1;
+            } else {
+                self.wide_chars += 1;
+            }
+        }
+    }
+
+    /// 估出来的 token 数。
+    pub fn tokens(&self) -> u64 {
+        self.ascii_bytes / 4 + self.wide_chars
+    }
+
+    /// 端点数过这批输出了，重新开始估。
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// 首页底部那句话：token 换算成《善恶的彼岸》（按一本约 8 万 token）。
 pub fn book_line(tokens: u64) -> String {
     const BOOK: u64 = 80_000;
