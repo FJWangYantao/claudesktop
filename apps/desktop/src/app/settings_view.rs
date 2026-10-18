@@ -21,7 +21,9 @@ use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
 const SETTINGS_TABS: [(IconAll, &str); 5] = [
@@ -97,6 +99,8 @@ pub struct SettingsForm {
     rules: Vec<(String, Vec<String>)>,
     /// 展开着的说明 / 示例（`ChatApp::disclosure` 的 key），关设置页也记着
     pub(super) open_help: HashSet<&'static str>,
+    /// 上一帧量到的内容列宽度（见 `render_settings`）
+    content_w: Rc<Cell<Option<Pixels>>>,
 }
 
 impl SettingsForm {
@@ -125,6 +129,7 @@ impl SettingsForm {
             message: None,
             rules: Vec::new(),
             open_help: HashSet::new(),
+            content_w: Rc::default(),
         }
     }
 
@@ -1378,6 +1383,22 @@ impl ChatApp {
             );
         }
         let kernel_tab = f.tab == KERNEL_TAB;
+        // 内容列定宽：宽度不定时 taffy 每帧要按不同约束把整页来回排好几遍，滚一格就重排一次
+        // （实测「内核与模型」每帧 25ms，定宽后 10ms）。拿上一帧量到的列宽当定宽，
+        // 宽度变了（拉窗口、调字号）就记下并再画一帧
+        let content_w = f.content_w.get();
+        let measured = f.content_w.clone();
+        let width_probe = canvas(
+            move |bounds, window, _| {
+                if measured.get() != Some(bounds.size.width) {
+                    measured.set(Some(bounds.size.width));
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
         let tab_content: Div = match f.tab {
             KERNEL_TAB => self.render_kernel_tab(window, cx),
             2 => self.render_rules(cx),
@@ -1441,6 +1462,7 @@ impl ChatApp {
                                 .v_flex()
                                 .flex_1()
                                 .min_w_0()
+                                .relative()
                                 .child(
                                     div()
                                         .id("settings-scroll")
@@ -1449,9 +1471,16 @@ impl ChatApp {
                                         .overflow_y_scroll()
                                         // pt_1：分区标题与导航第一项的文字对齐
                                         .child(
-                                            div().v_flex().px_8().pt_1().pb_10().child(tab_content),
+                                            div()
+                                                .v_flex()
+                                                .px_8()
+                                                .pt_1()
+                                                .pb_10()
+                                                .when_some(content_w, |d, w| d.w(w))
+                                                .child(tab_content),
                                         ),
                                 )
+                                .child(width_probe)
                                 .when(kernel_tab, |d| d.child(self.render_save_bar(cx))),
                         ),
                     ),
