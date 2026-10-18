@@ -17,7 +17,7 @@
 //! **外部 agent**（ACP 内核的子进程）加不了我们的请求头：启动时把它的 `ANTHROPIC_BASE_URL` /
 //! `OPENAI_BASE_URL` 指到 `http://127.0.0.1:<端口>/via/<真实端点的 base64url>`（见 [`agent_env`]），
 //! 网关从路径里取回真实端点，用途记成 `acp`。会话从请求体里认（Claude Code 在 `metadata.user_id`
-//! 里带 `session_<ID>`，和 ACP 会话 ID 一致），第几轮由界面发消息时登记（[`note_turn`]）。
+//! 里带会话 ID，和 ACP 会话 ID 一致，见 [`agent_session`]），第几轮由界面发消息时登记（[`note_turn`]）。
 
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -237,8 +237,7 @@ impl Gateway {
                 && let Some(session) = value
                     .pointer("/metadata/user_id")
                     .and_then(Value::as_str)
-                    .and_then(|id| id.rsplit_once("session_"))
-                    .map(|(_, s)| s.to_string())
+                    .and_then(agent_session)
             {
                 entry.turn = turn_of(&session);
                 entry.session = Some(session);
@@ -331,6 +330,15 @@ fn upstream_of(request: &Request) -> Option<(String, String)> {
     };
     let upstream = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded).ok()?;
     Some((String::from_utf8(upstream).ok()?, path.to_string()))
+}
+
+/// Claude Code 请求体 `metadata.user_id` 里的会话 ID：新版是一段 JSON（`{"session_id": ..}`），
+/// 旧版是 `user_<..>_account_<..>_session_<ID>`。
+fn agent_session(user_id: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(user_id) {
+        return value.get("session_id").and_then(Value::as_str).map(str::to_string);
+    }
+    user_id.rsplit_once("session_").map(|(_, s)| s.to_string()).filter(|s| !s.is_empty())
 }
 
 /// 外部 agent 的会话现在是第几轮（界面每发一条消息登记一次）。
@@ -844,6 +852,15 @@ mod tests {
         left.sort();
         assert_eq!(left, ["2026-10-17.jsonl", "2026-10-18.jsonl", "notes.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_the_agent_session_in_both_user_id_formats() {
+        let json = r#"{"device_id":"d1","account_uuid":"","session_id":"cd2029b5-58b8"}"#;
+        assert_eq!(agent_session(json).as_deref(), Some("cd2029b5-58b8"));
+        assert_eq!(agent_session("user_abc_account__session_acp-s1").as_deref(), Some("acp-s1"));
+        assert_eq!(agent_session(r#"{"device_id":"d1"}"#), None);
+        assert_eq!(agent_session("anonymous"), None);
     }
 
     #[test]

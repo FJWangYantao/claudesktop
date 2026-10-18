@@ -7,7 +7,7 @@
 //
 // 提示词以 `write:<路径>:<内容>` 开头时只经客户端写一个文件就结束这一轮（检查点测试用）。
 // 提示词以 `llm:` 开头时向 `$ANTHROPIC_BASE_URL/v1/messages` 发一个流式请求（像 Claude Code 那样在
-// metadata.user_id 里带会话 ID），把收到的字原样回给客户端（用量网关接外部 agent 的测试用）。
+// metadata.user_id 的 JSON 里带会话 ID），把收到的字原样回给客户端（用量网关接外部 agent 的测试用）。
 //
 // 传输：stdio 上的换行分隔 JSON-RPC 2.0。
 import readline from 'node:readline';
@@ -53,7 +53,7 @@ async function askLlm(sid, text) {
       model: 'claude-sonnet-4-5',
       max_tokens: 100,
       stream: true,
-      metadata: { user_id: `user_mock_account__session_${sid}` },
+      metadata: { user_id: JSON.stringify({ device_id: 'mock', account_uuid: '', session_id: sid }) },
       messages: [{ role: 'user', content: text }],
     }),
   });
