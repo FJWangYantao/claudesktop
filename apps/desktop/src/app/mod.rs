@@ -137,6 +137,8 @@ pub struct ChatApp {
     sidebar_spinners_view: Entity<SidebarSpinners>,
     /// 输入框上方的内容区（缓存 view，`ChatApp` 每次通知都让它重画，见 `content.rs`）
     content_view: Entity<ContentView>,
+    /// 首页滚动区内容的定宽（见 `MeasuredWidth`）
+    home_w: widgets::MeasuredWidth,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
     /// 侧栏只列哪些会话（全部 / 进行中 / 待查看）
@@ -370,6 +372,7 @@ impl ChatApp {
             sidebar_spinners: Default::default(),
             sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
             content_view: cx.new(|_| ContentView::new(weak.clone())),
+            home_w: Default::default(),
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),
@@ -726,6 +729,67 @@ impl ChatApp {
         window.on_next_frame(move |window, cx| {
             let _ = this.update(cx, |app, cx| app.debug_scroll_frames(step + 1, window, cx));
         });
+    }
+
+    /// 压测钩子：把内容区换成要压的页面（`CLAUDESKTOP_STRESS_VIEW`）。`settings:N` 是设置页第 N 个分类，
+    /// `home` 是首页概览，`requests` 是首页「请求」页签（灌 `n` 轮假请求，列第一页），
+    /// `requests-all` 同上但全部列出来。
+    /// 首页要有内核才显示用量面板，没配过的就在内存里先当演示内核（不写盘）。
+    pub(crate) fn debug_stress_view(
+        &mut self,
+        view: &str,
+        n: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match view {
+            "home" | "requests" | "requests-all" => {
+                self.settings.kernel.get_or_insert(KernelChoice::Demo);
+                self.overview_tab = 0;
+                if view != "home" {
+                    self.overview_tab = 2;
+                    self.debug_fill_requests(n, view == "requests-all");
+                }
+            }
+            _ => {
+                let tab = view.strip_prefix("settings:").and_then(|t| t.parse().ok());
+                self.open_settings_at(tab.unwrap_or(0), window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 压测钩子：逐帧往内容区发一格滚轮（先往下 150 帧再往上 150 帧），走完出统计。
+    /// 走真实的滚轮路径：事件交给窗口分发，滚动容器自己改偏移、通知内容区重画。
+    /// 滚到头不动了也让内容区照样重画一帧，量的始终是「滚一格要画多久」。
+    /// 分发事件时不能占着 `ChatApp`（滚轮监听里会再去更新它），所以是关联函数、拿弱引用。
+    pub(crate) fn debug_wheel_frames(
+        this: WeakEntity<Self>,
+        step: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        const STEPS: usize = 300;
+        if step >= STEPS {
+            let _ = this.update(cx, |app, _| app.stress_report());
+            return;
+        }
+        let size = window.viewport_size();
+        // 内容区中间偏右：设置页避开左侧分类导航，首页落在用量面板上
+        let position = point(size.width * 0.65, size.height * 0.45);
+        let lines = if step < STEPS / 2 { -3. } else { 3. };
+        window.dispatch_event(
+            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Lines(point(0., lines)),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            }),
+            cx,
+        );
+        let _ = this.update(cx, |app, cx| app.content_view.update(cx, |_, cx| cx.notify()));
+        window
+            .on_next_frame(move |window, cx| Self::debug_wheel_frames(this, step + 1, window, cx));
     }
 
     /// 压测钩子：逐帧往输入框里打一个字（300 帧，每 40 字换一行），走完清空输入框出统计。

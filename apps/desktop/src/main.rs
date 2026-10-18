@@ -127,6 +127,9 @@ fn main() {
                     // 每帧画完才滚下一段，量的是真实帧间隔；不用计时器驱动，Windows 计时器按 15.6ms 一档）。
                     // 加 CLAUDESKTOP_STRESS_BUSY=1 则不滚，置忙 5 秒看转圈常驻时每秒重绘几次；
                     // 加 CLAUDESKTOP_STRESS_TYPE=1 则改成逐帧往输入框里打字。
+                    // 加 CLAUDESKTOP_STRESS_VIEW=settings:N / home / requests / requests-all 则不灌对话，
+                    // 改成逐帧滚设置页第 N 个分类 / 首页概览 / 首页「请求」页签
+                    // （灌 <行数> 轮假请求，只列第一页 / 全部列出来）。
                     // 统计写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）
                     if let Some(n) = std::env::var("CLAUDESKTOP_STRESS")
                         .ok()
@@ -134,16 +137,29 @@ fn main() {
                     {
                         let busy = std::env::var_os("CLAUDESKTOP_STRESS_BUSY").is_some();
                         let typing = std::env::var_os("CLAUDESKTOP_STRESS_TYPE").is_some();
-                        let _ = this.update(cx, |app, cx| app.debug_stress(n, busy, cx));
+                        let view = std::env::var("CLAUDESKTOP_STRESS_VIEW").ok();
+                        let _ = this.update_in(cx, |app, window, cx| match &view {
+                            Some(view) => app.debug_stress_view(view, n, window, cx),
+                            None => app.debug_stress(n, busy, cx),
+                        });
                         cx.background_executor().timer(Duration::from_millis(1500)).await;
                         let _ = this.update_in(cx, |app, window, cx| {
                             app.frame_log = Some(Vec::new());
+                            if view.is_some() {
+                                return;
+                            }
                             if typing {
                                 app.debug_type_frames(0, window, cx);
                             } else if !busy {
                                 app.debug_scroll_frames(0, window, cx);
                             }
                         });
+                        if view.is_some() {
+                            let weak = this.clone();
+                            let _ = cx.update(|window, cx| {
+                                ChatApp::debug_wheel_frames(weak, 0, window, cx)
+                            });
+                        }
                         if busy {
                             cx.background_executor().timer(Duration::from_secs(5)).await;
                             let _ = this.update(cx, |app, _| app.stress_report());
