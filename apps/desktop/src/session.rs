@@ -433,7 +433,13 @@ impl Session {
                     let shown = if open {
                         &steps[..]
                     } else if live {
-                        &steps[n.saturating_sub(LIVE_TAIL)..]
+                        // 并行的子任务的子行插在各自 task 行下面，最近的几步不一定在最后：
+                        // 露出的第一行是子行时往前带上它的 task 行，不让子行没了上级
+                        let mut from = n.saturating_sub(LIVE_TAIL);
+                        while from > 0 && matches!(&t[steps[from]], ChatItem::Tool(c) if c.sub) {
+                            from -= 1;
+                        }
+                        &steps[from..]
                     } else {
                         &[]
                     };
@@ -977,7 +983,9 @@ impl Session {
             KernelEvent::ToolCallStarted { id, title, status, kind, parent } => {
                 self.finish_thinking();
                 let (name, arg) = tool_label(&kind, &title);
-                self.transcript.push(ChatItem::Tool(ToolCard {
+                // 子任务的工具行接在自己那个 task 行（和它已有的子行）后面：几个子任务并行时不交错
+                let at = parent.as_deref().and_then(|p| self.after_task(p));
+                let card = ChatItem::Tool(ToolCard {
                     id: Some(id),
                     kind,
                     name,
@@ -988,7 +996,11 @@ impl Session {
                     diffs: Vec::new(),
                     expanded: false,
                     sub: parent.is_some(),
-                }));
+                });
+                match at {
+                    Some(i) => self.transcript.insert(i, card),
+                    None => self.transcript.push(card),
+                }
             }
             KernelEvent::ToolCallUpdated { id, title, status, raw_output, output } => {
                 if let Some(card) = self.tool_card(&id) {
@@ -1118,6 +1130,16 @@ impl Session {
     }
 
     /// 按 tool_call_id 找最近的工具行。
+    /// task 调用 `task` 的子行该插在哪：它和它已有子行里最后一行的后面；找不到 task 行时为 None（追加）。
+    fn after_task(&self, task: &str) -> Option<usize> {
+        let prefix = format!("{task}/");
+        let last = self.transcript.iter().rposition(|item| {
+            matches!(item, ChatItem::Tool(card)
+                if card.id.as_deref().is_some_and(|id| id == task || id.starts_with(&prefix)))
+        })?;
+        Some(last + 1)
+    }
+
     fn tool_card(&mut self, id: &str) -> Option<&mut ToolCard> {
         self.transcript.iter_mut().rev().find_map(|item| match item {
             ChatItem::Tool(card) if card.id.as_deref() == Some(id) => Some(card),
@@ -1540,6 +1562,51 @@ mod tests {
         // 复制整轮正文，不跨到上一轮
         assert_eq!(s.turn_text(3), "a\n\nb");
         assert_eq!(s.turn_text(6), "c");
+    }
+
+    #[core::prelude::v1::test]
+    fn parallel_subagent_rows_stay_under_their_own_task() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.transcript.push(ChatItem::User { text: "查".into(), images: Vec::new() });
+        s.begin_turn();
+        let started = |id: &str, parent: Option<&str>| KernelEvent::ToolCallStarted {
+            id: id.into(),
+            title: format!("Read {id}"),
+            status: "pending".into(),
+            kind: "read".into(),
+            parent: parent.map(Into::into),
+        };
+        s.apply_event(started("t1", None), None);
+        s.apply_event(started("t2", None), None);
+        // 两个子任务的行交错着到
+        s.apply_event(started("t2/c1", Some("t2")), None);
+        s.apply_event(started("t1/c1", Some("t1")), None);
+        s.apply_event(started("t2/c2", Some("t2")), None);
+        s.apply_event(started("t1/c2", Some("t1")), None);
+        let ids: Vec<&str> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                ChatItem::Tool(card) => card.id.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["t1", "t1/c1", "t1/c2", "t2", "t2/c1", "t2/c2"]);
+        // 找不到 task 行（不该发生）：照常追加
+        s.apply_event(started("t9/c1", Some("t9")), None);
+        assert!(
+            matches!(s.transcript.last(), Some(ChatItem::Tool(c)) if c.id.as_deref() == Some("t9/c1"))
+        );
+        // 跑着时组里只露最近几步：露出的第一行是子行（t2/c1）时带上它的 task 行
+        let at = |id: &str| {
+            s.transcript
+                .iter()
+                .position(|i| matches!(i, ChatItem::Tool(c) if c.id.as_deref() == Some(id)))
+                .unwrap()
+        };
+        let layout = s.compute_layout(ViewMode::Normal);
+        assert!(layout[at("t2")].body && layout[at("t2/c1")].body);
+        assert!(!layout[at("t1/c2")].body);
     }
 
     #[core::prelude::v1::test]

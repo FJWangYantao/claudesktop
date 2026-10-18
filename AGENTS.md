@@ -161,5 +161,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   ACP agent 可选经网关：起进程时设 base URL（`gateway::agent_env`，端点编码在 `/via/` 路径里），轮次靠 `gateway::note_turn`。
 - 子 agent 在 `crates/builtin/src/subagent.rs`：`task` 工具开子会话（ID `主会话/调用 ID`），和主会话共用 `run_steps`；
   子会话的事件经 `subagent::forward` 转到主会话（工具行带 `parent`，`history::rebuild` 跳过它们）。
+  同一步的几个 `task` 并行跑（`run_tools`），界面把子行插在各自 task 行下面（`Session::after_task`），
+  所以 transcript 不是只追加的：按下标记的状态（如 `open_groups`）要想到这一点。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。

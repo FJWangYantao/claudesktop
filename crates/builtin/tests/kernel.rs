@@ -1998,3 +1998,90 @@ fn gateway_routes_external_agents_by_path_and_finds_their_session() {
     assert_eq!(entry["output"], 5);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 收到的请求：(到达时刻, 请求体)
+type Arrivals = Arc<Mutex<Vec<(Instant, String)>>>;
+
+/// 并发版的剧本服务器：每个连接一个线程，按到达顺序取剧本里的下一条；另记每个请求到达的时刻。
+fn serve_concurrent(script: Vec<Reply>) -> (String, Arrivals) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let seen: Arrivals = Arc::default();
+    let log = seen.clone();
+    let script = Arc::new(Mutex::new(std::collections::VecDeque::from(script)));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (log, script) = (log.clone(), script.clone());
+            std::thread::spawn(move || {
+                let body = read_request(&stream);
+                // 取剧本和记到达在同一把锁里：第几个到的就拿第几条
+                let reply = {
+                    let mut log = log.lock().unwrap();
+                    log.push((Instant::now(), body));
+                    script.lock().unwrap().pop_front()
+                };
+                if let Some(reply) = reply {
+                    let _ = respond(stream, reply);
+                }
+            });
+        }
+    });
+    (base, seen)
+}
+
+#[test]
+fn tasks_in_the_same_step_run_in_parallel() {
+    let dir = workdir("subagent-parallel");
+    let slow = || Reply::Sse {
+        lines: vec![
+            delta("content", "子任务"),
+            delta("content", "做完"),
+            delta("content", "了"),
+            finish("stop"),
+            "data: [DONE]".into(),
+        ],
+        gap_ms: 300,
+    };
+    let (base, seen) = serve_concurrent(vec![
+        tool_calls(&[
+            ("t1", "task", serde_json::json!({ "description": "查 A", "prompt": "look at A" })),
+            ("t2", "task", serde_json::json!({ "description": "查 B", "prompt": "look at B" })),
+        ]),
+        slow(),
+        slow(),
+        happy_stream("两个都查完了。"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("查查 A 和 B")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.tool_status("t1").as_deref(), Some("completed"));
+    assert_eq!(h.tool_status("t2").as_deref(), Some("completed"));
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    // 两个子会话的请求几乎同时发出（依次跑的话第二个要等第一个的流跑完，约 1.2 秒）
+    let gap = seen[2].0.duration_since(seen[1].0);
+    assert!(gap < Duration::from_millis(600), "子任务没有并行：间隔 {gap:?}");
+    let prompts: Vec<String> = seen[1..3]
+        .iter()
+        .map(|(_, b)| {
+            serde_json::from_str::<serde_json::Value>(b).unwrap()["messages"][1]["content"]
+                .to_string()
+        })
+        .collect();
+    assert!(
+        prompts.iter().any(|p| p.contains("look at A"))
+            && prompts.iter().any(|p| p.contains("look at B"))
+    );
+    // 两份报告按调用顺序回给主模型
+    let last: serde_json::Value = serde_json::from_str(&seen[3].1).unwrap();
+    let msgs = last["messages"].as_array().unwrap();
+    let results: Vec<&str> = msgs
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["tool_call_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(results, ["t1", "t2"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

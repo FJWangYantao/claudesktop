@@ -8,7 +8,8 @@
 //!   带 `parent`，界面缩进在 task 那一行下面）、权限请求、文件改动（检查点照常记）、重试、用量；
 //!   文字、思考、压缩是子会话自己的事，不转
 //! - 权限跟主会话当前的模式和「总是允许」规则；停止主会话的这一轮，子会话一起停
-//! - 一次跑一个：并行时几个子任务的步骤会在界面上交错
+//! - 同一步里的几个 `task` 一起跑（和连续的只读调用一样，见 `run_tools`）；各自的工具行在界面上
+//!   插在自己那个 task 行下面（`Session::apply_event`）
 
 use claudesktop_core::KernelEvent;
 use claudesktop_core::plugin::{self, AgentDef};
@@ -57,8 +58,9 @@ pub fn spec(agents: &[AgentDef]) -> Value {
          search across the codebase or an investigation whose intermediate steps you don't need \
          to keep. The subagent does not see this conversation: the prompt must contain everything \
          it needs (the goal, relevant paths, constraints, and what to report back). It returns a \
-         single final report that only you see, so relay what matters to the user. Subagents run \
-         one at a time, and their tool calls still need the user's approval.\n\nAvailable agents:",
+         single final report that only you see, so relay what matters to the user. To run several \
+         independent subtasks at once, call task several times in the same response: they run in \
+         parallel. Their tool calls still need the user's approval.\n\nAvailable agents:",
     );
     for agent in agents {
         description.push_str(&format!("\n- {}: {}", agent.name, agent.description));

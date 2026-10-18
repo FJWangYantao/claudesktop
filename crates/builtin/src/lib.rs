@@ -665,7 +665,7 @@ impl Inner {
         self.finish_tool(session, cwd, call, action, &title, stopped)
     }
 
-    /// 一步里的全部调用：连续的只读调用一起并行跑，其余依次执行；结果按调用顺序返回。
+    /// 一步里的全部调用：连续的只读调用和子任务（`task`）一起并行跑，其余依次执行；结果按调用顺序返回。
     /// 中途被取消时返回 None。
     fn run_tools(
         &self,
@@ -679,7 +679,10 @@ impl Inner {
         while !rest.is_empty() {
             let n = rest
                 .iter()
-                .take_while(|c| tools::parallel_safe(&c.function.name))
+                .take_while(|c| {
+                    let name = &c.function.name;
+                    tools::parallel_safe(name) || name == subagent::TASK
+                })
                 .count()
                 .min(PARALLEL_TOOLS);
             if n < 2 {
