@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（已存在，如 v0.1.0）'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # tag 推送用 ref_name，手动触发用输入的 tag
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Windows release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 版本号与 tag 一致
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          if ("v$version" -ne $env:TAG) {
+            throw "Cargo.toml 里的版本是 $version，tag 是 $env:TAG；先改版本号再打 tag"
+          }
+
+      - name: 构建
+        run: cargo build --release -p claudesktop --locked
+
+      - name: 打包
+        shell: pwsh
+        run: |
+          $dir = "dist/claudesktop-$env:TAG-windows-x64"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item target/release/claudesktop.exe $dir
+          Copy-Item README.md, LICENSE $dir
+          Compress-Archive -Path $dir/* -DestinationPath "$dir.zip"
+          # 顺带传一份裸 exe，只想单文件的人直接下
+          Copy-Item target/release/claudesktop.exe "dist/claudesktop.exe"
+          $zip = Get-FileHash "$dir.zip" -Algorithm SHA256
+          "$($zip.Hash)  $(Split-Path $zip.Path -Leaf)" |
+            Out-File "dist/SHA256SUMS.txt" -Encoding utf8
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: claudesktop ${{ env.TAG }}
+          # 带预发布后缀（如 v0.2.0-beta.1）自动标成 pre-release
+          prerelease: ${{ contains(env.TAG, '-') }}
+          generate_release_notes: true
+          body: |
+            Windows x64 免安装版：下载 `claudesktop-<tag>-windows-x64.zip` 解压双击 `claudesktop.exe`。
+
+            第一次启动不会猜后端，首页是配置引导：选自研内核（填端点 / API Key / 模型）或 ACP agent（填适配器命令）。
+
+            需要 Windows 10/11 与 VC++ 运行库（一般已随系统或其它软件装好）。
+            设置与会话存在 `%APPDATA%\claudesktop`，可用 `CLAUDESKTOP_DATA_DIR` 改。
+          files: |
+            dist/claudesktop-*-windows-x64.zip
+            dist/claudesktop.exe
+            dist/SHA256SUMS.txt

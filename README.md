@@ -1,113 +1,180 @@
 # claudesktop
 
-Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
+Claude 风格的 AI 编程桌面端（Rust + GPUI），Windows 原生，**内核可更换**。
 
-- 调研报告：[调研报告-GPUI-Claude风格桌面Harness.md](./调研报告-GPUI-Claude风格桌面Harness.md)
-- 设计指南：[设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md)（Claude 系产品的设计理念、视觉系统、组件做法与本项目落地清单）
-- 技术栈：`gpui-kit 0.7`（UI，内含 pin 版 GPUI）+ `agent-client-protocol`（内核边界，M1 引入）+ 自研 Rust 内核（进程内）
-- 用量网关：[内置用量统计网关](./想法-用量统计网关.md)（每个请求一行日志：耗时、用量、重试、取消，按设置里的单价估算费用；首页用量的「请求」页签里看）
-- 待做设计：[MCP 远程服务的 OAuth 登录](./设计说明-MCP-OAuth.md)（401 时在设置页「登录」，走 DCR + PKCE，token 过期自动刷新）
+界面照着 Claude 系的暖纸底 + 赤陶橙做：浮起的圆角侧栏、顶栏兼做窗口拖拽区、
+右对齐的用户气泡、流式 Markdown、工具行与 diff、权限卡片。内核是一个可替换的槽——
+同一个界面下可以挂自研的进程内内核，也可以挂任意 ACP agent（Claude Code、pi 等），
+一个会话绑一个内核，两个内核可以同时在线、并排跑同一个任务。
 
-## 里程碑
+- 许可证：Apache-2.0（[LICENSE](./LICENSE)）
+- 平台：目前只支持 **Windows**（GPUI 的窗口 / 输入法 / 通知层都按 Windows 打通并实测；macOS 理论上可编，未测）
 
-- [x] **M0（核心已过）** 走通框架：窗口 + 中文渲染 + IME（微软拼音全绿：候选框跟随/组词 Enter·Backspace 正常/无豆腐块；进程内存 ~103MB）
-  - [ ] 开放项：搜狗拼音实测（报告预判存疑，不影响推进）；多显示器（跨屏换缩放）没测，手边只有一块屏
-  - [x] 高 DPI：开发机单屏 125%（120 DPI）下日常使用
-  - [x] 1 万条虚拟列表滚动压测：对话区改用 GPUI `list`（只布局可见行，按行指纹只重测变化的行），1 万行（用户消息 / markdown / 工具行混合）上下滚动 300 帧，帧间隔与空会话相同（p50 33ms，受压测驱动的定时器粒度限制），内存 +12MB；`CLAUDESKTOP_STRESS=10000` 复现
-- [x] **M1** Kernel trait + KernelEvent（复用 ACP 类型）+ AcpKernel 驱动真实 agent
-  - [x] 桌面端接入 AcpKernel：事件流 → 消息 / 思考 / 工具行 / 计划；默认 mock agent，`CLAUDESKTOP_KERNEL=demo` 退回演示回放
-  - [x] 真实适配器握手通过（`ACP_AGENT="cmd /c npx -y @agentclientprotocol/claude-agent-acp"`，Windows 实测；未发提示词）
-  - [x] 用真实 agent 跑通一次完整只读任务：pi（`ACP_AGENT="cmd /c npx -y pi-acp"`，模型由 pi 配置决定）经同一套 UI 完成「列目录 + 读 README + 总结」，未改动任何文件
-  - [x] Claude Code 适配器同样跑通：只读任务（ls + 读 README）与写文件任务（Manual 模式弹出权限卡片，点「Yes」后在隔离目录创建了文件）均成功
-  - [x] 多会话：一条连接上开任意多个 ACP 会话（事件带 sessionId 路由），界面每个会话各自的对话 / 忙闲 / 模式 / 模型；「新会话」真正发 `session/new`；pi 与 Claude 适配器均实测支持
-  - [x] 下拉与模型名由 agent 上报：Claude = 权限模式，pi = 思考强度；pi 启动时推送的 Skills 列表折叠为「启动信息」
-  - 注：pi 没有逐项权限审批（工具直接执行），只读性靠提示词约束；`CLAUDESKTOP_AUTOPROMPT` 可指定自动发送的提示词
-  - [x] 权限审批 UI：agent 请求权限时界面弹卡片（允许 / 拒绝），内核挂起等待；`ACP_AUTO_APPROVE=1` 可退回自动批准
-  - [x] 权限模式下拉接 `session/set_mode`（真实适配器实测接受）
-  - [x] 修复：提示词不再阻塞指令循环，一轮进行中「停止」可即时生效
-  - [x] 会话持久化：每会话一份追加式事件日志（`%APPDATA%\claudesktop\sessions\<id>.jsonl` + 元信息 `<id>.json`；`CLAUDESKTOP_DATA_DIR` 可改位置），流式块合并后写入；启动时重放恢复，侧栏按工作目录分组并显示最近活动时间；演示回放模式不落盘
-  - [x] 恢复的会话续聊：在历史会话里发消息时先续接内核会话——优先 ACP `session/resume`，其次 `session/load`（agent 重放的历史直接丢弃，本地已有），都不支持或失败则新开会话并提示「看不到之前的上下文」；仅当记录的 agent 命令与当前一致时才尝试续接。mock 用 `MOCK_RESUME=resume|load` 模拟两种能力
-  - [x] 真实适配器续接：Claude 适配器关掉 agent 进程后重新起一个续接，上下文还在（`tests/live_acp.rs`）；pi 没有再测
-  - [x] Windows job object 防孤儿进程：启动时把本进程放进 `KILL_ON_JOB_CLOSE` job，子孙进程自动继承；强杀应用后实测 `cmd → powershell Start-Sleep`（不读 stdin）整棵树被回收
-- [x] **M2** 自研内核 `crates/builtin`（provider 抽象：OpenAI 兼容 + Anthropic 原生两种协议）
-  - [x] provider 层抽象：`ChatProvider` trait + 协议无关的消息结构（文本 / 图片分段），`OpenAiProvider`（Chat Completions，覆盖 OpenAI / DeepSeek / GLM / Kimi / OpenRouter / Ollama / vLLM）与 `AnthropicProvider`（原生 `/v1/messages`：思考块、`tool_use`、提示缓存、连续 tool 结果合并成一个 user 回合）各实现一套翻译
-  - [x] OpenAI 兼容流式对话：正文 / 思考（`reasoning_content` 或 `reasoning`）/ 用量；429·5xx 在出字前退避重试（1s、3s）；取消即时生效且之后不再发事件；多轮历史
-  - [x] Anthropic 原生流式：`message_start` / `content_block_*` / `message_delta`，`stop_reason` 映射到统一语义（`tool_use` → `tool_calls`、`max_tokens` → `length`）；system 提到顶层并带 `cache_control: ephemeral`，工具定义同样打缓存标记
-  - [x] **图片输入**：输入框可直接粘贴截图（读剪贴板里的图片或图片文件）或点「附加图片」选文件，缩略图排在输入框上方可逐张删除（一轮最多 8 张）；发送时图片落到 `<sessions>/<id>.assets/`，历史重建时读回；OpenAI 兼容走 `image_url` 的 data URI，Anthropic 走 `source.base64`
-  - [x] 桌面端接入：`CLAUDESKTOP_KERNEL=builtin`，配置走 `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`
-  - [x] 真实端点实测：Antigravity Tools 本地网关（`http://127.0.0.1:8045/v1`）的 `gemini-3.8-flash`，单测与桌面端均跑通
-  - [x] 工具调用循环：`read_file` / `list_dir` / `write_file` / `edit_file`（精确替换，兼容 CRLF）/ `shell`（Windows 用 pwsh，超时、取消连子进程一起结束）；一轮最多 200 步（设置页「内核与模型」可改，`CLAUDESKTOP_MAX_STEPS` 可覆盖）
-  - [x] 权限：读工具直接放行；写和命令按模式（Manual / Accept edits / Plan 只读 / Bypass）→ 已保存规则 → 弹卡片询问（允许一次 / 总是允许 / 拒绝）。「总是允许」按项目存到数据目录的 `permissions.json`（编辑 = `edit`，命令 = `shell:<程序> [子命令]` 前缀，复合命令不提供）；工作目录外的写入永远询问
-  - [x] 工具循环实测：gemini-3.8-flash 读 → 写（弹权限）→ 回答，桌面端工具行与权限卡片正常
-  - [x] 历史会话续聊：用本地日志重建上下文（工具调用以 `[tool] 标题 → 状态：摘要` 行并入，总量超 20 万字符从最早的轮次丢）；换了端点 / 模型也能续接；上次没完成的工具调用恢复为「已中断」
-  - [x] 改文件显示 diff：`write_file` / `edit_file` 执行前算出改动预览，挂在工具行下（先于权限卡片，看着 diff 决定是否放行）；ACP agent 上报的 `ToolCallContent::Diff` 走同一条路径。事件和日志里只存带 3 行上下文的 hunk（单份最多 400 行），界面默认显示前 40 行可展开
-  - [x] 设置页（侧栏「设置」）：选内核（自研 / ACP agent / 演示回放）。自研内核支持**多套 provider 档案**——每套含名称、协议（OpenAI 兼容 / Anthropic 原生）、端点、API Key、模型与请求参数，内置 DeepSeek / GLM / Kimi / Anthropic / OpenAI / OpenRouter / Ollama 预设一键添加，可增删；旧版单套配置读入时自动迁移成一套档案；输入框旁的档案菜单可快速切换（切档会重启自研内核，进行中的对话下次发消息时续接）。ACP 填启动命令。保存到数据目录的 `settings.json`，「保存并应用」时重启内核，有对话的会话下次发消息时自动续接。启动时环境变量优先于设置文件
-  - [x] 参数透传：每套档案可带 `temperature` / `max_tokens` / 额外 JSON 字段（浅合并进请求体，同名键覆盖默认值）；调试可用 `CLAUDESKTOP_TEMPERATURE` / `CLAUDESKTOP_MAX_TOKENS` / `CLAUDESKTOP_EXTRA_JSON` 覆盖，`CLAUDESKTOP_PROTOCOL=anthropic` 切原生协议，`CLAUDESKTOP_DEBUG_HTTP=1` 把请求与错误细节打到 stderr
-  - [x] 会话内切模型：输入框旁的模型名可点开，列出端点的模型（原生协议走 `/models`），选中后当前会话下一步起生效，并记为新会话的默认模型
-- [x] **M3** 双内核收口：同一 UI、同一任务、两个内核
-  - [x] 内核按需启动、可同时在线：自研 / ACP / 演示回放各一个槽，每个会话绑定自己的内核（侧栏会话行标出「自研 / ACP」，底部列出每个已启动内核的状态）；改了某个内核的设置只重启那一个
-  - [x] 输入框旁的内核下拉：空会话直接换内核（并记为新会话默认）；有对话的会话固定在原内核上，可把首条提示词放到另一个内核上新开会话重跑；用户消息悬停时也有「在 X 上重跑」
-  - [x] 历史会话按记录的 agent 标识回到原来的内核续接（内核没启动就先启动）
-  - [x] 实测：同一条提示词先在自研内核（gemini-3.8-flash）跑完，再一键放到 ACP（mock agent）上重跑，两个会话并排、各自的事件互不串
-- [ ] **打磨**（M3 之后，把界面上剩下的演示数据换成真的）
-  - [x] 首页用量概览接真实数据：每轮结束时日志里记一条 `turn`（时间、模型、输入 / 输出 token），启动时汇总全部会话；会话数 / 消息数 / Token 总量 / 活跃天数 / 高峰时段（本地时间）/ 最常用模型，可按全部 / 30 天 / 7 天筛选；热力图为最近 26 周（行 = 周一到周日）；「模型」页签列出各模型的轮数和 token。旧日志没有 `turn` 记录的按会话更新时间计、模型从内核标识里取
-  - [x] 设置页列出已保存的「总是允许」规则（按项目分组），可逐条删除；内核每次判断前重读 `permissions.json`，删除不用重启即生效，写入也先读后改不会覆盖
-  - [x] 侧栏：写死的「任务」换成真实的「进行中」（所有正在跑 / 等授权的会话，标出内核，点击切换）；会话列表可滚动（之前超出高度会被截掉）
-  - [x] 会话重命名 / 删除：侧栏会话行悬停出现按钮；重命名回车或点别处提交，写回元信息；删除先确认，停掉进行中的一轮并删除日志与元信息（用量统计同步去掉），删光时自动补一个新会话
-  - [x] 顶栏的模型名也能点开模型下拉（与输入框旁的是同一个，锚在顶栏下方）
-  - [x] 自研内核新增只读搜索工具 `glob`（按文件名 / 路径模式找文件，按修改时间排序）与 `grep`（正则搜内容，可限定 include、忽略大小写、只返回文件名）：遵守 `.gitignore`、跳过隐藏 / 二进制 / 超过 2MB 的文件，结果有上限；Plan 模式可用；实测 gemini 会主动用它们代替 shell 搜索
-  - [x] 对话区虚拟列表：长对话只渲染视口附近的行；自动跟随改为「在底部才跟随」，往上翻看历史时不再被拽回底部，发消息时重新跟随
-  - [x] 侧栏底部的内核状态行（「自研内核 · 已连接」）可在设置页关掉（「通用 → 侧栏显示内核状态」，开关即时生效并写回；默认显示，老设置文件不受影响）
-  - [x] 设置页改为左侧分类导航（通用 / 内核与模型 / 权限），右侧内容单独滚动；「通用」里的选项是「标题 + 说明 | 控件」一行式，行间细分隔线
-  - [x] 自研内核读项目说明：用户级 `~/.claude/CLAUDE.md` + 工作目录到仓库根（含 `.git` 的目录）之间各级的 `AGENTS.md` / `CLAUDE.md` 进系统提示词（同内容只读一份，单个 2 万字、合计 4 万字封顶），每轮开始时重读
-  - [x] 自研内核上下文压缩：用量过窗口八成时下一次请求前自动把较早的对话总结成摘要（摘要进系统提示词，保留本轮；本轮自己太长时只留用户消息和最近几步），端点报「超出上下文」时压缩一次再重发；`/compact` 或提示条上的「现在压缩」手动压缩。对话里留一条可展开看摘要的分隔线，日志里有记录，重启续接时按同样的规则重建
-  - [x] 自研内核待办工具 `todo_write`：多步任务时模型列清单、逐项标进行中 / 完成，直接显示成界面上的计划（不占工具行，Plan 模式也能用）；续接时清单作为一行摘要回到上下文
-  - [x] 自研内核并行读：同一步里连续的只读调用（read_file / list_dir / glob / grep）同时执行（最多 8 个），工具行和结果仍按调用顺序；写入、命令和需要授权的调用照旧逐个执行
-  - [x] 系统通知：窗口不在前台（失活或最小化）时，回复完成 / 等你授权 / 出错弹 Windows 通知（标题是会话名，正文是回复首行或要授权的操作）；点通知回到那个会话，回到窗口时撤掉已发的通知；设置页「通用 → 系统通知」可关（用 gpui 自带的 toast，首次发通知时在 `HKCU\Software\Classes\AppUserModelId\claudesktop.desktop` 登记应用名）
-  - [x] 自研内核 web_fetch：抓 http(s) 网页，HTML 转成带标题 / 列表 / 代码块 / 绝对链接的纯文本（JSON 等文本原样，二进制拒绝），单次最多 2 万字、用 offset 翻页；按主机询问授权，可「本项目内总是允许访问 <主机>」，Plan 模式下也能用；不跑脚本，只认 UTF-8
-- [x] 三个下拉（权限模式 / 内核 / 模型）迁移到 gpui-kit `Popover`：open 状态由组件自管（点外 / Esc 关闭），删掉根视图的菜单 bool、互斥逻辑与手摆坐标；组件使用惯例见 AGENTS.md
-- [x] 设计规范落地（[设计指南](./设计指南-Claude风格UI.md) 第七章 P0 + P1）：交互态 / 主按钮 / 宽度 token，信息文字对比度达标；快捷键（Esc 停止、Shift+Tab 权限模式、Ctrl+N / Ctrl+B / Ctrl+Tab、Ctrl+O 视图模式）；视图模式三档（摘要 / 标准 / 详细，写回设置）；回复「复制」、用户消息「复制 / 编辑」；输入框一体化（工具栏收进卡片、聚焦反馈）；发送按钮三态；深色模式（设置页「外观」：跟随系统 / 浅色 / 深色，即时生效）
-- [x] **M4** 扩展：检查点、MCP、插件、子 agent、用量网关
-  - [x] 检查点与回退：自研内核写文件前后的内容按内容寻址存下，用户消息上「回退」可选对话和文件 / 只回对话 / 只回文件，之后被别人改过的文件默认跳过；ACP agent 经客户端写的文件同样记（对话回退只有自研内核支持），见[设计说明-检查点与回退.md](./设计说明-检查点与回退.md)
-  - [x] MCP（自研内核）：数据目录的 `mcp.json`（格式同 Claude Code 的 `.mcp.json`），本地命令走 stdio，远程走 Streamable HTTP / 旧版 SSE（可带 headers），连上过又断了的自动退避重连；工具走正常的权限流程，标了只读的 Plan 模式也能用；设置页「MCP」看状态、编辑配置、重新加载 / 重新连接。实测连上 DeepWiki 的公开端点（经系统代理）
-  - [x] 插件：数据目录 `plugins/`，兼容 Claude Code 的插件格式（斜杠命令、技能、子 agent、MCP 服务、钩子），设置页「插件」里启用，也能从 git 地址安装 / 更新 / 卸载，见[设计说明-插件.md](./设计说明-插件.md)
-  - [x] 子 agent：`task` 工具把独立的子任务交给子会话（角色来自插件或内置的通用角色），工具行缩进在 Task 行下；同一步的几个 `task` 并行跑，各自的行不交错
-  - [x] 用量网关：自研内核的每个请求经本地网关转发并记一行日志（不记提示词和密钥），首页用量的「请求」页签按会话和轮列出，按设置里的单价表估算费用（支持峰谷价）；ACP agent 可选经网关（设置页开关，靠 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`；实测 Claude 适配器的请求按会话和轮归组），见[想法-用量统计网关.md](./想法-用量统计网关.md)
-  - [x] 交互：Ctrl+K 命令面板（含搜消息正文）、应用内提示、运行中排队发消息、失败卡片按错误种类给提示和操作、每轮「改动 N 个文件」、侧栏分组折叠和归档、界面缩放和字体设置、动效（矢量转圈、状态行呼吸圆点、思考扫光，遵守「减少动态效果」）；从资源管理器往会话区拖文件（图片收成附件，其他文件 / 文件夹在光标处插入 `@引用`，工作目录里的写相对路径；`CLAUDESKTOP_DROP=路径;路径` 模拟松开）
+## 功能
+
+**内核三种**
+
+| 内核 | 说明 |
+|---|---|
+| 自研内核（进程内） | 直接连 OpenAI 兼容或 Anthropic 原生端点；工具循环、权限、压缩、子 agent、MCP、插件全在这一层 |
+| ACP agent | 走 `agent-client-protocol` 起外部进程（Claude Code 适配器、pi 等），多会话、权限审批、续接都支持 |
+| 演示回放 | 内置假数据，改界面时用，不落盘 |
+
+**自研内核**
+
+- 两种协议：OpenAI 兼容（OpenAI / DeepSeek / GLM / Kimi / OpenRouter / Ollama / vLLM …）
+  与 Anthropic 原生（思考块、`tool_use`、提示缓存），都是流式，正文 / 思考 / 用量齐全
+- 多套 provider 档案，输入框旁可快速切档；每套可带 temperature / max_tokens / 额外 JSON 字段
+- 工具：`read_file` / `list_dir` / `write_file` / `edit_file` / `shell`（pwsh，超时、取消连子进程一起结束）/
+  `glob` / `grep` / `web_fetch` / `todo_write` / `task`；同一步的只读调用并行执行
+- 权限：Manual / Accept edits / Plan（只读）/ Bypass；「总是允许」按项目落盘，工作目录外的写入永远询问
+- 上下文：自动压缩（用量过窗口八成时总结较早对话），「超出上下文」报错后压缩一次重发，`/compact` 手动压缩
+- 读项目说明：`~/.claude/CLAUDE.md` + 工作目录到仓库根各层的 `AGENTS.md` / `CLAUDE.md` 进系统提示词，每轮重读
+- 子 agent：`task` 工具开子会话，同一步的几个并行跑，工具行缩进在各自的 Task 行下
+- 图片输入：粘贴截图或选文件，一轮最多 8 张
+
+**MCP 与插件**
+
+- MCP：数据目录的 `mcp.json`（格式同 Claude Code 的 `.mcp.json`），本地 stdio / 远程 Streamable HTTP / 旧版 SSE，
+  远程服务支持 OAuth 2.1 登录（DCR + PKCE，token 过期自动刷新），断线自动退避重连
+- 插件：兼容 Claude Code 的插件格式（斜杠命令、技能、子 agent、MCP 服务、钩子），可从 git 地址安装 / 更新 / 卸载
+
+**会话与安全**
+
+- 每会话一份追加式事件日志，启动时重放恢复；历史会话续聊时优先 ACP `session/resume`，其次 `session/load`，
+  都不行就用本地日志重建上下文
+- 检查点与回退：写文件前后按内容寻址存下旧内容，用户消息上可选「回退对话和文件 / 只回对话 / 只回文件」
+- Windows job object 防孤儿进程：应用退出（含被强杀）时连带结束 agent 进程树
+
+**界面**
+
+- 虚拟列表对话区：1 万行滚动帧间隔与空会话相同
+- 三种视图模式（摘要 / 标准 / 详细）、深色模式、界面缩放与字体设置
+- 命令面板（Ctrl+K，含搜消息正文）、快捷键速查（Ctrl+/）、应用内提示、系统通知
+- 首页用量概览：会话数 / 消息数 / Token / 活跃天数 / 高峰时段 / 26 周热力图 / 各模型用量
+
+**用量网关**
+
+每个请求经本地网关转发并记一行日志（只记耗时、用量、重试、取消，**不记提示词和密钥**），
+按设置里的单价表估算费用，支持峰谷价。ACP agent 也能选经网关。
+
+## 构建与运行
+
+### 依赖
+
+- Windows 10/11
+- Rust stable（edition 2024，用 `rustup` 装即可；仓库没有 pin 工具链版本）
+- Visual Studio 生成工具（C++ 桌面开发工作负载，提供链接器和 Windows SDK）
+- 不必装 Node，除非要用 ACP 内核（`npx` 起适配器）
+
+### 编译
+
+```bash
+git clone https://github.com/FJWangYantao/claudesktop.git
+cd claudesktop
+cargo build --release -p claudesktop
+# 产物：target/release/claudesktop.exe（单文件，图标和版本信息已编进去，约 36 MB）
+```
+
+首次编译要拉 GPUI 那套依赖，约 10 分钟；之后增量很快。
+
+### 运行
+
+直接双击 `claudesktop.exe` 也可以，直接跑则能看到 stderr：
+
+```bash
+cargo run -p claudesktop
+# 或者
+./target/release/claudesktop.exe
+```
+
+**第一次启动**不会猜后端：没配过任何内核时，首页出来的是配置引导，
+选「自研内核」或「ACP agent」进设置页填好，再回首页开始用。
+
+- **自研内核**：设置 → 内核与模型 → 填端点、API Key、模型。
+  内置 DeepSeek / GLM / Kimi / Anthropic / OpenAI / OpenRouter / Ollama 预设，点一下就能带出端点
+- **ACP agent**：设置 → 内核与模型 → 选 ACP，命令填例如
+  `cmd /c npx -y @agentclientprotocol/claude-agent-acp`（Claude Code 适配器），
+  之后按适配器自己的方式配密钥
+
+设置存在数据目录的 `settings.json`，点「保存并应用」会重启对应内核，有对话的会话下次发消息时自动续接。
+
+### 数据目录
+
+默认 `%APPDATA%\claudesktop`（可用 `CLAUDESKTOP_DATA_DIR` 改）：
+
+```
+settings.json        设置（含 provider 档案，保存后请自行保管）
+permissions.json     「总是允许」规则，按项目分组
+mcp.json             MCP 服务器配置
+plugins/             插件
+sessions/            每会话一份事件日志 + 元信息，图片附件在同级 .assets/
+gateway/<日期>.jsonl 用量日志
+```
+
+### 测试与检查
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                                    # 235 个，不需要网络和密钥
+
+# 真实端点 / 真实 agent / 远程 MCP（默认 ignore，会花钱并需要网络）
+cargo test -p claudesktop-builtin -- --ignored
+```
+
+CI（[.github/workflows/ci.yml](./.github/workflows/ci.yml)）在 windows-latest 上跑上面的 fmt + clippy + test。
+打 `v*` tag 会触发 [release.yml](./.github/workflows/release.yml) 生成 GitHub Release。
 
 ## 开发
 
+环境变量（都在 `main.rs` / `settings.rs` 里集中读取）：
+
 ```bash
-cargo run -p claudesktop                       # ACP 内核（默认 mock agent）
+# 指定新会话的默认内核：builtin / acp / demo
+CLAUDESKTOP_KERNEL=builtin
 
-# 自研内核 + OpenAI 兼容端点（例：Antigravity Tools 本地网关）
-CLAUDESKTOP_KERNEL=builtin CLAUDESKTOP_BASE_URL=http://127.0.0.1:8045/v1 CLAUDESKTOP_MODEL=gemini-3.8-flash CLAUDESKTOP_API_KEY=sk-... cargo run -p claudesktop --bin claudesktop
+# 自研内核的端点（等价于在设置页里填，启动时环境变量优先）
+CLAUDESKTOP_BASE_URL=http://127.0.0.1:8045/v1
+CLAUDESKTOP_MODEL=gemini-3.8-flash
+CLAUDESKTOP_API_KEY=sk-...
+CLAUDESKTOP_PROTOCOL=anthropic          # 走 Anthropic 原生协议
+CLAUDESKTOP_TEMPERATURE=0.3 CLAUDESKTOP_MAX_TOKENS=8192
+CLAUDESKTOP_EXTRA_JSON='{"top_p":0.9}'  # 浅合并进请求体，同名键覆盖默认值
+CLAUDESKTOP_DEBUG_HTTP=1                # 请求与错误细节打到 stderr
+CLAUDESKTOP_MAX_STEPS=200               # 一轮最多的工具步数
 
-# CLAUDESKTOP_KERNEL 现在是「新会话的默认内核」；其他内核在会话用到时再启动
+# 数据目录与调试钩子
+CLAUDESKTOP_DATA_DIR=D:\tmp\claudesktop
+CLAUDESKTOP_OPEN=settings|fetch|restart # 启动 1.5s 后打开某个界面
+CLAUDESKTOP_DROP='路径;路径'             # 模拟从资源管理器拖文件进来
+CLAUDESKTOP_RERUN=builtin|acp|demo      # 把首条提示词放到另一个内核上重跑
 
-# Anthropic 原生协议（也可在设置页给某一套档案选「Anthropic 原生」）
-CLAUDESKTOP_KERNEL=builtin CLAUDESKTOP_PROTOCOL=anthropic CLAUDESKTOP_BASE_URL=https://api.anthropic.com/v1 CLAUDESKTOP_MODEL=claude-sonnet-4-5-20250929 CLAUDESKTOP_API_KEY=sk-ant-... cargo run -p claudesktop --bin claudesktop
-
-# 请求参数覆盖（写进当前档案；extra JSON 浅合并进请求体，同名键覆盖默认值）
-# CLAUDESKTOP_TEMPERATURE=0.3 CLAUDESKTOP_MAX_TOKENS=8192 CLAUDESKTOP_EXTRA_JSON='{"top_p":0.9}'
-
-# 排障：把发给 provider 的请求与错误细节打到 stderr
-# CLAUDESKTOP_DEBUG_HTTP=1
-
-# 真实端点测试（默认忽略）
-cargo test -p claudesktop-builtin -- --ignored
-# 其中 live_acp 起真实 ACP agent（ACP_AGENT，默认 Claude 适配器）经用量网关跑两轮并续接，端点 / 模型照 agent 的环境变量；
-# live_remote_server 连远程 MCP（CLAUDESKTOP_MCP_URL，默认 DeepWiki 公开端点）
+# 性能压测：逐帧滚动并输出帧间隔与每帧工作量
+CLAUDESKTOP_STRESS=10000                # 灌 1 万行再滚；加 _BUSY=1 看转圈，_TYPE=1 看打字
 ```
 
-## 结构（随里程碑生长）
+提交约定：英文 conventional commits，代码注释中文。改 UI 前请先读 [AGENTS.md](./AGENTS.md)（组件、配色、
+动效、快捷键都有既定封装与惯例）和 [设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md)。
+
+## 结构
 
 ```
-apps/desktop   # UI 壳（gpui-kit）
-crates/core    # 会话编排层：Kernel trait + KernelEvent（M1）
-crates/builtin # 自研内核（进程内）：OpenAI 兼容 provider、工具循环、权限规则（M2）
-tools          # 调试与接入工具（截图脚本、mock agent），见下
+apps/desktop   # UI 壳（gpui-kit 0.7）：窗口框架、会话视图、输入区、设置 / 首页 / 侧栏
+crates/core    # 会话编排层：Kernel trait + KernelEvent（复用 ACP 类型）、存储、检查点、插件
+crates/builtin # 自研内核：provider、工具循环、权限、压缩、MCP、子 agent、用量网关
+tools          # 调试与接入工具（截图脚本、mock agent、mock MCP 服务器）
 ```
+
+| 文档 | 内容 |
+|---|---|
+| [AGENTS.md](./AGENTS.md) | 开发约定：UI 组件惯例、配色与字号规范、动效、快捷键、内核侧注意事项 |
+| [设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md) | Claude 系产品的设计理念与视觉系统，第七章是本项目的落地清单 |
+| [调研报告-GPUI-Claude风格桌面Harness.md](./调研报告-GPUI-Claude风格桌面Harness.md) | 立项时的技术调研 |
+| [设计说明-检查点与回退.md](./设计说明-检查点与回退.md) | 回退的粒度、文件被别人改过怎么办 |
+| [设计说明-插件.md](./设计说明-插件.md) | 插件目录格式、钩子、与 Claude Code 的兼容范围 |
+| [设计说明-MCP-OAuth.md](./设计说明-MCP-OAuth.md) | 远程 MCP 的 OAuth 登录流程 |
+| [想法-用量统计网关.md](./想法-用量统计网关.md) | 网关、日志格式、费用估算与峰谷价 |
 
 ## tools
 
@@ -115,3 +182,8 @@ tools          # 调试与接入工具（截图脚本、mock agent），见下
 |---|---|
 | [tools/shot.ps1](./tools/shot.ps1) | 抓窗口截图，改完 UI 后自检渲染 |
 | [tools/mock-acp-agent.mjs](./tools/mock-acp-agent.mjs) | mock ACP agent，跑内核事件链测试 |
+| [tools/mock-mcp-server.mjs](./tools/mock-mcp-server.mjs) | mock MCP 服务器（`--http` / `--sse` 起远程模式） |
+| [tools/make-icon.py](./tools/make-icon.py) | 生成 `resources/claudesktop.ico` |
+
+内嵌字体（Inter / Newsreader / JetBrains Mono）均为 SIL OFL，来源见
+[apps/desktop/assets/fonts/README.md](./apps/desktop/assets/fonts/README.md)。
