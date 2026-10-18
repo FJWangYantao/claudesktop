@@ -97,7 +97,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   否则节拍器每拍通知 `ChatApp`，内容区跟着重画。
 - **性能压测**：`CLAUDESKTOP_STRESS=<行数>` 逐帧滚动出帧间隔和每帧工作量（`work`，render 到画完）；
   再加 `CLAUDESKTOP_STRESS_BUSY=1` 改成置忙 5 秒，看转圈常驻时每秒重画几次（CPU 在外面量）；
-  加 `CLAUDESKTOP_STRESS_TYPE=1` 改成逐帧往输入框打字。动画 / 重画范围相关的改动前后各跑一次。
+  加 `CLAUDESKTOP_STRESS_TYPE=1` 改成逐帧往输入框打字；加 `CLAUDESKTOP_STRESS_VIEW=settings:N` / `home` /
+  `requests`（`requests-all` 全部列出）改成逐帧滚设置页 / 首页 / 「请求」页签（`<行数>` 是假请求的轮数）。
+  动画 / 重画范围、设置页和首页的改动前后各跑一次。
 
 ### gpui-kit 踩坑备忘
 
@@ -114,6 +116,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **`Animation::with_max_fps` 在 Windows 上不准**：靠计时器排下一帧，计时器按 15.6ms 一档取整再等垂直同步，
   要 30 帧实际 21~25 帧，还和别的动画错开多出重画。限帧用 `motion.rs` 的节拍器（`on_next_frame` 数帧）。
 - `MotionReveal`（gpui-base）首次出现、还没量过高度时按 0 高排一帧，在虚拟列表里会跳；用 `motion::Reveal`。
+- **滚一格就重画整个 view、重排整页**（不是虚拟列表的滚动区）：所以滚动区里每帧要排的东西得便宜。
+  内容宽度不定时 taffy 会按不同约束把整页来回排好几遍，用 `widgets.rs` 的 `MeasuredWidth` 给内容定宽；
+  一排小段别用 `flex_wrap` + 每段一个元素，拼成一段 `StyledText` 按段着色；
+  归组、汇总这类按数据算的东西别在 render 里每帧重算，按输入缓存（见 `requests_view.rs` 的 `derived_requests`）。
 - `overflow_y_scroll()` 在 `StatefulInteractiveElement` 上——链式调用前必须先 `.id(...)`。
 - trigger 要作为 `Popover::trigger` 使用需实现 `gpui_kit::base::Selectable`（平凡
   builder trait，见 `MenuChip`）。

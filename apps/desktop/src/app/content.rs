@@ -12,6 +12,7 @@ use crate::model::ChatItem;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 内容区的缓存 view：内容全由 `ChatApp::render_content` 画，这里只是把它隔成一块单独重画的区域。
@@ -56,12 +57,17 @@ impl ChatApp {
                 .relative()
                 .size_full()
                 .child(
-                    div()
-                        .id("home-scroll")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .child(div().min_h_full().py_4().v_flex().child(self.render_overview(cx))),
+                    div().id("home-scroll").size_full().overflow_y_scroll().child(
+                        div()
+                            .min_h_full()
+                            .py_4()
+                            .v_flex()
+                            // 定宽，滚动时不用每帧把整页来回排好几遍（见 `MeasuredWidth`）
+                            .when_some(self.home_w.get(), |d, w| d.w(w))
+                            .child(self.render_overview(cx)),
+                    ),
                 )
+                .child(self.home_w.probe())
                 .child(edge_fade(px(16.), paper, clear).top_0())
                 .child(edge_fade(px(24.), clear, paper).bottom_0())
                 .into_any_element();

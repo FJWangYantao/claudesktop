@@ -18,7 +18,9 @@ use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// 先列多少轮；「显示更多」每次再多列这么多（首页整页滚动，不另开滚动框）
@@ -39,6 +41,33 @@ pub(super) struct RequestsView {
     session: Option<u64>,
     /// 多列出来的页数（「显示更多」）
     more: usize,
+    /// 上次归组、筛选、汇总的结果（见 `derived_requests`）
+    derived: RefCell<Option<Rc<Derived>>>,
+}
+
+/// 「请求」页签按当前日志、筛选和单价算好的数据。
+struct Derived {
+    /// 算的是哪一份日志（重读日志才换）
+    logs: Arc<Vec<RequestLog>>,
+    key: DerivedKey,
+    rows: Vec<TurnRow>,
+    /// 筛选的候选：模型按出现次数，会话按最近
+    models: Vec<String>,
+    sessions: Vec<SessionRef>,
+    /// 筛选后留下的轮（`rows` 的下标）
+    shown: Vec<usize>,
+    sum: requests::Summary,
+    cost: Cost,
+}
+
+/// 除日志外，影响 [`Derived`] 的输入。
+#[derive(PartialEq)]
+struct DerivedKey {
+    names: HashMap<String, SessionRef>,
+    model: Option<String>,
+    session: Option<u64>,
+    prices: Vec<Price>,
+    peaks: Vec<PeakWindow>,
 }
 
 impl ChatApp {
@@ -79,6 +108,104 @@ impl ChatApp {
         .detach();
     }
 
+    /// 压测钩子：灌 `n` 轮假请求（每轮 3 次，几个会话和模型轮着来）；`all` = 全部列出来，否则只列第一页。
+    pub(super) fn debug_fill_requests(&mut self, n: usize, all: bool) {
+        let now = super::now_ms();
+        let models = ["deepseek-chat", "kimi-k2-0905-preview", "claude-sonnet-4-5"];
+        let mut logs = Vec::with_capacity(n * 3);
+        for turn in 0..n as u64 {
+            for k in 0..3u64 {
+                logs.push(RequestLog {
+                    at_ms: now.saturating_sub((n as u64 - turn) * 60_000) + k * 4_000,
+                    req_id: Some(turn * 3 + k),
+                    attempt: Some(1),
+                    session: Some(format!("stress-{}", turn % 7)),
+                    turn: Some(turn),
+                    purpose: "turn".into(),
+                    protocol: "openai".into(),
+                    model: Some(models[turn as usize % models.len()].into()),
+                    host: "api.example.com".into(),
+                    path: "/v1/chat/completions".into(),
+                    method: "POST".into(),
+                    status: 200,
+                    ttfb_ms: Some(300),
+                    first_token_ms: Some(800),
+                    total_ms: 3_000,
+                    input: 20_000 + turn * 50,
+                    output: 600,
+                    cache_read: 12_000,
+                    ..Default::default()
+                });
+            }
+        }
+        self.requests_view = RequestsView {
+            logs: Some(Arc::new(logs)),
+            loaded_range: Some(self.overview_range),
+            more: if all { n / PAGE_ROWS } else { 0 },
+            ..Default::default()
+        };
+    }
+
+    /// 归组、筛选、汇总的结果，输入没变就用上次的（滚一格都要重画，日志多时每帧重算很贵）。
+    fn derived_requests(&self, logs: &Arc<Vec<RequestLog>>) -> Rc<Derived> {
+        let v = &self.requests_view;
+        let key = DerivedKey {
+            names: self.request_names(),
+            model: v.model.clone(),
+            session: v.session,
+            prices: self.settings.prices(),
+            peaks: self.settings.price_peaks(),
+        };
+        if let Some(d) = v.derived.borrow().as_ref()
+            && Arc::ptr_eq(&d.logs, logs)
+            && d.key == key
+        {
+            return d.clone();
+        }
+        let rows = requests::group(logs, &key.names);
+        // 筛选的候选：模型按出现次数，会话按最近
+        let mut models: Vec<(String, usize)> = Vec::new();
+        let mut sessions: Vec<SessionRef> = Vec::new();
+        for row in &rows {
+            if let Some(m) = &row.model {
+                match models.iter_mut().find(|(n, _)| n == m) {
+                    Some((_, c)) => *c += 1,
+                    None => models.push((m.clone(), 1)),
+                }
+            }
+            if let Some(s) = &row.session
+                && !sessions.iter().any(|x| x.token == s.token)
+            {
+                sessions.push(s.clone());
+            }
+        }
+        models.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let shown: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| key.model.as_ref().is_none_or(|m| r.model.as_ref() == Some(m)))
+            .filter(|(_, r)| {
+                key.session.is_none_or(|t| r.session.as_ref().is_some_and(|s| s.token == t))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let shown_rows: Vec<&TurnRow> = shown.iter().map(|&i| &rows[i]).collect();
+        let sum = requests::summarize(&shown_rows);
+        let cost = Cost::of(&key.prices, &key.peaks, shown_rows.iter().flat_map(|r| &r.requests));
+        let d = Rc::new(Derived {
+            logs: logs.clone(),
+            models: models.into_iter().map(|(m, _)| m).collect(),
+            sessions,
+            shown,
+            sum,
+            cost,
+            rows,
+            key,
+        });
+        *v.derived.borrow_mut() = Some(d.clone());
+        d
+    }
+
     /// 内核会话 ID → 侧栏里的会话（续接过的会话有好几个 ID）。
     fn request_names(&self) -> HashMap<String, SessionRef> {
         let mut names = HashMap::new();
@@ -105,40 +232,18 @@ impl ChatApp {
         let Some(logs) = v.logs.clone() else {
             return div().child(hint("正在读取请求记录…"));
         };
-        let rows = requests::group(&logs, &self.request_names());
-        // 筛选的候选：模型按出现次数，会话按最近
-        let mut models: Vec<(String, usize)> = Vec::new();
-        let mut sessions: Vec<SessionRef> = Vec::new();
-        for row in &rows {
-            if let Some(m) = &row.model {
-                match models.iter_mut().find(|(n, _)| n == m) {
-                    Some((_, c)) => *c += 1,
-                    None => models.push((m.clone(), 1)),
-                }
-            }
-            if let Some(s) = &row.session
-                && !sessions.iter().any(|x| x.token == s.token)
-            {
-                sessions.push(s.clone());
-            }
-        }
-        models.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let shown: Vec<&TurnRow> = rows
-            .iter()
-            .filter(|r| v.model.as_ref().is_none_or(|m| r.model.as_ref() == Some(m)))
-            .filter(|r| v.session.is_none_or(|t| r.session.as_ref().is_some_and(|s| s.token == t)))
-            .collect();
-        let sum = requests::summarize(&shown);
-        let prices = self.settings.prices();
-        let peaks = self.settings.price_peaks();
-        let cost = Cost::of(&prices, &peaks, shown.iter().flat_map(|r| &r.requests));
+        let d = self.derived_requests(&logs);
+        let shown: Vec<&TurnRow> = d.shown.iter().map(|&i| &d.rows[i]).collect();
+        let (sum, cost) = (&d.sum, &d.cost);
+        let (prices, peaks) = (&d.key.prices, &d.key.peaks);
+        let (models, sessions) = (d.models.clone(), d.sessions.clone());
 
         let model_label = v.model.clone().unwrap_or_else(|| "全部模型".into());
         let session_label = v
             .session
             .and_then(|t| sessions.iter().find(|s| s.token == t))
             .map_or_else(|| "全部会话".to_string(), |s| s.title.clone());
-        let model_items: Vec<String> = models.into_iter().map(|(m, _)| m).take(20).collect();
+        let model_items: Vec<String> = models.into_iter().take(20).collect();
         let session_items: Vec<SessionRef> = sessions.into_iter().take(20).collect();
         let filters = div()
             .h_flex()
@@ -285,7 +390,7 @@ impl ChatApp {
         }
         let limit = PAGE_ROWS * (v.more + 1);
         for (i, row) in shown.iter().take(limit).enumerate() {
-            list = list.child(self.request_turn(i, row, &prices, &peaks, cx));
+            list = list.child(self.request_turn(i, row, prices, peaks, cx));
         }
         if shown.len() > limit {
             list = list.child(
@@ -541,19 +646,30 @@ fn request_line(
     meta_line(parts).text_size(TEXT_META)
 }
 
-/// 用「·」隔开的一行小字：每段是一个整体，放不下时整段换到下一行；太长的一段单行截断。
+/// 用「·」隔开的一行小字，放不下时折行；不是 `INK_SOFT` 的段（失败次数）单独着色。
 fn meta_line(parts: Vec<(String, Color)>) -> Div {
-    div().h_flex().flex_wrap().gap_x_1p5().font_features(tabular_nums()).children(
-        parts.into_iter().enumerate().map(|(i, (text, color))| {
-            div()
-                .max_w_full()
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
-                .text_color(rgb(color))
-                .child(if i == 0 { text } else { format!("· {text}") })
-        }),
-    )
+    // 拼成一段文字、按段着色：每段一个元素再 flex_wrap 的话，taffy 每帧要把每段量好几遍，
+    // 「请求」页签列 60 轮时每帧多花 10ms 以上
+    let mut text = String::new();
+    let mut highlights = Vec::new();
+    for (i, (part, color)) in parts.into_iter().enumerate() {
+        if i > 0 {
+            text.push_str(" · ");
+        }
+        let start = text.len();
+        text.push_str(&part);
+        if color != INK_SOFT {
+            let color: Hsla = rgb(color).into();
+            highlights.push((
+                start..text.len(),
+                HighlightStyle { color: Some(color), ..Default::default() },
+            ));
+        }
+    }
+    div()
+        .font_features(tabular_nums())
+        .text_color(rgb(INK_SOFT))
+        .child(StyledText::new(text).with_highlights(highlights))
 }
 
 /// 本地时间 `10-18 21:03`。
