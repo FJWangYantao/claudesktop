@@ -214,8 +214,8 @@ pub struct Settings {
     /// 外观（跟随系统 / 浅色 / 深色），设置页切换后立即生效并写回
     pub appearance: Appearance,
     /// 侧栏底部列出各内核状态（「自研内核 · 已连接」），设置页切换后立即生效并写回。
-    /// 默认显示：老设置文件里没有这一项时也保持原样（容器级 `#[serde(default)]`
-    /// 会用下面的 `Default` 实现补齐缺失字段）。
+    /// 默认不显示（状态另有设置页与侧栏「进行中」可看）；老设置文件里没有这一项时
+    /// 容器级 `#[serde(default)]` 会用下面的 `Default` 实现补齐，这里取 `false` 干净利落。
     pub sidebar_kernel_status: bool,
     /// 上次在输入框上方的目录 chip 里选的工作目录（新会话默认在这里开）；
     /// None = 用启动目录。环境变量 `ACP_CWD` 优先于它（启动时处理，不写进这里）
@@ -261,7 +261,7 @@ impl Default for Settings {
             acp: AcpSettings::default(),
             view_mode: ViewMode::default(),
             appearance: Appearance::default(),
-            sidebar_kernel_status: yes(),
+            sidebar_kernel_status: false,
             workspace: None,
             sidebar_by_date: false,
             sidebar_folded: Vec::new(),
@@ -562,10 +562,10 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn ui_prefs_default_and_parse() {
-        // 旧设置文件没有这几项：跟随系统 + 标准视图 + 侧栏显示内核状态
+        // 旧设置文件没有这几项：跟随系统 + 标准视图 + 不显示内核状态
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::System, ViewMode::Normal));
-        assert!(s.sidebar_kernel_status);
+        assert!(!s.sidebar_kernel_status);
         assert!(s.notifications);
         let s: Settings = serde_json::from_str(
             r#"{"appearance":"dark","view_mode":"verbose","sidebar_kernel_status":false}"#,

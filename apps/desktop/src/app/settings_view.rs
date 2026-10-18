@@ -357,7 +357,7 @@ impl ChatApp {
             ),
             setting_row(
                 "侧栏显示内核状态",
-                "在侧栏底部列出已启动内核的连接状态；关掉不影响内核运行",
+                "在侧栏底部列出已启动内核的连接状态；默认关闭，打开不影响内核运行",
                 Switch::new("sidebar-kernel-status")
                     .checked(self.settings.sidebar_kernel_status)
                     .color(rgb(CORAL))
