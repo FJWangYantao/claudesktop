@@ -5,10 +5,11 @@
 //! （DeepSeek / 多数网关）与 `reasoning`（OpenRouter）两种字段；
 //! 工具调用按 `delta.tool_calls[]` 流式拼接。
 
+use crate::gateway::Route;
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, RequestParams, StreamEvent, StreamOutcome, ToolCall,
-    Usage, debug_http, error_message, finish_stream, parse_model_list, post_sse_with_retry,
-    read_sse,
+    Usage, debug_http, error_message, finish_stream, get_json, parse_model_list,
+    post_sse_with_retry, read_sse,
 };
 use serde_json::Value;
 
@@ -33,24 +34,15 @@ impl OpenAiProvider {
         self.config.api_key.as_ref().map(|key| ("Authorization", format!("Bearer {key}")))
     }
 
-    fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.config.base_url.trim_end_matches('/'))
+    fn endpoint(&self, path: &str) -> Route {
+        crate::gateway::route(self.config.gateway.as_ref(), &self.config.base_url, path)
     }
 }
 
 impl ChatProvider for OpenAiProvider {
     fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        let url = self.endpoint("/models");
-        let mut request = self.agent.get(&url).header("Accept", "application/json");
-        if let Some((name, value)) = self.auth_header() {
-            request = request.header(name, &value);
-        }
-        let response = request.call().map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
-        let status = response.status().as_u16();
-        let text = response.into_body().read_to_string().unwrap_or_default();
-        if !(200..300).contains(&status) {
-            anyhow::bail!("HTTP {status}: {}", error_message(&text));
-        }
+        let headers = self.auth_header().into_iter().collect::<Vec<_>>();
+        let text = get_json(&self.agent, &self.endpoint("/models"), &headers)?;
         parse_models(&text)
     }
 
@@ -62,7 +54,7 @@ impl ChatProvider for OpenAiProvider {
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
-        let url = self.endpoint("/chat/completions");
+        let route = self.endpoint("/chat/completions");
         let mut body = serde_json::json!({
             "model": model,
             "stream": true,
@@ -77,7 +69,7 @@ impl ChatProvider for OpenAiProvider {
 
         let headers = self.auth_header().into_iter().collect::<Vec<_>>();
         let reader =
-            post_sse_with_retry(&self.agent, &url, &headers, &body, should_stop, on_event)?;
+            post_sse_with_retry(&self.agent, &route, &headers, &body, should_stop, on_event)?;
 
         let mut outcome = StreamOutcome::default();
         let mut calls = ToolCallAccumulator::default();

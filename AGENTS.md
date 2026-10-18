@@ -155,6 +155,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   启用状态在设置的 `plugins_enabled`，经 `Kernel::set_plugins` 交给内核。斜杠命令在界面 `submit_to` 展开
   （日志 `Record::User.sent` 存展开后的全文，重建上下文用它）；技能、子 agent、钩子只有自研内核接（`run_hooks`）；
   MCP 服务并进 `McpHub`，ACP 内核在开会话时经 `mcpServers` 交给 agent。
+- 用量网关在 `crates/builtin/src/gateway.rs`：provider 经 `gateway::route` 发请求，开着（`ProviderConfig::gateway`）就转给本地网关、
+  每个请求记一行 `gateway/<日期>.jsonl`。新的请求出口（新 provider、新接口）也要走 `route`，内核里新的请求用途用 `gateway::tag` 标上。
 - 子 agent 在 `crates/builtin/src/subagent.rs`：`task` 工具开子会话（ID `主会话/调用 ID`），和主会话共用 `run_steps`；
   子会话的事件经 `subagent::forward` 转到主会话（工具行带 `parent`，`history::rebuild` 跳过它们）。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，

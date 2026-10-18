@@ -6,8 +6,8 @@
 //! 启动时环境变量优先于文件，方便脚本和调试：`CLAUDESKTOP_KERNEL` /
 //! `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`（key 也认 `OPENAI_API_KEY`）
 //! / `CLAUDESKTOP_PROTOCOL` / `CLAUDESKTOP_TEMPERATURE` / `CLAUDESKTOP_MAX_TOKENS` /
-//! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）/ `CLAUDESKTOP_MAX_STEPS`（一轮最多几步）
-//! 以及 `ACP_AGENT`。
+//! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）/ `CLAUDESKTOP_MAX_STEPS`（一轮最多几步）/
+//! `CLAUDESKTOP_GATEWAY`（`0` / `1`，用量网关）以及 `ACP_AGENT`。
 //! 设置页保存时写下的是当时界面上的值。
 
 use crate::model::ViewMode;
@@ -106,6 +106,8 @@ impl ProviderProfile {
             api_key: Some(self.api_key.trim().to_string()).filter(|k| !k.is_empty()),
             model: self.model.trim().to_string(),
             params: self.params.clone(),
+            // 网关由 `Settings::builtin_config` 按开关补上
+            gateway: None,
         }
     }
 
@@ -223,6 +225,9 @@ pub struct Settings {
     /// 自研内核一轮里最多请求模型的次数（工具循环上限，默认 200）；
     /// 越界的值读取时夹进 [`claudesktop_builtin::MIN_MAX_STEPS`] .. [`claudesktop_builtin::MAX_MAX_STEPS`]
     pub max_steps: usize,
+    /// 自研内核的请求经用量网关转发、每个请求记一行日志（数据目录 `gateway/`）；默认开。
+    /// 关掉就直连端点。设置页还没有开关（界面以后再加），先靠设置文件或 `CLAUDESKTOP_GATEWAY`
+    pub usage_gateway: bool,
     /// 窗口不在前台时，回复完成 / 等待授权 / 出错发系统通知；默认开
     pub notifications: bool,
     /// 界面缩放倍率（1.0 = 标准），设置页即时生效并写回
@@ -252,6 +257,7 @@ impl Default for Settings {
             sidebar_folded: Vec::new(),
             plugins_enabled: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
+            usage_gateway: yes(),
             notifications: yes(),
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
@@ -401,6 +407,9 @@ impl Settings {
         if let Some(v) = var("ACP_AGENT") {
             self.acp.command = v;
         }
+        if let Some(v) = var("CLAUDESKTOP_GATEWAY") {
+            self.usage_gateway = v.trim() != "0";
+        }
         if let Some(v) = var("CLAUDESKTOP_MAX_STEPS").and_then(|v| v.parse::<usize>().ok()) {
             self.max_steps =
                 v.clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS);
@@ -429,7 +438,14 @@ impl Settings {
         // 自动压缩要知道窗口多大
         config.context_windows = p.context_windows.clone().into_iter().collect();
         config.max_steps = self.max_steps;
+        config.provider.gateway = self.gateway();
         Ok(config)
+    }
+
+    /// 用量网关（开着才有；进程里共用一个，第一次用到时起）。起不来就直连，不影响用。
+    pub fn gateway(&self) -> Option<claudesktop_builtin::gateway::GatewayHandle> {
+        use claudesktop_builtin::gateway;
+        self.usage_gateway.then(gateway::default_dir).flatten().and_then(|d| gateway::shared(&d))
     }
 
     /// ACP 配置：命令为空时沿用默认（mock agent）。

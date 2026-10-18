@@ -6,7 +6,7 @@
 
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, ProviderConfig, StreamEvent, StreamOutcome, ToolCall,
-    debug_http, error_message, finish_stream, parse_model_list, post_sse_with_retry, read_sse,
+    debug_http, finish_stream, get_json, parse_model_list, post_sse_with_retry, read_sse,
 };
 use serde_json::{Value, json};
 
@@ -36,24 +36,14 @@ impl AnthropicProvider {
         headers
     }
 
-    fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.config.base_url.trim_end_matches('/'))
+    fn endpoint(&self, path: &str) -> crate::gateway::Route {
+        crate::gateway::route(self.config.gateway.as_ref(), &self.config.base_url, path)
     }
 }
 
 impl ChatProvider for AnthropicProvider {
     fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        let url = self.endpoint("/models?limit=1000");
-        let mut request = self.agent.get(&url).header("Accept", "application/json");
-        for (name, value) in self.headers() {
-            request = request.header(name, &value);
-        }
-        let response = request.call().map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
-        let status = response.status().as_u16();
-        let text = response.into_body().read_to_string().unwrap_or_default();
-        if !(200..300).contains(&status) {
-            anyhow::bail!("HTTP {status}: {}", error_message(&text));
-        }
+        let text = get_json(&self.agent, &self.endpoint("/models?limit=1000"), &self.headers())?;
         let value: Value =
             serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("模型列表不是 JSON: {e}"))?;
         Ok(parse_model_list(value.get("data").and_then(Value::as_array).map_or(&[], Vec::as_slice)))
@@ -67,7 +57,7 @@ impl ChatProvider for AnthropicProvider {
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
-        let url = self.endpoint("/messages");
+        let route = self.endpoint("/messages");
         let (system, converted) = convert_messages(messages);
         let mut body = json!({
             "model": model,
@@ -98,7 +88,7 @@ impl ChatProvider for AnthropicProvider {
 
         let headers = self.headers();
         let reader =
-            post_sse_with_retry(&self.agent, &url, &headers, &body, should_stop, on_event)?;
+            post_sse_with_retry(&self.agent, &route, &headers, &body, should_stop, on_event)?;
 
         let mut outcome = StreamOutcome::default();
         let mut usage = crate::provider::Usage::default();

@@ -59,6 +59,8 @@ fn read_request(stream: &TcpStream) -> String {
 }
 
 fn respond(mut stream: TcpStream, reply: Reply) -> std::io::Result<()> {
+    // 每行立刻发出去（不让 Nagle 攒包），流式的时间间隔才准
+    stream.set_nodelay(true)?;
     match reply {
         Reply::Status(code, body) => write!(
             stream,
@@ -1747,4 +1749,192 @@ fn subagent_asks_in_the_main_session_and_stops_with_it() {
     );
     assert!(h.kernel.send_prompt(&sid, UserPrompt::text("再来")).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- 用量网关 ----------
+
+/// 经网关的端点配置；返回 (配置, 日志目录)
+fn via_gateway(base_url: String, name: &str) -> (ProviderConfig, PathBuf) {
+    let dir = workdir(&format!("gateway-{name}"));
+    let gateway = claudesktop_builtin::gateway::Gateway::start(dir.clone()).unwrap();
+    let config = ProviderConfig {
+        base_url,
+        api_key: Some("test-key".into()),
+        model: "mock-model".into(),
+        gateway: Some(gateway),
+        ..Default::default()
+    };
+    (config, dir)
+}
+
+/// 网关日志里的全部行（等到至少 `n` 行）
+fn gateway_log(dir: &std::path::Path, n: usize) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let lines: Vec<serde_json::Value> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+            .flat_map(|e| {
+                std::fs::read_to_string(e.path())
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if lines.len() >= n {
+            return lines;
+        }
+        assert!(Instant::now() < deadline, "gateway log has {} lines, want {n}", lines.len());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn gateway_forwards_the_stream_and_logs_every_attempt() {
+    let (base, bodies) = serve(vec![
+        Reply::Status(429, r#"{"error":{"message":"slow down"}}"#),
+        happy_stream("你好！"),
+    ]);
+    let host = base.trim_start_matches("http://").split('/').next().unwrap().to_string();
+    let (config, dir) = via_gateway(base, "retry");
+    let h = Harness::with_config(config, std::env::temp_dir());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("打个招呼")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 内核这边和直连一样：照常重试、出字
+    assert_eq!(h.text(false), "你好！");
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Retrying { status: 429, .. })), 1);
+    // 上游收到的是原样的请求体
+    assert_eq!(body(&bodies, 1)["model"], "mock-model");
+
+    let log = gateway_log(&dir, 2);
+    let (first, second) = (&log[0], &log[1]);
+    assert_eq!(first["status"], 429);
+    assert_eq!(first["error"], "slow down");
+    assert_eq!(second["status"], 200);
+    // 重试共用一个请求号，各记一次尝试
+    assert_eq!(first["req_id"], second["req_id"]);
+    assert_eq!((first["attempt"].as_u64(), second["attempt"].as_u64()), (Some(1), Some(2)));
+    assert_eq!(second["session"], sid.as_str());
+    assert_eq!(second["purpose"], "turn");
+    assert_eq!(second["model"], "mock-model");
+    assert_eq!(second["host"], host.as_str());
+    assert_eq!(second["path"], "/chat/completions");
+    assert_eq!((second["input"].as_u64(), second["output"].as_u64()), (Some(6), Some(14)));
+    assert_eq!(second["reasoning"], 8);
+    assert_eq!(second["finish_reason"], "stop");
+    assert_eq!(second["messages"], 2);
+    assert_eq!(second["cancelled"], false);
+    assert!(second["first_token_ms"].as_u64().is_some());
+    // 不记 key
+    let raw: String = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(!raw.contains("test-key"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gateway_reports_unreachable_endpoints_like_a_direct_connection() {
+    // 拿一个空闲端口再放掉：连不上
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let real = format!("http://127.0.0.1:{port}/v1");
+    let (config, dir) = via_gateway(real.clone(), "down");
+    let h = Harness::with_config(config, std::env::temp_dir());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("在吗")).unwrap();
+    h.wait("prompt failed", |e| matches!(e, KernelEvent::PromptFailed { .. }));
+    // 报错里是真实端点（不是网关的地址），格式同直连，界面按网络问题处理；也不重试
+    let want = format!("请求 {real}/chat/completions 失败: ");
+    let failed = h.count(
+        |e| matches!(e, KernelEvent::PromptFailed { message } if message.starts_with(&want)),
+    );
+    assert_eq!(failed, 1, "{:?}", h.events.lock().unwrap());
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Retrying { .. })), 0);
+    let log = gateway_log(&dir, 1);
+    assert_eq!(log[0]["status"], 0);
+    assert!(log[0]["error"].as_str().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gateway_logs_a_stopped_request_as_cancelled() {
+    let lines: Vec<String> = (0..100).map(|i| delta("content", &format!("{i} "))).collect();
+    let (base, _bodies) = serve(vec![Reply::Sse { lines, gap_ms: 30 }]);
+    let (config, dir) = via_gateway(base, "cancel");
+    let h = Harness::with_config(config, std::env::temp_dir());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("数数")).unwrap();
+    h.wait("some text", |e| matches!(e, KernelEvent::AgentMessageChunk { .. }));
+    h.kernel.cancel(&sid).unwrap();
+    let log = gateway_log(&dir, 1);
+    assert_eq!(log[0]["cancelled"], true);
+    // 停下之后很快就断开了上游，没等整条流跑完（100 × 30ms）
+    assert!(log[0]["total_ms"].as_u64().unwrap() < 2_000, "{}", log[0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 流式经网关会不会一顿一顿：同一条流（每 10ms 一块，共 300 块）直连 / 经网关交替各跑两次，
+/// 比较内核发出 `AgentMessageChunk` 的时间间隔和首块延迟。
+/// `cargo test --release -p claudesktop-builtin --test kernel gateway_stream_timing -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn gateway_stream_timing() {
+    fn run(gateway: bool) -> (f64, f64, f64, f64, f64) {
+        let lines: Vec<String> = (0..300)
+            .map(|i| delta("content", &format!("{i} ")))
+            .chain([finish("stop"), "data: [DONE]".into()])
+            .collect();
+        let (base, _bodies) = serve(vec![Reply::Sse { lines, gap_ms: 10 }]);
+        let config = if gateway {
+            via_gateway(base, "timing").0
+        } else {
+            ProviderConfig { base_url: base, model: "mock-model".into(), ..Default::default() }
+        };
+        let stamps: Arc<Mutex<Vec<(Instant, bool)>>> = Arc::default();
+        let sink: EventSink = {
+            let stamps = stamps.clone();
+            Arc::new(move |e: RoutedEvent| {
+                let chunk = matches!(e.event, KernelEvent::AgentMessageChunk { .. });
+                let end = matches!(e.event, KernelEvent::TurnEnded { .. });
+                if chunk || end {
+                    stamps.lock().unwrap().push((Instant::now(), end));
+                }
+            })
+        };
+        let mut builtin = BuiltinConfig::new(config, std::env::temp_dir());
+        builtin.rules_path = None;
+        builtin.user_instructions = None;
+        builtin.mcp_config = None;
+        let kernel = BuiltinKernel::spawn(builtin, sink).unwrap();
+        kernel.new_session(1, None).unwrap();
+        let sid = format!("builtin-{}-1", std::process::id());
+        let sent = Instant::now();
+        kernel.send_prompt(&sid, UserPrompt::text("数数")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !stamps.lock().unwrap().iter().any(|(_, end)| *end) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let times: Vec<Instant> =
+            stamps.lock().unwrap().iter().filter(|(_, end)| !end).map(|(t, _)| *t).collect();
+        let mut gaps: Vec<f64> =
+            times.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0).collect();
+        gaps.sort_by(f64::total_cmp);
+        let pct = |p: f64| gaps[((gaps.len() - 1) as f64 * p) as usize];
+        let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
+        let first = (times[0] - sent).as_secs_f64() * 1000.0;
+        (first, mean, pct(0.5), pct(0.99), *gaps.last().unwrap())
+    }
+    for gateway in [false, true, false, true] {
+        let (first, mean, p50, p99, max) = run(gateway);
+        println!(
+            "{} 首块 {first:6.1}ms  间隔 平均 {mean:5.2} p50 {p50:5.2} p99 {p99:5.2} 最大 {max:5.2} ms",
+            if gateway { "网关" } else { "直连" }
+        );
+    }
 }

@@ -21,6 +21,7 @@
 mod anthropic;
 mod compact;
 mod fetch;
+pub mod gateway;
 mod history;
 mod instructions;
 pub mod mcp;
@@ -139,6 +140,7 @@ impl BuiltinConfig {
                 api_key: var("CLAUDESKTOP_API_KEY").or_else(|| var("OPENAI_API_KEY")),
                 model,
                 params: RequestParams::default(),
+                gateway: None,
             },
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         ))
@@ -557,6 +559,7 @@ impl Inner {
         mut max_bytes: usize,
         stopped: &dyn Fn() -> bool,
     ) -> anyhow::Result<(String, Option<Usage>)> {
+        let _tag = gateway::tag(session, "compact");
         let mut attempt = 0;
         loop {
             let request = compact::summary_request(previous, &compact::transcript(head, max_bytes));
@@ -1274,6 +1277,9 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
 /// 工具循环：请求模型 → 执行工具 → 再请求，直到不再调用工具。主会话的一轮和子任务（子会话）都走这里。
 fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
     let stopped = || flag.load(Ordering::SeqCst);
+    // 用量网关的日志按会话、用途归类（子任务的 ID 是 `主会话/调用 ID`）
+    let purpose = if subagent::split_id(session).is_some() { "subagent" } else { "turn" };
+    let _tag = gateway::tag(session, purpose);
     let mut usage: Option<Usage> = None;
     // 最后一次请求的输入 + 输出 = 此刻上下文的大小（之前各步都包含在这次的输入里）
     let mut context_tokens = 0;

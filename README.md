@@ -5,7 +5,7 @@ Claude 风格高性能桌面 harness（Rust + GPUI），内核可更换。
 - 调研报告：[调研报告-GPUI-Claude风格桌面Harness.md](./调研报告-GPUI-Claude风格桌面Harness.md)
 - 设计指南：[设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md)（Claude 系产品的设计理念、视觉系统、组件做法与本项目落地清单）
 - 技术栈：`gpui-kit 0.7`（UI，内含 pin 版 GPUI）+ `agent-client-protocol`（内核边界，M1 引入）+ 自研 Rust 内核（进程内）
-- 想法：[内置用量统计网关](./想法-用量统计网关.md)（每个请求一行日志：耗时、用量、重试、取消；未开工）
+- 用量网关：[内置用量统计网关](./想法-用量统计网关.md)（每个请求一行日志：耗时、用量、重试、取消；第一阶段已做，界面未做）
 
 ## 里程碑
 

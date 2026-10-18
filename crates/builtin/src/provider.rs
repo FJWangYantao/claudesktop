@@ -9,9 +9,11 @@
 //! 消息（[`ChatMessage`]）对上承载多模态分段（文本 / 图片），对下由各实现
 //! 翻译成自己协议的请求体；工具定义统一用 OpenAI 的 JSON 形状传入。
 
+use crate::gateway::Route;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// 还没收到任何输出时，这些状态码按瞬态错误退避重试。
@@ -67,6 +69,8 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub model: String,
     pub params: RequestParams,
+    /// 用量网关：有就把请求经它转发、每个请求记一行日志（见 `gateway` 模块）；None = 直连
+    pub gateway: Option<crate::gateway::GatewayHandle>,
 }
 
 impl ProviderConfig {
@@ -305,30 +309,44 @@ pub trait ChatProvider: Send + Sync {
 
 /// 带退避重试的 SSE POST（两个 provider 共用）：非 2xx 读出错误体，
 /// 可重试状态码在出字前按 [`BACKOFF_MS`] 退避重试；成功返回响应体的行读取器。
+/// 经用量网关时每次尝试带上请求号和第几次（网关日志里重试归到同一个请求）。
 pub(crate) fn post_sse_with_retry(
     agent: &ureq::Agent,
-    url: &str,
+    route: &Route,
     headers: &[(&str, String)],
     body: &str,
     should_stop: &dyn Fn() -> bool,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> anyhow::Result<impl BufRead + use<>> {
+    static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+    let url = &route.real;
     debug_http(|| format!("→ POST {url}\n{body}"));
+    let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed).to_string();
     let mut attempt = 0;
     loop {
         let mut request = agent
-            .post(url)
+            .post(&route.url)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
-        for (name, value) in headers {
+        for (name, value) in headers.iter().chain(&route.headers) {
             request = request.header(*name, value.as_str());
+        }
+        if route.via_gateway() {
+            request = request
+                .header(crate::gateway::REQUEST, request_id.as_str())
+                .header(crate::gateway::ATTEMPT, (attempt + 1).to_string());
         }
         let response = request.send(body).map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
             return Ok(BufReader::new(response.into_body().into_reader()));
         }
+        let gateway_error = response.headers().contains_key(crate::gateway::GATEWAY_ERROR);
         let text = response.into_body().read_to_string().unwrap_or_default();
+        // 网关没连上上游：和直连时连不上一样报（界面按「网络问题」处理）
+        if gateway_error {
+            anyhow::bail!("请求 {url} 失败: {}", error_message(&text));
+        }
         let reason = format!("HTTP {status}: {}", error_message(&text));
         if !RETRYABLE.contains(&status) || attempt >= BACKOFF_MS.len() || should_stop() {
             anyhow::bail!(reason);
@@ -338,6 +356,30 @@ pub(crate) fn post_sse_with_retry(
         on_event(StreamEvent::Retrying { status, attempt, delay_ms, reason });
         std::thread::sleep(Duration::from_millis(delay_ms));
     }
+}
+
+/// GET 一个 JSON 接口（列模型）：非 2xx 报 `HTTP 状态: 信息`，连不上报「请求 … 失败」（经网关时同样）。
+pub(crate) fn get_json(
+    agent: &ureq::Agent,
+    route: &Route,
+    headers: &[(&str, String)],
+) -> anyhow::Result<String> {
+    let url = &route.real;
+    let mut request = agent.get(&route.url).header("Accept", "application/json");
+    for (name, value) in headers.iter().chain(&route.headers) {
+        request = request.header(*name, value.as_str());
+    }
+    let response = request.call().map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
+    let status = response.status().as_u16();
+    let gateway_error = response.headers().contains_key(crate::gateway::GATEWAY_ERROR);
+    let text = response.into_body().read_to_string().unwrap_or_default();
+    if gateway_error {
+        anyhow::bail!("请求 {url} 失败: {}", error_message(&text));
+    }
+    if !(200..300).contains(&status) {
+        anyhow::bail!("HTTP {status}: {}", error_message(&text));
+    }
+    Ok(text)
 }
 
 /// 从错误响应体里取人类可读的信息（`error.message` 或 `message`），否则原文截断。
@@ -472,6 +514,7 @@ mod tests {
             api_key: None,
             model: "m".into(),
             params: RequestParams::default(),
+            gateway: None,
         };
         assert_eq!(config.identity(), "builtin:http://x/v1#m");
         config.protocol = Protocol::Anthropic;

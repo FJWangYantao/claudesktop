@@ -585,7 +585,7 @@ impl ChatApp {
         if self.fetching_models {
             return;
         }
-        let config = if from_form {
+        let mut config = if from_form {
             let f = &self.settings_form;
             let Some(inputs) = f.inputs.get(f.active) else {
                 return;
@@ -600,6 +600,8 @@ impl ChatApp {
         } else {
             self.settings.builtin.provider()
         };
+        // 列模型的请求也经用量网关（日志里记成 models）
+        config.gateway = self.settings.gateway();
         if config.base_url.is_empty() {
             // 后台探测时自研内核可能已经没配了（只剩历史会话），不往设置页塞错误提示
             if !quiet {
