@@ -150,7 +150,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - MCP 客户端在 `crates/builtin/src/mcp.rs`（配置是数据目录的 `mcp.json`，格式同 Claude Code 的 `.mcp.json`，
   只支持 stdio）；工具以 `mcp__服务器__工具` 交给模型、走 `Action::Mcp` 和正常的权限流程，
   状态经 `KernelEvent::McpStatus` 到设置页「MCP」（`app/mcp_view.rs`）。改 MCP 用 `tools/mock-mcp-server.mjs` 测。
-- 插件读取在 `crates/core/src/plugin.rs`（数据目录 `plugins/`，格式兼容 Claude Code，说明见「设计说明-插件.md」），
+- 插件读取在 `crates/core/src/plugin.rs`（数据目录 `plugins/`，格式兼容 Claude Code，说明见「设计说明-插件.md」；
+  从 git 装 / 更新 / 卸载在 `plugin_git.rs`），
   启用状态在设置的 `plugins_enabled`，经 `Kernel::set_plugins` 交给内核。斜杠命令在界面 `submit_to` 展开
   （日志 `Record::User.sent` 存展开后的全文，重建上下文用它）；技能、子 agent、钩子只有自研内核接（`run_hooks`）；
   MCP 服务并进 `McpHub`，ACP 内核在开会话时经 `mcpServers` 交给 agent。

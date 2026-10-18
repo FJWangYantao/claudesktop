@@ -4,17 +4,51 @@
 //! （新放进来的默认停用：钩子和 MCP 服务会在本机跑插件作者写的命令，看过再开）。
 //! 启用状态一变就经 `Kernel::set_plugins` 交给已经起来的内核，没起来的内核启动时带上。
 //! 斜杠命令在发消息时由界面展开（`submit_to`），所以对所有内核都管用。
+//!
+//! 也可以填 git 地址安装（`claudesktop_core::plugin_git`，克隆在后台线程跑）；
+//! 从 git 装的插件卡片上有「更新」「卸载」，手动放进来的没有。
 
 use super::ChatApp;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::plugin::{self, Plugin};
+use claudesktop_core::plugin_git;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::button::{
+    Button, ButtonCustomVariant, ButtonVariant, ButtonVariants as _,
+};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::path::PathBuf;
+
+/// 插件页自己的状态：安装地址输入框、进行中的 git 操作、等确认的卸载。
+pub(super) struct PluginsForm {
+    url: Entity<InputState>,
+    /// 正在跑的 git 操作（安装 / 更新）；跑着时别的按钮先不让点
+    busy: Option<SharedString>,
+    /// 点了「卸载」、等确认的仓库目录
+    confirm_uninstall: Option<PathBuf>,
+}
+
+impl PluginsForm {
+    pub(super) fn new(window: &mut Window, cx: &mut Context<ChatApp>) -> Self {
+        let url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("git 仓库地址，或 GitHub 的「作者/仓库」")
+        });
+        // 回车直接装
+        cx.subscribe_in(&url, window, |this: &mut ChatApp, _, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.install_plugin(window, cx);
+            }
+        })
+        .detach();
+        Self { url, busy: None, confirm_uninstall: None }
+    }
+}
 
 impl ChatApp {
     /// 启用了的插件（按名字记，插件目录里找不到的名字忽略）。
@@ -56,6 +90,101 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 克隆输入框里的仓库到插件目录；装好的和手动放进来的一样默认停用。
+    fn install_plugin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugins_form.busy.is_some() {
+            return;
+        }
+        let url = self.plugins_form.url.read(cx).value().to_string();
+        if let Err(err) = plugin_git::normalize_url(&url) {
+            self.toast(Notification::error(err), cx);
+            return;
+        }
+        let Some(dir) = plugin::default_plugins_dir() else {
+            self.toast(Notification::error("找不到数据目录"), cx);
+            return;
+        };
+        self.plugins_form.busy = Some("正在安装…".into());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { plugin_git::install(&dir, &url) })
+                .await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.plugins_form.busy = None;
+                match result {
+                    Ok(repo) => {
+                        app.plugins_form.url.update(cx, |s, cx| s.set_value("", window, cx));
+                        app.rescan_plugins(cx);
+                        let n =
+                            app.plugins.iter().filter(|p| p.repo.as_ref() == Some(&repo)).count();
+                        let text = match n {
+                            0 => "装好了，但没在里面找到插件（看看是不是插件仓库）".to_string(),
+                            1 => "装好了，默认停用：看过下面列出的内容再打开".to_string(),
+                            n => format!("装好了 {n} 个插件，默认停用：看过下面列出的内容再打开"),
+                        };
+                        app.toast(Notification::success(text), cx);
+                    }
+                    Err(err) => app.toast(Notification::error(format!("安装失败：{err}")), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `git pull` 一个从 git 装的插件仓库，再重新扫描（内核拿到新内容）。
+    fn update_plugin(&mut self, repo: PathBuf, cx: &mut Context<Self>) {
+        if self.plugins_form.busy.is_some() {
+            return;
+        }
+        self.plugins_form.busy = Some("正在更新…".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result =
+                cx.background_executor().spawn(async move { plugin_git::update(&repo) }).await;
+            let _ = this.update(cx, |app, cx| {
+                app.plugins_form.busy = None;
+                match result {
+                    Ok(out) => {
+                        app.rescan_plugins(cx);
+                        let text = if out.contains("up to date") {
+                            "已经是最新的"
+                        } else {
+                            "更新好了"
+                        };
+                        app.toast(Notification::success(text), cx);
+                    }
+                    Err(err) => app.toast(Notification::error(format!("更新失败：{err}")), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 删掉克隆下来的仓库，它带来的插件一并从启用名单里拿掉。
+    fn uninstall_plugin(&mut self, repo: PathBuf, cx: &mut Context<Self>) {
+        self.plugins_form.confirm_uninstall = None;
+        let Some(dir) = plugin::default_plugins_dir() else {
+            return;
+        };
+        if let Err(err) = plugin_git::uninstall(&dir, &repo) {
+            self.toast(Notification::error(err), cx);
+            cx.notify();
+            return;
+        }
+        let names: Vec<String> = self
+            .plugins
+            .iter()
+            .filter(|p| p.repo.as_ref() == Some(&repo))
+            .map(|p| p.name.clone())
+            .collect();
+        self.save_ui_pref(move |s| s.plugins_enabled.retain(|n| !names.contains(n)), cx);
+        self.rescan_plugins(cx);
+    }
+
     /// 在资源管理器里打开插件目录（还没有就建一个）。
     fn open_plugins_dir(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = plugin::default_plugins_dir() else {
@@ -89,18 +218,46 @@ impl ChatApp {
                     .small()
                     .on_click(cx.listener(|this, _, _, cx| this.rescan_plugins(cx))),
             );
+        let busy = self.plugins_form.busy.clone();
+        // 从 git 地址装：输入框 + 安装按钮（回车也行）
+        let install = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(CARD))
+                    .px_1()
+                    .child(Input::new(&self.plugins_form.url).appearance(false).bordered(false)),
+            )
+            .child(
+                Self::text_button("plugins-install", "安装", true)
+                    .when(busy.is_some(), |b| b.loading(true))
+                    .disabled(busy.is_some())
+                    .on_click(cx.listener(|this, _, window, cx| this.install_plugin(window, cx))),
+            );
         let section = div()
             .v_flex()
             .gap_2()
             .child(header)
             .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(format!(
-            "每个插件是 {dir} 下的一个文件夹，格式兼容 Claude Code 的插件。新放进来的插件默认停用：\
+                "每个插件是 {dir} 下的一个文件夹，格式兼容 Claude Code 的插件（也认插件市场仓库）。\
+                 可以填 git 地址安装，也可以把文件夹直接放进去。新插件默认停用：\
                  钩子和 MCP 服务会在你的电脑上运行插件里写的命令，看过下面列出的内容再启用。"
-        )));
+            )))
+            .child(install)
+            .when_some(busy, |d, text| {
+                d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text))
+            });
         if self.plugins.is_empty() {
             return section.child(
                 div().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
-                    "还没有插件。点「打开插件目录」，把插件文件夹放进去，再点「重新扫描」。",
+                    "还没有插件。填上 git 地址安装，或者点「打开插件目录」把插件文件夹放进去，再点「重新扫描」。",
                 ),
             );
         }
@@ -206,6 +363,36 @@ impl ChatApp {
                         )
                     })
                     .child(div().flex_1())
+                    // 从 git 装的：更新 / 卸载（卡片自带边框，按钮不描边）
+                    .when_some(p.repo.clone(), |d, repo| {
+                        let update = repo.clone();
+                        d.child(
+                            Self::text_button(("plugin-update", i), "更新", false)
+                                .small()
+                                .with_variant(ButtonVariant::Secondary)
+                                .disabled(self.plugins_form.busy.is_some())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_plugin(update.clone(), cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("plugin-uninstall", i))
+                                .small()
+                                .label("卸载")
+                                .cursor_pointer()
+                                .custom(
+                                    ButtonCustomVariant::new(cx)
+                                        .foreground(rgb(RED).into())
+                                        .hover(rgb(HOVER).into())
+                                        .active(rgb(HOVER).into()),
+                                )
+                                .disabled(self.plugins_form.busy.is_some())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.plugins_form.confirm_uninstall = Some(repo.clone());
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         Switch::new(("plugin-enabled", i)).checked(on).color(rgb(CORAL)).on_change(
                             cx.listener(move |this, checked: &bool, _, cx| {
@@ -233,5 +420,45 @@ impl ChatApp {
             .children(p.problems.iter().map(|problem| {
                 div().text_size(TEXT_SMALL).text_color(rgb(RED)).child(problem.clone())
             }))
+            .when_some(self.uninstall_prompt(i, p, cx), |d, prompt| d.child(prompt))
+    }
+
+    /// 点了「卸载」之后卡片底部的确认行：删哪个目录、连带几个插件。
+    fn uninstall_prompt(&self, i: usize, p: &Plugin, cx: &mut Context<Self>) -> Option<Div> {
+        let repo =
+            p.repo.clone().filter(|r| self.plugins_form.confirm_uninstall.as_ref() == Some(r))?;
+        let siblings = self.plugins.iter().filter(|q| q.repo.as_ref() == Some(&repo)).count();
+        let folder = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let what = if siblings > 1 {
+            format!("从插件目录删除 {folder} 文件夹（连同其中 {siblings} 个插件）？")
+        } else {
+            format!("从插件目录删除 {folder} 文件夹？")
+        };
+        Some(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div().flex_1().min_w_0().text_size(TEXT_SMALL).text_color(rgb(RED)).child(what),
+                )
+                .child(
+                    Self::text_button(("plugin-uninstall-yes", i), "删除", false)
+                        .small()
+                        .with_variant(ButtonVariant::Danger)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.uninstall_plugin(repo.clone(), cx)
+                        })),
+                )
+                .child(
+                    Self::text_button(("plugin-uninstall-no", i), "取消", false)
+                        .small()
+                        .with_variant(ButtonVariant::Secondary)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.plugins_form.confirm_uninstall = None;
+                            cx.notify();
+                        })),
+                ),
+        )
     }
 }

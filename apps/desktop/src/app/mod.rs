@@ -139,6 +139,8 @@ pub struct ChatApp {
     sidebar_expanded: std::collections::HashSet<String>,
     /// 插件目录里的全部插件（启动时和设置页「重新扫描」时读；启用哪些见 `enabled_plugins`）
     plugins: Vec<claudesktop_core::Plugin>,
+    /// 插件页的安装框和进行中的 git 操作
+    plugins_form: plugins_view::PluginsForm,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
     placeholder: SharedString,
     /// 「回退到这里」浮层开着时算好的预览（打开时算一次，见 rewind.rs）
@@ -289,6 +291,7 @@ impl ChatApp {
         .detach();
 
         let settings_form = SettingsForm::new(window, cx);
+        let plugins_form = plugins_view::PluginsForm::new(window, cx);
         // 字号滑杆：85% ~ 140%，步进 5%
         let font_slider = cx.new(|_| {
             SliderState::new()
@@ -362,6 +365,7 @@ impl ChatApp {
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),
+            plugins_form,
             plugins: claudesktop_core::plugin::default_plugins_dir()
                 .map(|d| claudesktop_core::plugin::discover(&d))
                 .unwrap_or_default(),

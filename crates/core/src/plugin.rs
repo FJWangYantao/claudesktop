@@ -13,6 +13,9 @@
 //! 清单里的 `mcpServers` / `hooks` 也可以直接写对象或指向别的文件。命令、参数、环境变量里的
 //! `${CLAUDE_PLUGIN_ROOT}` 换成插件目录。
 //!
+//! `plugins/` 下的一个文件夹也可以是 Claude Code 的插件市场仓库（`.claude-plugin/marketplace.json`
+//! 列出仓库里的几个插件），这时它带来的是清单里的那几个插件。从 git 地址装、更新、卸载见 [`crate::plugin_git`]。
+//!
 //! 哪些插件启用由界面决定（设置里记着），这里只负责读：[`discover`] 列出全部插件，
 //! 读坏了的也列出来、带上原因。斜杠命令的展开（[`expand_command`]）在界面发消息时做，
 //! 所有内核都能用；技能、子 agent、钩子目前只有自研内核接，MCP 服务自研内核和 ACP agent 都接。
@@ -40,6 +43,9 @@ pub struct Plugin {
     pub description: String,
     /// 插件目录
     pub root: PathBuf,
+    /// 从 git 克隆来的：仓库目录（`plugins/` 下那一层，市场仓库里的几个插件共用一个）；
+    /// 手动放进来的为 None。更新、卸载按它来
+    pub repo: Option<PathBuf>,
     pub commands: Vec<PluginCommand>,
     pub skills: Vec<Skill>,
     pub agents: Vec<AgentDef>,
@@ -176,10 +182,68 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
         .flatten()
         .filter(|e| e.path().is_dir())
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .map(|e| load(&e.path()))
+        .flat_map(|e| {
+            let dir = e.path();
+            let repo = dir.join(".git").exists().then(|| dir.clone());
+            let mut found = match read_json(&dir.join(".claude-plugin").join("marketplace.json")) {
+                Ok(Some(value)) => load_marketplace(&dir, &value),
+                Ok(None) => vec![load(&dir)],
+                Err(e) => {
+                    let mut p = load(&dir);
+                    p.problems.push(e);
+                    vec![p]
+                }
+            };
+            for p in &mut found {
+                p.repo = repo.clone();
+            }
+            found
+        })
         .collect();
     plugins.sort_by(|a, b| a.name.cmp(&b.name));
     plugins
+}
+
+/// 插件市场仓库：按 `marketplace.json` 的 `plugins` 逐个读（`source` 是仓库里的相对路径）。
+/// 来源是别的仓库 / 网址的条目不去取，列出来、标上原因。
+fn load_marketplace(dir: &Path, value: &Value) -> Vec<Plugin> {
+    let Some(entries) = value.get("plugins").and_then(Value::as_array) else {
+        let mut p = load(dir);
+        p.problems.push("marketplace.json 里没有 plugins 列表".into());
+        return vec![p];
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name").and_then(Value::as_str)?.to_string();
+            let text = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_string);
+            let mut plugin = match entry.get("source").and_then(Value::as_str) {
+                Some(source) => {
+                    let mut p = load(&dir.join(source.trim_start_matches("./")));
+                    // 插件自己没写清单时，名字、说明用市场里的
+                    if !p.root.join(".claude-plugin").join("plugin.json").exists() {
+                        p.name = name;
+                    }
+                    p
+                }
+                None => Plugin {
+                    name,
+                    root: dir.to_path_buf(),
+                    problems: vec![
+                        "这个插件在别的仓库里，暂不支持从市场跟着装，请单独用它的地址安装".into(),
+                    ],
+                    ..Plugin::default()
+                },
+            };
+            if plugin.description.is_empty() {
+                plugin.description = text("description").unwrap_or_default();
+            }
+            if plugin.version.is_none() {
+                plugin.version = text("version");
+            }
+            Some(plugin)
+        })
+        .collect()
 }
 
 /// 读一个插件目录。

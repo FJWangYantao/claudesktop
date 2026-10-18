@@ -16,6 +16,7 @@ mod acp;
 pub mod checkpoint;
 mod diff;
 pub mod plugin;
+pub mod plugin_git;
 mod process_guard;
 mod store;
 
