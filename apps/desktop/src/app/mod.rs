@@ -17,6 +17,7 @@ mod plugins_view;
 mod requests_view;
 mod rewind;
 mod search;
+mod settings_kit;
 mod settings_view;
 mod shortcuts;
 mod sidebar;

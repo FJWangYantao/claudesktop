@@ -17,9 +17,14 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `PopoverState::dismiss`），**不要**在 `ChatApp` 根 struct 里加 `*_open` bool、
   手摆 `absolute()` 坐标或手写互斥——那是 2026-10 之前的老写法，已清除。
 - **菜单条目**：两行式（图标 + 名称 + 灰色说明 + 当前项对勾）用 `menu.rs` 的 `menu_item()`，
-  装进 `MenuList::pick(row, action)`（点了执行并收起，前 9 个自动标键帽、按数字直接选）；
+  装进 `MenuList::pick(row, action)`（点了执行并收起，前 9 个自动标键帽、按数字直接选；动作要 `Window` 时用 `pick_in`）；
   不收起面板的内容用 `MenuList::child`。面板宽度用 rem。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
   `widgets.rs` 的 `message_action()`。
+- **设置页**：排版件在 `app/settings_kit.rs`——`section`（分区标题 + 一句说明 + 右侧操作）、
+  `setting_row` / `setting_group`（标题说明 + 右侧控件）、`form_field`（左标签右输入）、
+  `choice_panel` + `choice_row`（沙色面板里的单选列表，同首页配置引导）、`seg_control`。
+  说明只写一句「这是干什么的」；怎么用写成 `how_to` 编号步骤放空状态，格式细节收进 `ChatApp::disclosure`。
+  「内核与模型」要点保存（底栏固定，`form_dirty` 决定能不能点），其余分类即时生效。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
   分组规则在 `Session::compute_layout`）；

@@ -158,13 +158,22 @@ impl MenuList {
 
     /// 可选条目：`row` 一般是 [`menu_item`]，`action` 在根视图上执行，之后收起面板。
     pub(super) fn pick(
-        mut self,
+        self,
         row: Stateful<Div>,
         action: impl Fn(&mut ChatApp, &mut Context<ChatApp>) + 'static,
     ) -> Self {
+        self.pick_in(row, move |this, _, cx| action(this, cx))
+    }
+
+    /// 同 [`pick`](Self::pick)，动作里要用 `Window`（如给输入框填值）时用它。
+    pub(super) fn pick_in(
+        mut self,
+        row: Stateful<Div>,
+        action: impl Fn(&mut ChatApp, &mut Window, &mut Context<ChatApp>) + 'static,
+    ) -> Self {
         let (handle, popover) = (self.handle.clone(), self.popover.clone());
         let pick: Pick = Rc::new(move |window, cx| {
-            handle.update(cx, |this, cx| action(this, cx));
+            handle.update(cx, |this, cx| action(this, window, cx));
             popover.update(cx, |s, cx| s.dismiss(window, cx));
         });
         let n = self.picks.len() + 1;

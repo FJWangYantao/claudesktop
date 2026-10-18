@@ -88,20 +88,25 @@ fn main() {
                 cx.spawn_in(window, async move |this, cx| {
                     cx.background_executor().timer(Duration::from_millis(1500)).await;
                     let _ = this.update_in(cx, |app, window, cx| {
-                        // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页）/ fetch（并获取模型列表）
-                        // / restart（重启内核）
+                        // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页；settings:N 打开第 N 个分类）
+                        // / fetch（并获取模型列表）/ restart（重启内核）
                         // / rename、ask-delete、delete（对侧栏第 2 个会话）
-                        match std::env::var("CLAUDESKTOP_OPEN").as_deref() {
-                            Ok("settings") => app.open_settings(window, cx),
-                            Ok("fetch") => {
+                        let open = std::env::var("CLAUDESKTOP_OPEN").unwrap_or_default();
+                        match open.as_str() {
+                            "settings" => app.open_settings(window, cx),
+                            o if o.starts_with("settings:") => {
+                                let tab = o["settings:".len()..].parse().unwrap_or(0);
+                                app.open_settings_at(tab, window, cx)
+                            }
+                            "fetch" => {
                                 app.open_settings(window, cx);
                                 app.fetch_models(true, cx);
                             }
                             // 侧栏第 2 行（第一个历史会话）：重命名 / 删除确认 / 直接删除
-                            Ok("rename") => app.start_rename(1, window, cx),
-                            Ok("ask-delete") => app.ask_delete(1, cx),
-                            Ok("delete") => app.delete_session(1, cx),
-                            Ok("restart") => {
+                            "rename" => app.start_rename(1, window, cx),
+                            "ask-delete" => app.ask_delete(1, cx),
+                            "delete" => app.delete_session(1, cx),
+                            "restart" => {
                                 let kind = app.session().kernel;
                                 app.restart_kernel(kind, cx)
                             }

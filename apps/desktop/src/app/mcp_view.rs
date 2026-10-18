@@ -5,6 +5,7 @@
 //! 状态经 `KernelEvent::McpStatus` 回来，存在自研内核那个 `KernelSlot::mcp` 里。
 
 use super::ChatApp;
+use super::settings_kit::{example_block, how_to, note, section};
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
@@ -17,6 +18,21 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+/// 设置页「配置示例」里的 mcp.json：一个本地命令、一个远程服务。
+const CONFIG_EXAMPLE: &str = r#"{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:/notes"]
+    },
+    "remote": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${MY_TOKEN}" }
+    }
+  }
+}"#;
 
 impl ChatApp {
     /// 用系统默认程序打开 `mcp.json`；还没有就先写一份模板（示例服务器是禁用的）。
@@ -55,20 +71,12 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(super) fn render_mcp(&self, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_mcp(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let path =
             default_mcp_config().map_or_else(|| "mcp.json".into(), |p| p.display().to_string());
-        let header = div()
+        let actions = div()
             .h_flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(TEXT_BODY)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("MCP 服务器"),
-            )
+            .gap_1p5()
             .child(
                 Self::text_button("mcp-edit", "编辑配置文件", false)
                     .small()
@@ -77,13 +85,38 @@ impl ChatApp {
             .child(
                 Self::text_button("mcp-reload", "重新加载", false)
                     .small()
+                    .tooltip("改完配置文件后点它，重新读配置并重连全部服务器")
                     .on_click(cx.listener(|this, _, _, cx| this.reload_mcp(cx))),
-            );
-        let section = div().v_flex().gap_2().child(header).child(
-            div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(format!(
-                "自研内核可以调用 MCP 服务器提供的工具：本地命令，或远程的 HTTP / SSE 服务（\"type\": \"http\"、\"url\"、\"headers\"，值里可写 ${{环境变量}}）。配置写在 {path}，格式同 Claude Code 的 .mcp.json；改完点「重新加载」。启用的插件带的服务也列在这里。工具调用照常弹权限卡。"
-            )),
-        );
+            )
+            .into_any_element();
+        // 配置示例：空着时和列表下面都能展开看
+        let example = div()
+            .v_flex()
+            .gap_2()
+            .child(example_block(CONFIG_EXAMPLE))
+            .child(note(IconAll::Dot, "本地程序写 command 和 args（需要时加 env），远程服务写 type 和 url"))
+            .child(note(
+                IconAll::Dot,
+                "headers 和 env 的值里可以写 ${环境变量}，Key 不用明文写进文件；旧版 SSE 服务把 type 写成 \"sse\"",
+            ))
+            .child(note(IconAll::Dot, "\"disabled\": true 表示先不连；格式同 Claude Code 的 .mcp.json"));
+        let footer = div()
+            .v_flex()
+            .gap_1()
+            .child(self.disclosure("mcp-example", "配置示例", example, window, cx))
+            .child(note(IconAll::Braces, format!("配置文件：{path}")))
+            .child(note(
+                IconAll::ShieldCheck,
+                "调用 MCP 工具同样会弹权限卡片；模型看到的工具名是 mcp__服务器__工具。启用的插件带来的服务器也列在这里",
+            ));
+        let section = |body: Div| {
+            section(
+                "MCP 服务器",
+                "给自研内核接上外部工具，比如浏览器、数据库、GitHub",
+                Some(actions),
+                body.child(footer),
+            )
+        };
 
         let running = self.kernel_of(KernelChoice::Builtin).is_some();
         let servers: Vec<McpServerView> = if running {
@@ -105,15 +138,16 @@ impl ChatApp {
                 .collect()
         };
         if servers.is_empty() {
-            return section.child(
-                div()
-                    .py_2()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .child("还没有配置 MCP 服务器。点「编辑配置文件」，照模板填好、去掉 \"disabled\"，再点「重新加载」。"),
-            );
+            return section(div().v_flex().gap_4().child(how_to(
+                "还没有 MCP 服务器，三步加上",
+                &[
+                    "点右上角「编辑配置文件」，会用系统默认程序打开 mcp.json（第一次打开时已写好两个示例）",
+                    "照下面的「配置示例」写上服务器：本地程序写命令，远程服务写地址",
+                    "删掉那一项的 \"disabled\": true，保存文件，回来点「重新加载」",
+                ],
+            )));
         }
-        let mut card = div().v_flex().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD));
+        let mut card = div().v_flex().rounded_xl().border_1().border_color(rgb(LINE)).bg(rgb(CARD));
         for (i, server) in servers.iter().enumerate() {
             // 需要 OAuth 登录：给一个「登录」按钮，打开授权页
             let (dot, label, detail, sign_in) = match &server.state {
@@ -223,15 +257,6 @@ impl ChatApp {
                     }),
             );
         }
-        section.child(card).child(
-            div()
-                .h_flex()
-                .items_center()
-                .gap_1p5()
-                .text_size(TEXT_META)
-                .text_color(rgb(INK_SOFT))
-                .child(Icon::new(IconAll::Info).size_3p5().flex_shrink_0())
-                .child("模型看到的工具名是 mcp__服务器__工具；「总是允许」按项目、服务器和工具记在权限规则里。"),
-        )
+        section(div().v_flex().gap_4().child(card))
     }
 }

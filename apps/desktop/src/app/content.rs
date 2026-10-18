@@ -43,7 +43,7 @@ impl ChatApp {
     /// 内容区：设置页、首页（问候 + 用量概览）或当前会话的对话列表。
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.settings_open {
-            return v_flex().size_full().child(self.render_settings(cx)).into_any_element();
+            return v_flex().size_full().child(self.render_settings(window, cx)).into_any_element();
         }
         let active = self.active;
         // 还没发过消息的会话显示首页（与官方空会话一致，输入框在底部）

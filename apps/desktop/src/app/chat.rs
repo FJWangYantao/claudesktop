@@ -756,7 +756,11 @@ impl ChatApp {
                             d.child(
                                 button("fail-settings", IconAll::Settings, "打开设置").on_click(
                                     cx.listener(|this, _, window, cx| {
-                                        this.open_settings_at(1, window, cx)
+                                        this.open_settings_at(
+                                            super::settings_view::KERNEL_TAB,
+                                            window,
+                                            cx,
+                                        )
                                     }),
                                 ),
                             )

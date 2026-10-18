@@ -3,6 +3,8 @@
 use super::ChatApp;
 use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::motion::{self, Reveal};
+use super::settings_kit::*;
 use super::widgets::Surface;
 use crate::settings::*;
 use crate::theme::rgb;
@@ -19,6 +21,7 @@ use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::collections::HashSet;
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
 const SETTINGS_TABS: [(IconAll, &str); 5] = [
@@ -29,44 +32,11 @@ const SETTINGS_TABS: [(IconAll, &str); 5] = [
     (IconAll::Blocks, "插件"),
 ];
 
+/// 设置页「内核与模型」分类的下标（首页配置引导、失败卡片的「打开设置」直接打开它）
+pub(super) const KERNEL_TAB: usize = 1;
+
 /// 设置页「插件」分类的下标（侧栏的「插件」入口直接打开它）
 pub(super) const PLUGINS_TAB: usize = 4;
-
-/// 设置项的一行：左边标题 + 灰色说明，右边控件。
-fn setting_row(title: &'static str, desc: impl IntoElement, control: impl IntoElement) -> Div {
-    div()
-        .h_flex()
-        .items_center()
-        .gap_4()
-        .py_4()
-        .child(
-            div()
-                .v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_0p5()
-                .child(
-                    div()
-                        .text_size(TEXT_BODY)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(INK))
-                        .child(title),
-                )
-                .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc)),
-        )
-        .child(div().flex_none().child(control))
-}
-
-/// 一组设置行，行与行之间细分隔线。
-fn setting_group(rows: impl IntoIterator<Item = Div>) -> Div {
-    let mut group = div().v_flex();
-    for (i, row) in rows.into_iter().enumerate() {
-        group = group.child(
-            row.when(i == 0, |d| d.pt_0()).when(i > 0, |d| d.border_t_1().border_color(rgb(LINE))),
-        );
-    }
-    group
-}
 
 /// 一套档案在表单里的输入框（与 `SettingsForm::profiles` 一一对应）。
 pub struct ProfileInputs {
@@ -108,7 +78,7 @@ pub struct SettingsForm {
     active: usize,
     /// 每套档案的输入框
     inputs: Vec<ProfileInputs>,
-    /// 设置页当前所在的 tab（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP）
+    /// 设置页当前所在的 tab（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP / 4 插件）
     pub(super) tab: usize,
     acp_command: Entity<InputState>,
     /// 一轮最多几步（自研内核的工具循环上限）
@@ -125,12 +95,16 @@ pub struct SettingsForm {
     message: Option<(bool, SharedString)>,
     /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
     rules: Vec<(String, Vec<String>)>,
+    /// 展开着的说明 / 示例（`ChatApp::disclosure` 的 key），关设置页也记着
+    pub(super) open_help: HashSet<&'static str>,
 }
 
 impl SettingsForm {
     pub fn new(window: &mut Window, cx: &mut Context<ChatApp>) -> Self {
-        let acp_command =
-            cx.new(|cx| InputState::new(window, cx).placeholder("留空 = 内置 mock agent"));
+        let acp_command = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("如 npx -y @agentclientprotocol/claude-agent-acp")
+        });
         let max_steps = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(claudesktop_builtin::DEFAULT_MAX_STEPS.to_string())
@@ -150,6 +124,7 @@ impl SettingsForm {
             prices,
             message: None,
             rules: Vec::new(),
+            open_help: HashSet::new(),
         }
     }
 
@@ -333,55 +308,44 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 「通用」分类：外观、字号、字体、侧栏内核状态、系统通知（都即时生效，不走「保存并应用」）。
+    /// 「通用」分类：外观、字号、字体、侧栏、通知（都即时生效，不走「保存并应用」），以及设置文件在哪。
     fn render_general(&self, cx: &mut Context<Self>) -> Div {
-        let current = self.settings.appearance;
-        let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
-        for (i, a) in Appearance::ALL.into_iter().enumerate() {
-            segs = segs.child(
-                div()
-                    .id(("appearance", i))
-                    .cursor_pointer()
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.set_appearance(a, window, cx)),
-                    )
-                    .child(Self::seg(a.label(), a == current)),
-            );
-        }
         let motion = self.settings.motion;
-        let mut motion_segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
-        for (i, m) in MotionPref::ALL.into_iter().enumerate() {
-            motion_segs = motion_segs.child(
-                div()
-                    .id(("motion", i))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_motion_pref(m, cx)))
-                    .child(Self::seg(m.label(), m == motion)),
-            );
-        }
         let motion_desc = if motion == MotionPref::System && self.system_reduce_motion {
-            "展开收起、转圈等过渡；Windows 里已关闭"
+            "展开收起、转圈这类过渡效果（Windows 里已关闭）"
         } else {
-            "展开收起、转圈等过渡；可跟随 Windows 设置"
+            "展开收起、转圈这类过渡效果"
         };
-        setting_group([
-            setting_row("外观", "跟随系统，或固定用浅色 / 深色；立即生效", segs),
-            setting_row("动画", motion_desc, motion_segs),
-            self.font_scale_row(),
-            self.font_family_row(cx),
+        let appearance = setting_group([
             setting_row(
-                "侧栏显示内核状态",
-                "在侧栏底部列出每个已启动内核的连接状态；默认关闭，打开不影响内核运行",
-                Switch::new("sidebar-kernel-status")
-                    .checked(self.settings.sidebar_kernel_status)
-                    .color(rgb(CORAL))
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        this.set_sidebar_kernel_status(*checked, cx)
-                    })),
+                "主题",
+                "跟随系统，或固定用浅色 / 深色",
+                seg_control(
+                    "appearance",
+                    Appearance::ALL.map(|a| (a, a.label())),
+                    self.settings.appearance,
+                    |this, a, window, cx| this.set_appearance(a, window, cx),
+                    cx,
+                ),
             ),
             setting_row(
+                "动画",
+                motion_desc,
+                seg_control(
+                    "motion",
+                    MotionPref::ALL.map(|m| (m, m.label())),
+                    motion,
+                    |this, m, _, cx| this.set_motion_pref(m, cx),
+                    cx,
+                ),
+            ),
+            self.font_scale_row(),
+            self.font_family_row(cx),
+        ]);
+        let reminders = setting_group([
+            setting_row(
                 "系统通知",
-                "窗口在后台时，回复完成、等授权或出错会弹通知；点通知回到该会话",
+                "窗口在后台时，回复完成、等你授权或出错会弹通知，点通知回到那个会话",
                 Switch::new("notifications")
                     .checked(self.settings.notifications)
                     .color(rgb(CORAL))
@@ -391,7 +355,49 @@ impl ChatApp {
                         cx.notify();
                     })),
             ),
-        ])
+            setting_row(
+                "侧栏显示内核状态",
+                "在侧栏底部列出已启动内核的连接状态；默认关闭，打开不影响内核运行",
+                Switch::new("sidebar-kernel-status")
+                    .checked(self.settings.sidebar_kernel_status)
+                    .color(rgb(CORAL))
+                    .on_change(cx.listener(|this, checked, _, cx| {
+                        this.set_sidebar_kernel_status(*checked, cx)
+                    })),
+            ),
+        ]);
+        div()
+            .v_flex()
+            .gap_8()
+            .child(section("外观", "这一页的改动立即生效", None, appearance))
+            .child(section("提醒", "", None, reminders))
+            .child(section("数据", "", None, setting_group([self.settings_file_row(cx)])))
+    }
+
+    /// 设置文件在哪：路径 + 「打开文件夹」。
+    fn settings_file_row(&self, cx: &mut Context<Self>) -> Div {
+        let path = self.settings_path.clone();
+        let desc = div()
+            .v_flex()
+            .gap_0p5()
+            .child(match &path {
+                Some(p) => {
+                    div().font_family(MONO).text_size(TEXT_META).child(p.display().to_string())
+                }
+                None => div().text_color(rgb(RED)).child("数据目录不可用，设置不会保存"),
+            })
+            .child("API Key 以明文保存；启动时设置的环境变量优先于这里");
+        setting_row(
+            "设置文件",
+            desc,
+            div().when_some(path, |d, path| {
+                d.child(
+                    Self::text_button("settings-reveal", "打开文件夹", false)
+                        .small()
+                        .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&path))),
+                )
+            }),
+        )
     }
 
     /// 字号滑杆：右边带当前百分比。事件订阅在 `ChatApp::new`（`SliderState` 自己 emit），
@@ -402,7 +408,7 @@ impl ChatApp {
             .h_flex()
             .items_center()
             .gap_3()
-            .w(px(240.))
+            .w(rems(15.))
             .child(div().flex_1().min_w_0().child(Slider::new(&self.font_slider)))
             .child(
                 // 宽度用 rem：字号放大后「140%」也不会折成两行
@@ -411,21 +417,22 @@ impl ChatApp {
                     .flex_shrink_0()
                     .whitespace_nowrap()
                     .text_right()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK))
                     .font_features(tabular_nums())
                     .child(format!("{percent:.0}%")),
             );
-        let desc =
-            div().v_flex().gap_1p5().child("整界面等比缩放（文字、间距、圆角一起变）").child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(Self::kbd(ZOOM_IN_KEY))
-                    .child("放大")
-                    .child(div().w_1())
-                    .child(Self::kbd(ZOOM_OUT_KEY))
-                    .child("缩小"),
-            );
+        let desc = div().v_flex().gap_1().child("文字、间距、圆角一起等比缩放").child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_1()
+                .child(Self::kbd(ZOOM_IN_KEY))
+                .child("放大")
+                .child(div().w_1())
+                .child(Self::kbd(ZOOM_OUT_KEY))
+                .child("缩小"),
+        );
         setting_row("界面字号", desc, slider)
     }
 
@@ -436,7 +443,7 @@ impl ChatApp {
             self.settings.font_family_or_default().unwrap_or_else(|| "Inter（内嵌）".into());
         setting_row(
             "界面字体",
-            "界面文字用哪套字体；代码块始终用等宽的 JetBrains Mono",
+            "代码块始终用等宽的 JetBrains Mono",
             menu_popover(
                 "font-family-menu",
                 Anchor::BottomRight,
@@ -483,16 +490,12 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_settings_at(1, window, cx);
+        self.open_settings_at(KERNEL_TAB, window, cx);
         self.settings_form.kernel = kind;
         if kind == KernelChoice::Acp
             && self.settings_form.acp_command.read(cx).value().trim().is_empty()
         {
-            let command = if cfg!(windows) {
-                "cmd /c npx -y @agentclientprotocol/claude-agent-acp"
-            } else {
-                "npx -y @agentclientprotocol/claude-agent-acp"
-            };
+            let command = acp_command(ACP_PRESETS[0].1);
             self.settings_form
                 .acp_command
                 .update(cx, |state, cx| state.set_value(command, window, cx));
@@ -591,6 +594,7 @@ impl ChatApp {
     }
 
     /// 表单里追加一套档案（预设 `preset = None` 时是空白自定义）。
+    /// 选中的那套还什么都没填（首次配置时补的空档案）就直接换掉它，不留一套空的。
     fn add_form_profile(
         &mut self,
         preset: Option<usize>,
@@ -603,9 +607,22 @@ impl ChatApp {
             p.set_models(&[]);
             p
         });
-        self.settings_form.inputs.push(ProfileInputs::new(window, cx, &p));
-        self.settings_form.profiles.push(p);
-        self.settings_form.active = self.settings_form.profiles.len() - 1;
+        let inputs = ProfileInputs::new(window, cx, &p);
+        let f = &mut self.settings_form;
+        let blank = f.current().is_some_and(|(_, i)| {
+            [&i.name, &i.base_url, &i.api_key, &i.model]
+                .iter()
+                .all(|input| value(input, cx).is_empty())
+        });
+        if blank {
+            f.profiles[f.active] = p;
+            f.inputs[f.active] = inputs;
+        } else {
+            f.inputs.push(inputs);
+            f.profiles.push(p);
+            f.active = f.profiles.len() - 1;
+        }
+        f.message = None;
         cx.notify();
     }
 
@@ -736,79 +753,106 @@ impl ChatApp {
     }
 
     fn render_rules(&self, cx: &mut Context<Self>) -> Div {
-        let mut section = div()
-            .v_flex()
-            .gap_2()
-            .child(
-                div()
-                    .text_size(TEXT_BODY)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("已保存的权限规则"),
-            )
-            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
-                "自研内核里在权限卡片上选「总是允许」时记下的，按项目生效；删除后立即生效。",
-            ));
         let rules = &self.settings_form.rules;
-        if rules.is_empty() {
-            return section.child(
-                div().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("还没有规则"),
-            );
-        }
-        let mut n = 0usize;
-        for (project, list) in rules {
-            let mut card =
-                div().v_flex().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(rgb(LINE))
-                        .child(Icon::new(IconAll::Folder).size_3p5().text_color(rgb(INK_SOFT)))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .font_family(MONO)
-                                .text_size(TEXT_SMALL)
-                                .text_color(rgb(INK))
-                                .child(project.clone()),
-                        ),
-                );
-            for rule in list {
-                let (p, r) = (project.clone(), rule.clone());
-                card = card.child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .px_3()
-                        .py_1p5()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(TEXT_SMALL)
-                                .text_color(rgb(INK))
-                                .child(rule_label(rule)),
-                        )
-                        .child(
-                            Self::quiet_button(("rule-remove", n), IconAll::X, Surface::Paper, cx)
+        let body = if rules.is_empty() {
+            div().v_flex().gap_3().child(how_to(
+                "还没有记下的规则",
+                &[
+                    "自研内核要运行命令、改文件或访问网站时，对话里会弹出权限卡片问你",
+                    "在卡片上选「总是允许」，这个项目里同类的操作以后就不再询问",
+                    "记下的规则列在这里；不想要了点 × 删掉，下次会重新问你",
+                ],
+            ))
+        } else {
+            let mut list = div().v_flex().gap_3();
+            let mut n = 0usize;
+            for (project, items) in rules {
+                let mut card = div()
+                    .v_flex()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(CARD))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(LINE))
+                            .child(Icon::new(IconAll::Folder).size_3p5().text_color(rgb(INK_SOFT)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_family(MONO)
+                                    .text_size(TEXT_SMALL)
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(project.clone()),
+                            ),
+                    );
+                for rule in items {
+                    let (p, r) = (project.clone(), rule.clone());
+                    card = card.child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .pl_3()
+                            .pr_1p5()
+                            .py_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(TEXT_BODY)
+                                    .text_color(rgb(INK))
+                                    .child(rule_label(rule)),
+                            )
+                            .child(
+                                Self::quiet_button(
+                                    ("rule-remove", n),
+                                    IconAll::X,
+                                    Surface::Paper,
+                                    cx,
+                                )
                                 .small()
                                 .tooltip("删除这条规则")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_rule(p.clone(), r.clone(), cx)
-                                })),
-                        ),
-                );
-                n += 1;
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.remove_rule(p.clone(), r.clone(), cx)
+                                    },
+                                )),
+                            ),
+                    );
+                    n += 1;
+                }
+                list = list.child(card);
             }
-            section = section.child(card);
-        }
-        section
+            list
+        };
+        let body = body
+            .when_some(self.settings_form.message.clone(), |d, (error, text)| {
+                d.child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(if error { RED } else { GREEN }))
+                        .child(text),
+                )
+            })
+            .child(note(
+                IconAll::Info,
+                "什么时候弹权限卡片，由输入框下方的权限模式决定（如「逐项确认」）",
+            ));
+        section(
+            "总是允许的操作",
+            "在权限卡片上选「总是允许」时记下的，按项目生效；删除立即生效",
+            None,
+            body,
+        )
     }
 
     fn import_antigravity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -855,69 +899,76 @@ impl ChatApp {
         }
     }
 
-    fn field(label: &'static str, hint: Option<&'static str>, input: impl IntoElement) -> Div {
-        div()
-            .v_flex()
-            .gap_1p5()
-            .child(
-                div()
-                    .text_size(TEXT_BODY)
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(INK))
-                    .child(label),
-            )
-            .child(input)
-            .when_some(hint, |d, h| {
-                d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(h))
-            })
-    }
-
-    /// 用量网关：开关（随「保存」生效）、打开日志目录、清空日志（再点一次确认）。
-    fn gateway_field(&self, cx: &mut Context<Self>) -> Div {
+    /// 用量网关：开关（随「保存」生效），说明下面带「打开日志目录」「清空日志」（再点一次确认）。
+    fn gateway_row(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let confirm = f.confirm_clear_gateway;
-        let row = div()
+        let actions = div()
             .h_flex()
             .items_center()
-            .gap_2()
+            .gap_1()
+            .ml(rems(-0.5))
             .child(
-                Switch::new("usage-gateway").checked(f.usage_gateway).color(rgb(CORAL)).on_change(
-                    cx.listener(|this, checked: &bool, _, cx| {
-                        this.settings_form.usage_gateway = *checked;
-                        cx.notify();
-                    }),
-                ),
-            )
-            .child(div().flex_1())
-            .child(
-                Self::text_button("gateway-open", "打开日志目录", false)
-                    .small()
+                Self::quiet_button("gateway-open", IconAll::FolderOpen, Surface::Paper, cx)
+                    .xsmall()
+                    .label("打开日志目录")
+                    .px_2()
                     .on_click(cx.listener(|this, _, _, cx| this.open_gateway_dir(cx))),
             )
-            .child(
-                Self::text_button(
-                    "gateway-clear",
-                    if confirm { "确定清空？" } else { "清空日志" },
-                    false,
-                )
-                .small()
-                .when(confirm, |b| b.with_variant(ButtonVariant::Danger))
-                .on_click(cx.listener(|this, _, _, cx| this.clear_gateway_logs(cx))),
-            );
-        Self::field(
+            .child(if confirm {
+                Self::text_button("gateway-clear", "确定清空？", false)
+                    .xsmall()
+                    .with_variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_gateway_logs(cx)))
+            } else {
+                Self::quiet_button("gateway-clear", IconAll::Trash, Surface::Paper, cx)
+                    .xsmall()
+                    .label("清空日志")
+                    .px_2()
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_gateway_logs(cx)))
+            });
+        setting_row(
             "用量网关",
-            Some(
-                "自研内核的每个请求经本地网关转发，记下耗时、用量、重试和停止（不记提示词和 key），\
-                 在首页用量的「请求」页签里看；关掉就直连服务商",
+            div()
+                .v_flex()
+                .gap_1()
+                .child(
+                    "记下每个请求的耗时、用量和重试（不记提示词和 Key），在首页「请求」页签查看；\
+                     关掉就直连服务商",
+                )
+                .child(actions),
+            Switch::new("usage-gateway").checked(f.usage_gateway).color(rgb(CORAL)).on_change(
+                cx.listener(|this, checked: &bool, _, cx| {
+                    this.settings_form.usage_gateway = *checked;
+                    cx.notify();
+                }),
             ),
-            row,
         )
     }
 
-    /// 模型单价表：多行文本框 + 「恢复默认」。
-    fn prices_field(&self, cx: &mut Context<Self>) -> Div {
+    /// 模型单价：一行说明 +「编辑」；展开后是多行文本框、写法说明和「恢复默认」。
+    fn prices_row(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        const KEY: &str = "prices";
+        let open = self.settings_form.open_help.contains(KEY);
+        let row = setting_row(
+            "模型单价",
+            "首页「请求」页签按它估算费用；内置的是参考价，以服务商为准",
+            Self::text_button("prices-edit", if open { "收起" } else { "编辑" }, false)
+                .small()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let help = &mut this.settings_form.open_help;
+                    if !help.remove(KEY) {
+                        help.insert(KEY);
+                    }
+                    cx.notify();
+                })),
+        );
+        let progress = motion::reveal_progress("prices-editor", open, window, cx);
+        if progress <= 0. {
+            return row;
+        }
         let editor = div()
-            .rounded_md()
+            .rounded_lg()
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
@@ -925,28 +976,42 @@ impl ChatApp {
             .font_family(MONO)
             .text_size(TEXT_SMALL)
             .child(Textarea::new(&self.settings_form.prices).appearance(false).bordered(false));
-        let row = div().v_flex().gap_1p5().child(editor).child(
-            div().h_flex().child(div().flex_1()).child(
-                Self::text_button("prices-reset", "恢复默认", false).small().on_click(cx.listener(
-                    |this, _, window, cx| {
+        let format = div()
+            .v_flex()
+            .gap_2()
+            .child(example_block(PRICES_EXAMPLE))
+            .child(note(
+                IconAll::Dot,
+                "一行一个模型：名称、输入价、输出价、缓存命中价，按每百万 token 计，数字前写 $ 或 ¥",
+            ))
+            .child(note(IconAll::Dot, "名称按包含匹配，几条都对得上时取最长的那条；# 开头是注释"))
+            .child(note(
+                IconAll::Dot,
+                "分峰谷价的模型行尾写 x2（前面填谷价），再加一行 @peak 写峰时段：星期（1-5 = 周一到周五）、时段、时区",
+            ));
+        let editor = div().v_flex().gap_2().pb_4().child(editor).child(
+            div()
+                .h_flex()
+                .items_start()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(self.disclosure(
+                    "prices-format",
+                    "写法说明",
+                    format,
+                    window,
+                    cx,
+                )))
+                .child(Self::text_button("prices-reset", "恢复默认", false).small().on_click(
+                    cx.listener(|this, _, window, cx| {
                         let text = crate::pricing::to_text(&crate::pricing::Table::defaults());
                         this.settings_form
                             .prices
                             .update(cx, |state, cx| state.set_value(text, window, cx));
                         cx.notify();
-                    },
+                    }),
                 )),
-            ),
         );
-        Self::field(
-            "模型单价",
-            Some(
-                "估算首页「请求」页签的费用用。一行一个模型：名称 输入 输出 缓存命中，\
-                 按每百万 token，数字前写 $ 或 ¥；名称按包含匹配、取最长的一条。内置的是参考价，以服务商为准。\
-                 分峰谷价的模型在后面写 x2（写的是谷价）；峰时段单独一行：@peak 1-5 09:00-12:00 +08:00",
-            ),
-            row,
-        )
+        div().v_flex().child(row).child(Reveal::new("prices-editor-body", progress, editor))
     }
 
     pub(super) fn open_gateway_dir(&mut self, cx: &mut Context<Self>) {
@@ -979,7 +1044,7 @@ impl ChatApp {
 
     fn text_input(state: &Entity<InputState>) -> Div {
         div()
-            .rounded_md()
+            .rounded_lg()
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
@@ -987,379 +1052,303 @@ impl ChatApp {
             .child(Input::new(state).appearance(false).bordered(false))
     }
 
-    pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// 表单和生效中的设置有没有不同（底栏据此提示、决定「保存」能不能点）。
+    fn form_dirty(&self, cx: &App) -> bool {
+        // 单价表写错了也算改动：点「保存」才看得到错在哪
+        if crate::pricing::parse_text(&self.settings_form.prices.read(cx).value()).is_err() {
+            return true;
+        }
+        let normalize = |mut s: Settings| {
+            s.kernel = Some(s.kernel());
+            // 打开设置页时补上的那套空档案不算改动
+            let blank = ProviderProfile::default();
+            s.builtin.profiles.retain(|p| *p != blank);
+            s.builtin.active = s.builtin.active.min(s.builtin.profiles.len().saturating_sub(1));
+            s
+        };
+        normalize(self.form_settings(cx)) != normalize(self.settings.clone())
+    }
+
+    /// 「内核与模型」：默认内核三选一，下面是选中那种内核的配置。
+    fn render_kernel_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let choice =
-            |id: &'static str, kind: KernelChoice, title: &'static str, desc: &'static str| {
-                let active = f.kernel == kind;
-                div()
-                    .id(id)
-                    .flex_1()
-                    .min_w_0()
-                    .v_flex()
-                    .gap_1()
-                    .p_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(if active { CORAL } else { LINE }))
-                    .bg(rgb(CARD))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)))
+        let mut kernels = choice_panel();
+        for (kind, icon, title, desc) in KERNEL_CHOICES {
+            kernels = kernels.child(
+                choice_row(("kernel", kind.index()), icon, title, desc, f.kernel == kind, None)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_form.kernel = kind;
                         this.settings_form.message = None;
                         cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_1p5()
-                            .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(title))
-                            .when(active, |d| {
-                                d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                            }),
-                    )
-                    .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc))
-            };
+                    })),
+            );
+        }
+        let body = div().v_flex().gap_8().child(section(
+            "默认内核",
+            "新会话用哪种方式连模型；已经有对话的会话留在原来的内核上",
+            None,
+            kernels,
+        ));
+        match f.kernel {
+            KernelChoice::Builtin => body.child(self.render_providers(window, cx)).child(section(
+                "运行",
+                "",
+                None,
+                setting_group([
+                    setting_row(
+                        "一轮最多几步",
+                        "一轮里最多请求模型几次（默认 200）；调大能跑更长的任务，也更费 token",
+                        div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
+                    ),
+                    self.gateway_row(cx),
+                    self.prices_row(window, cx),
+                ]),
+            )),
+            KernelChoice::Acp => body.child(self.render_acp(cx)),
+            KernelChoice::Demo => body,
+        }
+    }
 
-        let mut body = div().v_flex().gap_5().child(
+    /// 自研内核的服务商：档案列表（选中的那套在用）+「添加」菜单，下面编辑选中的那套。
+    fn render_providers(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let app = cx.entity();
+        let add = menu_popover(
+            "profile-add-menu",
+            Anchor::TopRight,
+            rems(20.),
+            &app,
+            &self.menu_focus,
+            MenuChip::new(IconAll::Plus, "添加").filled(),
+            add_profile_menu_items,
+        )
+        .into_any_element();
+
+        let mut list = choice_panel();
+        for (i, inputs) in f.inputs.iter().enumerate() {
+            let active = i == f.active;
+            let name = value(&inputs.name, cx);
+            let base_url = value(&inputs.base_url, cx);
+            let model = value(&inputs.model, cx);
+            let title = if name.is_empty() { format!("服务商 {}", i + 1) } else { name };
+            let desc = match (host_of(&base_url), model.is_empty()) {
+                ("", _) => "还没填端点地址".to_string(),
+                (host, true) => host.to_string(),
+                (host, false) => format!("{host} · {model}"),
+            };
+            // 删除只给选中的那行（先选中再删，不会误点）
+            let remove = active.then(|| {
+                Self::quiet_button(("profile-remove", i), IconAll::Trash, Surface::Paper, cx)
+                    .small()
+                    .tooltip("删除这套")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_form_profile(i, cx);
+                    }))
+                    .into_any_element()
+            });
+            list = list.child(
+                choice_row(("profile", i), IconAll::Server, title, desc, active, remove)
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_form_profile(i, cx))),
+            );
+        }
+
+        let mut body = div().v_flex().gap_4();
+        let blank = f.current().is_none_or(|(_, inputs)| value(&inputs.base_url, cx).is_empty());
+        if f.inputs.len() <= 1 && blank {
+            body = body.child(how_to(
+                "三步接上模型",
+                &[
+                    "点右上角「添加」，选你在用的服务商（列表里没有的选「自定义」，自己填端点地址）",
+                    "填上服务商给你的 API Key（本机的 Ollama 不用填）",
+                    "点模型旁的「获取列表」挑一个模型，再点底部的「保存并应用」",
+                ],
+            ));
+        }
+        if !f.inputs.is_empty() {
+            body = body.child(list);
+        }
+        if let Some((p, inputs)) = f.current() {
+            body = body.child(self.render_profile_editor(p, inputs, window, cx));
+        }
+        section("服务商", "可以存多套，选中的那套在用", Some(add), body)
+    }
+
+    /// 选中那套档案的表单：名称、协议、端点、Key、模型。
+    fn render_profile_editor(
+        &self,
+        p: &ProviderProfile,
+        inputs: &ProfileInputs,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let app = cx.entity();
+        let mut model_row = div()
+            .h_flex()
+            .gap_2()
+            .child(div().flex_1().min_w_0().child(Self::text_input(&inputs.model)));
+        if !p.models.is_empty() {
+            model_row = model_row.child(menu_popover(
+                "model-pick-menu",
+                Anchor::TopRight,
+                rems(20.),
+                &app,
+                &self.menu_focus,
+                MenuChip::new(IconAll::List, format!("{} 个可选", p.models.len())),
+                model_menu_items,
+            ));
+        }
+        model_row = model_row.child(
+            Self::text_button("fetch-models", "获取列表", false)
+                .loading(self.fetching_models)
+                .on_click(cx.listener(|this, _, _, cx| this.fetch_models(true, cx))),
+        );
+        let model_hint = if p.models.is_empty() {
+            "填好端点和 Key 后点「获取列表」，从服务商拿可用的模型；也可以直接填名字"
+        } else {
+            "新会话默认用它；会话里也能在输入框下方换"
+        };
+        let mut endpoint = div().v_flex().gap_1p5().child(Self::text_input(&inputs.base_url));
+        if antigravity_gateway().is_some() {
+            endpoint = endpoint.child(
+                div().h_flex().child(
+                    Self::quiet_button("import-antigravity", IconAll::Download, Surface::Paper, cx)
+                        .xsmall()
+                        .label("从 Antigravity Tools 导入端点和 Key")
+                        .px_2()
+                        .ml(rems(-0.5))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.import_antigravity(window, cx)),
+                        ),
+                ),
+            );
+        }
+        div()
+            .v_flex()
+            .gap_4()
+            .pt_2()
+            .child(form_field("名称", None, Self::text_input(&inputs.name)))
+            .child(form_field(
+                "协议",
+                Some("大多数服务选 OpenAI 兼容；Anthropic 官方端点选原生".into()),
+                div().h_flex().child(seg_control(
+                    "protocol",
+                    [
+                        (Protocol::OpenAiCompat, "OpenAI 兼容"),
+                        (Protocol::Anthropic, "Anthropic 原生"),
+                    ],
+                    p.protocol,
+                    |this, protocol, _, cx| this.set_form_protocol(protocol, cx),
+                    cx,
+                )),
+            ))
+            .child(form_field(
+                "端点地址",
+                Some("服务商文档里的 base URL，不带 /chat/completions 或 /messages".into()),
+                endpoint,
+            ))
+            .child(form_field(
+                "API Key",
+                None,
+                div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).px_1().child(
+                    Input::new(&inputs.api_key).appearance(false).bordered(false).mask_toggle(),
+                ),
+            ))
+            .child(form_field("模型", Some(model_hint.into()), model_row))
+    }
+
+    /// ACP agent：启动命令（带常用命令一键填入）和要不要经用量网关。
+    fn render_acp(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let mut quick = div().h_flex().items_center().gap_1().ml(rems(-0.5));
+        for (i, (label, command)) in ACP_PRESETS.into_iter().enumerate() {
+            quick = quick.child(
+                Self::quiet_button(("acp-preset", i), IconAll::SquareTerminal, Surface::Paper, cx)
+                    .xsmall()
+                    .label(format!("填入 {label}"))
+                    .px_2()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let command = acp_command(command);
+                        this.settings_form
+                            .acp_command
+                            .update(cx, |s, cx| s.set_value(command, window, cx));
+                        cx.notify();
+                    })),
+            );
+        }
+        let command = div().v_flex().gap_1p5().child(Self::text_input(&f.acp_command)).child(quick);
+        let gateway_desc = if self.settings.usage_gateway {
+            "agent 的请求也记进首页「请求」页签：启动时把 ANTHROPIC_BASE_URL / OPENAI_BASE_URL \
+             指到本地网关，agent 不认这两个变量时不起作用"
+        } else {
+            "用量网关关着（在自研内核的「运行」里打开），这一项不起作用"
+        };
+        section(
+            "ACP agent",
+            "claudesktop 运行这条命令启动 agent；登录和模型都在 agent 那边设置",
+            None,
             div()
                 .v_flex()
-                .gap_2()
-                .child(div().text_size(TEXT_BODY).font_weight(FontWeight::MEDIUM).child("默认内核"))
-                .child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .items_start()
-                        .child(choice(
-                            "kernel-builtin",
-                            KernelChoice::Builtin,
-                            "自研内核",
-                            "OpenAI 兼容接口，含 Ollama 和本地网关",
-                        ))
-                        .child(choice(
-                            "kernel-acp",
-                            KernelChoice::Acp,
-                            "ACP agent",
-                            "外部 agent：Claude Code、pi 等",
-                        ))
-                        .child(choice(
-                            "kernel-demo",
-                            KernelChoice::Demo,
-                            "演示回放",
-                            "不连模型，只播放界面演示",
-                        )),
-                ),
-        );
-
-        match f.kernel {
-            KernelChoice::Builtin => {
-                // 配置档案切换条：点名字换档案，× 删除；后面跟「＋ 添加」
-                let mut profile_row = div().h_flex().flex_wrap().gap_1p5();
-                for (i, p) in f.profiles.iter().enumerate() {
-                    let active = i == f.active;
-                    let label: SharedString = if p.name.trim().is_empty() {
-                        format!("档案 {}", i + 1).into()
-                    } else {
-                        p.name.clone().into()
-                    };
-                    profile_row = profile_row.child(
-                        div()
-                            .id(("profile-chip", i))
-                            .h_flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(if active { CORAL } else { LINE }))
-                            .bg(rgb(if active { SAND } else { CARD }))
-                            .cursor_pointer()
-                            .hover(|d| d.bg(rgb(HOVER)))
-                            .text_size(TEXT_SMALL)
-                            .text_color(rgb(INK))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_form_profile(i, cx);
-                            }))
-                            .child(label)
-                            .child(
-                                Self::quiet_button(
-                                    ("profile-remove", i),
-                                    IconAll::X,
-                                    Surface::Sand,
-                                    cx,
-                                )
-                                .xsmall()
-                                .tooltip("删除这套档案")
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.remove_form_profile(i, cx);
-                                    },
-                                )),
-                            ),
-                    );
-                }
-                profile_row = profile_row.child(
-                    div()
-                        .id("profile-add")
-                        .h_flex()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .cursor_pointer()
-                        .hover(|d| d.bg(rgb(HOVER)))
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK_SOFT))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.add_form_profile(None, window, cx);
-                        }))
-                        .child(Icon::new(IconAll::Plus).size_3())
-                        .child("空白档案"),
-                );
-                // 预设一键添加
-                let mut presets = div().h_flex().flex_wrap().gap_1p5();
-                for (i, p) in preset_profiles().into_iter().enumerate() {
-                    presets = presets.child(
-                        div()
-                            .id(("preset-add", i))
-                            .h_flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .cursor_pointer()
-                            .hover(|d| d.bg(rgb(HOVER)))
-                            .text_size(TEXT_SMALL)
-                            .text_color(rgb(INK))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.add_form_profile(Some(i), window, cx);
-                            }))
-                            .child(Icon::new(IconAll::Plus).size_3().text_color(rgb(INK_SOFT)))
-                            .child(p.name.clone()),
-                    );
-                }
-
-                let mut builtin_body = div().v_flex().gap_4().child(Self::field(
-                    "配置档案",
-                    Some("可以存多套 provider 配置，输入框旁的菜单可快速切换"),
-                    profile_row,
-                ));
-                if !f.profiles.is_empty()
-                    && let Some((p, inputs)) = f.current()
-                {
-                    // 协议二选一
-                    let proto = |id: &'static str, label: &'static str, want: Protocol| {
-                        let active = p.protocol == want;
-                        div()
-                            .id(id)
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(if active { CORAL } else { LINE }))
-                            .bg(rgb(if active { SAND } else { CARD }))
-                            .cursor_pointer()
-                            .hover(|d| d.bg(rgb(HOVER)))
-                            .text_size(TEXT_SMALL)
-                            .text_color(rgb(INK))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_form_protocol(want, cx);
-                            }))
-                            .child(label)
-                    };
-                    let mut model_row = div()
-                        .h_flex()
-                        .gap_2()
-                        .child(div().flex_1().child(Self::text_input(&inputs.model)))
-                        .child(
-                            Self::text_button("fetch-models", "获取模型列表", false)
-                                .loading(self.fetching_models)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.fetch_models(true, cx)),
-                                ),
-                        );
-                    if antigravity_gateway().is_some() {
-                        model_row = model_row.child(
-                            Self::text_button(
-                                "import-antigravity",
-                                "从 Antigravity Tools 导入",
-                                false,
-                            )
-                            .on_click(cx.listener(
-                                |this, _, window, cx| this.import_antigravity(window, cx),
-                            )),
-                        );
-                    }
-                    let current_model = value(&inputs.model, cx);
-                    let mut chips = div().flex().flex_wrap().gap_1p5();
-                    for (i, m) in p.models.iter().enumerate() {
-                        let active = *m == current_model;
-                        let pick = m.clone();
-                        chips = chips.child(
-                            div()
-                                .id(("model-chip", i))
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(if active { CORAL } else { LINE }))
-                                .bg(rgb(if active { SAND } else { CARD }))
-                                .cursor_pointer()
-                                .hover(|d| d.bg(rgb(HOVER)))
-                                .text_size(TEXT_SMALL)
-                                .font_family(MONO)
-                                .text_color(rgb(INK))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let pick = pick.clone();
-                                    let i = this.settings_form.active;
-                                    if let Some(inputs) = this.settings_form.inputs.get(i) {
-                                        inputs
-                                            .model
-                                            .update(cx, |s, cx| s.set_value(pick, window, cx));
-                                    }
-                                    cx.notify();
-                                }))
-                                .child(m.clone()),
-                        );
-                    }
-                    builtin_body = builtin_body
-                        .child(Self::field(
-                            "常用服务预设",
-                            Some("点击追加一套已填好端点的档案，再补上自己的 key"),
-                            presets,
-                        ))
-                        .child(Self::field("名称", None, Self::text_input(&inputs.name)))
-                        .child(Self::field(
-                            "协议",
-                            Some("绝大多数服务选 OpenAI 兼容；Anthropic 官方端点用原生协议"),
-                            div()
-                                .h_flex()
-                                .gap_1p5()
-                                .child(proto(
-                                    "protocol-openai",
-                                    "OpenAI 兼容",
-                                    Protocol::OpenAiCompat,
-                                ))
-                                .child(proto(
-                                    "protocol-anthropic",
-                                    "Anthropic 原生",
-                                    Protocol::Anthropic,
-                                )),
-                        ))
-                        .child(Self::field(
-                            "端点地址",
-                            Some("base URL，不含 /chat/completions 或 /messages 后缀"),
-                            Self::text_input(&inputs.base_url),
-                        ))
-                        .child(Self::field(
-                            "API Key",
-                            None,
-                            div()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(LINE))
-                                .bg(rgb(CARD))
-                                .px_1()
-                                .child(
-                                    Input::new(&inputs.api_key)
-                                        .appearance(false)
-                                        .bordered(false)
-                                        .mask_toggle(),
-                                ),
-                        ))
-                        .child(Self::field(
-                            "模型",
-                            Some("新会话的默认模型；会话里也可以在输入框旁切换"),
-                            model_row,
-                        ))
-                        .when(!p.models.is_empty(), |d| d.child(chips));
-                }
-                // 内核级配置，不属于某一套档案
-                builtin_body = builtin_body.child(Self::field(
-                    "一轮最多几步",
-                    Some(
-                        "一轮里最多请求模型几次（工具循环上限，默认 200）；\
-                         调大能跑更长的任务，耗 token 也更多",
-                    ),
-                    div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
-                ));
-                builtin_body =
-                    builtin_body.child(self.gateway_field(cx)).child(self.prices_field(cx));
-                body = body.child(builtin_body);
-            }
-            KernelChoice::Acp => {
-                body = body
-                    .child(Self::field(
-                        "启动命令",
-                        Some("例：cmd /c npx -y @agentclientprotocol/claude-agent-acp　或　cmd /c npx -y pi-acp"),
-                        Self::text_input(&f.acp_command),
-                    ))
-                    .child(Self::field(
-                        "经过用量网关",
-                        Some(if self.settings.usage_gateway {
-                            "启动 agent 时把它的 ANTHROPIC_BASE_URL / OPENAI_BASE_URL 指到本地网关，它的请求也记进首页「请求」页签\
-                             （Claude Code 能对上会话和轮次）；agent 不认这两个变量时不起作用。保存后重启 agent 生效"
-                        } else {
-                            "用量网关关着（在「自研内核」的设置里打开），这一项不起作用"
-                        }),
-                        Switch::new("acp-gateway").checked(f.acp_gateway).color(rgb(CORAL)).on_change(
-                            cx.listener(|this, checked: &bool, _, cx| {
-                                this.settings_form.acp_gateway = *checked;
-                                cx.notify();
-                            }),
-                        ),
-                    ));
-            }
-            KernelChoice::Demo => {}
-        }
-
-        if let Some((error, text)) = &f.message {
-            body = body.child(
-                div()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(if *error { RED } else { GREEN }))
-                    .child(text.clone()),
-            );
-        }
-        let path = self.settings_path.as_ref().map_or_else(
-            || "（数据目录不可用，设置不会保存）".to_string(),
-            |p| p.display().to_string(),
-        );
-        let kernel_tab = body
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .child(
-                        Self::text_button("settings-save", "保存并应用", true)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                    )
-                    .child(Self::text_button("settings-cancel", "取消", false).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.settings_open = false;
+                .gap_4()
+                .child(form_field(
+                    "启动命令",
+                    Some("常用的两个都要先装好 Node.js；留空则用内置的演示 agent".into()),
+                    command,
+                ))
+                .child(setting_group([setting_row(
+                    "经过用量网关",
+                    gateway_desc,
+                    Switch::new("acp-gateway").checked(f.acp_gateway).color(rgb(CORAL)).on_change(
+                        cx.listener(|this, checked: &bool, _, cx| {
+                            this.settings_form.acp_gateway = *checked;
                             cx.notify();
-                        },
-                    ))),
-            )
-            .child(
-                div()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .child(format!(
-                        "保存在 {path}（API Key 为明文）。启动时环境变量优先于这里的设置。只重启配置变了的内核，它上面进行中的对话会中断，下次发消息时自动续接。"
-                    )),
-            );
+                        }),
+                    ),
+                )])),
+        )
+    }
 
-        // 左侧分类导航：通用 / 内核与模型 / 权限
+    /// 「内核与模型」底部固定的保存栏：左边状态 / 提示，右边取消和保存。
+    fn render_save_bar(&self, cx: &mut Context<Self>) -> Div {
+        let dirty = self.form_dirty(cx);
+        let status = match &self.settings_form.message {
+            Some((error, text)) => {
+                div().text_color(rgb(if *error { RED } else { GREEN })).child(text.clone())
+            }
+            None if dirty => div().text_color(rgb(INK)).child("有未保存的改动"),
+            None => div().text_color(rgb(INK_SOFT)).child("这一页的改动点「保存并应用」后生效"),
+        };
+        div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .flex_none()
+            .px_8()
+            .py_3()
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .child(div().flex_1().min_w_0().text_size(TEXT_SMALL).child(status))
+            .child(Self::text_button("settings-cancel", "取消", false).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.settings_open = false;
+                    cx.notify();
+                },
+            )))
+            .child(
+                Self::text_button("settings-save", "保存并应用", true)
+                    .disabled(!dirty)
+                    .tooltip("只重启配置变了的内核；它上面进行中的对话会中断，下次发消息时自动续接")
+                    .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+            )
+    }
+
+    pub(super) fn render_settings(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let f = &self.settings_form;
+        // 左侧分类导航
         let mut nav = div().v_flex().w(SETTINGS_NAV_W).flex_none().px_3().gap_0p5();
         for (i, (icon, label)) in SETTINGS_TABS.into_iter().enumerate() {
             let active = i == f.tab;
@@ -1380,6 +1369,7 @@ impl ChatApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.settings_form.tab != i {
                             this.settings_form.tab = i;
+                            this.settings_form.message = None;
                             cx.notify();
                         }
                     }))
@@ -1387,10 +1377,11 @@ impl ChatApp {
                     .child(label),
             );
         }
+        let kernel_tab = f.tab == KERNEL_TAB;
         let tab_content: Div = match f.tab {
-            1 => kernel_tab,
+            KERNEL_TAB => self.render_kernel_tab(window, cx),
             2 => self.render_rules(cx),
-            3 => self.render_mcp(cx),
+            3 => self.render_mcp(window, cx),
             PLUGINS_TAB => self.render_plugins(cx),
             _ => self.render_general(cx),
         };
@@ -1443,20 +1434,124 @@ impl ChatApp {
                                 )),
                             ),
                     )
-                    // 导航固定，只滚右侧内容
+                    // 导航固定，只滚右侧内容；「内核与模型」的保存栏固定在右侧底部
                     .child(
                         div().flex().flex_1().min_h_0().child(nav).child(
                             div()
-                                .id("settings-scroll")
+                                .v_flex()
                                 .flex_1()
                                 .min_w_0()
-                                .overflow_y_scroll()
-                                // pt_2：首行文字与导航第一项的文字对齐
-                                .child(div().v_flex().px_8().pt_2().pb_8().child(tab_content)),
+                                .child(
+                                    div()
+                                        .id("settings-scroll")
+                                        .flex_1()
+                                        .min_h_0()
+                                        .overflow_y_scroll()
+                                        // pt_1：分区标题与导航第一项的文字对齐
+                                        .child(
+                                            div().v_flex().px_8().pt_1().pb_10().child(tab_content),
+                                        ),
+                                )
+                                .when(kernel_tab, |d| d.child(self.render_save_bar(cx))),
                         ),
                     ),
             )
     }
+}
+
+/// 「内核与模型」里默认内核的三种选择。
+const KERNEL_CHOICES: [(KernelChoice, IconAll, &str, &str); 3] = [
+    (
+        KernelChoice::Builtin,
+        IconAll::Cpu,
+        "自研内核",
+        "填 API Key 直连模型服务：DeepSeek、Kimi、GLM、OpenAI、Anthropic、本机 Ollama 等",
+    ),
+    (
+        KernelChoice::Acp,
+        IconAll::SquareTerminal,
+        "ACP agent",
+        "接 Claude Code、pi 这类外部 agent，用它们自己的登录和模型",
+    ),
+    (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，只播放一段界面演示"),
+];
+
+/// ACP 启动命令的常用项：(名称, 命令)；Windows 上前面补 `cmd /c`（见 [`acp_command`]）。
+const ACP_PRESETS: [(&str, &str); 2] =
+    [("Claude Code", "npx -y @agentclientprotocol/claude-agent-acp"), ("pi", "npx -y pi-acp")];
+
+/// npx 在 Windows 上是 .cmd，要经 `cmd /c` 才起得来。
+fn acp_command(command: &str) -> String {
+    if cfg!(windows) { format!("cmd /c {command}") } else { command.to_string() }
+}
+
+/// 单价表写法说明里的示例。
+const PRICES_EXAMPLE: &str = "\
+# 名称            输入    输出    缓存命中
+deepseek-chat     ¥2      ¥8      ¥0.2     x2
+claude-sonnet-4   $3      $15     $0.3
+@peak 1-5 09:00-12:00 14:00-18:00 +08:00";
+
+/// 端点地址里的主机名（档案列表里当说明）；没写协议头也行。
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// 「添加」菜单：常用服务预设 + 自定义。
+fn add_profile_menu_items(
+    _: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let mut menu = MenuList::new("profile-add-list", handle, popover);
+    for (i, p) in preset_profiles().into_iter().enumerate() {
+        menu = menu.pick_in(
+            menu_item(
+                ("preset", i),
+                IconAll::Server,
+                p.name.clone(),
+                host_of(&p.base_url).to_string(),
+                false,
+            ),
+            move |this, window, cx| this.add_form_profile(Some(i), window, cx),
+        );
+    }
+    menu.pick_in(
+        menu_item(
+            "preset-custom",
+            IconAll::Plus,
+            "自定义",
+            "其他兼容的服务，自己填端点地址",
+            false,
+        ),
+        |this, window, cx| this.add_form_profile(None, window, cx),
+    )
+}
+
+/// 「N 个可选」菜单：获取到的模型列表，点了填进模型输入框。
+fn model_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let f = &app.settings_form;
+    let models = f.profiles.get(f.active).map(|p| p.models.clone()).unwrap_or_default();
+    let mut menu = MenuList::new("model-pick-list", handle, popover).scroll(rems(22.5));
+    for (i, m) in models.into_iter().enumerate() {
+        let pick = m.clone();
+        menu = menu.pick_in(
+            menu_item(("model-pick", i), IconAll::Box, m, "", false),
+            move |this, window, cx| {
+                let i = this.settings_form.active;
+                if let Some(inputs) = this.settings_form.inputs.get(i) {
+                    inputs.model.update(cx, |s, cx| s.set_value(pick.clone(), window, cx));
+                }
+                cx.notify();
+            },
+        );
+    }
+    menu
 }
 
 /// 规则 → 给人看的说明
