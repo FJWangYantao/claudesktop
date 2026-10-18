@@ -1013,7 +1013,7 @@ impl Inner {
         let mut options = vec![option("allow_once", "允许一次".into())];
         if let Some(rule) = &rule {
             let name = if let Some(prefix) = rule.strip_prefix("shell:") {
-                format!("总是允许 `{prefix}` 开头的命令")
+                format!("总是允许「{prefix}」开头的命令")
             } else if let Some(host) = rule.strip_prefix("fetch:") {
                 format!("本项目内总是允许访问 {host}")
             } else if let Some(tool) = rule.strip_prefix("mcp:") {

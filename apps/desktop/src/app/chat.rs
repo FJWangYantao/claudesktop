@@ -561,7 +561,7 @@ impl ChatApp {
     fn render_auto_approved(idx: usize, title: &SharedString, chosen: &SharedString) -> Div {
         step_line(Icon::new(IconAll::ShieldCheck).size_3p5().text_color(rgb(INK_SOFT)))
             .child(div().flex_shrink_0().child("已自动批准"))
-            .child(ellipsis(("auto-title", idx), title.clone()).font_family(MONO))
+            .child(ellipsis(("auto-title", idx), plain_title(title)).font_family(MONO))
             .child(div().flex_shrink_0().child(format!("· {chosen}")))
     }
 
@@ -790,7 +790,7 @@ impl ChatApp {
         if let Some(label) = resolved {
             return step_line(Icon::new(IconAll::Shield).size_3p5().text_color(rgb(INK_SOFT)))
                 .child(div().flex_shrink_0().child("权限请求"))
-                .child(ellipsis(("perm-title", idx), title.clone()).font_family(MONO))
+                .child(ellipsis(("perm-title", idx), plain_title(title)).font_family(MONO))
                 .child(div().flex_shrink_0().child(format!("· {label}")));
         }
 
@@ -889,7 +889,7 @@ impl ChatApp {
                             .font_family(MONO)
                             .text_color(rgb(INK_SOFT))
                             .line_height(LEADING)
-                            .child(title.clone()),
+                            .child(plain_title(title)),
                     ),
             )
             .child(div().pl(STEP_INDENT).child(buttons))
@@ -1434,10 +1434,14 @@ impl ChatApp {
             cx,
         );
         let current = self.session().kernel;
+        // 只给配置过的内核：ACP 的启动命令空着时跑的是仓库里的演示 agent，新用户那里没有
         let others = KernelChoice::ALL.into_iter().filter(|k| {
             *k != current
-                && *k != KernelChoice::Demo
-                && (*k != KernelChoice::Builtin || self.settings.builtin.is_configured())
+                && match k {
+                    KernelChoice::Builtin => self.settings.builtin.is_configured(),
+                    KernelChoice::Acp => !self.settings.acp.command.trim().is_empty(),
+                    KernelChoice::Demo => false,
+                }
         });
         let edit_tip = if images.is_empty() {
             "放回输入框，改完重新发送"
@@ -1740,5 +1744,14 @@ mod tests {
         // 行内代码里的星号、上一行的星号不算
         assert_eq!(close_dangling_markup("用 `**` 表示粗体"), "用 `**` 表示粗体");
         assert_eq!(close_dangling_markup("**a\nb"), "**a\nb");
+    }
+}
+
+/// 权限请求的标题：内核常把命令写成行内代码（`` `ls -la` ``），这里本来就用等宽字，去掉包着的反引号。
+fn plain_title(title: &SharedString) -> SharedString {
+    let trimmed = title.trim();
+    match trimmed.strip_prefix('`').and_then(|t| t.strip_suffix('`')) {
+        Some(inner) if !inner.is_empty() && !inner.contains('`') => inner.to_string().into(),
+        _ => title.clone(),
     }
 }

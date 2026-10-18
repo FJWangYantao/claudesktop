@@ -654,6 +654,8 @@ pub enum FailureKind {
     Overflow,
     /// 401 / 403：API Key 不对或没有权限
     Auth,
+    /// ACP agent 要先登录（Claude Code 没登录时报「Authentication required」）
+    Login,
     /// 429：太频繁或额度用完
     RateLimit,
     /// 5xx：服务端的问题（自研内核已经退避重试过）
@@ -688,6 +690,13 @@ impl FailureKind {
         if is_context_overflow(message) {
             return Self::Overflow;
         }
+        let lower = message.to_lowercase();
+        if ["authentication required", "/login", "not logged in", "please log in", "please login"]
+            .iter()
+            .any(|m| lower.contains(m))
+        {
+            return Self::Login;
+        }
         // 自研内核的两种传输错误（见 builtin 的 provider.rs）
         if message.starts_with("读取流失败") {
             Self::Interrupted
@@ -707,6 +716,7 @@ impl FailureKind {
         match self {
             Self::Overflow => "超出了模型的上下文长度",
             Self::Auth => "模型服务拒绝了请求",
+            Self::Login => "agent 还没登录",
             Self::RateLimit => "请求太频繁或额度用完了",
             Self::Server => "模型服务出错了",
             Self::Model => "找不到这个模型",
@@ -725,6 +735,9 @@ impl FailureKind {
             }
             Self::Auth => "API Key 不对、过期了，或者没有这个模型的权限。到设置里检查服务商配置。",
             Self::RateLimit => "等一会儿再试，或者到服务商那边看看额度。",
+            Self::Login => {
+                "agent 要先登录才能用。Claude Code：在终端里运行 claude，按提示登录一次（或者设好 ANTHROPIC_API_KEY 环境变量），然后回来点重试。"
+            }
             // 自研内核会自己退避重试几次，ACP 内核的重试策略由 agent 决定，这里不断言
             Self::Server => "是服务端的问题，不是这个会话的错。稍后再试通常就好。",
             Self::Model => {
@@ -949,6 +962,8 @@ mod tests {
             ("请求 https://x/v1/chat 失败: Connection refused", FailureKind::Network),
             ("读取流失败: connection reset", FailureKind::Interrupted),
             ("agent 崩了", FailureKind::Other),
+            ("Authentication required", FailureKind::Login),
+            ("Invalid API key · Please run /login", FailureKind::Login),
         ];
         for (message, kind) in cases {
             assert_eq!(FailureKind::of(message), kind, "{message}");

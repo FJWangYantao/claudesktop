@@ -84,12 +84,34 @@ pub fn commands_after(records: &[Record], turn: usize) -> usize {
     let Some(start) = user_index(records, turn) else {
         return 0;
     };
-    records[start..]
+    let records = &records[start..];
+    // 被拒绝的命令没跑过，不会改文件
+    let denied: std::collections::HashSet<&str> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Event {
+                event: KernelEvent::ToolCallUpdated { id, raw_output: Some(raw), .. },
+            } if is_denial(raw) => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    records
         .iter()
         .filter(|r| {
-            matches!(r, Record::Event { event: KernelEvent::ToolCallStarted { kind, .. } } if kind == "execute")
+            matches!(r, Record::Event { event: KernelEvent::ToolCallStarted { kind, id, .. } }
+                if kind == "execute" && !denied.contains(id.as_str()))
         })
         .count()
+}
+
+/// 工具结果说的是「用户拒绝了」：自研内核写「已拒绝」，ACP agent 各有说法（Claude Code 是
+/// 「The user doesn't want to proceed …」）。
+fn is_denial(raw: &str) -> bool {
+    let lower = raw.to_lowercase();
+    raw.trim() == "已拒绝"
+        || ["doesn't want to proceed", "rejected", "denied", "declined"]
+            .iter()
+            .any(|m| lower.contains(m))
 }
 
 /// 把一个文件还原成 `restore.target`：写回那份内容，原本不存在的就删掉（已经没了也算成功）。
@@ -215,6 +237,17 @@ mod tests {
             vec![user("一"), started("execute"), user("二"), started("execute"), started("read")];
         assert_eq!(commands_after(&records, 0), 2);
         assert_eq!(commands_after(&records, 1), 1);
+        // 被拒绝的那条没跑过，不算
+        let denied = Record::Event {
+            event: KernelEvent::ToolCallUpdated {
+                id: "1".into(),
+                title: None,
+                status: Some("failed".into()),
+                raw_output: Some("已拒绝".into()),
+                output: None,
+            },
+        };
+        assert_eq!(commands_after(&[user("一"), started("execute"), denied], 0), 0);
     }
 
     #[test]
