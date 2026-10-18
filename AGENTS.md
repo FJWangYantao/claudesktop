@@ -73,8 +73,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   不在 `ChatApp` 键上下文下，派发的动作收不到。
 - **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
 - **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
-  - 运行状态行用品牌字形 `motion::star()`（✻ 系字形循环，字体钉在 `SYMBOL`，否则 ✳ 落到彩色 emoji）；
-    其余转圈 / 扫光用 `motion::spinner()` / `shimmer_text()`，**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
+  - 「进行中」只有两种样子：运行状态行用呼吸圆点 `motion::breathing_dot()`，其余（工具行、侧栏、压缩）一律圆弧转圈
+    `motion::spinner()`，都是 `canvas` + `PathBuilder` 矢量画；思考中的扫光用 `shimmer_text()`（按像素分档着色）。
+    转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
     动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
     motion 版相位按全局时钟算，由节拍器每两帧重画一次（约 30 帧）。
   - 展开 / 收起：`reveal_progress(id, open, ..)` 拿弹簧进度，内容 `progress > 0` 时包进 `Reveal::new(id, progress, ..)`；

@@ -98,8 +98,6 @@ pub const HOVER_STRONG: Color = c(0xDCD6C6, 0x45443F);
 pub const DEFAULT_SANS: &str = "Inter";
 /// 代码 / 工具行的等宽字体（`fonts.rs` 内嵌；不随设置变化，代码靠它对齐）
 pub const MONO: &str = "JetBrains Mono";
-/// 符号字形（等待动效的 ✻ 系字形）：不指定的话 ✳ 会回退到彩色 emoji 字体，画成绿方块
-pub const SYMBOL: &str = "Segoe UI Symbol";
 pub const DIFF_ADD_BG: Color = c(0xE4F3DE, 0x243222);
 pub const DIFF_ADD_FG: Color = c(0x3C6B2E, 0x9FCC8C);
 pub const DIFF_DEL_BG: Color = c(0xFBE3DF, 0x3A2422);

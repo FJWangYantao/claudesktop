@@ -24,7 +24,7 @@ impl ChatApp {
             return None;
         }
         let activity = s.activity();
-        // 等授权要用户处理：静止红点、红字；其余是 ✻ 字形（减少动态效果时是静止的转圈图标）。
+        // 等授权要用户处理：静止红点、红字；其余是呼吸的赤陶色圆点（减少动态效果时静止）。
         // 只分三档：具体在跑哪一步看上面的过程组，这里不跟着每个工具来回切
         let (indicator, label) = match activity {
             Activity::WaitingPermission => (
@@ -33,20 +33,20 @@ impl ChatApp {
             ),
             // 限流 / 5xx：内核自己会重发，告诉用户在等什么、还要等多久（不然看着像卡死）
             Activity::Retrying => (
-                super::motion::star().into_any_element(),
+                super::motion::breathing_dot().into_any_element(),
                 div().child(s.retry.as_ref().map_or_else(String::new, |r| {
                     retry_label(r.status, r.attempt, r.at.saturating_duration_since(Instant::now()))
                 })),
             ),
             Activity::Compacting => {
-                (super::motion::star().into_any_element(), div().child("正在压缩上下文"))
+                (super::motion::breathing_dot().into_any_element(), div().child("正在压缩上下文"))
             }
             Activity::Replying => {
-                (super::motion::star().into_any_element(), div().child("正在回复"))
+                (super::motion::breathing_dot().into_any_element(), div().child("正在回复"))
             }
             // 一轮里固定一个动词，下一轮换（按会话和本轮开始的时刻取）
             Activity::Working => (
-                super::motion::star().into_any_element(),
+                super::motion::breathing_dot().into_any_element(),
                 div().child(working_verb((s.token, s.turn_started))),
             ),
         };

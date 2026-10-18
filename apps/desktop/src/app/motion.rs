@@ -1,4 +1,8 @@
-//! 动效：限帧的转圈 / 扫光、展开收起（弹簧 + 高度裁切）、悬停淡入、新内容入场、平滑回到底部。
+//! 动效：限帧的转圈 / 呼吸圆点 / 扫光、展开收起（弹簧 + 高度裁切）、悬停淡入、新内容入场、平滑回到底部。
+//!
+//! 「进行中」只有两种样子：通用的圆弧转圈（[`spinner`]）和运行状态行专用的呼吸圆点（[`breathing_dot`]），
+//! 都用 `canvas` + `PathBuilder` 矢量画，不靠旋转图标或换字形（小尺寸下旋转的位图发虚、
+//! 符号字体里各个字形粗细不一）。
 //!
 //! gpui 的动画每一帧都要重画它所在的整个 view（`request_animation_frame` 通知当前 view，
 //! 祖先一并变脏），所以常驻的循环动画（转圈、扫光）不用 `with_animation`：相位按全局时钟算，
@@ -16,10 +20,9 @@ use crate::theme::*;
 use gpui_kit::base::animation::ease_out_cubic;
 use gpui_kit::base::motion::{Transition, spring, transition};
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::RefCell;
-use std::ops::Range;
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::panic::Location;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,10 +32,15 @@ use std::time::{Duration, Instant};
 const LOOP_INTERVAL: Duration = Duration::from_millis(33);
 /// 帧到来的时刻有抖动：差这么一点也算到了（60Hz 下正好每两帧一拍）
 const TICK_SLACK: Duration = Duration::from_millis(4);
-/// 转一圈的时长（gpui-kit `Spinner` 同款）
-const SPIN_PERIOD: Duration = Duration::from_millis(800);
+// 循环动画的节奏：转圈 1 秒一圈，圆弧伸缩和扫光 2 秒一拍，状态行圆点 1.6 秒一呼一吸
+/// 转圈匀速转一圈的时长
+const SPIN_PERIOD: Duration = Duration::from_millis(1000);
+/// 圆弧一伸一缩的周期
+const PULSE_PERIOD: Duration = Duration::from_millis(2000);
+/// 状态行圆点变大变亮再回落的周期
+const BREATH_PERIOD: Duration = Duration::from_millis(1600);
 /// 扫光扫一遍的时长
-const SHIMMER_PERIOD: Duration = Duration::from_millis(1600);
+const SHIMMER_PERIOD: Duration = Duration::from_millis(2000);
 
 /// `App::reduce_motion` 的镜像：画转圈 / 扫光时手里没有 `App`（由 [`ChatApp::apply_motion_pref`] 同步）
 static REDUCED: AtomicBool = AtomicBool::new(false);
@@ -81,13 +89,10 @@ fn wait_for_tick(since: Instant, window: &Window) {
     });
 }
 
-/// 不占地方、不画东西，只在 prepaint 时排下一拍（循环动画画在哪就放在哪）。
-fn ticker() -> impl IntoElement {
-    canvas(|_, window, _| request_loop_tick(window), |_, _, _, _| {}).absolute().size_0()
-}
-
-/// 扫光高光的半宽（占整段文字的比例）
-const SHIMMER_SPREAD: f32 = 0.35;
+/// 扫光高光的半宽（按字号算，约两个半字宽）
+const SHIMMER_SPREAD_EM: f32 = 2.5;
+/// 扫光的颜色从底色到高光分这么多档（每档一条竖向裁切区，档差小到看不出台阶）
+const SHIMMER_LEVELS: usize = 10;
 
 /// 新内容入场：淡入的同时从下方这么远的地方升上来
 const ENTER_RISE: Pixels = px(8.);
@@ -110,72 +115,184 @@ pub(super) struct JumpAnim {
     pub last: Instant,
 }
 
-/// 转圈（赤陶色，12px）：gpui-kit `Spinner` 的同款图标和节奏，约 30 帧。
+/// 转圈（赤陶色，12px，界面里所有「进行中」共用这一个：工具行、侧栏、压缩上下文）：
+/// 淡色圆环上一段圆头圆弧匀速转，弧长随 [`PULSE_PERIOD`] 一伸一缩，矢量画（不是旋转图标，边缘不发虚）。
+/// 减少动态效果时停成一段静止的四分之三圆弧。
 pub(super) fn spinner() -> Div {
     let reduced = REDUCED.load(Ordering::Relaxed);
-    let turn = if reduced { 0. } else { ease_in_out(loop_phase(SPIN_PERIOD)) };
-    div()
-        .flex_shrink_0()
-        .child(
-            Icon::new(IconName::Loader)
-                .xsmall()
-                .text_color(rgb(CORAL))
-                .transform(Transformation::rotate(percentage(turn))),
+    // 起点和弧长都按圈数算
+    let (start, sweep) = if reduced {
+        (0., 0.75)
+    } else {
+        (loop_phase(SPIN_PERIOD), 0.2 + 0.45 * pulse(loop_phase(PULSE_PERIOD)))
+    };
+    let color = rgb(CORAL);
+    div().size_3().flex_shrink_0().child(
+        canvas(
+            move |_, window, _| {
+                if !reduced {
+                    request_loop_tick(window);
+                }
+            },
+            move |bounds, _, window, _| paint_spinner(bounds, start, sweep, color, window),
         )
-        .when(!reduced, |d| d.child(ticker()))
+        .size_full(),
+    )
 }
 
-/// 等待字形：✻ 系字形一格格变大再变小（对照官方 CLI 的 `·✢✳✶✻✽`）
-const STAR_FRAMES: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
-/// 字形走一个来回的时长（10 步，每步 120ms）
-const STAR_PERIOD: Duration = Duration::from_millis(1200);
+/// 0..1 的相位变成 0→1→0 的平滑起伏（余弦）。
+fn pulse(phase: f32) -> f32 {
+    0.5 - 0.5 * (phase * TAU).cos()
+}
 
-/// 品牌等待动效（运行状态行）：赤陶色 ✻ 系字形来回循环，节拍器重画（约 30 帧）。
-/// 减少动态效果时退回静止的 [`spinner`]。
-pub(super) fn star() -> Div {
-    if REDUCED.load(Ordering::Relaxed) {
-        return spinner();
+/// 圆周上第 `turns` 圈处的点（0 = 正上方，顺时针）。
+fn on_circle(center: Point<Pixels>, r: Pixels, turns: f32) -> Point<Pixels> {
+    let a = turns * TAU - FRAC_PI_2;
+    center + point(r * a.cos(), r * a.sin())
+}
+
+/// 实心圆点（圆弧的圆头、星芒的花心）。
+fn paint_dot(center: Point<Pixels>, r: Pixels, color: Rgba, window: &mut Window) {
+    let (left, right) = (center - point(r, px(0.)), center + point(r, px(0.)));
+    let mut dot = PathBuilder::fill();
+    dot.move_to(right);
+    dot.arc_to(point(r, r), px(0.), false, true, left);
+    dot.arc_to(point(r, r), px(0.), false, true, right);
+    dot.close();
+    if let Ok(path) = dot.build() {
+        window.paint_path(path, color);
     }
-    let steps = 2 * (STAR_FRAMES.len() - 1);
-    let step = (loop_phase(STAR_PERIOD) * steps as f32) as usize % steps;
-    let frame = if step < STAR_FRAMES.len() { step } else { steps - step };
-    div()
-        .flex_shrink_0()
-        .font_family(SYMBOL)
-        .text_size(TEXT_BODY)
-        .line_height(rems(1.))
-        .text_color(rgb(CORAL))
-        .child(STAR_FRAMES[frame])
-        .child(ticker())
 }
 
-/// 扫光文字（「思考中…」）：`base` 色的字上一道 `highlight` 色的高光从左扫到右，约 30 帧。
-/// 按字着色（`StyledText` 高亮），减少动态效果时整段都是 `base` 色。
+fn paint_spinner(bounds: Bounds<Pixels>, start: f32, sweep: f32, color: Rgba, window: &mut Window) {
+    let d = bounds.size.width.min(bounds.size.height);
+    let stroke = d * 0.15;
+    let r = (d - stroke) / 2.;
+    let c = bounds.center();
+    // 轨道：同色的淡圆环，弧短的时候也看得出是个圈
+    let mut ring = PathBuilder::stroke(stroke);
+    ring.move_to(on_circle(c, r, 0.));
+    ring.arc_to(point(r, r), px(0.), false, true, on_circle(c, r, 0.5));
+    ring.arc_to(point(r, r), px(0.), false, true, on_circle(c, r, 0.));
+    if let Ok(path) = ring.build() {
+        window.paint_path(path, Rgba { a: 0.2, ..color });
+    }
+    let (from, to) = (on_circle(c, r, start), on_circle(c, r, start + sweep));
+    let mut arc = PathBuilder::stroke(stroke);
+    arc.move_to(from);
+    arc.arc_to(point(r, r), px(0.), sweep > 0.5, true, to);
+    if let Ok(path) = arc.build() {
+        window.paint_path(path, color);
+    }
+    // 描边是平头：两端各补一个半个线宽的圆点当圆头
+    paint_dot(from, stroke / 2., color, window);
+    paint_dot(to, stroke / 2., color, window);
+}
+
+/// 运行状态行的等待动效（14px 格子）：一个赤陶色圆点缓慢变大变亮再回落，约 30 帧（节拍器重画）。
+/// 早先试过换字形的 ✻ 和矢量星芒，小尺寸下都显得怪，最后选了最克制的圆点（对比稿见设计指南第 13 条）。
+/// 减少动态效果时停在中间大小、不透明。
+pub(super) fn breathing_dot() -> Div {
+    let reduced = REDUCED.load(Ordering::Relaxed);
+    let k = if reduced { 0.5 } else { pulse(loop_phase(BREATH_PERIOD)) };
+    let color = rgb(CORAL);
+    div().size_3p5().flex_shrink_0().child(
+        canvas(
+            move |_, window, _| {
+                if !reduced {
+                    request_loop_tick(window);
+                }
+            },
+            move |bounds, _, window, _| {
+                let r = bounds.size.width.min(bounds.size.height) / 2. * 0.92;
+                let alpha = if reduced { 1. } else { 0.55 + 0.45 * k };
+                paint_dot(
+                    bounds.center(),
+                    r * (0.38 + 0.14 * k),
+                    Rgba { a: alpha, ..color },
+                    window,
+                );
+            },
+        )
+        .size_full(),
+    )
+}
+
+/// 扫光文字（「思考中…」）：`base` 色的字上一道 `highlight` 色的柔和高光从左扫到右，约 30 帧。
+/// 按像素位置着色：高光强度是余弦钟形，切成 [`SHIMMER_LEVELS`] 档同心竖条，每档用一种颜色
+/// 画一遍文字、裁到自己那条（各条不重叠，字形边缘不会被叠画加粗）。排版靠一份透明的同样文字。
+/// 减少动态效果时整段都是 `base` 色。
 pub(super) fn shimmer_text(text: impl Into<SharedString>, base: Color, highlight: Color) -> Div {
     let text: SharedString = text.into();
-    let reduced = REDUCED.load(Ordering::Relaxed);
+    if REDUCED.load(Ordering::Relaxed) {
+        return div().text_color(rgb(base)).child(text);
+    }
     let (base, highlight) = (rgb(base), rgb(highlight));
-    let n = text.chars().count().max(1) as f32;
-    // 高光中心从左边外侧走到右边外侧，首尾都不露半截；减少动态效果时停在左边外侧
-    let phase = if reduced { 0. } else { loop_phase(SHIMMER_PERIOD) };
-    let center = -SHIMMER_SPREAD + phase * (1. + 2. * SHIMMER_SPREAD);
-    let highlights: Vec<(Range<usize>, HighlightStyle)> = text
-        .char_indices()
-        .enumerate()
-        .map(|(i, (at, c))| {
-            let x = (i as f32 + 0.5) / n;
-            let k = (1. - (x - center).abs() / SHIMMER_SPREAD).max(0.);
-            let color = mix(base, highlight, k);
-            (
-                at..at + c.len_utf8(),
-                HighlightStyle { color: Some(color.into()), ..Default::default() },
-            )
-        })
-        .collect();
-    div()
-        .relative()
-        .child(StyledText::new(text).with_highlights(highlights))
-        .when(!reduced, |d| d.child(ticker()))
+    let phase = loop_phase(SHIMMER_PERIOD);
+    div().relative().child(div().text_color(transparent_black()).child(text.clone())).child(
+        canvas(
+            |_, window, _| request_loop_tick(window),
+            move |bounds, _, window, cx| {
+                paint_shimmer(&text, bounds, phase, base, highlight, window, cx)
+            },
+        )
+        .absolute()
+        .inset_0(),
+    )
+}
+
+fn paint_shimmer(
+    text: &SharedString,
+    bounds: Bounds<Pixels>,
+    phase: f32,
+    base: Rgba,
+    highlight: Rgba,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // 字体、字号、行高跟外层排版那份文字一样（都继承同一串祖先的文字样式）
+    let style = window.text_style();
+    let rem = window.rem_size();
+    let font_size = style.font_size.to_pixels(rem);
+    let line_height = style.line_height_in_pixels(rem);
+    let spread = font_size * SHIMMER_SPREAD_EM;
+    // 高光中心从左边外侧走到右边外侧，首尾都不露半截
+    let center = bounds.left() - spread + (bounds.size.width + spread * 2.) * phase;
+    // 第 j 档的外沿：强度 0.5 + 0.5·cos(π·d/spread) 等于 j/档数 处离中心的距离
+    let edge = |j: usize| spread * ((2. * j as f32 / SHIMMER_LEVELS as f32 - 1.).acos() / PI);
+    // 上下多留一点，字形出了行框也不被切
+    let (top, bottom) = (bounds.top() - px(4.), bounds.bottom() + px(4.));
+    let (far_left, far_right) = (bounds.left() - px(4.), bounds.right() + px(4.));
+    for j in 0..SHIMMER_LEVELS {
+        let color = mix(base, highlight, j as f32 / (SHIMMER_LEVELS - 1) as f32);
+        // 这一档占的横向范围：最外档是高光以外的全部，最内档是中间一整段，其余左右各一条
+        let (outer, inner) = (edge(j), edge(j + 1));
+        let spans = if j == 0 {
+            [(far_left, center - inner), (center + inner, far_right)]
+        } else if j == SHIMMER_LEVELS - 1 {
+            [(center - outer, center + outer), (px(0.), px(0.))]
+        } else {
+            [(center - outer, center - inner), (center + inner, center + outer)]
+        };
+        let spans: Vec<_> = spans
+            .into_iter()
+            .map(|(l, r)| (l.max(far_left), r.min(far_right)))
+            .filter(|(l, r)| r > l)
+            .collect();
+        if spans.is_empty() {
+            continue;
+        }
+        let mut run = style.to_run(text.len());
+        run.color = color.into();
+        let line = window.text_system().shape_line(text.clone(), font_size, &[run], None);
+        for (l, r) in spans {
+            let mask =
+                ContentMask { bounds: Bounds::from_corners(point(l, top), point(r, bottom)) };
+            window.with_content_mask(Some(mask), |window| {
+                let _ = line.paint(bounds.origin, line_height, TextAlign::Left, None, window, cx);
+            });
+        }
+    }
 }
 
 fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
@@ -208,6 +325,18 @@ pub(super) fn hover_opacity(
 ) -> f32 {
     let policy = Transition::new(cx.theme().motion_tokens().duration_fast);
     transition((id.into(), "hover"), if hovered { 1f32 } else { 0. }, policy, window, cx)
+}
+
+/// 进行中的东西有了结果（转圈换成结果图标）的入场进度：从 0 走到 1，180ms ease-out。
+/// 第一次画时就已经有结果（读历史、滚进视口）直接是 1，不补放。
+pub(super) fn settle(
+    id: impl Into<ElementId>,
+    done: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> f32 {
+    let policy = Transition::new(cx.theme().motion_tokens().duration_normal);
+    transition((id.into(), "settle"), if done { 1f32 } else { 0. }, policy, window, cx)
 }
 
 /// 刚出现的东西（刚发出的消息、刚变成对勾的「已复制」）入场：出现了 `age`，

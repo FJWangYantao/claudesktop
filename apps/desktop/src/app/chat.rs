@@ -70,17 +70,20 @@ fn ellipsis(id: impl Into<ElementId>, text: SharedString) -> Stateful<Div> {
 }
 
 /// 工具的状态图标：进行中转圈，失败红叉，完成显示种类图标。
-fn tool_status_icon(card: &ToolCard) -> AnyElement {
-    match card.phase {
-        ToolPhase::Running => motion::spinner().into_any_element(),
-        ToolPhase::Failed => {
-            Icon::new(IconAll::CircleX).size_3p5().text_color(rgb(RED)).into_any_element()
+/// 转圈换成结果图标时淡入、从小放大到原尺寸（`settle` 见 [`motion::settle`]）。
+fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
+    let icon = match card.phase {
+        ToolPhase::Running => return motion::spinner().into_any_element(),
+        ToolPhase::Failed => Icon::new(IconAll::CircleX).size_3p5().text_color(rgb(RED)),
+        ToolPhase::Done => {
+            Icon::new(tool_icon(card.kind_key())).size_3p5().text_color(rgb(INK_SOFT))
         }
-        ToolPhase::Done => Icon::new(tool_icon(card.kind_key()))
-            .size_3p5()
-            .text_color(rgb(INK_SOFT))
-            .into_any_element(),
-    }
+    };
+    let scale = 0.6 + 0.4 * settle;
+    div()
+        .opacity(settle)
+        .child(icon.transform(Transformation::scale(size(scale, scale))))
+        .into_any_element()
 }
 
 /// 回复 / 思考共用的 Markdown 样式。
@@ -423,10 +426,11 @@ impl ChatApp {
         // 文件改动：默认每份只显示前若干行，超出的部分展开 / 收起走弹簧
         let preview = (!verbose).then_some(DIFF_PREVIEW_ROWS);
         let rest = motion::reveal_progress(("diff", idx), card.expanded || verbose, window, cx);
+        let settle = motion::settle(("tool", idx), card.phase != ToolPhase::Running, window, cx);
         let mut col = div().v_flex().gap_2();
         for (k, diff) in card.diffs.iter().enumerate() {
             let rest = (ElementId::from(("diff-rest", idx * 64 + k)), rest);
-            col = col.child(Self::render_diff(diff, preview, Some(rest), Some(card)));
+            col = col.child(Self::render_diff(diff, preview, Some(rest), Some((card, settle))));
         }
         // diff 已经说明了改了什么；结果摘要只在失败时有用（为什么没改成）
         if card.phase == ToolPhase::Failed && !card.result.is_empty() {
@@ -480,24 +484,30 @@ impl ChatApp {
         let has_output = !card.output.trim().is_empty();
         let toggle = has_output && !verbose;
         let open = has_output && (card.expanded || verbose);
-        let line = Self::render_tool_line(idx, card).id(("tool-toggle", idx)).when(toggle, |d| {
-            d.cursor_pointer()
-                .hover(|d| d.text_color(rgb(INK)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(ChatItem::Tool(card)) =
-                        this.sessions[this.active].transcript.get_mut(idx)
-                    {
-                        card.expanded = !card.expanded;
-                        cx.notify();
-                    }
-                }))
-                .child(
-                    div().flex_shrink_0().child(
-                        Icon::new(if open { IconAll::ChevronDown } else { IconAll::ChevronRight })
+        let settle = motion::settle(("tool", idx), card.phase != ToolPhase::Running, window, cx);
+        let line =
+            Self::render_tool_line(idx, card, settle).id(("tool-toggle", idx)).when(toggle, |d| {
+                d.cursor_pointer()
+                    .hover(|d| d.text_color(rgb(INK)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(ChatItem::Tool(card)) =
+                            this.sessions[this.active].transcript.get_mut(idx)
+                        {
+                            card.expanded = !card.expanded;
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        div().flex_shrink_0().child(
+                            Icon::new(if open {
+                                IconAll::ChevronDown
+                            } else {
+                                IconAll::ChevronRight
+                            })
                             .size_3(),
-                    ),
-                )
-        });
+                        ),
+                    )
+            });
         let mut col = div().v_flex().child(line);
         let progress = motion::reveal_progress(("tool", idx), open, window, cx);
         if progress > 0. && has_output {
@@ -525,9 +535,9 @@ impl ChatApp {
     }
 
     /// 不带 diff 的工具：一行，名称稍深、参数等宽、结果摘要接在后面（都单行省略，悬停看全文）。
-    fn render_tool_line(idx: usize, card: &ToolCard) -> Div {
+    fn render_tool_line(idx: usize, card: &ToolCard, settle: f32) -> Div {
         let failed = card.phase == ToolPhase::Failed;
-        step_line(tool_status_icon(card))
+        step_line(tool_status_icon(card, settle))
             .child(
                 div()
                     .flex_shrink_0()
@@ -936,12 +946,12 @@ impl ChatApp {
 
     /// 一个文件的 diff 卡片；`preview` = 默认露出的行数（None = 全部）。
     /// 超出的部分由 `rest`（元素 id, 展开进度）决定：进度 > 0 时按进度裁切着画出来。
-    /// `tool` 给了时表头带上工具的状态图标和名称（兼当工具行）。
+    /// `tool`（工具, 结果图标的入场进度）给了时表头带上工具的状态图标和名称（兼当工具行）。
     pub(super) fn render_diff(
         diff: &DiffView,
         preview: Option<usize>,
         rest: Option<(ElementId, f32)>,
-        tool: Option<&ToolCard>,
+        tool: Option<(&ToolCard, f32)>,
     ) -> Div {
         let line_el = |line: &claudesktop_core::DiffLineView| {
             if line.tag == '~' {
@@ -1012,7 +1022,7 @@ impl ChatApp {
             body = body.child(Reveal::new(id, progress, more));
         }
         let icon = match tool {
-            Some(card) => tool_status_icon(card),
+            Some((card, settle)) => tool_status_icon(card, settle),
             None => {
                 Icon::new(IconAll::FileText).size_3p5().text_color(rgb(INK_SOFT)).into_any_element()
             }
@@ -1029,7 +1039,7 @@ impl ChatApp {
             .text_size(TEXT_SMALL)
             .text_color(rgb(INK_SOFT))
             .child(icon_cell(icon))
-            .children(tool.map(|card| {
+            .children(tool.map(|(card, _)| {
                 div()
                     .flex_shrink_0()
                     .font_weight(FontWeight::MEDIUM)
