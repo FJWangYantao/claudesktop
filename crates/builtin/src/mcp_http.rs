@@ -100,8 +100,7 @@ impl Http {
         if let Some(auth) = &self.auth {
             request = request.header("Authorization", format!("Bearer {}", auth.access_token()));
         }
-        let response =
-            request.call().map_err(|e| OpenError::Failed(format!("连不上 {}：{e}", self.url)))?;
+        let response = request.call().map_err(|e| OpenError::Failed(send_error(&self.url, &e)))?;
         let status = response.status().as_u16();
         if status == 401 {
             let challenge = response
@@ -196,7 +195,7 @@ impl Http {
             };
             let mut response = match build().send(&body) {
                 Ok(r) => r,
-                Err(e) => return fail(format!("请求 {url} 失败：{e}")),
+                Err(e) => return fail(send_error(&url, &e)),
             };
             // 401：先把挑战记下来（上层据此决定走不走 OAuth），再考虑刷新
             if response.status().as_u16() == 401
@@ -217,7 +216,7 @@ impl Http {
                 }
                 match build().send(&body) {
                     Ok(r) => response = r,
-                    Err(e) => return fail(format!("请求 {url} 失败：{e}")),
+                    Err(e) => return fail(send_error(&url, &e)),
                 }
             }
             let status = response.status().as_u16();
@@ -281,6 +280,19 @@ impl Drop for Http {
         let _ = std::thread::Builder::new().name("mcp-delete".into()).spawn(move || {
             let _ = request.call();
         });
+    }
+}
+
+/// 请求没发出去 / 没回来的原因：连不上、找不到主机、超时说人话，其余附原文。
+fn send_error(url: &str, e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
+            format!("连不上 {url}：服务没在运行，或者地址、端口不对")
+        }
+        ureq::Error::ConnectionFailed => format!("连不上 {url}：服务没在运行，或者地址、端口不对"),
+        ureq::Error::HostNotFound => format!("找不到 {url} 的主机：检查地址拼写和网络"),
+        ureq::Error::Timeout(_) => format!("请求 {url} 超时了：服务没有响应"),
+        _ => format!("请求 {url} 失败：{e}"),
     }
 }
 

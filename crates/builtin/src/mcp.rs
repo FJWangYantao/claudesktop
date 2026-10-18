@@ -133,7 +133,8 @@ pub fn load_config(path: &Path) -> Result<Vec<ServerConfig>, String> {
 }
 
 fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
-    let root: Value = serde_json::from_str(text).map_err(|e| format!("mcp.json 格式不对：{e}"))?;
+    let root: Value = serde_json::from_str(text)
+        .map_err(|e| format!("mcp.json 格式不对：{}", claudesktop_core::json_error_text(&e)))?;
     let Some(servers) = root.get("mcpServers").and_then(Value::as_object) else {
         return Err("mcp.json 里缺少 \"mcpServers\" 对象".into());
     };
@@ -630,7 +631,11 @@ fn establish(
     };
     let challenge = Arc::new(Mutex::new(None));
     let mut auth = initial_auth(&server.config);
+    // 这一轮刚登录过：再回 401 就别再要登录了（服务器不认它自己发的令牌，登多少次都一样）
+    let mut signed_in = false;
     let client = loop {
+        // 只看这一次握手的 401，上一轮留下的挑战不算
+        *challenge.lock().unwrap() = None;
         let client = Client::open(
             &server.config,
             &cwd,
@@ -657,11 +662,15 @@ fn establish(
                 if !challenge.to_ascii_lowercase().contains("bearer") {
                     return Err(reason);
                 }
+                if signed_in {
+                    return Err(format!("登录完成了，但服务器还是拒绝访问：{reason}"));
+                }
                 if let Some(stale) = auth.take() {
                     drop(stale);
                     crate::mcp_oauth::forget(&server.config.url);
                 }
                 auth = Some(authorize(&server.config, &challenge, &mut on_auth)?);
+                signed_in = true;
             }
         }
     };
@@ -1074,9 +1083,20 @@ fn spawn_process(config: &ServerConfig, cwd: &Path) -> Result<Child, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut args = vec!["/C".to_string(), config.command.clone()];
             args.extend(config.args.iter().cloned());
-            build("cmd", &args).spawn().map_err(|e| format!("起不来 `{}`：{e}", config.command))
+            build("cmd", &args).spawn().map_err(|e| spawn_error(&config.command, &e))
         }
-        Err(e) => Err(format!("起不来 `{}`：{e}", config.command)),
+        Err(e) => Err(spawn_error(&config.command, &e)),
+    }
+}
+
+/// 起进程失败的原因：最常见的是命令没装 / 不在 PATH 里。
+fn spawn_error(command: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("找不到命令 `{command}`：确认它已经装好、在 PATH 里，或者写完整路径")
+        }
+        std::io::ErrorKind::PermissionDenied => format!("没有权限运行 `{command}`"),
+        _ => format!("起不来 `{command}`：{e}"),
     }
 }
 

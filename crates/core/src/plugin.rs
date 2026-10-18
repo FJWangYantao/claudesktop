@@ -323,7 +323,9 @@ fn read_json(path: &Path) -> Result<Option<Value>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("读不了 {}：{e}", file_label(path))),
     };
-    serde_json::from_str(&text).map(Some).map_err(|e| format!("{} 格式不对：{e}", file_label(path)))
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("{} 格式不对：{}", file_label(path), crate::json_error_text(&e)))
 }
 
 /// 报错里的文件名：只留最后两段（`hooks/hooks.json`），整条路径太长

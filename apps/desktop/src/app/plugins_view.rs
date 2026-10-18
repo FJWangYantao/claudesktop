@@ -33,6 +33,8 @@ pub(super) struct PluginsForm {
     busy: Option<SharedString>,
     /// 点了「卸载」、等确认的仓库目录
     confirm_uninstall: Option<PathBuf>,
+    /// 上次安装失败的原因：留在输入框下面，改了地址才消失（toast 一会儿就没了，来不及看）
+    error: Option<SharedString>,
 }
 
 impl PluginsForm {
@@ -42,12 +44,17 @@ impl PluginsForm {
         });
         // 回车直接装
         cx.subscribe_in(&url, window, |this: &mut ChatApp, _, event: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.install_plugin(window, cx);
+            match event {
+                InputEvent::PressEnter { .. } => this.install_plugin(window, cx),
+                InputEvent::Change if this.plugins_form.error.is_some() => {
+                    this.plugins_form.error = None;
+                    cx.notify();
+                }
+                _ => {}
             }
         })
         .detach();
-        Self { url, busy: None, confirm_uninstall: None }
+        Self { url, busy: None, confirm_uninstall: None, error: None }
     }
 }
 
@@ -98,9 +105,11 @@ impl ChatApp {
         }
         let url = self.plugins_form.url.read(cx).value().to_string();
         if let Err(err) = plugin_git::normalize_url(&url) {
-            self.toast(Notification::error(err), cx);
+            self.plugins_form.error = Some(err.into());
+            cx.notify();
             return;
         }
+        self.plugins_form.error = None;
         let Some(dir) = plugin::default_plugins_dir() else {
             self.toast(Notification::error("找不到数据目录"), cx);
             return;
@@ -127,7 +136,7 @@ impl ChatApp {
                         };
                         app.toast(Notification::success(text), cx);
                     }
-                    Err(err) => app.toast(Notification::error(format!("安装失败：{err}")), cx),
+                    Err(err) => app.plugins_form.error = Some(format!("没装上：{err}").into()),
                 }
                 cx.notify();
             });
@@ -240,10 +249,18 @@ impl ChatApp {
                     .disabled(busy.is_some())
                     .on_click(cx.listener(|this, _, window, cx| this.install_plugin(window, cx))),
             );
+        let error = self.plugins_form.error.clone();
         let mut body = div().v_flex().gap_4().child(
-            div().v_flex().gap_2().child(install).when_some(busy, |d, text| {
-                d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text))
-            }),
+            div()
+                .v_flex()
+                .gap_2()
+                .child(install)
+                .when_some(busy, |d, text| {
+                    d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text))
+                })
+                .when_some(error, |d, text| {
+                    d.child(note(IconAll::CircleX, text).text_color(rgb(RED)))
+                }),
         );
         if self.plugins.is_empty() {
             body = body.child(how_to(
