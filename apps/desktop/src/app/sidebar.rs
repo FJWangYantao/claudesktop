@@ -654,7 +654,7 @@ impl ChatApp {
                         })),
                     )
                     .child(div().v_flex().gap_1().px_4().pt_1().children(
-                        // 可在设置页关掉（「侧栏显示内核状态」）
+                        // 默认不显示，可在设置页打开（「侧栏显示内核状态」）
                         if self.settings.sidebar_kernel_status {
                             self.kernel_status_rows()
                         } else {
