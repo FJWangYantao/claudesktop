@@ -6,6 +6,9 @@
 //! - 空会话首页：问候语 + 用量概览（统计卡 + 热力图）
 //! - 底部输入区：上方环境 / 项目 chips，输入框，下方权限模式 / 内核 / 模型
 
+// release 版双击打开不带控制台黑窗（子进程都带 CREATE_NO_WINDOW）；debug 版留着看 stderr
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod complete;
 mod demo;
@@ -103,6 +106,15 @@ fn main() {
                                 app.restart_kernel(kind, cx)
                             }
                             _ => {}
+                        }
+                        // 调试钩子：CLAUDESKTOP_DROP = 以 ; 分隔的路径，当作从资源管理器拖进来松开
+                        if let Ok(paths) = std::env::var("CLAUDESKTOP_DROP") {
+                            let paths: Vec<std::path::PathBuf> = paths
+                                .split(';')
+                                .filter(|p| !p.is_empty())
+                                .map(Into::into)
+                                .collect();
+                            app.drop_paths(&paths, window, cx);
                         }
                         app.autodemo_hook(cx);
                     });

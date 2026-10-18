@@ -57,6 +57,8 @@ pub struct ChatApp {
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
+    /// 正从系统往会话区拖文件（盖一层「松开添加」的提示，见 `composer.rs` 的 `render_drop_hint`）
+    file_drag: bool,
     /// 内核会话（可多个）；至少有一个，`active` 始终有效
     sessions: Vec<Session>,
     active: usize,
@@ -321,6 +323,7 @@ impl ChatApp {
         let mut app = Self {
             input,
             pending: Vec::new(),
+            file_drag: false,
             sessions: Vec::new(),
             active: 0,
             next_token: 1,
@@ -1533,8 +1536,14 @@ impl Render for ChatApp {
             v_flex().flex_1().min_h_0().child(self.content_slot()).when(!self.settings_open, |d| {
                 d.child(div().px_6().pb_4().pt_2().child(self.render_composer(window, cx)))
             });
-        let main =
-            v_flex().flex_1().min_w_0().h_full().child(self.render_header(window, cx)).child(body);
+        let main = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            .child(self.render_header(window, cx))
+            .child(body)
+            .when(!self.settings_open, |d| self.with_file_drop(d, cx));
 
         let mut root = div();
         // 中文回退字体：根上设一次，子元素换 font_family 时继承

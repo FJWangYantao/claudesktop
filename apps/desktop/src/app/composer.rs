@@ -506,6 +506,90 @@ impl ChatApp {
     }
 }
 
+impl ChatApp {
+    /// 会话区接系统拖进来的文件：拖到上方时盖一层提示，松开后图片收成附件、其余插入 `@引用`。
+    pub(super) fn with_file_drop(&mut self, area: Div, cx: &mut Context<Self>) -> Div {
+        // 拖出窗口或取消时系统会清掉进行中的拖拽，提示跟着收起
+        if !cx.has_active_drag() {
+            self.file_drag = false;
+        }
+        area.on_drag_move(cx.listener(|this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+            let over = e.bounds.contains(&e.event.position);
+            if this.file_drag != over {
+                this.file_drag = over;
+                cx.notify();
+            }
+        }))
+        .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+            this.drop_paths(paths.paths(), window, cx)
+        }))
+        .when(self.file_drag, |d| d.child(Self::render_drop_hint()))
+    }
+
+    pub(crate) fn drop_paths(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_drag = false;
+        let cwd = self.session().cwd.clone();
+        let mut images = Vec::new();
+        let mut mentions = Vec::new();
+        for path in paths {
+            match PendingImage::from_path(path) {
+                Some(image) => images.push(image),
+                None => mentions.push(crate::complete::mention_for(path, &cwd)),
+            }
+        }
+        self.add_pending_images(images, cx);
+        if !mentions.is_empty() {
+            // 插在光标处，和前后文字各隔一个空格
+            self.input.update(cx, |state, cx| {
+                let value = state.value();
+                let spaced = value[..state.cursor().min(value.len())]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace);
+                let text = mentions.join(" ");
+                state.insert(
+                    if spaced { format!("{text} ") } else { format!(" {text} ") },
+                    window,
+                    cx,
+                );
+            });
+        }
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
+    /// 拖拽中盖在会话区上的提示（不挡事件：松开落在下面的会话区上）。
+    fn render_drop_hint() -> Div {
+        let mut scrim = rgb(PAPER);
+        scrim.a = 0.94;
+        div().absolute().inset_0().p_4().bg(scrim).child(
+            div()
+                .size_full()
+                .v_flex()
+                .items_center()
+                .justify_center()
+                .gap_1p5()
+                .border_2()
+                .border_dashed()
+                .border_color(rgb(CORAL))
+                .rounded_2xl()
+                .child(Icon::new(IconAll::Plus).size_6().text_color(rgb(CORAL)))
+                .child(div().text_size(TEXT_LEAD).font_medium().child("松开即可添加"))
+                .child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .child("图片作为附件，其他文件和文件夹插入 @ 引用"),
+                ),
+        )
+    }
+}
+
 /// 粘贴处理：剪贴板里是图片（截图）或图片文件路径时收成待发送附件并吃掉这次粘贴；
 /// 纯文字返回 false，交给输入框照常插入。
 fn paste_to_attachments(

@@ -115,6 +115,19 @@ pub fn rank_files(files: &[String], query: &str, n: usize) -> Vec<String> {
     scored.into_iter().take(n).map(|(_, _, p)| p.clone()).collect()
 }
 
+/// 拖进来的文件 → 插进输入框的 `@引用`：在工作目录里的写相对路径（正斜杠，和补全一致），
+/// 外面的写绝对路径；目录末尾加 `/`，带空白的加引号。
+pub fn mention_for(path: &Path, cwd: &Path) -> String {
+    let mut shown = match path.strip_prefix(cwd) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
+        _ => path.to_string_lossy().into_owned(),
+    };
+    if path.is_dir() && !shown.ends_with(['/', '\\']) {
+        shown.push('/');
+    }
+    if shown.contains(char::is_whitespace) { format!("@\"{shown}\"") } else { format!("@{shown}") }
+}
+
 /// 指令是否匹配查询：关键字开头命中，或中文名 / 说明里包含。
 pub fn command_matches(keyword: &str, label: &str, query: &str) -> bool {
     let q = query.to_lowercase();
@@ -177,6 +190,20 @@ mod tests {
         let mut files = list_files(&dir, 100);
         files.sort();
         assert_eq!(files, ["README.md", "src/a.rs"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mentions_dropped_paths() {
+        let cwd = Path::new(r"C:\proj");
+        assert_eq!(mention_for(Path::new(r"C:\proj\src\a.rs"), cwd), "@src/a.rs");
+        assert_eq!(mention_for(Path::new(r"D:\notes\b.md"), cwd), r"@D:\notes\b.md");
+        assert_eq!(mention_for(Path::new(r"C:\proj\my docs"), cwd), "@\"my docs\"");
+        // 目录末尾加 `/`；拖的就是工作目录本身时写全路径
+        let dir = std::env::temp_dir().join(format!("cd-mention-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(mention_for(&dir.join("sub"), &dir), "@sub/");
+        assert_eq!(mention_for(&dir, &dir), format!("@{}/", dir.display()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
