@@ -207,6 +207,12 @@ pub struct McpServerView {
     /// 来自哪个插件；None = 数据目录的 mcp.json
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
+    /// 远程服务的地址；本地命令为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// 没连上、可以点「重新连接」（配置本身有问题的不行）
+    #[serde(default)]
+    pub retry: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +222,8 @@ pub enum McpState {
     Ready,
     /// 起不来、握手失败或中途退出：原因（含服务器 stderr 的最后几行）
     Failed(String),
+    /// 连上过、断了，正在退避重连：断开的原因和下次重连的说明
+    Reconnecting(String),
     /// 配置里写了 `"disabled": true`
     Disabled,
 }
@@ -451,6 +459,8 @@ pub trait Kernel: Send + Sync {
     }
     /// 重新读 MCP 配置、重连全部服务器；结果经 `McpStatus` 回报。默认没有 MCP。
     fn reload_mcp(&self) {}
+    /// 重连一个没连上的 MCP 服务器（设置页的「重新连接」）。
+    fn reconnect_mcp(&self, _server: &str) {}
 
     /// 换一批启用的插件（启用 / 停用之后）：自研内核接它们的 MCP 服务、技能和钩子，
     /// ACP 内核在之后新开 / 续接的会话里把插件的 MCP 服务交给 agent。

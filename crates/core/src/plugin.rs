@@ -92,13 +92,18 @@ pub struct AgentDef {
     pub plugin: String,
 }
 
-/// 插件提供的 MCP 服务（只支持本地命令方式，占位符已替换）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 插件提供的 MCP 服务（本地命令或远程 HTTP / SSE，占位符已替换）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginMcpServer {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// 远程服务的地址；空 = 本地命令
+    pub url: String,
+    /// 远程服务走旧版 HTTP + SSE（`"type": "sse"`）；否则 Streamable HTTP
+    pub sse: bool,
+    pub headers: BTreeMap<String, String>,
 }
 
 /// 钩子触发的时机（名字同 Claude Code）。
@@ -471,7 +476,7 @@ fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, &str) {
     (BTreeMap::new(), text)
 }
 
-/// `{"mcpServers": {...}}` → 本地命令方式的服务；HTTP / 缺命令的记成问题跳过。
+/// `{"mcpServers": {...}}` → 本地命令或远程（HTTP / SSE）的服务；既没命令也没地址的记成问题跳过。
 fn parse_mcp(value: &Value, root: &Path) -> (Vec<PluginMcpServer>, Vec<String>) {
     let mut servers = Vec::new();
     let mut problems = Vec::new();
@@ -484,8 +489,9 @@ fn parse_mcp(value: &Value, root: &Path) -> (Vec<PluginMcpServer>, Vec<String>) 
             continue;
         }
         let command = s.get("command").and_then(Value::as_str).unwrap_or_default();
-        if s.get("url").is_some() || command.trim().is_empty() {
-            problems.push(format!("MCP 服务 {name}：只支持本地命令（stdio）方式，已跳过"));
+        let url = s.get("url").and_then(Value::as_str).unwrap_or_default();
+        if url.is_empty() && command.trim().is_empty() {
+            problems.push(format!("MCP 服务 {name}：缺少 \"command\" 或 \"url\"，已跳过"));
             continue;
         }
         let strings = |key: &str| -> Vec<String> {
@@ -494,20 +500,24 @@ fn parse_mcp(value: &Value, root: &Path) -> (Vec<PluginMcpServer>, Vec<String>) 
                 .map(|a| a.iter().filter_map(Value::as_str).map(|v| substitute(v, root)).collect())
                 .unwrap_or_default()
         };
-        let env = s
-            .get("env")
-            .and_then(Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), substitute(v, root))))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let map = |key: &str| -> BTreeMap<String, String> {
+            s.get(key)
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), substitute(v, root))))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         servers.push(PluginMcpServer {
             name: name.clone(),
             command: substitute(command, root),
             args: strings("args"),
-            env,
+            env: map("env"),
+            url: substitute(url, root),
+            sse: s.get("type").and_then(Value::as_str) == Some("sse"),
+            headers: map("headers"),
         });
     }
     (servers, problems)
@@ -819,7 +829,8 @@ mod tests {
         write(
             &root.join(".mcp.json"),
             r#"{"mcpServers": {"db": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/db", "args": ["--root", "${CLAUDE_PLUGIN_ROOT}"]},
-                "remote": {"url": "https://x"}}}"#,
+                "remote": {"type": "sse", "url": "https://x/sse", "headers": {"X-Root": "${CLAUDE_PLUGIN_ROOT}"}},
+                "bad": {"args": []}}}"#,
         );
         write(
             &root.join("hooks/hooks.json"),
@@ -851,14 +862,18 @@ mod tests {
         let scout = &p.agents[1];
         assert_eq!((scout.name.as_str(), scout.tools.is_none()), ("scout", true));
         assert_eq!((scout.model.as_deref(), scout.plugin.as_str()), (Some("fast-model"), "review"));
-        assert_eq!(p.mcp_servers.len(), 1);
+        assert_eq!(p.mcp_servers.len(), 2);
         let root_text = root.to_string_lossy().replace('\\', "/");
         assert_eq!(p.mcp_servers[0].command, format!("{root_text}/bin/db"));
         assert_eq!(p.mcp_servers[0].args, ["--root", root_text.as_str()]);
+        // 远程服务：地址、旧版 SSE、请求头里的占位符也替换
+        let remote = &p.mcp_servers[1];
+        assert_eq!((remote.url.as_str(), remote.sse), ("https://x/sse", true));
+        assert_eq!(remote.headers.get("X-Root"), Some(&root_text));
         assert_eq!(p.hooks.len(), 1);
         assert_eq!(p.hooks[0].event, HookEvent::PreToolUse);
         assert_eq!(p.hooks[0].timeout, Duration::from_secs(5));
-        // 远程 MCP、不认识的时机记成问题，其余照常
+        // 缺命令的 MCP、不认识的时机记成问题，其余照常
         assert_eq!(p.problems.len(), 2, "{:?}", p.problems);
         let _ = std::fs::remove_dir_all(&dir);
     }

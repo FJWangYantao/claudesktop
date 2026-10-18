@@ -25,6 +25,7 @@ pub mod gateway;
 mod history;
 mod instructions;
 pub mod mcp;
+mod mcp_http;
 mod openai;
 mod permissions;
 mod provider;
@@ -1631,6 +1632,10 @@ impl Kernel for BuiltinKernel {
             })
             .map_err(|e| anyhow::anyhow!("spawn compact thread: {e}"))?;
         Ok(())
+    }
+
+    fn reconnect_mcp(&self, server: &str) {
+        self.inner.mcp.reconnect(server);
     }
 
     fn reload_mcp(&self) {

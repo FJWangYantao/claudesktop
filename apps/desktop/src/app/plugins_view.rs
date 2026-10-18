@@ -309,11 +309,16 @@ impl ChatApp {
             contents = contents.child(line("子 agent", format!("{}：{tools}", a.name)));
         }
         for s in &p.mcp_servers {
-            let command = std::iter::once(s.command.as_str())
-                .chain(s.args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" ");
-            contents = contents.child(line("MCP", format!("{}：{command}", s.name)));
+            // 远程的写地址，本地的写命令
+            let target = if s.url.is_empty() {
+                std::iter::once(s.command.as_str())
+                    .chain(s.args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                s.url.clone()
+            };
+            contents = contents.child(line("MCP", format!("{}：{target}", s.name)));
         }
         for h in &p.hooks {
             let when = match h.matcher.trim() {

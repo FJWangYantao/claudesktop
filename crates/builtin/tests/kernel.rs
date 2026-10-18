@@ -1557,7 +1557,7 @@ fn mcp_read_only_tools_survive_plan_mode_and_list_changes() {
     // 服务器说工具变了：重新列，多出 extra
     h.wait("relist", |e| {
         matches!(e, KernelEvent::McpStatus { servers }
-            if servers.iter().any(|s| s.name == "mock" && s.tools == 3))
+            if servers.iter().any(|s| s.name == "mock" && s.tools == 4))
     });
     h.kernel.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

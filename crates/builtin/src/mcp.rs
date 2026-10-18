@@ -1,13 +1,18 @@
 //! MCP（Model Context Protocol）客户端：让自研内核调用外部工具服务器提供的工具。
 //!
 //! - 配置：数据目录的 `mcp.json`，格式同 Claude Code 的 `.mcp.json`
-//!   （`{"mcpServers": {"名字": {"command", "args", "env", "disabled"}}}`）。只支持本地命令（stdio）。
-//! - 每个服务器一个子进程，stdio 上换行分隔的 JSON-RPC 2.0：`initialize` → `notifications/initialized`
-//!   → `tools/list`；服务器说工具变了（`notifications/tools/list_changed`）就重新列。
+//!   （`{"mcpServers": {"名字": {"command", "args", "env", "disabled"}}}`；远程服务写
+//!   `{"type": "http" | "sse", "url", "headers"}`）。字符串里的 `${VAR}` / `${VAR:-默认值}` 换成环境变量。
+//! - 本地服务一个子进程，stdio 上换行分隔的 JSON-RPC 2.0；远程服务走 HTTP（见 `mcp_http`）。
+//!   都是 `initialize` → `notifications/initialized` → `tools/list`；服务器说工具变了
+//!   （`notifications/tools/list_changed`）就重新列。
+//! - 连上过的服务断了（进程退出、事件流断、会话过期）按 [`RECONNECT_DELAYS`] 退避自动重连；
+//!   一开始就没连上的不自动重试，设置页每个服务旁有「重新连接」。
 //! - 工具以 `mcp__<服务器>__<工具>` 的名字交给模型（和 Claude Code 一致）；调用走内核的权限流程，
 //!   「总是允许」记成 `mcp:<服务器>:<工具>`。服务器标了只读（`readOnlyHint`）的工具 Plan 模式下也能用。
 //! - 状态（连接中 / 已连接 N 个工具 / 失败原因）变了就整份经回调上报，界面在设置页显示。
 
+use crate::mcp_http::{self, Http, Sink};
 use crate::tools::ToolOutput;
 use claudesktop_core::{McpServerView, McpState};
 use serde_json::{Value, json};
@@ -16,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 /// 握手要等多久（`npx` 第一次跑要下载包，给宽一点）
@@ -30,7 +35,15 @@ const OUTPUT_MAX_CHARS: usize = 30_000;
 /// 失败原因里带上服务器 stderr 的开头和结尾各几行（报错通常在开头，退出原因在结尾）
 const STDERR_LINES: usize = 4;
 /// 写进请求的协议版本（服务器回它支持的版本，不一致也照常用：只用到最基本的几个方法）
-const PROTOCOL_VERSION: &str = "2025-06-18";
+pub(crate) const PROTOCOL_VERSION: &str = "2025-06-18";
+/// 连上过的服务断了之后，第几次重连前等多久；都失败就停在「没连上」
+pub const RECONNECT_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 /// 交给模型的工具名前缀
 const TOOL_PREFIX: &str = "mcp__";
@@ -43,36 +56,66 @@ pub const CONFIG_TEMPLATE: &str = r#"{
       "args": ["-y", "@modelcontextprotocol/server-everything"],
       "env": {},
       "disabled": true
+    },
+    "remote-example": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${EXAMPLE_TOKEN}" },
+      "disabled": true
     }
   }
 }
 "#;
 
+/// 怎么连服务器。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Transport {
+    /// 本地命令，stdio
+    #[default]
+    Stdio,
+    /// Streamable HTTP
+    Http,
+    /// 旧版 HTTP + SSE
+    Sse,
+}
+
 /// 一个服务器的配置。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerConfig {
     pub name: String,
+    pub transport: Transport,
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// 远程服务的地址和请求头
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
     pub disabled: bool,
-    /// 配置了但用不了的原因（HTTP / SSE 服务器、缺 command）
+    /// 配置了但用不了的原因（缺 command / url、不认识的 type）
     pub unsupported: Option<String>,
     /// 来自哪个插件；None = mcp.json
     pub plugin: Option<String>,
 }
 
 impl ServerConfig {
-    /// 插件提供的服务（插件那边已经只留了本地命令方式的）。
+    /// 插件提供的服务（本地命令或远程）；远程的地址和请求头里的 `${VAR}` 照样换成环境变量。
     pub fn from_plugin(plugin: &str, s: &claudesktop_core::plugin::PluginMcpServer) -> Self {
+        let env = |key: &str| std::env::var(key).ok();
+        let transport = match (s.url.is_empty(), s.sse) {
+            (true, _) => Transport::Stdio,
+            (false, false) => Transport::Http,
+            (false, true) => Transport::Sse,
+        };
         Self {
             name: s.name.clone(),
+            transport,
             command: s.command.clone(),
             args: s.args.clone(),
             env: s.env.clone(),
-            disabled: false,
-            unsupported: None,
+            url: expand(&s.url, &env),
+            headers: s.headers.iter().map(|(k, v)| (k.clone(), expand(v, &env))).collect(),
             plugin: Some(plugin.to_string()),
+            ..Self::default()
         }
     }
 }
@@ -92,43 +135,75 @@ fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
     let Some(servers) = root.get("mcpServers").and_then(Value::as_object) else {
         return Err("mcp.json 里缺少 \"mcpServers\" 对象".into());
     };
+    let env = |key: &str| std::env::var(key).ok();
     Ok(servers
         .iter()
         .map(|(name, s)| {
             let text =
-                |key: &str| s.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
-            let command = text("command");
-            let kind = text("type");
-            let unsupported = if s.get("url").is_some() || matches!(kind.as_str(), "http" | "sse") {
-                Some("暂不支持 HTTP / SSE 服务器，只支持本地命令（stdio）".into())
-            } else if command.trim().is_empty() {
-                Some("缺少 \"command\"".into())
-            } else {
-                None
+                |key: &str| expand(s.get(key).and_then(Value::as_str).unwrap_or_default(), &env);
+            let map = |key: &str| -> BTreeMap<String, String> {
+                s.get(key)
+                    .and_then(Value::as_object)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), expand(v, &env))))
+                            .collect()
+                    })
+                    .unwrap_or_default()
             };
+            let command = text("command");
+            let url = text("url");
+            // 没写 type 时：有 url 是远程（Streamable HTTP），否则本地命令
+            let (transport, unsupported) = match text("type").as_str() {
+                "" if !url.is_empty() => (Transport::Http, None),
+                "" | "stdio" => (Transport::Stdio, None),
+                "http" | "streamable-http" => (Transport::Http, None),
+                "sse" => (Transport::Sse, None),
+                other => (Transport::Stdio, Some(format!("不认识的 \"type\": {other}"))),
+            };
+            let unsupported = unsupported.or_else(|| match transport {
+                Transport::Stdio if command.trim().is_empty() => Some("缺少 \"command\"".into()),
+                Transport::Http | Transport::Sse
+                    if !url.starts_with("http://") && !url.starts_with("https://") =>
+                {
+                    Some("\"url\" 要以 http:// 或 https:// 开头".into())
+                }
+                _ => None,
+            });
             ServerConfig {
                 name: name.clone(),
+                transport,
                 command,
                 args: s
                     .get("args")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).map(|v| expand(v, &env)).collect())
                     .unwrap_or_default(),
-                env: s
-                    .get("env")
-                    .and_then(Value::as_object)
-                    .map(|m| {
-                        m.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                env: map("env"),
+                url,
+                headers: map("headers"),
                 disabled: s.get("disabled").and_then(Value::as_bool).unwrap_or(false),
                 unsupported,
                 plugin: None,
             }
         })
         .collect())
+}
+
+/// `${VAR}` / `${VAR:-默认值}` 换成环境变量（没有这个变量时换成默认值或空串），同 Claude Code。
+fn expand(text: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start..].find('}') else { break };
+        out.push_str(&rest[..start]);
+        let inner = &rest[start + 2..start + len];
+        let (name, default) = inner.split_once(":-").unwrap_or((inner, ""));
+        out.push_str(&env(name).unwrap_or_else(|| default.to_string()));
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 服务器提供的一个工具。
@@ -240,12 +315,8 @@ impl McpHub {
             Err(reason) => vec![Arc::new(Server {
                 config: ServerConfig {
                     name: "mcp.json".into(),
-                    command: String::new(),
-                    args: Vec::new(),
-                    env: BTreeMap::new(),
-                    disabled: false,
                     unsupported: Some(reason.clone()),
-                    plugin: None,
+                    ..ServerConfig::default()
                 },
                 state: Mutex::new(McpState::Failed(reason)),
                 tools: Mutex::new(Vec::new()),
@@ -277,6 +348,26 @@ impl McpHub {
         }
     }
 
+    /// 重连一个没连上的服务（设置页的「重新连接」）；配置本身有问题、已禁用或已连上的不动。
+    pub fn reconnect(self: &Arc<Self>, name: &str) {
+        let server = self.servers.lock().unwrap().iter().find(|s| s.config.name == name).cloned();
+        let Some(server) = server else { return };
+        {
+            let mut state = server.state.lock().unwrap();
+            let stuck = matches!(*state, McpState::Failed(_) | McpState::Reconnecting(_));
+            if !stuck || server.config.unsupported.is_some() || server.config.disabled {
+                return;
+            }
+            *state = McpState::Connecting;
+        }
+        self.report();
+        let generation = self.generation.load(Ordering::SeqCst);
+        let hub = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name(format!("mcp-{}", server.config.name))
+            .spawn(move || connect(hub, server, generation));
+    }
+
     fn report(&self) {
         (self.on_status)(self.status());
     }
@@ -287,11 +378,17 @@ impl McpHub {
             .lock()
             .unwrap()
             .iter()
-            .map(|s| McpServerView {
-                name: s.config.name.clone(),
-                state: s.state.lock().unwrap().clone(),
-                tools: s.tools.lock().unwrap().len(),
-                plugin: s.config.plugin.clone(),
+            .map(|s| {
+                let state = s.state.lock().unwrap().clone();
+                McpServerView {
+                    name: s.config.name.clone(),
+                    retry: matches!(state, McpState::Failed(_) | McpState::Reconnecting(_))
+                        && s.config.unsupported.is_none(),
+                    state,
+                    tools: s.tools.lock().unwrap().len(),
+                    plugin: s.config.plugin.clone(),
+                    url: (s.config.transport != Transport::Stdio).then(|| s.config.url.clone()),
+                }
             })
             .collect()
     }
@@ -367,28 +464,85 @@ impl Drop for McpHub {
     }
 }
 
-/// 后台连接一个服务器：起进程 → 握手 → 列工具。成功 / 失败都上报（已经换代的不报）。
+/// 后台连接一个服务器，成功 / 失败都上报（已经换代的不报）。一开始就没连上的不自动重试。
 fn connect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64) {
-    let current = move |hub: &McpHub| hub.generation.load(Ordering::SeqCst) == generation;
-    let cwd = match hub.upgrade() {
-        Some(hub) => hub.cwd.clone(),
-        None => return,
+    let result = establish(&hub, &server, generation);
+    let Some(hub) = hub.upgrade() else {
+        return;
     };
-    // 进程退出 / 工具变了：回到 hub 更新状态
-    let on_exit = {
-        let (hub, server) = (hub.clone(), Arc::downgrade(&server));
-        move |reason: String| {
-            if let (Some(hub), Some(server)) = (hub.upgrade(), server.upgrade())
-                && current(&hub)
-            {
-                *server.state.lock().unwrap() = McpState::Failed(reason);
-                server.tools.lock().unwrap().clear();
+    if hub.generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    match result {
+        Ok((client, tools)) => server.ready(client, tools),
+        Err(reason) => *server.state.lock().unwrap() = McpState::Failed(reason),
+    }
+    hub.report();
+}
+
+/// 连上过的服务断了：按 [`RECONNECT_DELAYS`] 退避重连，期间状态是「重连中」；都失败就停在「没连上」。
+fn reconnect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64, mut reason: String) {
+    let current = |hub: &McpHub| hub.generation.load(Ordering::SeqCst) == generation;
+    for (attempt, delay) in RECONNECT_DELAYS.iter().enumerate() {
+        {
+            let Some(hub) = hub.upgrade().filter(|h| current(h)) else { return };
+            *server.state.lock().unwrap() = McpState::Reconnecting(format!(
+                "{reason}\n{} 秒后第 {} 次重连",
+                delay.as_secs(),
+                attempt + 1
+            ));
+            hub.report();
+        }
+        std::thread::sleep(*delay);
+        if hub.upgrade().is_none_or(|h| !current(&h)) {
+            return;
+        }
+        // 期间点了「重新连接」或重新加载，已经有人在连
+        if *server.state.lock().unwrap() == McpState::Connecting {
+            return;
+        }
+        match establish(&hub, &server, generation) {
+            Ok((client, tools)) => {
+                let Some(hub) = hub.upgrade().filter(|h| current(h)) else { return };
+                server.ready(client, tools);
                 hub.report();
+                return;
             }
+            Err(e) => reason = e,
+        }
+    }
+    if let Some(hub) = hub.upgrade().filter(|h| current(h)) {
+        *server.state.lock().unwrap() = McpState::Failed(reason);
+        hub.report();
+    }
+}
+
+/// 连一次：起进程 / 建连接 → 握手 → 列工具。
+fn establish(
+    hub: &Weak<McpHub>,
+    server: &Arc<Server>,
+    generation: u64,
+) -> Result<(Arc<Client>, Vec<McpTool>), String> {
+    let cwd = hub.upgrade().ok_or("内核已关闭")?.cwd.clone();
+    // 断了：连上过的转去重连；还在握手时断的由握手那边报错
+    let on_exit = {
+        let (hub, server) = (hub.clone(), Arc::downgrade(server));
+        move |reason: String| {
+            let (Some(h), Some(server)) = (hub.upgrade(), server.upgrade()) else { return };
+            if h.generation.load(Ordering::SeqCst) != generation
+                || *server.state.lock().unwrap() != McpState::Ready
+            {
+                return;
+            }
+            server.tools.lock().unwrap().clear();
+            server.client.lock().unwrap().take();
+            let _ = std::thread::Builder::new()
+                .name(format!("mcp-reconnect-{}", server.config.name))
+                .spawn(move || reconnect(hub, server, generation, reason));
         }
     };
     let on_tools_changed = {
-        let (hub, server) = (hub.clone(), Arc::downgrade(&server));
+        let (hub, server) = (hub.clone(), Arc::downgrade(server));
         move || {
             let (hub, server) = (hub.clone(), server.clone());
             let _ = std::thread::Builder::new().name("mcp-relist".into()).spawn(move || {
@@ -398,7 +552,7 @@ fn connect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64) {
                 let client = server.client.lock().unwrap().clone();
                 if let Some(client) = client
                     && let Ok(tools) = list_tools(&client)
-                    && current(&hub)
+                    && hub.generation.load(Ordering::SeqCst) == generation
                 {
                     *server.tools.lock().unwrap() = tools;
                     hub.report();
@@ -406,36 +560,27 @@ fn connect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64) {
             });
         }
     };
-    let result =
-        Client::spawn(&server.config, &cwd, on_exit, on_tools_changed).and_then(|client| {
-            let init = json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "claudesktop", "version": env!("CARGO_PKG_VERSION") },
-            });
-            client
-                .request("initialize", init, INIT_TIMEOUT, &|| false)
-                .map_err(|e| client.with_stderr(format!("握手失败：{e}")))?;
-            client.notify("notifications/initialized", json!({}));
-            let tools =
-                list_tools(&client).map_err(|e| client.with_stderr(format!("列工具失败：{e}")))?;
-            Ok((client, tools))
-        });
-    let Some(hub) = hub.upgrade() else {
-        return;
-    };
-    if !current(&hub) {
-        return;
+    let client = Client::open(&server.config, &cwd, on_exit, on_tools_changed)?;
+    let init = json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": { "name": "claudesktop", "version": env!("CARGO_PKG_VERSION") },
+    });
+    client
+        .request("initialize", init, INIT_TIMEOUT, &|| false)
+        .map_err(|e| client.with_stderr(format!("握手失败：{e}")))?;
+    client.notify("notifications/initialized", json!({}));
+    let tools = list_tools(&client).map_err(|e| client.with_stderr(format!("列工具失败：{e}")))?;
+    Ok((client, tools))
+}
+
+impl Server {
+    /// 连上了：换上新连接和工具。
+    fn ready(&self, client: Arc<Client>, tools: Vec<McpTool>) {
+        *self.tools.lock().unwrap() = tools;
+        *self.client.lock().unwrap() = Some(client);
+        *self.state.lock().unwrap() = McpState::Ready;
     }
-    match result {
-        Ok((client, tools)) => {
-            *server.tools.lock().unwrap() = tools;
-            *server.client.lock().unwrap() = Some(client);
-            *server.state.lock().unwrap() = McpState::Ready;
-        }
-        Err(reason) => *server.state.lock().unwrap() = McpState::Failed(reason),
-    }
-    hub.report();
 }
 
 /// `tools/list`（按 `nextCursor` 翻页）。
@@ -527,37 +672,72 @@ fn short(text: &str, n: usize) -> String {
 }
 
 type Reply = Result<Value, String>;
+/// 断线时的回调（只调一次）
+type OnExit = Box<dyn FnOnce(String) + Send>;
 
-/// 一个服务器子进程上的 JSON-RPC 连接。释放时结束子进程（连同子孙）。
+/// 和服务器之间怎么收发。
+enum Pipe {
+    Stdio {
+        stdin: Mutex<ChildStdin>,
+        child: Mutex<Child>,
+    },
+    /// 建好 `Client` 之后才连（旧版 SSE 的读线程要拿着它的弱引用）
+    Http(OnceLock<Http>),
+}
+
+/// 一个服务器上的 JSON-RPC 连接。释放时结束子进程（连同子孙）/ 结束远程会话。
 struct Client {
-    stdin: Mutex<ChildStdin>,
-    child: Mutex<Child>,
+    pipe: Pipe,
+    /// 自己的弱引用：远程发消息的线程要拿着连接
+    me: Weak<Client>,
     pending: Mutex<HashMap<u64, mpsc::Sender<Reply>>>,
     next_id: AtomicU64,
     alive: AtomicBool,
-    /// stderr 的开头和结尾几行（失败时附在原因后面）
+    /// stderr 的开头和结尾几行（失败时附在原因后面；远程服务没有）
     stderr: Mutex<StderrLog>,
+    on_tools_changed: Box<dyn Fn() + Send + Sync>,
+    /// 断线时调一次
+    on_exit: Mutex<Option<OnExit>>,
 }
 
 impl Client {
-    fn spawn(
+    fn open(
         config: &ServerConfig,
         cwd: &Path,
-        on_exit: impl Fn(String) + Send + 'static,
-        on_tools_changed: impl Fn() + Send + 'static,
+        on_exit: impl FnOnce(String) + Send + 'static,
+        on_tools_changed: impl Fn() + Send + Sync + 'static,
     ) -> Result<Arc<Self>, String> {
+        let new = |pipe: Pipe| {
+            Arc::new_cyclic(|me| Self {
+                pipe,
+                me: me.clone(),
+                pending: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(1),
+                alive: AtomicBool::new(true),
+                stderr: Mutex::new(StderrLog::default()),
+                on_tools_changed: Box::new(on_tools_changed),
+                on_exit: Mutex::new(Some(Box::new(on_exit))),
+            })
+        };
+        let kind = match config.transport {
+            Transport::Stdio => None,
+            Transport::Http => Some(mcp_http::Kind::Streamable),
+            Transport::Sse => Some(mcp_http::Kind::Legacy),
+        };
+        if let Some(kind) = kind {
+            let client = new(Pipe::Http(OnceLock::new()));
+            let sink: Weak<dyn Sink> = client.me.clone();
+            let http = Http::open(kind, &config.url, config.headers.clone(), sink)?;
+            if let Pipe::Http(slot) = &client.pipe {
+                let _ = slot.set(http);
+            }
+            return Ok(client);
+        }
         let mut child = spawn_process(config, cwd)?;
         let stdin = child.stdin.take().ok_or("拿不到子进程的 stdin")?;
         let stdout = child.stdout.take().ok_or("拿不到子进程的 stdout")?;
         let stderr = child.stderr.take();
-        let client = Arc::new(Self {
-            stdin: Mutex::new(stdin),
-            child: Mutex::new(child),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            alive: AtomicBool::new(true),
-            stderr: Mutex::new(StderrLog::default()),
-        });
+        let client = new(Pipe::Stdio { stdin: Mutex::new(stdin), child: Mutex::new(child) });
         if let Some(stderr) = stderr {
             let weak = Arc::downgrade(&client);
             let _ = std::thread::Builder::new().name("mcp-stderr".into()).spawn(move || {
@@ -572,24 +752,19 @@ impl Client {
         let _ = std::thread::Builder::new().name("mcp-stdout".into()).spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 let Some(client) = weak.upgrade() else { return };
-                client.dispatch(&line, &on_tools_changed);
+                if let Ok(msg) = serde_json::from_str(&line) {
+                    client.dispatch(msg);
+                }
             }
             if let Some(client) = weak.upgrade() {
-                client.alive.store(false, Ordering::SeqCst);
-                for (_, tx) in client.pending.lock().unwrap().drain() {
-                    let _ = tx.send(Err("服务器进程已退出".into()));
-                }
-                on_exit(client.with_stderr("服务器进程已退出".into()));
+                client.closed("服务器进程已退出".into());
             }
         });
         Ok(client)
     }
 
-    /// 处理服务器发来的一行：响应交给等它的请求；服务器的请求（ping 等）就地应答；通知按需处理。
-    fn dispatch(&self, line: &str, on_tools_changed: &dyn Fn()) {
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
+    /// 处理服务器发来的一条消息：响应交给等它的请求；服务器的请求（ping 等）就地应答；通知按需处理。
+    fn dispatch(&self, msg: Value) {
         let method = msg.get("method").and_then(Value::as_str);
         match (msg.get("id"), method) {
             (Some(id), None) => {
@@ -615,16 +790,28 @@ impl Client {
                 };
                 self.send(&reply);
             }
-            (None, Some("notifications/tools/list_changed")) => on_tools_changed(),
+            (None, Some("notifications/tools/list_changed")) => (self.on_tools_changed)(),
             _ => {}
         }
     }
 
+    /// 发一条消息；本地写不进 stdin 时返回 false（远程的失败经 [`Sink::fail`] 回来）。
     fn send(&self, msg: &Value) -> bool {
-        let mut line = msg.to_string();
-        line.push('\n');
-        let mut stdin = self.stdin.lock().unwrap();
-        stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()).is_ok()
+        match &self.pipe {
+            Pipe::Stdio { stdin, .. } => {
+                let mut line = msg.to_string();
+                line.push('\n');
+                let mut stdin = stdin.lock().unwrap();
+                stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()).is_ok()
+            }
+            Pipe::Http(http) => {
+                let (Some(http), Some(me)) = (http.get(), self.me.upgrade()) else {
+                    return false;
+                };
+                http.send(msg, me);
+                true
+            }
+        }
     }
 
     fn notify(&self, method: &str, params: Value) {
@@ -640,7 +827,7 @@ impl Client {
         stopped: &dyn Fn() -> bool,
     ) -> Reply {
         if !self.alive.load(Ordering::SeqCst) {
-            return Err("服务器进程已退出".into());
+            return Err("连接已断开".into());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
@@ -653,7 +840,7 @@ impl Client {
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(reply) => return reply,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err("服务器进程已退出".into()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err("连接已断开".into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let gave_up = if stopped() {
                         Some("已取消")
@@ -680,6 +867,30 @@ impl Client {
         match self.stderr.lock().unwrap().render() {
             Some(log) => format!("{reason}\n{log}"),
             None => reason,
+        }
+    }
+}
+
+impl Sink for Client {
+    fn message(&self, msg: Value) {
+        self.dispatch(msg);
+    }
+
+    fn fail(&self, id: u64, reason: String) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
+            let _ = tx.send(Err(reason));
+        }
+    }
+
+    /// 断了：等着的请求都报错，通知外面（只通知一次）。
+    fn closed(&self, reason: String) {
+        self.alive.store(false, Ordering::SeqCst);
+        for (_, tx) in self.pending.lock().unwrap().drain() {
+            let _ = tx.send(Err(reason.clone()));
+        }
+        let on_exit = self.on_exit.lock().unwrap().take();
+        if let Some(on_exit) = on_exit {
+            on_exit(self.with_stderr(reason));
         }
     }
 }
@@ -723,7 +934,10 @@ impl StderrLog {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        crate::tools::kill_tree(&mut self.child.lock().unwrap());
+        // 远程的会话由 `Http` 的 Drop 结束
+        if let Pipe::Stdio { child, .. } = &self.pipe {
+            crate::tools::kill_tree(&mut child.lock().unwrap());
+        }
     }
 }
 
@@ -766,7 +980,11 @@ mod tests {
             r#"{"mcpServers": {
                 "fs": {"command": "npx", "args": ["-y", "server-fs", "C:/x"], "env": {"K": "V"}},
                 "off": {"command": "x", "disabled": true},
-                "web": {"type": "http", "url": "https://example.com/mcp"},
+                "web": {"type": "http", "url": "https://example.com/mcp", "headers": {"X": "1"}},
+                "bare": {"url": "http://h/mcp"},
+                "old": {"type": "sse", "url": "http://h/sse"},
+                "nourl": {"type": "http"},
+                "odd": {"type": "ws", "url": "ws://h"},
                 "bad": {"args": []}
             }}"#,
         )
@@ -776,11 +994,28 @@ mod tests {
         assert_eq!(by("fs").env.get("K").map(String::as_str), Some("V"));
         assert!(by("fs").unsupported.is_none());
         assert!(by("off").disabled);
-        assert!(by("web").unsupported.as_deref().unwrap().contains("HTTP"));
+        assert_eq!(
+            (by("web").transport, by("web").unsupported.as_deref()),
+            (Transport::Http, None)
+        );
+        assert_eq!(by("web").headers.get("X").map(String::as_str), Some("1"));
+        // 没写 type、有 url 的是 Streamable HTTP
+        assert_eq!(by("bare").transport, Transport::Http);
+        assert_eq!(by("old").transport, Transport::Sse);
+        assert!(by("nourl").unsupported.as_deref().unwrap().contains("url"));
+        assert!(by("odd").unsupported.as_deref().unwrap().contains("ws"));
         assert!(by("bad").unsupported.is_some());
         assert!(parse_config("{}").is_err());
         assert!(parse_config("not json").is_err());
         assert!(parse_config(CONFIG_TEMPLATE).is_ok());
+    }
+
+    #[test]
+    fn expands_environment_variables() {
+        let env = |k: &str| (k == "TOKEN").then(|| "abc".to_string());
+        assert_eq!(expand("Bearer ${TOKEN}", &env), "Bearer abc");
+        assert_eq!(expand("${NOPE:-dflt}/${TOKEN:-x}", &env), "dflt/abc");
+        assert_eq!(expand("${NOPE}-${unclosed", &env), "-${unclosed");
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! 设置页「MCP」：自研内核接的 MCP 服务器，各自的连接状态，编辑配置文件 / 重新加载。
+//! 设置页「MCP」：自研内核接的 MCP 服务器（本地命令或远程 HTTP / SSE），各自的连接状态，
+//! 编辑配置文件 / 重新加载 / 单个服务重新连接。连上过又断了的服务内核会自己重连，这里显示「重连中」。
 //!
 //! 配置在数据目录的 `mcp.json`（格式同 Claude Code 的 `.mcp.json`），由内核读（`claudesktop_builtin::mcp`）；
 //! 状态经 `KernelEvent::McpStatus` 回来，存在自研内核那个 `KernelSlot::mcp` 里。
@@ -11,6 +12,7 @@ use claudesktop_builtin::default_mcp_config;
 use claudesktop_builtin::mcp::{self, CONFIG_TEMPLATE};
 use claudesktop_core::{McpServerView, McpState};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::button::{ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -45,6 +47,14 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 重连一个没连上的服务。
+    fn reconnect_mcp(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(kernel) = self.kernel_of(KernelChoice::Builtin) {
+            kernel.reconnect_mcp(name);
+        }
+        cx.notify();
+    }
+
     pub(super) fn render_mcp(&self, cx: &mut Context<Self>) -> Div {
         let path =
             default_mcp_config().map_or_else(|| "mcp.json".into(), |p| p.display().to_string());
@@ -71,7 +81,7 @@ impl ChatApp {
             );
         let section = div().v_flex().gap_2().child(header).child(
             div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(format!(
-                "自研内核可以调用 MCP 服务器提供的工具（只支持本地命令）。配置写在 {path}，格式同 Claude Code 的 .mcp.json；改完点「重新加载」。启用的插件带的服务也列在这里。工具调用照常弹权限卡。"
+                "自研内核可以调用 MCP 服务器提供的工具：本地命令，或远程的 HTTP / SSE 服务（\"type\": \"http\"、\"url\"、\"headers\"，值里可写 ${{环境变量}}）。配置写在 {path}，格式同 Claude Code 的 .mcp.json；改完点「重新加载」。启用的插件带的服务也列在这里。工具调用照常弹权限卡。"
             )),
         );
 
@@ -85,10 +95,12 @@ impl ChatApp {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|c| McpServerView {
-                    name: c.name,
                     state: if c.disabled { McpState::Disabled } else { McpState::Connecting },
                     tools: 0,
                     plugin: None,
+                    url: (c.transport != mcp::Transport::Stdio).then(|| c.url.clone()),
+                    retry: false,
+                    name: c.name,
                 })
                 .collect()
         };
@@ -111,7 +123,11 @@ impl ChatApp {
                 McpState::Connecting => (INK_FAINT, "连接中…".into(), None),
                 McpState::Disabled => (INK_FAINT, "已禁用".into(), None),
                 McpState::Failed(reason) => (RED, "没连上".into(), Some(reason.clone())),
+                McpState::Reconnecting(detail) => {
+                    (CORAL, "断开了，重连中…".into(), Some(detail.clone()))
+                }
             };
+            let retry_name = server.name.clone();
             card = card.child(
                 div()
                     .v_flex()
@@ -151,8 +167,32 @@ impl ChatApp {
                                     .text_color(rgb(if dot == RED { RED } else { INK_SOFT }))
                                     .font_features(tabular_nums())
                                     .child(label),
-                            ),
+                            )
+                            .when(server.retry && running, |d| {
+                                d.child(
+                                    Self::text_button(("mcp-retry", i), "重新连接", false)
+                                        .xsmall()
+                                        .with_variant(ButtonVariant::Secondary)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.reconnect_mcp(&retry_name, cx)
+                                        })),
+                                )
+                            }),
                     )
+                    // 远程服务的地址
+                    .when_some(server.url.clone(), |d, url| {
+                        d.child(
+                            div()
+                                .pl(px(15.))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .font_family(MONO)
+                                .text_size(TEXT_META)
+                                .text_color(rgb(INK_SOFT))
+                                .child(url),
+                        )
+                    })
                     // 失败原因（含服务器 stderr 的最后几行）：等宽小字，缩进到名字下面
                     .when_some(detail, |d, reason| {
                         d.child(

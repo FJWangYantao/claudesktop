@@ -26,12 +26,12 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::SessionUpdate;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, EnvVariable, FileSystemCapabilities,
-    ImageContent, Implementation, InitializeRequest, LoadSessionRequest, McpServer, McpServerStdio,
-    NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionModeState,
-    SessionNotification, SetSessionModeRequest, TextContent, ToolCallContent, WriteTextFileRequest,
-    WriteTextFileResponse,
+    HttpHeader, ImageContent, Implementation, InitializeRequest, LoadSessionRequest, McpServer,
+    McpServerHttp, McpServerSse, McpServerStdio, NewSessionRequest, PermissionOptionKind,
+    PromptRequest, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionModeState, SessionNotification, SetSessionModeRequest,
+    TextContent, ToolCallContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo};
 use futures::StreamExt;
@@ -170,12 +170,24 @@ impl Kernel for AcpKernel {
             .iter()
             .flat_map(|p| p.mcp_servers.iter())
             .map(|s| {
-                let env = s.env.iter().map(|(k, v)| EnvVariable::new(k, v)).collect();
-                McpServer::Stdio(
-                    McpServerStdio::new(s.name.clone(), s.command.clone())
-                        .args(s.args.clone())
-                        .env(env),
-                )
+                let headers =
+                    || s.headers.iter().map(|(k, v)| HttpHeader::new(k, v)).collect::<Vec<_>>();
+                if s.url.is_empty() {
+                    let env = s.env.iter().map(|(k, v)| EnvVariable::new(k, v)).collect();
+                    McpServer::Stdio(
+                        McpServerStdio::new(s.name.clone(), s.command.clone())
+                            .args(s.args.clone())
+                            .env(env),
+                    )
+                } else if s.sse {
+                    McpServer::Sse(
+                        McpServerSse::new(s.name.clone(), s.url.clone()).headers(headers()),
+                    )
+                } else {
+                    McpServer::Http(
+                        McpServerHttp::new(s.name.clone(), s.url.clone()).headers(headers()),
+                    )
+                }
             })
             .collect();
     }
@@ -418,6 +430,18 @@ fn run_kernel(
                     .block_task()
                     .await?;
                 let caps = &init.agent_capabilities;
+                // 远程 MCP 服务只交给声明了支持它的 agent
+                let mcp_caps = caps.mcp_capabilities.clone();
+                let supported = move |servers: Vec<McpServer>| -> Vec<McpServer> {
+                    servers
+                        .into_iter()
+                        .filter(|s| match s {
+                            McpServer::Http(_) => mcp_caps.http,
+                            McpServer::Sse(_) => mcp_caps.sse,
+                            _ => true,
+                        })
+                        .collect()
+                };
                 let can_resume = caps.session_capabilities.resume.is_some();
                 let can_load = caps.load_session;
                 let agent_name =
@@ -437,14 +461,14 @@ fn run_kernel(
                     match command {
                         KernelCommand::NewSession { token, cwd } => {
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
-                            let servers = plugin_servers.lock().unwrap().clone();
+                            let servers = supported(plugin_servers.lock().unwrap().clone());
                             let opened = open_new_session(&connection, cwd, servers).await;
                             report_started(&sink, &agent_name, token, opened, false);
                         }
                         KernelCommand::ResumeSession { token, session_id, cwd } => {
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
                             // 先拷出来再放锁：锁不能跨 await 拿着（界面线程 set_plugins 会被卡住）
-                            let servers = plugin_servers.lock().unwrap().clone();
+                            let servers = supported(plugin_servers.lock().unwrap().clone());
                             let restored = if can_resume {
                                 connection
                                     .send_request(

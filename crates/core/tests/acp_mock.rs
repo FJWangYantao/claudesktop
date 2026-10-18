@@ -477,7 +477,7 @@ fn plugin_mcp_servers_are_passed_to_new_sessions() {
             name: "db".into(),
             command: "node".into(),
             args: vec!["server.js".into()],
-            env: Default::default(),
+            ..Default::default()
         }],
         ..Default::default()
     }]);
