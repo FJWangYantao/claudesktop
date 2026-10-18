@@ -196,3 +196,29 @@ fn unauthorized_servers_fail_with_a_hint_and_can_be_retried() {
     assert!(matches!(h.state("web"), Some(McpState::Failed(_))));
     h.hub.stop();
 }
+
+/// 真实的远程服务（默认 DeepWiki 的公开 Streamable HTTP 端点，免登录）：握手、列工具、调一次。
+/// `CLAUDESKTOP_MCP_URL` 换地址；走系统代理（`HTTPS_PROXY`）的网络也该连得上。
+#[test]
+#[ignore]
+fn live_remote_server() {
+    let url = std::env::var("CLAUDESKTOP_MCP_URL")
+        .unwrap_or_else(|_| "https://mcp.deepwiki.com/mcp".into());
+    let h = Hub::new("live", serde_json::json!({ "live": { "type": "http", "url": url } }));
+    let s = h.wait("ready", "live", |s| {
+        s.state == McpState::Ready || matches!(s.state, McpState::Failed(_))
+    });
+    assert_eq!(s.state, McpState::Ready, "{s:?}");
+    println!("工具 {} 个", s.tools);
+    assert!(s.tools > 0);
+    if url.contains("deepwiki") {
+        let (ok, content) = h.call(
+            "live",
+            "read_wiki_structure",
+            serde_json::json!({ "repoName": "zed-industries/zed" }),
+        );
+        println!("{}", content.chars().take(300).collect::<String>());
+        assert!(ok && !content.is_empty(), "{content}");
+    }
+    h.hub.stop();
+}
