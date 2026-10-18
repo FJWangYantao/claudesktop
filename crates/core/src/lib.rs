@@ -15,6 +15,7 @@
 mod acp;
 pub mod checkpoint;
 mod diff;
+mod json_error;
 pub mod plugin;
 pub mod plugin_git;
 mod process_guard;
@@ -22,6 +23,7 @@ mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
 pub use diff::{DiffLineView, DiffView};
+pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
 pub use store::{Record, SessionLog, SessionMeta, SessionStore, default_data_dir, effective};
 

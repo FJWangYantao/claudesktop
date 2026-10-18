@@ -50,6 +50,8 @@ impl ChatApp {
                 self.toast(Notification::error(format!("写不了 {}：{err}", path.display())), cx);
                 return;
             }
+            // 列表里马上出现模板里的示例（禁用状态），不用等手动「重新加载」
+            self.reload_mcp(cx);
         }
         cx.open_with_system(&path);
     }
@@ -123,19 +125,29 @@ impl ChatApp {
             self.kernels[KernelChoice::Builtin.index()].mcp.clone()
         } else {
             // 内核没起来：照配置文件列出来，状态写「未连接」
-            default_mcp_config()
-                .and_then(|p| mcp::load_config(&p).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|c| McpServerView {
-                    state: if c.disabled { McpState::Disabled } else { McpState::Connecting },
+            match default_mcp_config().map(|p| mcp::load_config(&p)) {
+                Some(Ok(configs)) => configs
+                    .into_iter()
+                    .map(|c| McpServerView {
+                        state: if c.disabled { McpState::Disabled } else { McpState::Connecting },
+                        tools: 0,
+                        plugin: None,
+                        url: (c.transport != mcp::Transport::Stdio).then(|| c.url.clone()),
+                        retry: false,
+                        name: c.name,
+                    })
+                    .collect(),
+                // 文件坏了：和内核起来后报的一样，列成一行「mcp.json 格式不对」
+                Some(Err(reason)) => vec![McpServerView {
+                    name: "mcp.json".into(),
+                    state: McpState::Failed(reason),
                     tools: 0,
                     plugin: None,
-                    url: (c.transport != mcp::Transport::Stdio).then(|| c.url.clone()),
+                    url: None,
                     retry: false,
-                    name: c.name,
-                })
-                .collect()
+                }],
+                None => Vec::new(),
+            }
         };
         if servers.is_empty() {
             return section(div().v_flex().gap_4().child(how_to(
@@ -149,8 +161,22 @@ impl ChatApp {
         }
         let mut card = div().v_flex().rounded_xl().border_1().border_color(rgb(LINE)).bg(rgb(CARD));
         for (i, server) in servers.iter().enumerate() {
+            // 配置文件本身坏了：内核把它报成一个叫 mcp.json 的失败服务，改好文件点「重新加载」，单独重连没用
+            let config_error = server.name == "mcp.json"
+                && server.url.is_none()
+                && server.plugin.is_none()
+                && matches!(server.state, McpState::Failed(_));
             // 需要 OAuth 登录：给一个「登录」按钮，打开授权页
             let (dot, label, detail, sign_in) = match &server.state {
+                McpState::Failed(reason) if config_error => (
+                    RED,
+                    "格式不对".into(),
+                    Some(format!(
+                        "{}。改好后点「重新加载」",
+                        reason.strip_prefix("mcp.json 格式不对：").unwrap_or(reason)
+                    )),
+                    None,
+                ),
                 McpState::Ready => (GREEN, format!("{} 个工具", server.tools), None, None),
                 McpState::Connecting if !running => {
                     (INK_FAINT, "未连接（自研内核没在运行）".into(), None, None)
@@ -213,16 +239,16 @@ impl ChatApp {
                             .when_some(sign_in, |d, url| {
                                 d.child(
                                     Self::text_button(("mcp-login", i), "登录", true)
-                                        .xsmall()
+                                        .small()
                                         .on_click(cx.listener(move |_, _, _, cx| {
                                             cx.open_url(&url);
                                         })),
                                 )
                             })
-                            .when(server.retry && running, |d| {
+                            .when(server.retry && running && !config_error, |d| {
                                 d.child(
                                     Self::text_button(("mcp-retry", i), "重新连接", false)
-                                        .xsmall()
+                                        .small()
                                         .with_variant(ButtonVariant::Secondary)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.reconnect_mcp(&retry_name, cx)

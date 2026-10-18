@@ -195,10 +195,17 @@ mod tests {
 
     #[test]
     fn mentions_dropped_paths() {
-        let cwd = Path::new(r"C:\proj");
-        assert_eq!(mention_for(Path::new(r"C:\proj\src\a.rs"), cwd), "@src/a.rs");
-        assert_eq!(mention_for(Path::new(r"D:\notes\b.md"), cwd), r"@D:\notes\b.md");
-        assert_eq!(mention_for(Path::new(r"C:\proj\my docs"), cwd), "@\"my docs\"");
+        // 路径写法按平台：Windows 的盘符路径在别的系统上不算绝对路径
+        #[cfg(windows)]
+        let (cwd, inside, outside, spaced) =
+            (r"C:\proj", r"C:\proj\src\a.rs", r"D:\notes\b.md", r"C:\proj\my docs");
+        #[cfg(not(windows))]
+        let (cwd, inside, outside, spaced) =
+            ("/proj", "/proj/src/a.rs", "/notes/b.md", "/proj/my docs");
+        let cwd = Path::new(cwd);
+        assert_eq!(mention_for(Path::new(inside), cwd), "@src/a.rs");
+        assert_eq!(mention_for(Path::new(outside), cwd), format!("@{outside}"));
+        assert_eq!(mention_for(Path::new(spaced), cwd), "@\"my docs\"");
         // 目录末尾加 `/`；拖的就是工作目录本身时写全路径
         let dir = std::env::temp_dir().join(format!("cd-mention-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();

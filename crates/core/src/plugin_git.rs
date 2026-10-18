@@ -114,11 +114,42 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
         let out = text(&output.stdout);
         Ok(if out.is_empty() { text(&output.stderr) } else { out })
     } else {
-        let err = text(&output.stderr);
-        let tail: Vec<&str> = err.lines().rev().take(3).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        Err(if tail.is_empty() { "git 失败了".into() } else { tail.join("\n") })
+        Err(explain_git_error(&text(&output.stderr)))
     }
+}
+
+/// git 的报错 → 中文原因：常见的几种（仓库不存在 / 要登录 / 连不上 / 本地改过）说人话，
+/// 其余留 git 原文的最后几行。
+fn explain_git_error(stderr: &str) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+    if has("could not read username")
+        || has("terminal prompts disabled")
+        || has("authentication failed")
+    {
+        return "这个仓库要登录才能访问：私有仓库请先在命令行里配好 git 凭据（装的时候不会弹窗要密码）"
+            .into();
+    }
+    if has("repository not found")
+        || has("does not appear to be a git repository")
+        || has("correct access rights")
+    {
+        return "找不到这个仓库，或者没有访问权限：检查地址拼写；私有仓库请先在命令行里配好 git 凭据"
+            .into();
+    }
+    if has("could not resolve host") {
+        return "连不上仓库所在的网站：检查网络和地址拼写".into();
+    }
+    if has("connection timed out") || has("failed to connect") || has("connection refused") {
+        return "连不上仓库：检查网络或代理设置".into();
+    }
+    if has("not possible to fast-forward") || has("diverging") || has("would be overwritten") {
+        return "插件目录里的文件在本地改过，没法直接更新：卸载后重新安装，或者在命令行里处理"
+            .into();
+    }
+    let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+    let tail: Vec<&str> = tail.into_iter().rev().collect();
+    if tail.is_empty() { "git 失败了".into() } else { tail.join("\n") }
 }
 
 #[cfg(test)]
@@ -139,6 +170,21 @@ mod tests {
         assert_eq!(folder_name("https://github.com/acme/review-kit.git").unwrap(), "review-kit");
         assert_eq!(folder_name("git@github.com:acme/kit").unwrap(), "kit");
         assert_eq!(folder_name("https://x.com/a/b/").unwrap(), "b");
+    }
+
+    #[test]
+    fn explains_common_git_errors() {
+        let missing = "fatal: '/tmp/nope' does not appear to be a git repository\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.";
+        assert!(explain_git_error(missing).starts_with("找不到这个仓库"));
+        let login =
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled";
+        assert!(explain_git_error(login).starts_with("这个仓库要登录"));
+        assert!(
+            explain_git_error("fatal: unable to access 'https://x/': Could not resolve host: x")
+                .starts_with("连不上仓库所在的网站")
+        );
+        // 认不出的：留原文最后几行
+        assert_eq!(explain_git_error("a\nb\nc\nd"), "b\nc\nd");
     }
 
     /// 本地起一个 git 仓库当远端：装 → 能被发现、带上 repo → 远端加了提交后更新 → 卸载。

@@ -250,6 +250,20 @@ fn oauth_servers_authorize_refresh_and_ask_again() {
     let _ = h.call("web", "echo", serde_json::json!({ "text": "gone" }));
     h.wait("needs auth again", "web", |s| matches!(s.state, McpState::NeedsAuth { .. }));
     h.hub.stop();
+
+    // 5. 服务器不认自己发的令牌（还要别的凭据）：登录一次后报错，不再反复要登录
+    let picky = Remote::start_with("--http", "other", &["--oauth"]);
+    let h = Hub::new(
+        "oauth-picky",
+        serde_json::json!({ "web": { "type": "http", "url": format!("http://127.0.0.1:{}/mcp", picky.1) } }),
+    );
+    let s = h.wait("needs auth", "web", |s| matches!(s.state, McpState::NeedsAuth { .. }));
+    let McpState::NeedsAuth { url } = s.state else { unreachable!() };
+    follow_authorization(&url);
+    let s = h.wait("failed after sign-in", "web", |s| matches!(s.state, McpState::Failed(_)));
+    let McpState::Failed(reason) = s.state else { unreachable!() };
+    assert!(reason.contains("401"), "{reason}");
+    h.hub.stop();
     unsafe { std::env::remove_var("CLAUDESKTOP_DATA_DIR") };
     let _ = std::fs::remove_dir_all(dir);
 }
