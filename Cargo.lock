@@ -893,6 +893,7 @@ dependencies = [
  "chrono",
  "claudesktop-builtin",
  "claudesktop-core",
+ "embed-resource",
  "futures",
  "gpui-kit",
  "serde",
