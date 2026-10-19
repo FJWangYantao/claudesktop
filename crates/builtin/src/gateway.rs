@@ -10,7 +10,8 @@
 //! - 响应边读边转（读到多少转多少、立刻刷出去，不攒），旁路解析 SSE 里的用量、结束原因、首个内容块；
 //! - provider 停下（用户点停止）就断开连接，网关下一次往回写失败时断开上游，这条记成 `cancelled`；
 //! - 连不上上游时回 502 并带 [`GATEWAY_ERROR`] 头，provider 据此报成和直连一样的「请求 … 失败」；
-//! - 不记提示词正文、不记 key；日志按天分文件，超过 [`KEEP_DAYS`] 天或总量超过 [`KEEP_BYTES`] 删最旧的。
+//! - 日志行里不记提示词正文、不记 key；日志按天分文件，超过 [`KEEP_DAYS`] 天或总量超过 [`KEEP_BYTES`] 删最旧的。
+//!   请求体和响应原文另存在 `bodies/`（压缩、留得更短、可在设置里关掉），见 [`crate::request_bodies`]。
 //!
 //! 哪个会话、为什么发的请求由内核在线程上打标记（[`tag`]），provider 发请求时带上（见 [`route`]）。
 //!
@@ -100,6 +101,7 @@ impl Gateway {
     pub fn start(dir: PathBuf) -> std::io::Result<GatewayHandle> {
         std::fs::create_dir_all(&dir)?;
         prune(&dir, Local::now().date_naive());
+        crate::request_bodies::prune(&dir, Local::now().date_naive());
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         let gateway = Arc::new(Gateway { port, dir, log: Mutex::new(()) });
@@ -164,7 +166,7 @@ impl Gateway {
                 let _ = respond(&mut client, 502, &[(GATEWAY_ERROR, "1")], body.as_bytes());
                 entry.error = Some(message);
                 entry.total_ms = millis(started.elapsed());
-                self.write(&entry, &request.body);
+                self.write(&entry, &request.body, body.as_bytes());
                 return;
             }
         };
@@ -192,6 +194,10 @@ impl Gateway {
         head.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
         let mut stats = StreamStats::new(entry.protocol == "anthropic");
         let mut error_body = Vec::new();
+        // 存原文用的响应（开着才攒，最多 RESPONSE_MAX）
+        let keep =
+            if crate::request_bodies::enabled() { crate::request_bodies::RESPONSE_MAX } else { 0 };
+        let mut response_body = Vec::new();
         let mut reader = response.into_body().into_reader();
         let mut buf = vec![0u8; 16 << 10];
         let mut broken = client.write_all(head.as_bytes()).is_err();
@@ -203,6 +209,8 @@ impl Gateway {
                 }
                 Ok(n) => {
                     let data = &buf[..n];
+                    let room = keep.saturating_sub(response_body.len());
+                    response_body.extend_from_slice(&data[..n.min(room)]);
                     if sse {
                         stats.feed(data, started);
                     } else if !status.is_success() && error_body.len() < ERROR_BODY_MAX {
@@ -224,12 +232,16 @@ impl Gateway {
             let text = String::from_utf8_lossy(&error_body);
             entry.error = Some(crate::provider::error_message(&text));
         }
-        self.write(&entry, &request.body);
+        self.write(&entry, &request.body, &response_body);
     }
 
-    /// 补上请求体里的模型、消息数、工具数，追加一行到当天的日志。
-    fn write(&self, entry: &RequestLog, body: &[u8]) {
+    /// 补上请求体里的模型、消息数、工具数，追加一行到当天的日志；开着「存原文」就把请求体和响应另存。
+    fn write(&self, entry: &RequestLog, body: &[u8], response: &[u8]) {
         let mut entry = entry.clone();
+        if crate::request_bodies::enabled() {
+            let date = Local::now().date_naive();
+            entry.body = crate::request_bodies::save(&self.dir, date, entry.at_ms, body, response);
+        }
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
             entry.model = value.get("model").and_then(Value::as_str).map(str::to_string);
             // 外部 agent：会话从请求体里认，第几轮查界面登记的
@@ -425,6 +437,9 @@ pub struct RequestLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     pub cancelled: bool,
+    /// 存下的原文（见 [`crate::request_bodies`]）；没存为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 impl RequestLog {
@@ -754,6 +769,7 @@ pub fn read_logs(dir: &Path, since_ms: Option<u64>) -> Vec<RequestLog> {
 
 /// 删掉全部请求日志，返回删了几个文件。
 pub fn clear_logs(dir: &Path) -> std::io::Result<usize> {
+    crate::request_bodies::clear(dir);
     let mut removed = 0;
     for entry in std::fs::read_dir(dir)?.flatten() {
         if entry.path().extension().is_some_and(|e| e == "jsonl") {

@@ -73,9 +73,10 @@ pub const MCP_PICKS: &[McpPick] = &[
     McpPick {
         name: "playwright",
         title: "Playwright 浏览器",
-        description: "开浏览器点页面、填表单、截图，适合测网页",
+        description: "在后台开浏览器点页面、填表单、截图，适合测网页",
         needs: "需要 Node.js",
-        config: r#"{"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}"#,
+        // 无头：不在前台弹浏览器窗口（要看着它操作就把 --headless 删掉）
+        config: r#"{"command": "npx", "args": ["-y", "@playwright/mcp@latest", "--headless"]}"#,
         input: None,
     },
     McpPick {
@@ -83,7 +84,7 @@ pub const MCP_PICKS: &[McpPick] = &[
         title: "Chrome 开发者工具",
         description: "控制 Chrome，看控制台、网络请求和性能",
         needs: "需要 Node.js 和 Chrome",
-        config: r#"{"command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"]}"#,
+        config: r#"{"command": "npx", "args": ["-y", "chrome-devtools-mcp@latest", "--headless"]}"#,
         input: None,
     },
     McpPick {

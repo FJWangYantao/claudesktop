@@ -30,6 +30,7 @@ mod mcp_oauth;
 mod openai;
 mod permissions;
 mod provider;
+pub mod request_bodies;
 mod sse;
 mod subagent;
 mod tools;
@@ -1160,6 +1161,13 @@ impl BuiltinKernel {
     }
 }
 
+/// 跑测试、开浏览器、截图默认不打扰前台（用户在别的窗口干活）
+const BACKGROUND: &str = "Work in the background by default: the user keeps using their computer while you work. \
+    Run tests, browsers and screenshot tools headless (headless browser modes, `--headless` flags, CI-style \
+    non-interactive runs), do not open GUI windows, browser tabs or report viewers, and do not steal focus. \
+    To check a GUI or web page, use a headless browser or a virtual display (e.g. Xvfb on Linux) and save \
+    screenshots to files you can read. Only bring something to the foreground when the user asks for it.";
+
 fn system_prompt(
     cwd: &Path,
     mode: &str,
@@ -1187,6 +1195,7 @@ fn system_prompt(
          when it makes sense. {todo}\
          Tool calls that change things may need the user's approval; \
          if one is denied, do not retry it and ask the user instead.\n\
+         {BACKGROUND}\n\
          Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
         cwd.display(),
         std::env::consts::OS,

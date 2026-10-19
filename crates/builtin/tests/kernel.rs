@@ -1834,9 +1834,16 @@ fn gateway_forwards_the_stream_and_logs_every_attempt() {
     let raw: String = std::fs::read_dir(&dir)
         .unwrap()
         .flatten()
+        .filter(|e| e.path().is_file())
         .map(|e| std::fs::read_to_string(e.path()).unwrap())
         .collect();
     assert!(!raw.contains("test-key"));
+    // 原文另存：请求体排好版、响应是原样的 SSE，同样没有 key
+    let saved =
+        claudesktop_builtin::request_bodies::load(&dir, second["body"].as_str().unwrap()).unwrap();
+    assert!(saved.request.contains("\"model\": \"mock-model\""));
+    assert!(saved.response.contains("data: "));
+    assert!(!saved.request.contains("test-key") && !saved.response.contains("test-key"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

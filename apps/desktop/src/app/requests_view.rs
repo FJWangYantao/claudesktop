@@ -682,16 +682,37 @@ impl ChatApp {
         if open {
             let mut detail = div().v_flex().gap_0p5().pt_1().pl(rems(1.25));
             for (k, r) in row.requests.iter().enumerate() {
+                // 存了原文的：行尾一个「原文」，点开看发出去的请求体和返回（别让卡片跟着收起）
+                let raw = r.body.is_some().then(|| {
+                    let log = r.clone();
+                    Self::quiet_button(
+                        ("req-raw", i * 1000 + k),
+                        IconAll::Braces,
+                        Surface::Paper,
+                        cx,
+                    )
+                    .xsmall()
+                    .label("原文")
+                    .px_1p5()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_raw_request(&log, window, cx);
+                    }))
+                });
                 detail = detail.child(
-                    div().h_flex().items_start().gap_2().child(timeline_bar(row, r)).child(
-                        div().flex_1().min_w_0().child(request_line(
+                    div()
+                        .h_flex()
+                        .items_start()
+                        .gap_2()
+                        .child(timeline_bar(row, r))
+                        .child(div().flex_1().min_w_0().child(request_line(
                             k,
                             r,
                             &row.requests[..k],
                             prices,
                             peaks,
-                        )),
-                    ),
+                        )))
+                        .children(raw.map(|b| div().flex_none().mt(rems(-0.125)).child(b))),
                 );
             }
             card = card.child(detail);
@@ -812,7 +833,7 @@ fn meta_line(parts: Vec<(String, Color)>) -> Div {
 }
 
 /// 本地时间 `10-18 21:03`。
-fn time_label(ms: u64) -> String {
+pub(super) fn time_label(ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(ms as i64)
         .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
         .unwrap_or_default()

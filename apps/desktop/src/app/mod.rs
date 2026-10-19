@@ -15,6 +15,7 @@ mod notify;
 mod overview;
 mod palette;
 mod plugins_view;
+mod raw_request;
 mod requests_view;
 mod rewind;
 mod search;
@@ -248,6 +249,7 @@ impl ChatApp {
         let settings_path = Settings::default_path();
         let (settings, settings_error) = Settings::load(settings_path.as_deref());
         let settings = settings.with_env();
+        claudesktop_builtin::request_bodies::set_enabled(settings.gateway_bodies);
         // 默认工作目录：环境变量 ACP_CWD 优先，其次上次选的（目录还在的话），最后是启动目录
         let cwd = settings
             .workspace
