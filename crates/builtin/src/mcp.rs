@@ -13,7 +13,7 @@
 //! - 状态（连接中 / 已连接 N 个工具 / 失败原因）变了就整份经回调上报，界面在设置页显示。
 
 use crate::mcp_http::{self, Http, Sink};
-use crate::tools::ToolOutput;
+use crate::tools::{OutputImage, ToolOutput};
 use claudesktop_core::{McpServerView, McpState};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -32,6 +32,10 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// 回给模型的工具结果最多这么多字符
 const OUTPUT_MAX_CHARS: usize = 30_000;
+/// 一张工具结果图片的上限（base64 字符数，约 768KB 原始字节）：超出的丢掉留一行占位
+const IMAGE_MAX_B64: usize = 1_048_576;
+/// 一次工具结果最多带几张图（每张按 ~1500 token 计，成本可控）
+const IMAGES_MAX: usize = 4;
 /// 失败原因里带上服务器 stderr 的开头和结尾各几行（报错通常在开头，退出原因在结尾）
 const STDERR_LINES: usize = 4;
 /// 写进请求的协议版本（服务器回它支持的版本，不一致也照常用：只用到最基本的几个方法）
@@ -487,11 +491,15 @@ impl McpHub {
             .collect()
     }
 
-    /// 交给模型的工具定义（OpenAI `tools` 格式）；`writable = false`（Plan 模式）只给只读的。
-    pub fn specs(&self, writable: bool) -> Vec<Value> {
+    /// 交给模型的工具定义（OpenAI `tools` 格式）；`writable = false`（Plan 模式）只给只读的；
+    /// `exclude` 是这个项目停用的服务器名（项目级配置 `mcpDisabled`），它们的工具不给。
+    pub fn specs(&self, writable: bool, exclude: &[String]) -> Vec<Value> {
         let mut specs = Vec::new();
         for server in self.servers.lock().unwrap().iter() {
             if *server.state.lock().unwrap() != McpState::Ready {
+                continue;
+            }
+            if exclude.iter().any(|e| e == &server.config.name) {
                 continue;
             }
             for tool in server.tools.lock().unwrap().iter().filter(|t| writable || t.read_only) {
@@ -794,14 +802,38 @@ fn list_tools(client: &Client) -> Result<Vec<McpTool>, String> {
     }
 }
 
-/// `tools/call` 的结果 → 工具输出：文本拼起来，图片 / 资源写一行占位；`isError` 算失败。
+/// `tools/call` 的结果 → 工具输出：文本拼起来，图片进 `images`（有张数和大小上限，
+/// 超出的写一行占位），音频 / 资源写一行占位；`isError` 算失败。
 fn render_result(result: &Value) -> ToolOutput {
     let mut parts = Vec::new();
+    let mut images = Vec::new();
     for item in result.get("content").and_then(Value::as_array).into_iter().flatten() {
         let field = |k: &str| item.get(k).and_then(Value::as_str).unwrap_or_default();
         match field("type") {
             "text" => parts.push(field("text").to_string()),
-            "image" => parts.push(format!("[image {}]", field("mimeType"))),
+            "image" => {
+                let media_type = field("mimeType");
+                let data = field("data");
+                if data.is_empty() {
+                    parts.push("[image missing data]".into());
+                } else if images.len() >= IMAGES_MAX {
+                    parts.push(format!("[image {media_type} dropped: too many images]"));
+                } else if data.len() > IMAGE_MAX_B64 {
+                    parts.push(format!(
+                        "[image {media_type} dropped: {} KB is too large]",
+                        data.len() / 1024 / 4 * 3
+                    ));
+                } else {
+                    images.push(OutputImage {
+                        media_type: if media_type.is_empty() {
+                            "image/png".into()
+                        } else {
+                            media_type.into()
+                        },
+                        data: data.into(),
+                    });
+                }
+            }
             "audio" => parts.push(format!("[audio {}]", field("mimeType"))),
             "resource" => {
                 let r = item.get("resource");
@@ -828,11 +860,13 @@ fn render_result(result: &Value) -> ToolOutput {
         .lines()
         .find(|l| !l.trim().is_empty())
         .map_or_else(|| "完成".into(), |l| short(l.trim(), 60));
-    if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+    let output = if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
         ToolOutput::fail(content, format!("出错：{summary}"))
     } else {
         ToolOutput::ok(content, summary)
-    }
+    };
+    // 出错的结果也可能带图片（比如截图失败的现场），照样带上
+    ToolOutput { images, ..output }
 }
 
 /// 截到 `n` 个字符，超出加省略号。
@@ -1263,12 +1297,39 @@ mod tests {
         let ok = render_result(&json!({
             "content": [
                 {"type": "text", "text": "第一行\n第二行"},
-                {"type": "image", "mimeType": "image/png", "data": "..."},
+                {"type": "image", "mimeType": "image/png", "data": "QUJD"},
             ]
         }));
         assert!(ok.ok);
-        assert_eq!(ok.content, "第一行\n第二行\n[image image/png]");
+        assert_eq!(ok.content, "第一行\n第二行");
         assert_eq!(ok.summary, "第一行");
+        // 图片进 `images`，带 mime；空 data / 缺 mime 的有兜底
+        assert_eq!(
+            ok.images,
+            vec![OutputImage { media_type: "image/png".into(), data: "QUJD".into() }]
+        );
+        let no_mime = render_result(&json!({
+            "content": [{"type": "image", "data": "QUJD"}]
+        }));
+        assert_eq!(no_mime.images[0].media_type, "image/png");
+        let missing = render_result(&json!({
+            "content": [{"type": "image", "mimeType": "image/png"}]
+        }));
+        assert!(missing.images.is_empty());
+        assert!(missing.content.contains("[image missing data]"));
+        // 张数超限：只留前 IMAGES_MAX 张，其余占位
+        let many: Vec<_> = (0..6)
+            .map(|i| json!({"type": "image", "mimeType": "image/png", "data": i.to_string()}))
+            .collect();
+        let many = render_result(&json!({ "content": many }));
+        assert_eq!(many.images.len(), IMAGES_MAX);
+        assert!(many.content.contains("dropped: too many images"));
+        // 大小超限：整张丢掉留占位
+        let huge = render_result(&json!({
+            "content": [{"type": "image", "mimeType": "image/jpeg", "data": "x".repeat(IMAGE_MAX_B64 + 1)}]
+        }));
+        assert!(huge.images.is_empty());
+        assert!(huge.content.contains("dropped"));
         let err = render_result(
             &json!({ "content": [{"type": "text", "text": "boom"}], "isError": true }),
         );

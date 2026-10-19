@@ -142,11 +142,36 @@ pub(crate) fn convert_messages(messages: &[ChatMessage]) -> (String, Vec<Value>)
                     system_parts.push(text);
                 }
             }
-            "tool" => tool_results.push(json!({
-                "type": "tool_result",
-                "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
-                "content": message.text().unwrap_or_default(),
-            })),
+            "tool" => {
+                // tool_result 的 content 可以是纯文本，也可以是 text + image 块（MCP 多模态结果）：
+                // 没有图片时保持纯字符串（和以前一样，也少一层嵌套）
+                let images: Vec<Value> = message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        crate::provider::ContentPart::Image { media_type, data } => Some(json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": media_type, "data": data },
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                let content = if images.is_empty() {
+                    json!(message.text().unwrap_or_default())
+                } else {
+                    let mut blocks = vec![json!({
+                        "type": "text",
+                        "text": message.text().unwrap_or_default(),
+                    })];
+                    blocks.extend(images);
+                    json!(blocks)
+                };
+                tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "content": content,
+                }));
+            }
             "user" => {
                 flush_results(&mut out, &mut tool_results);
                 let blocks = content_blocks(message);
@@ -399,10 +424,25 @@ mod tests {
         let results = &out[2]["content"];
         assert_eq!(results.as_array().unwrap().len(), 2);
         assert_eq!(results[0]["tool_use_id"], "t1");
+        // 纯文本工具结果的 content 是字符串
         assert_eq!(results[0]["content"], "内容1");
         // 工具调用转成 tool_use，参数解析成对象（空文本不产生块）
         assert_eq!(out[1]["content"][0]["type"], "tool_use");
         assert_eq!(out[1]["content"][0]["input"]["path"], "a");
+
+        // 带图片的工具结果：tool_result 的 content 变成 text + image 块
+        let with_image = vec![M::tool_result_with_images(
+            "t1".into(),
+            "截图".into(),
+            vec![crate::tools::OutputImage { media_type: "image/png".into(), data: "QUJD".into() }],
+        )];
+        let (_, out) = convert_messages(&with_image);
+        let block = &out[0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["content"][0]["type"], "text");
+        assert_eq!(block["content"][0]["text"], "截图");
+        assert_eq!(block["content"][1]["type"], "image");
+        assert_eq!(block["content"][1]["source"]["data"], "QUJD");
     }
 
     #[test]

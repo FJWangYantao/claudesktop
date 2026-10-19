@@ -17,7 +17,8 @@
 //   POST /oauth/revoke           让所有 refresh token 也失效（状态回到「需要登录」）
 //   GET  /oauth/log              至今的授权 / 刷新次数（JSON）
 //
-// 工具：`echo`（标了只读，原样返回 text）、`boom`（返回 isError）、`crash`（模拟断线：
+// 工具：`echo`（标了只读，原样返回 text）、`boom`（返回 isError）、`snapshot`（返回
+// 文本 + 一张 1×1 PNG，测多模态结果）、`crash`（模拟断线：
 // stdio 退出进程；HTTP 丢掉所有会话，之后带旧会话的请求回 404；SSE 关掉事件流）。
 // 调 `echo` 且 text 为 "relist" 时，先发 `notifications/tools/list_changed`，
 // 之后的 `tools/list` 里多出一个 `extra` 工具。HTTP 模式下 `tools/call` 用 SSE 流回（通知在响应前面），
@@ -35,6 +36,12 @@ const tools = () => [
     annotations: { readOnlyHint: true },
   },
   { name: 'boom', description: 'Always fails', inputSchema: { type: 'object', properties: {} } },
+  {
+    name: 'snapshot',
+    description: 'Returns text and an image',
+    inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true },
+  },
   { name: 'crash', description: 'Drops the connection', inputSchema: { type: 'object', properties: {} } },
   ...(extra ? [{ name: 'extra', description: 'Appears after relist', inputSchema: { type: 'object' } }] : []),
 ];
@@ -66,6 +73,17 @@ function handle(msg) {
       }
       if (name === 'boom') {
         return [[reply({ content: [{ type: 'text', text: 'boom failed' }], isError: true })], false];
+      }
+      if (name === 'snapshot') {
+        // 1×1 红色 PNG，测多模态工具结果（图片进模型）
+        const png =
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+        return [[reply({
+          content: [
+            { type: 'text', text: 'snapshot taken' },
+            { type: 'image', mimeType: 'image/png', data: png },
+          ],
+        })], false];
       }
       if (name === 'crash') return [[reply({ content: [{ type: 'text', text: 'bye' }] })], true];
       return [[{ jsonrpc: '2.0', id, error: { code: -32602, message: `unknown tool ${name}` } }], false];

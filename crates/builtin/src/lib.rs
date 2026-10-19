@@ -34,6 +34,7 @@ pub mod request_bodies;
 mod sse;
 mod subagent;
 mod tools;
+pub mod websearch;
 
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
@@ -104,6 +105,8 @@ pub struct BuiltinConfig {
     /// 一轮里最多请求模型的次数（工具循环的上限，默认 [`DEFAULT_MAX_STEPS`]）；
     /// 超界的值读取时夹回 [MIN_MAX_STEPS, MAX_MAX_STEPS]
     pub max_steps: usize,
+    /// 第一轮结束后让模型给会话起标题（多一次小请求）；测试里关掉，免得打乱剧本
+    pub session_titles: bool,
 }
 
 impl BuiltinConfig {
@@ -118,6 +121,7 @@ impl BuiltinConfig {
             mcp_config: default_mcp_config(),
             plugins: Vec::new(),
             max_steps: DEFAULT_MAX_STEPS,
+            session_titles: true,
         }
     }
 
@@ -199,6 +203,10 @@ struct SessionState {
     turns: u64,
     /// 子会话的角色（`task` 开的，ID 是 `主会话/调用 ID`）；主会话为 None
     agent: Option<AgentDef>,
+    /// 项目级配置停用的 MCP 服务器名（`.claudesktop/settings.json` 的 `mcpDisabled`）
+    mcp_disabled: Vec<String>,
+    /// 项目级配置指定的插件范围（`pluginsEnabled`）；None = 用全部启用的插件
+    plugins_enabled: Option<Vec<String>>,
 }
 
 impl SessionState {
@@ -230,6 +238,8 @@ struct Inner {
     user_instructions: Option<PathBuf>,
     /// 一轮里最多请求模型的次数（见 [`BuiltinConfig::max_steps`]）
     max_steps: usize,
+    /// 是否让模型给会话起标题（见 [`BuiltinConfig::session_titles`]）
+    session_titles: bool,
     /// 见 [`BuiltinConfig::context_windows`]；界面取到模型列表后经 `set_context_windows` 更新
     context_windows: Mutex<HashMap<String, u64>>,
     sessions: Mutex<HashMap<String, SessionState>>,
@@ -295,15 +305,28 @@ impl Inner {
         (self.sink)(RoutedEvent { session: session.map(str::to_owned), event });
     }
 
-    /// 启用的插件提供的全部技能。
-    fn skills(&self) -> Vec<Skill> {
-        self.plugins.lock().unwrap().iter().flat_map(|p| p.skills.iter().cloned()).collect()
+    /// 启用的插件提供的全部技能。`only` 有值时只算这些插件（项目级 `pluginsEnabled`）。
+    fn skills(&self, only: Option<&[String]>) -> Vec<Skill> {
+        self.plugins
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| only.is_none_or(|names| names.iter().any(|n| n == &p.name)))
+            .flat_map(|p| p.skills.iter().cloned())
+            .collect()
     }
 
     /// 可用的子 agent 角色：插件提供的，加上内置的通用角色（插件里没有同名的时候）。
-    fn agents(&self) -> Vec<AgentDef> {
-        let mut agents: Vec<AgentDef> =
-            self.plugins.lock().unwrap().iter().flat_map(|p| p.agents.iter().cloned()).collect();
+    /// `only` 同 [`Inner::skills`]。
+    fn agents(&self, only: Option<&[String]>) -> Vec<AgentDef> {
+        let mut agents: Vec<AgentDef> = self
+            .plugins
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| only.is_none_or(|names| names.iter().any(|n| n == &p.name)))
+            .flat_map(|p| p.agents.iter().cloned())
+            .collect();
         if !agents.iter().any(|a| a.name == subagent::GENERAL) {
             agents.insert(0, subagent::general());
         }
@@ -317,6 +340,42 @@ impl Inner {
             .get(session)
             .and_then(|s| s.agent.as_ref())
             .is_none_or(|agent| subagent::allows(agent, tool))
+    }
+
+    /// 这是会话的第一轮吗（给标题起名用）；子会话 / 不存在的会话返回 false。
+    fn is_first_turn(&self, session: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session).is_some_and(|s| s.turns <= 1 && subagent::split_id(session).is_none())
+    }
+
+    /// 起标题要的素材：模型 ID、第一条用户消息、第一条助手回复。
+    fn title_inputs(&self, session: &str) -> Option<(String, String, String)> {
+        let sessions = self.sessions.lock().unwrap();
+        let state = sessions.get(session)?;
+        if state.history.is_empty() {
+            return None;
+        }
+        let first_user = state
+            .history
+            .iter()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.text())
+            .unwrap_or_default();
+        let first_reply = state
+            .history
+            .iter()
+            .find(|m| m.role == "assistant" && m.text().is_some_and(|t| !t.trim().is_empty()))
+            .and_then(|m| m.text())
+            .unwrap_or_default();
+        if first_user.trim().is_empty() {
+            return None;
+        }
+        // 各截一段，控制这个请求的输入
+        let clip = |s: &str| -> String {
+            s.chars().take(2_000).collect::<String>()
+                + if s.chars().count() > 2_000 { "…" } else { "" }
+        };
+        Some((state.model.clone(), clip(&first_user), clip(&first_reply)))
     }
 
     /// 依次跑某个时机的钩子（工具类时机按 matcher 只跑管这个工具的），返回
@@ -929,7 +988,11 @@ impl Inner {
         agent: Option<&str>,
     ) -> ToolOutput {
         let name = agent.unwrap_or(subagent::GENERAL);
-        let agents = self.agents();
+        let scope = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(session).and_then(|s| s.plugins_enabled.clone())
+        };
+        let agents = self.agents(scope.as_deref());
         let Some(agent) = agents.iter().find(|a| a.name == name).cloned() else {
             let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
             return ToolOutput::fail(
@@ -956,6 +1019,9 @@ impl Inner {
                     turn: Some(flag.clone()),
                     turns: parent.turns,
                     agent: Some(agent.clone()),
+                    // 项目级停用的 MCP 服务器子会话照样停用
+                    mcp_disabled: parent.mcp_disabled.clone(),
+                    plugins_enabled: parent.plugins_enabled.clone(),
                 };
                 Some((flag, state))
             }) else {
@@ -1068,6 +1134,8 @@ impl Inner {
                 format!("本项目内总是{verb}「{prefix}」开头的命令")
             } else if let Some(host) = rule.strip_prefix("fetch:") {
                 format!("本项目内总是{verb}访问 {host}")
+            } else if rule == "search" {
+                format!("本项目内总是{verb}搜索网页")
             } else if let Some(tool) = rule.strip_prefix("mcp:") {
                 format!("本项目内总是{verb} {}", tool.replacen(':', " 的 ", 1))
             } else {
@@ -1167,6 +1235,12 @@ impl BuiltinKernel {
             })
         };
         mcp.set_extra(plugin_servers(&config.plugins));
+        // web_search 的 Brave key 存数据目录（`brave_key` 文件），按规则文件的位置推
+        if let Some(dir) = config.rules_path.as_ref().and_then(|p| p.parent()) {
+            websearch::set_data_dir(dir.to_path_buf());
+        } else if let Ok(dir) = claudesktop_core::default_data_dir() {
+            websearch::set_data_dir(dir);
+        }
         let inner = Arc::new(Inner {
             provider: make_provider(&config.provider),
             default_model: Mutex::new(config.provider.model.clone()),
@@ -1175,6 +1249,7 @@ impl BuiltinKernel {
             default_cwd: config.cwd,
             user_instructions: config.user_instructions,
             max_steps,
+            session_titles: config.session_titles,
             context_windows: Mutex::new(config.context_windows),
             sessions: Mutex::default(),
             next_session: AtomicU64::new(1),
@@ -1197,9 +1272,66 @@ impl BuiltinKernel {
         let session_id = format!("builtin-{}-{n}", std::process::id());
         let cwd = cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
         let resumed = !history.messages.is_empty() || history.summary.is_some();
-        let instructions = instructions::load(&cwd, self.inner.user_instructions.as_deref());
-        let skills = self.inner.skills();
-        let model = self.inner.default_model.lock().unwrap().clone();
+        // 项目级配置（`.claudesktop/settings.json`）：模型、说明文件、停用的 MCP、权限规则
+        let project = claudesktop_core::project::load(&cwd);
+        for warning in project.as_ref().map(|p| p.warnings.iter()).into_iter().flatten() {
+            self.inner.emit(Some(&session_id), KernelEvent::Notice(warning.clone()));
+        }
+        if let Some(project) = &project
+            && !project.permissions.is_empty()
+            && let Some(root) = claudesktop_core::project::project_root(&cwd)
+        {
+            // 项目里写的权限规则并进 permissions.json（集合语义，去重后落盘）
+            if let Some(path) = &self.inner.rules.lock().unwrap().path().map(PathBuf::from) {
+                let file = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
+                let file: Value = serde_json::from_str(&file).unwrap_or_else(|_| json!({}));
+                if let Some(merged) =
+                    claudesktop_core::project::merge_permissions(&file, root, project)
+                    && serde_json::to_string_pretty(&merged)
+                        .map_err(|e| e.to_string())
+                        .and_then(|text| {
+                            std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
+                                .map_err(|e| e.to_string())
+                                .and_then(|()| {
+                                    let tmp = path.with_extension("json.tmp");
+                                    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+                                    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+                                })
+                        })
+                        .is_err()
+                {
+                    self.inner.emit(
+                        Some(&session_id),
+                        KernelEvent::Notice(
+                            "项目配置里的权限规则并进 permissions.json 失败".into(),
+                        ),
+                    );
+                }
+            }
+        }
+        let mut instructions = instructions::load(&cwd, self.inner.user_instructions.as_deref());
+        if let Some(project) = &project
+            && let Some(file) = &project.instructions
+        {
+            // 项目说明文件（相对项目根）追加在最后（最具体）
+            let path = claudesktop_core::project::project_root(&cwd).unwrap_or(&cwd).join(file);
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && !text.trim().is_empty()
+            {
+                instructions.push(instructions::Instruction {
+                    path,
+                    text: text.trim().chars().take(20_000).collect(),
+                });
+            }
+        }
+        let skills = self.inner.skills(project.as_ref().and_then(|p| p.plugins_enabled.as_deref()));
+        // 项目指定的默认模型优先（全局默认其次）
+        let model = project
+            .as_ref()
+            .and_then(|p| p.model.clone())
+            .unwrap_or_else(|| self.inner.default_model.lock().unwrap().clone());
+        let mcp_disabled = project.as_ref().map(|p| p.mcp_disabled.clone()).unwrap_or_default();
+        let plugins_enabled = project.as_ref().and_then(|p| p.plugins_enabled.clone());
         self.inner.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionState {
@@ -1216,6 +1348,8 @@ impl BuiltinKernel {
                 turn: None,
                 turns: 0,
                 agent: None,
+                mcp_disabled,
+                plugins_enabled,
             },
         );
         self.inner.emit(
@@ -1374,6 +1508,37 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     if let Some(cwd) = cwd {
         inner.run_hooks(&session, &cwd, HookEvent::Stop, None, json!({"stop_reason": stop}));
     }
+    // 第一轮正常结束后让模型给会话起个标题（失败静默，保留截断版）；子会话不用
+    if stop == "end_turn" && inner.session_titles && inner.is_first_turn(&session) {
+        name_session(&inner, &session);
+    }
+}
+
+/// 用模型给会话起标题：单独发一个 max_tokens 很小的请求，只带第一条用户消息和第一条回复。
+/// 成功发 `TitleGenerated`；失败 / 取消 / 内容为空都不吭声（界面保留截断版标题）。
+fn name_session(inner: &Inner, session: &str) {
+    let Some((model, first_user, first_reply)) = inner.title_inputs(session) else {
+        return;
+    };
+    let prompt = format!(
+        "为下面的对话起一个简短的标题（不超过 12 个字，概括用户想要什么，用对话的语言，\
+         不加引号和句号）。只输出标题本身。\n\n用户：{}\n\n助手：{}",
+        first_user, first_reply
+    );
+    let messages = vec![ChatMessage::new("user", prompt)];
+    let no_stop = || false;
+    let mut text = String::new();
+    let _tag = gateway::tag(session, "title", 1);
+    let outcome = inner.provider.stream_chat(&model, &messages, &[], &no_stop, &mut |event| {
+        if let StreamEvent::Text(t) = event {
+            text.push_str(&t);
+        }
+    });
+    let title = text.trim().trim_matches(['"', '\'', '「', '」', '『', '』']).trim();
+    let title: String = title.chars().take(24).collect();
+    if outcome.is_ok() && !title.is_empty() {
+        inner.emit(Some(session), KernelEvent::TitleGenerated { title });
+    }
 }
 
 /// 工具循环：请求模型 → 执行工具 → 再请求，直到不再调用工具。主会话的一轮和子任务（子会话）都走这里。
@@ -1421,10 +1586,17 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             return Steps::Stopped;
         };
         let mut specs = tools::specs(mode != MODE_PLAN);
-        specs.extend(inner.mcp.specs(mode != MODE_PLAN));
+        let (disabled, plugin_scope) = {
+            let sessions = inner.sessions.lock().unwrap();
+            sessions
+                .get(session)
+                .map(|s| (s.mcp_disabled.clone(), s.plugins_enabled.clone()))
+                .unwrap_or_default()
+        };
+        specs.extend(inner.mcp.specs(mode != MODE_PLAN, &disabled));
         match &agent {
             // 主会话能派子任务；子会话按角色的工具清单筛（不嵌套）
-            None => specs.push(subagent::spec(&inner.agents())),
+            None => specs.push(subagent::spec(&inner.agents(plugin_scope.as_deref()))),
             Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
         }
         let mut text = String::new();
@@ -1510,7 +1682,17 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             .tool_calls
             .iter()
             .zip(outputs)
-            .map(|(call, output)| ChatMessage::tool_result(call.id.clone(), output.content))
+            .map(|(call, output)| {
+                if output.images.is_empty() {
+                    ChatMessage::tool_result(call.id.clone(), output.content)
+                } else {
+                    ChatMessage::tool_result_with_images(
+                        call.id.clone(),
+                        output.content,
+                        output.images,
+                    )
+                }
+            })
             .collect();
         let mut step = Vec::with_capacity(results.len() + 1);
         let unmeasured = results.len();
@@ -1587,7 +1769,7 @@ impl Kernel for BuiltinKernel {
             // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
             state.instructions =
                 instructions::load(&state.cwd, self.inner.user_instructions.as_deref());
-            state.skills = self.inner.skills();
+            state.skills = self.inner.skills(state.plugins_enabled.as_deref());
             // 文本 + 图片附件合成一条多段用户消息
             let mut parts = vec![ContentPart::Text(prompt.text)];
             for image in prompt.images {

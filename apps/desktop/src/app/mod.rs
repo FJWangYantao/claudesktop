@@ -1445,7 +1445,11 @@ impl ChatApp {
                         self.record_turn(idx);
                         self.touch_meta(idx);
                     }
-                    let prompt = self.sessions[idx].apply_event(event, kernel.as_ref());
+                    let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
+                    // 模型起了标题：元信息也跟着更新（TurnEnded 时写的还是旧标题）
+                    if matches!(event, KernelEvent::TitleGenerated { .. }) {
+                        self.touch_meta(idx);
+                    }
                     // 这条事件收尾了一段思考：用时紧跟着写进日志，重放时挂回那段思考
                     if let Some(ms) = self.sessions[idx].take_thought_done() {
                         self.persist(idx, Record::Thought { elapsed_ms: ms });

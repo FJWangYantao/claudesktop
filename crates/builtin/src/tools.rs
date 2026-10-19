@@ -21,6 +21,7 @@ const SHELL: &str = "shell";
 const GLOB: &str = "glob";
 const GREP: &str = "grep";
 const WEB_FETCH: &str = "web_fetch";
+const WEB_SEARCH: &str = "web_search";
 pub const TODO_WRITE: &str = "todo_write";
 /// 待办清单最多几项
 const TODO_MAX: usize = 50;
@@ -113,6 +114,10 @@ pub enum Action {
         url: String,
         offset: usize,
     },
+    /// 搜网页（Brave 有 key 走 Brave，否则 DuckDuckGo 兜底，见 `websearch` 模块）
+    Search {
+        query: String,
+    },
     /// MCP 服务器的工具（由内核交给 `McpHub::call` 执行，不走 [`Action::run`]）
     Mcp {
         server: String,
@@ -129,21 +134,32 @@ pub enum Action {
     },
 }
 
-/// 工具执行结果：`content` 回给模型，`summary` 显示在 UI 工具行。
+/// 工具结果里带回的图片（base64，跟 `ContentPart::Image` 同形状）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputImage {
+    /// 如 `image/png`
+    pub media_type: String,
+    /// 图片字节（base64 编码）
+    pub data: String,
+}
+
+/// 工具执行结果：`content` 回给模型，`summary` 显示在 UI 工具行；
+/// `images` 是 MCP 服务器返回的图片（多模态工具结果），一并进消息历史。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
     pub ok: bool,
     pub content: String,
     pub summary: String,
+    pub images: Vec<OutputImage>,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self { ok: true, content: content.into(), summary: summary.into() }
+        Self { ok: true, content: content.into(), summary: summary.into(), images: Vec::new() }
     }
 
     pub fn fail(content: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self { ok: false, content: content.into(), summary: summary.into() }
+        Self { ok: false, content: content.into(), summary: summary.into(), images: Vec::new() }
     }
 }
 
@@ -259,6 +275,22 @@ pub fn specs(writable: bool) -> Vec<Value> {
                 "required": ["url"]
             }),
         ),
+        f(
+            WEB_SEARCH,
+            format!(
+                "Search the web and return at most {} results (title, URL, snippet). \
+                 Use it to find documentation, solutions or current information, then web_fetch the most \
+                 promising URL for details. The user may be asked to approve the search.",
+                crate::websearch::SEARCH_MAX_RESULTS
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" }
+                },
+                "required": ["query"]
+            }),
+        ),
     ];
     if writable {
         tools.push(f(
@@ -319,6 +351,11 @@ struct FetchArgs {
     url: String,
     #[serde(default)]
     offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SearchArgs {
+    query: String,
 }
 
 #[derive(Deserialize)]
@@ -522,6 +559,10 @@ impl Action {
                     offset: a.offset.unwrap_or(0),
                 }
             }
+            WEB_SEARCH => {
+                let a: SearchArgs = de(name, args)?;
+                Self::Search { query: a.query }
+            }
             crate::subagent::TASK => {
                 let a: crate::subagent::TaskArgs = de(name, args)?;
                 if a.prompt.trim().is_empty() {
@@ -555,7 +596,7 @@ impl Action {
             | Self::Task { .. } => Access::Read,
             Self::Write { .. } | Self::Edit { .. } => Access::Edit,
             Self::Shell { .. } => Access::Exec,
-            Self::Fetch { .. } => Access::Fetch,
+            Self::Fetch { .. } | Self::Search { .. } => Access::Fetch,
             Self::Mcp { read_only, .. } => Access::Mcp { read_only: *read_only },
         }
     }
@@ -567,7 +608,7 @@ impl Action {
             Self::Glob { .. } | Self::Grep { .. } => "search",
             Self::Write { .. } | Self::Edit { .. } => "edit",
             Self::Shell { .. } => "execute",
-            Self::Fetch { .. } => "fetch",
+            Self::Fetch { .. } | Self::Search { .. } => "fetch",
             Self::Mcp { .. } => "other",
             Self::Task { .. } => "think",
         }
@@ -582,6 +623,7 @@ impl Action {
             Self::Edit { path, .. } => format!("Edit {}", display(cwd, path)),
             Self::Shell { command, .. } => format!("`{}`", command.trim()),
             Self::Fetch { url, .. } => format!("Fetch {url}"),
+            Self::Search { query } => format!("Search {query}"),
             Self::Task { description, agent, .. } => match agent {
                 Some(agent) if agent != crate::subagent::GENERAL => {
                     format!("Task {description}（{agent}）")
@@ -634,6 +676,7 @@ impl Action {
             Self::Write { .. } | Self::Edit { .. } => self.inside(cwd).then(|| "edit".to_string()),
             Self::Shell { command, .. } => shell_rule(command).map(|r| format!("shell:{r}")),
             Self::Fetch { url, .. } => Some(format!("fetch:{}", crate::fetch::host_of(url))),
+            Self::Search { .. } => Some("search".to_string()),
             Self::Mcp { server, tool, .. } => Some(format!("mcp:{server}:{tool}")),
             _ => None,
         }
@@ -675,6 +718,7 @@ impl Action {
                 should_stop,
             ),
             Self::Fetch { url, offset } => crate::fetch::fetch(url, *offset, should_stop),
+            Self::Search { query } => crate::websearch::search(query, should_stop),
             Self::Mcp { .. } => {
                 ToolOutput::fail("MCP tool was not routed to its server", "内部错误")
             }

@@ -66,6 +66,8 @@ pub struct Session {
     pub turn_started: Option<Instant>,
     /// 用户手动改过标题（首条消息不再覆盖）
     pub renamed: bool,
+    /// 标题已是模型起的（`TitleGenerated`；之后不再用首条消息覆盖）
+    pub title_generated: bool,
     /// 每行在当前视图下怎么画（[`Session::sync_list`] 每帧重算，渲染与测量指纹共用）
     pub layout: Vec<RowLayout>,
     /// 用户点开的过程组（按组第一行的下标）
@@ -230,6 +232,7 @@ impl Session {
             turn_streamed: Streamed::default(),
             turn_started: None,
             renamed: false,
+            title_generated: false,
             layout: Vec::new(),
             open_groups: HashSet::new(),
             turn_summaries: HashMap::new(),
@@ -1194,6 +1197,13 @@ impl Session {
             | KernelEvent::FsWrite { .. }
             | KernelEvent::FileChanged { .. }
             | KernelEvent::McpStatus { .. } => {}
+            KernelEvent::TitleGenerated { title } => {
+                // 模型起的标题替换截断版（用户手动改过的不覆盖）
+                if !self.renamed {
+                    self.title = title.clone().into();
+                    self.title_generated = true;
+                }
+            }
             KernelEvent::UsageUpdated {
                 input_tokens,
                 output_tokens,

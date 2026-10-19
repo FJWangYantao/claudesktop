@@ -94,6 +94,8 @@ pub struct SettingsForm {
     confirm_clear_gateway: bool,
     /// 模型单价表（一行一个模型，格式见 `pricing.rs`）
     prices: Entity<TextareaState>,
+    /// Brave Search API key（`web_search` 用；空 = DuckDuckGo 兜底）
+    brave_key: Entity<InputState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
     /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
@@ -117,6 +119,8 @@ impl SettingsForm {
                 .placeholder(claudesktop_builtin::DEFAULT_MAX_STEPS.to_string())
         });
         let prices = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 12));
+        let brave_key =
+            cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
         Self {
             kernel: KernelChoice::default(),
             profiles: Vec::new(),
@@ -130,6 +134,7 @@ impl SettingsForm {
             acp_gateway: false,
             confirm_clear_gateway: false,
             prices,
+            brave_key,
             message: None,
             rules: Vec::new(),
             open_help: HashSet::new(),
@@ -196,6 +201,12 @@ impl ChatApp {
         });
         self.settings_form.prices.update(cx, |state, cx| state.set_value(prices, window, cx));
         self.settings_form.rules = PermissionRules::load(default_rules_path()).list();
+        // web_search 的 Brave key（环境变量优先；文件里没有时输入框留空）
+        let brave = std::env::var(claudesktop_builtin::websearch::BRAVE_KEY_ENV)
+            .ok()
+            .or_else(claudesktop_builtin::websearch::brave_key)
+            .unwrap_or_default();
+        self.settings_form.brave_key.update(cx, |state, cx| state.set_value(brave, window, cx));
         // 步数上限：默认值留空时显示实际生效的数（占位符就是默认值）
         self.settings_form.max_steps.update(cx, |state, cx| {
             state.set_value(
@@ -926,6 +937,39 @@ impl ChatApp {
             None,
             body,
         )
+        .child(section(
+            "网页搜索",
+            "自研内核的 `web_search` 工具：没有 key 时用 DuckDuckGo 兜底（可能被限流），\
+             填 Brave Search 的 API key 换成 Brave（api.search.brave.com 免费注册）",
+            None,
+            setting_group([setting_row(
+                "Brave API key",
+                "存在本机数据目录；也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY",
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(rems(24.))
+                            .child(Input::new(&self.settings_form.brave_key).cleanable(true)),
+                    )
+                    .child(Self::text_button("brave-key-save", "保存", false).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            let key = this.settings_form.brave_key.read(cx).value().to_string();
+                            let res = claudesktop_builtin::websearch::set_brave_key(Some(&key));
+                            this.settings_form.message = Some(match res {
+                                Ok(()) => (false, "搜索后端已保存".into()),
+                                Err(e) => (true, format!("保存失败：{e}").into()),
+                            });
+                            // 输入框回到已保存的值（密码态）
+                            this.settings_form
+                                .brave_key
+                                .update(cx, |state, cx| state.set_value(key, window, cx));
+                            cx.notify();
+                        }),
+                    )),
+            )]),
+        ))
     }
 
     fn import_antigravity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1709,6 +1753,8 @@ fn rule_label(rule: &str) -> String {
         format!("{verb}以「{prefix}」开头的命令")
     } else if let Some(host) = rule.strip_prefix("fetch:") {
         format!("{}网站 {host}", if deny { "总是拒绝访问" } else { "访问" })
+    } else if rule == "search" {
+        if deny { "总是拒绝搜索网页".into() } else { "搜索网页".into() }
     } else if let Some(tool) = rule.strip_prefix("mcp:") {
         format!(
             "{} MCP 工具 {}",

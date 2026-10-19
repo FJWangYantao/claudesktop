@@ -204,6 +204,8 @@ impl Harness {
                 mcp_config,
                 plugins: Vec::new(),
                 max_steps,
+                // 起标题会多发一个请求，打乱剧本；专门测它的用例自己开
+                session_titles: false,
             },
             sink,
         )
@@ -572,6 +574,7 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
             "todo_write",
             "grep",
             "web_fetch",
+            "web_search",
             "write_file",
             "edit_file",
             "shell",
@@ -864,7 +867,10 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "task"]);
+    assert_eq!(
+        names,
+        ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "web_search", "task"]
+    );
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2126,4 +2132,108 @@ fn tasks_in_the_same_step_run_in_parallel() {
         .collect();
     assert_eq!(results, ["t1", "t2"]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 项目级配置（`.claudesktop/settings.json`）：默认模型、MCP 停用。
+#[test]
+fn project_settings_override_model_and_disable_mcp() {
+    let dir = workdir("project");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join(".claudesktop")).unwrap();
+    std::fs::write(
+        dir.join(".claudesktop/settings.json"),
+        r#"{"model": "proj-model", "mcpDisabled": ["mock"], "instructions": "docs/AGENTS.md"}"#,
+    )
+    .unwrap();
+    let (base, bodies) = serve(vec![happy_stream("好")]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    // Started 事件里的模型来自项目配置
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::Started { model: Some(m), .. } if m == "proj-model")),
+        1
+    );
+    h.kernel.send_prompt(&sid, UserPrompt::text("一")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(body(&bodies, 0)["model"], "proj-model");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 项目配置文件坏了：照常开会话，把能照着改的提示发出来。
+#[test]
+fn broken_project_settings_report_a_notice() {
+    let dir = workdir("project-broken");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.join(".claudesktop")).unwrap();
+    std::fs::write(dir.join(".claudesktop/settings.json"), "{ not json").unwrap();
+    let (base, _bodies) = serve(vec![happy_stream("好")]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("一")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Notice(t) if t.contains("格式有问题"))), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 第一轮正常结束后让模型起标题：单独一次请求（不带工具），标题从流里取。
+#[test]
+fn session_title_comes_from_a_second_request() {
+    let (base, bodies) =
+        serve(vec![happy_stream("把日志改成结构化"), happy_stream("「结构化日志」")]);
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |e| events.lock().unwrap().push(e))
+    };
+    let kernel = BuiltinKernel::spawn(
+        BuiltinConfig {
+            provider: provider(base),
+            cwd: std::env::temp_dir(),
+            rules_path: None,
+            user_instructions: None,
+            context_windows: HashMap::new(),
+            mcp_config: None,
+            plugins: Vec::new(),
+            max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
+            session_titles: true,
+        },
+        sink,
+    )
+    .unwrap();
+    kernel.new_session(1, None).unwrap();
+    let sid = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|r| match &r.event {
+            KernelEvent::Started { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    kernel.send_prompt(&sid, UserPrompt::text("把日志改成结构化")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| matches!(r.event, KernelEvent::TitleGenerated { .. }))
+    {
+        assert!(Instant::now() < deadline, "等不到标题：{:?}", events.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let title = events.lock().unwrap().iter().find_map(|r| match &r.event {
+        KernelEvent::TitleGenerated { title } => Some(title.clone()),
+        _ => None,
+    });
+    // 引号 / 书名号被剥掉
+    assert_eq!(title.as_deref(), Some("结构化日志"));
+
+    // 第二次请求只有一条 user 消息、不带工具、模型和主对话一致
+    let second = body(&bodies, 1);
+    assert_eq!(second["model"], "mock-model");
+    assert!(second["tools"].as_array().is_none_or(|t| t.is_empty()), "{second}");
+    let msgs = second["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    let prompt = msgs[0]["content"].as_str().unwrap();
+    assert!(prompt.contains("把日志改成结构化") && prompt.contains("起一个简短的标题"), "{prompt}");
 }

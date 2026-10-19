@@ -20,6 +20,7 @@ mod json_error;
 pub mod plugin;
 pub mod plugin_git;
 mod process_guard;
+pub mod project;
 mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
@@ -207,6 +208,8 @@ pub enum KernelEvent {
     FileChanged { path: String, before: Option<String>, after: Option<String> },
     /// MCP 服务器的连接状态（连接级事件，配置变了 / 某个服务器状态变了就整份重发）
     McpStatus { servers: Vec<McpServerView> },
+    /// 内核用模型给会话起了个新标题（第一轮结束后）；界面更新侧栏，失败不发
+    TitleGenerated { title: String },
 }
 
 /// 一个 MCP 服务器在界面上的样子。
@@ -275,6 +278,7 @@ impl KernelEvent {
             Self::Fatal(_) => "fatal",
             Self::FileChanged { .. } => "file_changed",
             Self::McpStatus { .. } => "mcp_status",
+            Self::TitleGenerated { .. } => "title_generated",
         }
     }
 }

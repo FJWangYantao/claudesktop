@@ -108,7 +108,7 @@ fn crash_and_recover(h: &Hub, name: &str) {
     let r = h.wait("reconnecting", name, |s| matches!(s.state, McpState::Reconnecting(_)));
     let McpState::Reconnecting(detail) = r.state else { unreachable!() };
     assert!(detail.contains("第 1 次重连"), "{detail}");
-    h.ready(name, 3);
+    h.ready(name, 4);
     assert_eq!(
         h.call(name, "echo", serde_json::json!({ "text": "again" })),
         (true, "echo: again".into())
@@ -121,11 +121,18 @@ fn stdio_servers_reconnect_after_the_process_dies() {
         "stdio",
         serde_json::json!({ "local": { "command": "node", "args": [script()] } }),
     );
-    h.ready("local", 3);
+    h.ready("local", 4);
     assert_eq!(
         h.call("local", "echo", serde_json::json!({ "text": "hi" })),
         (true, "echo: hi".into())
     );
+    // 多模态结果：文本照旧，图片进 `images`（带 mime 和 base64 数据）
+    let out = h.hub.call("local", "snapshot", serde_json::json!({}), &|| false);
+    assert!(out.ok);
+    assert_eq!(out.content, "snapshot taken");
+    assert_eq!(out.images.len(), 1);
+    assert_eq!(out.images[0].media_type, "image/png");
+    assert!(out.images[0].data.starts_with("iVBOR"));
     crash_and_recover(&h, "local");
     h.hub.stop();
 }
@@ -142,7 +149,7 @@ fn streamable_http_servers_work_and_recover_from_lost_sessions() {
             "headers": { "Authorization": "Bearer ${CLAUDESKTOP_TEST_UNSET:-tok123}" },
         }}),
     );
-    h.ready("web", 3);
+    h.ready("web", 4);
     // tools/call 的响应是 SSE 流，工具变了的通知在响应前面：重新列出 4 个
     assert_eq!(
         h.call("web", "echo", serde_json::json!({ "text": "relist" })),
@@ -172,7 +179,7 @@ fn legacy_sse_servers_work_and_reconnect_when_the_stream_ends() {
         "sse",
         serde_json::json!({ "old": { "type": "sse", "url": format!("http://127.0.0.1:{}/sse", remote.1) } }),
     );
-    h.ready("old", 3);
+    h.ready("old", 4);
     assert_eq!(
         h.call("old", "echo", serde_json::json!({ "text": "hi" })),
         (true, "echo: hi".into())
@@ -230,7 +237,7 @@ fn oauth_servers_authorize_refresh_and_ask_again() {
 
     // 2. 扮演浏览器：跟一次 302 就回到 client 的回调
     follow_authorization(&url);
-    h.ready("web", 3);
+    h.ready("web", 4);
     assert_eq!(
         h.call("web", "echo", serde_json::json!({ "text": "authed" })),
         (true, "echo: authed".into())

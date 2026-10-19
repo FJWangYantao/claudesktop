@@ -136,6 +136,7 @@ impl Record {
                 | KernelEvent::Compacted { .. }
                 | KernelEvent::CompactFailed { .. }
                 | KernelEvent::TurnEnded { .. }
+                | KernelEvent::TitleGenerated { .. }
         )
     }
 }

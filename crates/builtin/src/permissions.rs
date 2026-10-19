@@ -34,6 +34,11 @@ pub fn default_rules_path() -> Option<PathBuf> {
 }
 
 impl PermissionRules {
+    /// 规则文件的位置（None = 只在内存里）。
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// 读取规则文件；不存在或损坏时从空规则开始。
     pub fn load(path: Option<PathBuf>) -> Self {
         let mut rules = Self { path, data: FileFormat::default() };

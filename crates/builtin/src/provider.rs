@@ -131,6 +131,23 @@ impl ChatMessage {
         m
     }
 
+    /// 带图片的工具结果：图片段跟在文本段后面（`run_tools` 里 MCP 的多模态结果用）。
+    pub fn tool_result_with_images(
+        call_id: String,
+        content: String,
+        images: Vec<crate::tools::OutputImage>,
+    ) -> Self {
+        let mut m = Self::tool_result(call_id, content);
+        if !images.is_empty() {
+            m.parts.extend(
+                images
+                    .into_iter()
+                    .map(|img| ContentPart::Image { media_type: img.media_type, data: img.data }),
+            );
+        }
+        m
+    }
+
     /// 文本内容（各文本段拼接）；没有文本返回 None
     pub fn text(&self) -> Option<String> {
         let mut out = String::new();
@@ -155,34 +172,38 @@ impl Serialize for ChatMessage {
         use serde::ser::Error as _;
         let mut message = serde_json::Map::new();
         message.insert("role".into(), Value::String(self.role.clone()));
-        // 工具结果永远是纯文本；其余消息单段文本时保持字符串形状（网关兼容性最好）。
+        // 纯文本的工具结果和单段文本的普通消息保持字符串形状（网关兼容性最好）；
+        // 带图片的工具结果（MCP 多模态）用分段数组，文本段在前图片段在后。
         // 空文本段一律跳过：纯工具调用的 assistant 消息 content 为 null。
-        let content = if self.role == "tool" || !self.has_image() {
-            match self.text().filter(|t| !t.is_empty()) {
+        let multipart = |msg: &ChatMessage| -> Option<Value> {
+            if !msg.has_image() {
+                return None;
+            }
+            let parts: Vec<Value> = msg
+                .parts
+                .iter()
+                .filter(|part| match part {
+                    ContentPart::Text(t) => !t.is_empty(),
+                    _ => true,
+                })
+                .map(|part| match part {
+                    ContentPart::Text(text) => serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    }),
+                    ContentPart::Image { media_type, data } => serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{media_type};base64,{data}") },
+                    }),
+                })
+                .collect();
+            (!parts.is_empty()).then(|| Value::Array(parts))
+        };
+        let content =
+            multipart(self).unwrap_or_else(|| match self.text().filter(|t| !t.is_empty()) {
                 Some(text) => Value::String(text),
                 None => Value::Null,
-            }
-        } else {
-            Value::Array(
-                self.parts
-                    .iter()
-                    .filter(|part| match part {
-                        ContentPart::Text(t) => !t.is_empty(),
-                        _ => true,
-                    })
-                    .map(|part| match part {
-                        ContentPart::Text(text) => serde_json::json!({
-                            "type": "text",
-                            "text": text,
-                        }),
-                        ContentPart::Image { media_type, data } => serde_json::json!({
-                            "type": "image_url",
-                            "image_url": { "url": format!("data:{media_type};base64,{data}") },
-                        }),
-                    })
-                    .collect(),
-            )
-        };
+            });
         message.insert("content".into(), content);
         if !self.tool_calls.is_empty() {
             message.insert(
@@ -490,6 +511,24 @@ mod tests {
         assert_eq!(v["role"], "tool");
         assert_eq!(v["content"], "1 行");
         assert_eq!(v["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn tool_message_with_image_is_segmented() {
+        // MCP 多模态工具结果：文本段在前，图片段在后
+        let m = ChatMessage::tool_result_with_images(
+            "c2".into(),
+            "截图完成".into(),
+            vec![crate::tools::OutputImage { media_type: "image/png".into(), data: "QUJD".into() }],
+        );
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["role"], "tool");
+        assert_eq!(v["tool_call_id"], "c2");
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "截图完成");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
     }
 
     #[test]

@@ -23,24 +23,40 @@ const IMAGE_TOKENS: u64 = 1_500;
 const TOOL_ARGS_CHARS: usize = 400;
 const TOOL_RESULT_CHARS: usize = 1_500;
 
-/// 粗估一组消息的 token：按字节数 / 4（英文和代码偏高、中文偏低，够用来判断要不要压缩）。
+/// 粗估一组消息的 token：ASCII 按字节 / 4，非 ASCII（中文等）按每字符 1.5——
+/// 旧算法一个中文字 3 字节只算 0.75 token，实际普遍在 1~2 之间，触发压缩会偏晚。
 pub fn estimate_tokens(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(estimate_message).sum()
 }
 
+/// 一段文字的 token：ASCII 4 字符 ≈ 1 token，非 ASCII 每字符按 1.5 记。
+fn estimate_text(text: &str) -> u64 {
+    let mut ascii = 0u64;
+    let mut wide = 0u64;
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    // wide × 1.5 = wide × 6 / 4，并进同一趟除法
+    (ascii + wide * 6) / 4
+}
+
 fn estimate_message(m: &ChatMessage) -> u64 {
-    let mut bytes = 0u64;
+    let mut tokens = 0u64;
     let mut images = 0u64;
     for part in &m.parts {
         match part {
-            ContentPart::Text(t) => bytes += t.len() as u64,
+            ContentPart::Text(t) => tokens += estimate_text(t),
             ContentPart::Image { .. } => images += 1,
         }
     }
     for call in &m.tool_calls {
-        bytes += (call.function.name.len() + call.function.arguments.len()) as u64;
+        tokens += estimate_text(&call.function.name) + estimate_text(&call.function.arguments);
     }
-    bytes / 4 + images * IMAGE_TOKENS + 4
+    tokens + images * IMAGE_TOKENS + 4
 }
 
 /// 压缩方案：`history[..tail_from]` 进摘要（`keep_user` 那条除外），其余保留。
@@ -288,5 +304,15 @@ mod tests {
     #[test]
     fn estimates_by_bytes() {
         assert_eq!(estimate_tokens(&[user(&"a".repeat(400))]), 104);
+    }
+
+    #[test]
+    fn chinese_counts_more_than_bytes_div_4() {
+        // 400 个汉字：旧算法 300 字节 / 4 = 75 + 4；现在按每字 1.5 ≈ 604
+        let tokens = estimate_tokens(&[user(&"中".repeat(400))]);
+        assert_eq!(tokens, 604);
+        // 混合文本在两档之间
+        let mixed = estimate_tokens(&[user(&("a".repeat(200) + &"中".repeat(100)))]);
+        assert_eq!(mixed, 50 + 150 + 4);
     }
 }
