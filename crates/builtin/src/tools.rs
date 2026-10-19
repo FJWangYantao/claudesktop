@@ -1168,7 +1168,28 @@ fn has_pwsh() -> bool {
     false
 }
 
+/// 跑命令时默认带上的环境变量：常见的会弹窗口 / 开浏览器的工具改成不弹（用户自己设了的不覆盖）。
+const QUIET_ENV: [(&str, &str); 4] = [
+    // Playwright 测试失败后默认会打开 HTML 报告
+    ("PLAYWRIGHT_HTML_OPEN", "never"),
+    ("PW_TEST_HTML_REPORT_OPEN", "never"),
+    // create-react-app 等开发服务器启动时开浏览器
+    ("BROWSER", "none"),
+    // matplotlib 画图不弹窗口（savefig 照常）
+    ("MPLBACKEND", "Agg"),
+];
+
 fn shell_command(command: &str) -> Command {
+    let mut cmd = shell_command_raw(command);
+    for (key, value) in QUIET_ENV {
+        if std::env::var_os(key).is_none() {
+            cmd.env(key, value);
+        }
+    }
+    cmd
+}
+
+fn shell_command_raw(command: &str) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -1321,6 +1342,17 @@ fn run_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 跑命令默认不弹窗口：没设过的环境变量带上，用户自己设了的不覆盖。
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_commands_run_quietly_by_default() {
+        if std::env::var_os("MPLBACKEND").is_some() {
+            return;
+        }
+        let out = shell_command("echo \"$MPLBACKEND $PLAYWRIGHT_HTML_OPEN\"").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Agg never");
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let dir =

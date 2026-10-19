@@ -86,6 +86,7 @@ pub struct SettingsForm {
     max_steps: Entity<InputState>,
     /// 用量网关开关（保存才生效，会重启自研内核）
     usage_gateway: bool,
+    gateway_bodies: bool,
     /// ACP agent 的请求也经网关（保存才生效，会重启 ACP 内核）
     acp_gateway: bool,
     /// 点了「清空日志」，等再点一次确认
@@ -124,6 +125,7 @@ impl SettingsForm {
             acp_command,
             max_steps,
             usage_gateway: true,
+            gateway_bodies: true,
             acp_gateway: false,
             confirm_clear_gateway: false,
             prices,
@@ -184,6 +186,7 @@ impl ChatApp {
         self.settings_form.message = None;
         self.settings_form.fetch_result = None;
         self.settings_form.usage_gateway = s.usage_gateway;
+        self.settings_form.gateway_bodies = s.gateway_bodies;
         self.settings_form.acp_gateway = s.acp.gateway;
         self.settings_form.confirm_clear_gateway = false;
         let prices = crate::pricing::to_text(&crate::pricing::Table {
@@ -481,6 +484,7 @@ impl ChatApp {
         s.acp.gateway = f.acp_gateway;
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
         s.usage_gateway = f.usage_gateway;
+        s.gateway_bodies = f.gateway_bodies;
         // 单价表写错了留着原来的（`save_settings` 先报错，不会走到这里）；和内置的一样就不存
         if let Ok(table) = crate::pricing::parse_text(&f.prices.read(cx).value()) {
             let defaults = crate::pricing::Table::defaults();
@@ -571,6 +575,8 @@ impl ChatApp {
         let restart_acp = new.acp != self.settings.acp;
         let default = new.kernel();
         let default_changed = default != self.settings.kernel();
+        // 存不存原文对已经跑着的网关立刻生效，不用重启内核
+        claudesktop_builtin::request_bodies::set_enabled(new.gateway_bodies);
         self.settings = new;
         self.settings_open = false;
         if restart_builtin {
@@ -999,7 +1005,7 @@ impl ChatApp {
                 .v_flex()
                 .gap_1()
                 .child(
-                    "记下每个请求的耗时、用量和重试（不记提示词和 Key），在首页「请求」页签查看；\
+                    "记下每个请求的耗时、用量和重试（日志里不记提示词和 Key），在首页「请求」页签查看；\
                      关掉就直连服务商",
                 )
                 .child(actions),
@@ -1009,6 +1015,24 @@ impl ChatApp {
                     cx.notify();
                 }),
             ),
+        )
+    }
+
+    /// 网关存不存请求原文（随「保存」生效；网关关着时不可点）。
+    fn bodies_row(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        setting_row(
+            "保存请求原文",
+            "另存每个请求发给服务商的完整内容和返回（压缩，留 7 天），在「请求」页签点开一次请求查看；\
+             里面有对话和代码，只存在本机",
+            Switch::new("gateway-bodies")
+                .checked(f.gateway_bodies && f.usage_gateway)
+                .disabled(!f.usage_gateway)
+                .color(rgb(CORAL))
+                .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                    this.settings_form.gateway_bodies = *checked;
+                    cx.notify();
+                })),
         )
     }
 
@@ -1167,6 +1191,7 @@ impl ChatApp {
                         div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
                     ),
                     self.gateway_row(cx),
+                    self.bodies_row(cx),
                     self.prices_row(window, cx),
                 ]),
             )),

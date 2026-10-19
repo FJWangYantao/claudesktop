@@ -238,6 +238,8 @@ pub struct Settings {
     /// 自研内核的请求经用量网关转发、每个请求记一行日志（数据目录 `gateway/`）；默认开。
     /// 关掉就直连端点。设置页「内核与模型」有开关，`CLAUDESKTOP_GATEWAY` 覆盖它
     pub usage_gateway: bool,
+    /// 网关另存每个请求的原文（请求体和响应），首页「请求」页签点开一次请求可看；默认开
+    pub gateway_bodies: bool,
     /// 估算费用用的模型单价表；None = 没改过，用内置参考价（[`crate::pricing::default_prices`]）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_prices: Option<Vec<crate::pricing::Price>>,
@@ -274,6 +276,7 @@ impl Default for Settings {
             plugins_enabled: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
             usage_gateway: yes(),
+            gateway_bodies: yes(),
             model_prices: None,
             price_peaks: None,
             notifications: yes(),
@@ -481,6 +484,7 @@ impl Settings {
     /// 用量网关（开着才有；进程里共用一个，第一次用到时起）。起不来就直连，不影响用。
     pub fn gateway(&self) -> Option<claudesktop_builtin::gateway::GatewayHandle> {
         use claudesktop_builtin::gateway;
+        claudesktop_builtin::request_bodies::set_enabled(self.gateway_bodies);
         self.usage_gateway.then(gateway::default_dir).flatten().and_then(|d| gateway::shared(&d))
     }
 

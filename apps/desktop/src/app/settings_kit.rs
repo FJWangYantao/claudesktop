@@ -204,6 +204,17 @@ pub(super) fn seg_control<T: Copy + PartialEq + 'static, L: Into<SharedString>>(
     on_pick: impl Fn(&mut ChatApp, T, &mut Window, &mut Context<ChatApp>) + Clone + 'static,
     cx: &mut Context<ChatApp>,
 ) -> Div {
+    seg_control_in(id, options, current, on_pick, cx)
+}
+
+/// 同 [`seg_control`]，用在别的 view 里（如请求原文对话框）。
+pub(super) fn seg_control_in<V: 'static, T: Copy + PartialEq + 'static, L: Into<SharedString>>(
+    id: &'static str,
+    options: impl IntoIterator<Item = (T, L)>,
+    current: T,
+    on_pick: impl Fn(&mut V, T, &mut Window, &mut Context<V>) + Clone + 'static,
+    cx: &mut Context<V>,
+) -> Div {
     let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
     for (i, (value, label)) in options.into_iter().enumerate() {
         let on_pick = on_pick.clone();
