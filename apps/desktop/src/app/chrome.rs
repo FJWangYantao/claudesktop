@@ -137,6 +137,16 @@ impl ChatApp {
         };
         let can_export = !self.settings_open && s.has_user_message();
         let view = self.settings.view_mode;
+        // 这个会话在跑的后台命令：顶栏给一个小标（悬停看命令行，点一下停掉）
+        let running: Vec<_> = self
+            .kernels
+            .iter()
+            .flat_map(|slot| slot.tasks.iter())
+            .filter(|t| t.running && s.acp_id.as_deref() == Some(t.session.as_str()))
+            .collect();
+        let running_count = running.len();
+        let running_names: Vec<&str> = running.iter().map(|t| t.command.as_str()).collect();
+        let running_ids: Vec<String> = running.iter().map(|t| t.id.clone()).collect();
 
         div()
             .h_flex()
@@ -149,6 +159,23 @@ impl ChatApp {
                     .child(self.sidebar_toggle("header-sidebar-toggle", cx))
             })
             .child(drag_area().pl_4().pr_2().child(crumb))
+            // 后台命令在跑：一个小标（悬停看命令行，点一下停掉）
+            .when(running_count > 0, |d| {
+                d.child(
+                    Self::quiet_button("bg-tasks", IconAll::SquareTerminal, Surface::Paper, cx)
+                        .mr_1()
+                        .tooltip(if running_count == 1 {
+                            format!("后台命令在跑：{}（点击停止）", running_names[0])
+                        } else {
+                            format!("{running_count} 条后台命令在跑（点击全部停止）")
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            for id in &running_ids {
+                                this.stop_background(id, cx);
+                            }
+                        })),
+                )
+            })
             // 视图模式（Ctrl+O 循环）：只在有对话时出现
             .when(can_export, |d| {
                 d.child(div().mr_1().child(menu_popover(

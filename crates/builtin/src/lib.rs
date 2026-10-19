@@ -19,6 +19,7 @@
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
 
 mod anthropic;
+mod bgtasks;
 mod compact;
 mod fetch;
 pub mod gateway;
@@ -252,6 +253,8 @@ struct Inner {
     /// 等待 UI 应答的权限请求：请求 ID → 应答通道
     pending: Mutex<HashMap<u64, mpsc::Sender<Option<String>>>>,
     next_request: AtomicU64,
+    /// 这个内核的编号（后台命令表按它分组：同一进程里几个内核各收自己的）
+    kernel_id: u64,
 }
 
 /// 默认 MCP 配置文件：数据目录下的 `mcp.json`。
@@ -860,6 +863,8 @@ impl Inner {
     ) -> ToolOutput {
         let target = action.written_path().map(Path::to_path_buf);
         let before = target.as_deref().and_then(checkpoint::read_snapshot);
+        // 后台任务记在这个会话名下（事件里按会话分组）
+        bgtasks::set_current(self.kernel_id, session);
         let output = action.run(stopped);
         if let (Some(path), Some(before)) = (target, before)
             && let Some(after) = checkpoint::read_snapshot(&path)
@@ -1223,11 +1228,16 @@ pub struct BuiltinKernel {
     inner: Arc<Inner>,
 }
 
+/// 内核编号：后台命令表按它分组（同一进程里几个内核各收自己的任务）
+static NEXT_KERNEL_ID: AtomicU64 = AtomicU64::new(1);
+
 impl BuiltinKernel {
     /// 创建内核。进程内无握手，立即报告 `Connected`。
     pub fn spawn(config: BuiltinConfig, sink: EventSink) -> anyhow::Result<Self> {
         let agent_name = format!("builtin · {}", config.provider.model);
         let max_steps = config.clamped_max_steps();
+        // 这个内核的编号（后台命令表按它分组）
+        let kernel_id = NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed);
         let mcp = {
             let sink = sink.clone();
             mcp::McpHub::new(config.mcp_config, config.cwd.clone(), move |servers| {
@@ -1258,9 +1268,20 @@ impl BuiltinKernel {
             plugins: Mutex::new(Arc::new(config.plugins)),
             pending: Mutex::default(),
             next_request: AtomicU64::new(1),
+            kernel_id,
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
+        // 后台命令的状态变化整份发一次（表是进程级的，出口在这里装上）
+        {
+            let inner = inner.clone();
+            bgtasks::register(
+                kernel_id,
+                Box::new(move |tasks| {
+                    inner.emit(None, KernelEvent::BackgroundTasks { tasks });
+                }),
+            );
+        }
         // MCP 服务器在后台连，连上之前的轮次没有它们的工具
         inner.mcp.reload();
         Ok(Self { inner })
@@ -1921,6 +1942,16 @@ impl Kernel for BuiltinKernel {
 
     fn reconnect_mcp(&self, server: &str) {
         self.inner.mcp.reconnect(server);
+    }
+
+    /// 会话结束（切走 / 关掉）时把它起的后台命令停掉：模型再也读不到输出了。
+    fn close_session(&self, session: &str) {
+        bgtasks::stop_session(session);
+        self.inner.sessions.lock().unwrap().remove(session);
+    }
+
+    fn stop_background_task(&self, id: &str) {
+        let _ = bgtasks::stop(id);
     }
 
     fn reload_mcp(&self) {

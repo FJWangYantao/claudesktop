@@ -196,6 +196,8 @@ pub(crate) struct KernelSlot {
     agent_cmd: String,
     /// MCP 服务器的状态（只有自研内核有；设置页「MCP」显示）
     mcp: Vec<claudesktop_core::McpServerView>,
+    /// 后台命令（只有自研内核有；会话顶栏显示运行中的）
+    tasks: Vec<claudesktop_core::BackgroundTaskView>,
 }
 
 impl Drop for ChatApp {
@@ -524,6 +526,17 @@ impl ChatApp {
     /// 第 `idx` 个会话绑定的内核
     pub(crate) fn session_kernel(&self, idx: usize) -> Option<Arc<dyn Kernel>> {
         self.kernel_of(self.sessions[idx].kernel)
+    }
+
+    /// 停掉一条后台命令（顶栏的小标点的）。
+    pub(crate) fn stop_background(&mut self, id: &str, cx: &mut Context<Self>) {
+        let kind = self.sessions[self.active].kernel;
+        if let Some(kernel) = self.kernel_of(kind)
+            && kernel.kind() == "builtin"
+        {
+            kernel.stop_background_task(id);
+        }
+        cx.notify();
     }
 
     /// 系统已装字体族（设置页的字体下拉用）。枚举一次要上百毫秒，缓存在 `theme` 里。
@@ -1391,6 +1404,10 @@ impl ChatApp {
                 }
             }
             KernelEvent::McpStatus { servers } => slot.mcp = servers,
+            KernelEvent::BackgroundTasks { tasks } => {
+                slot.tasks = tasks;
+                cx.notify();
+            }
             KernelEvent::Fatal(message) => {
                 slot.ready = false;
                 slot.error = true;

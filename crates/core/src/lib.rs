@@ -210,6 +210,24 @@ pub enum KernelEvent {
     McpStatus { servers: Vec<McpServerView> },
     /// 内核用模型给会话起了个新标题（第一轮结束后）；界面更新侧栏，失败不发
     TitleGenerated { title: String },
+    /// 后台命令的状态变了（启动 / 结束 / 被停掉）：整份任务列表（最近的在前）
+    BackgroundTasks { tasks: Vec<BackgroundTaskView> },
+}
+
+/// 一条后台命令在界面上的样子（见自研内核的 `bgtasks` 模块）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskView {
+    pub id: String,
+    /// 起它的会话
+    pub session: String,
+    pub command: String,
+    pub running: bool,
+    /// 退出码；还在跑 / 被信号结束时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub duration_secs: u64,
+    /// 输出末尾几行（预览）
+    pub output_tail: String,
 }
 
 /// 一个 MCP 服务器在界面上的样子。
@@ -279,6 +297,7 @@ impl KernelEvent {
             Self::FileChanged { .. } => "file_changed",
             Self::McpStatus { .. } => "mcp_status",
             Self::TitleGenerated { .. } => "title_generated",
+            Self::BackgroundTasks { .. } => "background_tasks",
         }
     }
 }
@@ -486,6 +505,10 @@ pub trait Kernel: Send + Sync {
     /// 换一批启用的插件（启用 / 停用之后）：自研内核接它们的 MCP 服务、技能和钩子，
     /// ACP 内核在之后新开 / 续接的会话里把插件的 MCP 服务交给 agent。
     fn set_plugins(&self, _plugins: Vec<plugin::Plugin>) {}
+    /// 会话不再使用时调用（切走 / 关掉）：内核可以停掉它起的后台命令、释放上下文。
+    fn close_session(&self, _session: &str) {}
+    /// 停掉一条后台命令（自研内核的 `shell_background` 起的）。默认没有后台命令。
+    fn stop_background_task(&self, _id: &str) {}
     /// 关闭内核。
     fn shutdown(&self);
 }

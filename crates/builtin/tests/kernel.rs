@@ -578,6 +578,9 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
             "write_file",
             "edit_file",
             "shell",
+            "shell_background",
+            "shell_output",
+            "shell_stop",
             "task"
         ]
     );
@@ -2172,6 +2175,52 @@ fn broken_project_settings_report_a_notice() {
     h.kernel.send_prompt(&sid, UserPrompt::text("一")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.count(|e| matches!(e, KernelEvent::Notice(t) if t.contains("格式有问题"))), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 后台命令三件套：起 → 取增量输出 → 停。
+#[test]
+fn background_shell_runs_reads_and_stops() {
+    let dir = workdir("bg");
+    let (base, _bodies) = serve(vec![
+        tool_call(
+            "b1",
+            "shell_background",
+            serde_json::json!({ "command": "echo hello; sleep 5" }),
+        ),
+        tool_call("b2", "shell_output", serde_json::json!({ "id": "bg-1", "wait_secs": 10 })),
+        tool_call("b3", "shell_stop", serde_json::json!({ "id": "bg-1" })),
+        happy_stream("好了"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("起个后台")).unwrap();
+    // 只有 `shell_background` 要授权（读输出 / 停任务是跟进，不再问）
+    let (id, _) = h.permission(1);
+    h.kernel.resolve_permission(id, Some("allow_once".into())).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 启动报告任务 ID，状态行标题带「后台」
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::ToolCallStarted { id, title, .. }
+            if id == "b1" && title.contains("后台"))),
+        1
+    );
+    let output = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|r| match &r.event {
+            KernelEvent::ToolCallUpdated { id, raw_output: Some(o), .. } if id == "b2" => {
+                Some(o.clone())
+            }
+            _ => None,
+        })
+        .expect("b2 的输出");
+    assert!(output.contains("hello"), "{output}");
+    // 停掉之后状态行是完成
+    assert_eq!(h.tool_status("b3").as_deref(), Some("completed"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -18,6 +18,9 @@ const LIST_DIR: &str = "list_dir";
 const WRITE_FILE: &str = "write_file";
 const EDIT_FILE: &str = "edit_file";
 const SHELL: &str = "shell";
+const SHELL_BACKGROUND: &str = "shell_background";
+const SHELL_OUTPUT: &str = "shell_output";
+const SHELL_STOP: &str = "shell_stop";
 const GLOB: &str = "glob";
 const GREP: &str = "grep";
 const WEB_FETCH: &str = "web_fetch";
@@ -93,6 +96,20 @@ pub enum Action {
         command: String,
         timeout: Duration,
         cwd: PathBuf,
+    },
+    /// 起一条后台命令，立刻返回任务 ID
+    ShellBackground {
+        command: String,
+        cwd: PathBuf,
+    },
+    /// 取后台任务的增量输出（最多等一会儿）
+    ShellOutput {
+        id: String,
+        wait_secs: u64,
+    },
+    /// 结束后台任务
+    ShellStop {
+        id: String,
     },
     /// 按文件名模式找文件（遵守 .gitignore）
     Glob {
@@ -342,6 +359,51 @@ pub fn specs(writable: bool) -> Vec<Value> {
                 "required": ["command"]
             }),
         ));
+        tools.push(f(
+            SHELL_BACKGROUND,
+            format!(
+                "Start a long-running command ({}) in the background and return immediately with a \
+                 task id. Use it for dev servers, watchers and anything that does not finish \
+                 quickly; read what it printed with `{SHELL_OUTPUT}`, stop it with `{SHELL_STOP}`. \
+                 The process is killed when the application exits.{}",
+                shell_name(),
+                DETACH_HINT,
+            ),
+            json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+        ));
+        tools.push(f(
+            SHELL_OUTPUT,
+            format!(
+                "Read the new output of a background command started with `{SHELL_BACKGROUND}`. \
+                 Only what was printed since the last read is returned, plus whether it is still \
+                 running or its exit code. `wait_secs` (default 5, max {}) waits that long for new \
+                 output before answering; raise it to follow a build instead of polling.",
+                crate::bgtasks::WAIT_MAX_SECS,
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Task id from shell_background" },
+                    "wait_secs": { "type": "integer" }
+                },
+                "required": ["id"]
+            }),
+        ));
+        tools.push(f(
+            SHELL_STOP,
+            "Stop a background command (and everything it started). \
+             Use it when a dev server is no longer needed or a test run hangs."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        ));
     }
     tools
 }
@@ -356,6 +418,13 @@ struct FetchArgs {
 #[derive(Deserialize)]
 struct SearchArgs {
     query: String,
+}
+
+#[derive(Deserialize)]
+struct ShellOutputArgs {
+    id: String,
+    #[serde(default)]
+    wait_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -516,6 +585,32 @@ impl Action {
                     cwd: cwd.to_path_buf(),
                 }
             }
+            SHELL_BACKGROUND => {
+                let a: ShellArgs = de(name, args)?;
+                if a.command.trim().is_empty() {
+                    return Err("shell_background: `command` is empty".into());
+                }
+                Self::ShellBackground { command: a.command, cwd: cwd.to_path_buf() }
+            }
+            SHELL_OUTPUT => {
+                let a: ShellOutputArgs = de(name, args)?;
+                let id = a.id.trim();
+                if id.is_empty() {
+                    return Err("shell_output: `id` is empty".into());
+                }
+                Self::ShellOutput {
+                    id: id.to_string(),
+                    wait_secs: a.wait_secs.unwrap_or(5).min(crate::bgtasks::WAIT_MAX_SECS),
+                }
+            }
+            SHELL_STOP => {
+                let a: ShellOutputArgs = de(name, args)?;
+                let id = a.id.trim();
+                if id.is_empty() {
+                    return Err("shell_stop: `id` is empty".into());
+                }
+                Self::ShellStop { id: id.to_string() }
+            }
             GLOB => {
                 let a: GlobArgs = de(name, args)?;
                 if a.pattern.trim().is_empty() {
@@ -594,8 +689,10 @@ impl Action {
             | Self::Glob { .. }
             | Self::Grep { .. }
             | Self::Task { .. } => Access::Read,
+            // 读后台输出 / 停任务是对已有调用的跟进，不再问
+            Self::ShellOutput { .. } | Self::ShellStop { .. } => Access::Read,
             Self::Write { .. } | Self::Edit { .. } => Access::Edit,
-            Self::Shell { .. } => Access::Exec,
+            Self::Shell { .. } | Self::ShellBackground { .. } => Access::Exec,
             Self::Fetch { .. } | Self::Search { .. } => Access::Fetch,
             Self::Mcp { read_only, .. } => Access::Mcp { read_only: *read_only },
         }
@@ -607,7 +704,8 @@ impl Action {
             Self::Read { .. } | Self::List { .. } => "read",
             Self::Glob { .. } | Self::Grep { .. } => "search",
             Self::Write { .. } | Self::Edit { .. } => "edit",
-            Self::Shell { .. } => "execute",
+            Self::Shell { .. } | Self::ShellBackground { .. } => "execute",
+            Self::ShellOutput { .. } | Self::ShellStop { .. } => "read",
             Self::Fetch { .. } | Self::Search { .. } => "fetch",
             Self::Mcp { .. } => "other",
             Self::Task { .. } => "think",
@@ -622,6 +720,9 @@ impl Action {
             Self::Write { path, .. } => format!("Write {}", display(cwd, path)),
             Self::Edit { path, .. } => format!("Edit {}", display(cwd, path)),
             Self::Shell { command, .. } => format!("`{}`", command.trim()),
+            Self::ShellBackground { command, .. } => format!("`{}`（后台）", command.trim()),
+            Self::ShellOutput { id, .. } => format!("后台输出 {id}"),
+            Self::ShellStop { id } => format!("结束后台任务 {id}"),
             Self::Fetch { url, .. } => format!("Fetch {url}"),
             Self::Search { query } => format!("Search {query}"),
             Self::Task { description, agent, .. } => match agent {
@@ -674,7 +775,9 @@ impl Action {
     pub fn rule(&self, cwd: &Path) -> Option<String> {
         match self {
             Self::Write { .. } | Self::Edit { .. } => self.inside(cwd).then(|| "edit".to_string()),
-            Self::Shell { command, .. } => shell_rule(command).map(|r| format!("shell:{r}")),
+            Self::Shell { command, .. } | Self::ShellBackground { command, .. } => {
+                shell_rule(command).map(|r| format!("shell:{r}"))
+            }
             Self::Fetch { url, .. } => Some(format!("fetch:{}", crate::fetch::host_of(url))),
             Self::Search { .. } => Some("search".to_string()),
             Self::Mcp { server, tool, .. } => Some(format!("mcp:{server}:{tool}")),
@@ -707,6 +810,23 @@ impl Action {
             Self::Write { path, content } => write_file(path, content),
             Self::Edit { path, old, new, all } => edit_file(path, old, new, *all),
             Self::Shell { command, timeout, cwd } => run_shell(command, cwd, *timeout, should_stop),
+            Self::ShellBackground { command, cwd } => start_background(command, cwd),
+            Self::ShellOutput { id, wait_secs } => {
+                match crate::bgtasks::output(id, Duration::from_secs(*wait_secs)) {
+                    Ok(text) => {
+                        let summary = crate::bgtasks::clip(
+                            text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim(),
+                            60,
+                        );
+                        ToolOutput::ok(clip_output_front(&text), summary)
+                    }
+                    Err(e) => ToolOutput::fail(e, "没有这个任务"),
+                }
+            }
+            Self::ShellStop { id } => match crate::bgtasks::stop(id) {
+                Ok(text) => ToolOutput::ok(text.clone(), text),
+                Err(e) => ToolOutput::fail(e, "没有这个任务"),
+            },
             Self::Glob { pattern, root, cwd } => glob_files(pattern, root, cwd, should_stop),
             Self::Grep { pattern, root, include, ignore_case, files_only, cwd } => grep_files(
                 pattern,
@@ -980,6 +1100,30 @@ fn clip_output(s: String) -> String {
     format!("{head}\n… [{} chars truncated] …\n{tail}", n - OUTPUT_MAX_CHARS)
 }
 
+/// 后台任务的输出只留最近的：超了丢最前面的（日志越新越有用）。
+fn clip_output_front(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= OUTPUT_MAX_CHARS {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - OUTPUT_MAX_CHARS).collect();
+    format!("… [{} chars truncated] …\n{tail}", n - OUTPUT_MAX_CHARS)
+}
+
+/// `shell_background`：起一条后台命令，立刻回任务 ID。
+fn start_background(command: &str, cwd: &Path) -> ToolOutput {
+    match crate::bgtasks::start(command, cwd) {
+        Ok(id) => ToolOutput::ok(
+            format!(
+                "Started {id} in the background. Read its output with `shell_output` \
+                 {{\"id\":\"{id}\"}} (it waits for new output); stop it with `shell_stop`."
+            ),
+            format!("后台 {id}"),
+        ),
+        Err(e) => ToolOutput::fail(e, "无法启动后台命令"),
+    }
+}
+
 fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -1231,6 +1375,11 @@ fn shell_command(command: &str) -> Command {
         }
     }
     cmd
+}
+
+/// 后台命令用同一套 shell / 编码 / 不弹窗设置（`bgtasks` 模块调）。
+pub(crate) fn background_command(command: &str) -> Command {
+    shell_command(command)
 }
 
 fn shell_command_raw(command: &str) -> Command {
