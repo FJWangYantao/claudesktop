@@ -88,7 +88,7 @@ pub fn project_root(cwd: &Path) -> Option<&Path> {
 
 /// 从 `cwd` 往上最多 4 层找 `is_root` 为真的目录（`cwd` 本身优先）。
 /// 判断单独抽出来，测试不用依赖临时目录在不在仓库里。
-fn climb<'a>(cwd: &'a Path, is_root: impl Fn(&Path) -> bool) -> Option<&'a Path> {
+fn climb(cwd: &Path, is_root: impl Fn(&Path) -> bool) -> Option<&Path> {
     let mut dir = Some(cwd);
     for _ in 0..4 {
         let d = dir?;

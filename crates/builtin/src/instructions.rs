@@ -157,9 +157,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "上级").unwrap();
         std::fs::write(dir.join("sub/AGENTS.md"), "本级").unwrap();
-        let texts = |cwd: &Path| -> Vec<String> {
-            load(cwd, None).into_iter().map(|f| f.text).collect()
-        };
+        let texts =
+            |cwd: &Path| -> Vec<String> { load(cwd, None).into_iter().map(|f| f.text).collect() };
         assert_eq!(texts(&dir), ["上级"]);
         assert_eq!(texts(&dir.join("sub")), ["上级", "本级"]);
         let _ = std::fs::remove_dir_all(&dir);
