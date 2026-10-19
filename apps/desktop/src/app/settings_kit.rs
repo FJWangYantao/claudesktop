@@ -62,15 +62,21 @@ pub(super) fn setting_row(
     desc: impl IntoElement,
     control: impl IntoElement,
 ) -> Div {
+    // 放不下时控件换到下一行：文字列按 14rem 起算参与折行（不然宽控件会把它挤成一个字宽、竖着排），
+    // 同一行放得下时再长满剩下的宽度
     div()
         .h_flex()
+        .flex_wrap()
         .items_center()
-        .gap_4()
+        .gap_x_4()
+        .gap_y_2()
         .py_3p5()
         .child(
             div()
                 .v_flex()
-                .flex_1()
+                .flex_grow(1.)
+                .flex_shrink(1.)
+                .flex_basis(rems(14.))
                 .min_w_0()
                 .gap_0p5()
                 .child(
@@ -88,7 +94,7 @@ pub(super) fn setting_row(
                         .child(desc),
                 ),
         )
-        .child(div().flex_none().child(control))
+        .child(div().flex_none().max_w_full().child(control))
 }
 
 /// 一组设置行，行与行之间细分隔线（第一行顶上不留白，紧跟分区标题）。

@@ -146,6 +146,8 @@ pub struct ChatApp {
     sidebar_spinners_view: Entity<SidebarSpinners>,
     /// 输入框上方的内容区（缓存 view，`ChatApp` 每次通知都让它重画，见 `content.rs`）
     content_view: Entity<ContentView>,
+    /// 内容区里的转圈 / 呼吸点 / 扫光叠在这上面画（见 motion.rs 文件头）
+    loop_overlay: Entity<motion::LoopOverlay>,
     /// 首页滚动区内容的定宽（见 `MeasuredWidth`）
     home_w: widgets::MeasuredWidth,
     /// 首页整页的滚动位置（「请求」页签据此只排视口附近的几轮）
@@ -403,6 +405,7 @@ impl ChatApp {
             sidebar_spinners: Default::default(),
             sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
             content_view: cx.new(|_| ContentView::new(weak.clone())),
+            loop_overlay: cx.new(|_| motion::LoopOverlay),
             home_w: Default::default(),
             home_scroll: ScrollHandle::new(),
             task_scroll: ScrollHandle::new(),
@@ -761,8 +764,29 @@ impl ChatApp {
             });
         }
         s.title = format!("压测 {n} 行").into();
-        // 置忙：状态行和侧栏的转圈常驻（只看重绘频率，不会真的有内核事件来收尾）
+        // 置忙：状态行和侧栏的转圈常驻（只看重绘频率，不会真的有内核事件来收尾），
+        // 末尾再挂一段思考中（扫光）和一个跑着的工具（转圈）
         if busy {
+            s.transcript.push(ChatItem::Thinking {
+                text: "先看看热点在哪".into(),
+                streaming: true,
+                open: false,
+                started: Some(std::time::Instant::now()),
+                elapsed_ms: None,
+            });
+            s.transcript.push(ChatItem::Tool(ToolCard {
+                id: None,
+                kind: "execute".into(),
+                name: "Bash".into(),
+                arg: "cargo test".into(),
+                result: SharedString::default(),
+                output: SharedString::default(),
+                phase: ToolPhase::Running,
+                diffs: Vec::new(),
+                expanded: false,
+                task: false,
+                grant: None,
+            }));
             s.begin_turn();
         }
         cx.notify();

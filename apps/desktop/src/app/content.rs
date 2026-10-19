@@ -5,7 +5,8 @@
 //! 失效规则很粗：`ChatApp` 每次 `cx.notify()` 都通知内容区重画（`ChatApp::new` 里的 `observe_self`），
 //! 不用像侧栏那样维护指纹。反过来，只影响输入区的刷新要用 `ChatApp::refresh_composer`，
 //! 别用 `cx.notify()`，否则又连对话一起重画。
-//! 内容区里的动画（展开、悬停淡入、转圈、平滑滚动）通知的是当前 view，也就是内容区自己。
+//! 内容区里的动画（展开、悬停淡入、平滑滚动）通知的是当前 view，也就是内容区自己；
+//! 常驻的循环动画（转圈、呼吸点、扫光）例外，由叠在上面的 `motion::LoopOverlay` 画（见 motion.rs 文件头）。
 
 use super::{ChatApp, motion};
 use crate::model::ChatItem;
@@ -28,6 +29,7 @@ impl ContentView {
 
 impl Render for ContentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        motion::begin_loop_spots();
         match self.app.upgrade() {
             Some(app) => app.update(cx, |app, cx| app.render_content(window, cx)),
             None => div().into_any_element(),
@@ -36,9 +38,16 @@ impl Render for ContentView {
 }
 
 impl ChatApp {
-    /// 内容区在 `ChatApp` 里的位置：占满输入区以上的高度（按 style 排版，不按内容量）。
+    /// 内容区在 `ChatApp` 里的位置：占满输入区以上的高度（按 style 排版，不按内容量），
+    /// 上面叠着画循环动画的覆盖层。
     pub(super) fn content_slot(&self) -> impl IntoElement + use<> {
-        self.content_view.clone().cached(StyleRefinement::default().flex_1().min_h_0().w_full())
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(self.content_view.clone().cached(StyleRefinement::default().size_full()))
+            .child(self.loop_overlay.clone())
     }
 
     /// 内容区：设置页、首页（问候 + 用量概览）或当前会话的对话列表。
