@@ -236,16 +236,19 @@ impl SessionState {
     }
 
     fn system_prompt(&self) -> String {
+        let ctx = Context {
+            instructions: &self.instructions,
+            skills: &self.skills,
+            memory_project: &self.memory_project,
+            memory_global: &self.memory_global,
+        };
         system_prompt(
             &self.cwd,
             &self.mode,
             self.restored,
-            &self.instructions,
-            &self.skills,
             self.summary.as_deref(),
             self.agent.as_ref(),
-            &self.memory_project,
-            &self.memory_global,
+            ctx,
         )
     }
 
@@ -1496,17 +1499,26 @@ const BACKGROUND: &str = "Work in the background by default: the user keeps usin
     To check a GUI or web page, use a headless browser or a virtual display (e.g. Xvfb on Linux) and save \
     screenshots to files you can read. Only bring something to the foreground when the user asks for it.";
 
+/// 进系统提示词的「背景材料」：项目说明文件、技能、记忆。
+///
+/// 打包传（而不是一个个参数）是为了别让 `system_prompt` 的参数越加越长，
+/// 以后再加一类背景材料只往这里添字段。
+struct Context<'a> {
+    instructions: &'a [instructions::Instruction],
+    skills: &'a [Skill],
+    memory_project: &'a [claudesktop_core::memory::Entry],
+    memory_global: &'a [claudesktop_core::memory::Entry],
+}
+
 fn system_prompt(
     cwd: &Path,
     mode: &str,
     restored: bool,
-    project: &[instructions::Instruction],
-    skills: &[Skill],
     summary: Option<&str>,
     agent: Option<&AgentDef>,
-    memory_project: &[claudesktop_core::memory::Entry],
-    memory_global: &[claudesktop_core::memory::Entry],
+    ctx: Context<'_>,
 ) -> String {
+    let Context { instructions: project, skills, memory_project, memory_global } = ctx;
     // 子会话没有待办清单（计划是主会话的）
     let todo = if agent.is_none() {
         "For tasks with several steps, track progress with todo_write. "

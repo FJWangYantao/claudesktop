@@ -147,7 +147,7 @@ impl FileFormat {
     fn from(config: &ProjectConfig) -> Self {
         let (allow, deny) = split_rules(&config.permissions);
         let permissions = (config.permissions.iter().any(|r| !r.trim().is_empty()))
-            .then(|| Permissions { allow, deny });
+            .then_some(Permissions { allow, deny });
         Self {
             model: config.model.clone(),
             permissions,
