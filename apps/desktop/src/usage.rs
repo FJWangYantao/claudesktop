@@ -197,17 +197,16 @@ fn in_range(
         .collect()
 }
 
-/// 一天的汇总（设置页「用量 → 每天」的一行）。
+/// 趋势图的一根柱子：一天，或者（时间跨度长时）一周。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DayRow {
-    /// [`day_of`] 的天序号
+    /// [`day_of`] 的天序号（按周时是那周的周一）
     pub day: i64,
     pub turns: usize,
     pub tokens: u64,
-    pub sessions: usize,
 }
 
-/// 一个会话的汇总（「用量 → 会话」、某天的明细）。
+/// 一个会话的汇总（用量页的会话排行）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionRow {
     /// [`TurnStat::session`]
@@ -217,46 +216,71 @@ pub struct SessionRow {
     pub last_ms: u64,
 }
 
-/// 设置页「用量」各详情页的数据：按天、按时段、按星期、按会话。
-#[derive(Clone, Debug, PartialEq)]
-pub struct Breakdown {
-    /// 有对话的日子，新的在前
-    pub days: Vec<DayRow>,
-    /// 本地时间每个小时的轮数
-    pub hours: [usize; 24],
-    /// 周一到周日的轮数
-    pub weekdays: [usize; 7],
-    /// 按 token 从多到少（一样多按轮数、最近活动）
-    pub sessions: Vec<SessionRow>,
+/// 用量页的筛选：点趋势图的一天、模型排行的一行、会话排行的一行，整页都只看它。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Filter<'a> {
+    pub day: Option<i64>,
+    pub model: Option<&'a str>,
+    /// [`TurnStat::session`]
+    pub session: Option<&'a str>,
 }
 
-/// 汇总时间范围内的轮；给了 `day` 就只算那一天（不看范围）。
-pub fn breakdown(
+impl Filter<'_> {
+    fn keeps(&self, t: &TurnStat, offset_secs: i64) -> bool {
+        self.keeps_except_day(t) && self.day.is_none_or(|d| day_of(t.at_ms, offset_secs) == d)
+    }
+
+    fn keeps_except_day(&self, t: &TurnStat) -> bool {
+        self.model.is_none_or(|m| t.model.as_deref() == Some(m))
+            && self.session.is_none_or(|s| t.session == s)
+    }
+}
+
+/// 时间跨度超过这么多天，趋势图按周画（全部范围下几百根细柱子看不清）
+pub const WEEKLY_AFTER_DAYS: i64 = 62;
+
+/// 用量页一整页的数据。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Board {
+    pub turns: usize,
+    pub tokens: u64,
+    pub sessions: usize,
+    pub active_days: usize,
+    /// 上一个同样长的时段的（轮数, token），算涨跌用；范围是「全部」或只看某天时没有
+    pub prev: Option<(usize, u64)>,
+    /// 趋势图：从早到晚连续排（没对话的日子也有一根 0），不受「某天」的筛选影响
+    pub series: Vec<DayRow>,
+    /// `series` 一根是一周
+    pub weekly: bool,
+    /// 按轮数从多到少
+    pub models: Vec<ModelRow>,
+    /// 按 token 从多到少（一样多按轮数、最近活动）
+    pub session_rows: Vec<SessionRow>,
+    /// 星期（周一 = 0）× 本地时间的小时，各多少轮
+    pub heat: [[usize; 24]; 7],
+}
+
+/// 汇总时间范围里、筛选留下的轮。`range_days` = None 是全部。
+pub fn board(
     turns: &[TurnStat],
     now_ms: u64,
     offset_secs: i64,
     range_days: Option<u64>,
-    day: Option<i64>,
-) -> Breakdown {
-    let picked: Vec<&TurnStat> = match day {
-        Some(d) => turns.iter().filter(|t| day_of(t.at_ms, offset_secs) == d).collect(),
-        None => in_range(turns, now_ms, offset_secs, range_days),
-    };
-    let mut hours = [0usize; 24];
-    let mut weekdays = [0usize; 7];
-    let mut days: HashMap<i64, (DayRow, HashSet<&str>)> = HashMap::new();
+    filter: Filter,
+) -> Board {
+    let today = day_of(now_ms, offset_secs);
+    let in_range = in_range(turns, now_ms, offset_secs, range_days);
+    let picked: Vec<&TurnStat> =
+        in_range.iter().copied().filter(|t| filter.keeps(t, offset_secs)).collect();
+
     let mut sessions: HashMap<&str, SessionRow> = HashMap::new();
+    let mut models: HashMap<&str, (ModelRow, HashSet<&str>)> = HashMap::new();
+    let mut days: HashSet<i64> = HashSet::new();
+    let mut heat = [[0usize; 24]; 7];
     for t in &picked {
         let d = day_of(t.at_ms, offset_secs);
-        hours[hour_of(t.at_ms, offset_secs) as usize] += 1;
-        weekdays[weekday(d)] += 1;
-        let (row, seen) = days.entry(d).or_insert_with(|| {
-            (DayRow { day: d, turns: 0, tokens: 0, sessions: 0 }, HashSet::new())
-        });
-        row.turns += 1;
-        row.tokens += t.tokens;
-        seen.insert(&t.session);
-        row.sessions = seen.len();
+        days.insert(d);
+        heat[weekday(d)][hour_of(t.at_ms, offset_secs) as usize] += 1;
         let row = sessions.entry(&t.session).or_insert_with(|| SessionRow {
             session: t.session.clone(),
             turns: 0,
@@ -266,14 +290,82 @@ pub fn breakdown(
         row.turns += 1;
         row.tokens += t.tokens;
         row.last_ms = row.last_ms.max(t.at_ms);
+        if let Some(name) = t.model.as_deref() {
+            let (row, seen) = models.entry(name).or_insert_with(|| {
+                let row = ModelRow {
+                    name: name.to_string(),
+                    turns: 0,
+                    tokens: 0,
+                    sessions: 0,
+                    last_ms: 0,
+                };
+                (row, HashSet::new())
+            });
+            row.turns += 1;
+            row.tokens += t.tokens;
+            row.last_ms = row.last_ms.max(t.at_ms);
+            seen.insert(&t.session);
+            row.sessions = seen.len();
+        }
     }
-    let mut days: Vec<DayRow> = days.into_values().map(|(row, _)| row).collect();
-    days.sort_by_key(|d| std::cmp::Reverse(d.day));
-    let mut sessions: Vec<SessionRow> = sessions.into_values().collect();
-    sessions.sort_by(|a, b| {
+    let mut models: Vec<ModelRow> = models.into_values().map(|(row, _)| row).collect();
+    models.sort_by(|a, b| {
+        b.turns.cmp(&a.turns).then(b.tokens.cmp(&a.tokens)).then(a.name.cmp(&b.name))
+    });
+    let mut session_rows: Vec<SessionRow> = sessions.into_values().collect();
+    session_rows.sort_by(|a, b| {
         b.tokens.cmp(&a.tokens).then(b.turns.cmp(&a.turns)).then(b.last_ms.cmp(&a.last_ms))
     });
-    Breakdown { days, hours, weekdays, sessions }
+
+    let prev = match (range_days, filter.day) {
+        (Some(n), None) => {
+            let n = n as i64;
+            let (mut turns_n, mut tokens) = (0, 0);
+            for t in turns.iter().filter(|t| filter.keeps_except_day(t)) {
+                let ago = today - day_of(t.at_ms, offset_secs);
+                if (n..2 * n).contains(&ago) {
+                    turns_n += 1;
+                    tokens += t.tokens;
+                }
+            }
+            Some((turns_n, tokens))
+        }
+        _ => None,
+    };
+
+    // 趋势：范围内连续的日子；「全部」从有记录的第一天起，跨度长了按周
+    let trend: Vec<&TurnStat> =
+        in_range.iter().copied().filter(|t| filter.keeps_except_day(t)).collect();
+    let first = match range_days {
+        Some(n) => today - n as i64 + 1,
+        None => trend.iter().map(|t| day_of(t.at_ms, offset_secs)).min().unwrap_or(today),
+    };
+    let weekly = today - first >= WEEKLY_AFTER_DAYS;
+    let bucket = |d: i64| if weekly { d - weekday(d) as i64 } else { d };
+    let (start, step) = (bucket(first), if weekly { 7 } else { 1 });
+    let mut series: Vec<DayRow> = (0..=(today - start) / step)
+        .map(|i| DayRow { day: start + i * step, turns: 0, tokens: 0 })
+        .collect();
+    for t in &trend {
+        let i = ((bucket(day_of(t.at_ms, offset_secs)) - start) / step) as usize;
+        if let Some(row) = series.get_mut(i) {
+            row.turns += 1;
+            row.tokens += t.tokens;
+        }
+    }
+
+    Board {
+        turns: picked.len(),
+        tokens: picked.iter().map(|t| t.tokens).sum(),
+        sessions: session_rows.len(),
+        active_days: days.len(),
+        prev,
+        series,
+        weekly,
+        models,
+        session_rows,
+        heat,
+    }
 }
 
 /// 周一 = 0 … 周日 = 6（1970-01-01 是周四）。
@@ -527,7 +619,7 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
-    fn breakdown_by_day_hour_and_session() {
+    fn board_filters_trends_and_compares() {
         // 2026-10-14（周三）12:00 UTC
         let now = 1_791_979_200_000;
         let t = |session: &str, at_ms: u64, model: Option<&str>, tokens: u64| TurnStat {
@@ -541,22 +633,41 @@ mod tests {
             t("a", now - 3_600_000, Some("m2"), 50),
             t("a", now - 2 * 3_600_000, Some("m2"), 1),
             t("b", now - DAY, Some("m2"), 400),
-            t("c", now - 40 * DAY, None, 9),
+            t("b", now - 8 * DAY, Some("m2"), 30),
+            t("c", now - 100 * DAY, None, 9),
         ];
         let today = day_of(now, 0);
-        let all = breakdown(&turns, now, 0, None, None);
-        let days: Vec<(i64, usize, u64, usize)> =
-            all.days.iter().map(|d| (today - d.day, d.turns, d.tokens, d.sessions)).collect();
-        assert_eq!(days, vec![(0, 3, 151, 1), (1, 1, 400, 1), (40, 1, 9, 1)]);
-        assert_eq!((all.hours[12], all.hours[11], all.hours[10]), (3, 1, 1));
-        assert_eq!((all.weekdays[2], all.weekdays[1]), (3, 1));
-        // 按 token 排
-        assert_eq!(all.sessions[0].session, "b");
-        assert_eq!((all.sessions[1].turns, all.sessions[1].last_ms), (3, now));
-        assert_eq!(breakdown(&turns, now, 0, Some(30), None).days.len(), 2);
-        // 只看一天：不受范围限制
-        let day = breakdown(&turns, now, 0, Some(7), Some(today - 40));
-        assert_eq!((day.days.len(), day.sessions[0].session.as_str()), (1, "c"));
+        let week = board(&turns, now, 0, Some(7), Filter::default());
+        assert_eq!((week.turns, week.tokens, week.sessions, week.active_days), (4, 551, 2, 2));
+        // 上一个 7 天里只有 8 天前那一轮
+        assert_eq!(week.prev, Some((1, 30)));
+        // 7 根柱子，最后一根是今天
+        assert_eq!(week.series.len(), 7);
+        assert_eq!((week.series[6].day, week.series[6].turns), (today, 3));
+        assert_eq!(week.series[5].tokens, 400);
+        assert!(!week.weekly);
+        // 周三中午 12 点那格
+        assert_eq!(week.heat[2][12], 1);
+        assert_eq!(week.models[0].name, "m2");
+        assert_eq!(week.session_rows[0].session, "b");
+
+        // 只看今天：数字跟着变，趋势还是整段；没有涨跌
+        let day = board(&turns, now, 0, Some(7), Filter { day: Some(today), ..Default::default() });
+        assert_eq!((day.turns, day.sessions, day.prev), (3, 1, None));
+        assert_eq!(day.series, week.series);
+        // 只看一个模型：趋势也只算它
+        let m1 = board(&turns, now, 0, Some(7), Filter { model: Some("m1"), ..Default::default() });
+        assert_eq!((m1.turns, m1.series[5].tokens, m1.prev), (1, 0, Some((0, 0))));
+        let b = board(&turns, now, 0, None, Filter { session: Some("b"), ..Default::default() });
+        assert_eq!((b.turns, b.tokens), (2, 430));
+        assert!(!b.weekly);
+
+        // 全部：从第一轮那天起，100 天按周画，每周一根、从周一起
+        let all = board(&turns, now, 0, None, Filter::default());
+        assert!(all.weekly);
+        assert!(all.series.iter().all(|w| weekday(w.day) == 0));
+        assert_eq!(all.series.iter().map(|w| w.turns).sum::<usize>(), 6);
+        assert_eq!(all.series.last().map(|w| w.turns), Some(4));
 
         assert_eq!(date_label(today, today), "10月14日 周三");
         assert_eq!(date_label(today - 300, today), "2025年12月18日 周四");

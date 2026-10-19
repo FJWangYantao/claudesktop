@@ -81,7 +81,7 @@ pub struct ChatApp {
     /// 首页「请求」页签：读到的用量网关日志、筛选、点开的轮
     requests_view: requests_view::RequestsView,
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
-    /// 设置页「用量」看哪一栏、点开的哪天 / 哪个模型
+    /// 用量页的状态（筛选在 `requests_view` 上）
     usage_page: usage_view::UsagePage,
     sidebar_open: bool,
     /// 侧栏会话按最近活动排序（否则按打开顺序）
@@ -152,7 +152,7 @@ pub struct ChatApp {
     home_scroll: ScrollHandle,
     /// 子任务详情页的滚动位置（每次打开从顶上看起）
     task_scroll: ScrollHandle,
-    /// 设置页右侧内容的滚动位置（「用量 → 请求」同样只排视口附近的几轮）
+    /// 设置页右侧内容（和用量页）的滚动位置（用量页的请求明细同样只排视口附近的几轮）
     settings_scroll: ScrollHandle,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
@@ -1488,6 +1488,10 @@ impl ChatApp {
                         self.touch_meta(idx);
                     }
                     let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
+                    // 网关又记了请求：用量页的费用、请求跟着刷新（不用等这一轮跑完再手动重读）
+                    if turn_over || matches!(event, KernelEvent::UsageUpdated { .. }) {
+                        self.refresh_requests_soon(cx);
+                    }
                     // 模型起了标题：元信息也跟着更新（TurnEnded 时写的还是旧标题）
                     if matches!(event, KernelEvent::TitleGenerated { .. }) {
                         self.touch_meta(idx);
@@ -1615,6 +1619,30 @@ impl ChatApp {
         let s = &self.sessions[idx];
         let session = s.meta.as_ref().map_or_else(|| format!("live-{}", s.token), |m| m.id.clone());
         self.usage.push(TurnStat { session, at_ms, model, tokens: input_tokens + output_tokens });
+    }
+
+    /// 用量统计：结束了的轮，加上还在跑的轮（按目前已知的用量算；跑完 `record_turn` 换成准数）。
+    pub(super) fn usage_stats(&self) -> std::borrow::Cow<'_, [TurnStat]> {
+        let live: Vec<TurnStat> = self
+            .sessions
+            .iter()
+            .filter(|s| s.busy && !s.compact_turn && s.turn_started.is_some())
+            .map(|s| TurnStat {
+                session: s
+                    .meta
+                    .as_ref()
+                    .map_or_else(|| format!("live-{}", s.token), |m| m.id.clone()),
+                at_ms: now_ms(),
+                model: Some(s.model_label.to_string()).filter(|m| m != UNKNOWN_MODEL),
+                tokens: s.turn_usage.input + s.live_output_tokens(),
+            })
+            .collect();
+        if live.is_empty() {
+            return self.usage.as_slice().into();
+        }
+        let mut all = self.usage.clone();
+        all.extend(live);
+        all.into()
     }
 
     /// 一轮结束：刷新日志，更新元信息（标题 / 内核会话 ID / 更新时间）。

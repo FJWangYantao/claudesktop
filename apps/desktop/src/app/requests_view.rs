@@ -37,13 +37,16 @@ pub(super) struct RequestsView {
     /// 读的是哪个时间范围（`overview_range`）
     loaded_range: Option<usize>,
     loading: bool,
+    /// 已经约好过一会儿重读（跑着的轮又发完一个请求，见 `refresh_requests_soon`）
+    reload_soon: bool,
     /// 点开的轮（`TurnRow::key`）
     open: HashSet<(String, u64)>,
-    /// 只看某个模型 / 某个会话（`Session::token`）
-    model: Option<String>,
-    session: Option<u64>,
+    /// 只看某个模型 / 某个会话（`Session::token`）/ 某一天（`usage::day_of`，用量页的筛选）
+    pub(super) model: Option<String>,
+    pub(super) session: Option<u64>,
+    pub(super) day: Option<i64>,
     /// 多列出来的页数（「显示更多」）
-    more: usize,
+    pub(super) more: usize,
     /// 上次归组、筛选、汇总的结果（见 `derived_requests`）
     derived: RefCell<Option<Rc<Derived>>>,
     /// 列表只排视口附近的几轮（见 [`ListWindow`]）
@@ -78,8 +81,8 @@ impl ListWindow {
     }
 }
 
-/// 「请求」页签按当前日志、筛选和单价算好的数据。
-struct Derived {
+/// 「请求」页签按当前日志、筛选和单价算好的数据（用量页的费用也从这里取）。
+pub(super) struct Derived {
     /// 算的是哪一份日志（重读日志才换）
     logs: Arc<Vec<RequestLog>>,
     key: DerivedKey,
@@ -89,8 +92,13 @@ struct Derived {
     sessions: Vec<SessionRef>,
     /// 筛选后留下的轮（`rows` 的下标）
     shown: Vec<usize>,
-    sum: requests::Summary,
-    cost: Cost,
+    pub(super) sum: requests::Summary,
+    pub(super) cost: Cost,
+    /// 筛选后各模型、各会话（`Session::token`）的费用
+    pub(super) model_cost: HashMap<String, Cost>,
+    pub(super) session_cost: HashMap<u64, Cost>,
+    /// 筛选后对话请求的缓存命中率
+    pub(super) cache_hit: Option<u32>,
 }
 
 /// 除日志外，影响 [`Derived`] 的输入。
@@ -99,16 +107,17 @@ struct DerivedKey {
     names: HashMap<String, SessionRef>,
     model: Option<String>,
     session: Option<u64>,
+    day: Option<i64>,
     prices: Vec<Price>,
     peaks: Vec<PeakWindow>,
 }
 
 impl ChatApp {
-    /// 在「请求」页签上（首页或设置页「用量」）、日志还没按当前范围读过：在后台读。
+    /// 在首页「请求」页签上或用量页开着、日志还没按当前范围读过：在后台读。
     pub(super) fn sync_requests(&mut self, cx: &mut Context<Self>) {
+        // 用量页整页都要（费用、缓存命中也从请求日志算）
         let shown = if self.settings_open {
             self.settings_form.tab == super::usage_view::USAGE_TAB
-                && self.usage_page.view == super::usage_view::UsageView::Requests
         } else {
             self.overview_tab == 2
         };
@@ -118,15 +127,7 @@ impl ChatApp {
         }
     }
 
-    /// 只看某个模型 / 某个会话的请求（设置页「用量」里模型、会话的「看请求」）。
-    pub(super) fn filter_requests(&mut self, model: Option<String>, session: Option<u64>) {
-        let v = &mut self.requests_view;
-        v.model = model;
-        v.session = session;
-        v.more = 0;
-    }
-
-    /// 列表所在的整页滚动区：首页，或设置页（「用量 → 请求」）。
+    /// 列表所在的整页滚动区：首页，或用量页。
     fn list_scroll(&self) -> &ScrollHandle {
         if self.settings_open { &self.settings_scroll } else { &self.home_scroll }
     }
@@ -151,10 +152,36 @@ impl ChatApp {
             let _ = this.update(cx, |app, cx| {
                 let v = &mut app.requests_view;
                 v.logs = Some(Arc::new(logs));
+                // 同一范围重读（跑着的轮刷新）不收起已经展开的「显示更多」
+                if v.loaded_range != Some(range) {
+                    v.more = 0;
+                }
                 v.loaded_range = Some(range);
                 v.loading = false;
-                v.more = 0;
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 网关又记下了请求（跑着的轮报了用量、一轮结束）：过一会儿重读日志。
+    /// 页面开着就读，没开着记成过期，下次打开再读；一轮里请求一个接一个，攒 2 秒读一次。
+    pub(super) fn refresh_requests_soon(&mut self, cx: &mut Context<Self>) {
+        let v = &mut self.requests_view;
+        if !self.settings.usage_gateway || v.logs.is_none() || v.reload_soon {
+            return;
+        }
+        v.reload_soon = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+            let _ = this.update(cx, |app, cx| {
+                app.requests_view.reload_soon = false;
+                // 上一次还没读完：读完会把范围记成已读，这次的就丢了，所以再约一次
+                if app.requests_view.loading {
+                    return app.refresh_requests_soon(cx);
+                }
+                app.requests_view.loaded_range = None;
+                app.sync_requests(cx);
             });
         })
         .detach();
@@ -199,12 +226,14 @@ impl ChatApp {
     }
 
     /// 归组、筛选、汇总的结果，输入没变就用上次的（滚一格都要重画，日志多时每帧重算很贵）。
-    fn derived_requests(&self, logs: &Arc<Vec<RequestLog>>) -> Rc<Derived> {
+    /// `day`：只看那天（用量页的筛选；首页「请求」页签不按天筛）。
+    fn derived_requests(&self, logs: &Arc<Vec<RequestLog>>, day: Option<i64>) -> Rc<Derived> {
         let v = &self.requests_view;
         let key = DerivedKey {
             names: self.request_names(),
             model: v.model.clone(),
             session: v.session,
+            day,
             prices: self.settings.prices(),
             peaks: self.settings.price_peaks(),
         };
@@ -239,11 +268,37 @@ impl ChatApp {
             .filter(|(_, r)| {
                 key.session.is_none_or(|t| r.session.as_ref().is_some_and(|s| s.token == t))
             })
+            .filter(|(_, r)| {
+                key.day.is_none_or(|d| usage::day_of(r.at_ms, usage::local_offset_secs()) == d)
+            })
             .map(|(i, _)| i)
             .collect();
         let shown_rows: Vec<&TurnRow> = shown.iter().map(|&i| &rows[i]).collect();
         let sum = requests::summarize(&shown_rows);
         let cost = Cost::of(&key.prices, &key.peaks, shown_rows.iter().flat_map(|r| &r.requests));
+        let mut by_model: HashMap<&str, Vec<&RequestLog>> = HashMap::new();
+        let mut by_session: HashMap<u64, Vec<&RequestLog>> = HashMap::new();
+        for row in &shown_rows {
+            for r in &row.requests {
+                if let Some(m) = &r.model {
+                    by_model.entry(m).or_default().push(r);
+                }
+                if let Some(s) = &row.session {
+                    by_session.entry(s.token).or_default().push(r);
+                }
+            }
+        }
+        let model_cost = by_model
+            .into_iter()
+            .map(|(m, logs)| (m.to_string(), Cost::of(&key.prices, &key.peaks, logs)))
+            .collect();
+        let session_cost = by_session
+            .into_iter()
+            .map(|(t, logs)| (t, Cost::of(&key.prices, &key.peaks, logs)))
+            .collect();
+        let (cache_read, input) =
+            shown_rows.iter().fold((0, 0), |(c, i), r| (c + r.cache_read, i + r.input));
+        let cache_hit = usage::cache_hit_percent(cache_read, input);
         let d = Rc::new(Derived {
             logs: logs.clone(),
             models: models.into_iter().map(|(m, _)| m).collect(),
@@ -251,6 +306,9 @@ impl ChatApp {
             shown,
             sum,
             cost,
+            model_cost,
+            session_cost,
+            cache_hit,
             rows,
             key,
         });
@@ -271,7 +329,17 @@ impl ChatApp {
         names
     }
 
-    pub(super) fn render_usage_requests(&self, cx: &mut Context<Self>) -> Div {
+    /// 用量页要的费用、缓存命中：网关开着、日志读到了才有。
+    pub(super) fn request_costs(&self) -> Option<Rc<Derived>> {
+        if !self.settings.usage_gateway {
+            return None;
+        }
+        let logs = self.requests_view.logs.clone()?;
+        Some(self.derived_requests(&logs, self.requests_view.day))
+    }
+
+    /// 请求列表。`embedded` = 用量页里的那份：筛选跟着整页走、总数在页顶，这里不再画筛选菜单和统计卡。
+    pub(super) fn render_usage_requests(&self, embedded: bool, cx: &mut Context<Self>) -> Div {
         let hint = |text: &'static str| {
             div().py_6().text_size(TEXT_BODY).text_color(rgb(INK_SOFT)).child(text)
         };
@@ -284,7 +352,7 @@ impl ChatApp {
         let Some(logs) = v.logs.clone() else {
             return div().child(hint("正在读取请求记录…"));
         };
-        let d = self.derived_requests(&logs);
+        let d = self.derived_requests(&logs, if embedded { v.day } else { None });
         let shown: Vec<&TurnRow> = d.shown.iter().map(|&i| &d.rows[i]).collect();
         let (sum, cost) = (&d.sum, &d.cost);
         let (prices, peaks) = (&d.key.prices, &d.key.peaks);
@@ -301,86 +369,96 @@ impl ChatApp {
             .h_flex()
             .items_center()
             .gap_1()
-            .child(menu_popover(
-                "req-model",
-                Anchor::TopLeft,
-                rems(18.),
-                &cx.entity(),
-                &self.menu_focus,
-                MenuChip::new(IconAll::Cpu, model_label).filled(),
-                move |app, handle, popover| {
-                    let current = app.requests_view.model.clone();
-                    let mut menu = MenuList::new("req-model-list", handle, popover).pick(
-                        menu_item("req-model-all", IconAll::Cpu, "全部模型", "", current.is_none()),
-                        |this, cx| {
-                            this.requests_view.model = None;
-                            this.requests_view.more = 0;
-                            cx.notify();
-                        },
-                    );
-                    for (i, m) in model_items.iter().enumerate() {
-                        let pick = m.clone();
-                        menu = menu.pick(
+            .when(!embedded, |d| {
+                d.child(menu_popover(
+                    "req-model",
+                    Anchor::TopLeft,
+                    rems(18.),
+                    &cx.entity(),
+                    &self.menu_focus,
+                    MenuChip::new(IconAll::Cpu, model_label).filled(),
+                    move |app, handle, popover| {
+                        let current = app.requests_view.model.clone();
+                        let mut menu = MenuList::new("req-model-list", handle, popover).pick(
                             menu_item(
-                                ("req-model-item", i),
+                                "req-model-all",
                                 IconAll::Cpu,
-                                m.clone(),
+                                "全部模型",
                                 "",
-                                current.as_ref() == Some(m),
+                                current.is_none(),
                             ),
-                            move |this, cx| {
-                                this.requests_view.model = Some(pick.clone());
+                            |this, cx| {
+                                this.requests_view.model = None;
                                 this.requests_view.more = 0;
                                 cx.notify();
                             },
                         );
-                    }
-                    menu
-                },
-            ))
-            .child(menu_popover(
-                "req-session",
-                Anchor::TopLeft,
-                rems(20.),
-                &cx.entity(),
-                &self.menu_focus,
-                MenuChip::new(IconAll::MessageSquare, session_label).filled(),
-                move |app, handle, popover| {
-                    let current = app.requests_view.session;
-                    let mut menu = MenuList::new("req-session-list", handle, popover).pick(
-                        menu_item(
-                            "req-session-all",
-                            IconAll::MessageSquare,
-                            "全部会话",
-                            "",
-                            current.is_none(),
-                        ),
-                        |this, cx| {
-                            this.requests_view.session = None;
-                            this.requests_view.more = 0;
-                            cx.notify();
-                        },
-                    );
-                    for (i, s) in session_items.iter().enumerate() {
-                        let token = s.token;
-                        menu = menu.pick(
+                        for (i, m) in model_items.iter().enumerate() {
+                            let pick = m.clone();
+                            menu = menu.pick(
+                                menu_item(
+                                    ("req-model-item", i),
+                                    IconAll::Cpu,
+                                    m.clone(),
+                                    "",
+                                    current.as_ref() == Some(m),
+                                ),
+                                move |this, cx| {
+                                    this.requests_view.model = Some(pick.clone());
+                                    this.requests_view.more = 0;
+                                    cx.notify();
+                                },
+                            );
+                        }
+                        menu
+                    },
+                ))
+            })
+            .when(!embedded, |d| {
+                d.child(menu_popover(
+                    "req-session",
+                    Anchor::TopLeft,
+                    rems(20.),
+                    &cx.entity(),
+                    &self.menu_focus,
+                    MenuChip::new(IconAll::MessageSquare, session_label).filled(),
+                    move |app, handle, popover| {
+                        let current = app.requests_view.session;
+                        let mut menu = MenuList::new("req-session-list", handle, popover).pick(
                             menu_item(
-                                ("req-session-item", i),
+                                "req-session-all",
                                 IconAll::MessageSquare,
-                                s.title.clone(),
+                                "全部会话",
                                 "",
-                                current == Some(token),
+                                current.is_none(),
                             ),
-                            move |this, cx| {
-                                this.requests_view.session = Some(token);
+                            |this, cx| {
+                                this.requests_view.session = None;
                                 this.requests_view.more = 0;
                                 cx.notify();
                             },
                         );
-                    }
-                    menu
-                },
-            ))
+                        for (i, s) in session_items.iter().enumerate() {
+                            let token = s.token;
+                            menu = menu.pick(
+                                menu_item(
+                                    ("req-session-item", i),
+                                    IconAll::MessageSquare,
+                                    s.title.clone(),
+                                    "",
+                                    current == Some(token),
+                                ),
+                                move |this, cx| {
+                                    this.requests_view.session = Some(token);
+                                    this.requests_view.more = 0;
+                                    cx.notify();
+                                },
+                            );
+                        }
+                        menu
+                    },
+                ))
+            })
             .child(div().flex_1())
             .child(
                 Self::quiet_button("req-refresh", IconAll::RefreshCw, Surface::Sand, cx)
@@ -413,6 +491,9 @@ impl ChatApp {
                 .child(m)
         }));
         let mut notes = vec![format!("{} 轮", sum.turns)];
+        if embedded {
+            notes.push(format!("{} 次请求", sum.requests));
+        }
         if let Some(ms) = sum.first_token_ms {
             notes.push(format!("首字中位 {}", requests::ms_label(ms)));
         }
@@ -456,6 +537,16 @@ impl ChatApp {
             );
         }
 
+        // 用量页里：说明一行和刷新按钮并排
+        let notes =
+            meta_line(notes.into_iter().map(|n| (n, INK_SOFT)).collect()).text_size(TEXT_SMALL);
+        if embedded {
+            return div()
+                .v_flex()
+                .gap_3()
+                .child(div().h_flex().items_center().gap_2().child(notes.flex_1()).child(filters))
+                .child(list);
+        }
         div()
             .v_flex()
             .gap_3()
@@ -469,9 +560,7 @@ impl ChatApp {
                     .children(stats.iter().map(Self::stat_card))
                     .child(cost_card),
             )
-            .child(
-                meta_line(notes.into_iter().map(|n| (n, INK_SOFT)).collect()).text_size(TEXT_SMALL),
-            )
+            .child(notes)
             .child(list)
     }
 
