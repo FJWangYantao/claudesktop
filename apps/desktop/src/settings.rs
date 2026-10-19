@@ -382,13 +382,13 @@ impl Settings {
         // 服务端工具里认不得的名字丢掉（手写错的、以后版本删掉的）
         for profile in &mut s.builtin.profiles {
             let params = &mut profile.params;
-            params.thinking_budget =
-                params.thinking_budget.filter(|b| *b > 0).map(|b| {
-                    b.max(claudesktop_builtin::RequestParams::MIN_THINKING_BUDGET)
-                });
-            params.server_tools.retain(|name| {
-                claudesktop_builtin::RequestParams::knows_server_tool(name)
-            });
+            params.thinking_budget = params
+                .thinking_budget
+                .filter(|b| *b > 0)
+                .map(|b| b.max(claudesktop_builtin::RequestParams::MIN_THINKING_BUDGET));
+            params
+                .server_tools
+                .retain(|name| claudesktop_builtin::RequestParams::knows_server_tool(name));
             // 去重（顺序不重要：界面按 `SERVER_TOOLS` 的顺序摆开关）
             params.server_tools.sort();
             params.server_tools.dedup();

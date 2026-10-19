@@ -7,8 +7,9 @@
 //! 内完成；对上层暴露统一的 [`ChatProvider`] 接口。
 
 use crate::provider::{
-    ChatMessage, ChatProvider, ModelInfo, ProviderConfig, RequestParams, StreamEvent, StreamOutcome,
-    ToolCall, debug_http, finish_stream, get_json, parse_model_list, post_sse_with_retry, read_sse,
+    ChatMessage, ChatProvider, ModelInfo, ProviderConfig, RequestParams, StreamEvent,
+    StreamOutcome, ToolCall, debug_http, finish_stream, get_json, parse_model_list,
+    post_sse_with_retry, read_sse,
 };
 use serde_json::{Value, json};
 
@@ -175,7 +176,8 @@ fn build_body(
             "cache_control": { "type": "ephemeral" },
         }]);
     }
-    let server: Vec<Value> = params.server_tools.iter().filter_map(|n| server_tool_spec(n)).collect();
+    let server: Vec<Value> =
+        params.server_tools.iter().filter_map(|n| server_tool_spec(n)).collect();
     if !tools.is_empty() || !server.is_empty() {
         let mut all = convert_tools(tools).as_array().cloned().unwrap_or_default();
         all.extend(server);
@@ -491,7 +493,9 @@ fn server_result_text(kind: &str, block: &Value) -> Option<String> {
                     .map(|m| format!("（抓到的内容不是文本：{m}）"))
                     .or_else(|| Some(data.to_string()))
             })
-            .or_else(|| content.get("error_code").and_then(Value::as_str).map(|e| format!("抓取失败：{e}")))
+            .or_else(|| {
+                content.get("error_code").and_then(Value::as_str).map(|e| format!("抓取失败：{e}"))
+            })
             .unwrap_or_else(|| compact_json(content))
     } else if kind.ends_with("_tool_result") {
         // 代码执行：stdout / stderr / return_code
@@ -527,9 +531,7 @@ fn server_result_text(kind: &str, block: &Value) -> Option<String> {
         return None;
     };
     let body = truncate_chars(body.trim().to_string(), MAX_BLOCK_TEXT);
-    (!body.is_empty()).then(|| {
-        format!("[服务端工具 {kind}] {body}")
-    })
+    (!body.is_empty()).then(|| format!("[服务端工具 {kind}] {body}"))
 }
 
 /// `web_search_tool_result.content`：结果列表或错误对象。
@@ -770,14 +772,20 @@ mod tests {
         let body = build_body("m", &messages, &[], &RequestParams::default());
         assert!(body.get("thinking").is_none() && body.get("temperature").is_none());
         // 小于 1024 的预算 API 会拒，抬到官方下限再发（仍然不发 temperature）
-        let too_small =
-            RequestParams { temperature: Some(1.0), thinking_budget: Some(512), ..Default::default() };
+        let too_small = RequestParams {
+            temperature: Some(1.0),
+            thinking_budget: Some(512),
+            ..Default::default()
+        };
         let body = build_body("m", &messages, &[], &too_small);
         assert_eq!(body["thinking"]["budget_tokens"], RequestParams::MIN_THINKING_BUDGET);
         assert!(body.get("temperature").is_none());
         // 0 当成没开（设置文件里手写 0 的样子）
-        let zero =
-            RequestParams { temperature: Some(0.2), thinking_budget: Some(0), ..Default::default() };
+        let zero = RequestParams {
+            temperature: Some(0.2),
+            thinking_budget: Some(0),
+            ..Default::default()
+        };
         let body = build_body("m", &messages, &[], &zero);
         assert!(body.get("thinking").is_none());
         assert_eq!(body["temperature"], 0.2);
@@ -846,8 +854,9 @@ mod tests {
         ];
         let mut finish = None;
         for line in lines {
-            let out = parse_event(line, &mut blocks, &mut usage, &mut seen, &mut |e| events.push(e))
-                .unwrap();
+            let out =
+                parse_event(line, &mut blocks, &mut usage, &mut seen, &mut |e| events.push(e))
+                    .unwrap();
             if out.is_some() {
                 finish = out;
             }
