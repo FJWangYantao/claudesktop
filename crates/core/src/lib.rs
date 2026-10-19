@@ -249,6 +249,10 @@ pub struct McpServerView {
     /// 没连上、可以点「重新连接」（配置本身有问题的不行）
     #[serde(default)]
     pub retry: bool,
+    /// 存着这个远程服务的登录令牌（OAuth）：界面据此给「清除登录状态」。
+    /// 只看有没有，令牌内容不经过这里（见 `mcp_oauth::has_token`）
+    #[serde(default)]
+    pub has_auth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,6 +508,11 @@ pub trait Kernel: Send + Sync {
     fn reload_mcp(&self) {}
     /// 重连一个没连上的 MCP 服务器（设置页的「重新连接」）。
     fn reconnect_mcp(&self, _server: &str) {}
+    /// 清除一个 MCP 服务器存着的登录状态（OAuth 令牌），并重连它：状态回到「没连上 / 需要登录」。
+    /// 默认没有 MCP，什么也不做。
+    fn clear_mcp_auth(&self, _server: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// 换一批启用的插件（启用 / 停用之后）：自研内核接它们的 MCP 服务、技能和钩子，
     /// ACP 内核在之后新开 / 续接的会话里把插件的 MCP 服务交给 agent。

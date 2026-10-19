@@ -462,6 +462,46 @@ impl McpHub {
             .spawn(move || connect(hub, server, generation));
     }
 
+    /// 清除一个远程服务的登录状态（设置页的「清除登录状态」）：删掉存着的 OAuth 令牌 →
+    /// 断开现在的连接、状态回到「没连上」→ 再重连一次（没有令牌了，服务器要授权就会重新走到
+    /// 「需要登录」，推一个新的授权地址）。
+    ///
+    /// 本地命令（stdio）、配置本身用不了的、本来就没存令牌的都返回原因，界面用提示消息报出来。
+    pub fn clear_auth(self: &Arc<Self>, name: &str) -> Result<(), String> {
+        let server = self.servers.lock().unwrap().iter().find(|s| s.config.name == name).cloned();
+        let Some(server) = server else {
+            return Err(format!("没有叫「{name}」的 MCP 服务"));
+        };
+        if server.config.transport == Transport::Stdio {
+            return Err("本地命令没有登录状态".into());
+        }
+        if let Some(reason) = &server.config.unsupported {
+            return Err(reason.clone());
+        }
+        if !crate::mcp_oauth::has_token(&server.config.url) {
+            return Err("没有存着的登录状态".into());
+        }
+        // 1. 删令牌文件（按服务器地址存的那份）
+        crate::mcp_oauth::forget(&server.config.url);
+        // 2. 先改状态再断开旧连接：`Client` 释放时若触发 `on_exit`，那时状态已不是「已连接」，
+        //    不会另起一条退避重连和新连接抢
+        {
+            let mut state = server.state.lock().unwrap();
+            // 停用的保持「已停用」：清令牌不该把它显示成连不上
+            *state = if server.config.disabled {
+                McpState::Disabled
+            } else {
+                McpState::Failed("已经清除了登录状态，重新连接会要求你重新登录".into())
+            };
+        }
+        server.client.lock().unwrap().take();
+        server.tools.lock().unwrap().clear();
+        self.report();
+        // 3. 重连（可能正连着，那是用刚删掉的令牌建的；停用的由 reconnect 自己跳过）
+        self.reconnect(name);
+        Ok(())
+    }
+
     fn report(&self) {
         (self.on_status)(self.status());
     }
@@ -486,6 +526,10 @@ impl McpHub {
                     tools: s.tools.lock().unwrap().len(),
                     plugin: s.config.plugin.clone(),
                     url: (s.config.transport != Transport::Stdio).then(|| s.config.url.clone()),
+                    // 远程服务存着 OAuth 令牌时界面给「清除登录状态」；本地命令没有这一说
+                    has_auth: s.config.transport != Transport::Stdio
+                        && s.config.unsupported.is_none()
+                        && crate::mcp_oauth::has_token(&s.config.url),
                 }
             })
             .collect()

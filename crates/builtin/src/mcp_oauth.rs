@@ -96,6 +96,27 @@ pub(crate) fn forget(server: &str) {
     }
 }
 
+/// 这台服务器有没有存着的 token（文件在、能解析就算有）。
+///
+/// 界面据此决定给不给「清除登录状态」（见 `McpServerView::has_auth`）；只看存在与格式，
+/// 不把令牌内容交给任何调用方 —— 隐私上「界面不显示、日志不打」这条（设计说明第七节）靠这个守着。
+pub fn has_token(server: &str) -> bool {
+    token_file(server).is_some_and(|path| has_token_file(&path))
+}
+
+/// 这台服务器的 token 文件路径（数据目录不可用时 None）。
+fn token_file(server: &str) -> Option<PathBuf> {
+    Some(store_dir()?.join(format!("{}.json", file_stem(server))))
+}
+
+/// 这个 token 文件在且能解析（坏的 / 半份的当没有）。
+fn has_token_file(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Token>(&text).ok())
+        .is_some()
+}
+
 /// 存 token（先写临时文件再改名，崩溃时不留半份）。
 pub(crate) fn save(token: &Token) -> Result<(), String> {
     let dir = store_dir().ok_or("找不到数据目录")?;
@@ -781,5 +802,30 @@ mod tests {
         };
         let err = register(&agent(), &meta, "http://127.0.0.1:1/callback").unwrap_err();
         assert!(err.contains("client_id"), "{err}");
+    }
+
+    #[test]
+    fn has_token_only_counts_a_parsable_file() {
+        // 没存过的地址没有令牌（只读，不碰数据目录里已有的东西）
+        assert!(!has_token("https://never-saved.example.invalid/mcp"));
+
+        // 坏掉的 / 半份的当没有；解析得出来的才算有。用临时目录，别往数据目录写
+        let dir = std::env::temp_dir().join(format!("claudesktop-mcp-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = "https://has-token-test.example.invalid/mcp";
+        let path = dir.join(format!("{}.json", file_stem(server)));
+        assert!(!has_token_file(&path));
+        std::fs::write(&path, "{ 坏掉的 json").unwrap();
+        assert!(!has_token_file(&path));
+        let token = Token { server: server.into(), access_token: "at".into(), ..Token::default() };
+        std::fs::write(&path, serde_json::to_string(&token).unwrap()).unwrap();
+        assert!(has_token_file(&path));
+        // 过期到没法续的 token 文件仍然算「存着登录状态」：清除按钮就该出现
+        let stale =
+            Token { refresh_token: None, expires_at_ms: Some(now_ms().saturating_sub(1)), ..token };
+        std::fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
+        assert!(has_token_file(&path));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

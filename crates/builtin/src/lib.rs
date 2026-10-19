@@ -1947,6 +1947,10 @@ impl Kernel for BuiltinKernel {
         self.inner.mcp.reconnect(server);
     }
 
+    fn clear_mcp_auth(&self, server: &str) -> anyhow::Result<()> {
+        self.inner.mcp.clear_auth(server).map_err(|e| anyhow::anyhow!(e))
+    }
+
     /// 会话结束（切走 / 关掉）时把它起的后台命令停掉：模型再也读不到输出了。
     fn close_session(&self, session: &str) {
         bgtasks::stop_session(session);

@@ -214,6 +214,23 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 清除一个远程服务存着的登录状态（OAuth 令牌）：内核删掉令牌文件、断开并重连，
+    /// 服务器要授权的话会重新走到「需要登录」。结果用提示消息报（不属于任何对话）。
+    fn clear_mcp_auth(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(kernel) = self.kernel_of(KernelChoice::Builtin) else {
+            self.toast(
+                Notification::error("自研内核没在运行，清除不了登录状态；先发一条消息把内核起来"),
+                cx,
+            );
+            return;
+        };
+        match kernel.clear_mcp_auth(name) {
+            Ok(()) => self.toast(Notification::success(format!("已清除「{name}」的登录状态")), cx),
+            Err(err) => self.toast(Notification::error(format!("清除登录状态失败：{err}")), cx),
+        }
+        cx.notify();
+    }
+
     pub(super) fn render_mcp(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let path =
             default_mcp_config().map_or_else(|| "mcp.json".into(), |p| p.display().to_string());
@@ -267,6 +284,8 @@ impl ChatApp {
                         plugin: None,
                         url: (c.transport != mcp::Transport::Stdio).then(|| c.url.clone()),
                         retry: false,
+                        // 令牌存在数据目录里，界面这一层不读它：内核起来之后才有这个信息
+                        has_auth: false,
                         name: c.name,
                     })
                     .collect(),
@@ -278,6 +297,7 @@ impl ChatApp {
                     plugin: None,
                     url: None,
                     retry: false,
+                    has_auth: false,
                 }],
                 None => Vec::new(),
             }
@@ -455,6 +475,7 @@ impl ChatApp {
         let retry_name = server.name.clone();
         let toggle_name = server.name.clone();
         let remove_name = server.name.clone();
+        let clear_name = server.name.clone();
         let confirming = self.mcp_form.confirm_remove.as_deref() == Some(server.name.as_str());
         div()
             .v_flex()
@@ -510,6 +531,27 @@ impl ChatApp {
                                 .with_variant(ButtonVariant::Secondary)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.reconnect_mcp(&retry_name, cx)
+                                })),
+                        )
+                    })
+                    // 存着登录令牌的远程服务：给一条「清除登录状态」（危险操作，只留红字、悬停出底色）
+                    .when(server.has_auth && running, |d| {
+                        d.child(
+                            Button::new(("mcp-clear-auth", i))
+                                .small()
+                                .label("清除登录状态")
+                                .cursor_pointer()
+                                .tooltip(
+                                    "删掉存着的登录令牌，然后重新连接；要授权时会重新给「登录」",
+                                )
+                                .custom(
+                                    ButtonCustomVariant::new(cx)
+                                        .foreground(rgb(RED).into())
+                                        .hover(rgb(HOVER).into())
+                                        .active(rgb(HOVER).into()),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.clear_mcp_auth(&clear_name, cx)
                                 })),
                         )
                     })
