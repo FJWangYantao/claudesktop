@@ -688,7 +688,7 @@ fn write_asks_permission_and_allow_always_is_remembered() {
     let sid = h.start();
     h.kernel.send_prompt(&sid, UserPrompt::text("写 a")).unwrap();
     let (req, options) = h.permission(1);
-    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once", "reject_always"]);
     // 应答前不执行
     assert!(!dir.join("out/a.txt").exists());
     h.kernel.resolve_permission(req, Some("allow_always".into())).unwrap();
@@ -711,6 +711,41 @@ fn write_asks_permission_and_allow_always_is_remembered() {
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 1);
     assert_eq!(std::fs::read_to_string(dir.join("out/b.txt")).unwrap(), "B");
     assert_eq!(bodies.lock().unwrap().len(), 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reject_always_saves_a_deny_rule_and_skips_asking_next_time() {
+    let dir = workdir("reject");
+    let (base, bodies) = serve(vec![
+        tool_call("w1", "write_file", serde_json::json!({ "path": "out/a.txt", "content": "A" })),
+        happy_stream("好，那我不写了"),
+        tool_call("w2", "write_file", serde_json::json!({ "path": "out/b.txt", "content": "B" })),
+        happy_stream("还是不行，好吧"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("写 a")).unwrap();
+    let (req, options) = h.permission(1);
+    assert_eq!(options.last().unwrap(), "reject_always");
+    h.kernel.resolve_permission(req, Some("reject_always".into())).unwrap();
+    h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 没有写文件
+    assert!(!dir.join("out/a.txt").exists());
+    // 第二轮：拒绝规则命中，不再弹权限卡，直接按拒绝回给模型
+    h.kernel.send_prompt(&sid, UserPrompt::text("再写 b")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 1);
+    assert!(!dir.join("out/b.txt").exists());
+    // 模型收到了拒绝说明
+    let second = body(&bodies, 2);
+    let denied = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .any(|m| m["content"].as_str().unwrap().contains("always denies"));
+    assert!(denied);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -793,7 +828,7 @@ fn rejected_call_is_reported_to_the_model() {
     let sid = h.start();
     h.kernel.send_prompt(&sid, UserPrompt::text("跑个命令")).unwrap();
     let (req, options) = h.permission(1);
-    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once", "reject_always"]);
     h.kernel.resolve_permission(req, Some("reject_once".into())).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.tool_status("s1").as_deref(), Some("failed"));
@@ -869,7 +904,7 @@ fn web_fetch_asks_per_host_even_in_plan_mode_and_converts_html() {
     h.kernel.set_mode(&sid, "plan").unwrap();
     h.kernel.send_prompt(&sid, UserPrompt::text("看下文档")).unwrap();
     let (req, options) = h.permission(1);
-    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once", "reject_always"]);
     h.kernel.resolve_permission(req, Some("allow_always".into())).unwrap();
     h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.tool_status("f1").as_deref(), Some("completed"));
@@ -1512,7 +1547,7 @@ fn mcp_tools_are_offered_asked_and_called() {
     h.kernel.send_prompt(&sid, UserPrompt::text("调 echo")).unwrap();
     // MCP 工具一律要问；「总是允许」按服务器 + 工具记
     let (req, options) = h.permission(1);
-    assert_eq!(options, ["allow_once", "allow_always", "reject_once"]);
+    assert_eq!(options, ["allow_once", "allow_always", "reject_once", "reject_always"]);
     h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
     h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.tool_status("m1").as_deref(), Some("completed"));

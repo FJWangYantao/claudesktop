@@ -117,6 +117,8 @@ pub enum HookEvent {
     PreToolUse,
     /// 工具执行完；退出码 2 = 把原因追加到工具结果里给模型看
     PostToolUse,
+    /// 压缩上下文前；只是通知（拦下没有意义：拦了上下文照涨），输出并进总结请求
+    PreCompact,
     /// 一轮结束后；只是通知，结果不影响这一轮
     Stop,
     /// 子 agent 跑完、结果交回主会话前；只是通知
@@ -124,11 +126,12 @@ pub enum HookEvent {
 }
 
 impl HookEvent {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::SessionStart,
         Self::UserPromptSubmit,
         Self::PreToolUse,
         Self::PostToolUse,
+        Self::PreCompact,
         Self::Stop,
         Self::SubagentStop,
     ];
@@ -140,6 +143,7 @@ impl HookEvent {
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
+            Self::PreCompact => "PreCompact",
             Self::Stop => "Stop",
             Self::SubagentStop => "SubagentStop",
         }
@@ -152,6 +156,7 @@ impl HookEvent {
             Self::UserPromptSubmit => "提交消息",
             Self::PreToolUse => "执行工具前",
             Self::PostToolUse => "执行工具后",
+            Self::PreCompact => "压缩上下文前",
             Self::Stop => "一轮结束",
             Self::SubagentStop => "子任务结束",
         }
@@ -842,6 +847,7 @@ mod tests {
         write(
             &root.join("hooks/hooks.json"),
             r#"{"hooks": {"PreToolUse": [{"matcher": "Write|Edit", "hooks": [{"type": "command", "command": "check.sh", "timeout": 5}]}],
+                "PreCompact": [{"hooks": [{"type": "command", "command": "note.sh"}]}],
                 "Bogus": []}}"#,
         );
 
@@ -877,9 +883,10 @@ mod tests {
         let remote = &p.mcp_servers[1];
         assert_eq!((remote.url.as_str(), remote.sse), ("https://x/sse", true));
         assert_eq!(remote.headers.get("X-Root"), Some(&root_text));
-        assert_eq!(p.hooks.len(), 1);
+        assert_eq!(p.hooks.len(), 2);
         assert_eq!(p.hooks[0].event, HookEvent::PreToolUse);
         assert_eq!(p.hooks[0].timeout, Duration::from_secs(5));
+        assert_eq!(p.hooks[1].event, HookEvent::PreCompact);
         // 缺命令的 MCP、不认识的时机记成问题，其余照常
         assert_eq!(p.problems.len(), 2, "{:?}", p.problems);
         let _ = std::fs::remove_dir_all(&dir);

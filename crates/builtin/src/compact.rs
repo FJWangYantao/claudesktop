@@ -149,16 +149,26 @@ Write in the language the user writes in. Use Markdown headings and bullet lists
 Do not add a preamble or closing remarks.";
 
 /// 总结请求：系统提示词 + 一条用户消息（之前的摘要 + 这段记录 + 要求）。
-pub fn summary_request(previous: Option<&str>, transcript: &str) -> Vec<ChatMessage> {
+/// `hook_context` = `PreCompact` 钩子的补充说明（如「别忘了 X」），插在要求前。
+pub fn summary_request(
+    previous: Option<&str>,
+    transcript: &str,
+    hook_context: &[String],
+) -> Vec<ChatMessage> {
     let mut body = String::new();
     if let Some(prev) = previous {
         body.push_str(&format!(
             "<earlier-summary>\nA summary of the conversation before the part below:\n\n{prev}\n</earlier-summary>\n\n"
         ));
     }
-    body.push_str(&format!(
-        "<conversation>\n{transcript}\n</conversation>\n\n{SUMMARY_INSTRUCTIONS}"
-    ));
+    body.push_str(&format!("<conversation>\n{transcript}\n</conversation>\n\n"));
+    if !hook_context.is_empty() {
+        body.push_str(&format!(
+            "<plugin-hook-context>\n{}\n</plugin-hook-context>\n\n",
+            hook_context.join("\n\n")
+        ));
+    }
+    body.push_str(SUMMARY_INSTRUCTIONS);
     vec![ChatMessage::new("system", SUMMARY_SYSTEM), ChatMessage::new("user", body)]
 }
 
@@ -257,11 +267,22 @@ mod tests {
 
     #[test]
     fn summary_request_carries_the_previous_summary() {
-        let req = summary_request(Some("旧摘要"), "记录");
+        let req = summary_request(Some("旧摘要"), "记录", &[]);
         assert_eq!(req[0].role, "system");
         let body = req[1].text().unwrap();
         assert!(body.contains("旧摘要") && body.contains("<conversation>\n记录"), "{body}");
-        assert!(!summary_request(None, "记录")[1].text().unwrap().contains("earlier-summary"));
+        assert!(!summary_request(None, "记录", &[])[1].text().unwrap().contains("earlier-summary"));
+    }
+
+    #[test]
+    fn summary_request_carries_hook_context() {
+        let body =
+            summary_request(None, "记录", &["别忘了构建脚本".into()])[1].text().unwrap().to_owned();
+        assert!(
+            body.contains("<plugin-hook-context>\n别忘了构建脚本\n</plugin-hook-context>"),
+            "{body}"
+        );
+        assert!(body.ends_with("Do not add a preamble or closing remarks."), "{body}");
     }
 
     #[test]

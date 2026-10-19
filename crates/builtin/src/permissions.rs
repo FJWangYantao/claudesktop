@@ -1,7 +1,7 @@
-//! 「总是允许」规则：按项目（工作目录）保存，落盘到数据目录的 `permissions.json`。
+//! 「总是允许 / 总是拒绝」规则：按项目（工作目录）保存，落盘到数据目录的 `permissions.json`。
 //!
 //! 规则形如 `edit`（本项目内的文件编辑）、`shell:git status`（以这些词开头的
-//! 非复合命令）。
+//! 非复合命令）；拒绝规则多一层前缀：`deny:edit`、`deny:shell:rm`。
 //!
 //! 文件是唯一的真相：每次判断前都重新读（文件很小），这样设置页里删掉的规则
 //! 不用重启内核就生效；写入时也先读再改，不会覆盖别处的修改。
@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// 拒绝规则在存储里的前缀（界面和内核判断时剥掉）。
+pub const DENY_PREFIX: &str = "deny:";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FileFormat {
@@ -60,7 +63,7 @@ impl PermissionRules {
         std::fs::rename(&tmp, path)
     }
 
-    /// 全部规则：(项目目录, 规则)，按项目、规则排序。
+    /// 全部规则：(项目目录, 规则)，按项目、规则排序。拒绝规则带 `deny:` 前缀。
     pub fn list(&self) -> Vec<(String, Vec<String>)> {
         self.data
             .projects
@@ -86,25 +89,50 @@ impl PermissionRules {
         cwd.display().to_string()
     }
 
-    /// 这条动作是否被已保存的规则覆盖。`rule` 来自 [`crate::tools::Action::rule`]，
+    /// 这条动作是否命中已保存的拒绝规则。`rule` 来自 [`crate::tools::Action::rule`]，
     /// `command` 为 shell 命令原文（shell 规则按词前缀匹配）。
+    pub fn denies(&mut self, cwd: &Path, rule: &str, command: Option<&str>) -> bool {
+        self.matching(cwd, rule, command, DENY_PREFIX)
+    }
+
+    /// 这条动作是否被已保存的允许规则覆盖。
     pub fn allows(&mut self, cwd: &Path, rule: &str, command: Option<&str>) -> bool {
+        self.matching(cwd, rule, command, "")
+    }
+
+    /// 在当前项目的规则里找 `prefix` 前缀（`""` = 允许、`deny:` = 拒绝）下
+    /// 与 `rule` 匹配的一条。shell 规则按词前缀匹配，其余按整串相等。
+    fn matching(&mut self, cwd: &Path, rule: &str, command: Option<&str>, prefix: &str) -> bool {
         self.reload();
         let Some(rules) = self.data.projects.get(&Self::key(cwd)) else {
             return false;
         };
+        let stored_prefix = format!("{prefix}shell:");
         match (rule.strip_prefix("shell:"), command) {
             (Some(_), Some(command)) => rules
                 .iter()
-                .filter_map(|r| r.strip_prefix("shell:"))
+                .filter_map(|r| r.strip_prefix(&stored_prefix))
                 .any(|r| shell_rule_matches(r, command)),
-            _ => rules.contains(rule),
+            _ => rules.contains(&format!("{prefix}{rule}")),
         }
     }
 
-    /// 添加一条规则并立即落盘（原子写）。
+    /// 添加一条规则并立即落盘（原子写）。拒绝规则带 `deny:` 前缀。
     pub fn add(&mut self, cwd: &Path, rule: String) -> io::Result<()> {
         self.reload();
+        // 同一动作允许和拒绝不会同时存：加一边时把整串相反的那条删掉（后写的赢）；
+        // shell 规则前缀重叠的细粒度情况留给用户在设置页里自己清理
+        let opposite = if let Some(rest) = rule.strip_prefix(DENY_PREFIX) {
+            rest.to_string()
+        } else {
+            format!("{DENY_PREFIX}{rule}")
+        };
+        if let Some(rules) = self.data.projects.get_mut(&Self::key(cwd)) {
+            rules.remove(&opposite);
+            if rules.is_empty() {
+                self.data.projects.remove(&Self::key(cwd));
+            }
+        }
         self.data.projects.entry(Self::key(cwd)).or_default().insert(rule);
         self.save()
     }
@@ -143,6 +171,50 @@ mod tests {
         assert!(!rules.allows(a, "edit", None));
         other.remove(&key, "shell:git status").unwrap();
         assert!(other.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deny_rules_win_and_replace_allows() {
+        let dir =
+            std::env::temp_dir().join(format!("claudesktop-perm-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("permissions.json");
+        let project = Path::new("/proj/a");
+
+        // 先允许、再拒绝：只剩拒绝
+        let mut rules = PermissionRules::load(Some(file.clone()));
+        rules.add(project, "edit".into()).unwrap();
+        rules.add(project, "deny:edit".into()).unwrap();
+        assert!(rules.denies(project, "edit", None));
+        assert!(!rules.allows(project, "edit", None));
+        assert_eq!(rules.list(), vec![("/proj/a".into(), vec!["deny:edit".to_string()])]);
+
+        // shell 拒绝按词前缀匹配，不影响别的命令
+        rules.add(project, "deny:shell:rm".into()).unwrap();
+        assert!(rules.denies(project, "shell:rm", Some("rm -rf target")));
+        assert!(!rules.denies(project, "shell:git", Some("git status")));
+
+        // 拒绝换回允许：拒绝那条被替换掉
+        rules.add(project, "shell:rm".into()).unwrap();
+        assert!(!rules.denies(project, "shell:rm", Some("rm -rf target")));
+        assert!(rules.allows(project, "shell:rm", Some("rm -rf target")));
+
+        // 另一个项目不受影响
+        assert!(!rules.denies(Path::new("/proj/b"), "edit", None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_files_without_deny_rules_still_load() {
+        let dir = std::env::temp_dir().join(format!("claudesktop-perm-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("permissions.json");
+        std::fs::write(&file, r#"{"projects":{"/old":["edit"]}}"#).unwrap();
+        let mut rules = PermissionRules::load(Some(file));
+        assert!(rules.allows(Path::new("/old"), "edit", None));
+        assert!(!rules.denies(Path::new("/old"), "edit", None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

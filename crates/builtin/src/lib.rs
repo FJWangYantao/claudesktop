@@ -37,7 +37,7 @@ mod tools;
 
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
-pub use permissions::{PermissionRules, default_rules_path};
+pub use permissions::{DENY_PREFIX, PermissionRules, default_rules_path};
 
 pub use provider::{
     ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, Protocol, ProviderConfig,
@@ -495,7 +495,15 @@ impl Inner {
             state.measured = Some((tokens, state.history.len().saturating_sub(unmeasured)));
         }
     }
+}
 
+/// 进总结请求的既有内容：之前压缩留下的摘要 + `PreCompact` 钩子的补充说明。
+struct SummaryInput<'a> {
+    previous: Option<&'a str>,
+    hook_context: &'a [String],
+}
+
+impl Inner {
     /// 压缩上下文：挑切点、请模型总结、换掉历史（规则见 `compact` 模块）。
     /// `idle` = 手动压缩（没有进行中的一轮），全部进摘要；`keep_budget` 是保留尾部的 token 预算。
     /// 开始和结果都报给 UI（`Compacting` → `Compacted` / `CompactFailed`）。
@@ -518,12 +526,33 @@ impl Inner {
         let Some(split) = compact::split(&history, keep_budget, idle) else {
             return Ok(None);
         };
+        // 压缩前跑 PreCompact 钩子：只是通知 + 输出并进总结请求（拦下没有意义，拦了上下文照涨）
+        let cwd = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(|| self.default_cwd.clone());
+        let (hook_context, blocked) = self.run_hooks(
+            session,
+            &cwd,
+            HookEvent::PreCompact,
+            None,
+            json!({ "trigger": if idle { "manual" } else { "auto" } }),
+        );
+        if let Some(reason) = blocked {
+            self.emit(
+                Some(session),
+                KernelEvent::Notice(format!("插件钩子不支持拦下压缩（{reason}），已照常压缩")),
+            );
+        }
         self.emit(Some(session), KernelEvent::Compacting);
         let result = self.summarize(
             session,
             model,
             &history[..split.tail_from],
-            previous.as_deref(),
+            SummaryInput { previous: previous.as_deref(), hook_context: &hook_context },
             transcript_bytes,
             &stopped,
         );
@@ -555,19 +584,25 @@ impl Inner {
     }
 
     /// 请模型把一段对话写成摘要（不带工具）。记录太长、总结请求本身也超限时，记录减半再试，最多两次。
+    /// `summary_input` 汇总了进总结请求的既有内容（旧摘要 + `PreCompact` 钩子的补充说明）。
     fn summarize(
         &self,
         session: &str,
         model: &str,
         head: &[ChatMessage],
-        previous: Option<&str>,
+        summary_input: SummaryInput<'_>,
         mut max_bytes: usize,
         stopped: &dyn Fn() -> bool,
     ) -> anyhow::Result<(String, Option<Usage>)> {
+        let SummaryInput { previous, hook_context } = summary_input;
         let _tag = gateway::tag(session, "compact", self.turn_number(session));
         let mut attempt = 0;
         loop {
-            let request = compact::summary_request(previous, &compact::transcript(head, max_bytes));
+            let request = compact::summary_request(
+                previous,
+                &compact::transcript(head, max_bytes),
+                hook_context,
+            );
             let mut text = String::new();
             let result =
                 self.provider.stream_chat(
@@ -1004,28 +1039,49 @@ impl Inner {
             Action::Shell { command, .. } => Some(command.as_str()),
             _ => None,
         };
-        if let Some(rule) = &rule
-            && self.rules.lock().unwrap().allows(cwd, rule, command)
         {
-            return Verdict::Allow;
+            let mut rules = self.rules.lock().unwrap();
+            // 拒绝规则优先：命中就不问，直接按「用户拒绝」回给模型
+            if let Some(rule) = &rule
+                && rules.denies(cwd, rule, command)
+            {
+                return Verdict::Deny(
+                    "The user has a saved rule that always denies this action. \
+                     Do not retry it; stop and ask the user how they would like to proceed \
+                     (the rule can be removed in Settings)."
+                        .into(),
+                );
+            }
+            if let Some(rule) = &rule
+                && rules.allows(cwd, rule, command)
+            {
+                return Verdict::Allow;
+            }
         }
 
         let option =
             |id: &str, name: String| PermissionOptionView { id: id.into(), name, kind: id.into() };
+        // 「总是」两个选项的文案：kind = allow_always / reject_always
+        let always_name = |rule: &str, deny: bool| {
+            let verb = if deny { "拒绝" } else { "允许" };
+            if let Some(prefix) = rule.strip_prefix("shell:") {
+                format!("本项目内总是{verb}「{prefix}」开头的命令")
+            } else if let Some(host) = rule.strip_prefix("fetch:") {
+                format!("本项目内总是{verb}访问 {host}")
+            } else if let Some(tool) = rule.strip_prefix("mcp:") {
+                format!("本项目内总是{verb} {}", tool.replacen(':', " 的 ", 1))
+            } else {
+                format!("本项目内总是{verb}编辑")
+            }
+        };
         let mut options = vec![option("allow_once", "允许一次".into())];
         if let Some(rule) = &rule {
-            let name = if let Some(prefix) = rule.strip_prefix("shell:") {
-                format!("总是允许「{prefix}」开头的命令")
-            } else if let Some(host) = rule.strip_prefix("fetch:") {
-                format!("本项目内总是允许访问 {host}")
-            } else if let Some(tool) = rule.strip_prefix("mcp:") {
-                format!("本项目内总是允许 {}", tool.replacen(':', " 的 ", 1))
-            } else {
-                "本项目内总是允许编辑".into()
-            };
-            options.push(option("allow_always", name));
+            options.push(option("allow_always", always_name(rule, false)));
         }
         options.push(option("reject_once", "拒绝".into()));
+        if let Some(rule) = &rule {
+            options.push(option("reject_always", always_name(rule, true)));
+        }
 
         match self.ask(session, title, tool, options, stopped).as_deref() {
             Some("allow_once") => Verdict::Allow,
@@ -1036,6 +1092,22 @@ impl Inner {
                     self.emit(None, KernelEvent::Status(format!("保存权限规则失败: {e}")));
                 }
                 Verdict::Allow
+            }
+            Some("reject_always") => {
+                if let Some(rule) = rule
+                    && let Err(e) = self
+                        .rules
+                        .lock()
+                        .unwrap()
+                        .add(cwd, format!("{}{}", permissions::DENY_PREFIX, rule))
+                {
+                    self.emit(None, KernelEvent::Status(format!("保存权限规则失败: {e}")));
+                }
+                Verdict::Deny(
+                    "The user denied this tool call and saved a rule that always denies it. \
+                     Do not retry it in this session; ask the user how they would like to proceed."
+                        .into(),
+                )
             }
             _ => Verdict::Deny(
                 "The user denied this tool call. Do not retry it; \

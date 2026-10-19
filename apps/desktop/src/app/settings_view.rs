@@ -832,7 +832,7 @@ impl ChatApp {
                 "还没有记下的规则",
                 &[
                     "自研内核要运行命令、改文件或访问网站时，对话里会弹出权限卡片问你",
-                    "在卡片上选「总是允许」，这个项目里同类的操作以后就不再询问",
+                    "选「总是允许」或「总是拒绝」，这个项目里同类的操作以后不再询问（拒绝的直接拦下）",
                     "记下的规则列在这里；不想要了点 × 删掉，下次会重新问你",
                 ],
             ))
@@ -1699,19 +1699,32 @@ fn model_menu_items(
 
 /// 规则 → 给人看的说明
 fn rule_label(rule: &str) -> String {
+    // 拒绝规则带一层前缀：剥掉后复用允许规则的文案，再改「总是拒绝」的说法
+    let (deny, rule) = match rule.strip_prefix(claudesktop_builtin::DENY_PREFIX) {
+        Some(rest) => (true, rest),
+        None => (false, rule),
+    };
     if let Some(prefix) = rule.strip_prefix("shell:") {
-        format!("运行以「{prefix}」开头的命令")
+        let verb = if deny { "总是拒绝运行" } else { "运行" };
+        format!("{verb}以「{prefix}」开头的命令")
     } else if let Some(host) = rule.strip_prefix("fetch:") {
-        format!("访问网站 {host}")
+        format!("{}网站 {host}", if deny { "总是拒绝访问" } else { "访问" })
     } else if let Some(tool) = rule.strip_prefix("mcp:") {
-        format!("调用 MCP 工具 {}", tool.replacen(':', " 的 ", 1))
+        format!(
+            "{} MCP 工具 {}",
+            if deny { "总是拒绝调用" } else { "调用" },
+            tool.replacen(':', " 的 ", 1)
+        )
     } else if rule == "edit" {
-        "编辑项目内的文件".into()
+        if deny {
+            "总是拒绝编辑项目内的文件".into()
+        } else {
+            "编辑项目内的文件".into()
+        }
     } else {
         rule.to_string()
     }
 }
-
 /// 界面字体下拉的条目：第一项是内嵌的 Inter，后面跟系统已装字体（可滚动，最多列一批）。
 /// 当前项打勾；列不完的靠「还有 N 款」提示，需要的话在设置文件里手写字体名。
 fn font_family_menu_items(
