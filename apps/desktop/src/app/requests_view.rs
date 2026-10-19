@@ -104,12 +104,31 @@ struct DerivedKey {
 }
 
 impl ChatApp {
-    /// 在「请求」页签上、日志还没按当前范围读过：在后台读。
+    /// 在「请求」页签上（首页或设置页「用量」）、日志还没按当前范围读过：在后台读。
     pub(super) fn sync_requests(&mut self, cx: &mut Context<Self>) {
+        let shown = if self.settings_open {
+            self.settings_form.tab == super::usage_view::USAGE_TAB
+                && self.usage_page.view == super::usage_view::UsageView::Requests
+        } else {
+            self.overview_tab == 2
+        };
         let v = &self.requests_view;
-        if self.overview_tab == 2 && !v.loading && v.loaded_range != Some(self.overview_range) {
+        if shown && !v.loading && v.loaded_range != Some(self.overview_range) {
             self.load_requests(cx);
         }
+    }
+
+    /// 只看某个模型 / 某个会话的请求（设置页「用量」里模型、会话的「看请求」）。
+    pub(super) fn filter_requests(&mut self, model: Option<String>, session: Option<u64>) {
+        let v = &mut self.requests_view;
+        v.model = model;
+        v.session = session;
+        v.more = 0;
+    }
+
+    /// 列表所在的整页滚动区：首页，或设置页（「用量 → 请求」）。
+    fn list_scroll(&self) -> &ScrollHandle {
+        if self.settings_open { &self.settings_scroll } else { &self.home_scroll }
     }
 
     fn load_requests(&mut self, cx: &mut Context<Self>) {
@@ -470,11 +489,12 @@ impl ChatApp {
         let state = self.requests_view.window.clone();
         let rem = crate::theme::root_font_size();
         let (gap, line) = (rems(0.375).to_pixels(rem), TEXT_SMALL.to_pixels(rem));
-        let viewport = self.home_scroll.bounds().size.height;
+        let scroll = self.list_scroll().clone();
+        let viewport = scroll.bounds().size.height;
         // 滚过头（顶上再往上、底下再往下）时滚动区要到排版之后才把位置收回来，这里先自己收住，
         // 否则这一帧按越界的位置算，视口里一片空白
-        let max = self.home_scroll.max_offset().y.max(px(0.));
-        let scrolled = (-self.home_scroll.offset().y).clamp(px(0.), max);
+        let max = scroll.max_offset().y.max(px(0.));
+        let scrolled = (-scroll.offset().y).clamp(px(0.), max);
         // 视口在列表里的范围；还没画过（不知道列表在哪）就先排一屏
         let (lo, hi) = match state.borrow().top {
             Some(top) if viewport > px(0.) => {
@@ -508,7 +528,6 @@ impl ChatApp {
             .collect();
         // list 里排在这几轮前面的子元素：量位置的 canvas、上面的空白
         let skip = 1 + usize::from(before > gap);
-        let scroll = self.home_scroll.clone();
         let top_state = state.clone();
         // 量列表顶端在滚动内容里的位置（上面的统计卡片变高时会变）；绝对定位，不占行距
         let probe = canvas(
