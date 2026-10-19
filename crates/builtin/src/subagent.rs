@@ -130,8 +130,13 @@ pub fn forward(call: &str, event: KernelEvent) -> Option<KernelEvent> {
             KernelEvent::ToolCallUpdated { id: id(i), title, status, raw_output, output }
         }
         KernelEvent::ToolCallDiff { id: i, diff } => KernelEvent::ToolCallDiff { id: id(i), diff },
-        KernelEvent::PermissionRequest { id, title, options } => {
-            KernelEvent::PermissionRequest { id, title: format!("子任务 · {title}"), options }
+        KernelEvent::PermissionRequest { id: req, title, options, tool } => {
+            KernelEvent::PermissionRequest {
+                id: req,
+                title: format!("子任务 · {title}"),
+                options,
+                tool: tool.map(id),
+            }
         }
         e @ (KernelEvent::FileChanged { .. }
         | KernelEvent::Retrying { .. }

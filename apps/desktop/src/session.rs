@@ -304,11 +304,14 @@ impl Session {
                     }
                 }
                 Record::PermissionResolved { id, label } => {
-                    let item = s.transcript.iter_mut().rev().find(|i| {
+                    let at = s.transcript.iter().rposition(|i| {
                         matches!(i, ChatItem::Permission { id: pid, resolved: None, .. } if *pid == id)
                     });
-                    if let Some(ChatItem::Permission { resolved, .. }) = item {
-                        *resolved = Some(label.into());
+                    if let Some(at) = at {
+                        if let ChatItem::Permission { resolved, .. } = &mut s.transcript[at] {
+                            *resolved = Some(label.into());
+                        }
+                        s.merge_permission(at);
                     }
                 }
                 Record::Rewind { conversation, files, prompt, .. } => {
@@ -338,6 +341,7 @@ impl Session {
                 _ => {}
             }
         }
+        s.merge_permissions();
         // 关应用时这一轮还在跑：补一张卡片说清楚，并给「继续」（不然只剩几行「已中断」，不知道下一步）
         if unfinished {
             s.transcript.push(ChatItem::Failed {
@@ -747,11 +751,16 @@ impl Session {
                     );
                 }
                 ChatItem::Tool(card) => {
-                    out += &format!("> **{}** `{}` → {}\n\n", card.name, card.arg, card.result);
+                    out += &format!("> **{}** `{}` → {}", card.name, card.arg, card.result);
+                    if let Some(grant) = &card.grant {
+                        out += &format!("（{}）", grant.label);
+                    }
+                    out += "\n\n";
                 }
                 ChatItem::AutoApproved { title, chosen } => {
                     out += &format!("> 已自动批准 `{title}`（{chosen}）\n\n");
                 }
+                ChatItem::Permission { merged: true, .. } => {}
                 ChatItem::Permission { title, resolved, .. } => {
                     let state = resolved.as_deref().unwrap_or("待处理");
                     out += &format!("> 权限请求 `{title}`（{state}）\n\n");
@@ -825,6 +834,54 @@ impl Session {
                 Ok(()) => label,
                 Err(err) => format!("应答失败：{err}").into(),
             });
+            self.merge_permission(idx);
+        }
+    }
+
+    /// 应答过的权限请求并进它的工具行（工具行末尾出「已允许」之类的短标签），这一行不再画。
+    /// 找不到工具行（旧日志没有工具 ID）、认不出选的是什么或应答失败时，照旧单独一行。
+    fn merge_permission(&mut self, idx: usize) {
+        let Some(ChatItem::Permission {
+            tool: Some(tool),
+            options,
+            resolved: Some(label),
+            merged: false,
+            ..
+        }) = self.transcript.get(idx)
+        else {
+            return;
+        };
+        let grant = if label.as_ref() == "已取消" {
+            Grant::from_choice(None, label.clone())
+        } else {
+            match options.iter().find(|o| o.name == label.as_ref()) {
+                Some(option) => Grant::from_choice(Some(&option.kind), label.clone()),
+                None => return,
+            }
+        };
+        let tool = tool.clone();
+        let card = self.transcript.iter_mut().rev().find_map(|i| match i {
+            ChatItem::Tool(card) if card.id.as_deref() == Some(tool.as_str()) => Some(card),
+            _ => None,
+        });
+        let Some(card) = card else {
+            return;
+        };
+        card.grant = Some(grant);
+        if let Some(ChatItem::Permission { merged, .. }) = self.transcript.get_mut(idx) {
+            *merged = true;
+        }
+    }
+
+    /// 把所有应答过、还没并进工具行的权限请求并过去（重放收尾、整轮取消时用）。
+    fn merge_permissions(&mut self) {
+        for idx in 0..self.transcript.len() {
+            if matches!(
+                self.transcript[idx],
+                ChatItem::Permission { resolved: Some(_), merged: false, .. }
+            ) {
+                self.merge_permission(idx);
+            }
         }
     }
 
@@ -841,6 +898,7 @@ impl Session {
                 *resolved = Some("已取消".into());
             }
         }
+        self.merge_permissions();
     }
 
     /// 回退对话：对话截到第 `idx` 行之前（那条用户消息起都不要了），挂在这些行上的状态一并清掉。
@@ -1007,6 +1065,7 @@ impl Session {
                     diffs: Vec::new(),
                     expanded: false,
                     sub: parent.is_some(),
+                    grant: None,
                 });
                 match at {
                     Some(i) => self.transcript.insert(i, card),
@@ -1055,17 +1114,35 @@ impl Session {
                     None => self.transcript.push(ChatItem::Plan(rows)),
                 }
             }
-            KernelEvent::PermissionAuto { title, chosen } => {
-                self.transcript
-                    .push(ChatItem::AutoApproved { title: title.into(), chosen: chosen.into() });
+            KernelEvent::PermissionAuto { title, chosen, tool } => {
+                // 知道是哪个工具调用的：标在那一行上，不另起一行
+                let card = tool.and_then(|tool| {
+                    self.transcript.iter_mut().rev().find_map(|i| match i {
+                        ChatItem::Tool(card) if card.id.as_deref() == Some(tool.as_str()) => {
+                            Some(card)
+                        }
+                        _ => None,
+                    })
+                });
+                match card {
+                    Some(card) => {
+                        card.grant = Some(Grant { kind: GrantKind::Auto, label: chosen.into() })
+                    }
+                    None => self.transcript.push(ChatItem::AutoApproved {
+                        title: title.into(),
+                        chosen: chosen.into(),
+                    }),
+                }
             }
-            KernelEvent::PermissionRequest { id, title, options } => {
+            KernelEvent::PermissionRequest { id, title, options, tool } => {
                 self.finish_thinking();
                 self.transcript.push(ChatItem::Permission {
                     id,
                     title: title.into(),
                     options,
                     resolved: None,
+                    tool,
+                    merged: false,
                 });
             }
             KernelEvent::Compacting => {
@@ -1181,6 +1258,7 @@ impl Session {
                     diffs: Vec::new(),
                     expanded: false,
                     sub: false,
+                    grant: None,
                 }));
             }
             MockAction::ToolDone(result) => {
@@ -1283,6 +1361,7 @@ mod tests {
             diffs: Vec::new(),
             expanded: false,
             sub: false,
+            grant: None,
         };
         let tool = ChatItem::Tool(card);
         let row = PlanRow { status: PlanStatus::Pending, text: "第一步".into() };
@@ -1318,6 +1397,7 @@ mod tests {
                 diffs: Vec::new(),
                 expanded: false,
                 sub: false,
+                grant: None,
             })
         };
         s.transcript = vec![
@@ -1378,6 +1458,8 @@ mod tests {
                 name: "Yes".into(),
                 kind: "allow_once".into(),
             }],
+            // 旧日志：不知道是哪个工具调用的，应答后照旧单独一行
+            tool: None,
         })
     }
 
@@ -1670,6 +1752,7 @@ mod tests {
             diffs: Vec::new(),
             expanded: false,
             sub: false,
+            grant: None,
         }));
         // 用户停下：等内核回结束，期间工具行不该一直转圈
         s.busy = false;
@@ -1979,7 +2062,11 @@ mod tests {
             None,
         );
         s.apply_event(
-            KernelEvent::PermissionAuto { title: "Bash ls".into(), chosen: "总是允许".into() },
+            KernelEvent::PermissionAuto {
+                title: "Bash ls".into(),
+                chosen: "总是允许".into(),
+                tool: None,
+            },
             None,
         );
         s.apply_event(read("c"), None);
@@ -1989,6 +2076,77 @@ mod tests {
         assert!(l[3].body && l[3].head.is_none());
         assert_eq!(l[4].head.unwrap().end, 6);
         assert!(matches!(s.transcript[4], ChatItem::AutoApproved { .. }));
+    }
+
+    /// 带工具 ID 的权限请求：应答后结果标在工具行上，这一行不再画，也不把前后的步骤拆成两组；
+    /// 自动批准同样标在工具行上。
+    #[core::prelude::v1::test]
+    fn answered_permissions_merge_into_their_tool_rows() {
+        let ask = |id: u64, tool: &str| {
+            ev(KernelEvent::PermissionRequest {
+                id,
+                title: format!("Bash {tool}"),
+                options: ["allow_once", "allow_always", "reject_once"]
+                    .iter()
+                    .map(|k| PermissionOptionView {
+                        id: k.to_string(),
+                        name: format!("选 {k}"),
+                        kind: k.to_string(),
+                    })
+                    .collect(),
+                tool: Some(tool.into()),
+            })
+        };
+        let records = vec![
+            Record::user("跑一下"),
+            ev(read("a")),
+            ask(1, "a"),
+            Record::PermissionResolved { id: 1, label: "选 allow_always".into() },
+            ev(read("b")),
+            ask(2, "b"),
+            Record::PermissionResolved { id: 2, label: "选 reject_once".into() },
+            ev(read("c")),
+            ev(KernelEvent::PermissionAuto {
+                title: "Bash c".into(),
+                chosen: "允许".into(),
+                tool: Some("c".into()),
+            }),
+            // 上次退出时还没应答：按取消收尾，同样并进去
+            ev(read("d")),
+            ask(3, "d"),
+        ];
+        let s = Session::from_records(7, meta(), records);
+        let grants: Vec<Option<GrantKind>> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                ChatItem::Tool(c) => Some(c.grant.as_ref().map(|g| g.kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grants,
+            [
+                Some(GrantKind::Always),
+                Some(GrantKind::Denied),
+                Some(GrantKind::Auto),
+                Some(GrantKind::Cancelled)
+            ]
+        );
+        assert!(!s.transcript.iter().any(|i| matches!(i, ChatItem::AutoApproved { .. })));
+        assert!(s.transcript.iter().all(|i| match i {
+            ChatItem::Permission { merged, .. } => *merged,
+            _ => true,
+        }));
+        // 四个工具行连成一组（中间并掉的权限行不拆组）
+        let l = s.compute_layout(ViewMode::Normal);
+        let head = l.iter().find_map(|r| r.head).unwrap();
+        assert_eq!(head.end, s.transcript.len() - 1);
+        assert!(
+            !l.iter()
+                .enumerate()
+                .any(|(i, r)| r.body && matches!(s.transcript[i], ChatItem::Permission { .. }))
+        );
     }
 
     #[core::prelude::v1::test]

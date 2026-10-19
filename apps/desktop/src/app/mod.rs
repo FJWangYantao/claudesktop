@@ -139,6 +139,8 @@ pub struct ChatApp {
     content_view: Entity<ContentView>,
     /// 首页滚动区内容的定宽（见 `MeasuredWidth`）
     home_w: widgets::MeasuredWidth,
+    /// 首页整页的滚动位置（「请求」页签据此只排视口附近的几轮）
+    home_scroll: ScrollHandle,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
     /// 侧栏只列哪些会话（全部 / 进行中 / 待查看）
@@ -375,6 +377,7 @@ impl ChatApp {
             sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             home_w: Default::default(),
+            home_scroll: ScrollHandle::new(),
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),
@@ -708,6 +711,7 @@ impl ChatApp {
                     diffs: Vec::new(),
                     expanded: false,
                     sub: false,
+                    grant: None,
                 }),
                 _ => ChatItem::Note(format!("备注 {i}").into()),
             });
