@@ -1861,8 +1861,26 @@ fn task_runs_a_subagent_and_returns_its_report() {
     h.kernel.send_prompt(&sid, UserPrompt::text("秘密是什么")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
 
-    // 子会话的事件都转到主会话：工具行带前缀和 parent，文字不转
+    // 子会话的事件都转到主会话：工具行带前缀和 parent，文字换成子任务自己的块（不混进主会话的回复）
     assert!(h.events.lock().unwrap().iter().all(|r| r.session.as_deref().is_none_or(|s| s == sid)));
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::SubagentStarted { task, agent, prompt }
+            if task == "t1" && agent == "scout" && prompt == "Find the secret in notes.txt")),
+        1
+    );
+    let sub_text: String = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match &r.event {
+            KernelEvent::SubagentChunk { task, text, thought: false } if task == "t1" => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(sub_text.contains("秘密是 42"), "{sub_text}");
     assert_eq!(
         h.count(|e| matches!(e, KernelEvent::ToolCallStarted { id, parent: Some(p), .. } if id == "t1/c1" && p == "t1")),
         1

@@ -27,6 +27,7 @@ mod settings_view;
 mod shortcuts;
 mod sidebar;
 mod status;
+mod subagent_view;
 mod usage_view;
 mod widgets;
 
@@ -149,6 +150,8 @@ pub struct ChatApp {
     home_w: widgets::MeasuredWidth,
     /// 首页整页的滚动位置（「请求」页签据此只排视口附近的几轮）
     home_scroll: ScrollHandle,
+    /// 子任务详情页的滚动位置（每次打开从顶上看起）
+    task_scroll: ScrollHandle,
     /// 设置页右侧内容的滚动位置（「用量 → 请求」同样只排视口附近的几轮）
     settings_scroll: ScrollHandle,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
@@ -402,6 +405,7 @@ impl ChatApp {
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             home_w: Default::default(),
             home_scroll: ScrollHandle::new(),
+            task_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             sidebar_hover: None,
             sidebar_filter: Default::default(),
@@ -750,7 +754,7 @@ impl ChatApp {
                     phase: ToolPhase::Done,
                     diffs: Vec::new(),
                     expanded: false,
-                    sub: false,
+                    task: false,
                     grant: None,
                 }),
                 _ => ChatItem::Note(format!("备注 {i}").into()),

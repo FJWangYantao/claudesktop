@@ -185,8 +185,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   概览 / 每天 / 时段 / 模型 / 会话 / 请求，时间范围和首页共用）；按天、时段、会话的汇总在 `usage.rs` 的 `breakdown`。
   新的用量入口一律走 `ChatApp::open_usage`（「请求」一栏和首页同一份状态，列表按当前页面的滚动区窗口化，见 `requests_view.rs` 的 `list_scroll`）。
 - 子 agent 在 `crates/builtin/src/subagent.rs`：`task` 工具开子会话（ID `主会话/调用 ID`），和主会话共用 `run_steps`；
-  子会话的事件经 `subagent::forward` 转到主会话（工具行带 `parent`，`history::rebuild` 跳过它们）。
-  同一步的几个 `task` 并行跑（`run_tools`），界面把子行插在各自 task 行下面（`Session::after_task`），
-  所以 transcript 不是只追加的：按下标记的状态（如 `open_groups`）要想到这一点。
+  子会话的事件经 `subagent::forward` 转到主会话（工具行带 `parent`，回复 / 思考换成 `SubagentChunk`，
+  开头发 `SubagentStarted` 带任务说明；`history::rebuild` 都跳过）。同一步的几个 `task` 并行跑（`run_tools`）。
+  界面上子 agent 的事件按 task 调用 ID 收进 `Session::subagents`，不进 transcript；对话里只有一张子任务卡片，
+  点开是详情页（`app/subagent_view.rs`，`Session::viewing_task`）。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。

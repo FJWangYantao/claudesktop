@@ -125,6 +125,16 @@ pub enum KernelEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<String>,
     },
+    /// 子 agent（自研内核的 `task` 工具）开始干活：派它的 task 调用 ID、角色名、交给它的任务说明
+    /// （界面在子任务详情页显示；不进主会话的上下文）
+    SubagentStarted { task: String, agent: String, prompt: String },
+    /// 子 agent 的回复 / 思考文本块（`thought` 为真是思考）；同上，只给子任务详情页
+    SubagentChunk {
+        task: String,
+        text: String,
+        #[serde(default)]
+        thought: bool,
+    },
     /// 工具调用更新（状态推进、原始输出）
     ToolCallUpdated {
         id: String,
@@ -293,6 +303,8 @@ impl KernelEvent {
             Self::AgentThoughtChunk { .. } => "agent_thought_chunk",
             Self::UserMessageChunk { .. } => "user_message_chunk",
             Self::ToolCallStarted { .. } => "tool_call_started",
+            Self::SubagentStarted { .. } => "subagent_started",
+            Self::SubagentChunk { .. } => "subagent_chunk",
             Self::ToolCallUpdated { .. } => "tool_call_updated",
             Self::ToolCallDiff { .. } => "tool_call_diff",
             Self::PlanReplaced { .. } => "plan_replaced",

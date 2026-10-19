@@ -103,6 +103,65 @@ pub struct Session {
     content_seq: u64,
     /// 列表最后一次跟在底部时的 `content_seq`
     seen_seq: u64,
+    /// 子任务的过程，按 task 调用 ID（见 [`SubagentRun`]）
+    pub subagents: HashMap<String, SubagentRun>,
+    /// 正在看哪个子任务的详情页（task 调用 ID）；None = 看对话。只在内存里
+    pub viewing_task: Option<String>,
+}
+
+/// 一个子任务（自研内核的 `task` 调用）的过程：子 agent 的思考、回复和工具调用。
+/// 主会话的对话记录里只有 task 那一张卡片，这些在子任务详情页里看。
+#[derive(Default)]
+pub struct SubagentRun {
+    /// 角色名（旧日志里没有 `SubagentStarted`，为空）
+    pub agent: SharedString,
+    /// 主 agent 交给它的任务说明（同上，旧日志为空）
+    pub prompt: SharedString,
+    /// 按发生顺序：`Thinking` / `Agent` / `Tool`
+    pub items: Vec<ChatItem>,
+}
+
+impl SubagentRun {
+    fn push_text(&mut self, text: &str, thought: bool) {
+        match (self.items.last_mut(), thought) {
+            (Some(ChatItem::Thinking { text: buf, streaming: true, .. }), true) => {
+                buf.push_str(text)
+            }
+            (Some(ChatItem::Agent(buf)), false) => buf.push_str(text),
+            _ => {
+                self.finish_thinking();
+                self.items.push(if thought {
+                    ChatItem::thinking(text, None)
+                } else {
+                    ChatItem::Agent(text.to_string())
+                });
+            }
+        }
+    }
+
+    fn push_tool(&mut self, card: ToolCard) {
+        self.finish_thinking();
+        self.items.push(ChatItem::Tool(card));
+    }
+
+    fn finish_thinking(&mut self) {
+        if let Some(ChatItem::Thinking { streaming, .. }) = self.items.last_mut() {
+            *streaming = false;
+        }
+    }
+
+    /// 调用了几次工具。
+    pub fn steps(&self) -> usize {
+        self.items.iter().filter(|i| matches!(i, ChatItem::Tool(_))).count()
+    }
+
+    /// 交回主会话的报告：最后一段回复（后面没再调工具）。
+    pub fn report(&self) -> Option<&str> {
+        match self.items.last() {
+            Some(ChatItem::Agent(text)) if !text.trim().is_empty() => Some(text),
+            _ => None,
+        }
+    }
 }
 
 /// 内核的一次自动重试：状态行显示「网关限流，3 秒后第 1 次重试」。
@@ -250,6 +309,8 @@ impl Session {
             cache_hit: None,
             content_seq: 0,
             seen_seq: 0,
+            subagents: HashMap::new(),
+            viewing_task: None,
         }
     }
 
@@ -454,13 +515,7 @@ impl Session {
                     let shown = if open {
                         &steps[..]
                     } else if live {
-                        // 并行的子任务的子行插在各自 task 行下面，最近的几步不一定在最后：
-                        // 露出的第一行是子行时往前带上它的 task 行，不让子行没了上级
-                        let mut from = n.saturating_sub(LIVE_TAIL);
-                        while from > 0 && matches!(&t[steps[from]], ChatItem::Tool(c) if c.sub) {
-                            from -= 1;
-                        }
-                        &steps[from..]
+                        &steps[n.saturating_sub(LIVE_TAIL)..]
                     } else {
                         &[]
                     };
@@ -863,11 +918,7 @@ impl Session {
             }
         };
         let tool = tool.clone();
-        let card = self.transcript.iter_mut().rev().find_map(|i| match i {
-            ChatItem::Tool(card) if card.id.as_deref() == Some(tool.as_str()) => Some(card),
-            _ => None,
-        });
-        let Some(card) = card else {
+        let Some(card) = self.tool_card(&tool) else {
             return;
         };
         card.grant = Some(grant);
@@ -917,7 +968,8 @@ impl Session {
 
     /// 这一轮停了 / 断了，还在转圈的工具行收成「已中断」（内核不会再报它们的结果）。
     pub fn interrupt_running_tools(&mut self) {
-        for item in &mut self.transcript {
+        let runs = self.subagents.values_mut().flat_map(|r| r.items.iter_mut());
+        for item in self.transcript.iter_mut().chain(runs) {
             if let ChatItem::Tool(card) = item
                 && card.phase == ToolPhase::Running
             {
@@ -1058,12 +1110,18 @@ impl Session {
                     }
                 }
             }
+            KernelEvent::SubagentStarted { task, agent, prompt } => {
+                *self.subagent(&task) =
+                    SubagentRun { agent: agent.into(), prompt: prompt.into(), items: Vec::new() };
+            }
+            KernelEvent::SubagentChunk { task, text, thought } => {
+                self.turn_streamed.push(&text);
+                self.subagent(&task).push_text(&text, thought);
+            }
             KernelEvent::ToolCallStarted { id, title, status, kind, parent } => {
                 self.finish_thinking();
                 let (name, arg) = tool_label(&kind, &title);
-                // 子任务的工具行接在自己那个 task 行（和它已有的子行）后面：几个子任务并行时不交错
-                let at = parent.as_deref().and_then(|p| self.after_task(p));
-                let card = ChatItem::Tool(ToolCard {
+                let card = ToolCard {
                     id: Some(id),
                     kind,
                     name,
@@ -1073,12 +1131,13 @@ impl Session {
                     phase: tool_phase(&status),
                     diffs: Vec::new(),
                     expanded: false,
-                    sub: parent.is_some(),
+                    task: false,
                     grant: None,
-                });
-                match at {
-                    Some(i) => self.transcript.insert(i, card),
-                    None => self.transcript.push(card),
+                };
+                // 子 agent 的调用归到它那个子任务里，不进对话记录
+                match parent {
+                    Some(task) => self.subagent(&task).push_tool(card),
+                    None => self.transcript.push(ChatItem::Tool(card)),
                 }
             }
             KernelEvent::ToolCallUpdated { id, title, status, raw_output, output } => {
@@ -1235,22 +1294,28 @@ impl Session {
         None
     }
 
-    /// 按 tool_call_id 找最近的工具行。
-    /// task 调用 `task` 的子行该插在哪：它和它已有子行里最后一行的后面；找不到 task 行时为 None（追加）。
-    fn after_task(&self, task: &str) -> Option<usize> {
-        let prefix = format!("{task}/");
-        let last = self.transcript.iter().rposition(|item| {
-            matches!(item, ChatItem::Tool(card)
-                if card.id.as_deref().is_some_and(|id| id == task || id.starts_with(&prefix)))
-        })?;
-        Some(last + 1)
+    /// 第 `task` 个 task 调用的子任务（没有就建一个），并把那一行标成子任务卡片。
+    fn subagent(&mut self, task: &str) -> &mut SubagentRun {
+        if let Some(card) = self.tool_card(task) {
+            card.task = true;
+        }
+        self.subagents.entry(task.to_string()).or_default()
     }
 
+    /// 按 tool_call_id 找最近的工具行；子 agent 的调用（`task 调用 ID/调用 ID`）在它那个子任务里找。
     fn tool_card(&mut self, id: &str) -> Option<&mut ToolCard> {
-        self.transcript.iter_mut().rev().find_map(|item| match item {
-            ChatItem::Tool(card) if card.id.as_deref() == Some(id) => Some(card),
-            _ => None,
-        })
+        fn find<'a>(item: &'a mut ChatItem, id: &str) -> Option<&'a mut ToolCard> {
+            match item {
+                ChatItem::Tool(card) if card.id.as_deref() == Some(id) => Some(card),
+                _ => None,
+            }
+        }
+        if let Some((task, _)) = id.split_once('/')
+            && let Some(run) = self.subagents.get_mut(task)
+        {
+            return run.items.iter_mut().rev().find_map(|i| find(i, id));
+        }
+        self.transcript.iter_mut().rev().find_map(|i| find(i, id))
     }
 
     pub fn apply_mock(&mut self, action: &MockAction) {
@@ -1275,7 +1340,7 @@ impl Session {
                     phase: ToolPhase::Running,
                     diffs: Vec::new(),
                     expanded: false,
-                    sub: false,
+                    task: false,
                     grant: None,
                 }));
             }
@@ -1378,7 +1443,7 @@ mod tests {
             phase: ToolPhase::Done,
             diffs: Vec::new(),
             expanded: false,
-            sub: false,
+            task: false,
             grant: None,
         };
         let tool = ChatItem::Tool(card);
@@ -1414,7 +1479,7 @@ mod tests {
                 phase: ToolPhase::Done,
                 diffs: Vec::new(),
                 expanded: false,
-                sub: false,
+                task: false,
                 grant: None,
             })
         };
@@ -1688,7 +1753,7 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
-    fn parallel_subagent_rows_stay_under_their_own_task() {
+    fn subagent_events_go_to_their_own_task() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "查".into(), images: Vec::new() });
         s.begin_turn();
@@ -1699,37 +1764,61 @@ mod tests {
             kind: "read".into(),
             parent: parent.map(Into::into),
         };
+        let chunk = |task: &str, text: &str, thought: bool| KernelEvent::SubagentChunk {
+            task: task.into(),
+            text: text.into(),
+            thought,
+        };
         s.apply_event(started("t1", None), None);
         s.apply_event(started("t2", None), None);
-        // 两个子任务的行交错着到
-        s.apply_event(started("t2/c1", Some("t2")), None);
-        s.apply_event(started("t1/c1", Some("t1")), None);
-        s.apply_event(started("t2/c2", Some("t2")), None);
-        s.apply_event(started("t1/c2", Some("t1")), None);
-        let ids: Vec<&str> = s
-            .transcript
-            .iter()
-            .filter_map(|i| match i {
-                ChatItem::Tool(card) => card.id.as_deref(),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(ids, ["t1", "t1/c1", "t1/c2", "t2", "t2/c1", "t2/c2"]);
-        // 找不到 task 行（不该发生）：照常追加
-        s.apply_event(started("t9/c1", Some("t9")), None);
-        assert!(
-            matches!(s.transcript.last(), Some(ChatItem::Tool(c)) if c.id.as_deref() == Some("t9/c1"))
+        s.apply_event(
+            KernelEvent::SubagentStarted {
+                task: "t1".into(),
+                agent: "scout".into(),
+                prompt: "找 A".into(),
+            },
+            None,
         );
-        // 跑着时组里只露最近几步：露出的第一行是子行（t2/c1）时带上它的 task 行
-        let at = |id: &str| {
-            s.transcript
-                .iter()
-                .position(|i| matches!(i, ChatItem::Tool(c) if c.id.as_deref() == Some(id)))
-                .unwrap()
-        };
-        let layout = s.compute_layout(ViewMode::Normal);
-        assert!(layout[at("t2")].body && layout[at("t2/c1")].body);
-        assert!(!layout[at("t1/c2")].body);
+        // 两个子任务的事件交错着到
+        s.apply_event(chunk("t1", "想", true), None);
+        s.apply_event(started("t2/c1", Some("t2")), None);
+        s.apply_event(chunk("t1", "想", true), None);
+        s.apply_event(started("t1/c1", Some("t1")), None);
+        s.apply_event(
+            KernelEvent::ToolCallUpdated {
+                id: "t1/c1".into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: Some("3 行".into()),
+                output: None,
+            },
+            None,
+        );
+        s.apply_event(chunk("t1", "A 在", false), None);
+        s.apply_event(chunk("t1", "这里", false), None);
+
+        // 对话记录里只有两张子任务卡片，不算过程步骤
+        assert_eq!(s.transcript.len(), 3);
+        for item in &s.transcript[1..] {
+            assert!(matches!(item, ChatItem::Tool(c) if c.task) && !item.is_step());
+        }
+        let t1 = &s.subagents["t1"];
+        assert_eq!((t1.agent.as_ref(), t1.prompt.as_ref()), ("scout", "找 A"));
+        assert_eq!(t1.items.len(), 3);
+        assert!(
+            matches!(&t1.items[0], ChatItem::Thinking { text, streaming: false, .. } if text == "想想")
+        );
+        assert_eq!(t1.steps(), 1);
+        assert!(matches!(&t1.items[1], ChatItem::Tool(c) if c.phase == ToolPhase::Done));
+        assert_eq!(t1.report(), Some("A 在这里"));
+        // 旧日志没有 SubagentStarted：照样归到子任务里
+        let t2 = &s.subagents["t2"];
+        assert!(t2.prompt.is_empty() && t2.steps() == 1 && t2.report().is_none());
+        // 停下时子任务里转圈的调用一起收掉
+        s.interrupt_running_tools();
+        assert!(
+            matches!(&s.subagents["t2"].items[0], ChatItem::Tool(c) if c.phase == ToolPhase::Failed)
+        );
     }
 
     #[core::prelude::v1::test]
@@ -1769,7 +1858,7 @@ mod tests {
             phase: ToolPhase::Running,
             diffs: Vec::new(),
             expanded: false,
-            sub: false,
+            task: false,
             grant: None,
         }));
         // 用户停下：等内核回结束，期间工具行不该一直转圈

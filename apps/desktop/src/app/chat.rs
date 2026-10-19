@@ -35,17 +35,17 @@ pub(super) const BLOCK_GAP: Pixels = px(16.);
 /// 步骤行左侧的图标格宽度；组内细线对着它的中线
 const ICON_COL: Pixels = px(16.);
 /// 图标格 + 间距：步骤的展开内容（思考正文等）缩进到文字起点
-const STEP_INDENT: Pixels = px(24.);
+pub(super) const STEP_INDENT: Pixels = px(24.);
 /// 输入框上方的计划最多露出几条
 const PINNED_PLAN_ROWS: usize = 5;
 
 /// 步骤行左侧的图标格：固定宽度居中，转圈 / 种类图标 / 失败叉都放这里，文字才对得齐。
-fn icon_cell(icon: impl IntoElement) -> Div {
+pub(super) fn icon_cell(icon: impl IntoElement) -> Div {
     div().w(ICON_COL).flex_shrink_0().flex().justify_center().items_center().child(icon)
 }
 
 /// 一行过程步骤的骨架：图标格 + 内容，13px 次要色，单行。
-fn step_line(icon: impl IntoElement) -> Div {
+pub(super) fn step_line(icon: impl IntoElement) -> Div {
     div()
         .h_flex()
         .items_center()
@@ -57,7 +57,7 @@ fn step_line(icon: impl IntoElement) -> Div {
 }
 
 /// 单行省略的文字段（悬停看全文）。
-fn ellipsis(id: impl Into<ElementId>, text: SharedString) -> Stateful<Div> {
+pub(super) fn ellipsis(id: impl Into<ElementId>, text: SharedString) -> Stateful<Div> {
     let tip = text.clone();
     div()
         .id(id)
@@ -103,7 +103,7 @@ fn grant_badge(id: impl Into<ElementId>, card: &ToolCard) -> Option<Stateful<Div
 
 /// 工具的状态图标：进行中转圈，失败红叉，完成显示种类图标。
 /// 转圈换成结果图标时淡入、从小放大到原尺寸（`settle` 见 [`motion::settle`]）。
-fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
+pub(super) fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
     let icon = match card.phase {
         ToolPhase::Running => return motion::spinner().into_any_element(),
         ToolPhase::Failed => Icon::new(IconAll::CircleX).size_3p5().text_color(rgb(RED)),
@@ -119,7 +119,7 @@ fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
 }
 
 /// 回复 / 思考共用的 Markdown 样式。
-fn markdown_style() -> TextViewStyle {
+pub(super) fn markdown_style() -> TextViewStyle {
     TextViewStyle::default()
         .paragraph_gap(rems(0.75))
         // 标题接口只收 Pixels，所以按当前缩放换算一次
@@ -237,12 +237,6 @@ impl ChatApp {
         }
         if layout.body || reveal > 0. && layout.member {
             let body = self.render_item(ix, item, layout, window, cx);
-            // 子 agent 的调用：在组内再缩进一层，挂在 Task 那一行下面
-            let body = if matches!(item, ChatItem::Tool(card) if card.sub) {
-                div().ml(px(7.)).pl(px(16.)).border_l_1().border_color(rgb(LINE)).child(body)
-            } else {
-                body
-            };
             // 正在收起的步骤按展开时的样子画（缩进、挂细线、和下一步收紧）
             let (nested, tight) =
                 if layout.body { (layout.nested, layout.tight) } else { (true, true) };
@@ -543,31 +537,35 @@ impl ChatApp {
         let mut col = div().v_flex().child(line);
         let progress = motion::reveal_progress(("tool", idx), open, window, cx);
         if progress > 0. && has_output {
-            let body = div().pt_1().pl(STEP_INDENT).child(
-                div()
-                    .v_flex()
-                    .px_3()
-                    .py_2()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(CARD))
-                    .font_family(MONO)
-                    .text_size(TEXT_SMALL)
-                    .line_height(LEADING)
-                    .text_color(rgb(INK_SOFT))
-                    // 空行给个空格占住行高
-                    .children(card.output.lines().map(|l| {
-                        div().child(if l.is_empty() { " ".to_string() } else { l.to_string() })
-                    })),
-            );
-            col = col.child(Reveal::new(("tool-body", idx), progress, body));
+            col = col.child(Reveal::new(("tool-body", idx), progress, Self::tool_output(card)));
         }
         col
     }
 
+    /// 工具行点开后的输出预览（等宽、卡片底），缩进到工具名下面；和标题之间的空隙算在里面。
+    pub(super) fn tool_output(card: &ToolCard) -> Div {
+        div().pt_1().pl(STEP_INDENT).child(
+            div()
+                .v_flex()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(CARD))
+                .font_family(MONO)
+                .text_size(TEXT_SMALL)
+                .line_height(LEADING)
+                .text_color(rgb(INK_SOFT))
+                // 空行给个空格占住行高
+                .children(card.output.lines().map(|l| {
+                    div().child(if l.is_empty() { " ".to_string() } else { l.to_string() })
+                })),
+        )
+    }
+
     /// 不带 diff 的工具：一行，名称稍深、参数等宽、结果摘要接在后面（都单行省略，悬停看全文）。
-    fn render_tool_line(idx: usize, card: &ToolCard, settle: f32) -> Div {
+    pub(super) fn render_tool_line(idx: usize, card: &ToolCard, settle: f32) -> Div {
         let failed = card.phase == ToolPhase::Failed;
         step_line(tool_status_icon(card, settle))
             .child(
@@ -1590,6 +1588,7 @@ impl ChatApp {
             ChatItem::Info { text, open } => {
                 Self::render_info(idx, text, *open, verbose, window, cx)
             }
+            ChatItem::Tool(card) if card.task => self.render_task_card(idx, card, window, cx),
             ChatItem::Tool(card) => Self::render_tool(idx, card, verbose, window, cx),
             ChatItem::AutoApproved { title, chosen } => {
                 Self::render_auto_approved(idx, title, chosen)
@@ -1708,7 +1707,7 @@ fn distance_to_end(list: &ListState) -> Pixels {
 
 /// 流式输出停在半截标记上时（`` `foo `` 或没收尾的 ``` 围栏、`**粗体`），渲染前临时补齐，
 /// 免得标记原样露出来、等收尾后整段又跳成代码 / 粗体样式。
-fn close_dangling_markup(text: &str) -> Cow<'_, str> {
+pub(super) fn close_dangling_markup(text: &str) -> Cow<'_, str> {
     let mut in_fence = false;
     // 当前段落（围栏外）里的反引号个数；行内代码不跨段落
     let mut ticks = 0;

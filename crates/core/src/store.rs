@@ -128,6 +128,8 @@ impl Record {
                 | KernelEvent::AgentThoughtChunk { .. }
                 | KernelEvent::ToolCallStarted { .. }
                 | KernelEvent::ToolCallUpdated { .. }
+                | KernelEvent::SubagentStarted { .. }
+                | KernelEvent::SubagentChunk { .. }
                 | KernelEvent::PlanReplaced { .. }
                 | KernelEvent::PermissionAuto { .. }
                 | KernelEvent::PermissionRequest { .. }
@@ -323,9 +325,16 @@ impl SessionLog {
 
     /// 与合并中的块同类则并入，返回合并后长度。
     fn try_merge(&mut self, event: &KernelEvent) -> Option<usize> {
-        use KernelEvent::{AgentMessageChunk as M, AgentThoughtChunk as T};
+        use KernelEvent::{AgentMessageChunk as M, AgentThoughtChunk as T, SubagentChunk as S};
         match (self.pending.as_mut()?, event) {
             (M { text: buf }, M { text }) | (T { text: buf }, T { text }) => {
+                buf.push_str(text);
+                Some(buf.len())
+            }
+            // 子任务的块：同一个子任务、同是回复或同是思考才并
+            (S { task: a, text: buf, thought: x }, S { task: b, text, thought: y })
+                if a == b && x == y =>
+            {
                 buf.push_str(text);
                 Some(buf.len())
             }
@@ -368,7 +377,12 @@ pub fn effective(records: &[Record]) -> Vec<Record> {
 }
 
 fn is_chunk(event: &KernelEvent) -> bool {
-    matches!(event, KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. })
+    matches!(
+        event,
+        KernelEvent::AgentMessageChunk { .. }
+            | KernelEvent::AgentThoughtChunk { .. }
+            | KernelEvent::SubagentChunk { .. }
+    )
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -426,6 +440,34 @@ mod tests {
         meta.archived = true;
         store.save_meta(&meta).unwrap();
         assert!(store.list().iter().any(|m| m.id == meta.id && m.archived));
+    }
+
+    #[test]
+    fn subagent_chunks_coalesce_per_task_and_kind() {
+        let store = temp_store("subagent-chunks");
+        let (meta, mut log) = store.create("t", ".".into(), "mock").unwrap();
+        let sub = |task: &str, text: &str, thought: bool| Record::Event {
+            event: KernelEvent::SubagentChunk { task: task.into(), text: text.into(), thought },
+        };
+        for record in [
+            sub("t1", "想", true),
+            sub("t1", "想", true),
+            sub("t1", "答", false),
+            sub("t2", "另一个", false),
+            sub("t1", "案", false),
+        ] {
+            log.append(record).unwrap();
+        }
+        drop(log);
+        assert_eq!(
+            store.load(&meta.id).unwrap(),
+            vec![
+                sub("t1", "想想", true),
+                sub("t1", "答", false),
+                sub("t2", "另一个", false),
+                sub("t1", "案", false),
+            ]
+        );
     }
 
     #[test]

@@ -81,8 +81,9 @@ pub struct ToolCard {
     /// 带 diff：已展开全部行（默认只显示前 [`DIFF_PREVIEW_ROWS`] 行）；
     /// 不带 diff：工具行已点开，显示输出预览
     pub expanded: bool,
-    /// 子 agent 的调用：再缩进一层，挂在派出它的 Task 那一行下面
-    pub sub: bool,
+    /// 派出了子 agent 的 task 调用：画成子任务卡片（不收进过程组），点开看它的过程
+    /// （`Session::subagents`）；子 agent 自己的调用不在对话记录里
+    pub task: bool,
     /// 这次调用的授权结果（权限请求应答后并进这一行，不再单独占一行）
     pub grant: Option<Grant>,
 }
@@ -488,8 +489,8 @@ impl ChatItem {
         }
     }
 
-    /// 这一行在某个视图模式下是否显示。摘要模式只留回复、用户消息、权限卡和备注；
-    /// 工具调用只在「执行中且带 diff」时留着——那是正等你对着改动决定放不放行的一步。
+    /// 这一行在某个视图模式下是否显示。摘要模式只留回复、用户消息、权限卡、备注和子任务卡片；
+    /// 别的工具调用只在「执行中且带 diff」时留着——那是正等你对着改动决定放不放行的一步。
     pub fn visible_in(&self, view: ViewMode) -> bool {
         match (view, self) {
             (
@@ -500,18 +501,18 @@ impl ChatItem {
                 | Self::AutoApproved { .. },
             ) => false,
             (ViewMode::Summary, Self::Tool(c)) => {
-                c.phase == ToolPhase::Running && !c.diffs.is_empty()
+                c.task || c.phase == ToolPhase::Running && !c.diffs.is_empty()
             }
             _ => true,
         }
     }
 
     /// 过程中的一步：连续的几步合成一个可折叠的组（见 `Session::layout`）。
-    /// 带 diff 的工具不算——改了什么要直接摆出来，不收进组里。
+    /// 带 diff 的工具、子任务卡片不算——改了什么、派了谁去做要直接摆出来，不收进组里。
     pub fn is_step(&self) -> bool {
         match self {
             Self::Thinking { .. } | Self::AutoApproved { .. } => true,
-            Self::Tool(c) => c.diffs.is_empty(),
+            Self::Tool(c) => c.diffs.is_empty() && !c.task,
             // 并进工具行的权限请求：当成一步（不把前后的步骤拆成两组），但没东西可画
             Self::Permission { merged, .. } => *merged,
             _ => false,
@@ -547,7 +548,7 @@ impl ChatItem {
                 c.phase,
                 c.expanded,
                 c.diffs.iter().map(|d| d.lines.len() + 1).sum::<usize>(),
-                c.sub,
+                c.task,
                 c.grant.as_ref().map(|g| g.kind),
             )
                 .hash(&mut h),
@@ -975,7 +976,7 @@ mod tests {
                     Vec::new()
                 },
                 expanded: false,
-                sub: false,
+                task: false,
                 grant: None,
             })
         };
@@ -1004,7 +1005,7 @@ mod tests {
             phase,
             diffs: Vec::new(),
             expanded: false,
-            sub: false,
+            task: false,
             grant: None,
         })
     }
