@@ -123,7 +123,7 @@ gateway/<日期>.jsonl 用量日志
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                                    # 302 个，不需要网络和密钥
+cargo test --workspace                                    # 335 个，不需要网络和密钥
 
 # 真实端点 / 真实 agent / 远程 MCP（默认 ignore，会花钱并需要网络）
 cargo test -p claudesktop-builtin -- --ignored
