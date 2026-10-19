@@ -49,7 +49,17 @@ fn main() {
         fonts::register(cx);
         let t_fonts = t0.elapsed();
 
+        // 静默模式（CLAUDESKTOP_QUIET=1，或跑压测时自动开启）：窗口照常显示但不抢前台、不激活，
+        // 不打断用户手头正在做的事；截图脚本靠 PrintWindow 抓内容，不需要窗口在前台。
+        let quiet = std::env::var_os("CLAUDESKTOP_QUIET").is_some()
+            || std::env::var_os("CLAUDESKTOP_STRESS").is_some();
+
         let mut options = TitleBar::window_options();
+        options.focus = !quiet;
+        if quiet {
+            // 非活动窗口默认限到 30 帧，压测量到的就不是真实帧间隔了
+            options.inactive_frame_interval = None;
+        }
         options.window_bounds =
             Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx)));
         if let Some(tb) = options.titlebar.as_mut() {
@@ -188,6 +198,8 @@ fn main() {
             })
         })
         .expect("Failed to open window");
-        cx.activate(true);
+        if !quiet {
+            cx.activate(true);
+        }
     });
 }

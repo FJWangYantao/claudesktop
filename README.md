@@ -153,6 +153,7 @@ CLAUDESKTOP_RERUN=builtin|acp|demo      # 把首条提示词放到另一个内�
 
 # 性能压测：逐帧滚动并输出帧间隔与每帧工作量
 CLAUDESKTOP_STRESS=10000                # 灌 1 万行再滚；加 _BUSY=1 看转圈，_TYPE=1 看打字
+CLAUDESKTOP_QUIET=1                     # 开窗口但不抢前台、不激活（压测会自动开启）
 ```
 
 提交约定：英文 conventional commits，代码注释中文。改 UI 前请先读 [AGENTS.md](./AGENTS.md)（组件、配色、
@@ -181,7 +182,7 @@ tools          # 调试与接入工具（截图脚本、mock agent、mock MCP �
 
 | 文件 | 用途 |
 |---|---|
-| [tools/shot.ps1](./tools/shot.ps1) | 抓窗口截图，改完 UI 后自检渲染 |
+| [tools/shot.ps1](./tools/shot.ps1) | 抓窗口截图，改完 UI 后自检渲染（默认 PrintWindow，不抢焦点、不动光标） |
 | [tools/mock-acp-agent.mjs](./tools/mock-acp-agent.mjs) | mock ACP agent，跑内核事件链测试 |
 | [tools/mock-mcp-server.mjs](./tools/mock-mcp-server.mjs) | mock MCP 服务器（`--http` / `--sse` 起远程模式） |
 | [tools/make-icon.py](./tools/make-icon.py) | 生成 `resources/claudesktop.ico` |

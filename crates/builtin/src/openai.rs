@@ -359,6 +359,7 @@ mod tests {
                 temperature: Some(0.2),
                 max_tokens: Some(4096),
                 extra: serde_json::json!({"top_k": 5, "model": "override"}),
+                ..Default::default()
             },
         );
         assert_eq!(body["temperature"], 0.2);

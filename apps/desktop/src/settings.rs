@@ -517,6 +517,8 @@ impl BuiltinSettings {
             params: RequestParams {
                 temperature: None,
                 max_tokens: None,
+                thinking_budget: None,
+                server_tools: Vec::new(),
                 extra: serde_json::Value::Null,
             },
         };

@@ -52,6 +52,11 @@ impl Protocol {
 pub struct RequestParams {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
+    /// 思考预算（Anthropic 的 `thinking.budget_tokens`；不设 = 不显式开启思考）
+    pub thinking_budget: Option<u64>,
+    /// 用服务端工具（Anthropic 官方 `web_search` / `web_fetch` / `code_execution`，见
+    /// [`crate::anthropic::SERVER_TOOLS`]）；只有 Anthropic 原生协议认
+    pub server_tools: Vec<String>,
     /// 额外的请求体字段（JSON 对象）；浅合并进请求体，同名键覆盖默认值
     pub extra: Value,
 }
@@ -60,6 +65,8 @@ impl RequestParams {
     pub fn is_empty(&self) -> bool {
         self.temperature.is_none()
             && self.max_tokens.is_none()
+            && self.thinking_budget.is_none()
+            && self.server_tools.is_empty()
             && self.extra.as_object().is_none_or(|o| o.is_empty())
     }
 }
