@@ -83,6 +83,54 @@ pub struct ToolCard {
     pub expanded: bool,
     /// 子 agent 的调用：再缩进一层，挂在派出它的 Task 那一行下面
     pub sub: bool,
+    /// 这次调用的授权结果（权限请求应答后并进这一行，不再单独占一行）
+    pub grant: Option<Grant>,
+}
+
+/// 工具行上的授权结果：种类决定短标签，`label` 是选的那个选项的全名（悬停看）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grant {
+    pub kind: GrantKind,
+    pub label: SharedString,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GrantKind {
+    /// 你点了「允许一次」
+    Once,
+    /// 你点了「总是允许…」（存成了规则）
+    Always,
+    /// 按策略自动批准（没问你）
+    Auto,
+    /// 你拒绝了
+    Denied,
+    /// 没等你应答这一轮就停了
+    Cancelled,
+}
+
+impl Grant {
+    /// 按内核给的选项种类（`allow_once` / `allow_always` / `reject_*`）归类；取消单独算。
+    pub fn from_choice(option_kind: Option<&str>, label: SharedString) -> Self {
+        let kind = match option_kind {
+            Some("allow_once") => GrantKind::Once,
+            Some("allow_always") => GrantKind::Always,
+            Some(k) if k.starts_with("allow") => GrantKind::Once,
+            Some(_) => GrantKind::Denied,
+            None => GrantKind::Cancelled,
+        };
+        Self { kind, label }
+    }
+
+    /// 工具行末尾的短标签。
+    pub fn short(&self) -> &'static str {
+        match self.kind {
+            GrantKind::Once => "已允许",
+            GrantKind::Always => "总是允许",
+            GrantKind::Auto => "自动允许",
+            GrantKind::Denied => "已拒绝",
+            GrantKind::Cancelled => "未应答",
+        }
+    }
 }
 
 /// 折叠状态下每个 diff 最多显示的行数
@@ -327,6 +375,10 @@ pub enum ChatItem {
         title: SharedString,
         options: Vec<PermissionOptionView>,
         resolved: Option<SharedString>,
+        /// 触发请求的工具调用 ID（旧日志没有）
+        tool: Option<String>,
+        /// 应答结果已并进那个工具行：这一行不再画（见 `Session::merge_permission`）
+        merged: bool,
     },
     Plan(Vec<PlanRow>),
     Agent(String),
@@ -460,6 +512,8 @@ impl ChatItem {
         match self {
             Self::Thinking { .. } | Self::AutoApproved { .. } => true,
             Self::Tool(c) => c.diffs.is_empty(),
+            // 并进工具行的权限请求：当成一步（不把前后的步骤拆成两组），但没东西可画
+            Self::Permission { merged, .. } => *merged,
             _ => false,
         }
     }
@@ -468,6 +522,7 @@ impl ChatItem {
     pub fn has_content(&self) -> bool {
         match self {
             Self::Thinking { text, streaming, .. } => *streaming || !text.trim().is_empty(),
+            Self::Permission { merged, .. } => !*merged,
             _ => true,
         }
     }
@@ -493,10 +548,12 @@ impl ChatItem {
                 c.expanded,
                 c.diffs.iter().map(|d| d.lines.len() + 1).sum::<usize>(),
                 c.sub,
+                c.grant.as_ref().map(|g| g.kind),
             )
                 .hash(&mut h),
-            Self::Permission { title, options, resolved, .. } => {
-                (4u8, title.len(), options.len(), resolved.as_ref().map(|r| r.len())).hash(&mut h)
+            Self::Permission { title, options, resolved, merged, .. } => {
+                (4u8, title.len(), options.len(), resolved.as_ref().map(|r| r.len()), merged)
+                    .hash(&mut h)
             }
             Self::Plan(rows) => {
                 5u8.hash(&mut h);
@@ -919,6 +976,7 @@ mod tests {
                 },
                 expanded: false,
                 sub: false,
+                grant: None,
             })
         };
         let thinking = thought("t", None);
@@ -947,6 +1005,7 @@ mod tests {
             diffs: Vec::new(),
             expanded: false,
             sub: false,
+            grant: None,
         })
     }
 

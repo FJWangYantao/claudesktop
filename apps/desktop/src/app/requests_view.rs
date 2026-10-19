@@ -26,6 +26,9 @@ use std::sync::Arc;
 /// 先列多少轮；「显示更多」每次再多列这么多（首页整页滚动，不另开滚动框）
 const PAGE_ROWS: usize = 20;
 
+/// 视口上下各多排这么远（滚得快时边上不露白）
+const OVERSCAN: Pixels = px(200.);
+
 /// 「请求」页签的状态。
 #[derive(Default)]
 pub(super) struct RequestsView {
@@ -43,6 +46,36 @@ pub(super) struct RequestsView {
     more: usize,
     /// 上次归组、筛选、汇总的结果（见 `derived_requests`）
     derived: RefCell<Option<Rc<Derived>>>,
+    /// 列表只排视口附近的几轮（见 [`ListWindow`]）
+    window: Rc<RefCell<ListWindow>>,
+}
+
+/// 列表的窗口化：首页整页滚动、列表在页面中间，用不了自带滚动框的虚拟列表，
+/// 所以按首页的滚动位置算出视口附近是哪几轮，只排这几轮，上下用空白占住其余的高度
+/// （「显示更多」点了几次之后，几百轮全排一遍，滚一格要上百毫秒）。
+#[derive(Default)]
+struct ListWindow {
+    /// 列表顶端在滚动内容里的 y（画过一帧才知道）
+    top: Option<Pixels>,
+    /// 量高度时的列表宽度（变了量过的高度全作废）
+    width: Pixels,
+    /// 画过的轮的高度：[收起时, 展开时]
+    heights: HashMap<(String, u64), [Option<Pixels>; 2]>,
+    /// 没画过的收起的轮按这个估（画过的收起的轮的高度）
+    estimate: Option<Pixels>,
+}
+
+impl ListWindow {
+    /// 一轮的高度：量过的，或者估一个（展开的按每次请求一行估）。
+    fn height(&self, row: &TurnRow, open: bool, line: Pixels) -> Pixels {
+        let measured = self.heights.get(&row.key).and_then(|h| h[open as usize]);
+        let collapsed = self.estimate.unwrap_or(line * 3.5);
+        measured.unwrap_or(if open {
+            collapsed + line * row.requests.len() as f32 * 1.6
+        } else {
+            collapsed
+        })
+    }
 }
 
 /// 「请求」页签按当前日志、筛选和单价算好的数据。
@@ -389,9 +422,7 @@ impl ChatApp {
             ));
         }
         let limit = PAGE_ROWS * (v.more + 1);
-        for (i, row) in shown.iter().take(limit).enumerate() {
-            list = list.child(self.request_turn(i, row, prices, peaks, cx));
-        }
+        list = self.request_rows(list, &shown[..shown.len().min(limit)], prices, peaks, cx);
         if shown.len() > limit {
             list = list.child(
                 div().h_flex().justify_center().pt_1().child(
@@ -423,6 +454,114 @@ impl ChatApp {
                 meta_line(notes.into_iter().map(|n| (n, INK_SOFT)).collect()).text_size(TEXT_SMALL),
             )
             .child(list)
+    }
+
+    /// 列出的这些轮里只排视口附近的（见 [`ListWindow`]），上下各一块空白占住其余的高度。
+    /// 直接加进 `list`（竖排、行距 `gap_1p5`）：多包一层容器，taffy 会把每轮的文字多量几遍，
+    /// 20 轮一帧就多出好几毫秒。
+    fn request_rows(
+        &self,
+        list: Div,
+        rows: &[&TurnRow],
+        prices: &[Price],
+        peaks: &[PeakWindow],
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let state = self.requests_view.window.clone();
+        let rem = crate::theme::root_font_size();
+        let (gap, line) = (rems(0.375).to_pixels(rem), TEXT_SMALL.to_pixels(rem));
+        let viewport = self.home_scroll.bounds().size.height;
+        // 滚过头（顶上再往上、底下再往下）时滚动区要到排版之后才把位置收回来，这里先自己收住，
+        // 否则这一帧按越界的位置算，视口里一片空白
+        let max = self.home_scroll.max_offset().y.max(px(0.));
+        let scrolled = (-self.home_scroll.offset().y).clamp(px(0.), max);
+        // 视口在列表里的范围；还没画过（不知道列表在哪）就先排一屏
+        let (lo, hi) = match state.borrow().top {
+            Some(top) if viewport > px(0.) => {
+                (scrolled - top - OVERSCAN, scrolled - top + viewport + OVERSCAN)
+            }
+            _ => (px(0.), viewport.max(px(900.)) + OVERSCAN),
+        };
+        // 每轮占「高 + 行距」：before 是第一个排出来的那轮之前的，after 是最后一个之后的
+        let (mut first, mut last) = (rows.len(), rows.len());
+        let (mut before, mut after, mut y) = (px(0.), px(0.), px(0.));
+        {
+            let w = state.borrow();
+            for (i, row) in rows.iter().enumerate() {
+                let h = w.height(row, self.requests_view.open.contains(&row.key), line);
+                if first == rows.len() && y + h >= lo {
+                    first = i;
+                    before = y;
+                }
+                if first < rows.len() && last == rows.len() && y > hi {
+                    last = i;
+                }
+                if last < rows.len() {
+                    after += h + gap;
+                }
+                y += h + gap;
+            }
+        }
+        let keys: Vec<((String, u64), bool)> = rows[first..last]
+            .iter()
+            .map(|r| (r.key.clone(), self.requests_view.open.contains(&r.key)))
+            .collect();
+        // list 里排在这几轮前面的子元素：量位置的 canvas、上面的空白
+        let skip = 1 + usize::from(before > gap);
+        let scroll = self.home_scroll.clone();
+        let top_state = state.clone();
+        // 量列表顶端在滚动内容里的位置（上面的统计卡片变高时会变）；绝对定位，不占行距
+        let probe = canvas(
+            move |bounds, window, _| {
+                let top = bounds.origin.y - scroll.bounds().origin.y - scroll.offset().y;
+                let mut w = top_state.borrow_mut();
+                if w.top.is_none_or(|t| (t - top).abs() > px(0.5)) {
+                    w.top = Some(top);
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .w_full()
+        .h(px(0.));
+        list.relative()
+            .child(probe)
+            // 空白和相邻的那轮之间还有一个行距，空白本身少算一个
+            .when(before > gap, |d| d.child(div().flex_none().h(before - gap)))
+            .children(
+                rows[first..last]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, row)| self.request_turn(first + k, row, prices, peaks, cx)),
+            )
+            .when(after > gap, |d| d.child(div().flex_none().h(after - gap)))
+            // 量排出来的几轮的高度；和估的不一样就再排一帧
+            .on_children_prepainted(move |bounds, window, _| {
+                let rows = bounds.get(skip..).unwrap_or_default();
+                let mut w = state.borrow_mut();
+                if let Some(width) = rows.first().map(|b| b.size.width)
+                    && (w.width - width).abs() > px(0.5)
+                {
+                    w.width = width;
+                    w.heights.clear();
+                }
+                let mut changed = false;
+                for (b, (key, open)) in rows.iter().zip(&keys) {
+                    let slot = &mut w.heights.entry(key.clone()).or_default()[*open as usize];
+                    if slot.is_none_or(|h| (h - b.size.height).abs() > px(0.5)) {
+                        *slot = Some(b.size.height);
+                        changed = true;
+                    }
+                    if !*open && w.estimate.is_none() {
+                        w.estimate = Some(b.size.height);
+                    }
+                }
+                if changed {
+                    window.request_animation_frame();
+                }
+            })
     }
 
     /// 一轮：标题、时间，一行用量；点开列出每次请求。

@@ -826,7 +826,7 @@ impl Inner {
                 format!("Blocked by a plugin hook: {}", blocked.unwrap_or_default()),
                 "插件钩子拦下",
             ),
-            Ok(action) => match self.authorize(session, cwd, &action, title, stopped) {
+            Ok(action) => match self.authorize(session, cwd, &action, title, &call.id, stopped) {
                 Verdict::Allow => {
                     if stopped() {
                         return ToolOutput::fail("cancelled", "已中断");
@@ -976,6 +976,7 @@ impl Inner {
         cwd: &Path,
         action: &Action,
         title: &str,
+        tool: &str,
         stopped: &dyn Fn() -> bool,
     ) -> Verdict {
         let access = action.access();
@@ -1025,7 +1026,7 @@ impl Inner {
         }
         options.push(option("reject_once", "拒绝".into()));
 
-        match self.ask(session, title, options, stopped).as_deref() {
+        match self.ask(session, title, tool, options, stopped).as_deref() {
             Some("allow_once") => Verdict::Allow,
             Some("allow_always") => {
                 if let Some(rule) = rule
@@ -1048,6 +1049,7 @@ impl Inner {
         &self,
         session: &str,
         title: &str,
+        tool: &str,
         options: Vec<PermissionOptionView>,
         stopped: &dyn Fn() -> bool,
     ) -> Option<String> {
@@ -1056,7 +1058,12 @@ impl Inner {
         self.pending.lock().unwrap().insert(id, tx);
         self.emit(
             Some(session),
-            KernelEvent::PermissionRequest { id, title: title.to_string(), options },
+            KernelEvent::PermissionRequest {
+                id,
+                title: title.to_string(),
+                options,
+                tool: Some(tool.to_string()),
+            },
         );
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {

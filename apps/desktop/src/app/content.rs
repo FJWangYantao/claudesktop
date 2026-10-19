@@ -57,15 +57,20 @@ impl ChatApp {
                 .relative()
                 .size_full()
                 .child(
-                    div().id("home-scroll").size_full().overflow_y_scroll().child(
-                        div()
-                            .min_h_full()
-                            .py_4()
-                            .v_flex()
-                            // 定宽，滚动时不用每帧把整页来回排好几遍（见 `MeasuredWidth`）
-                            .when_some(self.home_w.get(), |d, w| d.w(w))
-                            .child(self.render_overview(cx)),
-                    ),
+                    div()
+                        .id("home-scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.home_scroll)
+                        .child(
+                            div()
+                                .min_h_full()
+                                .py_4()
+                                .v_flex()
+                                // 定宽，滚动时不用每帧把整页来回排好几遍（见 `MeasuredWidth`）
+                                .when_some(self.home_w.get(), |d, w| d.w(w))
+                                .child(self.render_overview(cx)),
+                        ),
                 )
                 .child(self.home_w.probe())
                 .child(edge_fade(px(16.), paper, clear).top_0())

@@ -135,7 +135,13 @@ pub enum KernelEvent {
     /// 计划整体替换（ACP 语义：每次都是全量列表）
     PlanReplaced { entries: Vec<PlanEntryView> },
     /// 权限请求已按策略自动应答（`auto_approve` 开启时：allow_once 优先）
-    PermissionAuto { title: String, chosen: String },
+    PermissionAuto {
+        title: String,
+        chosen: String,
+        /// 触发请求的工具调用 ID（界面把结果并进那一行）；旧日志没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+    },
     /// agent 请求权限，等待 UI 经 [`Kernel::resolve_permission`] 应答
     PermissionRequest {
         /// 请求 ID（应答时回传）
@@ -143,6 +149,9 @@ pub enum KernelEvent {
         /// 触发请求的工具调用标题
         title: String,
         options: Vec<PermissionOptionView>,
+        /// 触发请求的工具调用 ID（应答后界面把结果并进那一行）；旧日志没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
     },
     /// 客户端代执行的 fs 读请求结果
     FsRead { path: String, ok: bool },

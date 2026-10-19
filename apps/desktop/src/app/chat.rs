@@ -69,6 +69,38 @@ fn ellipsis(id: impl Into<ElementId>, text: SharedString) -> Stateful<Div> {
         .child(text)
 }
 
+/// 工具行末尾的授权标记：小盾牌 + 短标签（「已允许」「总是允许」…），悬停看选的是哪一项。
+/// 原先是工具行下面单独一行「权限请求 … · 允许一次」，顺序像是先跑后问，还每个工具多占一行。
+/// 拒绝时结果里已经写了「已拒绝」就不重复。
+fn grant_badge(id: impl Into<ElementId>, card: &ToolCard) -> Option<Stateful<Div>> {
+    let grant = card.grant.as_ref()?;
+    if grant.kind == GrantKind::Denied && card.result.contains("拒绝") {
+        return None;
+    }
+    let icon = match grant.kind {
+        GrantKind::Denied => IconAll::ShieldBan,
+        GrantKind::Cancelled => IconAll::Shield,
+        _ => IconAll::ShieldCheck,
+    };
+    let tip: SharedString = match grant.kind {
+        GrantKind::Auto => format!("按设置自动批准：{}", grant.label).into(),
+        GrantKind::Cancelled => "等你授权时这一轮停了，没有运行".into(),
+        _ => format!("你选了「{}」", grant.label).into(),
+    };
+    Some(
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .text_color(rgb(INK_SOFT))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .child(Icon::new(icon).size_3())
+            .child(grant.short()),
+    )
+}
+
 /// 工具的状态图标：进行中转圈，失败红叉，完成显示种类图标。
 /// 转圈换成结果图标时淡入、从小放大到原尺寸（`settle` 见 [`motion::settle`]）。
 fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
@@ -555,6 +587,7 @@ impl ChatApp {
                         .when(failed, |d| d.text_color(rgb(RED))),
                 )
             })
+            .children(grant_badge(("tool-grant", idx), card).map(|b| b.ml_1()))
     }
 
     /// 自动批准的权限请求：作为过程中的一步，不打断。
@@ -1060,6 +1093,9 @@ impl ChatApp {
                     .child(diff.path.clone()),
             )
             .when(diff.created, |d| d.child(div().flex_shrink_0().child("新文件")))
+            .children(tool.and_then(|(card, _)| {
+                grant_badge(ElementId::Name(format!("diff-grant-{}", diff.path).into()), card)
+            }))
             .child(
                 div()
                     .flex_shrink_0()

@@ -29,6 +29,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
   分组规则在 `Session::compute_layout`）；
   行高受别的状态影响时（如"是不是回合末尾"），把那个状态并进 `Session::row_key`（或 `RowLayout`），否则虚拟列表不会重测。
+  权限请求带工具调用 ID，应答后结果并进那一行（`ToolCard::grant`，见 `Session::merge_permission`），权限行不再画。
 - **Markdown（`TextView`）**：字号、颜色、行高要直接设在 `TextView` 上（它实现了 `Styled`），
   设在外层 div 上不生效。
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，
@@ -120,6 +121,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   内容宽度不定时 taffy 会按不同约束把整页来回排好几遍，用 `widgets.rs` 的 `MeasuredWidth` 给内容定宽；
   一排小段别用 `flex_wrap` + 每段一个元素，拼成一段 `StyledText` 按段着色；
   归组、汇总这类按数据算的东西别在 render 里每帧重算，按输入缓存（见 `requests_view.rs` 的 `derived_requests`）。
+  页面中间的长列表按页面的 `ScrollHandle` 只排视口附近的行、上下垫空白（见 `requests_view.rs` 的 `ListWindow`）；
+  排出来的行直接挂在原容器里，多包一层 taffy 会把文字多量几遍。
 - `overflow_y_scroll()` 在 `StatefulInteractiveElement` 上——链式调用前必须先 `.id(...)`。
 - trigger 要作为 `Popover::trigger` 使用需实现 `gpui_kit::base::Selectable`（平凡
   builder trait，见 `MenuChip`）。

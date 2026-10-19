@@ -291,6 +291,7 @@ fn run_kernel(
             .on_receive_request(
                 async move |request: RequestPermissionRequest, responder, connection| {
                     let session = request.session_id.to_string();
+                    let tool = Some(request.tool_call.tool_call_id.to_string());
                     let title = request
                         .tool_call
                         .fields
@@ -316,7 +317,7 @@ fn run_kernel(
                         emit(
                             &sink_permission,
                             Some(session),
-                            KernelEvent::PermissionRequest { id, title, options },
+                            KernelEvent::PermissionRequest { id, title, options, tool },
                         );
                         return connection.spawn(async move {
                             let outcome = match rx.await.ok().flatten() {
@@ -346,7 +347,11 @@ fn run_kernel(
                             emit(
                                 &sink_permission,
                                 Some(session),
-                                KernelEvent::PermissionAuto { chosen: option.name.clone(), title },
+                                KernelEvent::PermissionAuto {
+                                    chosen: option.name.clone(),
+                                    title,
+                                    tool,
+                                },
                             );
                             responder.respond(RequestPermissionResponse::new(
                                 RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
@@ -361,6 +366,7 @@ fn run_kernel(
                                 KernelEvent::PermissionAuto {
                                     chosen: "(已取消：无选项)".into(),
                                     title,
+                                    tool,
                                 },
                             );
                             responder.respond(RequestPermissionResponse::new(
