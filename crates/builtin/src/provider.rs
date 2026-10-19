@@ -31,6 +31,9 @@ pub enum Protocol {
     /// Anthropic 原生 Messages API
     #[serde(rename = "anthropic")]
     Anthropic,
+    /// OpenAI Responses API（`POST /responses`，思考摘要与内置工具）
+    #[serde(rename = "responses")]
+    Responses,
 }
 
 impl Protocol {
@@ -38,6 +41,7 @@ impl Protocol {
         match self {
             Self::OpenAiCompat => "OpenAI 兼容",
             Self::Anthropic => "Anthropic 原生",
+            Self::Responses => "OpenAI Responses",
         }
     }
 }
@@ -80,6 +84,7 @@ impl ProviderConfig {
         let proto = match self.protocol {
             Protocol::OpenAiCompat => "",
             Protocol::Anthropic => "anthropic:",
+            Protocol::Responses => "responses:",
         };
         format!("builtin:{proto}{}#{}", self.base_url, self.model)
     }

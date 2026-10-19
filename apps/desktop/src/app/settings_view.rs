@@ -1389,12 +1389,17 @@ impl ChatApp {
             .child(form_field("名称", None, Self::text_input(&inputs.name)))
             .child(form_field(
                 "协议",
-                Some("大多数服务选 OpenAI 兼容；Anthropic 官方端点选原生".into()),
+                Some(
+                    "大多数服务选 OpenAI 兼容；Anthropic 官方端点选原生；\
+                     OpenAI 的 Responses API（带思考摘要与内置工具）选 Responses"
+                        .into(),
+                ),
                 div().h_flex().child(seg_control(
                     "protocol",
                     [
                         (Protocol::OpenAiCompat, "OpenAI 兼容"),
                         (Protocol::Anthropic, "Anthropic 原生"),
+                        (Protocol::Responses, "Responses"),
                     ],
                     p.protocol,
                     |this, protocol, _, cx| this.set_form_protocol(protocol, cx),

@@ -465,7 +465,14 @@ impl RequestLog {
             session: request.header(SESSION).map(str::to_string),
             purpose,
             turn: request.header(TURN).and_then(|v| v.parse().ok()),
-            protocol: if path.ends_with("/messages") { "anthropic" } else { "openai" }.into(),
+            protocol: if path.ends_with("/messages") {
+                "anthropic"
+            } else if path.ends_with("/responses") {
+                "responses"
+            } else {
+                "openai"
+            }
+            .into(),
             method: request.method.clone(),
             body_bytes: request.body.len(),
             path,

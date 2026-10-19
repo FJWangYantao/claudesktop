@@ -415,6 +415,7 @@ impl Settings {
         if let Some(v) = var("CLAUDESKTOP_PROTOCOL") {
             self.builtin.current_mut().protocol = match v.to_ascii_lowercase().as_str() {
                 "anthropic" => Protocol::Anthropic,
+                claudesktop_builtin::responses::PROTOCOL_NAME => Protocol::Responses,
                 _ => Protocol::OpenAiCompat,
             };
         }

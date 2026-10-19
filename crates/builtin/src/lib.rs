@@ -32,6 +32,7 @@ mod openai;
 mod permissions;
 mod provider;
 pub mod request_bodies;
+pub mod responses;
 mod sse;
 mod subagent;
 mod tools;
@@ -40,6 +41,7 @@ pub mod websearch;
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 pub use permissions::{DENY_PREFIX, PermissionRules, default_rules_path};
+pub use responses::ResponsesProvider;
 
 pub use provider::{
     ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, Protocol, ProviderConfig,
@@ -56,6 +58,7 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
     match config.protocol {
         Protocol::OpenAiCompat => std::sync::Arc::new(OpenAiProvider::new(config.clone())),
         Protocol::Anthropic => std::sync::Arc::new(AnthropicProvider::new(config.clone())),
+        Protocol::Responses => std::sync::Arc::new(ResponsesProvider::new(config.clone())),
     }
 }
 

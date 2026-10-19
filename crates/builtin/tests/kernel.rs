@@ -1327,6 +1327,99 @@ fn resume_rebuilds_context_from_log() {
 }
 
 /// Anthropic 原生协议：思考 / 正文 / 用量 / stop_reason 映射 + 工具调用整圈。
+/// Responses API：`input` 数组 + 平形工具 + `function_call` 项流式回来，工具跑完再要一轮。
+#[test]
+fn responses_protocol_streams_and_runs_tools() {
+    fn ev(payload: &str) -> String {
+        format!("data: {payload}")
+    }
+    let first = Reply::Sse {
+        lines: vec![
+            ev(r#"{"type":"response.created"}"#),
+            ev(r#"{"type":"response.reasoning_summary_text.delta","delta":"想一下"}"#),
+            ev(
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":""}}"#,
+            ),
+            ev(
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"notes.txt\"}"}"#,
+            ),
+            ev(
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1"}}"#,
+            ),
+            ev(
+                r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":12,"output_tokens":7}}}"#,
+            ),
+            "data: [DONE]".into(),
+        ],
+        gap_ms: 5,
+    };
+    let second = Reply::Sse {
+        lines: vec![
+            ev(r#"{"type":"response.output_text.delta","delta":"文件里是 77。"}"#),
+            ev(
+                r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":40,"output_tokens":6}}}"#,
+            ),
+            "data: [DONE]".into(),
+        ],
+        gap_ms: 5,
+    };
+    let (base, bodies) = serve(vec![first, second]);
+    let dir = workdir("responses");
+    let work = dir.clone();
+    std::fs::write(work.join("notes.txt"), "magic 77\n").unwrap();
+    let h = Harness::with_config(
+        ProviderConfig {
+            protocol: Protocol::Responses,
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "gpt-mock".into(),
+            ..Default::default()
+        },
+        work,
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("读 notes.txt")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    assert_eq!(h.text(true), "想一下");
+    assert_eq!(h.text(false), "文件里是 77。");
+    // 第一次请求：system 进 instructions、工具是平的、发的是 /responses
+    let first = body(&bodies, 0);
+    assert_eq!(first["model"], "gpt-mock");
+    assert!(first["instructions"].as_str().unwrap().contains("coding agent"));
+    assert_eq!(first["tools"][0]["name"], "read_file");
+    assert!(first["tools"][0].get("function").is_none());
+    assert_eq!(first["input"][0]["type"], "message");
+    // 第二次请求：function_call + function_call_output 回来了
+    let second = body(&bodies, 1);
+    let input = second["input"].as_array().unwrap();
+    assert!(input.iter().any(|i| i["type"] == "function_call" && i["call_id"] == "call_1"));
+    let output =
+        input.iter().find(|i| i["type"] == "function_call_output").expect("function_call_output");
+    assert!(output["output"].as_str().unwrap().contains("magic 77"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Responses API 的端点路径是 `/responses`（不是 `/chat/completions`）。
+#[test]
+fn responses_protocol_uses_the_responses_endpoint() {
+    let (base, bodies) = serve(vec![happy_stream("好")]);
+    let h = Harness::with_config(
+        ProviderConfig {
+            protocol: Protocol::Responses,
+            base_url: base,
+            api_key: Some("k".into()),
+            model: "m".into(),
+            ..Default::default()
+        },
+        std::env::temp_dir(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("hi")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn anthropic_protocol_streams_and_runs_tools() {
     fn acme(payload: &str) -> String {
