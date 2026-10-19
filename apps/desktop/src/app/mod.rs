@@ -1,6 +1,7 @@
 //! 应用根视图 `ChatApp`：会话管理、内核事件分发与整体布局。
 //! 各区域的渲染拆在子模块里（都是 `impl ChatApp`）。
 
+mod catalog_view;
 mod chat;
 mod chrome;
 mod complete_view;
@@ -151,6 +152,7 @@ pub struct ChatApp {
     plugins: Vec<claudesktop_core::Plugin>,
     /// 插件页的安装框和进行中的 git 操作
     plugins_form: plugins_view::PluginsForm,
+    mcp_form: mcp_view::McpForm,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
     placeholder: SharedString,
     /// 「回退到这里」浮层开着时算好的预览（打开时算一次，见 rewind.rs）
@@ -304,6 +306,7 @@ impl ChatApp {
 
         let settings_form = SettingsForm::new(window, cx);
         let plugins_form = plugins_view::PluginsForm::new(window, cx);
+        let mcp_form = mcp_view::McpForm::new(window, cx);
         // 字号滑杆：85% ~ 140%，步进 5%
         let font_slider = cx.new(|_| {
             SliderState::new()
@@ -382,6 +385,7 @@ impl ChatApp {
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),
             plugins_form,
+            mcp_form,
             plugins: claudesktop_core::plugin::default_plugins_dir()
                 .map(|d| claudesktop_core::plugin::discover(&d))
                 .unwrap_or_default(),

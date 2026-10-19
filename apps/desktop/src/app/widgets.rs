@@ -76,7 +76,7 @@ impl ChatApp {
     }
 
     /// 首页概览的分段切换底（点击逻辑在 overview 的 tab 里）。
-    pub(super) fn seg(text: &'static str, active: bool) -> Div {
+    pub(super) fn seg(text: impl Into<SharedString>, active: bool) -> Div {
         div()
             .px_3()
             .py_1()
@@ -84,7 +84,8 @@ impl ChatApp {
             .text_size(TEXT_SMALL)
             .bg(if active { rgb(SELECTED) } else { rgba(CLEAR) })
             .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
-            .child(text)
+            .font_features(tabular_nums())
+            .child(text.into())
     }
 
     /// 快捷键提示（gpui-kit `Kbd`）：按键串传 `keys.rs` 的常量，和绑定同源，改键不用改文案。

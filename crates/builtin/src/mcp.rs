@@ -132,6 +132,66 @@ pub fn load_config(path: &Path) -> Result<Vec<ServerConfig>, String> {
     parse_config(&text)
 }
 
+/// 往 `mcp.json` 里加一个服务器（设置页「推荐」一键添加）：文件不存在就新建；同名的已经有了不覆盖。
+pub fn add_server(path: &Path, name: &str, entry: Value) -> Result<(), String> {
+    edit_config(path, |servers| {
+        if servers.contains_key(name) {
+            return Err(format!("mcp.json 里已经有 {name} 了"));
+        }
+        servers.insert(name.to_string(), entry);
+        Ok(())
+    })
+}
+
+/// 从 `mcp.json` 删掉一个服务器。
+pub fn remove_server(path: &Path, name: &str) -> Result<(), String> {
+    edit_config(path, |servers| {
+        servers.remove(name).map(drop).ok_or_else(|| format!("mcp.json 里没有 {name}"))
+    })
+}
+
+/// 打开 / 关掉一个服务器（`"disabled": true`）。
+pub fn set_server_disabled(path: &Path, name: &str, disabled: bool) -> Result<(), String> {
+    edit_config(path, |servers| {
+        let entry = servers
+            .get_mut(name)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| format!("mcp.json 里没有 {name}"))?;
+        if disabled {
+            entry.insert("disabled".into(), Value::Bool(true));
+        } else {
+            entry.remove("disabled");
+        }
+        Ok(())
+    })
+}
+
+/// 读出 `mcpServers` 改一下再写回（键的顺序不变）；文件格式不对就不动它。
+fn edit_config(
+    path: &Path,
+    change: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut root: Value = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| format!("mcp.json 格式不对：{}", claudesktop_core::json_error_text(&e)))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("读不了 {}：{e}", path.display())),
+    };
+    let Some(object) = root.as_object_mut() else {
+        return Err("mcp.json 应该是一个 JSON 对象".into());
+    };
+    let servers = object.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+    let Some(servers) = servers.as_object_mut() else {
+        return Err("mcp.json 里的 \"mcpServers\" 应该是对象".into());
+    };
+    change(servers)?;
+    let text = serde_json::to_string_pretty(&root).unwrap_or_default() + "\n";
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建不了 {}：{e}", dir.display()))?;
+    }
+    std::fs::write(path, text).map_err(|e| format!("写不了 {}：{e}", path.display()))
+}
+
 fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
     let root: Value = serde_json::from_str(text)
         .map_err(|e| format!("mcp.json 格式不对：{}", claudesktop_core::json_error_text(&e)))?;
@@ -1092,6 +1152,13 @@ fn spawn_process(config: &ServerConfig, cwd: &Path) -> Result<Child, String> {
 /// 起进程失败的原因：最常见的是命令没装 / 不在 PATH 里。
 fn spawn_error(command: &str, e: &std::io::Error) -> String {
     match e.kind() {
+        // 推荐列表里的服务大多靠这两个跑：直接说该装什么
+        std::io::ErrorKind::NotFound if command == "npx" => {
+            "找不到命令 `npx`：先安装 Node.js（nodejs.org），装好后重启本应用".into()
+        }
+        std::io::ErrorKind::NotFound if command == "uvx" => {
+            "找不到命令 `uvx`：先安装 uv（docs.astral.sh/uv），装好后重启本应用".into()
+        }
         std::io::ErrorKind::NotFound => {
             format!("找不到命令 `{command}`：确认它已经装好、在 PATH 里，或者写完整路径")
         }
@@ -1138,6 +1205,30 @@ mod tests {
         assert!(parse_config("{}").is_err());
         assert!(parse_config("not json").is_err());
         assert!(parse_config(CONFIG_TEMPLATE).is_ok());
+    }
+
+    #[test]
+    fn edits_servers_in_place() {
+        let dir = std::env::temp_dir().join(format!("cd-mcp-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mcp.json");
+        // 文件还没有：新建
+        add_server(&path, "b", serde_json::json!({"command": "x"})).unwrap();
+        add_server(&path, "a", serde_json::json!({"type": "http", "url": "https://a"})).unwrap();
+        assert!(add_server(&path, "a", serde_json::json!({})).is_err());
+        let names: Vec<String> = load_config(&path).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["b", "a"]);
+        set_server_disabled(&path, "b", true).unwrap();
+        assert!(load_config(&path).unwrap()[0].disabled);
+        set_server_disabled(&path, "b", false).unwrap();
+        assert!(!load_config(&path).unwrap()[0].disabled);
+        remove_server(&path, "b").unwrap();
+        assert_eq!(load_config(&path).unwrap().len(), 1);
+        // 文件坏了：不动它
+        std::fs::write(&path, "{ oops").unwrap();
+        assert!(add_server(&path, "c", serde_json::json!({})).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ oops");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

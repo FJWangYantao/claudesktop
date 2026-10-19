@@ -165,6 +165,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - MCP 客户端在 `crates/builtin/src/mcp.rs`（配置是数据目录的 `mcp.json`，格式同 Claude Code 的 `.mcp.json`；
   本地命令走 stdio，远程的 Streamable HTTP / 旧版 SSE 在 `mcp_http.rs`；连上过又断了的自动退避重连）；工具以 `mcp__服务器__工具` 交给模型、走 `Action::Mcp` 和正常的权限流程，
   状态经 `KernelEvent::McpStatus` 到设置页「MCP」（`app/mcp_view.rs`）。改 MCP 用 `tools/mock-mcp-server.mjs` 测（`--http` / `--sse` 起远程模式，测试在 `tests/mcp.rs`）。
+- 设置页「MCP」「插件」分「已安装 / 推荐」两栏带搜索（`app/catalog_view.rs`），推荐的内容在 `crates/core/src/catalog.rs`：
+  MCP 推荐项点「添加」写进 mcp.json（`mcp::add_server`，还有 `remove_server` / `set_server_disabled`）；插件推荐项从官方市场
+  稀疏克隆单个插件（`plugin_git::install_subdir`）并直接启用。新增推荐插件后跑一次 `cargo test -p claudesktop-core catalog -- --ignored`（联网真装一遍）。
 - 插件读取在 `crates/core/src/plugin.rs`（数据目录 `plugins/`，格式兼容 Claude Code，说明见「设计说明-插件.md」；
   从 git 装 / 更新 / 卸载在 `plugin_git.rs`），
   启用状态在设置的 `plugins_enabled`，经 `Kernel::set_plugins` 交给内核。斜杠命令在界面 `submit_to` 展开

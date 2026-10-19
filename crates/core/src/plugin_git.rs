@@ -4,6 +4,9 @@
 //! 一个仓库可以是一个插件，也可以是 Claude Code 的插件市场（见 [`crate::plugin::discover`]）。
 //! 装好的插件和手动放进来的一样默认停用。
 //!
+//! 也可以只装插件市场仓库里的一个插件（[`install_subdir`]，设置页的「推荐」走这个）：
+//! 稀疏克隆，只检出那个插件的目录，子路径记在 `.git/` 里（[`subdir`]），扫描时按它找插件根目录。
+//!
 //! 都是阻塞调用（界面在后台线程跑）。git 不会弹窗要密码：私有仓库要先在命令行配好凭据。
 
 use std::path::{Path, PathBuf};
@@ -65,6 +68,55 @@ pub fn install(dir: &Path, input: &str) -> Result<PathBuf, String> {
         let _ = std::fs::remove_dir_all(&dest);
     }
     result.map(|_| dest)
+}
+
+/// 记子路径的文件（在 `.git/` 里，不进工作区，`git pull` 不受影响）
+const SUBDIR_FILE: &str = "claudesktop-subdir";
+
+/// 只装仓库里的一个子目录（插件市场里的单个插件）：稀疏克隆到 `dir/<folder>`，只检出 `subpath`。
+/// 同名文件夹已经有了就不装；失败时删掉克隆了一半的目录。
+pub fn install_subdir(
+    dir: &Path,
+    input: &str,
+    subpath: &str,
+    folder: &str,
+) -> Result<PathBuf, String> {
+    let url = normalize_url(input)?;
+    let safe = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with(['/', '-'])
+            && s.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    };
+    if !safe(subpath) || !safe(folder) || folder.contains('/') {
+        return Err("插件路径不对".into());
+    }
+    let dest = dir.join(folder);
+    if dest.exists() {
+        return Err(format!("插件目录里已经有 {} 了", dest.display()));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("建不了 {}：{e}", dir.display()))?;
+    let dest_text = dest.to_string_lossy().to_string();
+    let result = git(
+        dir,
+        &["clone", "--depth", "1", "--filter=blob:none", "--sparse", "--", &url, &dest_text],
+    )
+    .and_then(|_| git(&dest, &["sparse-checkout", "set", subpath]))
+    .and_then(|_| {
+        std::fs::write(dest.join(".git").join(SUBDIR_FILE), subpath)
+            .map_err(|e| format!("写不了 {}：{e}", dest.display()))
+    });
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(e);
+    }
+    Ok(dest)
+}
+
+/// 用 [`install_subdir`] 装的仓库里，插件在哪个子目录；整仓库装的为 None。
+pub fn subdir(repo: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(repo.join(".git").join(SUBDIR_FILE)).ok()?;
+    let text = text.trim();
+    (!text.is_empty() && !text.split('/').any(|p| p == "..")).then(|| text.to_string())
 }
 
 /// 拉最新的（只快进，本地改过就报错、不合并）；返回 git 的输出（「Already up to date.」等）。
@@ -233,6 +285,63 @@ mod tests {
         assert!(uninstall(&plugins, &plugins.join("manual")).is_err());
         uninstall(&plugins, &dest).unwrap();
         assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 只装市场仓库里的一个插件：只检出那个目录，扫出来的就是它，不带市场里别的插件。
+    #[test]
+    fn installs_one_plugin_out_of_a_marketplace() {
+        let run = |cwd: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("cd-plugin-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("market");
+        let write = |p: PathBuf, t: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, t).unwrap();
+        };
+        write(
+            remote.join(".claude-plugin/marketplace.json"),
+            r#"{"name": "m", "plugins": [
+                {"name": "alpha", "source": "./plugins/alpha"},
+                {"name": "beta", "source": "./plugins/beta"}
+            ]}"#,
+        );
+        write(remote.join("plugins/alpha/commands/go.md"), "出发");
+        write(remote.join("plugins/beta/commands/stop.md"), "停下");
+        run(&remote, &["init", "-q"]);
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-qm", "one"]);
+
+        let plugins = base.join("plugins");
+        let url = format!("file://{}", remote.to_string_lossy().replace('\\', "/"));
+        assert!(install_subdir(&plugins, &url, "../x", "alpha").is_err());
+        let dest = install_subdir(&plugins, &url, "plugins/alpha", "alpha").unwrap();
+        assert_eq!(subdir(&dest).as_deref(), Some("plugins/alpha"));
+        assert!(!dest.join("plugins/beta").exists());
+        let found = crate::plugin::discover(&plugins);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "alpha");
+        assert_eq!(found[0].commands[0].name, "go");
+        assert_eq!(found[0].repo.as_deref(), Some(dest.as_path()));
+
+        write(remote.join("plugins/alpha/commands/again.md"), "再来");
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-qm", "two"]);
+        update(&dest).unwrap();
+        assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 2);
+        uninstall(&plugins, &dest).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -197,9 +197,9 @@ pub(super) fn choice_row(
 }
 
 /// 分段切换（外观、动画、协议）：沙色底上一排 `seg`，点了调 `on_pick(第几个)`。
-pub(super) fn seg_control<T: Copy + PartialEq + 'static>(
+pub(super) fn seg_control<T: Copy + PartialEq + 'static, L: Into<SharedString>>(
     id: &'static str,
-    options: impl IntoIterator<Item = (T, &'static str)>,
+    options: impl IntoIterator<Item = (T, L)>,
     current: T,
     on_pick: impl Fn(&mut ChatApp, T, &mut Window, &mut Context<ChatApp>) + Clone + 'static,
     cx: &mut Context<ChatApp>,

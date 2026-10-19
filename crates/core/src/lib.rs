@@ -13,6 +13,7 @@
 //! （内核线程调用），指令经 channel（UI 线程投递）。
 
 mod acp;
+pub mod catalog;
 pub mod checkpoint;
 mod diff;
 mod json_error;
