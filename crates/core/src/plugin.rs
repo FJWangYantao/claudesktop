@@ -190,14 +190,19 @@ pub fn discover(dir: &Path) -> Vec<Plugin> {
         .flat_map(|e| {
             let dir = e.path();
             let repo = dir.join(".git").exists().then(|| dir.clone());
-            let mut found = match read_json(&dir.join(".claude-plugin").join("marketplace.json")) {
-                Ok(Some(value)) => load_marketplace(&dir, &value),
-                Ok(None) => vec![load(&dir)],
-                Err(e) => {
-                    let mut p = load(&dir);
-                    p.problems.push(e);
-                    vec![p]
-                }
+            // 只装了市场里一个插件的仓库：插件在记下的子目录里
+            let sub = repo.as_deref().and_then(crate::plugin_git::subdir);
+            let mut found = match sub {
+                Some(sub) => vec![load(&dir.join(sub))],
+                None => match read_json(&dir.join(".claude-plugin").join("marketplace.json")) {
+                    Ok(Some(value)) => load_marketplace(&dir, &value),
+                    Ok(None) => vec![load(&dir)],
+                    Err(e) => {
+                        let mut p = load(&dir);
+                        p.problems.push(e);
+                        vec![p]
+                    }
+                },
             };
             for p in &mut found {
                 p.repo = repo.clone();
