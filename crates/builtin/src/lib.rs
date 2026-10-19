@@ -55,6 +55,13 @@ pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<ModelInfo>> {
 }
 
 /// 按配置里的协议构造 provider。
+/// 只留最近 [`MAX_USER_MESSAGES_KEPT`] 条用户消息。
+fn recent_user_messages(mut messages: Vec<String>) -> Vec<String> {
+    let extra = messages.len().saturating_sub(MAX_USER_MESSAGES_KEPT);
+    messages.drain(..extra);
+    messages
+}
+
 fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
     match config.protocol {
         Protocol::OpenAiCompat => std::sync::Arc::new(OpenAiProvider::new(config.clone())),
@@ -133,7 +140,6 @@ pub struct BuiltinConfig {
     /// 第一轮结束后让模型给会话起标题（多一次小请求）；测试里关掉，免得打乱剧本
     pub session_titles: bool,
     /// 全局记忆文件（默认数据目录的 `memory.json`，见 `claudesktop_core::memory`）
-    /// 自研内核的请求经用量网关转发、每个请求记一行日志（数据目录 `gateway/`）；默认开。
     pub memory_path: Option<PathBuf>,
     /// 「自动」模式（分类器代替用户审批）；None = 没配置，这个模式不出现
     pub auto_mode: Option<AutoModeConfig>,
@@ -209,11 +215,7 @@ fn modes(auto_available: bool) -> Vec<ModeView> {
         m(MODE_PLAN, "计划模式", "只读：不写文件、不执行命令"),
     ];
     if auto_available {
-        list.push(m(
-            MODE_AUTO,
-            "自动",
-            "由分类器判断：放行常规操作，拦下越界的和不可逆的",
-        ));
+        list.push(m(MODE_AUTO, "自动", "由分类器判断：放行常规操作，拦下越界的和不可逆的"));
     }
     list.push(m(MODE_BYPASS, "全部允许", "全部自动允许（谨慎）"));
     list
@@ -1432,11 +1434,14 @@ impl Inner {
         }
         let messages = self.user_messages(session);
         let (verdict, note) = self.classify(session, auto, cwd, action, title, &messages, stopped);
+        // 被取消：不算一次拒绝，也不再发事件（取消后不发任何事件）
+        if matches!(&verdict, Verdict::Deny(reason) if reason == "cancelled") {
+            return verdict;
+        }
         self.note_verdict(session, &verdict, title, &note);
         // 拒绝的理由连同「别换个马甲重试」的说明一起回给模型：它自己决定换路子还是问用户
         match verdict {
             Verdict::Allow => Verdict::Allow,
-            Verdict::Deny(reason) if reason == "cancelled" => Verdict::Deny(reason),
             Verdict::Deny(reason) => Verdict::Deny(auto::denial_text(&reason)),
         }
     }
@@ -1481,6 +1486,18 @@ impl Inner {
         }
     }
 
+    /// 用户发了新消息：连续拒绝清零；累计到了上限、已经停下来问过人的，也重新计数。
+    /// 否则一旦暂停，分类器再也不会被调用（放行才清零，而暂停时根本不判）。
+    fn reset_denials(&self, session: &str) {
+        let Some(auto) = &self.auto_mode else { return };
+        if let Some(d) = auto.denials.lock().unwrap().get_mut(session) {
+            d.streak = 0;
+            if d.total >= MAX_DENIALS {
+                d.total = 0;
+            }
+        }
+    }
+
     /// 会话里用户说过的话（分类器的输入之一）。
     fn user_messages(&self, session: &str) -> Vec<String> {
         self.sessions
@@ -1516,7 +1533,8 @@ impl Inner {
             Some(config) => (auto.provider.clone(), config.model.clone()),
             None => (
                 Some(self.provider.clone()),
-                self.session_model(session).unwrap_or_else(|| self.default_model.lock().unwrap().clone()),
+                self.session_model(session)
+                    .unwrap_or_else(|| self.default_model.lock().unwrap().clone()),
             ),
         };
         let provider = provider.unwrap_or_else(|| self.provider.clone());
@@ -1662,10 +1680,7 @@ impl BuiltinKernel {
             kernel_id,
             memory_path: config.memory_path,
             auto_mode: config.auto_mode.map(|config| AutoMode {
-                provider: config
-                    .model
-                    .as_ref()
-                    .map(|p| make_provider(p)),
+                provider: config.model.as_ref().map(|p| make_provider(p)),
                 config,
                 denials: Mutex::default(),
             }),
@@ -1761,7 +1776,8 @@ impl BuiltinKernel {
             plugins_enabled,
             memory_project: Vec::new(),
             memory_global: Vec::new(),
-            user_messages: Vec::new(),
+            // 续接的会话从日志里找回用户说过的话，否则分类器以为用户什么都没授权
+            user_messages: recent_user_messages(history.user_messages),
         };
         // 记住的东西一开始就带上（之后每轮重读）
         for warning in state.reload_memory(self.inner.memory_path.as_deref()) {
@@ -2228,14 +2244,14 @@ impl Kernel for BuiltinKernel {
             }
             state.history.push(ChatMessage::with_parts("user", parts));
             state.user_messages.push(text);
-            if state.user_messages.len() > MAX_USER_MESSAGES_KEPT {
-                state.user_messages.remove(0);
-            }
+            let messages = std::mem::take(&mut state.user_messages);
+            state.user_messages = recent_user_messages(messages);
             let flag = Arc::new(AtomicBool::new(false));
             state.turn = Some(flag.clone());
             state.turns += 1;
             (flag, warnings)
         };
+        self.inner.reset_denials(session);
         for warning in warnings {
             self.inner.emit(Some(session), KernelEvent::Notice(warning));
         }
@@ -2323,6 +2339,8 @@ impl Kernel for BuiltinKernel {
         }
         state.history = rebuilt.messages;
         state.summary = rebuilt.summary;
+        // 撤回的消息里的授权跟着作废
+        state.user_messages = recent_user_messages(rebuilt.user_messages);
         state.restored = true;
         state.measured = None;
         Ok(())

@@ -235,12 +235,12 @@ impl ChatApp {
         let auto = s.auto_mode.clone();
         self.settings_form.auto_enabled = auto.enabled;
         self.settings_form.auto_follow = auto.use_session_model;
-        self.settings_form.auto_model.update(cx, |state, cx| {
-            state.set_value(auto.model.clone(), window, cx)
-        });
-        self.settings_form.auto_environment.update(cx, |state, cx| {
-            state.set_value(auto.environment.clone(), window, cx)
-        });
+        self.settings_form
+            .auto_model
+            .update(cx, |state, cx| state.set_value(auto.model.clone(), window, cx));
+        self.settings_form
+            .auto_environment
+            .update(cx, |state, cx| state.set_value(auto.environment.clone(), window, cx));
         // web_search 的 Brave key（环境变量优先；文件里没有时输入框留空）
         let brave = std::env::var(claudesktop_builtin::websearch::BRAVE_KEY_ENV)
             .ok()
@@ -1326,13 +1326,13 @@ impl ChatApp {
                 cx.notify();
             }),
         );
-        let follow_switch =
-            Switch::new("auto-mode-follow").checked(follow).color(rgb(CORAL)).on_change(
-                cx.listener(|this, checked: &bool, _, cx| {
-                    this.settings_form.auto_follow = *checked;
-                    cx.notify();
-                }),
-            );
+        let follow_switch = Switch::new("auto-mode-follow")
+            .checked(follow)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                this.settings_form.auto_follow = *checked;
+                cx.notify();
+            }));
         let rows = setting_group([
             setting_row(
                 "启用「自动」",
@@ -1357,9 +1357,7 @@ impl ChatApp {
                 "信任边界",
                 "哪些仓库 / 域名 / 桶算「内部」。留空时只有当前工作目录和它的 remote 算内部，\
                  其余一律当作往外发",
-                div()
-                    .w(rems(32.))
-                    .child(Textarea::new(&f.auto_environment).appearance(false)),
+                div().w(rems(32.)).child(Textarea::new(&f.auto_environment).appearance(false)),
             ),
         ]);
         // 没配好时把话说在前面（保存时也会拦）
