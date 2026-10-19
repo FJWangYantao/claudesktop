@@ -301,7 +301,7 @@ impl ChatApp {
                             .flex()
                             .justify_center()
                             .items_center()
-                            .child(motion::spinner()),
+                            .child(motion::spinner_in_place()),
                     )
             })
             .collect()

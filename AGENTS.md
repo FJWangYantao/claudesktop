@@ -87,6 +87,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
   - 「进行中」只有两种样子：运行状态行用呼吸圆点 `motion::breathing_dot()`，其余（工具行、侧栏、压缩）一律圆弧转圈
     `motion::spinner()`，都是 `canvas` + `PathBuilder` 矢量画；思考中的扫光用 `shimmer_text()`（按像素分档着色）。
+    内容区里这三个只是占位格（prepaint 记位置），由叠在内容区上的 `motion::LoopOverlay` 画，节拍器只重画它、不重画整页对话；
+    内容区以外自己就是小覆盖层的 view（侧栏转圈）用 `spinner_in_place`。
     转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
     动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
     motion 版相位按全局时钟算，由节拍器每两帧重画一次（约 30 帧）。
@@ -103,7 +105,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   不用 `cx.notify()`；画在 `ChatApp` 里的循环动画要包成单独的小 view（如侧栏转圈的 `SidebarSpinners`），
   否则节拍器每拍通知 `ChatApp`，内容区跟着重画。
 - **性能压测**：`CLAUDESKTOP_STRESS=<行数>` 逐帧滚动出帧间隔和每帧工作量（`work`，render 到画完）；
-  再加 `CLAUDESKTOP_STRESS_BUSY=1` 改成置忙 5 秒，看转圈常驻时每秒重画几次（CPU 在外面量）；
+  再加 `CLAUDESKTOP_STRESS_BUSY=1` 改成置忙 5 秒（末尾挂着思考中和跑着的工具），看转圈常驻时每秒重画几次、每帧工作量（CPU 在外面量）；
   加 `CLAUDESKTOP_STRESS_TYPE=1` 改成逐帧往输入框打字；加 `CLAUDESKTOP_STRESS_VIEW=settings:N` / `home` /
   `requests`（`requests-all` 全部列出）改成逐帧滚设置页 / 首页 / 「请求」页签（`<行数>` 是假请求的轮数）。
   动画 / 重画范围、设置页和首页的改动前后各跑一次。

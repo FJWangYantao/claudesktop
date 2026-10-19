@@ -7,6 +7,9 @@
 //! gpui 的动画每一帧都要重画它所在的整个 view（`request_animation_frame` 通知当前 view，
 //! 祖先一并变脏），所以常驻的循环动画（转圈、扫光）不用 `with_animation`：相位按全局时钟算，
 //! 由一个共用的节拍器每隔约 33ms（60Hz 下每两帧）让画着它们的 view 重画一次（[`request_loop_tick`]）。
+//! 内容区（对话、设置页、子任务详情）里的循环动画也不画在内容区里：每拍重画内容区就是重排整页对话，
+//! 长回复、代码块多了一拍十几毫秒，跑着的时候转圈就掉帧。内容区里只放占位格、记下位置，
+//! 由叠在内容区上面的小 view [`LoopOverlay`] 画，节拍器只重画它（侧栏同理，见 sidebar.rs 文件头）。
 //! 不用 `Animation::with_max_fps`：它靠计时器排下一帧，Windows 计时器按 15.6ms 一档取整，
 //! 再等一次垂直同步，实测只剩 21~25 帧，还和别的动画错开、多出重画。
 //! 一次性的过渡（展开、淡入、侧栏）很短，满帧跑。时长和曲线取 gpui-kit 主题的 motion tokens
@@ -48,6 +51,82 @@ static REDUCED: AtomicBool = AtomicBool::new(false);
 thread_local! {
     /// 这一拍到点时要重画的 view（非空 = 已经排了一拍、还没到点）
     static TICK_VIEWS: RefCell<Vec<EntityId>> = const { RefCell::new(Vec::new()) };
+    /// 内容区这一遍记下的循环动画位置（内容区重画时清空重记，复用缓存时照旧有效）
+    static LOOP_SPOTS: RefCell<Vec<LoopSpot>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 内容区里的一个循环动画：画什么、画在哪、裁到哪（窗口坐标）。
+struct LoopSpot {
+    kind: LoopKind,
+    bounds: Bounds<Pixels>,
+    clip: Bounds<Pixels>,
+}
+
+enum LoopKind {
+    Spinner,
+    Dot,
+    /// 扫光文字：字体字号取占位那份透明文字的样式
+    Shimmer {
+        text: SharedString,
+        style: Box<TextStyle>,
+        base: Rgba,
+        highlight: Rgba,
+    },
+}
+
+/// 内容区开始重画（`ContentView::render` 开头调）：上一遍记的位置作废，占位格 prepaint 时重记。
+pub(super) fn begin_loop_spots() {
+    LOOP_SPOTS.with_borrow_mut(Vec::clear);
+}
+
+/// 循环动画的占位格：prepaint 时把位置和裁切范围记下，交给 [`LoopOverlay`] 画。
+fn loop_spot(kind: LoopKind) -> Canvas<()> {
+    canvas(
+        move |bounds, window, _| {
+            let clip = window.content_mask().bounds;
+            LOOP_SPOTS.with_borrow_mut(|spots| spots.push(LoopSpot { kind, bounds, clip }));
+        },
+        |_, _, _, _| {},
+    )
+}
+
+/// 内容区里循环动画的覆盖层：叠在内容区上、不挂事件，按占位格记下的位置画。
+/// 它排在内容区后面，prepaint 时内容区这一帧的位置已经记好（滚动时不会慢一帧）；
+/// 节拍器只通知它自己，内容区复用缓存。
+pub(crate) struct LoopOverlay;
+
+impl Render for LoopOverlay {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        canvas(
+            |_, window, _| {
+                if LOOP_SPOTS.with_borrow(|spots| !spots.is_empty()) {
+                    request_loop_tick(window);
+                }
+            },
+            |_, _, window, cx| paint_loop_spots(window, cx),
+        )
+        .absolute()
+        .size_full()
+    }
+}
+
+fn paint_loop_spots(window: &mut Window, cx: &mut App) {
+    let spin = (loop_phase(SPIN_PERIOD), 0.2 + 0.45 * pulse(loop_phase(PULSE_PERIOD)));
+    let breath = pulse(loop_phase(BREATH_PERIOD));
+    let shimmer = loop_phase(SHIMMER_PERIOD);
+    let color = rgb(CORAL);
+    LOOP_SPOTS.with_borrow(|spots| {
+        for spot in spots {
+            let mask = ContentMask { bounds: spot.clip };
+            window.with_content_mask(Some(mask), |window| match &spot.kind {
+                LoopKind::Spinner => paint_spinner(spot.bounds, spin.0, spin.1, color, window),
+                LoopKind::Dot => paint_breath(spot.bounds, breath, color, window),
+                LoopKind::Shimmer { text, style, base, highlight } => {
+                    paint_shimmer(text, style, spot.bounds, shimmer, *base, *highlight, window, cx)
+                }
+            });
+        }
+    });
 }
 
 /// 循环动画在这一刻的相位（0..1），所有转圈 / 扫光共用一个时钟，彼此同步。
@@ -118,7 +197,17 @@ pub(super) struct JumpAnim {
 /// 转圈（赤陶色，12px，界面里所有「进行中」共用这一个：工具行、侧栏、压缩上下文）：
 /// 淡色圆环上一段圆头圆弧匀速转，弧长随 [`PULSE_PERIOD`] 一伸一缩，矢量画（不是旋转图标，边缘不发虚）。
 /// 减少动态效果时停成一段静止的四分之三圆弧。
+/// 这里只是占位，由 [`LoopOverlay`] 画，只能用在内容区里；别的地方用 [`spinner_in_place`]。
 pub(super) fn spinner() -> Div {
+    let div = div().size_3().flex_shrink_0();
+    if REDUCED.load(Ordering::Relaxed) {
+        return div.child(spinner_in_place());
+    }
+    div.child(loop_spot(LoopKind::Spinner).size_full())
+}
+
+/// 就地画的转圈（[`spinner`] 在内容区里只是占位）：给自己就是小覆盖层的 view 用（侧栏转圈）。
+pub(super) fn spinner_in_place() -> Div {
     let reduced = REDUCED.load(Ordering::Relaxed);
     // 起点和弧长都按圈数算
     let (start, sweep) = if reduced {
@@ -193,29 +282,27 @@ fn paint_spinner(bounds: Bounds<Pixels>, start: f32, sweep: f32, color: Rgba, wi
 /// 早先试过换字形的 ✻ 和矢量星芒，小尺寸下都显得怪，最后选了最克制的圆点（对比稿见设计指南第 13 条）。
 /// 减少动态效果时停在中间大小、不透明。
 pub(super) fn breathing_dot() -> Div {
-    let reduced = REDUCED.load(Ordering::Relaxed);
-    let k = if reduced { 0.5 } else { pulse(loop_phase(BREATH_PERIOD)) };
-    let color = rgb(CORAL);
-    div().size_3p5().flex_shrink_0().child(
-        canvas(
-            move |_, window, _| {
-                if !reduced {
-                    request_loop_tick(window);
-                }
-            },
-            move |bounds, _, window, _| {
-                let r = bounds.size.width.min(bounds.size.height) / 2. * 0.92;
-                let alpha = if reduced { 1. } else { 0.55 + 0.45 * k };
-                paint_dot(
-                    bounds.center(),
-                    r * (0.38 + 0.14 * k),
-                    Rgba { a: alpha, ..color },
-                    window,
-                );
-            },
-        )
-        .size_full(),
-    )
+    let div = div().size_3p5().flex_shrink_0();
+    if REDUCED.load(Ordering::Relaxed) {
+        // 停在中间大小、不透明
+        return div.child(
+            canvas(
+                |_, _, _| {},
+                |bounds, _, window, _| {
+                    let r = bounds.size.width.min(bounds.size.height) / 2. * 0.92;
+                    paint_dot(bounds.center(), r * 0.45, rgb(CORAL), window);
+                },
+            )
+            .size_full(),
+        );
+    }
+    div.child(loop_spot(LoopKind::Dot).size_full())
+}
+
+/// 呼吸圆点的一帧：`k` 是 0..1 的起伏。
+fn paint_breath(bounds: Bounds<Pixels>, k: f32, color: Rgba, window: &mut Window) {
+    let r = bounds.size.width.min(bounds.size.height) / 2. * 0.92;
+    paint_dot(bounds.center(), r * (0.38 + 0.14 * k), Rgba { a: 0.55 + 0.45 * k, ..color }, window);
 }
 
 /// 扫光文字（「思考中…」）：`base` 色的字上一道 `highlight` 色的柔和高光从左扫到右，约 30 帧。
@@ -228,21 +315,26 @@ pub(super) fn shimmer_text(text: impl Into<SharedString>, base: Color, highlight
         return div().text_color(rgb(base)).child(text);
     }
     let (base, highlight) = (rgb(base), rgb(highlight));
-    let phase = loop_phase(SHIMMER_PERIOD);
-    div().relative().child(div().text_color(transparent_black()).child(text.clone())).child(
+    // 排版靠透明的同样文字；字体字号在 prepaint 时取（和这份文字继承同一串祖先的样式）
+    let layout = text.clone();
+    div().relative().child(div().text_color(transparent_black()).child(layout)).child(
         canvas(
-            |_, window, _| request_loop_tick(window),
-            move |bounds, _, window, cx| {
-                paint_shimmer(&text, bounds, phase, base, highlight, window, cx)
+            move |bounds, window, _| {
+                let (style, clip) = (Box::new(window.text_style()), window.content_mask().bounds);
+                let kind = LoopKind::Shimmer { text, style, base, highlight };
+                LOOP_SPOTS.with_borrow_mut(|spots| spots.push(LoopSpot { kind, bounds, clip }));
             },
+            |_, _, _, _| {},
         )
         .absolute()
         .inset_0(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_shimmer(
     text: &SharedString,
+    style: &TextStyle,
     bounds: Bounds<Pixels>,
     phase: f32,
     base: Rgba,
@@ -250,8 +342,7 @@ fn paint_shimmer(
     window: &mut Window,
     cx: &mut App,
 ) {
-    // 字体、字号、行高跟外层排版那份文字一样（都继承同一串祖先的文字样式）
-    let style = window.text_style();
+    // 字体、字号、行高跟占位那份透明文字一样
     let rem = window.rem_size();
     let font_size = style.font_size.to_pixels(rem);
     let line_height = style.line_height_in_pixels(rem);
