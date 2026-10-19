@@ -2558,7 +2558,8 @@ fn memory_write_respects_plan_mode_and_reaches_the_checkpoint() {
     ]);
     let h = Harness::with_memory(base, dir.clone(), global);
     let sid = h.start();
-    let path = dir.join(".claudesktop/memory.json");
+    // 分层拼接：`FileChanged` 里的路径按字符串比，Windows 上 `a/b` 和 `a\b` 不相等
+    let path = dir.join(".claudesktop").join("memory.json");
 
     h.kernel.set_mode(&sid, "plan").unwrap();
     h.kernel.send_prompt(&sid, UserPrompt::text("先想想")).unwrap();
