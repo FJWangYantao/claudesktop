@@ -930,11 +930,13 @@ impl Action {
     }
 }
 
-/// 硬熔断：即使「自动」模式也不放行的动作，返回原因（中文，直接当拒绝理由给模型）。
+/// 硬熔断：即使「自动」模式也不放行的动作，返回原因（英文，直接当拒绝理由给模型）。
 ///
 /// - 删除类命令指向关键路径（文件系统根、盘符根、家目录、工作目录及其父级、顶层目录）：
 ///   `rm -rf /`、`rm -rf ~`、`rm -rf <工作目录>`、`Remove-Item -Recurse -Force C:\` …
-/// - 写受保护的文件（`.gitconfig`、shell 启动脚本、包管理器配置、本程序的 MCP 配置）
+/// - 写受保护的文件（`.gitconfig`、shell 启动脚本、包管理器配置），以及本程序自己的配置：
+///   数据目录（`settings.json`、`permissions.json`、`mcp.json`、插件……）和项目的 `.claudesktop/`。
+///   改了它们就能给自己加「总是允许」规则或钩子，绕过分类器
 ///
 /// 模型的分类器再准也会被参数骗过去，这类「一句命令就能毁掉这台机器」的东西不交给它判。
 pub fn hard_block(action: &Action, cwd: &Path) -> Option<String> {
@@ -949,7 +951,8 @@ pub fn hard_block(action: &Action, cwd: &Path) -> Option<String> {
             ))
         }
         Action::Write { path, .. } | Action::Edit { path, .. } => {
-            protected_path(path).then(|| {
+            let data_dir = claudesktop_core::default_data_dir().ok();
+            protected_path(path, data_dir.as_deref()).then(|| {
                 format!(
                     "Automatic mode never writes to protected files such as secrets, shell startup \
                      scripts, package-manager settings and the agent's own config (`{}`). \
@@ -991,12 +994,17 @@ const PROTECTED_FILES: [&str; 24] = [
     "pyrightconfig.json",
 ];
 
-/// 受保护的目录（其中任何文件的写入都不放行）
-const PROTECTED_DIRS: [&str; 4] = [".git", ".cargo", ".config/git", ".ssh"];
+/// 受保护的目录（其中任何文件的写入都不放行）；`.claudesktop` 是项目级配置（含权限规则）
+const PROTECTED_DIRS: [&str; 5] = [".git", ".cargo", ".config/git", ".ssh", ".claudesktop"];
 
-/// 这个路径是不是受保护的（写它要人工处理）。
-fn protected_path(path: &Path) -> bool {
+/// 这个路径是不是受保护的（写它要人工处理）。`data_dir` 是本程序的数据目录（整个受保护）。
+fn protected_path(path: &Path, data_dir: Option<&Path>) -> bool {
     let path = normalize(path);
+    if let Some(dir) = data_dir
+        && starts_with_ignore_case(&path, &normalize(dir))
+    {
+        return true;
+    }
     if let Some(name) = path.file_name().and_then(|n| n.to_str())
         && (PROTECTED_FILES.iter().any(|f| f.eq_ignore_ascii_case(name))
             // 点开头的环境变量文件都算（`.env`、`.env.local`、`.env.production` …）
@@ -1027,6 +1035,15 @@ fn protected_path(path: &Path) -> bool {
         }
     }
     false
+}
+
+/// `path` 是否在 `dir` 下（逐段比较、不分大小写：Windows 上 `C:\Users\Me` 和 `c:\users\me` 是同一处）。
+fn starts_with_ignore_case(path: &Path, dir: &Path) -> bool {
+    let lower = |p: &Path| -> Vec<String> {
+        p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
+    };
+    let (path, dir) = (lower(path), lower(dir));
+    !dir.is_empty() && path.starts_with(&dir)
 }
 
 /// 命令里如果有删除类命令指向关键路径，返回那个目标。
@@ -1095,8 +1112,7 @@ fn removes_recursively(program: &str, args: &[String]) -> bool {
     }
     args.iter().any(|a| {
         let a = a.to_ascii_lowercase();
-        (a.starts_with('-')
-            && (a.contains('r') || a == "--recursive" || a.contains("recurse")))
+        (a.starts_with('-') && (a.contains('r') || a == "--recursive" || a.contains("recurse")))
             || a == "/s"
     })
 }
@@ -1990,11 +2006,16 @@ mod tests {
     #[test]
     fn hard_block_stops_critical_removals() {
         let cwd = if cfg!(windows) { Path::new("C:\\work\\proj") } else { Path::new("/work/proj") };
-        let shell = |command: &str| hard_block(&Action::Shell {
-            command: command.into(),
-            timeout: Duration::from_secs(1),
-            cwd: cwd.to_path_buf(),
-        }, cwd);
+        let shell = |command: &str| {
+            hard_block(
+                &Action::Shell {
+                    command: command.into(),
+                    timeout: Duration::from_secs(1),
+                    cwd: cwd.to_path_buf(),
+                },
+                cwd,
+            )
+        };
 
         // 文件系统根、盘符根、家目录、工作目录本身及父级：一律拦下
         for bad in [
@@ -2004,14 +2025,18 @@ mod tests {
             "rm -rf ~/",
             "rm -rf ..",
             "rm -r -f .",
-            "Remove-Item -Recurse -Force C:\\",
             "rm -rf /work",
             "rm -rf /work/proj",
             "sudo rm -rf /work/proj/src/../../..",
             "echo hi && rm -rf /work",
-            "rd /s /q C:\\Windows",
         ] {
             assert!(shell(bad).is_some(), "应拦下：{bad}");
+        }
+        // 盘符路径只在 Windows 上是绝对路径
+        if cfg!(windows) {
+            for bad in ["Remove-Item -Recurse -Force C:\\", "rd /s /q C:\\Windows"] {
+                assert!(shell(bad).is_some(), "应拦下：{bad}");
+            }
         }
 
         // 项目里的具体目录、单文件删除、非删除命令：放行给分类器判
@@ -2040,6 +2065,17 @@ mod tests {
         assert!(write("scripts/.gitconfig").is_some());
         assert!(write("src/main.rs").is_none());
         assert!(write("docs/environment.md").is_none());
+        // 项目级配置（含权限规则）：改了就能绕过分类器
+        assert!(write(".claudesktop/settings.json").is_some());
+
+        // 本程序的数据目录（设置、权限规则、mcp.json、插件）整个受保护，不分大小写
+        let data = cwd.join("..").join("AppData").join("claudesktop");
+        assert!(protected_path(&data.join("permissions.json"), Some(&data)));
+        assert!(protected_path(&data.join("plugins").join("x").join("hooks.json"), Some(&data)));
+        let upper = PathBuf::from(data.to_string_lossy().to_uppercase());
+        assert!(protected_path(&upper.join("mcp.json"), Some(&data)));
+        assert!(!protected_path(&cwd.join("mcp.json"), Some(&data)));
+        assert!(!protected_path(&cwd.join("src/main.rs"), None));
     }
 
     #[test]

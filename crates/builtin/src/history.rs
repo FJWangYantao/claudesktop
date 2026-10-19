@@ -77,6 +77,8 @@ pub struct Rebuilt {
     pub summary: Option<String>,
     /// 对话历史（不含系统提示词和摘要）
     pub messages: Vec<ChatMessage>,
+    /// 用户说过的话（从早到晚，回退掉的不算；压缩前的也留着）：「自动」模式的分类器据此判断授权
+    pub user_messages: Vec<String>,
 }
 
 /// 日志 → 对话历史。
@@ -85,6 +87,7 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
     let records = claudesktop_core::effective(records);
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut summary = None;
+    let mut user_messages = Vec::new();
     let mut assistant = Assistant::default();
     // 有进行中的一轮（最后一条用户消息之后还没结束）
     let mut in_turn = false;
@@ -94,6 +97,7 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
                 messages.extend(assistant.take());
                 // 插件命令展开过的，模型当时看到的是展开后的全文
                 messages.push(user_message(sent.as_deref().unwrap_or(text), images));
+                user_messages.push(sent.as_deref().unwrap_or(text).to_string());
                 in_turn = true;
             }
             Record::Event { event } => match event {
@@ -166,7 +170,7 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
         }
     }
     messages.extend(assistant.take());
-    Rebuilt { summary, messages: trim(messages) }
+    Rebuilt { summary, messages: trim(messages), user_messages }
 }
 
 /// 超出上限时从最早的轮次丢，并保证从一条用户消息开始。
