@@ -83,11 +83,16 @@ pub fn root_or(cwd: &Path) -> &Path {
 
 /// 项目根（向上找几层 `.claudesktop`，工作目录本身优先）。
 pub fn project_root(cwd: &Path) -> Option<&Path> {
+    climb(cwd, |d| path_in(d).is_file() || d.join(".git").is_dir())
+}
+
+/// 从 `cwd` 往上最多 4 层找 `is_root` 为真的目录（`cwd` 本身优先）。
+/// 判断单独抽出来，测试不用依赖临时目录在不在仓库里。
+fn climb<'a>(cwd: &'a Path, is_root: impl Fn(&Path) -> bool) -> Option<&'a Path> {
     let mut dir = Some(cwd);
-    // 最多向上 4 层：太深的项目配置反而让人意外
     for _ in 0..4 {
         let d = dir?;
-        if path_in(d).is_file() || d.join(".git").is_dir() {
+        if is_root(d) {
             return Some(d);
         }
         dir = d.parent();
@@ -410,10 +415,25 @@ mod tests {
         save(&dir, &ProjectConfig::default()).unwrap();
     }
 
+    /// 没有任何标记时返回 cwd 本身；标记在上级时返回上级。
+    /// 用 `climb` 直接测（临时目录本身可能就在某个仓库里，真去磁盘上找会读到宿主的标记）。
     #[test]
     fn root_or_falls_back_to_the_working_directory() {
-        let dir = tmp("root-or");
-        assert_eq!(root_or(&dir), dir.as_path());
+        let base = Path::new("base");
+        let cwd = base.join("a/b");
+        assert_eq!(climb(&cwd, |_| false), None);
+        assert_eq!(climb(&cwd, |d| d == base), Some(base));
+        // 工作目录本身有标记时优先用自己
+        assert_eq!(climb(&cwd, |d| d == cwd), Some(cwd.as_path()));
+        // 太深（超过 4 层）的标记不算
+        let deep = base.join("a/b/c/d/e");
+        assert_eq!(climb(&deep, |d| d == base), None);
+    }
+
+    /// 磁盘上真走一遍：cwd 自己有标记时就是它自己。
+    #[test]
+    fn root_or_uses_cwd_when_it_has_a_marker() {
+        let dir = tmp("root-or-cwd");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         assert_eq!(root_or(&dir), dir.as_path());
     }

@@ -24,14 +24,14 @@ pub struct Instruction {
     pub text: String,
 }
 
-/// 按「通用 → 具体」的顺序列出要读的文件：用户级，然后从仓库根往下到 `cwd`。
-/// 往上找到第一个含 `.git` 的目录为止；`cwd` 不在仓库里时只看 `cwd` 本身。
-fn candidates(cwd: &Path, user_file: Option<&Path>) -> Vec<PathBuf> {
+/// 从 `cwd` 往上到第一个含 `.git` 的目录（含）为止，返回「根 → cwd」顺序的各级目录。
+/// 一直在往上都没找到仓库根时只保留 `cwd` 本身：仓库外的上级目录不是这个项目的约定。
+fn dirs_up_to_root(cwd: &Path, is_root: impl Fn(&Path) -> bool) -> Vec<&Path> {
     let mut dirs: Vec<&Path> = Vec::new();
     let mut root_found = false;
     for dir in cwd.ancestors() {
         dirs.push(dir);
-        if dir.join(".git").exists() {
+        if is_root(dir) {
             root_found = true;
             break;
         }
@@ -39,8 +39,15 @@ fn candidates(cwd: &Path, user_file: Option<&Path>) -> Vec<PathBuf> {
     if !root_found {
         dirs.truncate(1);
     }
+    dirs.reverse();
+    dirs
+}
+
+/// 按「通用 → 具体」的顺序列出要读的文件：用户级，然后从仓库根往下到 `cwd`。
+fn candidates(cwd: &Path, user_file: Option<&Path>) -> Vec<PathBuf> {
+    let dirs = dirs_up_to_root(cwd, |dir| dir.join(".git").exists());
     let mut out: Vec<PathBuf> = user_file.map(Path::to_path_buf).into_iter().collect();
-    for dir in dirs.into_iter().rev() {
+    for dir in dirs {
         out.extend(FILE_NAMES.iter().map(|name| dir.join(name)));
     }
     out
@@ -123,14 +130,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 仓库外的上级目录不读：临时目录本身可能在某个仓库里（CI 上常把 TEMP 放进工作目录），
+    /// 所以这里用假的「是不是仓库根」判断，不依赖 temp 的真实位置。
     #[test]
     fn outside_a_repo_only_reads_cwd() {
-        let dir = temp("norepo");
+        let base = Path::new("base");
+        let cwd = base.join("sub");
+        let dirs = dirs_up_to_root(&cwd, |dir| dir.ends_with("repo"));
+        assert_eq!(dirs, [cwd.as_path()]);
+
+        // 找不到仓库根时，多深的 cwd 都只看自己
+        let deep = base.join("a/b/c/d");
+        assert_eq!(dirs_up_to_root(&deep, |_| false), [deep.as_path()]);
+
+        // 找到仓库根：根 → cwd 各级都在，且是从通用到具体
+        let dirs = dirs_up_to_root(&cwd, |dir| dir == base);
+        assert_eq!(dirs, [base, cwd.as_path()]);
+        assert_eq!(prompt_section(&[]), None);
+    }
+
+    /// 实际读文件的那条路：仓库根那一级和 cwd 自己那一级都读，根在前。
+    #[test]
+    fn load_reads_root_then_cwd() {
+        let dir = temp("root-then-cwd");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "上级").unwrap();
-        assert!(load(&dir.join("sub"), None).is_empty());
-        assert_eq!(load(&dir, None).len(), 1);
-        assert_eq!(prompt_section(&[]), None);
+        std::fs::write(dir.join("sub/AGENTS.md"), "本级").unwrap();
+        let texts = |cwd: &Path| -> Vec<String> {
+            load(cwd, None).into_iter().map(|f| f.text).collect()
+        };
+        assert_eq!(texts(&dir), ["上级"]);
+        assert_eq!(texts(&dir.join("sub")), ["上级", "本级"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
