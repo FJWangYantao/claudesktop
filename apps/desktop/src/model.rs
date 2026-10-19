@@ -592,6 +592,20 @@ pub const PERMISSION_MODES: [(&str, &str, IconAll, &str); 3] = [
     ("计划模式", "只出计划，不改动文件", IconAll::ListTodo, "plan"),
 ];
 
+/// 「自动」模式的 mode id（设置里开着时新会话默认用它；见 `Session::default_to`）
+pub const MODE_AUTO_ID: &str = "auto";
+
+/// 「自动」这一项本身。设置里开着「自动」时，会话还没连上内核（模式列表还是静态表）
+/// 就先把它补进去，chip 上显示的名字才和新建对话的默认模式对得上。
+pub fn auto_mode_entry() -> ModeEntry {
+    ModeEntry {
+        id: MODE_AUTO_ID.into(),
+        name: "自动".into(),
+        desc: "由分类器判断：放行常规操作，拦下越界的和不可逆的".into(),
+        icon: IconAll::Zap,
+    }
+}
+
 /// 下拉里的一项模式：mock / 演示用上面的静态表；连上真实 agent 后改用
 /// agent 自己上报的（Claude = 权限模式，pi = 思考强度）。
 pub struct ModeEntry {

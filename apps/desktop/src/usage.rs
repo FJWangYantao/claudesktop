@@ -544,6 +544,7 @@ mod tests {
             created_ms: 0,
             updated_ms: 99,
             archived: false,
+            task: false,
         }
     }
 

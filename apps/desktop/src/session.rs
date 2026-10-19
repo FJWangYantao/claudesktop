@@ -47,6 +47,9 @@ pub struct Session {
     pub autoprompt: Option<claudesktop_core::UserPrompt>,
     /// 会话工作目录（侧栏按它分组；session/new 用它）
     pub cwd: PathBuf,
+    /// 任务：建立时没为它选过文件夹（跑在默认目录里）。侧栏归到「任务」区，
+    /// 在输入框上方的目录菜单里选个文件夹就成了项目会话
+    pub task: bool,
     /// 持久化元信息：首条消息发出后才建档（空会话不落盘）
     pub meta: Option<SessionMeta>,
     /// 追加式日志；恢复的会话在第一次写入时才打开
@@ -57,6 +60,9 @@ pub struct Session {
     pub resuming: bool,
     /// 内核会话建立前选的模型：Started 之后再告诉内核
     pub pending_model: Option<String>,
+    /// 待同步给内核的权限模式：新会话的默认模式（设置里开着「自动」时是 `"auto"`），
+    /// 或用户在会话建立前自己选的。`Started` 时交给内核后清掉
+    pub pending_mode: Option<String>,
     /// 本轮累计的 token，一轮结束时写进日志后清零
     pub turn_usage: TurnUsage,
     /// 本轮收到、端点还没数过的输出（正文 + 思考）：流式期间状态行据此估算 token，
@@ -282,11 +288,13 @@ impl Session {
                 .into(),
             autoprompt: None,
             cwd,
+            task: false,
             meta: None,
             log: None,
             restored: false,
             resuming: false,
             pending_model: None,
+            pending_mode: None,
             turn_usage: TurnUsage::default(),
             turn_streamed: Streamed::default(),
             turn_started: None,
@@ -318,6 +326,10 @@ impl Session {
     pub fn from_records(token: u64, meta: SessionMeta, records: Vec<Record>) -> Self {
         let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent), meta.cwd.clone());
         s.ready = false;
+        // 历史会话不该被「新对话默认自动」改掉模式：它的模式由重建的日志决定
+        s.pending_mode = None;
+        // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
+        s.task = meta.task;
         s.title = meta.title.clone().into();
         s.restored = true;
         s.replaying = true;
@@ -677,6 +689,27 @@ impl Session {
         self.transcript.iter().any(|i| matches!(i, ChatItem::User { .. }))
     }
 
+    /// 新会话默认的权限模式（设置里开着「自动」时是「自动」）：先把这一项补进模式表并选中
+    /// （chip、下拉立刻显示它），内核会话建立（Started）后再交给内核；
+    /// 内核没提供这个模式就退回它报的那个。
+    pub fn default_to(&mut self, mode: &str) {
+        let i = match self.modes.iter().position(|m| m.id == mode) {
+            Some(i) => i,
+            None => {
+                self.modes.push(auto_mode_entry());
+                self.modes.len() - 1
+            }
+        };
+        self.permission_mode = i;
+        self.pending_mode = Some(mode.to_string());
+    }
+
+    /// 用户选了模式（下标）：立即生效，与「新对话的默认模式」无关了
+    pub fn choose_mode_index(&mut self, i: usize) {
+        self.permission_mode = i;
+        self.pending_mode = None;
+    }
+
     /// 有还没应答的权限请求
     pub fn waiting_permission(&self) -> bool {
         self.pending_permission().is_some()
@@ -999,6 +1032,8 @@ impl Session {
         self.ready = false;
         self.autoprompt = None;
         self.restored = self.has_user_message();
+        // 当前模式随新内核会话重新交回去：用户选的（或新对话默认的）模式不该因为重连丢掉
+        self.pending_mode = self.modes.get(self.permission_mode).map(|m| m.id.clone());
     }
 
     /// 内核致命错误：这个会话不再可用。
@@ -1069,6 +1104,22 @@ impl Session {
                     self.permission_mode = current_mode
                         .and_then(|id| self.modes.iter().position(|m| m.id == id))
                         .unwrap_or(0);
+                }
+                // 新建对话的默认模式 / 会话建立前选的模式：内核会话建立了才告诉它。
+                // 内核没报这个模式（如 ACP agent）就作罢，退回它报的那个
+                if let Some(mode) = self.pending_mode.take() {
+                    match self.modes.iter().position(|m| m.id == mode) {
+                        Some(i) => {
+                            self.permission_mode = i;
+                            if let (Some(kernel), Some(id)) = (kernel, self.acp_id.clone())
+                                && let Err(err) = kernel.set_mode(&id, &mode)
+                            {
+                                self.note(format!("切换权限模式失败：{err}"));
+                            }
+                        }
+                        // 内核不认这个模式：退回它报的那个
+                        None => self.permission_mode = 0,
+                    }
                 }
                 // 会话建立前在下拉里选过模型：现在告诉内核
                 if let (Some(model), Some(kernel), Some(id)) =
@@ -1525,6 +1576,7 @@ mod tests {
             created_ms: 0,
             updated_ms: 0,
             archived: false,
+            task: false,
         }
     }
 
@@ -2094,6 +2146,67 @@ mod tests {
 
     fn thought(text: &str) -> KernelEvent {
         KernelEvent::AgentThoughtChunk { text: text.into() }
+    }
+
+    fn started(modes: &[(&str, &str)]) -> KernelEvent {
+        KernelEvent::Started {
+            token: 1,
+            agent_name: "a".into(),
+            session_id: "k1".into(),
+            model: Some("m".into()),
+            modes: modes
+                .iter()
+                .map(|(id, name)| claudesktop_core::ModeView {
+                    id: (*id).into(),
+                    name: (*name).into(),
+                    description: None,
+                })
+                .collect(),
+            current_mode: Some("default".into()),
+            resumed: false,
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn new_session_default_mode_reaches_the_kernel() {
+        let modes = [("default", "逐项确认"), ("auto", "自动")];
+        // 设置里开着「自动」：新会话一建就把 chip 显示成「自动」，Started 后交给内核
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.default_to(MODE_AUTO_ID);
+        assert_eq!(s.modes[s.permission_mode].name.as_ref(), "自动");
+        s.apply_event(started(&modes), None);
+        assert_eq!(s.modes[s.permission_mode].id, MODE_AUTO_ID);
+        // 只在这一次生效：之后重开的（如回退）不会又改回「自动」
+        assert!(s.pending_mode.is_none());
+        s.choose_mode_index(0);
+        s.apply_event(started(&modes), None);
+        assert_eq!(s.modes[s.permission_mode].id, "default");
+
+        // 内核不认这个模式（ACP agent）：退回它报的那个，不留下「自动」
+        let mut s = Session::new(2, KernelChoice::Acp, PathBuf::from("."));
+        s.default_to(MODE_AUTO_ID);
+        s.apply_event(started(&[("default", "逐项确认"), ("plan", "计划")]), None);
+        assert_eq!(s.modes[s.permission_mode].id, "default");
+        assert!(s.modes.iter().all(|m| m.id != MODE_AUTO_ID));
+    }
+
+    #[core::prelude::v1::test]
+    fn history_sessions_keep_their_own_mode() {
+        let mut meta = meta();
+        meta.agent = "builtin:test".into();
+        let s = Session::from_records(1, meta, vec![Record::user("问")]);
+        assert!(s.pending_mode.is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn restored_sessions_keep_their_task_flag() {
+        // 侧栏按元信息把对话分到项目区 / 任务区，重放时不能丢
+        let mut with_task = meta();
+        with_task.task = true;
+        let s = Session::from_records(1, with_task, vec![Record::user("问")]);
+        assert!(s.task);
+        let s = Session::from_records(2, meta(), vec![Record::user("问")]);
+        assert!(!s.task);
     }
 
     #[core::prelude::v1::test]

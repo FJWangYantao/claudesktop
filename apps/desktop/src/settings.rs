@@ -561,6 +561,12 @@ impl Settings {
         Ok(config)
     }
 
+    /// 自研内核上新建的对话是否默认用「自动」模式（设置里开着并且配好了）。
+    /// 只对自研内核有意义：它的模式列表里才有「自动」。
+    pub fn auto_mode_default(&self) -> bool {
+        self.auto_mode.to_config(self.builtin.current()).is_some()
+    }
+
     /// 用量网关（开着才有；进程里共用一个，第一次用到时起）。起不来就直连，不影响用。
     pub fn gateway(&self) -> Option<claudesktop_builtin::gateway::GatewayHandle> {
         use claudesktop_builtin::gateway;

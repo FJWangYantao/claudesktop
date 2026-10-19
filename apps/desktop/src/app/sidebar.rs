@@ -1,5 +1,7 @@
-//! 侧栏：浮起的圆角面板，含导航、按工作目录分组的会话列表、设置与内核状态。
-//! 会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
+//! 侧栏：浮起的圆角面板，含导航、对话历史、设置与内核状态。
+//! 对话历史分两区：上面是**项目区**（按工作目录分组，当前项目在前），下面是**任务区**
+//! （[`TASKS_KEY`]：建立时没为它选过文件夹的对话，见 [`Session::task`]），
+//! 最后是「已归档」组。会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
 //! 会话多了不占地方：点组名折叠整组（记进设置），每组默认只列最近活动的几个
 //! （[`visible_members`]），当前 / 运行中 / 待查看的会话折叠了也照常露出来。
 //! 用不着又不想删的会话可以归档：收进列表末尾的「已归档」组（默认收起，元信息里记 `archived`）。
@@ -49,6 +51,9 @@ pub(crate) struct SessionGroup {
 
 /// 「已归档」组的 [`SessionGroup::key`]
 pub(crate) const ARCHIVED_KEY: &str = "archived";
+
+/// 「任务」组的 [`SessionGroup::key`]（对话历史的下半区：建立时没选过文件夹的对话）
+pub(crate) const TASKS_KEY: &str = "tasks";
 
 /// 一组默认列出几个会话，其余收进「显示其余 N 个」
 const GROUP_PREVIEW: usize = 5;
@@ -260,7 +265,7 @@ impl ChatApp {
         for s in &self.sessions {
             let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
             let archived = s.meta.as_ref().is_some_and(|m| m.archived);
-            (&s.title, s.busy, s.busy && s.waiting_permission(), s.unread, age, archived)
+            (&s.title, s.busy, s.busy && s.waiting_permission(), s.unread, age, archived, s.task)
                 .hash(&mut h);
         }
         let key = h.finish();
@@ -356,6 +361,8 @@ impl ChatApp {
             let foldable = filter == SidebarFilter::All;
             // 已归档组默认收起、点开就全列，开合只记在内存里（`sidebar_expanded`）
             let archive = key == ARCHIVED_KEY;
+            // 任务区：对话历史的下半区。上面排着项目，这里前加一道分隔线
+            let tasks = key == TASKS_KEY;
             let folded = foldable
                 && if archive {
                     !self.sidebar_expanded.contains(&key)
@@ -371,7 +378,7 @@ impl ChatApp {
                 (members, 0)
             };
             // 组名：点了折叠 / 展开整组；折叠时后面带上会话数（单独一块，组名截短时也留着），
-            // 箭头常显（展开时悬停才显出来）
+            // 箭头常显（展开时悬停才显出来）。任务区比项目名多一个小图标，一眼分得开
             let label = div()
                 .min_w_0()
                 .h_flex()
@@ -379,6 +386,14 @@ impl ChatApp {
                 .whitespace_nowrap()
                 .text_size(TEXT_META)
                 .text_color(rgb(INK_SOFT))
+                .when(tasks, |d| {
+                    d.child(
+                        Icon::new(IconAll::ListTodo)
+                            .size_3()
+                            .flex_shrink_0()
+                            .text_color(rgb(INK_SOFT)),
+                    )
+                })
                 .child(div().min_w_0().overflow_hidden().text_ellipsis().child(name))
                 .when(folded, |d| {
                     d.child(
@@ -443,6 +458,10 @@ impl ChatApp {
                 .px_4()
                 .pt(px(if g == 0 { 10. } else { 16. }))
                 .pb_1()
+                // 任务区前一道分隔线：上面是项目，下面是任务
+                .when(tasks && g > 0, |d| {
+                    d.mt(px(6.)).pt(px(12.)).border_t_1().border_color(rgb(LINE))
+                })
                 .child(title);
             // 折叠了的第一组只留筛选按钮：排序 / 分组方式 / 打开目录用不上，
             // 悬停才显的按钮不显时也占宽度，留着会把组名和会话数挤成省略号
@@ -767,22 +786,15 @@ impl ChatApp {
             .collect()
     }
 
-    /// 侧栏分组：(组名, 会话下标)。当前工作目录一组在最前；
+    /// 侧栏分组：(组名, 会话下标)。上半区是项目：当前工作目录一组在最前，其余工作目录按最近活动排；
+    /// 下半区是任务（[`TASKS_KEY`]）、最后是已归档。
     /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
     pub(super) fn session_groups(&self) -> Vec<SessionGroup> {
         let archived = |i: usize| self.sessions[i].meta.as_ref().is_some_and(|m| m.archived);
-        let mut groups = self.active_session_groups(|i| !archived(i));
-        let members: Vec<usize> = (0..self.sessions.len()).filter(|&i| archived(i)).collect();
-        if !members.is_empty() {
-            let mut members = members;
-            // 最近归档 / 用过的在前
-            members.sort_by_key(|&i| {
-                std::cmp::Reverse(self.sessions[i].meta.as_ref().map_or(0, |m| m.updated_ms))
-            });
-            groups
-                .push(SessionGroup { key: ARCHIVED_KEY.into(), name: "已归档".into(), members });
-        }
-        groups
+        let is_task = |i: usize| self.sessions[i].task;
+        let groups = self.active_session_groups(|i| !archived(i) && !is_task(i));
+        let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
+        assemble_groups(groups, self.sessions.len(), activity, is_task, archived)
     }
 
     /// 没归档的会话（`listed`）按工作目录或日期分组。
@@ -1143,6 +1155,35 @@ impl ChatApp {
     }
 }
 
+/// 侧栏分组的收尾：在项目分组后面补「任务」和「已归档」两组。
+/// `projects` 是 `active_session_groups` 排好的项目分组，其余参数从会话列表里读。
+fn assemble_groups(
+    mut projects: Vec<SessionGroup>,
+    total: usize,
+    activity: impl Fn(usize) -> u64,
+    is_task: impl Fn(usize) -> bool,
+    archived: impl Fn(usize) -> bool,
+) -> Vec<SessionGroup> {
+    // 任务区：建立时没为它选过文件夹的对话，按最近活动排（最近在上）
+    let mut tasks: Vec<usize> = (0..total).filter(|&i| !archived(i) && is_task(i)).collect();
+    if !tasks.is_empty() {
+        tasks.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
+        projects
+            .push(SessionGroup { key: TASKS_KEY.into(), name: "任务".into(), members: tasks });
+    }
+    // 已归档：最近归档 / 用过的在前
+    let mut old: Vec<usize> = (0..total).filter(|&i| archived(i)).collect();
+    if !old.is_empty() {
+        old.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
+        projects.push(SessionGroup {
+            key: ARCHIVED_KEY.into(),
+            name: "已归档".into(),
+            members: old,
+        });
+    }
+    projects
+}
+
 /// 「刚刚 / 5 分钟 / 3 小时 / 2 天」
 fn age_label(updated_ms: u64) -> SharedString {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
@@ -1176,5 +1217,26 @@ mod tests {
         // 折叠：只剩要紧的，「显示全部」也不管用
         assert_eq!(shown(3, true, false, &[]), (vec![], 3));
         assert_eq!(shown(10, true, true, &[2, 8]), (vec![2, 8], 8));
+    }
+
+    #[core::prelude::v1::test]
+    fn tasks_and_archive_follow_the_projects() {
+        // 0 / 1 在项目里，2 / 3 是任务，4 归档了；活动时间越大越新
+        let groups = assemble_groups(
+            vec![SessionGroup { key: "dir:a".into(), name: "a".into(), members: vec![0, 1] }],
+            5,
+            |i| i as u64,
+            |i| i == 2 || i == 3,
+            |i| i == 4,
+        );
+        let order: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(order, ["dir:a", TASKS_KEY, ARCHIVED_KEY]);
+        // 任务区按最近活动排，最近的在上面
+        assert_eq!(groups[1].members, [3, 2]);
+        assert_eq!(groups[1].name.as_ref(), "任务");
+        // 只有两边都空时才不出现这两组
+        let only_tasks = assemble_groups(Vec::new(), 2, |_| 0, |_| true, |_| false);
+        assert_eq!(only_tasks.len(), 1);
+        assert_eq!(only_tasks[0].members, [0, 1]);
     }
 }

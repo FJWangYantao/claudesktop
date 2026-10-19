@@ -88,13 +88,19 @@ impl ChatApp {
             }))
     }
 
-    /// 权限模式菜单里选了一项：会话立即生效，已建立的内核会话同步 set_mode。
+    /// 权限模式菜单里选了一项：会话立即生效，已建立的内核会话同步 set_mode；
+    /// 还没建立的会话等 Started 时再交给内核
     pub(crate) fn choose_mode(&mut self, i: usize, cx: &mut Context<Self>) {
         let kernel = self.session_kernel(self.active);
         let s = &mut self.sessions[self.active];
-        s.permission_mode = i;
-        if let (Some(kernel), Some(id), Some(mode)) = (kernel, s.acp_id.clone(), s.modes.get(i)) {
-            let _ = kernel.set_mode(&id, &mode.id);
+        s.choose_mode_index(i);
+        if let Some(mode) = s.modes.get(i) {
+            match (kernel, s.acp_id.clone()) {
+                (Some(kernel), Some(id)) => {
+                    let _ = kernel.set_mode(&id, &mode.id);
+                }
+                _ => s.pending_mode = Some(mode.id.clone()),
+            }
         }
         cx.notify();
     }
@@ -157,6 +163,13 @@ impl ChatApp {
             .map(|m| m.name.clone())
             .unwrap_or_else(|| "—".into());
         let project = project_label(&self.session().cwd);
+        // 任务（建立时没选过文件夹的对话）：chip 上直说，点开可以挂到某个文件夹上
+        let task = self.session().task;
+        let project_chip = if task {
+            MenuChip::new(IconAll::ListTodo, "任务").filled()
+        } else {
+            MenuChip::new(IconAll::Folder, project).filled()
+        };
         // 焦点几乎总在输入框上（丢了由 restore_focus 找回），所以窗口不在前台时按没聚焦画：
         // 切去别的程序后输入框回到静止样子，鼠标移上来是悬停态，点回来才是聚焦态
         let focused =
@@ -291,7 +304,7 @@ impl ChatApp {
             .gap_2()
             // 进行中这一轮的计划钉在最上面（对话往下走它也一直看得见）
             .children(self.render_pinned_plan(cx))
-            // 输入框上方：运行环境 + 项目目录（点开切换工作目录）
+            // 输入框上方：运行环境 + 项目目录（点开切换工作目录；任务会话是「任务」chip）
             .child(div().h_flex().gap_1p5().child(Self::chip(IconAll::Monitor, "本地")).child(
                 menu_popover(
                     "workspace-menu",
@@ -299,7 +312,7 @@ impl ChatApp {
                     rems(20.),
                     &app,
                     &self.menu_focus,
-                    MenuChip::new(IconAll::Folder, project).filled(),
+                    project_chip,
                     workspace_menu_items,
                 ),
             ))
@@ -608,16 +621,18 @@ fn mode_menu_items(
     menu
 }
 
-/// 工作目录条目：用过的目录（当前会话所在的打对勾）+「选择文件夹…」。
+/// 工作目录条目：用过的目录（当前会话所在的打对勾）+「不选项目（任务）」+「选择文件夹…」。
 fn workspace_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
 ) -> MenuList {
     let current = &app.session().cwd;
+    let task = app.session().task;
     let mut menu = MenuList::new("workspace-menu-list", handle, popover);
     for (i, dir) in app.recent_workspaces().into_iter().enumerate() {
-        let active = dir == *current;
+        // 任务会话没有「当前项目」，一个都不打勾
+        let active = !task && dir == *current;
         let path = short_path(&dir);
         let label = project_label(&dir);
         menu = menu.pick(
@@ -625,10 +640,26 @@ fn workspace_menu_items(
             move |this, cx| this.switch_workspace(dir.clone(), cx),
         );
     }
-    menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick(
-        menu_item("workspace-pick", IconAll::FolderOpen, "选择文件夹…", "", false),
-        |this, cx| this.pick_workspace(cx),
-    )
+    menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE)))
+        // 不选项目：这段对话算一件任务，归到侧栏下半区。已经跑在默认目录里就只改归类
+        .pick(
+            menu_item(
+                "workspace-task",
+                IconAll::ListTodo,
+                "不选项目（任务）",
+                if task {
+                    "这段对话已归在侧栏的「任务」里"
+                } else {
+                    "不指定文件夹，只作为一件任务"
+                },
+                task,
+            ),
+            |this, cx| this.as_task(cx),
+        )
+        .pick(
+            menu_item("workspace-pick", IconAll::FolderOpen, "选择文件夹…", "", false),
+            |this, cx| this.pick_workspace(cx),
+        )
 }
 
 /// 模型条目：非自研内核给提示；列表 + 刷新入口（刷新不收起面板，看得到进度）。

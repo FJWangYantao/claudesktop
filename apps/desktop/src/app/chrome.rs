@@ -96,11 +96,17 @@ impl ChatApp {
         let crumb = if self.settings_open {
             crumb
         } else {
-            let project = s
-                .cwd
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.project_name.to_string());
+            // 任务会话没有项目：面包屑里写「任务」，不拿默认目录的名字冒充项目
+            let (icon, project) = if s.task {
+                (IconAll::ListTodo, "任务".to_string())
+            } else {
+                let label = s
+                    .cwd
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.project_name.to_string());
+                (IconAll::Folder, label)
+            };
             // 顶栏窄到放不下「项目 / 标题」时只留标题（项目名在侧栏分组里也有）：
             // 带省略号的文字缩不到零，留着项目名会把标题挤没
             let sidebar = if self.sidebar_open { SIDEBAR_W } else { px(0.) };
@@ -109,7 +115,7 @@ impl ChatApp {
             crumb
                 .when(!compact, |crumb| {
                     crumb
-                        .child(Icon::new(IconAll::Folder).size_3p5().text_color(rgb(INK_SOFT)))
+                        .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
                         // 宽度不够时先缩标题（至少留几个字），标题缩到头了再缩项目名
                         .child(
                             div()

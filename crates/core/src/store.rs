@@ -40,6 +40,10 @@ pub struct SessionMeta {
     /// 归档了：侧栏不列在项目 / 日期分组里，收进末尾的「已归档」
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// 任务：建立时没有为它选过文件夹（只在默认目录里跑），侧栏归到「任务」区。
+    /// 老元信息没有这一项，读成 false（留在项目区，和加这一项之前一样）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub task: bool,
 }
 
 impl SessionMeta {
@@ -209,6 +213,7 @@ impl SessionStore {
             created_ms: now,
             updated_ms: now,
             archived: false,
+            task: false,
         };
         self.save_meta(&meta)?;
         let log = self.append_log(&meta.id)?;
@@ -429,17 +434,19 @@ mod tests {
 
     #[test]
     fn archived_flag_round_trips_and_old_metas_still_load() {
-        // 老的元信息文件没有 archived：读成没归档
+        // 老的元信息文件没有 archived / task：读成没归档、不是任务
         let old = r#"{"id":"s","title":"t","cwd":".","agent":"a","created_ms":1,"updated_ms":2}"#;
         let meta: SessionMeta = serde_json::from_str(old).unwrap();
         assert!(!meta.archived);
-        // 没归档不写这个字段，旧版本读新文件也不受影响
+        assert!(!meta.task);
+        // 没归档 / 不是任务就不写这两个字段，旧版本读新文件也不受影响
         assert!(!serde_json::to_string(&meta).unwrap().contains("archived"));
         let store = temp_store("archive");
         let (mut meta, _log) = store.create("t", ".".into(), "a").unwrap();
         meta.archived = true;
+        meta.task = true;
         store.save_meta(&meta).unwrap();
-        assert!(store.list().iter().any(|m| m.id == meta.id && m.archived));
+        assert!(store.list().iter().any(|m| m.id == meta.id && m.archived && m.task));
     }
 
     #[test]

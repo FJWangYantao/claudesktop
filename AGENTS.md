@@ -37,6 +37,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   分类器只喂用户说过的话 + 要执行的动作，**剥掉助手文本和工具结果**（防自我说服、防注入）；
   判不出来一律按拒绝。拒绝的理由连同「别换个马甲重试」回给模型，它自己决定换路子还是问用户。
   连续 3 次 / 累计 20 次拒绝就停下来等用户（用户再发消息就重新计数）。分类器看的用户消息续接 / 回退时从日志重建（`history::Rebuilt::user_messages`）。没在设置里配好时这个模式不出现在模式列表里。
+  设置里开着时，**新建的对话默认就是「自动」**（`ChatApp::new_session` → `Session::default_to`）：
+  会话还没连上内核时先把这一项补进模式表（`model::auto_mode_entry`）并选中，`Started` 时走
+  `Session::pending_mode` 交给内核（内核不认就退回它报的那个）；用户在下拉里改了就以此为准，
+  内核重连（`detach_kernel`）时把当前模式重新挂上 `pending_mode`。
 - **Markdown（`TextView`）**：字号、颜色、行高要直接设在 `TextView` 上（它实现了 `Styled`），
   设在外层 div 上不生效。
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，
@@ -99,6 +103,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
   - 对话列表的滚轮在 `content.rs` 的 capture 阶段截住，走 `ChatApp::wheel_by` / `step_wheel` 平滑滑动
     （gpui `List` 自己一格硬跳 60px）；新的程序化滚动（跳转、跟随底部）要清掉 `Session::wheel`，否则两边抢。
+- **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
+  下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
+  `SessionMeta::task`），最后是「已归档」。判定在 `ChatApp::new_session`（`is_project_dir`：
+  建会话的目录是不是设置里选过的 `workspace`）；输入框上方的目录菜单里有「不选项目（任务）」
+  （`ChatApp::as_task`，已经跑在默认目录就只改归类），chip 和顶栏面包屑对任务显示「任务」。
+  新增对话行状态时记得把它并进 `sync_sidebar` 的指纹。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
   否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。
 - **输入框上方的内容区也是缓存 view**（`ContentView`，见 `content.rs`）：`ChatApp` 每次 `cx.notify()` 都让它重画，

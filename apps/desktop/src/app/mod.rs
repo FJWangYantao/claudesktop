@@ -593,9 +593,27 @@ impl ChatApp {
         }
         let token = self.next_token;
         self.next_token += 1;
-        self.sessions.push(Session::new(token, kind, cwd));
+        self.sessions.push(self.new_session(kind, cwd, token));
         self.request_pending_sessions();
         self.sessions.len() - 1
+    }
+
+    /// 新建一个会话（还没向内核要）。设置里开着「自动」（自研内核）时，新对话默认就用它：
+    /// 先改界面上的选中项，内核会话建立（Started）后再交给内核。
+    /// 没为 `cwd` 选过文件夹的会话算**任务**（侧栏归到「任务」区，见 `sidebar.rs`）
+    fn new_session(&self, kind: KernelChoice, cwd: PathBuf, token: u64) -> Session {
+        let mut session = Session::new(token, kind, cwd.clone());
+        session.task = !self.is_project_dir(&cwd);
+        if kind == KernelChoice::Builtin && self.settings.auto_mode_default() {
+            session.default_to(MODE_AUTO_ID);
+        }
+        session
+    }
+
+    /// 这个目录是不是用户选过的工作目录（目录菜单里选的、记进设置的）。
+    /// 不是的话（默认目录、环境变量给的启动目录），在里面的对话算任务
+    fn is_project_dir(&self, dir: &Path) -> bool {
+        self.settings.workspace.as_deref() == Some(dir)
     }
 
     /// 把一个还没对话的会话换到另一种内核上：原地换成新会话，
@@ -616,12 +634,13 @@ impl ChatApp {
         self.ensure_kernel(kind);
         let token = self.next_token;
         self.next_token += 1;
-        self.sessions[idx] = Session::new(token, kind, cwd);
+        self.sessions[idx] = self.new_session(kind, cwd, token);
         self.request_pending_sessions();
     }
 
     /// 切换工作目录（输入框上方的目录 chip）：设为新会话的默认目录并记进设置；
     /// 当前会话还没对话就原地换到这个目录，已有对话就在那里开一个新会话（对话中途不换目录）。
+    /// 选过文件夹之后，在当前这个目录里的对话不再算「任务」（见 `Session::task`）
     pub(crate) fn switch_workspace(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.project_name = project_label(&dir);
         self.cwd = dir.clone();
@@ -634,8 +653,40 @@ impl ChatApp {
                 let kind = s.kernel;
                 self.replace_session(self.active, kind, dir);
             }
+        } else if self.sessions[self.active].task {
+            // 选的就是它已经在跑的目录：只是从「任务」改成项目，对话不动
+            self.sessions[self.active].task = false;
+            self.save_task(self.active);
         }
         cx.notify();
+    }
+
+    /// 目录菜单里的「不选项目（任务）」：当前对话回到任务区（侧栏下半区）。
+    /// 已经跑在默认目录里就只改归类，否则在默认目录另开一个（对话中途不换目录）。
+    pub(crate) fn as_task(&mut self, cx: &mut Context<Self>) {
+        let default_dir = self.acp_base.cwd.clone();
+        let kind = self.session().kernel;
+        if self.session().cwd == default_dir {
+            self.sessions[self.active].task = true;
+            self.save_task(self.active);
+        } else {
+            let idx = self.open_session(kind, default_dir);
+            self.sessions[idx].task = true;
+            self.active = idx;
+        }
+        cx.notify();
+    }
+
+    /// 把第 `idx` 个会话的「任务」归类写进元信息（还没落盘的会话在建档时按 `Session::task` 写）。
+    fn save_task(&mut self, idx: usize) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let s = &mut self.sessions[idx];
+        if let Some(meta) = &mut s.meta {
+            meta.task = s.task;
+            let _ = store.save_meta(meta);
+        }
     }
 
     /// 目录菜单里的「选择文件夹…」：系统对话框选一个目录切过去。
@@ -1561,6 +1612,8 @@ impl ChatApp {
             Some(meta) => store.append_log(&meta.id),
             None => store.create(&s.title, s.cwd.clone(), &agent_cmd).map(|(mut meta, log)| {
                 meta.set_kernel_session(s.acp_id.clone());
+                // 是不是任务在建档时定下来（侧栏右栏据此分组，见 sidebar.rs）
+                meta.task = s.task;
                 let _ = store.save_meta(&meta);
                 s.meta = Some(meta);
                 log
@@ -1683,6 +1736,7 @@ impl ChatApp {
             meta.agent = self.kernels[s.kernel.index()].agent_cmd.clone();
             meta.title = s.title.to_string();
             meta.set_kernel_session(s.acp_id.clone());
+            meta.task = s.task;
             meta.updated_ms = now_ms();
             let _ = store.save_meta(meta);
         }
