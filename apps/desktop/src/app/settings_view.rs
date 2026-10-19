@@ -102,6 +102,14 @@ pub struct SettingsForm {
     confirm_clear_gateway: bool,
     /// 模型单价表（一行一个模型，格式见 `pricing.rs`）
     prices: Entity<TextareaState>,
+    /// 「自动」模式：分类器模型（跟着会话走时不用）
+    auto_model: Entity<InputState>,
+    /// 「自动」模式：信任边界（自然语言）
+    auto_environment: Entity<TextareaState>,
+    /// 「自动」模式开着没有（保存才生效）
+    auto_enabled: bool,
+    /// 分类器跟随当前模型
+    auto_follow: bool,
     /// Brave Search API key（`web_search` 用；空 = DuckDuckGo 兜底）
     brave_key: Entity<InputState>,
     /// (是否错误, 文本)
@@ -127,6 +135,9 @@ impl SettingsForm {
                 .placeholder(claudesktop_builtin::DEFAULT_MAX_STEPS.to_string())
         });
         let prices = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 12));
+        let auto_model =
+            cx.new(|cx| InputState::new(window, cx).placeholder("如 deepseek-chat / glm-4-flash"));
+        let auto_environment = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10));
         let brave_key =
             cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
         Self {
@@ -142,6 +153,10 @@ impl SettingsForm {
             acp_gateway: false,
             confirm_clear_gateway: false,
             prices,
+            auto_model,
+            auto_environment,
+            auto_enabled: false,
+            auto_follow: true,
             brave_key,
             message: None,
             rules: Vec::new(),
@@ -221,6 +236,16 @@ impl ChatApp {
         });
         self.settings_form.prices.update(cx, |state, cx| state.set_value(prices, window, cx));
         self.settings_form.rules = PermissionRules::load(default_rules_path()).list();
+        // 「自动」模式的分类器模型和信任边界
+        let auto = s.auto_mode.clone();
+        self.settings_form.auto_enabled = auto.enabled;
+        self.settings_form.auto_follow = auto.use_session_model;
+        self.settings_form
+            .auto_model
+            .update(cx, |state, cx| state.set_value(auto.model.clone(), window, cx));
+        self.settings_form
+            .auto_environment
+            .update(cx, |state, cx| state.set_value(auto.environment.clone(), window, cx));
         // web_search 的 Brave key（环境变量优先；文件里没有时输入框留空）
         let brave = std::env::var(claudesktop_builtin::websearch::BRAVE_KEY_ENV)
             .ok()
@@ -525,6 +550,10 @@ impl ChatApp {
         s.acp.command = value(&f.acp_command, cx);
         s.acp.gateway = f.acp_gateway;
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
+        s.auto_mode.enabled = f.auto_enabled;
+        s.auto_mode.use_session_model = f.auto_follow;
+        s.auto_mode.model = value(&f.auto_model, cx);
+        s.auto_mode.environment = f.auto_environment.read(cx).value().to_string();
         s.usage_gateway = f.usage_gateway;
         s.gateway_bodies = f.gateway_bodies;
         // 单价表写错了留着原来的（`save_settings` 先报错，不会走到这里）；和内置的一样就不存
@@ -588,12 +617,23 @@ impl ChatApp {
             return;
         }
         let new = self.form_settings(cx);
-        if new.kernel() == KernelChoice::Builtin
-            && let Err(err) = new.builtin_config(self.cwd.clone())
-        {
-            self.settings_form.message = Some((true, err.to_string().into()));
-            cx.notify();
-            return;
+        if new.kernel() == KernelChoice::Builtin {
+            if let Err(err) = new.builtin_config(self.cwd.clone()) {
+                self.settings_form.message = Some((true, err.to_string().into()));
+                cx.notify();
+                return;
+            }
+            // 开着「自动」模式就必须配好：跟会话模型走要当前档案配好，自己指定模型要填模型名
+            if !new.auto_mode.is_configured(new.builtin.current()) {
+                let why = if new.builtin.current().is_configured() {
+                    "「自动」模式开着：要么选「跟随当前模型」，要么在上面填分类器用哪个模型"
+                } else {
+                    "「自动」模式开着：先在「服务商」里配好端点地址和模型"
+                };
+                self.settings_form.message = Some((true, why.into()));
+                cx.notify();
+                return;
+            }
         }
         if let Some(path) = &self.settings_path
             && let Err(err) = new.save(path)
@@ -613,7 +653,9 @@ impl ChatApp {
         };
         let restart_builtin = builtin_key(&new) != builtin_key(&self.settings)
             || new.max_steps != self.settings.max_steps
-            || new.usage_gateway != self.settings.usage_gateway;
+            || new.usage_gateway != self.settings.usage_gateway
+            // 自动模式的开关 / 分类器模型变了：模式列表和分类器都要重装
+            || new.auto_mode != self.settings.auto_mode;
         let restart_acp = new.acp != self.settings.acp;
         let default = new.kernel();
         let default_changed = default != self.settings.kernel();
@@ -1255,24 +1297,97 @@ impl ChatApp {
             kernels,
         ));
         match f.kernel {
-            KernelChoice::Builtin => body.child(self.render_providers(window, cx)).child(section(
-                "运行",
-                "",
-                None,
-                setting_group([
-                    setting_row(
-                        "一轮最多几步",
-                        "一轮里最多请求模型几次（默认 200）；调大能跑更长的任务，也更费 token",
-                        div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
-                    ),
-                    self.gateway_row(cx),
-                    self.bodies_row(cx),
-                    self.prices_row(window, cx),
-                ]),
-            )),
+            KernelChoice::Builtin => body
+                .child(self.render_providers(window, cx))
+                .child(self.render_auto_mode(window, cx))
+                .child(section(
+                    "运行",
+                    "",
+                    None,
+                    setting_group([
+                        setting_row(
+                            "一轮最多几步",
+                            "一轮里最多请求模型几次（默认 200）；调大能跑更长的任务，也更费 token",
+                            div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
+                        ),
+                        self.gateway_row(cx),
+                        self.bodies_row(cx),
+                        self.prices_row(window, cx),
+                    ]),
+                )),
             KernelChoice::Acp => body.child(self.render_acp(cx)),
             KernelChoice::Demo => body,
         }
+    }
+
+    /// 「自动」模式：开关 + 分类器用哪个模型 + 信任边界。默认关，开了必须配齐。
+    fn render_auto_mode(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let enabled = f.auto_enabled;
+        let follow = f.auto_follow;
+        let switch = Switch::new("auto-mode-on").checked(enabled).color(rgb(CORAL)).on_change(
+            cx.listener(|this, checked: &bool, _, cx| {
+                this.settings_form.auto_enabled = *checked;
+                cx.notify();
+            }),
+        );
+        let follow_switch = Switch::new("auto-mode-follow")
+            .checked(follow)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                this.settings_form.auto_follow = *checked;
+                cx.notify();
+            }));
+        let rows = setting_group([
+            setting_row(
+                "启用「自动」",
+                "权限模式里多出「自动」：分类器替你把关。工作目录内的编辑和只读操作不进分类器，\
+                 只有执行命令、联网、项目外写入这些才判",
+                switch,
+            ),
+            setting_row(
+                "分类器跟随当前模型",
+                "跟着会话的模型走省事，但每次判定都要等大模型回话；关掉可以自己填个小模型",
+                follow_switch,
+            ),
+            setting_row(
+                "分类器模型",
+                "和当前服务商同一个端点，填模型名；留空 = 用会话的模型",
+                div()
+                    .w(rems(20.))
+                    .child(Input::new(&f.auto_model).cleanable(true))
+                    .when(follow, |d| d.opacity(0.5)),
+            ),
+            setting_row(
+                "信任边界",
+                "哪些仓库 / 域名 / 桶算「内部」。留空时只有当前工作目录和它的 remote 算内部，\
+                 其余一律当作往外发",
+                div().w(rems(32.)).child(Textarea::new(&f.auto_environment).appearance(false)),
+            ),
+        ]);
+        // 没配好时把话说在前面（保存时也会拦）
+        let unconfigured = enabled && !self.settings.builtin.is_configured();
+        let body = div()
+            .v_flex()
+            .gap_3()
+            .child(rows)
+            .when(unconfigured, |d| {
+                d.child(note(IconAll::Info, "「自动」模式开着：先在「服务商」里配好端点地址和模型"))
+            })
+            .child(self.disclosure(
+                "auto-mode-rules",
+                "它拦什么、放什么",
+                auto_mode_docs(),
+                window,
+                cx,
+            ));
+        section(
+            "自动模式",
+            "由分类器代替你逐项审批；默认关，开了要配好模型。分类器看不到助手的解释和工具结果，\
+             只按动作本身判，拦下时会把理由交给 agent",
+            None,
+            body,
+        )
     }
 
     /// 自研内核的服务商：档案列表（选中的那套在用）+「添加」菜单，下面编辑选中的那套。
@@ -1814,6 +1929,23 @@ const ACP_PRESETS: [(&str, &str); 2] =
 /// npx 在 Windows 上是 .cmd，要经 `cmd /c` 才起得来。
 fn acp_command(command: &str) -> String {
     if cfg!(windows) { format!("cmd /c {command}") } else { command.to_string() }
+}
+
+/// 「自动」模式的说明（拦什么、放什么、判不出来怎么办）。
+fn auto_mode_docs() -> Div {
+    let line = |icon, text: &'static str| note(icon, text);
+    div()
+        .v_flex()
+        .gap_2()
+        .child(line(IconAll::ShieldBan, "拦：往信任边界外发数据、下载并执行（curl | sh）、force push / reset --hard 丢掉没提交的改动、删它自己没建的文件、生产部署和迁移、改共享基础设施和权限、关掉安全检查、装持久化（SSH key / 计划任务）"))
+        .child(line(IconAll::CircleCheck, "放：只读操作、工作目录内的编辑、构建和测试、项目自己声明的依赖安装、当前仓库的 add / commit / 分支操作"))
+        .child(line(IconAll::Zap, "分类器只看用户说过的话和要执行的动作：助手的解释和工具结果都剥掉，防止助手给自己找理由，也防止网页 / 文件里的注入影响它"))
+        .child(line(IconAll::ShieldAlert, "硬熔断：rm -rf / 、删家目录或工作目录、写 .env / shell 启动脚本 / 包管理器配置，这些一律不执行，也不送分类器"))
+        .child(line(IconAll::Info, "拦下时理由回给 agent：它要么换个安全做法，要么把打算做的事告诉你、等你回答。连着被拦 3 次或累计 20 次，自动模式会停下来等你"))
+        .child(line(
+            IconAll::ShieldX,
+            "判不出来（端点没回话、回复看不懂）一律按拒绝处理；每次判定多一次请求，算进用量",
+        ))
 }
 
 /// 单价表写法说明里的示例。

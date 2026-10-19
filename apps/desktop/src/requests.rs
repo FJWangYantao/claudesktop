@@ -147,6 +147,7 @@ pub fn purpose_label(purpose: &str) -> &'static str {
         "acp" => "ACP agent",
         "subagent" => "子任务",
         "compact" => "压缩上下文",
+        "auto" => "自动模式判定",
         "models" => "列模型",
         _ => "其他",
     }

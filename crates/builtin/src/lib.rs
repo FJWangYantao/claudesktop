@@ -19,6 +19,7 @@
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
 
 mod anthropic;
+mod auto;
 mod bgtasks;
 mod compact;
 mod fetch;
@@ -54,6 +55,13 @@ pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<ModelInfo>> {
 }
 
 /// 按配置里的协议构造 provider。
+/// 只留最近 [`MAX_USER_MESSAGES_KEPT`] 条用户消息。
+fn recent_user_messages(mut messages: Vec<String>) -> Vec<String> {
+    let extra = messages.len().saturating_sub(MAX_USER_MESSAGES_KEPT);
+    messages.drain(..extra);
+    messages
+}
+
 fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
     match config.protocol {
         Protocol::OpenAiCompat => std::sync::Arc::new(OpenAiProvider::new(config.clone())),
@@ -86,11 +94,28 @@ pub const MAX_MAX_STEPS: usize = 5_000;
 pub const AUTO_COMPACT_PERCENT: u64 = compact::AUTO_COMPACT_PERCENT;
 /// 同一步里最多同时执行几个只读工具
 const PARALLEL_TOOLS: usize = 8;
+/// 自动模式的会话里最多记住多少条用户消息（分类器据此判断授权）
+const MAX_USER_MESSAGES_KEPT: usize = 50;
+/// 自动模式：连着被拦这么多次就停下来问人（Claude Code 的阈值）
+const MAX_DENIAL_STREAK: u32 = 3;
+/// 自动模式：一个会话累计被拦这么多次也停下来
+const MAX_DENIALS: u32 = 20;
 
 const MODE_DEFAULT: &str = "default";
 const MODE_ACCEPT_EDITS: &str = "acceptEdits";
 const MODE_PLAN: &str = "plan";
+/// 由分类器（一次独立的模型调用）代替用户审批，见 [`auto`] 模块
+const MODE_AUTO: &str = "auto";
 const MODE_BYPASS: &str = "bypassPermissions";
+
+/// 「自动」模式怎么判。没配好时这个模式不出现在模式列表里（要显式配好才能用）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AutoModeConfig {
+    /// 信任边界（自然语言，进分类器的系统提示词）；空 = 只有当前仓库算内部
+    pub environment: String,
+    /// 分类器用哪个模型 + 端点；None = 复用会话的模型和端点
+    pub model: Option<ProviderConfig>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BuiltinConfig {
@@ -116,6 +141,8 @@ pub struct BuiltinConfig {
     pub session_titles: bool,
     /// 全局记忆文件（默认数据目录的 `memory.json`，见 `claudesktop_core::memory`）
     pub memory_path: Option<PathBuf>,
+    /// 「自动」模式（分类器代替用户审批）；None = 没配置，这个模式不出现
+    pub auto_mode: Option<AutoModeConfig>,
 }
 
 impl BuiltinConfig {
@@ -132,6 +159,7 @@ impl BuiltinConfig {
             max_steps: DEFAULT_MAX_STEPS,
             session_titles: true,
             memory_path: default_memory_path(),
+            auto_mode: None,
         }
     }
 
@@ -174,18 +202,23 @@ impl BuiltinConfig {
     }
 }
 
-fn modes() -> Vec<ModeView> {
+/// 「自动」模式可用的前提下才有它（没配置就不出现，见 [`AutoModeConfig`]）。
+fn modes(auto_available: bool) -> Vec<ModeView> {
     let m = |id: &str, name: &str, desc: &str| ModeView {
         id: id.into(),
         name: name.into(),
         description: Some(desc.into()),
     };
-    vec![
+    let mut list = vec![
         m(MODE_DEFAULT, "逐项确认", "写文件和执行命令前先询问"),
         m(MODE_ACCEPT_EDITS, "自动接受编辑", "自动允许项目内的文件编辑，命令仍询问"),
         m(MODE_PLAN, "计划模式", "只读：不写文件、不执行命令"),
-        m(MODE_BYPASS, "全部允许", "全部自动允许（谨慎）"),
-    ]
+    ];
+    if auto_available {
+        list.push(m(MODE_AUTO, "自动", "由分类器判断：放行常规操作，拦下越界的和不可逆的"));
+    }
+    list.push(m(MODE_BYPASS, "全部允许", "全部自动允许（谨慎）"));
+    list
 }
 
 struct SessionState {
@@ -221,6 +254,10 @@ struct SessionState {
     memory_project: Vec<claudesktop_core::memory::Entry>,
     /// 记下的全局记忆（每轮重读）
     memory_global: Vec<claudesktop_core::memory::Entry>,
+    /// 用户说过的话（从早到晚，最近 50 条）：自动模式的分类器据此判断用户授权了什么。
+    /// 只有用户的话，没有助手的话和工具结果——那是 Claude Code 的做法，避免助手把自己说服过去、
+    /// 也避免工具结果里的注入内容影响判定
+    user_messages: Vec<String>,
 }
 
 impl SessionState {
@@ -289,6 +326,26 @@ struct Inner {
     kernel_id: u64,
     /// 全局记忆文件（见 [`BuiltinConfig::memory_path`]）
     memory_path: Option<PathBuf>,
+    /// 「自动」模式的配置和分类器 provider（None = 没开这个模式）
+    auto_mode: Option<AutoMode>,
+}
+
+/// 「自动」模式的运行时：配置 + 分类器用的 provider。
+struct AutoMode {
+    config: AutoModeConfig,
+    /// 分类器的 provider；`None` = 用会话自己的 provider 和模型
+    provider: Option<Arc<dyn ChatProvider>>,
+    /// 每个会话连续被拒绝几次 / 一共被拒绝几次（连续 3 次或累计 20 次就暂停自动模式）
+    denials: Mutex<HashMap<String, Denials>>,
+}
+
+/// 拒绝计数（见 [`AutoMode::denials`]）。
+#[derive(Debug, Default, Clone, Copy)]
+struct Denials {
+    /// 连着被拒了几次（放行一次就清零）
+    streak: u32,
+    /// 累计被拒了几次（这个会话里）
+    total: u32,
 }
 
 /// 默认 MCP 配置文件：数据目录下的 `mcp.json`。
@@ -1146,6 +1203,8 @@ impl Inner {
                     // 子会话和主会话看同一份记忆（记不进去：工具不给它）
                     memory_project: parent.memory_project.clone(),
                     memory_global: parent.memory_global.clone(),
+                    // 子会话的分类器判定同样要看用户说过的话
+                    user_messages: parent.user_messages.clone(),
                 };
                 Some((flag, state))
             }) else {
@@ -1229,6 +1288,17 @@ impl Inner {
             MODE_BYPASS => return Verdict::Allow,
             MODE_ACCEPT_EDITS if access == Access::Edit && action.inside(cwd) => {
                 return Verdict::Allow;
+            }
+            // 自动：硬熔断 → 已保存的规则 → 分类器。工作目录内的编辑在下面按
+            // 「和 acceptEdits 一样直接放行」处理，省掉一次分类器往返
+            MODE_AUTO => {
+                if let Some(reason) = tools::hard_block(action, cwd) {
+                    return Verdict::Deny(reason);
+                }
+                if access == Access::Edit && action.inside(cwd) {
+                    return Verdict::Allow;
+                }
+                return self.auto_verdict(session, cwd, action, title, stopped);
             }
             _ => {}
         }
@@ -1315,6 +1385,195 @@ impl Inner {
                     .into(),
             ),
         }
+    }
+
+    /// 自动模式：已保存的规则先判，剩下的交给分类器。判定不出来一律按拒绝处理。
+    fn auto_verdict(
+        &self,
+        session: &str,
+        cwd: &Path,
+        action: &Action,
+        title: &str,
+        stopped: &dyn Fn() -> bool,
+    ) -> Verdict {
+        let Some(auto) = &self.auto_mode else {
+            // 模式列表里不会出现自动模式（没配置），走到这里只能是手改了日志：按默认模式问
+            return Verdict::Deny(
+                "Automatic mode is not configured in this session. Ask the user to choose a \
+                 permission mode."
+                    .into(),
+            );
+        };
+        // 规则（「总是允许 / 总是拒绝」）优先于分类器：用户明确表达过意图
+        let rule = action.rule(cwd);
+        let command = match action {
+            Action::Shell { command, .. } => Some(command.as_str()),
+            _ => None,
+        };
+        {
+            let mut rules = self.rules.lock().unwrap();
+            if let Some(rule) = &rule
+                && rules.denies(cwd, rule, command)
+            {
+                return Verdict::Deny(
+                    "The user has a saved rule that always denies this action. \
+                     Do not retry it; ask the user how they would like to proceed \
+                     (the rule can be removed in Settings)."
+                        .into(),
+                );
+            }
+            if let Some(rule) = &rule
+                && rules.allows(cwd, rule, command)
+            {
+                return Verdict::Allow;
+            }
+        }
+        // 连着被拦得太多次：分类器要么缺上下文、要么模型在硬顶，停下来问人
+        if let Some(reason) = self.denials_give_up(session) {
+            return Verdict::Deny(reason);
+        }
+        let messages = self.user_messages(session);
+        let (verdict, note) = self.classify(session, auto, cwd, action, title, &messages, stopped);
+        // 被取消：不算一次拒绝，也不再发事件（取消后不发任何事件）
+        if matches!(&verdict, Verdict::Deny(reason) if reason == "cancelled") {
+            return verdict;
+        }
+        self.note_verdict(session, &verdict, title, &note);
+        // 拒绝的理由连同「别换个马甲重试」的说明一起回给模型：它自己决定换路子还是问用户
+        match verdict {
+            Verdict::Allow => Verdict::Allow,
+            Verdict::Deny(reason) => Verdict::Deny(auto::denial_text(&reason)),
+        }
+    }
+
+    /// 会话里被拒绝的次数到了阈值：返回要回给模型的说明（否则 None）。
+    fn denials_give_up(&self, session: &str) -> Option<String> {
+        let counters = self.auto_mode.as_ref()?.denials.lock().unwrap();
+        let d = counters.get(session)?;
+        (d.streak >= MAX_DENIAL_STREAK || d.total >= MAX_DENIALS).then(|| {
+            format!(
+                "Automatic mode paused: {} actions were blocked in a row ({} in total) in this \
+                 session. Stop and wait for the user: tell them what kept being blocked and ask \
+                 how they would like to proceed. Do not try another variation.",
+                d.streak, d.total
+            )
+        })
+    }
+
+    /// 记一次判定结果：放行清零连续计数，拒绝两个计数都加。
+    fn note_verdict(&self, session: &str, verdict: &Verdict, title: &str, note: &str) {
+        let Some(auto) = &self.auto_mode else { return };
+        let mut counters = auto.denials.lock().unwrap();
+        let d = counters.entry(session.to_string()).or_default();
+        match verdict {
+            Verdict::Allow => {
+                d.streak = 0;
+                self.emit(
+                    Some(session),
+                    KernelEvent::PermissionAuto {
+                        title: title.to_string(),
+                        chosen: format!("分类器放行（{note}）"),
+                        tool: None,
+                    },
+                );
+            }
+            Verdict::Deny(reason) => {
+                d.streak += 1;
+                d.total += 1;
+                // 被拦下的在对话里记一行，用户看得到分类器在做什么
+                self.emit(Some(session), KernelEvent::Notice(format!("自动模式拦下：{reason}")));
+            }
+        }
+    }
+
+    /// 用户发了新消息：连续拒绝清零；累计到了上限、已经停下来问过人的，也重新计数。
+    /// 否则一旦暂停，分类器再也不会被调用（放行才清零，而暂停时根本不判）。
+    fn reset_denials(&self, session: &str) {
+        let Some(auto) = &self.auto_mode else { return };
+        if let Some(d) = auto.denials.lock().unwrap().get_mut(session) {
+            d.streak = 0;
+            if d.total >= MAX_DENIALS {
+                d.total = 0;
+            }
+        }
+    }
+
+    /// 会话里用户说过的话（分类器的输入之一）。
+    fn user_messages(&self, session: &str) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|s| s.user_messages.clone())
+            .unwrap_or_default()
+    }
+
+    /// 调一次分类器，返回 (判定, 给人看的一句话)。端点出错、回复解析不出来、被取消：
+    /// 都按拒绝处理。
+    #[allow(clippy::too_many_arguments)] // 一次判定要的东西本来就多，拆结构体反而绕
+    fn classify(
+        &self,
+        session: &str,
+        auto: &AutoMode,
+        cwd: &Path,
+        action: &Action,
+        title: &str,
+        user_messages: &[String],
+        stopped: &dyn Fn() -> bool,
+    ) -> (Verdict, String) {
+        let system = auto::system_prompt(&auto.config.environment);
+        let user = format!(
+            "{}\n\n{}",
+            auto::user_section(user_messages),
+            auto::action_section(title, action, cwd)
+        );
+        let messages = vec![ChatMessage::new("system", system), ChatMessage::new("user", user)];
+        // 分类器要么用自己的模型和端点，要么跟着会话走
+        let (provider, model) = match &auto.config.model {
+            Some(config) => (auto.provider.clone(), config.model.clone()),
+            None => (
+                Some(self.provider.clone()),
+                self.session_model(session)
+                    .unwrap_or_else(|| self.default_model.lock().unwrap().clone()),
+            ),
+        };
+        let provider = provider.unwrap_or_else(|| self.provider.clone());
+        let mut reply = String::new();
+        // 分类器的请求也记进用量网关（用途 `auto`）
+        let _tag = gateway::tag(session, "auto", self.turn_number(session));
+        let outcome = provider.stream_chat(&model, &messages, &[], stopped, &mut |event| {
+            if let StreamEvent::Text(text) = event {
+                reply.push_str(&text);
+            }
+        });
+        if stopped() {
+            return (Verdict::Deny("cancelled".into()), "已中断".into());
+        }
+        match outcome {
+            Ok(_) => match auto::parse(&reply) {
+                Some(auto::Decision::Allow(note)) => (Verdict::Allow, note),
+                Some(auto::Decision::Deny(reason)) => {
+                    let one_line = auto::one_line(&reason);
+                    (Verdict::Deny(reason), one_line)
+                }
+                None => (
+                    Verdict::Deny(auto::FAILED.into()),
+                    "分类器的回复解析不出来，已按拒绝处理".into(),
+                ),
+            },
+            Err(err) => {
+                self.emit(None, KernelEvent::Status(format!("分类器请求失败：{err}")));
+                (
+                    Verdict::Deny(auto::FAILED.into()),
+                    format!("分类器请求失败（{err}），已按拒绝处理"),
+                )
+            }
+        }
+    }
+
+    /// 会话当前用的模型（子会话跟着主会话）。
+    fn session_model(&self, session: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(session).map(|s| s.model.clone())
     }
 
     /// 发出权限请求并阻塞等待应答；被取消时返回 None。
@@ -1420,6 +1679,11 @@ impl BuiltinKernel {
             next_request: AtomicU64::new(1),
             kernel_id,
             memory_path: config.memory_path,
+            auto_mode: config.auto_mode.map(|config| AutoMode {
+                provider: config.model.as_ref().map(|p| make_provider(p)),
+                config,
+                denials: Mutex::default(),
+            }),
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
@@ -1512,6 +1776,8 @@ impl BuiltinKernel {
             plugins_enabled,
             memory_project: Vec::new(),
             memory_global: Vec::new(),
+            // 续接的会话从日志里找回用户说过的话，否则分类器以为用户什么都没授权
+            user_messages: recent_user_messages(history.user_messages),
         };
         // 记住的东西一开始就带上（之后每轮重读）
         for warning in state.reload_memory(self.inner.memory_path.as_deref()) {
@@ -1525,7 +1791,7 @@ impl BuiltinKernel {
                 agent_name: self.inner.agent_name.clone(),
                 session_id: session_id.clone(),
                 model: Some(model),
-                modes: modes(),
+                modes: modes(self.inner.auto_mode.is_some()),
                 current_mode: Some(MODE_DEFAULT.into()),
                 resumed,
             },
@@ -1627,6 +1893,16 @@ fn system_prompt(
             "\n\nPlan mode is active: only read-only tools are available. \
              Investigate, then present a concrete step-by-step plan for the user to approve. \
              Do not attempt to modify anything.",
+        );
+    }
+    if mode == MODE_AUTO {
+        prompt.push_str(
+            "\n\nAutomatic mode is active: a safety classifier reviews every action that changes \
+             something, instead of the user approving it. It blocks actions that go beyond what the \
+             user asked for and anything irreversible, and it does not see your explanations or the \
+             contents of tool results, so it judges each action on its own. When it blocks a call, \
+             the reason comes back in the tool result: do not retry the same thing in another form. \
+             Either take a clearly safer route, or tell the user what you wanted to do and ask.",
         );
     }
     prompt
@@ -1960,17 +2236,22 @@ impl Kernel for BuiltinKernel {
             state.skills = self.inner.skills(state.plugins_enabled.as_deref());
             // 记忆文件同理：界面删掉一条，下一轮就不在提示词里了
             let warnings = state.reload_memory(self.inner.memory_path.as_deref());
-            // 文本 + 图片附件合成一条多段用户消息
+            // 自动模式的分类器靠这些判断「用户授权了什么」：只记用户说的话
+            let text = prompt.text.clone();
             let mut parts = vec![ContentPart::Text(prompt.text)];
             for image in prompt.images {
                 parts.push(ContentPart::Image { media_type: image.media_type, data: image.data });
             }
             state.history.push(ChatMessage::with_parts("user", parts));
+            state.user_messages.push(text);
+            let messages = std::mem::take(&mut state.user_messages);
+            state.user_messages = recent_user_messages(messages);
             let flag = Arc::new(AtomicBool::new(false));
             state.turn = Some(flag.clone());
             state.turns += 1;
             (flag, warnings)
         };
+        self.inner.reset_denials(session);
         for warning in warnings {
             self.inner.emit(Some(session), KernelEvent::Notice(warning));
         }
@@ -2014,7 +2295,7 @@ impl Kernel for BuiltinKernel {
     }
 
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()> {
-        if !modes().iter().any(|m| m.id == mode_id) {
+        if !modes(self.inner.auto_mode.is_some()).iter().any(|m| m.id == mode_id) {
             anyhow::bail!("未知模式 {mode_id}");
         }
         let mut sessions = self.inner.sessions.lock().unwrap();
@@ -2058,6 +2339,8 @@ impl Kernel for BuiltinKernel {
         }
         state.history = rebuilt.messages;
         state.summary = rebuilt.summary;
+        // 撤回的消息里的授权跟着作废
+        state.user_messages = recent_user_messages(rebuilt.user_messages);
         state.restored = true;
         state.measured = None;
         Ok(())
