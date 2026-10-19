@@ -1647,6 +1647,11 @@ impl ChatApp {
                     .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER))))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.settings_form.tab != i {
+                            // 离开「项目」时把还在输入框里的改动写掉：点分类不一定让输入框失焦，
+                            // 回来时会重读文件
+                            if this.settings_form.tab == super::project_view::PROJECT_TAB {
+                                this.apply_project(cx);
+                            }
                             this.settings_form.tab = i;
                             this.settings_form.message = None;
                             // 「用量」停在「请求」一栏时按需读网关日志

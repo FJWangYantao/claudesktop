@@ -116,7 +116,9 @@ impl ChatApp {
         }
     }
 
-    /// 删一条记忆：读 → 去掉这条 → 原子写回。立即生效（内核每轮重读文件）。
+    /// 删一条记忆：读 → 去掉这条 → 原子写回（和内核记新的一条排队，不会互相覆盖）。
+    /// 立即生效（内核每轮重读文件）。文件读不了或格式坏了就不动它、报原因——
+    /// 否则会把一张空表写回去，全部记忆都没了。按 `id` 删：页面打开后内核可能更新过这条。
     fn remove_memory(&mut self, scope: Scope, entry: Entry, cx: &mut Context<Self>) {
         let Some(path) = (match scope {
             Scope::Project => Some(self.memory_form.project_path.clone()),
@@ -124,13 +126,12 @@ impl ChatApp {
         }) else {
             return;
         };
-        let (mut entries, _) = memory::load(&path);
-        entries.retain(|e| e != &entry);
-        match memory::save(&path, &entries) {
-            Ok(()) => self.reload_memory_view(),
-            Err(err) => {
-                self.toast(Notification::error(format!("删不掉 {}：{err}", path.display())), cx)
-            }
+        let result = memory::update(&path, memory::OnBroken::Refuse, |entries| {
+            entries.retain(|e| if entry.id.is_empty() { e != &entry } else { e.id != entry.id })
+        });
+        match result {
+            Ok(_) => self.reload_memory_view(),
+            Err(err) => self.toast(Notification::error(format!("删不掉：{err}")), cx),
         }
         cx.notify();
     }

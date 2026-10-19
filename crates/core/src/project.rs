@@ -42,10 +42,12 @@ pub struct ProjectConfig {
     pub instructions: Option<PathBuf>,
     /// 读文件时发现的问题（不影响可用字段的生效）
     pub warnings: Vec<String>,
+    /// 文件解析不了（不是 JSON、字段类型不对）：可用字段都不生效，[`save`] 也不会覆盖它
+    pub broken: bool,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct FileFormat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -57,7 +59,13 @@ struct FileFormat {
     plugins_enabled: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    /// 不认识的键（`$schema`、以后的新字段、手写的备注）：读时提示，写回时原样留着
+    #[serde(flatten)]
+    other: serde_json::Map<String, Value>,
 }
+
+/// 编辑器常用的 `$schema` 键：认得，不提示
+const SCHEMA_KEY: &str = "$schema";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Permissions {
@@ -106,8 +114,15 @@ pub fn load(cwd: &Path) -> Option<ProjectConfig> {
             config.plugins_enabled = f.plugins_enabled;
             config.instructions =
                 f.instructions.filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+            for key in f.other.keys().filter(|k| *k != SCHEMA_KEY) {
+                config.warnings.push(format!(
+                    "{} 里有不认识的字段 `{key}`（忽略；保存时原样留着）",
+                    path.display()
+                ));
+            }
         }
         Err(e) => {
+            config.broken = true;
             config.warnings.push(format!(
                 "{} 的格式有问题：{}（这个文件先按不存在处理，可用字段都不生效）",
                 path.display(),
@@ -119,10 +134,26 @@ pub fn load(cwd: &Path) -> Option<ProjectConfig> {
 }
 
 /// 写回项目配置（原子写）：只写和全局不一样的字段，全空就删掉这个文件。
-/// 返回文件位置；`warnings` 不落盘。
+/// 返回文件位置；`warnings` 不落盘。文件里不认识的键原样留着；
+/// 文件解析不了时不写（会把手写的内容整个盖掉），返回原因。
 pub fn save(root: &Path, config: &ProjectConfig) -> Result<PathBuf, String> {
     let path = path_in(root);
-    let file = FileFormat::from(config);
+    let mut file = FileFormat::from(config);
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => match serde_json::from_str::<FileFormat>(&text) {
+            Ok(old) => file.other = old.other,
+            Err(e) => {
+                return Err(format!(
+                    "{} 的格式有问题：{}（先改好这个文件，这次没有写）",
+                    path.display(),
+                    crate::json_error_text(&e)
+                ));
+            }
+        },
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("读不了 {}：{e}（这次没有写）", path.display())),
+    }
     if file.is_empty() {
         // 一个字段都没写：不留一个空对象在仓库里
         return match std::fs::remove_file(&path) {
@@ -158,6 +189,7 @@ impl FileFormat {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .filter(|s| !s.trim().is_empty()),
+            other: serde_json::Map::new(),
         }
     }
 
@@ -167,6 +199,7 @@ impl FileFormat {
             && self.mcp_disabled.is_none()
             && self.plugins_enabled.is_none()
             && self.instructions.is_none()
+            && self.other.is_empty()
     }
 }
 
@@ -287,8 +320,38 @@ mod tests {
         std::fs::write(path_in(&dir), "{ not json").unwrap();
         let c = load(&dir).unwrap();
         assert!(c.model.is_none());
+        assert!(c.broken);
         assert_eq!(c.warnings.len(), 1);
         assert!(c.warnings[0].contains("settings.json"), "{}", c.warnings[0]);
+        // 坏文件不被保存覆盖
+        let config = ProjectConfig { model: Some("m".into()), ..Default::default() };
+        assert!(save(&dir, &config).is_err());
+        assert_eq!(std::fs::read_to_string(path_in(&dir)).unwrap(), "{ not json");
+    }
+
+    /// 多一个 `$schema`（或别的不认识的键）不算坏文件：字段照常生效，保存时原样留着
+    #[test]
+    fn unknown_keys_are_kept() {
+        let dir = tmp("unknown");
+        std::fs::create_dir_all(dir.join(".claudesktop")).unwrap();
+        std::fs::write(
+            path_in(&dir),
+            r#"{"$schema":"x.json","model":"a","mcpDisabled":["git"],"note":"手写"}"#,
+        )
+        .unwrap();
+        let mut c = load(&dir).unwrap();
+        assert!(!c.broken);
+        assert_eq!(c.model.as_deref(), Some("a"));
+        assert_eq!(c.mcp_disabled, ["git"]);
+        assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings); // 只提示 note，不提示 $schema
+        c.model = Some("b".into());
+        save(&dir, &c).unwrap();
+        let text = std::fs::read_to_string(path_in(&dir)).unwrap();
+        assert!(
+            text.contains("$schema") && text.contains("手写") && text.contains("\"b\""),
+            "{text}"
+        );
+        assert!(text.contains("mcpDisabled"), "{text}");
     }
 
     #[test]

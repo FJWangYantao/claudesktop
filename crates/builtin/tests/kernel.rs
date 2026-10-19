@@ -603,10 +603,10 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
             "list_dir",
             "glob",
             "todo_write",
-            "memory_write",
             "grep",
             "web_fetch",
             "web_search",
+            "memory_write",
             "write_file",
             "edit_file",
             "shell",
@@ -904,17 +904,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .collect();
     assert_eq!(
         names,
-        [
-            "read_file",
-            "list_dir",
-            "glob",
-            "todo_write",
-            "memory_write",
-            "grep",
-            "web_fetch",
-            "web_search",
-            "task"
-        ]
+        ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "web_search", "task"]
     );
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -2552,6 +2542,42 @@ fn memory_scope_global_is_per_user_and_project_goes_with_the_directory() {
     for d in [&dir, &other] {
         let _ = std::fs::remove_dir_all(d);
     }
+}
+
+/// Plan 模式只读：模型硬调 memory_write 也不写文件；项目记忆写入要报 `FileChanged`（检查点能还原）
+#[test]
+fn memory_write_respects_plan_mode_and_reaches_the_checkpoint() {
+    let dir = project_dir("memory-plan");
+    let global = dir.join("global-memory.json");
+    let note = serde_json::json!({ "text": "构建只用 cargo test -p claudesktop-core" });
+    let (base, bodies) = serve(vec![
+        tool_call("m1", "memory_write", note.clone()),
+        happy_stream("计划如下"),
+        tool_call("m2", "memory_write", note),
+        happy_stream("记下了"),
+    ]);
+    let h = Harness::with_memory(base, dir.clone(), global);
+    let sid = h.start();
+    let path = dir.join(".claudesktop/memory.json");
+
+    h.kernel.set_mode(&sid, "plan").unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("先想想")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert!(!path.exists());
+    let reply = body(&bodies, 1)["messages"].as_array().unwrap().last().unwrap().clone();
+    assert!(reply["content"].as_str().unwrap().contains("Plan mode"), "{reply}");
+
+    h.kernel.set_mode(&sid, "default").unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("记一下")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(memory_entries(&path).len(), 1);
+    let file = path.to_string_lossy().into_owned();
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::FileChanged { path: p, before: None, after: Some(_) }
+            if *p == file)),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -258,38 +258,6 @@ pub fn specs(writable: bool) -> Vec<Value> {
             }),
         ),
         f(
-            MEMORY_WRITE,
-            format!(
-                "Save one short note for later sessions: a user preference, a project convention, \
-                 a decision with its reason, or a pitfall you hit. `text` is one sentence (at most \
-                 {MAX_TEXT_CHARS} characters), not a transcript and not \"the user asked me to …\". \
-                 Do not record things the repository already says (layout, dependency versions, \
-                 function signatures: read the files instead), one-off task details, or secrets \
-                 (tokens, passwords, keys). If the user asks you to remember something, save it \
-                 here instead of repeating the conversation. Use the `memory_write` note only when \
-                 it will matter in later sessions; rules that belong in the repository go into \
-                 AGENTS.md with edit_file."
-            ),
-            json!({
-                "type": "object",
-                "properties": {
-                    "text": { "type": "string", "description": "One sentence, with the why when it matters" },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "A few short categories, e.g. 构建 / 测试 / 偏好"
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["project", "global"],
-                        "description": "project (default): this working directory; global: every project"
-                    },
-                    "pinned": { "type": "boolean", "description": "Keep it in context and never evict it" }
-                },
-                "required": ["text"]
-            }),
-        ),
-        f(
             GREP,
             format!(
                 "Search file contents with a regular expression (Rust regex syntax). Respects .gitignore, skips hidden and binary files. \
@@ -344,6 +312,39 @@ pub fn specs(writable: bool) -> Vec<Value> {
         ),
     ];
     if writable {
+        // 记忆会写文件（项目记忆在项目目录里），Plan 模式只读，不给
+        tools.push(f(
+            MEMORY_WRITE,
+            format!(
+                "Save one short note for later sessions: a user preference, a project convention, \
+                 a decision with its reason, or a pitfall you hit. `text` is one sentence (at most \
+                 {MAX_TEXT_CHARS} characters), not a transcript and not \"the user asked me to …\". \
+                 Do not record things the repository already says (layout, dependency versions, \
+                 function signatures: read the files instead), one-off task details, or secrets \
+                 (tokens, passwords, keys). If the user asks you to remember something, save it \
+                 here instead of repeating the conversation. Use the `memory_write` note only when \
+                 it will matter in later sessions; rules that belong in the repository go into \
+                 AGENTS.md with edit_file."
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "One sentence, with the why when it matters" },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "A few short categories, e.g. 构建 / 测试 / 偏好"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global"],
+                        "description": "project (default): this working directory; global: every project"
+                    },
+                    "pinned": { "type": "boolean", "description": "Keep it in context and never evict it" }
+                },
+                "required": ["text"]
+            }),
+        ));
         tools.push(f(
             WRITE_FILE,
             "Create or overwrite a file with the given content. Parent directories are created. \
