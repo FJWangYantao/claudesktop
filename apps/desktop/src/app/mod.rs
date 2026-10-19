@@ -24,6 +24,7 @@ mod settings_view;
 mod shortcuts;
 mod sidebar;
 mod status;
+mod usage_view;
 mod widgets;
 
 use crate::demo::*;
@@ -76,6 +77,8 @@ pub struct ChatApp {
     /// 首页「请求」页签：读到的用量网关日志、筛选、点开的轮
     requests_view: requests_view::RequestsView,
     overview_range: usize, // 0 全部 / 1 30 天 / 2 7 天
+    /// 设置页「用量」看哪一栏、点开的哪天 / 哪个模型
+    usage_page: usage_view::UsagePage,
     sidebar_open: bool,
     /// 侧栏会话按最近活动排序（否则按打开顺序）
     sessions_by_activity: bool,
@@ -143,6 +146,8 @@ pub struct ChatApp {
     home_w: widgets::MeasuredWidth,
     /// 首页整页的滚动位置（「请求」页签据此只排视口附近的几轮）
     home_scroll: ScrollHandle,
+    /// 设置页右侧内容的滚动位置（「用量 → 请求」同样只排视口附近的几轮）
+    settings_scroll: ScrollHandle,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
     /// 侧栏只列哪些会话（全部 / 进行中 / 待查看）
@@ -345,6 +350,7 @@ impl ChatApp {
             overview_tab: 0,
             requests_view: Default::default(),
             overview_range: 0,
+            usage_page: Default::default(),
             sidebar_open: true,
             sessions_by_activity: false,
             renaming: None,
@@ -383,6 +389,7 @@ impl ChatApp {
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             home_w: Default::default(),
             home_scroll: ScrollHandle::new(),
+            settings_scroll: ScrollHandle::new(),
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),

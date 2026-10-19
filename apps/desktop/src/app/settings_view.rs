@@ -25,12 +25,13 @@ use gpui_kit::*;
 use std::collections::HashSet;
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
-const SETTINGS_TABS: [(IconAll, &str); 5] = [
+const SETTINGS_TABS: [(IconAll, &str); 6] = [
     (IconAll::Settings, "通用"),
     (IconAll::Cpu, "内核与模型"),
     (IconAll::ShieldCheck, "权限"),
     (IconAll::Plug, "MCP"),
     (IconAll::Blocks, "插件"),
+    (IconAll::ChartColumn, "用量"),
 ];
 
 /// 设置页「内核与模型」分类的下标（首页配置引导、失败卡片的「打开设置」直接打开它）
@@ -168,7 +169,7 @@ impl ChatApp {
         self.open_settings_at(tab, window, cx);
     }
 
-    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP / 4 插件）。
+    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP / 4 插件 / 5 用量）。
     /// 失败卡片的「打开设置」用它直接落到服务商配置。
     pub(crate) fn open_settings_at(
         &mut self,
@@ -1484,6 +1485,8 @@ impl ChatApp {
                         if this.settings_form.tab != i {
                             this.settings_form.tab = i;
                             this.settings_form.message = None;
+                            // 「用量」停在「请求」一栏时按需读网关日志
+                            this.sync_requests(cx);
                             cx.notify();
                         }
                     }))
@@ -1500,6 +1503,7 @@ impl ChatApp {
             2 => self.render_rules(cx),
             3 => self.render_mcp(window, cx),
             PLUGINS_TAB => self.render_plugins(cx),
+            super::usage_view::USAGE_TAB => self.render_usage_page(cx),
             _ => self.render_general(cx),
         };
 
@@ -1562,6 +1566,7 @@ impl ChatApp {
                                 .child(
                                     div()
                                         .id("settings-scroll")
+                                        .track_scroll(&self.settings_scroll)
                                         .flex_1()
                                         .min_h_0()
                                         .overflow_y_scroll()

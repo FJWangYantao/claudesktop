@@ -30,6 +30,8 @@ enum PaletteCmd {
     ToggleSidebar,
     PickWorkspace,
     OpenSettings,
+    /// 设置页「用量」
+    Usage,
     /// 在资源管理器里打开用量网关的日志目录
     GatewayLogs,
     Shortcuts,
@@ -157,6 +159,7 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         .key(TOGGLE_SIDEBAR_KEY),
         Entry::new(IconAll::FolderOpen, "切换工作目录…", PaletteCmd::PickWorkspace),
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
+        Entry::new(IconAll::ChartColumn, "查看用量", PaletteCmd::Usage),
         Entry::new(IconAll::FolderOpen, "打开用量网关日志", PaletteCmd::GatewayLogs)
             .desc("每个请求一行的 JSONL"),
         Entry::new(IconAll::Keyboard, "键盘快捷键", PaletteCmd::Shortcuts).key(SHORTCUTS_KEY),
@@ -313,6 +316,10 @@ impl ChatApp {
             PaletteCmd::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             PaletteCmd::PickWorkspace => self.pick_workspace(cx),
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
+            PaletteCmd::Usage => {
+                let view = self.usage_page.view;
+                self.open_usage(view, window, cx)
+            }
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),
             // 面板的对话框刚关，同一帧里还算开着：等下一帧再开速查
             PaletteCmd::Shortcuts => {

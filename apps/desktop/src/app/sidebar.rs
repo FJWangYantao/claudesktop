@@ -578,9 +578,11 @@ impl ChatApp {
                 .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(label))
         };
 
-        // 设置页开在「插件」分类时，高亮的是侧栏的「插件」而不是「设置」
+        // 设置页开在「插件」「用量」分类时，高亮的是侧栏的那一项而不是「设置」
         let plugins_open =
             self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
+        let usage_open =
+            self.settings_open && self.settings_form.tab == super::usage_view::USAGE_TAB;
         let panel = v_flex()
             .size_full()
             .rounded_xl()
@@ -605,6 +607,12 @@ impl ChatApp {
             .child(nav_item("plugins", IconAll::Blocks, "插件", plugins_open).on_click(
                 cx.listener(|this, _, window, cx| {
                     this.open_settings_at(super::settings_view::PLUGINS_TAB, window, cx)
+                }),
+            ))
+            .child(nav_item("usage", IconAll::ChartColumn, "用量", usage_open).on_click(
+                cx.listener(|this, _, window, cx| {
+                    let view = this.usage_page.view;
+                    this.open_usage(view, window, cx)
                 }),
             ))
             .child(
@@ -642,7 +650,7 @@ impl ChatApp {
                             "open-settings",
                             IconAll::Settings,
                             "设置",
-                            self.settings_open && !plugins_open,
+                            self.settings_open && !plugins_open && !usage_open,
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
                             if this.settings_open {

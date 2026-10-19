@@ -1,7 +1,9 @@
-//! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs），
+//! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs；卡片、格子、模型行点了进设置页「用量」，见 usage_view.rs），
 //! 输入框下方一排建议入口、空输入框里的建议提示词（Tab 填入，见 `complete_view.rs`）。
 
 use super::ChatApp;
+use super::usage_view::UsageView;
+use super::widgets::Surface;
 use crate::model::*;
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
@@ -9,6 +11,7 @@ use crate::theme::*;
 use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Position;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -57,34 +60,95 @@ impl ChatApp {
             )
     }
 
-    /// 概览页签：6 张统计卡 + 最近 26 周热力图
-    fn render_usage_cards(o: &Overview) -> Div {
+    /// 可点的统计卡：点了打开设置页「用量」里对应的详情（右上角一个小箭头示意）。
+    pub(super) fn stat_link(
+        c: &StatCard,
+        view: UsageView,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        Self::stat_card(c)
+            .id(c.label)
+            .relative()
+            .cursor_pointer()
+            .hover(|d| d.bg(rgb(HOVER)))
+            .child(
+                Icon::new(IconAll::ArrowUpRight)
+                    .size_3p5()
+                    .absolute()
+                    .top_3()
+                    .right_3()
+                    .text_color(rgb(INK_FAINT)),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.open_usage(view, window, cx)))
+    }
+
+    /// 概览页签：6 张统计卡 + 最近 26 周热力图。卡片和有过去日子的格子都能点，进设置页「用量」的详情。
+    pub(super) fn render_usage_cards(o: &Overview, cx: &mut Context<Self>) -> Div {
         let dash = || SharedString::from("—");
         let stats = [
-            StatCard { label: "会话数", value: usage::compact(o.sessions as u64).into() },
-            StatCard { label: "消息数", value: usage::compact(o.messages as u64).into() },
-            StatCard { label: "Token 总量", value: usage::compact(o.tokens).into() },
-            StatCard { label: "活跃天数", value: o.active_days.to_string().into() },
-            StatCard {
-                label: "高峰时段",
-                value: o.peak_hour.map_or_else(dash, |h| usage::hour_label(h).into()),
-            },
-            StatCard {
-                label: "最常用模型",
-                value: o.models.first().map_or_else(dash, |m| m.name.clone().into()),
-            },
+            (
+                StatCard { label: "会话数", value: usage::compact(o.sessions as u64).into() },
+                UsageView::Sessions,
+            ),
+            (
+                StatCard { label: "消息数", value: usage::compact(o.messages as u64).into() },
+                UsageView::Days,
+            ),
+            (
+                StatCard { label: "Token 总量", value: usage::compact(o.tokens).into() },
+                UsageView::Days,
+            ),
+            (
+                StatCard { label: "活跃天数", value: o.active_days.to_string().into() },
+                UsageView::Days,
+            ),
+            (
+                StatCard {
+                    label: "高峰时段",
+                    value: o.peak_hour.map_or_else(dash, |h| usage::hour_label(h).into()),
+                },
+                UsageView::Hours,
+            ),
+            (
+                StatCard {
+                    label: "最常用模型",
+                    value: o.models.first().map_or_else(dash, |m| m.name.clone().into()),
+                },
+                UsageView::Models,
+            ),
         ];
+        let mut cards: Vec<Stateful<Div>> =
+            stats.iter().map(|(c, view)| Self::stat_link(c, *view, cx)).collect();
+        let second = cards.split_off(3);
 
         // 格子按列数均分整行宽度，与上面的统计卡两端对齐
+        let today = usage::day_of(super::now_ms(), usage::local_offset_secs());
         let mut grid = div().v_flex().w_full().gap(px(3.));
         for row in 0..HEAT_ROWS {
             let mut line = div().h_flex().w_full().gap(px(3.));
             for col in 0..HEAT_COLS {
+                let i = row * HEAT_COLS + col;
                 let cell = div().flex_1().h(px(14.)).rounded_sm();
-                line = line.child(match o.heat[row * HEAT_COLS + col] {
-                    Some(v) => cell.bg(rgb(Self::heat_color(v))),
-                    None => cell,
-                });
+                let Some(v) = o.heat[i] else {
+                    line = line.child(cell);
+                    continue;
+                };
+                let day = o.heat_first + (col * 7 + row) as i64;
+                let tip: SharedString = match o.heat_turns[i] {
+                    0 => format!("{} · 没有对话", usage::date_label(day, today)),
+                    n => format!("{} · {n} 轮", usage::date_label(day, today)),
+                }
+                .into();
+                line = line.child(
+                    cell.id(("heat", i))
+                        .bg(rgb(Self::heat_color(v)))
+                        .cursor_pointer()
+                        .hover(|d| d.border_1().border_color(rgb(INK_SOFT)))
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_usage_day(day, window, cx)
+                        })),
+                );
             }
             grid = grid.child(line);
         }
@@ -96,14 +160,20 @@ impl ChatApp {
                 div()
                     .v_flex()
                     .gap_3()
-                    .child(div().h_flex().gap_3().children(stats[..3].iter().map(Self::stat_card)))
-                    .child(div().h_flex().gap_3().children(stats[3..].iter().map(Self::stat_card))),
+                    .child(div().h_flex().gap_3().children(cards))
+                    .child(div().h_flex().gap_3().children(second)),
             )
             .child(grid)
     }
 
-    /// 模型页签：每个模型的轮数和 token，条形按轮数
-    fn render_usage_models(o: &Overview) -> Div {
+    /// 模型页签：每个模型的轮数和 token，条形按轮数。点一行进设置页「用量 → 模型」看这个模型；
+    /// `selected` 是那边选中的模型（展开用过的会话数、最近使用和「看它的请求」）；`all` = 全列出来（首页只列前 8 个）。
+    pub(super) fn render_usage_models(
+        o: &Overview,
+        selected: Option<&str>,
+        all: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let mut list = div().v_flex().gap_2().w_full();
         if o.models.is_empty() {
             return list.child(
@@ -115,15 +185,56 @@ impl ChatApp {
             );
         }
         let max = o.models.first().map_or(1, |m| m.turns.max(1));
-        for m in o.models.iter().take(8) {
+        let total: u64 = o.models.iter().map(|m| m.tokens).sum::<u64>().max(1);
+        let shown = if all { o.models.len() } else { 8 };
+        for (i, m) in o.models.iter().take(shown).enumerate() {
             let share = m.turns as f32 / max as f32;
+            let open = selected == Some(m.name.as_str());
+            let name = m.name.clone();
+            let detail = open.then(|| {
+                let percent = (m.tokens * 100).div_ceil(total);
+                let per_turn = m.tokens / m.turns.max(1) as u64;
+                let model = m.name.clone();
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_3()
+                    .pt_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK_SOFT))
+                            .child(format!(
+                                "占全部 token 的 {percent}% · 平均每轮 {} token · {} 个会话用过 · 最近 {}",
+                                usage::compact(per_turn),
+                                m.sessions,
+                                super::requests_view::time_label(m.last_ms)
+                            )),
+                    )
+                    .child(
+                        Self::text_button(("model-requests", i), "看它的请求", false)
+                            .small()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.filter_requests(Some(model.clone()), None);
+                                this.open_usage(UsageView::Requests, window, cx)
+                            })),
+                    )
+            });
             list = list.child(
                 div()
+                    .id(("model-row", i))
                     .v_flex()
                     .gap_1()
                     .p_3()
                     .rounded_lg()
                     .bg(rgb(CARD))
+                    .cursor_pointer()
+                    .when(!open, |d| d.hover(|d| d.bg(rgb(HOVER))))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_usage_model(&name, window, cx)
+                    }))
                     .child(
                         div()
                             .h_flex()
@@ -160,7 +271,8 @@ impl ChatApp {
                                 .rounded_full()
                                 .bg(rgb(Self::heat_color(3))),
                         ),
-                    ),
+                    )
+                    .children(detail),
             );
         }
         list
@@ -279,9 +391,9 @@ impl ChatApp {
         let needs_setup = self.settings.needs_setup();
         let setup = needs_setup.then(|| self.render_setup(cx));
         let body = match self.overview_tab {
-            1 => Self::render_usage_models(&o),
+            1 => Self::render_usage_models(&o, None, false, cx),
             2 => self.render_usage_requests(cx),
-            _ => Self::render_usage_cards(&o),
+            _ => Self::render_usage_cards(&o, cx),
         };
 
         div()
@@ -373,6 +485,28 @@ impl ChatApp {
                                             cx,
                                             |t| t.overview_range = 2,
                                         )),
+                                )
+                                .child(
+                                    div().pl_2().child(
+                                        Self::quiet_button(
+                                            "usage-detail",
+                                            IconAll::ArrowUpRight,
+                                            Surface::Sand,
+                                            cx,
+                                        )
+                                        .small()
+                                        .tooltip("在设置里看详情")
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                let view = match this.overview_tab {
+                                                    1 => UsageView::Models,
+                                                    2 => UsageView::Requests,
+                                                    _ => UsageView::Overview,
+                                                };
+                                                this.open_usage(view, window, cx)
+                                            }),
+                                        ),
+                                    ),
                                 ),
                         )
                         .child(body)
