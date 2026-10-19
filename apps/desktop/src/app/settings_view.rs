@@ -32,6 +32,7 @@ const SETTINGS_TABS: [(IconAll, &str); 8] = [
     (IconAll::ShieldCheck, "权限"),
     (IconAll::Plug, "MCP"),
     (IconAll::Blocks, "插件"),
+    // 用量：单独一页，不在导航里列（见 `render_settings`）
     (IconAll::ChartColumn, "用量"),
     (IconAll::Brain, "记忆"),
 ];
@@ -87,7 +88,7 @@ pub struct SettingsForm {
     active: usize,
     /// 每套档案的输入框
     inputs: Vec<ProfileInputs>,
-    /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量 / 7 记忆）
+    /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量页 / 7 记忆）
     pub(super) tab: usize,
     acp_command: Entity<InputState>,
     /// 一轮最多几步（自研内核的工具循环上限）
@@ -118,7 +119,7 @@ pub struct SettingsForm {
     /// 展开着的说明 / 示例（`ChatApp::disclosure` 的 key），关设置页也记着
     pub(super) open_help: HashSet<&'static str>,
     /// 内容列的定宽（见 `MeasuredWidth`）
-    content_w: MeasuredWidth,
+    pub(super) content_w: MeasuredWidth,
     /// 上次「获取列表」的结果，显示在模型那一栏下面：(失败了吗, 给人看的话, 服务商的原文)
     fetch_result: Option<(bool, SharedString, Option<SharedString>)>,
 }
@@ -199,12 +200,16 @@ fn parse_thinking_budget(text: &str) -> Option<u64> {
 
 impl ChatApp {
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 记住上次看的 tab（打开时不动它），要指定 tab 的走 `open_settings_at`
-        let tab = self.settings_form.tab;
+        // 记住上次看的 tab（打开时不动它），要指定 tab 的走 `open_settings_at`；
+        // 停在用量页时回到进用量页之前的分类（用量不算设置的分类）
+        let mut tab = self.settings_form.tab;
+        if tab == super::usage_view::USAGE_TAB {
+            tab = self.usage_page.settings_tab;
+        }
         self.open_settings_at(tab, window, cx);
     }
 
-    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量 / 7 记忆）。
+    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量页 / 7 记忆）。
     /// 失败卡片的「打开设置」用它直接落到服务商配置。
     pub(crate) fn open_settings_at(
         &mut self,
@@ -1742,9 +1747,16 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let f = &self.settings_form;
+        // 用量是单独一页（侧栏「用量」打开），不带分类导航
+        if f.tab == super::usage_view::USAGE_TAB {
+            return self.render_usage_page(cx);
+        }
         // 左侧分类导航
         let mut nav = div().v_flex().w(SETTINGS_NAV_W).flex_none().px_3().gap_0p5();
         for (i, (icon, label)) in SETTINGS_TABS.into_iter().enumerate() {
+            if i == super::usage_view::USAGE_TAB {
+                continue;
+            }
             let active = i == f.tab;
             nav = nav.child(
                 div()
@@ -1769,8 +1781,6 @@ impl ChatApp {
                             }
                             this.settings_form.tab = i;
                             this.settings_form.message = None;
-                            // 「用量」停在「请求」一栏时按需读网关日志
-                            this.sync_requests(cx);
                             // 「记忆」每次进来都重读文件（内核 / 手改都可能动过它）
                             if i == super::memory_view::MEMORY_TAB {
                                 this.reload_memory_view();
@@ -1796,7 +1806,6 @@ impl ChatApp {
             3 => self.render_rules(cx),
             4 => self.render_mcp(window, cx),
             PLUGINS_TAB => self.render_plugins(cx),
-            super::usage_view::USAGE_TAB => self.render_usage_page(cx),
             super::memory_view::MEMORY_TAB => self.render_memory(window, cx),
             _ => self.render_general(cx),
         };

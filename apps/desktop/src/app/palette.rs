@@ -30,7 +30,7 @@ enum PaletteCmd {
     ToggleSidebar,
     PickWorkspace,
     OpenSettings,
-    /// 设置页「用量」
+    /// 用量页
     Usage,
     /// 在资源管理器里打开用量网关的日志目录
     GatewayLogs,
@@ -335,10 +335,7 @@ impl ChatApp {
             PaletteCmd::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             PaletteCmd::PickWorkspace => self.pick_workspace(cx),
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
-            PaletteCmd::Usage => {
-                let view = self.usage_page.view;
-                self.open_usage(view, window, cx)
-            }
+            PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),
             // 面板的对话框刚关，同一帧里还算开着：等下一帧再开速查
             PaletteCmd::Shortcuts => {

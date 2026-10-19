@@ -609,12 +609,10 @@ impl ChatApp {
                     this.open_settings_at(super::settings_view::PLUGINS_TAB, window, cx)
                 }),
             ))
-            .child(nav_item("usage", IconAll::ChartColumn, "用量", usage_open).on_click(
-                cx.listener(|this, _, window, cx| {
-                    let view = this.usage_page.view;
-                    this.open_usage(view, window, cx)
-                }),
-            ))
+            .child(
+                nav_item("usage", IconAll::ChartColumn, "用量", usage_open)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_usage(window, cx))),
+            )
             .child(
                 // 列表滚到底部「设置」上面时渐隐，不是一刀切（同对话区的下边缘）；
                 // 列表底下留出渐隐的高度，滚到头时最后一行不被盖住
@@ -653,8 +651,15 @@ impl ChatApp {
                             self.settings_open && !plugins_open && !usage_open,
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
-                            if this.settings_open {
+                            // 用量页也是设置页画的：在用量页上点「设置」是切过去，不是关掉
+                            if this.settings_open
+                                && this.settings_form.tab != super::usage_view::USAGE_TAB
+                            {
                                 this.settings_open = false;
+                                cx.notify();
+                            } else if this.settings_open {
+                                // 设置表单还是进用量页之前那份（可能有没保存的改动），只换分类
+                                this.settings_form.tab = this.usage_page.settings_tab;
                                 cx.notify();
                             } else {
                                 this.open_settings(window, cx);

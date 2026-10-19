@@ -187,9 +187,11 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   请求体和响应原文另存（`request_bodies.rs`，日志行的 `body` 指过去），「请求」页签每次请求行尾的「原文」打开查看（`app/raw_request.rs`）。
 - 自研内核默认不打扰前台：系统提示词里的 `BACKGROUND` 要求测试 / 浏览器 / 截图无头跑，`tools::QUIET_ENV` 给命令带上
   不弹窗口的环境变量（用户自己设了的不覆盖）；推荐的浏览器类 MCP 带 `--headless`。
-- 用量：首页概览（`app/overview.rs`）的统计卡、热力图格子、模型行和右上角箭头都跳到设置页「用量」（`app/usage_view.rs`，
-  概览 / 每天 / 时段 / 模型 / 会话 / 请求，时间范围和首页共用）；按天、时段、会话的汇总在 `usage.rs` 的 `breakdown`。
-  新的用量入口一律走 `ChatApp::open_usage`（「请求」一栏和首页同一份状态，列表按当前页面的滚动区窗口化，见 `requests_view.rs` 的 `list_scroll`）。
+- 用量：首页概览（`app/overview.rs`）的统计卡、热力图格子、模型行和右上角箭头都跳到用量页（`app/usage_view.rs`，
+  一整页不分页签：总数、趋势、模型 / 会话排行、时段、请求明细，时间范围和首页共用；画在设置页的位置上但不带分类导航）。
+  点一天 / 一个模型 / 一个会话是给整页加筛选（存在 `RequestsView` 的 `day` / `model` / `session`），汇总在 `usage.rs` 的 `board`；
+  费用、缓存命中从网关日志算（`request_costs`）。跑着的轮也要算进去：读用量统计用 `ChatApp::usage_stats`，不直接读 `usage`；
+  网关日志在报用量、一轮结束时自动重读（`refresh_requests_soon`）。新的用量入口一律走 `ChatApp::open_usage`。
 - 子 agent 在 `crates/builtin/src/subagent.rs`：`task` 工具开子会话（ID `主会话/调用 ID`），和主会话共用 `run_steps`；
   子会话的事件经 `subagent::forward` 转到主会话（工具行带 `parent`，回复 / 思考换成 `SubagentChunk`，
   开头发 `SubagentStarted` 带任务说明；`history::rebuild` 都跳过）。同一步的几个 `task` 并行跑（`run_tools`）。
