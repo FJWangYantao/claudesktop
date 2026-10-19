@@ -62,12 +62,27 @@ pub struct RequestParams {
 }
 
 impl RequestParams {
+    /// `thinking.budget_tokens` 的官方下限：小于它的请求 Anthropic 直接拒（400）。
+    /// 设置页和请求体组装都按它卡。
+    pub const MIN_THINKING_BUDGET: u64 = 1_024;
+
     pub fn is_empty(&self) -> bool {
         self.temperature.is_none()
             && self.max_tokens.is_none()
             && self.thinking_budget.is_none()
             && self.server_tools.is_empty()
             && self.extra.as_object().is_none_or(|o| o.is_empty())
+    }
+
+    /// 可选的服务端工具（内部名字 + 一句说明），设置页「服务端工具」的多选项用它。
+    /// 名单本身在 [`crate::anthropic::SERVER_TOOLS`]（带版本号的请求体片段也在那里）。
+    pub fn server_tool_choices() -> impl Iterator<Item = (&'static str, &'static str)> {
+        crate::anthropic::SERVER_TOOLS.iter().map(|tool| (tool.name, tool.desc))
+    }
+
+    /// 名字是不是认得的服务端工具（设置文件里手写错的、以后被删掉的都当不存在）
+    pub fn knows_server_tool(name: &str) -> bool {
+        crate::anthropic::SERVER_TOOLS.iter().any(|tool| tool.name == name)
     }
 }
 

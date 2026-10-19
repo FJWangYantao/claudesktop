@@ -46,6 +46,8 @@ pub struct ProfileInputs {
     base_url: Entity<InputState>,
     api_key: Entity<InputState>,
     model: Entity<InputState>,
+    /// 思考预算（`thinking.budget_tokens`）；空 = 不显式开启思考
+    thinking_budget: Entity<InputState>,
 }
 
 impl ProfileInputs {
@@ -62,11 +64,14 @@ impl ProfileInputs {
                     .default_value(value)
             })
         };
+        // 思考预算：1024 是官方下限；没设就留空（占位符顺便提醒最小值）
+        let budget = p.params.thinking_budget.map(|b| b.to_string()).unwrap_or_default();
         Self {
             name: make(p.name.clone(), "如 DeepSeek（可留空）", false, window, cx),
             base_url: make(p.base_url.clone(), "如 https://api.deepseek.com/v1", false, window, cx),
             api_key: make(p.api_key.clone(), "没有可留空", true, window, cx),
             model: make(p.model.clone(), "如 deepseek-chat", false, window, cx),
+            thinking_budget: make(budget, "空 = 不开启", false, window, cx),
         }
     }
 }
@@ -165,6 +170,14 @@ fn parse_max_steps(text: &str) -> usize {
     text.parse::<usize>()
         .unwrap_or(claudesktop_builtin::DEFAULT_MAX_STEPS)
         .clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS)
+}
+
+/// 设置页的「思考预算」输入 → `thinking.budget_tokens`：空着或写了非正数 = 不开启；
+/// 小于官方下限（1024）时抬到下限（请求里也会按这个下限卡一次）。
+fn parse_thinking_budget(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let n = text.parse::<u64>().ok().filter(|n| *n > 0)?;
+    Some(n.max(claudesktop_builtin::RequestParams::MIN_THINKING_BUDGET))
 }
 
 impl ChatApp {
@@ -489,6 +502,8 @@ impl ChatApp {
             p.base_url = value(&inputs.base_url, cx);
             p.api_key = value(&inputs.api_key, cx);
             p.model = value(&inputs.model, cx);
+            p.params.thinking_budget = parse_thinking_budget(&value(&inputs.thinking_budget, cx));
+            // 服务端工具（`p.params.server_tools`）由多选开关直接写在表单的档案里，这里不用再收
         }
         s.builtin.profiles = profiles;
         s.builtin.active = f.active.min(s.builtin.profiles.len().saturating_sub(1));
@@ -1419,6 +1434,102 @@ impl ChatApp {
                 ),
             ))
             .child(form_field("模型", model_hint, model_row))
+            .child(self.render_request_extras(p, inputs, cx))
+    }
+
+    /// 档案里只有 Anthropic 原生协议认的两项：思考预算 + 服务端工具。
+    /// 协议不是 Anthropic 时整块不显示（填了也不生效，免得误会）。
+    fn render_request_extras(
+        &self,
+        p: &ProviderProfile,
+        inputs: &ProfileInputs,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let builtin = "只有 Anthropic 原生协议认；其他协议填了也不生效";
+        let budget = form_field(
+            "思考预算",
+            Some(
+                if p.protocol == Protocol::Anthropic {
+                    "thinking.budget_tokens（最小 1024，需小于最大 token）；留空 = 不显式开启思考。\
+                     开启后不再发送 temperature（Anthropic 要求它为默认值 1）"
+                } else {
+                    "只有 Anthropic 原生协议认；留空 = 不显式开启思考"
+                }
+                .into(),
+            ),
+            div().w(NUMBER_INPUT_W).child(Self::text_input(&inputs.thinking_budget)),
+        );
+        // 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）
+        let mut tools = choice_panel();
+        for (i, (name, desc)) in claudesktop_builtin::RequestParams::server_tool_choices().enumerate()
+        {
+            let on = p.params.server_tools.iter().any(|s| s == name);
+            let desc = if p.protocol == Protocol::Anthropic {
+                desc.to_string()
+            } else {
+                format!("{desc}（{builtin}）")
+            };
+            tools = tools.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(TEXT_BODY)
+                                    .text_color(rgb(INK))
+                                    .child(name.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(TEXT_SMALL)
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(desc),
+                            ),
+                    )
+                    .child(
+                        Switch::new(("server-tool", i)).checked(on).color(rgb(CORAL)).on_change(
+                            cx.listener(move |this, checked: &bool, _, cx| {
+                                let checked = *checked;
+                                if let Some(profile) =
+                                    this.settings_form.profiles.get_mut(this.settings_form.active)
+                                {
+                                    let list = &mut profile.params.server_tools;
+                                    list.retain(|s| s != name);
+                                    if checked {
+                                        list.push(name.to_string());
+                                    }
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            );
+        }
+        div()
+            .v_flex()
+            .gap_4()
+            .child(budget)
+            .child(form_field(
+                "服务端工具",
+                Some(
+                    if p.protocol == Protocol::Anthropic {
+                        "Anthropic 在它的服务器上执行（会按次计费），结果自动折成文本进对话"
+                    } else {
+                        "只有 Anthropic 原生协议认；其他协议选了也不生效"
+                    }
+                    .into(),
+                ),
+                tools,
+            ))
     }
 
     /// ACP agent：启动命令（带常用命令一键填入）和要不要经用量网关。

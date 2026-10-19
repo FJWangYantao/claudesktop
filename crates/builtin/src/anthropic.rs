@@ -1,17 +1,23 @@
 //! Anthropic 原生 Messages API（`/v1/messages`）流式 provider。
 //!
 //! 相比走 OpenAI 兼容层，原生协议补齐了：思考块（`thinking_delta`）、
-//! 提示缓存（`cache_control`，长会话省费）、图片输入。请求与解析都在本模块
+//! 提示缓存（`cache_control`，长会话省费）、图片输入，以及两种只有原生协议认的
+//! 请求能力——思考预算（`thinking.budget_tokens`，见 [`build_body`]）和
+//! Anthropic 在服务端执行的工具（[`SERVER_TOOLS`]）。请求与解析都在本模块
 //! 内完成；对上层暴露统一的 [`ChatProvider`] 接口。
 
 use crate::provider::{
-    ChatMessage, ChatProvider, ModelInfo, ProviderConfig, StreamEvent, StreamOutcome, ToolCall,
-    debug_http, finish_stream, get_json, parse_model_list, post_sse_with_retry, read_sse,
+    ChatMessage, ChatProvider, ModelInfo, ProviderConfig, RequestParams, StreamEvent, StreamOutcome,
+    ToolCall, debug_http, finish_stream, get_json, parse_model_list, post_sse_with_retry, read_sse,
 };
 use serde_json::{Value, json};
 
 /// Anthropic 要求必填的 max_tokens 默认值（设置里可覆盖）
 const MAX_TOKENS_DEFAULT: u64 = 16_384;
+
+/// 一个服务端工具结果块转成文本时的字数上限（搜索结果 / 抓到的网页都很长，
+/// 全塞进正文会把下一轮的上下文吃掉）
+const MAX_BLOCK_TEXT: usize = 4_000;
 
 pub struct AnthropicProvider {
     config: ProviderConfig,
@@ -58,33 +64,7 @@ impl ChatProvider for AnthropicProvider {
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
         let route = self.endpoint("/messages");
-        let (system, converted) = convert_messages(messages);
-        let mut body = json!({
-            "model": model,
-            "max_tokens": self.config.params.max_tokens.unwrap_or(MAX_TOKENS_DEFAULT),
-            "stream": true,
-            "messages": converted,
-        });
-        if !system.is_empty() {
-            // 提示缓存：系统提示词标记为可缓存（命中后按缓存价计费）
-            body["system"] = json!([{
-                "type": "text",
-                "text": system,
-                "cache_control": { "type": "ephemeral" },
-            }]);
-        }
-        if !tools.is_empty() {
-            body["tools"] = convert_tools(tools);
-        }
-        if let Some(t) = self.config.params.temperature {
-            body["temperature"] = json!(t);
-        }
-        if let Some(extra) = self.config.params.extra.as_object() {
-            for (key, value) in extra {
-                body[key] = value.clone();
-            }
-        }
-        let body = body.to_string();
+        let body = build_body(model, messages, tools, &self.config.params).to_string();
 
         let headers = self.headers();
         let reader =
@@ -116,6 +96,104 @@ impl ChatProvider for AnthropicProvider {
         outcome.tool_calls = blocks.finish();
         Ok(outcome)
     }
+}
+
+/// 一个 Anthropic 服务端工具：内部名字 + 请求体片段。
+pub struct ServerTool {
+    /// 内部名字（设置里存的就是它，也是返回块里 `name` 字段的值）
+    pub name: &'static str,
+    /// 设置页给人看的说明
+    pub desc: &'static str,
+    /// 请求体里 `tools` 数组的那一项
+    pub spec: fn() -> Value,
+}
+
+/// Anthropic 在服务端执行的工具名单（`tools` 里多一项带版本号的 `type`，返回
+/// `server_tool_use` / `*_tool_result` 块，不由我们执行）。
+///
+/// **版本号需按官方文档核对**——这几个日期后缀是工具版本，Anthropic 会发新版本
+/// 并逐步废弃旧的（新模型上旧版本会被拒）。核实来源与日期：
+/// - `web_search_20250305`：https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+///   （基础版；`web_search_20260209` 起加动态过滤，`20260318` 起加 `response_inclusion`）
+/// - `web_fetch_20250910`：https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool
+///   （基础版；`20260209` / `20260309` / `20260318` 是加了动态过滤的后续版本）
+/// - `code_execution_20250825`：https://platform.claude.com/docs/en/agents-and-tools/tool-use/code-execution-tool
+///   （三个版本都仍受支持，此版在全部支持模型上行为一致；`20260120` 起加程序化工具调用/REPL 状态）
+///
+/// 这里统一选「基础版」：老模型也认，不需要 beta 头。
+pub const SERVER_TOOLS: &[ServerTool] = &[
+    ServerTool {
+        name: "web_search",
+        desc: "网络搜索（服务端执行，按次计费）",
+        spec: || json!({ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }),
+    },
+    ServerTool {
+        name: "web_fetch",
+        desc: "抓取网页正文（服务端执行）",
+        spec: || json!({ "type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 10 }),
+    },
+    ServerTool {
+        name: "code_execution",
+        desc: "在 Anthropic 沙箱里跑代码（服务端执行）",
+        spec: || json!({ "type": "code_execution_20250825", "name": "code_execution" }),
+    },
+];
+
+/// 服务端工具的内部名字 → 请求体片段；不认识的名字返回 None（设置文件里手写错的忽略掉）。
+fn server_tool_spec(name: &str) -> Option<Value> {
+    SERVER_TOOLS.iter().find(|t| t.name == name).map(|t| (t.spec)())
+}
+
+/// 组装 Messages API 请求体（纯函数，测试直接比 JSON）。
+///
+/// 几处取舍：
+/// - 思考预算（`thinking.budget_tokens`）与 `temperature` 不共存：Anthropic 要求
+///   开启 thinking 时 `temperature` 只能是默认值 1。两边都配了就**让 thinking 生效、
+///   不发 temperature**（思考预算是用户显式要的行为，temperature 常是照抄别的
+///   provider 配置留下的）。
+/// - 服务端工具（[`SERVER_TOOLS`]）和客户端工具合进同一个 `tools` 数组；
+///   缓存断点仍打在最后一个客户端工具上。
+/// - `extra` 最后浅合并，同名键覆盖上面所有默认值（留一个总开关）。
+fn build_body(
+    model: &str,
+    messages: &[ChatMessage],
+    tools: &[Value],
+    params: &RequestParams,
+) -> Value {
+    let (system, converted) = convert_messages(messages);
+    let mut body = json!({
+        "model": model,
+        "max_tokens": params.max_tokens.unwrap_or(MAX_TOKENS_DEFAULT),
+        "stream": true,
+        "messages": converted,
+    });
+    if !system.is_empty() {
+        // 提示缓存：系统提示词标记为可缓存（命中后按缓存价计费）
+        body["system"] = json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": { "type": "ephemeral" },
+        }]);
+    }
+    let server: Vec<Value> = params.server_tools.iter().filter_map(|n| server_tool_spec(n)).collect();
+    if !tools.is_empty() || !server.is_empty() {
+        let mut all = convert_tools(tools).as_array().cloned().unwrap_or_default();
+        all.extend(server);
+        body["tools"] = Value::Array(all);
+    }
+    if let Some(budget) = params.thinking_budget.filter(|b| *b > 0) {
+        // 小于官方下限的请求会被拒，抬到下限（设置页也会先抬一次）
+        let budget = budget.max(RequestParams::MIN_THINKING_BUDGET);
+        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    } else if let Some(t) = params.temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(extra) = params.extra.as_object() {
+        for (key, value) in extra {
+            body[key] = value.clone();
+        }
+    }
+    body
 }
 
 /// 把统一消息形状翻译成 Anthropic messages：
@@ -294,6 +372,13 @@ fn finish_reason(stop: &str) -> &'static str {
 }
 
 /// 解析一条 Messages API 流事件；返回 `Some(finish)` 表示拿到 stop_reason。
+///
+/// 服务端工具（`server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` /
+/// `*_code_execution_tool_result`）的块由 Anthropic 自己执行，**不是**要我们跑的工具调用，
+/// 所以**不进** [`ToolBlocks`]（那里出来的是 `outcome.tool_calls`，会进工具循环）。
+/// 结果转成一段给人看的文本，当作正文经 `StreamEvent::Text` 送出：内核会把它拼进本步的
+/// assistant 文本、写进日志，下一轮自然带着历史发回去。
+/// `server_tool_use` 本身（只要执行什么）不送，参数我们也不需要（结果块里带 `tool_use_id`）。
 type Parsed = Result<Option<String>, String>;
 
 fn parse_event(
@@ -321,13 +406,17 @@ fn parse_event(
         }
         "content_block_start" => {
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            if value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
-                let block = &value["content_block"];
+            let block = &value["content_block"];
+            let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind == "tool_use" {
                 blocks.start(
                     index,
                     block.get("id").and_then(Value::as_str).unwrap_or_default(),
                     block.get("name").and_then(Value::as_str).unwrap_or_default(),
                 );
+            } else if let Some(text) = server_result_text(kind, block) {
+                // 前后留空行：服务端工具的结果接在模型正文里也要读得清
+                on_event(StreamEvent::Text(format!("\n{text}\n")));
             }
             Ok(None)
         }
@@ -372,6 +461,130 @@ fn parse_event(
         // ping / message_stop / content_block_stop / message_start 之外的事件忽略
         _ => Ok(None),
     }
+}
+
+/// 服务端工具的结果块 → 给模型看的文本；不是结果块返回 None。
+///
+/// 覆盖官方文档里的几种形状（`content` 有的是列表、有的是对象、有的只是字符串）：
+/// - `web_search_tool_result`：`[{type: web_search_result, title, url, page_age}]`，
+///   或出错时的 `{type: web_search_tool_result_error, error_code}`
+/// - `web_fetch_tool_result`：`{type: web_fetch_result, url, content: {source: {data}}}`
+/// - `bash_code_execution_tool_result` / `text_editor_code_execution_tool_result`：
+///   `{type: bash_code_execution_result, stdout, stderr, return_code}` 等
+///
+/// 认不出来但块名是 `*_tool_result` 的，把整个 `content` 折成一行 JSON，
+/// 至少别把结果丢了。长度卡在 [`MAX_BLOCK_TEXT`]。
+fn server_result_text(kind: &str, block: &Value) -> Option<String> {
+    let content = block.get("content")?;
+    let body = if kind == "web_search_tool_result" {
+        search_results_text(content)
+    } else if kind == "web_fetch_tool_result" {
+        // content.content.source.data 是正文（也可能是 base64 的 PDF，那就给一句提示）
+        content
+            .pointer("/content/source/data")
+            .and_then(Value::as_str)
+            .and_then(|data| {
+                content
+                    .pointer("/content/source/media_type")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.starts_with("text/"))
+                    .map(|m| format!("（抓到的内容不是文本：{m}）"))
+                    .or_else(|| Some(data.to_string()))
+            })
+            .or_else(|| content.get("error_code").and_then(Value::as_str).map(|e| format!("抓取失败：{e}")))
+            .unwrap_or_else(|| compact_json(content))
+    } else if kind.ends_with("_tool_result") {
+        // 代码执行：stdout / stderr / return_code
+        let field = |k: &str| content.get(k).and_then(Value::as_str).unwrap_or_default();
+        match content.get("type").and_then(Value::as_str) {
+            Some("bash_code_execution_result") => {
+                let mut out = field("stdout").to_string();
+                if !field("stderr").is_empty() {
+                    out.push_str("\n[stderr] ");
+                    out.push_str(field("stderr"));
+                }
+                if content.get("return_code").and_then(Value::as_i64).is_some_and(|c| c != 0) {
+                    out.push_str(&format!(
+                        "\n[exit] {}",
+                        content.get("return_code").and_then(Value::as_i64).unwrap_or_default()
+                    ));
+                }
+                if out.trim().is_empty() { compact_json(content) } else { out }
+            }
+            Some("text_editor_code_execution_view_result") => field("content").to_string(),
+            Some("text_editor_code_execution_str_replace_result") => content
+                .get("lines")
+                .and_then(Value::as_array)
+                .map(|lines| lines.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default(),
+            _ => content
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(|e| format!("执行失败：{e}"))
+                .unwrap_or_else(|| compact_json(content)),
+        }
+    } else {
+        return None;
+    };
+    let body = truncate_chars(body.trim().to_string(), MAX_BLOCK_TEXT);
+    (!body.is_empty()).then(|| {
+        format!("[服务端工具 {kind}] {body}")
+    })
+}
+
+/// `web_search_tool_result.content`：结果列表或错误对象。
+fn search_results_text(content: &Value) -> String {
+    if let Some(error) = content.get("error_code").and_then(Value::as_str) {
+        return format!("搜索失败：{error}");
+    }
+    let Some(results) = content.as_array() else {
+        return compact_json(content);
+    };
+    if results.is_empty() {
+        return "（没有结果）".to_string();
+    }
+    results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let title = r.get("title").and_then(Value::as_str).unwrap_or("（无标题）");
+            let url = r.get("url").and_then(Value::as_str).unwrap_or_default();
+            let age = r.get("page_age").and_then(Value::as_str).unwrap_or_default();
+            if age.is_empty() {
+                format!("{}. {title} — {url}", i + 1)
+            } else {
+                format!("{}. {title} — {url}（{age}）", i + 1)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 认不出形状时把 JSON 压成一行（去掉 `encrypted_content` 这类密文，太占地方也没用）。
+fn compact_json(value: &Value) -> String {
+    fn scrub(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(k, _)| !k.starts_with("encrypted"))
+                    .map(|(k, v)| (k.clone(), scrub(v)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(scrub).collect()),
+            other => other.clone(),
+        }
+    }
+    scrub(value).to_string()
+}
+
+/// 按字符数截断（不切坏 UTF-8）。
+fn truncate_chars(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -530,5 +743,156 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Overloaded"), "{err}");
+    }
+
+    /// 思考预算：请求体带 `thinking`，且**不发** temperature（Anthropic 要求
+    /// 开 thinking 时 temperature 为默认值 1）。
+    #[test]
+    fn thinking_budget_wins_over_temperature() {
+        let messages = vec![M::new("user", "算一下")];
+        let params = RequestParams {
+            temperature: Some(0.3),
+            thinking_budget: Some(8_000),
+            ..Default::default()
+        };
+        let body = build_body("claude-sonnet-4-5", &messages, &[], &params);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8_000);
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert_eq!(body["max_tokens"], MAX_TOKENS_DEFAULT);
+
+        // 没设预算：照旧发 temperature，不发 thinking
+        let only_temp = RequestParams { temperature: Some(0.3), ..Default::default() };
+        let body = build_body("m", &messages, &[], &only_temp);
+        assert_eq!(body["temperature"], 0.3);
+        assert!(body.get("thinking").is_none());
+        // 都不设：两个键都不出现
+        let body = build_body("m", &messages, &[], &RequestParams::default());
+        assert!(body.get("thinking").is_none() && body.get("temperature").is_none());
+        // 小于 1024 的预算 API 会拒，抬到官方下限再发（仍然不发 temperature）
+        let too_small =
+            RequestParams { temperature: Some(1.0), thinking_budget: Some(512), ..Default::default() };
+        let body = build_body("m", &messages, &[], &too_small);
+        assert_eq!(body["thinking"]["budget_tokens"], RequestParams::MIN_THINKING_BUDGET);
+        assert!(body.get("temperature").is_none());
+        // 0 当成没开（设置文件里手写 0 的样子）
+        let zero =
+            RequestParams { temperature: Some(0.2), thinking_budget: Some(0), ..Default::default() };
+        let body = build_body("m", &messages, &[], &zero);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["temperature"], 0.2);
+    }
+
+    /// 服务端工具和客户端工具合进同一个 tools 数组；缓存断点仍在最后一个客户端工具上。
+    #[test]
+    fn merges_server_tools_with_client_tools() {
+        let messages = vec![M::new("user", "搜一下")];
+        let tools = vec![
+            json!({"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}),
+            json!({"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}),
+        ];
+        let params = RequestParams {
+            server_tools: vec!["web_search".into(), "code_execution".into(), "不认识的".into()],
+            ..Default::default()
+        };
+        let body = build_body("m", &messages, &tools, &params);
+        let arr = body["tools"].as_array().unwrap();
+        // 两客户端 + 两个认识的服务端；不认识的丢掉
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0]["name"], "read_file");
+        assert_eq!(arr[1]["name"], "shell");
+        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(arr[2]["type"], "web_search_20250305");
+        assert_eq!(arr[2]["name"], "web_search");
+        assert_eq!(arr[2]["max_uses"], 5);
+        assert!(arr[2].get("cache_control").is_none());
+        assert_eq!(arr[3]["type"], "code_execution_20250825");
+
+        // 只有服务端工具（没有客户端工具）也要发 tools 数组
+        let body = build_body("m", &messages, &[], &params);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        // 只有客户端工具：和以前一样
+        let body = build_body("m", &messages, &tools, &RequestParams::default());
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        // 都没有：不发 tools
+        let body = build_body("m", &messages, &[], &RequestParams::default());
+        assert!(body.get("tools").is_none());
+
+        // 名单里每个工具都有名字 / 说明 / 片段，且片段里的 name 与内部名字一致
+        for tool in SERVER_TOOLS {
+            assert!(!tool.desc.is_empty());
+            let spec = (tool.spec)();
+            assert_eq!(spec["name"], tool.name);
+            assert!(spec["type"].as_str().unwrap().contains('_'), "{spec}");
+        }
+    }
+
+    /// `server_tool_use` / `web_search_tool_result` 解析：结果转成正文文本经
+    /// `StreamEvent::Text` 送出（内核拼进本步 assistant 文本 → 进日志 → 下一轮带上历史），
+    /// **不**变成 tool_calls（否则工具循环会去找一个我们跑不了的工具）。
+    #[test]
+    fn parses_server_tool_blocks_into_text_events() {
+        let mut blocks = ToolBlocks::default();
+        let mut usage = crate::provider::Usage::default();
+        let mut seen = false;
+        let mut events = Vec::new();
+        let lines = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust\"}"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://example.com/a","title":"甲","page_age":"2025-04-30","encrypted_content":"EqgfCioIARgB"},{"type":"web_search_result","url":"https://example.com/b","title":"乙"}]}}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_2","content":{"type":"web_fetch_result","url":"https://example.com/a","content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"正文内容"}}}}}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"bash_code_execution_tool_result","tool_use_id":"srvtoolu_3","content":{"type":"bash_code_execution_result","stdout":"1 2 3\n","stderr":"","return_code":0,"content":[]}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+        ];
+        let mut finish = None;
+        for line in lines {
+            let out = parse_event(line, &mut blocks, &mut usage, &mut seen, &mut |e| events.push(e))
+                .unwrap();
+            if out.is_some() {
+                finish = out;
+            }
+        }
+        assert_eq!(finish.as_deref(), Some("stop"));
+        // 三个结果块 → 三条正文事件（`server_tool_use` 本身不送）
+        let texts: Vec<String> = events
+            .into_iter()
+            .map(|e| match e {
+                StreamEvent::Text(t) => t,
+                other => panic!("意外的事件：{other:?}"),
+            })
+            .collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        let search = &texts[0];
+        assert!(search.contains("甲") && search.contains("https://example.com/a"), "{search}");
+        assert!(search.contains("（2025-04-30）"), "{search}");
+        assert!(search.contains("乙"), "{search}");
+        // 密文（encrypted_content）不该出现在文本里
+        assert!(!search.contains("EqgfCioIARgB") && !search.contains("encrypted"), "{search}");
+        assert!(texts[1].contains("正文内容"), "{}", texts[1]);
+        assert!(texts[2].contains("1 2 3"), "{}", texts[2]);
+        // 服务端工具不算客户端工具调用
+        assert!(blocks.finish().is_empty());
+
+        // 搜索出错：error_code 转成一句人话
+        let err_block = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_9",
+            "content": { "type": "web_search_tool_result_error", "error_code": "max_uses_exceeded" },
+        });
+        let text = server_result_text("web_search_tool_result", &err_block).unwrap();
+        assert!(text.contains("max_uses_exceeded"), "{text}");
+        // 不认识的块名不产生文本
+        assert!(server_result_text("thinking", &json!({ "content": "x" })).is_none());
+    }
+
+    /// 服务端工具的结果文本进历史：拼进 assistant 文本后原样发回去（顺序在正文之后）。
+    #[test]
+    fn server_tool_text_goes_back_into_history() {
+        let mut m = M::new("assistant", "我查一下");
+        m.parts.push(ContentPart::Text("[服务端工具 web_search_tool_result] 1. 甲 — u".into()));
+        let blocks = content_blocks(&m);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "我查一下");
+        assert!(blocks[1]["text"].as_str().unwrap().contains("web_search_tool_result"));
     }
 }
