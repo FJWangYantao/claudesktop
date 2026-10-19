@@ -930,6 +930,236 @@ impl Action {
     }
 }
 
+/// 硬熔断：即使「自动」模式也不放行的动作，返回原因（中文，直接当拒绝理由给模型）。
+///
+/// - 删除类命令指向关键路径（文件系统根、盘符根、家目录、工作目录及其父级、顶层目录）：
+///   `rm -rf /`、`rm -rf ~`、`rm -rf <工作目录>`、`Remove-Item -Recurse -Force C:\` …
+/// - 写受保护的文件（`.gitconfig`、shell 启动脚本、包管理器配置、本程序的 MCP 配置）
+///
+/// 模型的分类器再准也会被参数骗过去，这类「一句命令就能毁掉这台机器」的东西不交给它判。
+pub fn hard_block(action: &Action, cwd: &Path) -> Option<String> {
+    match action {
+        Action::Shell { command, .. } | Action::ShellBackground { command, .. } => {
+            let target = critical_removal_target(command, cwd)?;
+            Some(format!(
+                "Automatic mode blocks recursive removal of a critical path (`{target}`): \
+                 the filesystem root, a drive root, the home directory, or the working directory \
+                 and its parents. Nothing was deleted. Choose a safer approach (a specific \
+                 subdirectory, or a branch), or ask the user to run this themselves."
+            ))
+        }
+        Action::Write { path, .. } | Action::Edit { path, .. } => {
+            protected_path(path).then(|| {
+                format!(
+                    "Automatic mode never writes to protected files such as secrets, shell startup \
+                     scripts, package-manager settings and the agent's own config (`{}`). \
+                     Ask the user to make this change themselves.",
+                    path.display()
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 受保护的文件名（写这些一律不放行）：密钥、shell 启动脚本、包管理器 / 钩子配置、
+/// 以及本程序自己的 MCP 配置和设置。
+const PROTECTED_FILES: [&str; 24] = [
+    ".gitconfig",
+    ".gitmodules",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_aliases",
+    ".bash_logout",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".profile",
+    ".envrc",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmfile.cjs",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
+    "gradle-wrapper.properties",
+    "maven-wrapper.properties",
+    ".mcp.json",
+    ".ripgreprc",
+    "pyrightconfig.json",
+];
+
+/// 受保护的目录（其中任何文件的写入都不放行）
+const PROTECTED_DIRS: [&str; 4] = [".git", ".cargo", ".config/git", ".ssh"];
+
+/// 这个路径是不是受保护的（写它要人工处理）。
+fn protected_path(path: &Path) -> bool {
+    let path = normalize(path);
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && (PROTECTED_FILES.iter().any(|f| f.eq_ignore_ascii_case(name))
+            // 点开头的环境变量文件都算（`.env`、`.env.local`、`.env.production` …）
+            || name.eq_ignore_ascii_case(".env")
+            || name.to_ascii_lowercase().starts_with(".env."))
+    {
+        return true;
+    }
+    // 目录：逐段比较（路径里任何一节命中就算）
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(str::to_ascii_lowercase))
+        .collect();
+    for (i, part) in parts.iter().enumerate() {
+        for dir in PROTECTED_DIRS {
+            let mut want = dir.split('/');
+            let first = want.next().unwrap_or_default();
+            if part != first {
+                continue;
+            }
+            // 两段的（`.config/git`）要求下一段也对上
+            if let Some(second) = want.next()
+                && parts.get(i + 1).map(String::as_str) != Some(second)
+            {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// 命令里如果有删除类命令指向关键路径，返回那个目标。
+///
+/// 只管「一句话就不可挽回」的情况：出现 `rm` / `rmdir` / `rd` / `del` / `Remove-Item`
+/// 这类删除命令且带递归，目标（按最坏读法展开）是文件系统根、盘符根、家目录、
+/// 工作目录本身或其父级、顶层目录。变量和命令替换展开结果不知道，不在这里判——
+/// 留给分类器，它能看到上一句赋的值。
+fn critical_removal_target(command: &str, cwd: &Path) -> Option<String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .map(|h| normalize(&h));
+    let cwd = normalize(cwd);
+    for (program, args) in removal_commands(command) {
+        if !removes_recursively(&program, &args) {
+            continue;
+        }
+        for arg in &args {
+            if is_option(arg) {
+                continue;
+            }
+            if let Some(target) = critical_target(arg, &cwd, home.as_deref()) {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+/// 命令里所有「删除」类的片段：(程序名（小写，去掉路径和 .exe）, 参数)。
+fn removal_commands(command: &str) -> Vec<(String, Vec<String>)> {
+    // 参数是临时字符串，程序名要单独持有，所以整体返回所有权
+    let owned: Vec<(String, Vec<String>)> = command
+        .split([';', '&', '|', '\n', '\r'])
+        .filter_map(|segment| {
+            let words: Vec<&str> = segment.split_whitespace().collect();
+            // 跳过前置的 `sudo` / `time` / `A=1` 之类
+            let start = words
+                .iter()
+                .position(|w| {
+                    !matches!(*w, "sudo" | "time" | "nohup" | "nice" | "env" | "call")
+                        && !w.contains('=')
+                })
+                .unwrap_or(0);
+            let word = *words.get(start)?;
+            let lower = word.trim_matches(['"', '\'']).to_ascii_lowercase();
+            let lower = lower.rsplit(['/', '\\']).next().unwrap_or(&lower).to_string();
+            let name = lower.trim_end_matches(".exe").to_string();
+            if !matches!(name.as_str(), "rm" | "rmdir" | "rd" | "del" | "remove-item" | "erase") {
+                return None;
+            }
+            let args = words[start + 1..]
+                .iter()
+                .map(|w| w.trim_matches(['"', '\'']).to_string())
+                .collect();
+            Some((name, args))
+        })
+        .collect();
+    owned
+}
+
+fn removes_recursively(program: &str, args: &[String]) -> bool {
+    if matches!(program, "rmdir" | "rd") {
+        return true;
+    }
+    args.iter().any(|a| {
+        let a = a.to_ascii_lowercase();
+        (a.starts_with('-')
+            && (a.contains('r') || a == "--recursive" || a.contains("recurse")))
+            || a == "/s"
+    })
+}
+
+/// 参数是选项而不是路径：`-rf`、`--recursive`、`/s`、`/q`。
+/// `/` 和 `/usr` 这种绝对路径不算。
+fn is_option(arg: &str) -> bool {
+    if arg.starts_with('-') {
+        return true;
+    }
+    // 形如 `/s`、`/q` 的：一个斜杠 + 一两个字母
+    let rest = arg.strip_prefix('/').or_else(|| arg.strip_prefix('\\'));
+    matches!(rest, Some(r) if !r.is_empty() && r.len() <= 2 && r.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// 一个删除目标是不是关键路径；是就返回它（给人看的原样）。
+fn critical_target(arg: &str, cwd: &Path, home: Option<&Path>) -> Option<String> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.contains("$(") || arg.contains('`') {
+        return None;
+    }
+    if arg.contains('$') {
+        return None;
+    }
+    // `~` / `~/*`：家目录本身
+    if let Some(rest) = arg.strip_prefix('~')
+        && (rest.is_empty() || rest == "/" || rest == "\\" || rest == "/*" || rest == "\\*")
+    {
+        return Some(arg.to_string());
+    }
+    // `/*`、`/`、`\`：文件系统根
+    if matches!(arg, "/" | "//" | "\\" | "/*" | "\\*") {
+        return Some(arg.to_string());
+    }
+    // 去掉结尾的通配 / 分隔符再判（`C:\*` → `C:\`，`D:/build/` → `D:/build`）
+    let bare = arg.trim_end_matches(['*', '/', '\\']);
+    if bare.is_empty() {
+        return Some(arg.to_string());
+    }
+    let path = normalize(&if Path::new(bare).is_absolute() {
+        PathBuf::from(bare)
+    } else {
+        cwd.join(bare)
+    });
+    // 文件系统根 / 盘符根（`/`、`C:\`）
+    if path.parent().is_none() {
+        return Some(arg.to_string());
+    }
+    // 顶层目录（`C:\Windows`、`/usr`）：删掉它等于毁掉系统
+    if path.ancestors().count() <= 2 {
+        return Some(arg.to_string());
+    }
+    // 家目录本身
+    if home == Some(path.as_path()) {
+        return Some(arg.to_string());
+    }
+    // 工作目录本身或它的某一级父目录
+    if cwd.starts_with(&path) {
+        return Some(arg.to_string());
+    }
+    None
+}
+
 /// `path` 参数为空时用工作目录
 fn dir_or_cwd(cwd: &Path, path: Option<String>) -> PathBuf {
     path.filter(|p| !p.trim().is_empty()).map_or_else(|| cwd.to_path_buf(), |p| resolve(cwd, &p))
@@ -1755,6 +1985,61 @@ mod tests {
         assert!(!shell_rule_matches("git status", "git push"));
         assert!(!shell_rule_matches("git status", "git status; rm x"));
         assert!(!shell_rule_matches("cargo", "cargo test > out.txt"));
+    }
+
+    #[test]
+    fn hard_block_stops_critical_removals() {
+        let cwd = if cfg!(windows) { Path::new("C:\\work\\proj") } else { Path::new("/work/proj") };
+        let shell = |command: &str| hard_block(&Action::Shell {
+            command: command.into(),
+            timeout: Duration::from_secs(1),
+            cwd: cwd.to_path_buf(),
+        }, cwd);
+
+        // 文件系统根、盘符根、家目录、工作目录本身及父级：一律拦下
+        for bad in [
+            "rm -rf /",
+            "rm -rf /*",
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf ..",
+            "rm -r -f .",
+            "Remove-Item -Recurse -Force C:\\",
+            "rm -rf /work",
+            "rm -rf /work/proj",
+            "sudo rm -rf /work/proj/src/../../..",
+            "echo hi && rm -rf /work",
+            "rd /s /q C:\\Windows",
+        ] {
+            assert!(shell(bad).is_some(), "应拦下：{bad}");
+        }
+
+        // 项目里的具体目录、单文件删除、非删除命令：放行给分类器判
+        for ok in [
+            "rm -rf target",
+            "rm -rf ./build/tmp",
+            "rm -rf src/generated/*.rs",
+            "rm a.txt",
+            "git status",
+            "cargo test",
+            "rm -rf $BUILD_DIR",
+        ] {
+            assert!(shell(ok).is_none(), "不该拦下：{ok}");
+        }
+        // 写受保护的路径：不交给分类器
+        let write = |path: &str| {
+            hard_block(
+                &Action::parse(WRITE_FILE, &json!({"path": path, "content": "x"}).to_string(), cwd)
+                    .unwrap(),
+                cwd,
+            )
+        };
+        assert!(write(".env").is_some());
+        assert!(write(".env.local").is_some());
+        assert!(write(".git/config").is_some());
+        assert!(write("scripts/.gitconfig").is_some());
+        assert!(write("src/main.rs").is_none());
+        assert!(write("docs/environment.md").is_none());
     }
 
     #[test]

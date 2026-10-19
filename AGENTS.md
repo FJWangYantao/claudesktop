@@ -30,6 +30,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   分组规则在 `Session::compute_layout`）；
   行高受别的状态影响时（如"是不是回合末尾"），把那个状态并进 `Session::row_key`（或 `RowLayout`），否则虚拟列表不会重测。
   权限请求带工具调用 ID，应答后结果并进那一行（`ToolCard::grant`，见 `Session::merge_permission`），权限行不再画。
+- **权限模式「自动」**（`crates/builtin/src/auto.rs`）：由一次独立的模型调用（分类器）代替用户审批。
+  `authorize` 里 `Access::Read` 和工作目录内的编辑**不进分类器**（省一个往返），其余走
+  「硬熔断（`tools::hard_block`：删关键路径、写受保护文件）→ 已保存规则 → 分类器」。
+  分类器只喂用户说过的话 + 要执行的动作，**剥掉助手文本和工具结果**（防自我说服、防注入）；
+  判不出来一律按拒绝。拒绝的理由连同「别换个马甲重试」回给模型，它自己决定换路子还是问用户。
+  连续 3 次 / 累计 20 次拒绝就停下来等用户。没在设置里配好时这个模式不出现在模式列表里。
 - **Markdown（`TextView`）**：字号、颜色、行高要直接设在 `TextView` 上（它实现了 `Styled`），
   设在外层 div 上不生效。
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，

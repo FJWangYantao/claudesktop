@@ -11,4 +11,5 @@
 已完成：测试 / 截图默认在后台跑；用量明细可看原始请求；`PreCompact` 钩子；权限「总是拒绝」按项目落盘（命中不问直接拦）；
 MCP 工具结果里的图片进模型；token 估算换准；`web_search` 工具；会话标题模型起名；
 Anthropic 思考预算与服务端工具；OpenAI Responses API；`shell` 后台任务三件套；历史会话全文搜索；
-项目级配置（内核侧 + 设置页「项目」）；记忆系统第 1 期（`memory.json` + `memory_write` + 设置页「记忆」）。
+项目级配置（内核侧 + 设置页「项目」）；记忆系统第 1 期（`memory.json` + `memory_write` + 设置页「记忆」）；
+权限「自动」模式（分类器代理审批，见 `crates/builtin/src/auto.rs`，设置页「内核与模型」里配）。

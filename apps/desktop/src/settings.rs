@@ -11,7 +11,9 @@
 //! 设置页保存时写下的是当时界面上的值。
 
 use crate::model::ViewMode;
-use claudesktop_builtin::{BuiltinConfig, ModelInfo, Protocol, ProviderConfig, RequestParams};
+use claudesktop_builtin::{
+    AutoModeConfig, BuiltinConfig, ModelInfo, Protocol, ProviderConfig, RequestParams,
+};
 use claudesktop_core::AcpKernelConfig;
 use gpui_kit::SharedString;
 use serde::{Deserialize, Serialize};
@@ -235,6 +237,8 @@ pub struct Settings {
     /// 自研内核一轮里最多请求模型的次数（工具循环上限，默认 200）；
     /// 越界的值读取时夹进 [`claudesktop_builtin::MIN_MAX_STEPS`] .. [`claudesktop_builtin::MAX_MAX_STEPS`]
     pub max_steps: usize,
+    /// 「自动」模式：开不开、分类器用哪个模型、信任边界（默认关）
+    pub auto_mode: AutoModeSettings,
     /// 自研内核的请求经用量网关转发、每个请求记一行日志（数据目录 `gateway/`）；默认开。
     /// 关掉就直连端点。设置页「内核与模型」有开关，`CLAUDESKTOP_GATEWAY` 覆盖它
     pub usage_gateway: bool,
@@ -283,7 +287,65 @@ impl Default for Settings {
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
             motion: MotionPref::default(),
+            auto_mode: AutoModeSettings::default(),
         }
+    }
+}
+
+/// 「自动」模式（权限模式里由分类器代替用户审批）的设置。
+///
+/// 默认关。开着时必须配好：要么跟着当前服务商和会话模型走（`use_session_model`），
+/// 要么自己指定一个模型（省钱 / 快的分类器小模型）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoModeSettings {
+    /// 打开「自动」模式（默认关）
+    pub enabled: bool,
+    /// 分类器跟着当前服务商的模型走；false = 用下面的 `model` 和 `/model` 菜单里挑的分类模型
+    pub use_session_model: bool,
+    /// 分类器用哪个模型（同一服务商）；空 = 没配
+    pub model: String,
+    /// 信任边界（自然语言，进分类器的系统提示词）；空 = 只有当前仓库算内部
+    pub environment: String,
+}
+
+impl Default for AutoModeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // 默认跟会话模型走：开关一开就能用，不用再挑一次模型
+            use_session_model: true,
+            model: String::new(),
+            environment: String::new(),
+        }
+    }
+}
+
+impl AutoModeSettings {
+    /// 配置是否齐全（开着的时候必须齐全，否则保存就报错）。
+    pub fn is_configured(&self, profile: &ProviderProfile) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if self.use_session_model {
+            // 跟着会话走：当前档案本身配好就行
+            return profile.is_configured();
+        }
+        profile.is_configured() && !self.model.trim().is_empty()
+    }
+
+    /// 交给自己研内核的配置；没开就 None（「自动」模式不出现）。
+    pub fn to_config(&self, profile: &ProviderProfile) -> Option<AutoModeConfig> {
+        if !self.enabled || !self.is_configured(profile) {
+            return None;
+        }
+        Some(AutoModeConfig {
+            environment: self.environment.trim().to_string(),
+            model: (!self.use_session_model).then(|| ProviderConfig {
+                model: self.model.trim().to_string(),
+                ..profile.provider_config()
+            }),
+        })
     }
 }
 
@@ -494,6 +556,8 @@ impl Settings {
         config.context_windows = p.context_windows.clone().into_iter().collect();
         config.max_steps = self.max_steps;
         config.provider.gateway = self.gateway();
+        // 「自动」模式没配好时不出现（设置页保存时会拦住，这里再兜一次）
+        config.auto_mode = self.auto_mode.to_config(p);
         Ok(config)
     }
 
@@ -631,6 +695,47 @@ mod tests {
         std::fs::write(&path, r#"{"max_steps":999999}"#).unwrap();
         assert_eq!(Settings::load(Some(&path)).0.max_steps, claudesktop_builtin::MAX_MAX_STEPS);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「自动」模式：默认关；开着时必须配好（跟会话走 = 档案配好即可，自选模型 = 要填模型名），
+    /// 没配好就不交给内核（模式里不出现）。
+    #[core::prelude::v1::test]
+    fn auto_mode_is_off_by_default_and_needs_a_model_when_on() {
+        // 旧设置文件没有这一项：关着、跟会话模型走
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.auto_mode.enabled);
+        assert!(s.auto_mode.use_session_model);
+        assert_eq!(s.auto_mode.to_config(s.builtin.current()), None);
+
+        let mut s = Settings::default();
+        s.builtin.current_mut().base_url = "http://x/v1".into();
+        s.builtin.current_mut().model = "big".into();
+        let profile = s.builtin.current().clone();
+
+        // 开着 + 跟会话：能用，分类器不单独指定模型
+        s.auto_mode.enabled = true;
+        assert!(s.auto_mode.is_configured(&profile));
+        let config = s.auto_mode.to_config(&profile).unwrap();
+        assert_eq!(config.model, None);
+        assert_eq!(config.environment, "");
+
+        // 开着 + 自选模型但没填：配不齐，不交给内核
+        s.auto_mode.use_session_model = false;
+        assert!(!s.auto_mode.is_configured(&profile));
+        assert_eq!(s.auto_mode.to_config(&profile), None);
+
+        // 填了模型就能用，端点沿用当前档案
+        s.auto_mode.model = "small".into();
+        s.auto_mode.environment = "  Trusted: github.com/acme  ".into();
+        let config = s.auto_mode.to_config(&profile).unwrap();
+        assert_eq!(config.model.as_ref().map(|p| p.model.as_str()), Some("small"));
+        assert_eq!(config.model.as_ref().map(|p| p.base_url.as_str()), Some("http://x/v1"));
+        assert_eq!(config.environment, "Trusted: github.com/acme");
+
+        // 落到内核配置里
+        assert!(s.builtin_config(PathBuf::from(".")).unwrap().auto_mode.is_some());
+        s.auto_mode.enabled = false;
+        assert!(s.builtin_config(PathBuf::from(".")).unwrap().auto_mode.is_none());
     }
 
     #[core::prelude::v1::test]
