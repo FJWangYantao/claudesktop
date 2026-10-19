@@ -26,14 +26,6 @@ const CARD_W: Rems = rems(17.);
 impl ChatApp {
     /// 输入框下方的上下文用量；没报告过用量时为 None（只有自研内核报告，窗口大小也只有它知道）。
     pub(super) fn context_gauge(&self) -> Option<ContextGauge> {
-        // TEMP-EYEBALL: 截图用，稍后删掉
-        if let Ok(v) = std::env::var("CD_EYEBALL_GAUGE") {
-            let (used, window) = v.split_once('/').unwrap_or((&v, "256000"));
-            return Some(usage::context_gauge(
-                used.parse().unwrap_or(23_400),
-                window.parse().ok(),
-            ));
-        }
         let s = self.session();
         if s.context_tokens == 0 {
             return None;
