@@ -473,14 +473,20 @@ impl ChatApp {
                 Some(_) => Self::heat_color(1),
                 None => Self::heat_color(3),
             };
+            let clickable = !b.weekly && day <= today;
             let bar = div()
                 .w_full()
                 .rounded_sm()
                 .bg(rgb(if n == 0 { Self::heat_color(0) } else { color }))
                 // 没有对话的日子也留一道底线，看得出是 0 而不是没画
-                .h(if n == 0 { px(2.).into() } else { relative(n as f32 / max as f32) });
+                .h(if n == 0 { px(2.).into() } else { relative(n as f32 / max as f32) })
+                // 悬停整根柱子那一列（不只是柱子本身）就加深，看得出点的是哪天
+                .when(clickable && picked != Some(day), |d| {
+                    d.group_hover("usage-trend", |d| d.bg(rgb(Self::heat_color(4))))
+                });
             let column = div()
                 .id(("usage-trend", i))
+                .group("usage-trend")
                 .flex_1()
                 .h_full()
                 .v_flex()
@@ -488,7 +494,7 @@ impl ChatApp {
                 .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                 .child(bar);
             // 按周画的不能点（筛选按天）
-            bars = bars.child(if b.weekly || day > today {
+            bars = bars.child(if !clickable {
                 column
             } else {
                 column.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
@@ -559,19 +565,25 @@ impl ChatApp {
             let name = m.name.clone();
             let on = picked.as_ref() == Some(&m.name);
             list = list.child(
-                bar_row(m.name.clone(), meta.join(" · "), m.turns as f32 / max as f32, on, None)
-                    .id(("usage-model", i))
-                    .cursor_pointer()
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(if on { "去掉这个筛选" } else { "只看这个模型" })
-                            .build(window, cx)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let v = &mut this.requests_view;
-                        v.model = (v.model.as_ref() != Some(&name)).then(|| name.clone());
-                        this.usage_filter_changed();
-                        cx.notify();
-                    })),
+                bar_row(
+                    m.name.clone(),
+                    meta.join(" · "),
+                    m.turns as f32 / max as f32,
+                    on,
+                    true,
+                    None,
+                )
+                .id(("usage-model", i))
+                .cursor_pointer()
+                .tooltip(move |window, cx| {
+                    Tooltip::new(if on { "去掉这个筛选" } else { "只看这个模型" }).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let v = &mut this.requests_view;
+                    v.model = (v.model.as_ref() != Some(&name)).then(|| name.clone());
+                    this.usage_filter_changed();
+                    cx.notify();
+                })),
             );
         }
         panel("模型", None, list).flex_1().min_w_0()
@@ -624,21 +636,23 @@ impl ChatApp {
                 }))
                 .into_any_element()
             });
-            let mut row = bar_row(title, meta.join(" · "), r.tokens as f32 / max as f32, on, open)
-                .id(("usage-session", i));
+            let mut row = bar_row(
+                title,
+                meta.join(" · "),
+                r.tokens as f32 / max as f32,
+                on,
+                token.is_some(),
+                open,
+            )
+            .id(("usage-session", i));
             if let Some(token) = token {
-                row = row
-                    .cursor_pointer()
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(if on { "去掉这个筛选" } else { "只看这个会话" })
-                            .build(window, cx)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let v = &mut this.requests_view;
-                        v.session = (v.session != Some(token)).then_some(token);
-                        this.usage_filter_changed();
-                        cx.notify();
-                    }));
+                // 不挂提示：右边「打开」按钮有自己的提示，悬停在按钮上会两个叠着出来
+                row = row.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    let v = &mut this.requests_view;
+                    v.session = (v.session != Some(token)).then_some(token);
+                    this.usage_filter_changed();
+                    cx.notify();
+                }));
             }
             list = list.child(row);
         }
@@ -695,6 +709,7 @@ fn render_usage_heat(b: &Board) -> Div {
                     .h(px(14.))
                     .rounded_sm()
                     .bg(rgb(ChatApp::heat_color(level as u8)))
+                    .hover(|d| d.border_1().border_color(rgb(INK_SOFT)))
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
             );
         }
@@ -747,11 +762,14 @@ fn panel(title: &'static str, actions: Option<AnyElement>, body: impl IntoElemen
 }
 
 /// 一行：标题 + 右边一句数字，下面一根条形（白卡片；选中的是筛选着的那个，换底色）。
+/// `clickable` = 点了能筛选，才有悬停态。白卡片放在沙色面板上，悬停换底色（`HOVER`）会和面板同色、
+/// 像卡片没了，所以同输入框那样加深边框：静止时边框和底色一样，悬停换成 `LINE_STRONG`。
 fn bar_row(
     title: impl Into<SharedString>,
     meta: String,
     share: f32,
     on: bool,
+    clickable: bool,
     trailing: Option<AnyElement>,
 ) -> Div {
     div()
@@ -759,8 +777,10 @@ fn bar_row(
         .gap_1()
         .p_3()
         .rounded_lg()
+        .border_1()
+        .border_color(rgb(if on { SELECTED } else { CARD }))
         .bg(rgb(if on { SELECTED } else { CARD }))
-        .when(!on, |d| d.hover(|d| d.bg(rgb(HOVER))))
+        .when(clickable, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
         .child(
             div()
                 .h_flex()
