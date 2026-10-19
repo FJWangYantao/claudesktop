@@ -3,6 +3,7 @@
 //!
 //! 给模型看的说明与结果用英文（与系统提示词一致），给 UI 的摘要用中文。
 
+use claudesktop_core::memory::MAX_TEXT_CHARS;
 use claudesktop_core::{DiffView, PlanEntryView};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,6 +27,7 @@ const GREP: &str = "grep";
 const WEB_FETCH: &str = "web_fetch";
 const WEB_SEARCH: &str = "web_search";
 pub const TODO_WRITE: &str = "todo_write";
+pub const MEMORY_WRITE: &str = "memory_write";
 /// 待办清单最多几项
 const TODO_MAX: usize = 50;
 
@@ -256,6 +258,38 @@ pub fn specs(writable: bool) -> Vec<Value> {
             }),
         ),
         f(
+            MEMORY_WRITE,
+            format!(
+                "Save one short note for later sessions: a user preference, a project convention, \
+                 a decision with its reason, or a pitfall you hit. `text` is one sentence (at most \
+                 {MAX_TEXT_CHARS} characters), not a transcript and not \"the user asked me to …\". \
+                 Do not record things the repository already says (layout, dependency versions, \
+                 function signatures: read the files instead), one-off task details, or secrets \
+                 (tokens, passwords, keys). If the user asks you to remember something, save it \
+                 here instead of repeating the conversation. Use the `memory_write` note only when \
+                 it will matter in later sessions; rules that belong in the repository go into \
+                 AGENTS.md with edit_file."
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "One sentence, with the why when it matters" },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "A few short categories, e.g. 构建 / 测试 / 偏好"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global"],
+                        "description": "project (default): this working directory; global: every project"
+                    },
+                    "pinned": { "type": "boolean", "description": "Keep it in context and never evict it" }
+                },
+                "required": ["text"]
+            }),
+        ),
+        f(
             GREP,
             format!(
                 "Search file contents with a regular expression (Rust regex syntax). Respects .gitignore, skips hidden and binary files. \
@@ -475,6 +509,54 @@ pub fn todo_summary(entries: &[PlanEntryView]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[derive(Deserialize)]
+struct MemoryArgs {
+    text: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    pinned: bool,
+}
+
+/// `memory_write` 的参数 → (记到哪个范围，一条记忆)；错误信息回给模型。
+pub fn parse_memory(
+    arguments: &str,
+) -> Result<(claudesktop_core::memory::Scope, claudesktop_core::memory::Entry), String> {
+    use claudesktop_core::memory::{self, Scope};
+    let args: MemoryArgs = serde_json::from_str(arguments)
+        .map_err(|e| format!("Invalid arguments for {MEMORY_WRITE}: {e}"))?;
+    let text = args.text.trim();
+    if text.is_empty() {
+        return Err(format!("{MEMORY_WRITE}: `text` is empty"));
+    }
+    if args.tags.len() > memory::MAX_TAGS {
+        return Err(format!("{MEMORY_WRITE}: at most {} tags", memory::MAX_TAGS));
+    }
+    let scope = match args.scope.as_deref() {
+        None | Some("") => Scope::Project,
+        other => Scope::parse(other.unwrap_or_default())
+            .ok_or_else(|| format!("{MEMORY_WRITE}: `scope` must be \"project\" or \"global\""))?,
+    };
+    let mut entry = memory::Entry::new(text, now_ms());
+    entry.tags = args
+        .tags
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .take(memory::MAX_TAGS)
+        .collect();
+    entry.pinned = args.pinned;
+    Ok((scope, entry))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[derive(Deserialize)]

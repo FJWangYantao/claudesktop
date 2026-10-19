@@ -18,6 +18,7 @@ pub mod checkpoint;
 mod diff;
 pub mod history_search;
 mod json_error;
+pub mod memory;
 pub mod plugin;
 pub mod plugin_git;
 mod process_guard;
@@ -215,6 +216,13 @@ pub enum KernelEvent {
     TitleGenerated { title: String },
     /// 后台命令的状态变了（启动 / 结束 / 被停掉）：整份任务列表（最近的在前）
     BackgroundTasks { tasks: Vec<BackgroundTaskView> },
+    /// 记忆里多了一条 / 更新了一条（界面刷新计数，不进对话流）
+    MemoryChanged {
+        /// `project` 或 `global`（见 `memory::Scope::name`）
+        scope: String,
+        /// 这份文件里现在有几条
+        count: usize,
+    },
 }
 
 /// 一条后台命令在界面上的样子（见自研内核的 `bgtasks` 模块）。
@@ -305,6 +313,7 @@ impl KernelEvent {
             Self::McpStatus { .. } => "mcp_status",
             Self::TitleGenerated { .. } => "title_generated",
             Self::BackgroundTasks { .. } => "background_tasks",
+            Self::MemoryChanged { .. } => "memory_changed",
         }
     }
 }
