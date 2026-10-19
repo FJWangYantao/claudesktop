@@ -31,11 +31,44 @@ struct Task {
     /// 起它的内核（同时有几个内核时事件只发给自己的）
     kernel: u64,
     started: Instant,
+    /// 回收线程只在 `try_wait` 的一瞬间拿锁，`stop` 随时能拿到它去结束进程
     child: Arc<Mutex<Child>>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<Output>>,
     state: Arc<Mutex<State>>,
-    /// `shell_output` 上次读到哪（增量）
+    /// `shell_output` 上次读到哪（从开头算的绝对字节数，含已丢掉的部分）
     cursor: Mutex<usize>,
+}
+
+/// 输出缓冲：只留最近的 [`OUTPUT_MAX_BYTES`]，`dropped` 记前面丢了多少，
+/// 绝对位置 = `dropped + buf` 里的下标（增量读取按绝对位置算，缓冲满了也能接着读）。
+#[derive(Default)]
+struct Output {
+    buf: Vec<u8>,
+    dropped: usize,
+}
+
+impl Output {
+    /// 一共写进来多少字节（含已丢的）
+    fn end(&self) -> usize {
+        self.dropped + self.buf.len()
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > OUTPUT_MAX_BYTES {
+            let cut = self.buf.len() - OUTPUT_MAX_BYTES;
+            self.buf.drain(..cut);
+            self.dropped += cut;
+        }
+    }
+
+    /// 从绝对位置 `from` 起的输出；`from` 落在已丢的区间里时从留着的开头给，
+    /// 第二个值是中间丢了多少字节。
+    fn since(&self, from: usize) -> (&[u8], usize) {
+        let skipped = self.dropped.saturating_sub(from);
+        let start = from.saturating_sub(self.dropped).min(self.buf.len());
+        (&self.buf[start..], skipped)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +101,23 @@ fn table() -> &'static Table {
 /// 收到的只有它拉起的那些任务。
 pub fn register(kernel: u64, sink: Box<dyn Fn(Vec<BackgroundTaskView>) + Send + Sync>) {
     table().sinks.lock().unwrap().push((kernel, sink));
+}
+
+/// 内核关闭时：停掉它起的任务、摘掉它的出口（出口里攥着内核，不摘内核就一直释放不掉）。
+pub fn unregister(kernel: u64) {
+    table().sinks.lock().unwrap().retain(|(k, _)| *k != kernel);
+    let ids: Vec<String> = table()
+        .tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, t)| t.kernel == kernel)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        let _ = stop(&id);
+    }
+    table().tasks.lock().unwrap().retain(|_, t| t.kernel != kernel);
 }
 
 /// 只通知某个内核（它的任务变了）；`None` = 全部（启动 / 停止时用）。
@@ -114,7 +164,7 @@ fn views_filtered(kernel: Option<u64>) -> Vec<BackgroundTaskView> {
                     State::Running => None,
                 },
                 duration_secs: task.started.elapsed().as_secs(),
-                output_tail: tail(&output),
+                output_tail: tail(&output.buf),
             }
         })
         .collect();
@@ -139,7 +189,7 @@ pub fn start(command: &str, cwd: &std::path::Path) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start shell: {e}"))?;
-    let output: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let output: Arc<Mutex<Output>> = Arc::default();
     let state = Arc::new(Mutex::new(State::Running));
     // stdout 和 stderr 都往一个缓冲里写：模型看输出不关心是哪一个
     for pipe in [
@@ -157,12 +207,7 @@ pub fn start(command: &str, cwd: &std::path::Path) -> Result<String, String> {
                 if n == 0 {
                     break;
                 }
-                let mut b = sink.lock().unwrap();
-                b.extend_from_slice(&chunk[..n]);
-                if b.len() > OUTPUT_MAX_BYTES {
-                    let cut = b.len() - OUTPUT_MAX_BYTES;
-                    b.drain(..cut);
-                }
+                sink.lock().unwrap().push(&chunk[..n]);
             }
         });
     }
@@ -199,33 +244,48 @@ pub fn start(command: &str, cwd: &std::path::Path) -> Result<String, String> {
         }
         tasks.insert(id.clone(), task);
     }
-    // 回收线程：等进程退出，记下退出码
+    // 回收线程：等进程退出，记下退出码。轮询 `try_wait` 而不是阻塞 `wait`：
+    // `wait` 要一直攥着 child 的锁，`stop` 就拿不到锁去结束进程了
     let owner = kernel;
     std::thread::spawn(move || {
-        let code = child.lock().unwrap().wait().ok().and_then(|s| s.code());
-        *state.lock().unwrap() = State::Exited(code);
+        loop {
+            let status = child.lock().unwrap().try_wait();
+            match status {
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Ok(Some(status)) => {
+                    let mut state = state.lock().unwrap();
+                    // 被 `stop` 结束的已经记成 Exited(None)，不再改
+                    if *state == State::Running {
+                        *state = State::Exited(status.code());
+                    }
+                    break;
+                }
+                Err(_) => {
+                    *state.lock().unwrap() = State::Exited(None);
+                    break;
+                }
+            }
+        }
         notify_kernel(Some(owner));
     });
     notify_kernel(Some(kernel));
     Ok(id)
 }
 
-/// 按 ID 取增量输出；`wait` 内没新输出也返回（附一句状态）。
-pub fn output(id: &str, wait: Duration) -> Result<String, String> {
+/// 按 ID 取增量输出；`wait` 内没新输出也返回（附一句状态），`should_stop` 为真（用户停了这一轮）时立刻返回。
+pub fn output(id: &str, wait: Duration, should_stop: &dyn Fn() -> bool) -> Result<String, String> {
     let task = get(id).ok_or_else(|| format!("没有这个后台任务：{id}"))?;
     let deadline = Instant::now() + wait;
     let cursor = *task.cursor.lock().unwrap();
     loop {
         let running = *task.state.lock().unwrap() == State::Running;
-        let available = task.output.lock().unwrap().len();
-        if available > cursor || !running || Instant::now() >= deadline {
-            let text = {
-                let buf = task.output.lock().unwrap();
-                // 输出被截断过（丢了最前面的）时，游标落在已丢的区间里：从头给
-                let from = cursor.min(buf.len());
-                String::from_utf8_lossy(&buf[from..]).into_owned()
+        let available = task.output.lock().unwrap().end();
+        if available > cursor || !running || Instant::now() >= deadline || should_stop() {
+            let (text, skipped, new_cursor) = {
+                let out = task.output.lock().unwrap();
+                let (bytes, skipped) = out.since(cursor);
+                (String::from_utf8_lossy(bytes).into_owned(), skipped, out.end())
             };
-            let new_cursor = task.output.lock().unwrap().len();
             *task.cursor.lock().unwrap() = new_cursor;
             let exit = *task.state.lock().unwrap();
             let mut out = if text.trim().is_empty() {
@@ -233,6 +293,9 @@ pub fn output(id: &str, wait: Duration) -> Result<String, String> {
             } else {
                 text.trim_end().to_string()
             };
+            if skipped > 0 {
+                out = format!("[{skipped} bytes of earlier output dropped]\n{out}");
+            }
             match exit {
                 State::Running => {
                     out.push_str(&format!(
@@ -301,6 +364,33 @@ mod unit {
     fn tail_keeps_the_last_lines() {
         let text = "a\n\nb\nc\nd\n";
         assert_eq!(tail(text.as_bytes()), "b\nc\nd");
+    }
+
+    /// 缓冲满了以后增量读取照样接得上：游标是绝对位置，不随丢掉前面的而失效
+    #[test]
+    fn output_cursor_survives_the_cap() {
+        let mut out = Output::default();
+        out.push(&vec![b'a'; OUTPUT_MAX_BYTES]);
+        let cursor = out.end();
+        out.push(b"new");
+        assert_eq!(out.since(cursor), (&b"new"[..], 0));
+        // 游标落在已丢的区间里：从留着的开头给，报告丢了多少
+        let (rest, skipped) = out.since(0);
+        assert_eq!(rest.len(), OUTPUT_MAX_BYTES);
+        assert_eq!(skipped, 3);
+    }
+
+    /// 回收线程等进程退出时不能攥着锁：`stop` 得马上结束一个还在跑的任务
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_a_running_task_promptly() {
+        let id = start("sleep 30", &std::env::temp_dir()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let begun = Instant::now();
+        stop(&id).unwrap();
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        let out = output(&id, Duration::from_secs(1), &|| false).unwrap();
+        assert!(out.ends_with("[exited]"), "{out}");
     }
 
     #[test]

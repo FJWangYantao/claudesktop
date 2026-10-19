@@ -987,6 +987,12 @@ impl Session {
                 });
             }
             KernelEvent::Started { session_id, model, modes, current_mode, resumed, .. } => {
+                // 换了新的内核会话（如回退后重开）：旧的不再用，交还内核收尾
+                if let (Some(old), Some(kernel)) = (&self.acp_id, kernel)
+                    && *old != session_id
+                {
+                    kernel.close_session(old);
+                }
                 self.acp_id = Some(session_id);
                 self.ready = true;
                 // 续接成功是理所当然的，不往对话里写；接不上才要说（agent 看不到之前的内容了）

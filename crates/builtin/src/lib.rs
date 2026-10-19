@@ -796,10 +796,17 @@ impl Inner {
                 Err(message) => ToolOutput::fail(message, "参数无效"),
             };
         }
-        // 记忆同样不碰项目文件、不出网：直接写 memory.json（见 memory 模块）
+        // 记忆不出网、不用授权：直接写 memory.json（见 memory 模块）。但它是写文件，
+        // Plan 模式（只读）不给（工具列表里也没有，这里挡住模型硬调的）
         if call.function.name == tools::MEMORY_WRITE
             && self.tool_allowed(session, tools::MEMORY_WRITE)
         {
+            if self.mode(session) == MODE_PLAN {
+                return ToolOutput::fail(
+                    "Plan mode is active: memory_write is not available. Present a plan instead.",
+                    "计划模式不能记",
+                );
+            }
             return self.remember(session, cwd, &call.function.arguments);
         }
         let (action, title) = self.start_tool(session, cwd, call);
@@ -824,20 +831,31 @@ impl Inner {
                 "没能保存",
             );
         };
-        let (mut entries, warning) = memory::load(&path);
-        if let Some(warning) = warning {
-            // 文件坏了：先把它挪开，别让新记的一条把原来的全盖掉
-            let _ = std::fs::rename(&path, path.with_extension("json.broken"));
-            self.emit(Some(session), KernelEvent::Notice(warning));
-        }
         let mut entry = entry;
         entry.source =
             Some(memory::Source { session: session.to_string(), turn: self.turn_number(session) });
-        let updated = memory::upsert(&mut entries, entry.clone());
-        memory::enforce_limits(&mut entries, scope.max_entries());
-        let count = entries.len();
-        match memory::save(&path, &entries) {
-            Ok(()) => {
+        // 项目记忆在项目目录里（进 git）：和别的写文件工具一样，前后各读一次交给检查点，回退时还原
+        let before =
+            (scope == memory::Scope::Project).then(|| checkpoint::read_snapshot(&path)).flatten();
+        // 读 → 改 → 写全程持锁（几个会话、设置页同时改不会互相覆盖）；读不了就不动文件，
+        // 格式坏了挪到旁边再记（不覆盖之前挪开的）
+        let result = memory::update(&path, memory::OnBroken::MoveAside, |entries| {
+            let updated = memory::upsert(entries, entry.clone());
+            memory::enforce_limits(entries, scope.max_entries());
+            (updated, entries.len())
+        });
+        if let Some(before) = before
+            && let Some(after) = checkpoint::read_snapshot(&path)
+            && before != after
+        {
+            let file = path.to_string_lossy().into_owned();
+            self.emit(Some(session), KernelEvent::FileChanged { path: file, before, after });
+        }
+        match result {
+            Ok(((updated, count), notice)) => {
+                if let Some(notice) = notice {
+                    self.emit(Some(session), KernelEvent::Notice(notice));
+                }
                 self.emit(
                     Some(session),
                     KernelEvent::MemoryChanged { scope: scope_name.into(), count },
@@ -852,8 +870,7 @@ impl Inner {
                     format!("记下了：{}", entry.text),
                 )
             }
-            Err(err) => {
-                let text = format!("没能写进 {}：{err}", path.display());
+            Err(text) => {
                 self.emit(Some(session), KernelEvent::Notice(text.clone()));
                 ToolOutput::fail(text, "没能保存")
             }
@@ -1323,6 +1340,29 @@ impl Inner {
     }
 }
 
+/// 会话的说明：用户级 + 目录里的 AGENTS.md / CLAUDE.md，再加项目配置指定的说明文件
+/// （相对项目根，追加在最后——最具体）。开会话和每轮重读都走这里，两边才一致。
+fn session_instructions(
+    cwd: &Path,
+    user: Option<&Path>,
+    project: Option<&claudesktop_core::project::ProjectConfig>,
+) -> Vec<instructions::Instruction> {
+    let mut list = instructions::load(cwd, user);
+    if let Some(file) = project.and_then(|p| p.instructions.as_ref()) {
+        let path = claudesktop_core::project::project_root(cwd).unwrap_or(cwd).join(file);
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && !text.trim().is_empty()
+            && !list.iter().any(|i| i.path == path)
+        {
+            list.push(instructions::Instruction {
+                path,
+                text: text.trim().chars().take(20_000).collect(),
+            });
+        }
+    }
+    list
+}
+
 pub struct BuiltinKernel {
     inner: Arc<Inner>,
 }
@@ -1373,12 +1413,15 @@ impl BuiltinKernel {
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
         // 后台命令的状态变化整份发一次（表是进程级的，出口在这里装上）
+        // 出口只攥弱引用：表是进程级的，强引用会让关掉的内核一直释放不掉（`shutdown` 里也会摘掉）
         {
-            let inner = inner.clone();
+            let inner = Arc::downgrade(&inner);
             bgtasks::register(
                 kernel_id,
                 Box::new(move |tasks| {
-                    inner.emit(None, KernelEvent::BackgroundTasks { tasks });
+                    if let Some(inner) = inner.upgrade() {
+                        inner.emit(None, KernelEvent::BackgroundTasks { tasks });
+                    }
                 }),
             );
         }
@@ -1430,21 +1473,8 @@ impl BuiltinKernel {
                 }
             }
         }
-        let mut instructions = instructions::load(&cwd, self.inner.user_instructions.as_deref());
-        if let Some(project) = &project
-            && let Some(file) = &project.instructions
-        {
-            // 项目说明文件（相对项目根）追加在最后（最具体）
-            let path = claudesktop_core::project::project_root(&cwd).unwrap_or(&cwd).join(file);
-            if let Ok(text) = std::fs::read_to_string(&path)
-                && !text.trim().is_empty()
-            {
-                instructions.push(instructions::Instruction {
-                    path,
-                    text: text.trim().chars().take(20_000).collect(),
-                });
-            }
-        }
+        let instructions =
+            session_instructions(&cwd, self.inner.user_instructions.as_deref(), project.as_ref());
         let skills = self.inner.skills(project.as_ref().and_then(|p| p.plugins_enabled.as_deref()));
         // 项目指定的默认模型优先（全局默认其次）
         let model = project
@@ -1836,7 +1866,10 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             .collect();
         let mut step = Vec::with_capacity(results.len() + 1);
         let unmeasured = results.len();
-        step.push(ChatMessage::assistant_tool_calls(text, outcome.tool_calls));
+        let mut call = ChatMessage::assistant_tool_calls(text, outcome.tool_calls);
+        // 思考块跟着工具调用回传（Anthropic 开了思考时缺了它，下一步请求会被拒）
+        call.thinking = outcome.thinking;
+        step.push(call);
         step.extend(results);
         if !inner.commit(session, flag, step) {
             return Steps::Stopped;
@@ -1907,8 +1940,12 @@ impl Kernel for BuiltinKernel {
                 anyhow::bail!("上一轮还没结束");
             }
             // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
-            state.instructions =
-                instructions::load(&state.cwd, self.inner.user_instructions.as_deref());
+            let project = claudesktop_core::project::load(&state.cwd);
+            state.instructions = session_instructions(
+                &state.cwd,
+                self.inner.user_instructions.as_deref(),
+                project.as_ref(),
+            );
             state.skills = self.inner.skills(state.plugins_enabled.as_deref());
             // 记忆文件同理：界面删掉一条，下一轮就不在提示词里了
             let warnings = state.reload_memory(self.inner.memory_path.as_deref());
@@ -2102,5 +2139,6 @@ impl Kernel for BuiltinKernel {
             }
         }
         self.inner.mcp.stop();
+        bgtasks::unregister(self.inner.kernel_id);
     }
 }

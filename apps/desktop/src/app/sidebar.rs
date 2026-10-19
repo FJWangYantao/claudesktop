@@ -1108,8 +1108,12 @@ impl ChatApp {
         let s = &mut self.sessions[idx];
         s.cancel_pending_permissions(kernel.as_ref());
         s.cancel_token += 1;
-        if let (true, Some(kernel), Some(id)) = (s.busy, &kernel, s.acp_id.clone()) {
-            let _ = kernel.cancel(&id);
+        if let (Some(kernel), Some(id)) = (&kernel, s.acp_id.clone()) {
+            if s.busy {
+                let _ = kernel.cancel(&id);
+            }
+            // 停掉它起的后台命令、释放内核里的会话状态
+            kernel.close_session(&id);
         }
         let removed = self.sessions.remove(idx);
         let id = removed.meta.as_ref().map(|m| m.id.clone());

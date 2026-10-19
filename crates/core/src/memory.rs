@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 pub const MAX_TEXT_CHARS: usize = 400;
 /// 一条记忆最多带几个标签
 pub const MAX_TAGS: usize = 6;
-/// 全局记忆最多多少条（超了淘汰最久没被带进上下文的，`pinned` 不淘汰）
+/// 全局记忆最多多少条（超了淘汰最久没更新的，`pinned` 不淘汰）
 pub const GLOBAL_MAX: usize = 300;
 /// 项目记忆最多多少条
 pub const PROJECT_MAX: usize = 200;
@@ -97,7 +97,8 @@ pub struct Entry {
     pub created_ms: u64,
     #[serde(default)]
     pub updated_ms: u64,
-    /// 最近一次被带进上下文的时间（淘汰按它：最久没用的先走）
+    /// 最近一次被带进上下文的时间。目前不更新（每轮写一次文件会让进 git 的项目记忆不停变）：
+    /// 淘汰和进上下文都按 `updated_ms`；字段留着兼容已有文件和设计说明里的第 2 期
     #[serde(default)]
     pub used_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,6 +182,66 @@ pub fn load(path: &Path) -> (Vec<Entry>, Option<String>) {
     }
 }
 
+/// 文件解析不了（格式坏了）时 [`update`] 怎么办。读不了（被占用、没权限）一律不动文件、报错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnBroken {
+    /// 不改，报错（界面上的删除：用户能看到原因、自己去修）
+    Refuse,
+    /// 挪到旁边（不覆盖已有的备份），从空表开始（内核记新的一条：不能因为文件坏了就记不下）
+    MoveAside,
+}
+
+/// 同一进程里所有对记忆文件的「读 → 改 → 写」排队（内核的几个会话、设置页都在这个进程里），
+/// 否则两边同时改，后写的会把先写的盖掉。
+static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 读 → `change` → 原子写回，全程持锁。返回 `change` 的结果和一句要告诉用户的话
+/// （文件坏了被挪开时）；读不了、坏了且 `Refuse`、写失败都返回 Err（文件不动）。
+pub fn update<R>(
+    path: &Path,
+    on_broken: OnBroken,
+    change: impl FnOnce(&mut Vec<Entry>) -> R,
+) -> Result<(R, Option<String>), String> {
+    let _guard = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut notice = None;
+    let mut entries = match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => Vec::new(),
+        Ok(text) => match serde_json::from_str::<FileFormat>(&text) {
+            Ok(f) => f.entries,
+            Err(e) => {
+                let reason =
+                    format!("{} 的格式有问题：{}", path.display(), crate::json_error_text(&e));
+                if on_broken == OnBroken::Refuse {
+                    return Err(format!("{reason}（先改好这个文件，这次没有改动）"));
+                }
+                let aside = broken_path(path);
+                std::fs::rename(path, &aside)
+                    .map_err(|e| format!("{reason}；挪开它也失败了：{e}"))?;
+                notice =
+                    Some(format!("{reason}；原文件挪到了 {}，从空表重新开始", aside.display()));
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("读不了 {}：{e}（这次没有改动）", path.display())),
+    };
+    let value = change(&mut entries);
+    save(path, &entries).map_err(|e| format!("没能写进 {}：{e}", path.display()))?;
+    Ok((value, notice))
+}
+
+/// 坏文件挪去的位置：`memory.json.broken`，已有就 `.broken-2`、`-3`…（不覆盖之前的备份）
+fn broken_path(path: &Path) -> PathBuf {
+    let first = path.with_extension("json.broken");
+    if !first.exists() {
+        return first;
+    }
+    (2..)
+        .map(|n| path.with_extension(format!("json.broken-{n}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
+}
+
 /// 原子写（临时文件 + 改名）。写失败时原来的文件不动。
 pub fn save(path: &Path, entries: &[Entry]) -> io::Result<()> {
     let file = FileFormat { entries: entries.to_vec() };
@@ -194,8 +255,9 @@ pub fn save(path: &Path, entries: &[Entry]) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// 新增或更新一条：同一 `tags` + 高相似 `text` 视为同一条（返回 true = 更新了已有的）。
-/// 更新时保留 `id` / `created_ms` / `used_ms`，`pinned` 只升不降。
+/// 新增或更新一条：同一 `tags` + 同一句话（只差大小写、空白、标点）视为同一条
+/// （返回 true = 更新了已有的）。更新时保留 `id` / `created_ms` / `used_ms`，`pinned` 只升不降，
+/// 新的没带标签时保留原来的标签。
 pub fn upsert(entries: &mut Vec<Entry>, entry: Entry) -> bool {
     let entry = Entry { text: clip_text(entry.text.trim()), ..entry };
     if let Some(old) = entries
@@ -203,7 +265,9 @@ pub fn upsert(entries: &mut Vec<Entry>, entry: Entry) -> bool {
         .find(|e| similar(&e.text, &entry.text) && same_tags(&e.tags, &entry.tags))
     {
         old.text = entry.text;
-        old.tags = entry.tags;
+        if !entry.tags.is_empty() {
+            old.tags = entry.tags;
+        }
         old.pinned |= entry.pinned;
         old.updated_ms = entry.updated_ms;
         if entry.source.is_some() {
@@ -215,14 +279,15 @@ pub fn upsert(entries: &mut Vec<Entry>, entry: Entry) -> bool {
     false
 }
 
-/// 超上限时淘汰最久没被带进上下文的那条（`pinned` 不动）。
+/// 超上限时淘汰最久没更新的那条（`pinned` 不动）。和 [`pick`] 的顺序一致：
+/// 进上下文的是最近更新的，淘汰的就是最不会被带进去的。
 pub fn enforce_limits(entries: &mut Vec<Entry>, max: usize) {
     while entries.len() > max {
         let victim = entries
             .iter()
             .enumerate()
             .filter(|(_, e)| !e.pinned)
-            .min_by_key(|(_, e)| e.used_ms)
+            .min_by_key(|(_, e)| e.updated_ms)
             .map(|(i, _)| i);
         match victim {
             Some(i) => drop(entries.remove(i)),
@@ -347,18 +412,11 @@ fn norm(text: &str) -> String {
     text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
-/// 两句话是不是同一条：规范形相同，或者短的是长的子串且长度接近。
+/// 两句话是不是同一条：规范形（小写、去掉空白和标点）相同。
+/// 不按子串算：「用 pnpm」和「不用 pnpm」只差一个否定词，意思正相反。
 fn similar(a: &str, b: &str) -> bool {
     let (a, b) = (norm(a), norm(b));
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    if a == b {
-        return true;
-    }
-    let (short, long) = if a.chars().count() <= b.chars().count() { (a, b) } else { (b, a) };
-    let short_len = short.chars().count();
-    long.contains(short.as_str()) && short_len * 10 >= long.chars().count() * 7
+    !a.is_empty() && a == b
 }
 
 /// 标签集合是否相同（不分大小写、不看顺序；一边没有标签时算相同）。
@@ -491,6 +549,81 @@ mod tests {
         assert_eq!(entries.len(), 2);
     }
 
+    /// 只差一个否定词的两句话意思相反，不能合成一条
+    #[test]
+    fn negations_are_separate_notes() {
+        let mut entries = vec![];
+        upsert(&mut entries, entry("用 pnpm", 1));
+        assert!(!upsert(&mut entries, entry("不用 pnpm", 2)));
+        assert!(!upsert(&mut entries, entry("never use tabs", 3)));
+        assert!(!upsert(&mut entries, entry("use tabs", 4)));
+        assert_eq!(entries.len(), 4);
+    }
+
+    /// 同一句话再记一次但没带标签：原来的标签留着
+    #[test]
+    fn untagged_repeat_keeps_the_tags() {
+        let mut entries = vec![];
+        let mut e = entry("构建只用 cargo", 1);
+        e.tags = vec!["构建".into(), "测试".into()];
+        upsert(&mut entries, e);
+        assert!(upsert(&mut entries, entry("构建只用 cargo。", 2)));
+        assert_eq!(entries[0].tags, ["构建", "测试"]);
+    }
+
+    /// 读不了的文件不动；格式坏了按 `OnBroken` 处理，挪开时不覆盖已有的备份
+    #[test]
+    fn update_never_clobbers_unreadable_or_broken_files() {
+        let dir = tmp("update");
+        // 读不了（这里是个目录）：报错，什么都不动
+        let unreadable = dir.join("dir.json");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        assert!(update(&unreadable, OnBroken::MoveAside, |e| e.push(entry("新", 1))).is_err());
+        assert!(unreadable.is_dir());
+
+        let path = dir.join("memory.json");
+        std::fs::write(&path, "{ broken").unwrap();
+        assert!(update(&path, OnBroken::Refuse, |e| e.clear()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
+
+        let (_, notice) =
+            update(&path, OnBroken::MoveAside, |e| e.push(entry("第一条", 1))).unwrap();
+        assert!(notice.unwrap().contains("memory.json.broken"));
+        std::fs::write(&path, "{ broken again").unwrap();
+        update(&path, OnBroken::MoveAside, |e| e.push(entry("第二条", 2))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.broken")).unwrap(),
+            "{ broken"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.broken-2")).unwrap(),
+            "{ broken again"
+        );
+        assert_eq!(load(&path).0[0].text, "第二条");
+    }
+
+    /// 几个线程同时记：一条都不丢
+    #[test]
+    fn concurrent_updates_keep_every_entry() {
+        let dir = tmp("concurrent");
+        let path = dir.join("memory.json");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    update(&path, OnBroken::Refuse, |e| {
+                        upsert(e, entry(&format!("第 {i} 条"), i));
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(load(&path).0.len(), 8);
+    }
+
     #[test]
     fn long_text_is_clipped() {
         let text = "字".repeat(MAX_TEXT_CHARS + 50);
@@ -501,15 +634,13 @@ mod tests {
     }
 
     #[test]
-    fn limits_evict_least_recently_used_but_keep_pinned() {
+    fn limits_evict_least_recently_updated_but_keep_pinned() {
         let mut entries = vec![];
         for i in 0..5u64 {
-            let mut e = entry(&format!("第 {i} 条"), i * 100);
-            e.used_ms = i * 100;
-            entries.push(e);
+            entries.push(entry(&format!("第 {i} 条"), i * 100));
         }
         entries[4].pinned = true;
-        entries[4].used_ms = 0; // 最久没用的也是 pinned
+        entries[4].updated_ms = 0; // 最久没更新的也是 pinned
         enforce_limits(&mut entries, 3);
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, ["第 2 条", "第 3 条", "第 4 条"]);

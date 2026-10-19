@@ -79,10 +79,7 @@ impl ChatProvider for ResponsesProvider {
         // 正在拼参数的函数调用（按 item id）；Responses 一般一次给全，仍按 id 归并以防分片
         let mut pending: Vec<(String, ToolCall)> = Vec::new();
         let end = read_sse(reader, should_stop, &mut |payload| match parse_event(payload) {
-            Ok(event) => {
-                apply_event(event, &mut outcome, &mut calls, &mut pending, on_event);
-                Ok(())
-            }
+            Ok(event) => apply_event(event, &mut outcome, &mut calls, &mut pending, on_event),
             Err(message) => {
                 debug_http(|| format!("✗ {message}"));
                 Err(message)
@@ -288,6 +285,11 @@ pub(crate) fn parse_event(payload: &str) -> Result<Event, String> {
                 stop: response["status"].as_str().map(str::to_owned),
             }
         }
+        // 没写完就停了（`max_output_tokens`、内容过滤）：也是收尾，按截断报
+        "response.incomplete" => Event::Completed {
+            usage: value["response"].get("usage").and_then(parse_usage),
+            stop: Some("incomplete".into()),
+        },
         "response.failed" => {
             let message = value
                 .pointer("/response/error/message")
@@ -300,13 +302,14 @@ pub(crate) fn parse_event(payload: &str) -> Result<Event, String> {
     })
 }
 
+/// 流里的错误（`response.failed` / `error`）返回 `Err`，读流就此中断，原文报给用户。
 fn apply_event(
     event: Event,
     outcome: &mut StreamOutcome,
     calls: &mut Vec<ToolCall>,
     pending: &mut Vec<(String, ToolCall)>,
     on_event: &mut dyn FnMut(StreamEvent),
-) {
+) -> Result<(), String> {
     match event {
         Event::Text(text) => {
             if !text.is_empty() {
@@ -365,12 +368,12 @@ fn apply_event(
             });
         }
         Event::Failed(message) => {
-            // 流里的错误：标一个结束原因，让调用方报错（读流闭包只能返回错误，
-            // 这里借助 finish_reason 让收尾看起来已完成，错误由 `outcome` 之外的路径报）
             debug_http(|| format!("✗ {message}"));
+            return Err(message);
         }
         Event::Other => {}
     }
+    Ok(())
 }
 
 fn parse_usage(usage: &Value) -> Option<Usage> {
@@ -500,7 +503,8 @@ mod tests {
                 &mut calls,
                 &mut pending,
                 &mut on_event,
-            );
+            )
+            .unwrap();
         }
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
@@ -508,5 +512,27 @@ mod tests {
         assert_eq!(calls[0].function.arguments, r#"{"path":"a"}"#);
         assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(outcome.usage.unwrap().input_tokens, 1);
+    }
+
+    /// `response.failed` 的原文报出来；`response.incomplete` 按截断（`length`）收尾
+    #[test]
+    fn failures_surface_and_incomplete_means_length() {
+        let mut outcome = StreamOutcome::default();
+        let (mut calls, mut pending) = (Vec::new(), Vec::new());
+        let mut on_event = |_: StreamEvent| {};
+        let failed = parse_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"context too long"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            apply_event(failed, &mut outcome, &mut calls, &mut pending, &mut on_event),
+            Err("context too long".into())
+        );
+        let incomplete = parse_event(
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        )
+        .unwrap();
+        apply_event(incomplete, &mut outcome, &mut calls, &mut pending, &mut on_event).unwrap();
+        assert_eq!(outcome.finish_reason.as_deref(), Some("length"));
     }
 }

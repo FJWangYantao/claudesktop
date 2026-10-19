@@ -2,15 +2,15 @@
 //! （格式和读取规则见 `claudesktop_core::project`）。
 //!
 //! 这是一层**轻覆盖**：全局设置永远在，项目文件只写和全局不一样的几项（模型、权限规则、
-//! 停用的 MCP 服务器、只用哪些插件、说明文件）。表单改完点「保存」写回文件；文件坏了照常
-//! 打开这一页，把读文件时的原因列在顶部（改好文件再回来点一次保存就正常了）。
+//! 停用的 MCP 服务器、只用哪些插件、说明文件）。和设置页其余分类一样**即时生效**：开关一拨就写，
+//! 输入框在离开（失焦）或按回车时写。文件解析不了时照常打开这一页，把原因列在顶部，
+//! 但不写回（会把手写的内容整个盖掉）——改好文件点「重新读取」。
 //!
 //! 生效时机：读发生在自研内核**开会话**的时候，所以保存后新开的会话按它来，正在聊的会话不变；
 //! 项目里的权限规则会在开会话时并进 `permissions.json`（集合语义，删掉项目规则不会删权限文件里的）。
 
 use super::ChatApp;
 use super::settings_kit::{form_field, note, section, seg_control};
-use super::widgets::Surface;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::project::{self, ProjectConfig};
@@ -46,11 +46,11 @@ pub(super) struct ProjectForm {
     mcp_disabled: Vec<String>,
     /// 表单里这个项目启用的插件；None = 跟全局
     plugins: Option<Vec<String>>,
-    /// 文件里读到的配置（算「有没有改动」、保存后据此清掉提示）
+    /// 文件里的配置（和表单不一样才写；`broken` 时不写）
     saved: ProjectConfig,
     /// 读文件时的问题（文件坏了、格式不对）
     warnings: Vec<String>,
-    /// 上次保存的结果：(是不是错误, 文本)
+    /// 上次写文件的结果：(是不是错误, 文本)；接着改就清掉
     message: Option<(bool, gpui::SharedString)>,
     /// 全局 mcp.json 里的服务器名（这一页列开关用）
     servers: Vec<String>,
@@ -64,19 +64,19 @@ impl ProjectForm {
         let rules = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
         let instructions =
             cx.new(|cx| InputState::new(window, cx).placeholder("默认读 AGENTS.md / CLAUDE.md"));
-        // 打字即重画：底部的「有未保存的改动」和保存按钮才知道要变
+        // 打字时清掉上次的结果；离开输入框（或单行框里按回车）时写文件
         for input in [&model, &instructions] {
-            cx.subscribe(input, |_: &mut ChatApp, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
+            cx.subscribe(input, |this: &mut ChatApp, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => this.project_edited(cx),
+                InputEvent::Blur | InputEvent::PressEnter { .. } => this.apply_project(cx),
+                InputEvent::Focus => {}
             })
             .detach();
         }
-        cx.subscribe(&rules, |_: &mut ChatApp, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
+        cx.subscribe(&rules, |this: &mut ChatApp, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => this.project_edited(cx),
+            InputEvent::Blur => this.apply_project(cx),
+            InputEvent::PressEnter { .. } | InputEvent::Focus => {}
         })
         .detach();
         Self {
@@ -101,9 +101,10 @@ impl ProjectForm {
     }
 }
 
-/// 比「有没有改动」用：顺序不影响语义，警告本来也不进文件。
+/// 比「有没有改动」用：顺序不影响语义，警告和「坏了」的标记本来也不进文件。
 fn normalize(mut config: ProjectConfig) -> ProjectConfig {
     config.warnings.clear();
+    config.broken = false;
     config.mcp_disabled.sort();
     if let Some(plugins) = &mut config.plugins_enabled {
         plugins.sort();
@@ -166,30 +167,45 @@ impl ChatApp {
             plugins_enabled: form.plugins.clone(),
             instructions: (!instructions.is_empty()).then(|| PathBuf::from(instructions)),
             warnings: Vec::new(),
+            broken: false,
         }
     }
 
-    /// 表单和文件里的配置不一样（保存按钮据此亮）
-    fn project_dirty(&self, cx: &App) -> bool {
-        let saved = self.project_form.saved.clone();
-        normalize(self.project_config(cx)) != normalize(saved)
+    /// 表单里又改了：上次写文件的结果不再代表现在的样子，清掉
+    fn project_edited(&mut self, cx: &mut Context<Self>) {
+        if self.project_form.message.take().is_some() {
+            cx.notify();
+        }
     }
 
-    /// 写回 `.claudesktop/settings.json`：一个字段都没填就把文件删掉，不留一个空对象在仓库里。
-    fn save_project(&mut self, cx: &mut Context<Self>) {
+    /// 表单和文件不一样就写回 `.claudesktop/settings.json`（一个字段都没填就把文件删掉，
+    /// 不留一个空对象在仓库里）。文件解析不了时不写，提示先改好文件。
+    pub(super) fn apply_project(&mut self, cx: &mut Context<Self>) {
         let config = self.project_config(cx);
-        let root = self.project_form.root.clone();
-        match project::save(&root, &config) {
+        let form = &mut self.project_form;
+        if form.root.as_os_str().is_empty()
+            || normalize(config.clone()) == normalize(form.saved.clone())
+        {
+            return;
+        }
+        if form.saved.broken {
+            form.message = Some((
+                true,
+                "配置文件格式有问题，这里的改动没有写进去：先改好文件，再点「重新读取」".into(),
+            ));
+            cx.notify();
+            return;
+        }
+        match project::save(&form.root, &config) {
             Ok(path) => {
-                self.project_form.saved = config;
-                self.project_form.warnings.clear();
-                self.project_form.message = Some((
+                form.saved = config;
+                form.message = Some((
                     false,
-                    format!("已保存到 {}；新开的会话按它来，正在聊的会话不受影响", path.display())
+                    format!("已写入 {}；新开的会话按它来，正在聊的会话不受影响", path.display())
                         .into(),
                 ));
             }
-            Err(err) => self.project_form.message = Some((true, err.into())),
+            Err(err) => form.message = Some((true, err.into())),
         }
         cx.notify();
     }
@@ -211,6 +227,7 @@ impl ChatApp {
         if !on {
             list.push(name);
         }
+        self.apply_project(cx);
         cx.notify();
     }
 
@@ -222,15 +239,21 @@ impl ChatApp {
         if on {
             list.push(name);
         }
+        self.apply_project(cx);
         cx.notify();
     }
 
     pub(super) fn render_project(&self, cx: &mut Context<Self>) -> Div {
         let form = &self.project_form;
-        let dirty = self.project_dirty(cx);
         let actions = div()
             .h_flex()
             .gap_1p5()
+            .child(Self::text_button("project-reload", "重新读取", false).small().on_click(
+                cx.listener(|this, _, window, cx| {
+                    this.reload_project_view(window, cx);
+                    cx.notify();
+                }),
+            ))
             .child(
                 Self::text_button("project-reveal", "打开文件位置", false)
                     .small()
@@ -356,6 +379,7 @@ impl ChatApp {
                     }
                     PluginScope::Global => form.plugins = None,
                 }
+                this.apply_project(cx);
                 cx.notify();
             },
             cx,
@@ -409,39 +433,20 @@ impl ChatApp {
                 "相对项目根的路径，默认读 AGENTS.md / CLAUDE.md 那一套；填了就在最后再追加这一份（最具体）",
             ));
 
-        // 底部：保存按钮 + 状态
+        // 底部：上次写文件的结果（即时生效，没有保存按钮）
         let status: AnyElement = match &form.message {
             Some((error, text)) => div()
                 .text_color(rgb(if *error { RED } else { GREEN }))
                 .child(text.clone())
                 .into_any_element(),
-            None if dirty => div().text_color(rgb(INK)).child("有未保存的改动").into_any_element(),
             None => div()
                 .text_color(rgb(INK_SOFT))
-                .child("只写和全局不一样的项；全删干净时保存会把这个文件删掉")
+                .child(
+                    "改完即生效（输入框离开时写入）；只写和全局不一样的项，全删干净时删掉这个文件",
+                )
                 .into_any_element(),
         };
-        let footer = div()
-            .h_flex()
-            .items_center()
-            .gap_3()
-            .child(div().flex_1().min_w_0().text_size(TEXT_SMALL).child(status))
-            .child(
-                Self::quiet_button("project-discard", IconAll::RotateCcw, Surface::Paper, cx)
-                    .small()
-                    .label("放弃改动")
-                    .px_2()
-                    .disabled(!dirty)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.reload_project_view(window, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Self::text_button("project-save", "保存", true)
-                    .disabled(!dirty)
-                    .on_click(cx.listener(|this, _, _, cx| this.save_project(cx))),
-            );
+        let footer = div().text_size(TEXT_SMALL).line_height(LEADING).child(status);
 
         let warnings = form.warnings.clone();
         section(

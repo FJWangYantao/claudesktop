@@ -94,6 +94,7 @@ impl ChatProvider for AnthropicProvider {
         })?;
         outcome.completed = finish_stream(end, outcome.finish_reason.is_some())?;
         outcome.usage = usage_seen.then_some(usage);
+        outcome.thinking = blocks.take_thinking();
         outcome.tool_calls = blocks.finish();
         Ok(outcome)
     }
@@ -261,7 +262,9 @@ pub(crate) fn convert_messages(messages: &[ChatMessage]) -> (String, Vec<Value>)
             }
             "assistant" => {
                 flush_results(&mut out, &mut tool_results);
-                let mut blocks = content_blocks(message);
+                // 思考块必须在最前（开了思考时，带 tool_use 的 assistant 轮缺了它会被拒）
+                let mut blocks = message.thinking.clone();
+                blocks.extend(content_blocks(message));
                 for call in &message.tool_calls {
                     blocks.push(json!({
                         "type": "tool_use",
@@ -332,13 +335,40 @@ pub(crate) fn convert_tools(tools: &[Value]) -> Value {
 }
 
 /// 按 content block 下标累积的 tool_use（id / name 在 block 开始时给出，
-/// input JSON 由后续 `input_json_delta` 流式拼出）。
+/// input JSON 由后续 `input_json_delta` 流式拼出），以及思考块（原样留着回传，
+/// 正文由 `thinking_delta` 拼、`signature_delta` 给签名；`redacted_thinking` 开始时就是完整的）。
 #[derive(Default)]
 struct ToolBlocks {
     blocks: Vec<Option<ToolCall>>,
+    thinking: Vec<(usize, Value)>,
 }
 
 impl ToolBlocks {
+    fn start_thinking(&mut self, index: usize, block: &Value) {
+        self.thinking.push((index, block.clone()));
+    }
+
+    fn thinking_at(&mut self, index: usize) -> Option<&mut Value> {
+        self.thinking.iter_mut().find(|(i, _)| *i == index).map(|(_, b)| b)
+    }
+
+    /// 追加到某个思考块的字符串字段（`thinking` 正文 / `signature`）
+    fn push_thinking(&mut self, index: usize, field: &str, text: &str) {
+        if let Some(block) = self.thinking_at(index) {
+            let mut value =
+                block.get(field).and_then(Value::as_str).unwrap_or_default().to_string();
+            value.push_str(text);
+            block[field] = Value::String(value);
+        }
+    }
+
+    /// 本步的思考块（按出现顺序）
+    fn take_thinking(&mut self) -> Vec<Value> {
+        let mut list = std::mem::take(&mut self.thinking);
+        list.sort_by_key(|(i, _)| *i);
+        list.into_iter().map(|(_, b)| b).collect()
+    }
+
     fn start(&mut self, index: usize, id: &str, name: &str) {
         if self.blocks.len() <= index {
             self.blocks.resize_with(index + 1, || None);
@@ -410,7 +440,9 @@ fn parse_event(
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let block = &value["content_block"];
             let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
-            if kind == "tool_use" {
+            if kind == "thinking" || kind == "redacted_thinking" {
+                blocks.start_thinking(index, block);
+            } else if kind == "tool_use" {
                 blocks.start(
                     index,
                     block.get("id").and_then(Value::as_str).unwrap_or_default(),
@@ -432,7 +464,13 @@ fn parse_event(
                 }
                 "thinking_delta" => {
                     if let Some(text) = value.pointer("/delta/thinking").and_then(Value::as_str) {
+                        blocks.push_thinking(index, "thinking", text);
                         on_event(StreamEvent::Reasoning(text.to_string()));
+                    }
+                }
+                "signature_delta" => {
+                    if let Some(sig) = value.pointer("/delta/signature").and_then(Value::as_str) {
+                        blocks.push_thinking(index, "signature", sig);
                     }
                 }
                 "input_json_delta" => {
@@ -668,6 +706,28 @@ mod tests {
         assert_eq!(out[1]["role"], "assistant");
     }
 
+    /// 带工具调用的 assistant 轮：思考块排在最前，后面才是正文和 tool_use
+    #[test]
+    fn thinking_blocks_lead_the_assistant_turn() {
+        let mut call = M::assistant_tool_calls(
+            "先看".into(),
+            vec![ToolCall {
+                id: "toolu_1".into(),
+                kind: "function".into(),
+                function: crate::provider::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a"}"#.into(),
+                },
+            }],
+        );
+        call.thinking = vec![json!({ "type": "thinking", "thinking": "想", "signature": "sig" })];
+        let (_, out) = convert_messages(&[M::new("user", "读"), call]);
+        let content = out[1]["content"].as_array().unwrap();
+        let kinds: Vec<_> = content.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["thinking", "text", "tool_use"]);
+        assert_eq!(content[0]["signature"], "sig");
+    }
+
     #[test]
     fn converts_tool_specs_with_cache_marker_on_last() {
         let tools = vec![
@@ -694,6 +754,7 @@ mod tests {
             r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":12,"cache_creation_input_tokens":8}}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"先看"}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
@@ -718,6 +779,11 @@ mod tests {
         assert_eq!(
             events,
             vec![StreamEvent::Reasoning("想".into()), StreamEvent::Text("先看".into())]
+        );
+        // 思考块连签名原样留着，回传时用
+        assert_eq!(
+            blocks.take_thinking(),
+            vec![json!({ "type": "thinking", "thinking": "想", "signature": "sig" })]
         );
         let calls = blocks.finish();
         assert_eq!(calls.len(), 1);
