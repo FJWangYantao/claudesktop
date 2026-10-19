@@ -13,7 +13,6 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Textarea;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::progress::ProgressCircle;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -326,19 +325,6 @@ impl ChatApp {
 }
 
 impl ChatApp {
-    /// 当前会话的上下文用量；没报告过用量时为 None（只有自研内核报告，窗口大小也只有它知道）。
-    fn context_gauge(&self) -> Option<crate::usage::ContextGauge> {
-        let s = self.session();
-        if s.context_tokens == 0 {
-            return None;
-        }
-        let window = match s.kernel {
-            KernelChoice::Builtin => self.settings.builtin.context_window(&s.model_label),
-            _ => None,
-        };
-        Some(crate::usage::context_gauge(s.context_tokens, window))
-    }
-
     /// 上下文用到九成以上：输入框正上方一行提示，建议新开会话（再发很可能超出上限失败）。
     /// 正在跑的一轮不提示，等它结束再说。
     fn render_context_warning(&self, cx: &mut Context<Self>) -> Option<Div> {
@@ -463,46 +449,6 @@ impl ChatApp {
             );
         }
         Some(card)
-    }
-
-    /// 模型名左边的上下文用量：小圆环 + 百分比，悬停看具体数字；端点没报窗口大小时只写用了多少。
-    /// 只有自研内核报告用量（ACP 协议没有），一轮结束后才出现。过七成圆环转赤陶，过九成连字一起变红。
-    fn render_context_gauge(&self) -> Option<Stateful<Div>> {
-        let gauge = self.context_gauge()?;
-        let tone = match gauge.percent {
-            Some(p) if p >= 90 => RED,
-            Some(p) if p >= 70 => CORAL,
-            _ => INK_SOFT,
-        };
-        // 悬停提示第二行：上一轮命中提示缓存的比例（命中的部分按折扣计费，越高越省）
-        let tooltip: SharedString = match self.session().cache_hit {
-            Some(hit) => format!("{}\n上一轮命中缓存 {hit}%", gauge.tooltip),
-            None => gauge.tooltip,
-        }
-        .into();
-        Some(
-            div()
-                .id("context-gauge")
-                .h_flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap_1p5()
-                .px_2()
-                .py_1()
-                .text_size(TEXT_SMALL)
-                .text_color(rgb(if tone == RED { RED } else { INK_SOFT }))
-                .font_features(tabular_nums())
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                .when_some(gauge.percent, |d, p| {
-                    d.child(
-                        ProgressCircle::new("context-ring")
-                            .value(p as f32)
-                            .color(rgb(tone))
-                            .size(px(14.)),
-                    )
-                })
-                .child(gauge.label),
-        )
     }
 }
 

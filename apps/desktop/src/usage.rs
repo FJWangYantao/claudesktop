@@ -6,6 +6,10 @@
 use claudesktop_core::{Record, SessionMeta};
 use std::collections::{HashMap, HashSet};
 
+/// 窗口用到这个比例，自研内核就会在下次请求前自动压缩（和内核同一个数，见
+/// [`claudesktop_builtin::AUTO_COMPACT_PERCENT`]）。
+pub const AUTO_COMPACT_PERCENT: u64 = claudesktop_builtin::AUTO_COMPACT_PERCENT;
+
 /// 热力图：7 行（周一到周日）× 26 列（周），最后一列是本周。
 pub const HEAT_ROWS: usize = 7;
 pub const HEAT_COLS: usize = 26;
@@ -314,36 +318,49 @@ pub fn compact(n: u64) -> String {
     }
 }
 
-/// 输入框旁的上下文用量。
-#[derive(Debug, PartialEq)]
+/// 输入框旁的上下文用量（圆环 + 百分比，悬停看这张卡的细节）。
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContextGauge {
     /// 占窗口的百分比（1–100，有用量就至少 1）；不知道窗口大小时为 None
     pub percent: Option<u32>,
+    /// 上下文里现在的 token
+    pub used: u64,
+    /// 模型的上下文窗口；端点没报告时为 None
+    pub window: Option<u64>,
+    /// 到自动压缩（窗口的 [`AUTO_COMPACT_PERCENT`]）还剩多少 token：不知道窗口、
+    /// 或已经过了阈值时为 None
+    pub until_compact: Option<u64>,
     /// 显示的字：`9%`；不知道窗口时 `上下文 23.4K`
     pub label: String,
-    /// 悬停提示：具体用了多少
-    pub tooltip: String,
 }
 
 /// 已用 `used` token、窗口 `window` 时上下文用量怎么显示。
 pub fn context_gauge(used: u64, window: Option<u64>) -> ContextGauge {
-    // 窗口大小多是整千：256.0K → 256K
-    let short = |n: u64| compact(n).replace(".0K", "K").replace(".0M", "M");
     match window.filter(|w| *w > 0) {
         Some(w) => {
             let percent = ((used.saturating_mul(100) + w / 2) / w).clamp(1, 100) as u32;
             ContextGauge {
                 percent: Some(percent),
+                used,
+                window: Some(w),
+                // 自研内核在窗口的这个比例上自动压缩（见 claudesktop-builtin 的 compact 模块）
+                until_compact: (w * AUTO_COMPACT_PERCENT / 100).checked_sub(used),
                 label: format!("{percent}%"),
-                tooltip: format!("上下文已用 {} / {} token", short(used), short(w)),
             }
         }
         None => ContextGauge {
             percent: None,
-            label: format!("上下文 {}", short(used)),
-            tooltip: format!("上下文已用 {} token（端点没报告窗口大小）", short(used)),
+            used,
+            window: None,
+            until_compact: None,
+            label: format!("上下文 {}", short_tokens(used)),
         },
     }
+}
+
+/// 窗口大小多是整千：256.0K → 256K。悬停卡里的数字用它。
+pub fn short_tokens(n: u64) -> String {
+    compact(n).replace(".0K", "K").replace(".0M", "M")
 }
 
 /// 侧栏按日期分组的组名，下标即 [`day_bucket`] 的返回值。
@@ -585,13 +602,18 @@ mod tests {
         let g = context_gauge(23_400, Some(256_000));
         assert_eq!(g.percent, Some(9));
         assert_eq!(g.label, "9%");
-        assert_eq!(g.tooltip, "上下文已用 23.4K / 256K token");
+        assert_eq!((g.used, g.window), (23_400, Some(256_000)));
+        // 到自动压缩（窗口的八成 = 204.8K）还剩 181.4K
+        assert_eq!(g.until_compact, Some(204_800 - 23_400));
         // 刚开头也至少 1%；超出窗口（换了个小模型）按满算
         assert_eq!(context_gauge(300, Some(1_000_000)).percent, Some(1));
         assert_eq!(context_gauge(300_000, Some(128_000)).percent, Some(100));
+        // 已经过了自动压缩线：没有「还剩多少」
+        assert_eq!(context_gauge(210_000, Some(256_000)).until_compact, None);
         // 不知道窗口：只说用了多少
         let g = context_gauge(4_194, None);
         assert_eq!((g.percent, g.label.as_str()), (None, "上下文 4,194"));
+        assert_eq!((g.used, g.until_compact), (4_194, None));
         assert_eq!(context_gauge(5, Some(0)).percent, None);
     }
 }

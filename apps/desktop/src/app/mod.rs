@@ -7,6 +7,7 @@ mod chrome;
 mod complete_view;
 mod composer;
 mod content;
+mod gauge;
 pub(crate) mod keys;
 mod mcp_view;
 mod memory_view;

@@ -146,13 +146,13 @@ fn pulse(phase: f32) -> f32 {
 }
 
 /// 圆周上第 `turns` 圈处的点（0 = 正上方，顺时针）。
-fn on_circle(center: Point<Pixels>, r: Pixels, turns: f32) -> Point<Pixels> {
+pub(super) fn on_circle(center: Point<Pixels>, r: Pixels, turns: f32) -> Point<Pixels> {
     let a = turns * TAU - FRAC_PI_2;
     center + point(r * a.cos(), r * a.sin())
 }
 
 /// 实心圆点（圆弧的圆头、星芒的花心）。
-fn paint_dot(center: Point<Pixels>, r: Pixels, color: Rgba, window: &mut Window) {
+pub(super) fn paint_dot(center: Point<Pixels>, r: Pixels, color: Rgba, window: &mut Window) {
     let (left, right) = (center - point(r, px(0.)), center + point(r, px(0.)));
     let mut dot = PathBuilder::fill();
     dot.move_to(right);

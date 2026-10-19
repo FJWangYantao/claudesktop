@@ -81,6 +81,9 @@ pub const DEFAULT_MAX_STEPS: usize = 200;
 pub const MIN_MAX_STEPS: usize = 1;
 /// 上限：防止手滑填个天文数字，工具循环真的停不下来。
 pub const MAX_MAX_STEPS: usize = 5_000;
+/// 用量达到窗口的这个比例时，下一次请求前自动压缩上下文（见 `compact` 模块）。
+/// 界面上的上下文用量卡据此算「还剩多少到自动压缩」，不要再写一份数字。
+pub const AUTO_COMPACT_PERCENT: u64 = compact::AUTO_COMPACT_PERCENT;
 /// 同一步里最多同时执行几个只读工具
 const PARALLEL_TOOLS: usize = 8;
 
