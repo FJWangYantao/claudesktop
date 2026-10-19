@@ -1,7 +1,9 @@
 //! 搜消息：命令面板（Ctrl+K）里打字时，在已载入的会话里搜用户消息和回复的正文，
 //! 命中的一条列成「消息」组（摘一小段上下文），确认后切到那个会话、滚到那条消息并闪一下底色。
 //!
-//! 只搜内存里的会话（侧栏里那些，见 `MAX_RESTORED`）；会话标题由面板的「会话」组自己按名字过滤。
+//! 内存里只有最近的一百个会话（`MAX_RESTORED`），更早的搜不到；所以同时让
+//! [`claudesktop_core::history_search`] 在后台线程里扫磁盘上的会话日志，
+//! 命中的列在「历史」组（会话还在磁盘上、没载入内存的那些），选中后把它恢复进侧栏再跳过去。
 
 use super::ChatApp;
 use crate::model::ChatItem;
@@ -35,6 +37,55 @@ pub(crate) struct MessageHit {
     pub from_user: bool,
     /// 命中处附近的一小段（压成一行）
     pub snippet: String,
+}
+
+/// 磁盘上搜到的一条命中（会话还没载入内存的那些）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryHitState {
+    /// 会话 ID（日志文件名）
+    pub session: String,
+    /// 第几条用户消息（从 0 数）
+    pub turn: usize,
+    pub from_user: bool,
+    pub snippet: String,
+    /// 会话标题（从元信息读；读不到时用那一轮的用户消息开头）
+    pub title: String,
+}
+
+/// 后台线程里跑：扫磁盘上的会话日志，跳过已经载入内存的会话。
+pub(crate) fn scan_history(
+    dir: &std::path::Path,
+    loaded: &std::collections::HashSet<String>,
+    query: &str,
+) -> Vec<HistoryHitState> {
+    let files = claudesktop_core::history_search::log_files(dir)
+        .into_iter()
+        .filter(|(id, _)| !loaded.contains(id));
+    let hits = claudesktop_core::history_search::search_logs(files, query);
+    // 标题从元信息读（每个会话的 json 文件），读不到的用那一轮的用户消息开头
+    let titles = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            let meta: claudesktop_core::SessionMeta =
+                serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            Some((meta.id, meta.title))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    hits.into_iter()
+        .map(|hit| {
+            let title = titles.get(&hit.session).cloned().unwrap_or(hit.prompt);
+            HistoryHitState {
+                session: hit.session,
+                turn: hit.turn,
+                from_user: hit.from_user,
+                snippet: hit.snippet,
+                title,
+            }
+        })
+        .collect()
 }
 
 /// 在 `order`（会话下标，按侧栏顺序）列出的会话里搜 `query`（不分大小写）。
@@ -98,7 +149,7 @@ impl ChatApp {
     ///
     /// 排到下一次节拍再搜：`on_query` 每敲一个字都会来，而在 UI 线程上把上百个会话的
     /// 正文整段小写化一遍是实打实的开销。查询变了才搜（连按两次同一个字只搜一次），
-    /// 面板那时已经重画过一次，列表跟着更新。
+    /// 面板那时已经画过一次，列表跟着更新。磁盘上的更早会话在后台线程里扫（见 [`scan_history`]）。
     pub(super) fn search_palette(&mut self, query: &str, cx: &mut Context<Self>) {
         let query = query.trim().to_lowercase();
         if query == self.palette_query {
@@ -120,7 +171,34 @@ impl ChatApp {
                 let order: Vec<usize> =
                     this.session_groups().into_iter().flat_map(|g| g.members).collect();
                 this.palette_hits = search_messages(&this.sessions, &order, &query);
+                // 已经在内存里的会话（侧栏有）不再重复扫磁盘
+                let loaded: std::collections::HashSet<String> = this
+                    .sessions
+                    .iter()
+                    .filter_map(|s| s.meta.as_ref().map(|m| m.id.clone()))
+                    .collect();
+                let dir = this.store.as_ref().map(|s| s.dir().to_path_buf());
+                this.palette_history.clear();
                 cx.notify();
+                let Some(dir) = dir else { return };
+                let query = query.clone();
+                let want = query.clone();
+                // 扫磁盘放在后台线程：几百个会话逐个读文件不能占 UI 线程
+                cx.spawn(async move |this, cx| {
+                    let hits = cx
+                        .background_executor()
+                        .spawn(async move { scan_history(&dir, &loaded, &query) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if this.palette_query != want || this.palette_generation != generation {
+                            return;
+                        }
+                        this.palette_history = hits;
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
             })
             .ok();
         }));
@@ -132,6 +210,43 @@ impl ChatApp {
         self.palette_generation += 1;
         self.palette_timer = None;
         self.palette_hits.clear();
+        self.palette_history.clear();
+    }
+
+    /// 从历史搜索结果跳过去：那个会话可能还在磁盘上（没载入内存），先恢复进侧栏再定位。
+    pub(super) fn reveal_history_hit(&mut self, hit: &HistoryHitState, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else { return };
+        let turn = hit.turn;
+        // 已经在内存里（同一个会话 ID）：直接跳
+        let existing =
+            self.sessions.iter().position(|s| s.meta.as_ref().is_some_and(|m| m.id == hit.session));
+        let idx = match existing {
+            Some(i) => i,
+            None => {
+                let Some(meta) = store.list().into_iter().find(|m| m.id == hit.session) else {
+                    return;
+                };
+                let Ok(records) = store.load(&meta.id) else { return };
+                let session = Session::from_records(self.next_token, meta, records);
+                self.next_token += 1;
+                self.sessions.push(session);
+                self.sessions.len() - 1
+            }
+        };
+        self.settings_open = false;
+        self.activate_session(idx, cx);
+        // 定位到那一轮的用户消息
+        let item = self.sessions[idx]
+            .transcript
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, ChatItem::User { .. }))
+            .nth(turn)
+            .map(|(i, _)| i);
+        if let Some(item) = item {
+            self.sessions[idx].reveal = Some(item);
+            self.flash = Some((self.sessions[idx].token, item, Instant::now()));
+        }
     }
 
     /// 从搜索结果跳到一条消息：切会话、滚过去（`Session::reveal`，列表同步时生效）、闪一下底色。

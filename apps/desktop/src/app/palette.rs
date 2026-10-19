@@ -40,6 +40,8 @@ enum PaletteCmd {
     Session(usize),
     /// 跳到某会话的某条消息（会话下标, 行号）
     Message(usize, usize),
+    /// 跳到磁盘上某个更早的会话的第几条用户消息（会话 ID, 轮次）
+    History(String, usize),
     View(ViewMode),
     Mode(usize),
     Model(String),
@@ -204,6 +206,22 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         })
         .collect();
 
+    // 磁盘上更早的会话里命中的消息（内存只恢复最近的一百个）
+    let history = app
+        .palette_history
+        .iter()
+        .map(|hit| {
+            let icon = if hit.from_user { IconAll::User } else { IconAll::Sparkles };
+            Entry::new(
+                icon,
+                hit.snippet.clone(),
+                PaletteCmd::History(hit.session.clone(), hit.turn),
+            )
+            .desc(format!("历史 · {}", hit.title))
+            .stacked()
+        })
+        .collect();
+
     let views = ViewMode::ALL
         .into_iter()
         .map(|m| {
@@ -245,6 +263,7 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         ("操作", actions),
         ("会话", sessions),
         ("消息", messages),
+        ("历史", history),
         ("视图", views),
         ("权限模式", modes),
         ("模型", models),
@@ -332,6 +351,16 @@ impl ChatApp {
                 self.activate_session(i, cx);
             }
             PaletteCmd::Message(i, item) => self.reveal_message(i, item, cx),
+            PaletteCmd::History(session, turn) => {
+                if let Some(hit) = self
+                    .palette_history
+                    .iter()
+                    .find(|h| h.session == session && h.turn == turn)
+                    .cloned()
+                {
+                    self.reveal_history_hit(&hit, cx);
+                }
+            }
             PaletteCmd::View(mode) => self.set_view_mode(mode, cx),
             PaletteCmd::Mode(i) => self.choose_mode(i, cx),
             PaletteCmd::Model(model) => self.choose_model(model, cx),

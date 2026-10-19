@@ -141,6 +141,18 @@ impl Record {
     }
 }
 
+/// 读一个日志文件的全部记录；末尾半行（写到一半崩溃）及无法解析的行跳过。
+/// 目录里那些按会话 ID 找不着的（历史搜索要扫全部）直接给路径。
+pub fn read_log(path: &Path) -> io::Result<Vec<Record>> {
+    let file = File::open(path)?;
+    Ok(BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(&l).ok())
+        .collect())
+}
+
 /// 会话存储目录。
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -217,13 +229,7 @@ impl SessionStore {
 
     /// 读出全部记录；末尾半行（写到一半崩溃）及无法解析的行跳过。
     pub fn load(&self, id: &str) -> io::Result<Vec<Record>> {
-        let file = File::open(self.log_path(id))?;
-        Ok(BufReader::new(file)
-            .lines()
-            .map_while(Result::ok)
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(&l).ok())
-            .collect())
+        read_log(&self.log_path(id))
     }
 
     pub fn delete(&self, id: &str) -> io::Result<()> {

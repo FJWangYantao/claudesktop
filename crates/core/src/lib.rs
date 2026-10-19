@@ -16,6 +16,7 @@ mod acp;
 pub mod catalog;
 pub mod checkpoint;
 mod diff;
+pub mod history_search;
 mod json_error;
 pub mod plugin;
 pub mod plugin_git;
@@ -27,7 +28,9 @@ pub use acp::{AcpKernel, AcpKernelConfig};
 pub use diff::{DiffLineView, DiffView};
 pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
-pub use store::{Record, SessionLog, SessionMeta, SessionStore, default_data_dir, effective};
+pub use store::{
+    Record, SessionLog, SessionMeta, SessionStore, default_data_dir, effective, read_log,
+};
 
 pub use plugin::Plugin;
 use serde::{Deserialize, Serialize};

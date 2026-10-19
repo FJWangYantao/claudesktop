@@ -167,6 +167,8 @@ pub struct ChatApp {
     rewind_overwrite: bool,
     /// 命令面板里按正文搜到的消息（查询变了才重搜，见 search.rs）
     palette_hits: Vec<search::MessageHit>,
+    /// 磁盘上搜到的命中（更早的会话，没载入内存；见 `search::scan_history`）
+    palette_history: Vec<search::HistoryHitState>,
     /// 上一次（已排上节拍的）搜索关键词，小写、去过首尾空白
     palette_query: String,
     /// 面板每关 / 开一次 +1：排在节拍里的搜索回来时靠它判断结果是否已经过期
@@ -404,6 +406,7 @@ impl ChatApp {
             rewind: None,
             rewind_overwrite: false,
             palette_hits: Vec::new(),
+            palette_history: Vec::new(),
             palette_query: String::new(),
             palette_generation: 0,
             palette_timer: None,
