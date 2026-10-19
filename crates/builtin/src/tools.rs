@@ -812,7 +812,7 @@ impl Action {
             Self::Shell { command, timeout, cwd } => run_shell(command, cwd, *timeout, should_stop),
             Self::ShellBackground { command, cwd } => start_background(command, cwd),
             Self::ShellOutput { id, wait_secs } => {
-                match crate::bgtasks::output(id, Duration::from_secs(*wait_secs)) {
+                match crate::bgtasks::output(id, Duration::from_secs(*wait_secs), should_stop) {
                     Ok(text) => {
                         let summary = crate::bgtasks::clip(
                             text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim(),

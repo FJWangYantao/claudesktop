@@ -1436,6 +1436,9 @@ fn anthropic_protocol_streams_and_runs_tools() {
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想想"}}"#,
             ),
             acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}"#,
+            ),
+            acme(
                 r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
             ),
             acme(
@@ -1520,8 +1523,12 @@ fn anthropic_protocol_streams_and_runs_tools() {
     assert_eq!(results["content"][0]["type"], "tool_result");
     assert_eq!(results["content"][0]["tool_use_id"], "toolu_1");
     assert!(results["content"][0]["content"].as_str().unwrap().contains("magic 77"));
-    // 工具结果轮后面跟着带 tool_use 的 assistant 轮
-    assert_eq!(second["messages"][1]["content"][0]["type"], "tool_use");
+    // 工具结果轮前面是带 tool_use 的 assistant 轮，思考块（连签名）原样排在最前
+    let assistant = &second["messages"][1]["content"];
+    assert_eq!(assistant[0]["type"], "thinking");
+    assert_eq!(assistant[0]["thinking"], "想想");
+    assert_eq!(assistant[0]["signature"], "sig-1");
+    assert_eq!(assistant[1]["type"], "tool_use");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

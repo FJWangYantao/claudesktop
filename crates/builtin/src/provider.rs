@@ -134,6 +134,10 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// role = tool 时对应的调用 ID
     pub tool_call_id: Option<String>,
+    /// 模型这一步的思考块原样（Anthropic 的 `thinking` / `redacted_thinking`，带 `signature`）：
+    /// 开了思考预算时，工具循环里回传的 assistant 消息必须以它们开头。只有原生 Anthropic
+    /// 协议发回去，别的协议序列化时忽略；不进日志（续接后没有，也不需要）。
+    pub thinking: Vec<Value>,
 }
 
 impl ChatMessage {
@@ -142,7 +146,13 @@ impl ChatMessage {
     }
 
     pub fn with_parts(role: &str, parts: Vec<ContentPart>) -> Self {
-        Self { role: role.to_string(), parts, tool_calls: Vec::new(), tool_call_id: None }
+        Self {
+            role: role.to_string(),
+            parts,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: Vec::new(),
+        }
     }
 
     /// 带工具调用的 assistant 消息（`text` 为同一步里模型说的话，可为空）
@@ -335,6 +345,8 @@ pub struct StreamOutcome {
     pub completed: bool,
     /// 本步模型请求的工具调用（按出现顺序）
     pub tool_calls: Vec<ToolCall>,
+    /// 本步的思考块原样（见 [`ChatMessage::thinking`]；只有 Anthropic 原生协议给）
+    pub thinking: Vec<Value>,
 }
 
 /// 协议无关的对话 provider。实现方负责把统一消息形状翻译成自己的请求体。

@@ -1227,6 +1227,29 @@ impl Inner {
     }
 }
 
+/// 会话的说明：用户级 + 目录里的 AGENTS.md / CLAUDE.md，再加项目配置指定的说明文件
+/// （相对项目根，追加在最后——最具体）。开会话和每轮重读都走这里，两边才一致。
+fn session_instructions(
+    cwd: &Path,
+    user: Option<&Path>,
+    project: Option<&claudesktop_core::project::ProjectConfig>,
+) -> Vec<instructions::Instruction> {
+    let mut list = instructions::load(cwd, user);
+    if let Some(file) = project.and_then(|p| p.instructions.as_ref()) {
+        let path = claudesktop_core::project::project_root(cwd).unwrap_or(cwd).join(file);
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && !text.trim().is_empty()
+            && !list.iter().any(|i| i.path == path)
+        {
+            list.push(instructions::Instruction {
+                path,
+                text: text.trim().chars().take(20_000).collect(),
+            });
+        }
+    }
+    list
+}
+
 pub struct BuiltinKernel {
     inner: Arc<Inner>,
 }
@@ -1276,12 +1299,15 @@ impl BuiltinKernel {
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
         // 后台命令的状态变化整份发一次（表是进程级的，出口在这里装上）
+        // 出口只攥弱引用：表是进程级的，强引用会让关掉的内核一直释放不掉（`shutdown` 里也会摘掉）
         {
-            let inner = inner.clone();
+            let inner = Arc::downgrade(&inner);
             bgtasks::register(
                 kernel_id,
                 Box::new(move |tasks| {
-                    inner.emit(None, KernelEvent::BackgroundTasks { tasks });
+                    if let Some(inner) = inner.upgrade() {
+                        inner.emit(None, KernelEvent::BackgroundTasks { tasks });
+                    }
                 }),
             );
         }
@@ -1333,21 +1359,8 @@ impl BuiltinKernel {
                 }
             }
         }
-        let mut instructions = instructions::load(&cwd, self.inner.user_instructions.as_deref());
-        if let Some(project) = &project
-            && let Some(file) = &project.instructions
-        {
-            // 项目说明文件（相对项目根）追加在最后（最具体）
-            let path = claudesktop_core::project::project_root(&cwd).unwrap_or(&cwd).join(file);
-            if let Ok(text) = std::fs::read_to_string(&path)
-                && !text.trim().is_empty()
-            {
-                instructions.push(instructions::Instruction {
-                    path,
-                    text: text.trim().chars().take(20_000).collect(),
-                });
-            }
-        }
+        let instructions =
+            session_instructions(&cwd, self.inner.user_instructions.as_deref(), project.as_ref());
         let skills = self.inner.skills(project.as_ref().and_then(|p| p.plugins_enabled.as_deref()));
         // 项目指定的默认模型优先（全局默认其次）
         let model = project
@@ -1720,7 +1733,10 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             .collect();
         let mut step = Vec::with_capacity(results.len() + 1);
         let unmeasured = results.len();
-        step.push(ChatMessage::assistant_tool_calls(text, outcome.tool_calls));
+        let mut call = ChatMessage::assistant_tool_calls(text, outcome.tool_calls);
+        // 思考块跟着工具调用回传（Anthropic 开了思考时缺了它，下一步请求会被拒）
+        call.thinking = outcome.thinking;
+        step.push(call);
         step.extend(results);
         if !inner.commit(session, flag, step) {
             return Steps::Stopped;
@@ -1791,8 +1807,12 @@ impl Kernel for BuiltinKernel {
                 anyhow::bail!("上一轮还没结束");
             }
             // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
-            state.instructions =
-                instructions::load(&state.cwd, self.inner.user_instructions.as_deref());
+            let project = claudesktop_core::project::load(&state.cwd);
+            state.instructions = session_instructions(
+                &state.cwd,
+                self.inner.user_instructions.as_deref(),
+                project.as_ref(),
+            );
             state.skills = self.inner.skills(state.plugins_enabled.as_deref());
             // 文本 + 图片附件合成一条多段用户消息
             let mut parts = vec![ContentPart::Text(prompt.text)];
@@ -1981,5 +2001,6 @@ impl Kernel for BuiltinKernel {
             }
         }
         self.inner.mcp.stop();
+        bgtasks::unregister(self.inner.kernel_id);
     }
 }

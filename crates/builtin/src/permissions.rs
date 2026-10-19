@@ -107,19 +107,25 @@ impl PermissionRules {
 
     /// 在当前项目的规则里找 `prefix` 前缀（`""` = 允许、`deny:` = 拒绝）下
     /// 与 `rule` 匹配的一条。shell 规则按词前缀匹配，其余按整串相等。
+    /// 工作目录在项目的子目录里时，项目根下的规则（项目配置并进来的就记在根下）同样算数。
     fn matching(&mut self, cwd: &Path, rule: &str, command: Option<&str>, prefix: &str) -> bool {
         self.reload();
-        let Some(rules) = self.data.projects.get(&Self::key(cwd)) else {
-            return false;
-        };
-        let stored_prefix = format!("{prefix}shell:");
-        match (rule.strip_prefix("shell:"), command) {
-            (Some(_), Some(command)) => rules
-                .iter()
-                .filter_map(|r| r.strip_prefix(&stored_prefix))
-                .any(|r| shell_rule_matches(r, command)),
-            _ => rules.contains(&format!("{prefix}{rule}")),
+        let mut keys = vec![Self::key(cwd)];
+        if let Some(root) = claudesktop_core::project::project_root(cwd)
+            && root != cwd
+        {
+            keys.push(Self::key(root));
         }
+        let stored_prefix = format!("{prefix}shell:");
+        keys.iter().filter_map(|key| self.data.projects.get(key)).any(|rules| {
+            match (rule.strip_prefix("shell:"), command) {
+                (Some(_), Some(command)) => rules
+                    .iter()
+                    .filter_map(|r| r.strip_prefix(&stored_prefix))
+                    .any(|r| shell_rule_matches(r, command)),
+                _ => rules.contains(&format!("{prefix}{rule}")),
+            }
+        })
     }
 
     /// 添加一条规则并立即落盘（原子写）。拒绝规则带 `deny:` 前缀。
@@ -176,6 +182,24 @@ mod tests {
         assert!(!rules.allows(a, "edit", None));
         other.remove(&key, "shell:git status").unwrap();
         assert!(other.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 会话开在项目子目录里：记在项目根下的规则（项目配置并进来的）照样生效
+    #[test]
+    fn rules_at_the_project_root_cover_subdirectories() {
+        let dir =
+            std::env::temp_dir().join(format!("claudesktop-perm-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("repo");
+        let sub = root.join("crates").join("x");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut rules = PermissionRules::load(Some(dir.join("permissions.json")));
+        rules.add(&root, "deny:shell:rm".into()).unwrap();
+        assert!(rules.denies(&sub, "shell:rm", Some("rm -rf build")));
+        assert!(rules.denies(&root, "shell:rm", Some("rm -rf build")));
+        assert!(!rules.denies(&dir, "shell:rm", Some("rm -rf build")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

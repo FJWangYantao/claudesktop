@@ -6,7 +6,7 @@
 
 use crate::tools::ToolOutput;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{OnceLock, mpsc};
 use std::time::Duration;
 
@@ -27,8 +27,9 @@ pub fn set_data_dir(dir: PathBuf) {
     let _ = DATA_DIR.set(dir);
 }
 
-fn data_dir() -> Option<&'static Path> {
-    DATA_DIR.get().map(PathBuf::as_path)
+/// 内核没起过（刚启动、只用 ACP）时设置页也要能读写 key：退回默认数据目录。
+fn data_dir() -> Option<PathBuf> {
+    DATA_DIR.get().cloned().or_else(|| claudesktop_core::default_data_dir().ok())
 }
 
 /// 取 Brave key：先环境变量，再数据目录的 `brave_key` 文件（设置页写入）。
@@ -48,6 +49,7 @@ pub fn set_brave_key(key: Option<&str>) -> std::io::Result<()> {
     let Some(dir) = data_dir() else {
         return Err(std::io::Error::other("data directory is not set"));
     };
+    std::fs::create_dir_all(&dir)?;
     let file = dir.join("brave_key");
     match key.map(str::trim).filter(|k| !k.is_empty()) {
         Some(k) => std::fs::write(file, k),
