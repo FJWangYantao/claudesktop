@@ -1197,7 +1197,8 @@ impl Session {
             | KernelEvent::FsWrite { .. }
             | KernelEvent::FileChanged { .. }
             | KernelEvent::McpStatus { .. }
-            | KernelEvent::BackgroundTasks { .. } => {}
+            | KernelEvent::BackgroundTasks { .. }
+            | KernelEvent::MemoryChanged { .. } => {}
             KernelEvent::TitleGenerated { title } => {
                 // 模型起的标题替换截断版（用户手动改过的不覆盖）
                 if !self.renamed {

@@ -9,12 +9,14 @@ mod composer;
 mod content;
 pub(crate) mod keys;
 mod mcp_view;
+mod memory_view;
 mod menu;
 mod motion;
 mod notify;
 mod overview;
 mod palette;
 mod plugins_view;
+mod project_view;
 mod raw_request;
 mod requests_view;
 mod rewind;
@@ -159,6 +161,10 @@ pub struct ChatApp {
     /// 插件页的安装框和进行中的 git 操作
     plugins_form: plugins_view::PluginsForm,
     mcp_form: mcp_view::McpForm,
+    /// 设置页「记忆」：看哪一栏、搜索、读到的两份记忆条目
+    memory_form: memory_view::MemoryForm,
+    /// 设置页「项目」：项目根、表单值、读文件时的问题
+    project_form: project_view::ProjectForm,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
     placeholder: SharedString,
     /// 「回退到这里」浮层开着时算好的预览（打开时算一次，见 rewind.rs）
@@ -318,6 +324,8 @@ impl ChatApp {
         let settings_form = SettingsForm::new(window, cx);
         let plugins_form = plugins_view::PluginsForm::new(window, cx);
         let mcp_form = mcp_view::McpForm::new(window, cx);
+        let memory_form = memory_view::MemoryForm::new(window, cx);
+        let project_form = project_view::ProjectForm::new(window, cx);
         // 字号滑杆：85% ~ 140%，步进 5%
         let font_slider = cx.new(|_| {
             SliderState::new()
@@ -399,6 +407,8 @@ impl ChatApp {
             sidebar_expanded: Default::default(),
             plugins_form,
             mcp_form,
+            memory_form,
+            project_form,
             plugins: claudesktop_core::plugin::default_plugins_dir()
                 .map(|d| claudesktop_core::plugin::discover(&d))
                 .unwrap_or_default(),
@@ -1426,6 +1436,13 @@ impl ChatApp {
                 self.toast(Notification::error(text), cx);
             }
             event => {
+                // 内核记下一条记忆时顺手刷新「记忆」页
+                if matches!(&event, KernelEvent::MemoryChanged { .. })
+                    && self.settings_open
+                    && self.settings_form.tab == memory_view::MEMORY_TAB
+                {
+                    self.reload_memory_view();
+                }
                 // 会话级事件：Started 按令牌认领，其余按 sessionId
                 let idx = match &event {
                     KernelEvent::Started { token, .. } => {

@@ -111,6 +111,8 @@ pub struct BuiltinConfig {
     pub max_steps: usize,
     /// 第一轮结束后让模型给会话起标题（多一次小请求）；测试里关掉，免得打乱剧本
     pub session_titles: bool,
+    /// 全局记忆文件（默认数据目录的 `memory.json`，见 `claudesktop_core::memory`）
+    pub memory_path: Option<PathBuf>,
 }
 
 impl BuiltinConfig {
@@ -126,6 +128,7 @@ impl BuiltinConfig {
             plugins: Vec::new(),
             max_steps: DEFAULT_MAX_STEPS,
             session_titles: true,
+            memory_path: default_memory_path(),
         }
     }
 
@@ -211,9 +214,27 @@ struct SessionState {
     mcp_disabled: Vec<String>,
     /// 项目级配置指定的插件范围（`pluginsEnabled`）；None = 用全部启用的插件
     plugins_enabled: Option<Vec<String>>,
+    /// 记下的项目记忆（每轮重读，见 `memory` 模块）
+    memory_project: Vec<claudesktop_core::memory::Entry>,
+    /// 记下的全局记忆（每轮重读）
+    memory_global: Vec<claudesktop_core::memory::Entry>,
 }
 
 impl SessionState {
+    /// 重读两份记忆（系统提示词每轮跟着变；文件没改时内容一样，不影响提示缓存）。
+    /// 返回值：读不了 / 格式坏了的原因（会话里各提示一行，项目、全局分开报）。
+    fn reload_memory(&mut self, global: Option<&Path>) -> Vec<String> {
+        use claudesktop_core::memory;
+        let mut warnings = Vec::new();
+        let (project, project_warning) = memory::load(&memory::project_file_or(&self.cwd));
+        self.memory_project = project;
+        warnings.extend(project_warning);
+        let (global_entries, global_warning) = global.map(memory::load).unwrap_or_default();
+        self.memory_global = global_entries;
+        warnings.extend(global_warning);
+        warnings
+    }
+
     fn system_prompt(&self) -> String {
         system_prompt(
             &self.cwd,
@@ -223,6 +244,8 @@ impl SessionState {
             &self.skills,
             self.summary.as_deref(),
             self.agent.as_ref(),
+            &self.memory_project,
+            &self.memory_global,
         )
     }
 
@@ -258,11 +281,18 @@ struct Inner {
     next_request: AtomicU64,
     /// 这个内核的编号（后台命令表按它分组：同一进程里几个内核各收自己的）
     kernel_id: u64,
+    /// 全局记忆文件（见 [`BuiltinConfig::memory_path`]）
+    memory_path: Option<PathBuf>,
 }
 
 /// 默认 MCP 配置文件：数据目录下的 `mcp.json`。
 pub fn default_mcp_config() -> Option<PathBuf> {
     claudesktop_core::default_data_dir().ok().map(|d| d.join("mcp.json"))
+}
+
+/// 默认的全局记忆文件：数据目录下的 `memory.json`。
+pub fn default_memory_path() -> Option<PathBuf> {
+    claudesktop_core::memory::global_path()
 }
 
 /// 一步要发给模型的东西（[`Inner::snapshot`]）。
@@ -763,8 +793,68 @@ impl Inner {
                 Err(message) => ToolOutput::fail(message, "参数无效"),
             };
         }
+        // 记忆同样不碰项目文件、不出网：直接写 memory.json（见 memory 模块）
+        if call.function.name == tools::MEMORY_WRITE
+            && self.tool_allowed(session, tools::MEMORY_WRITE)
+        {
+            return self.remember(session, cwd, &call.function.arguments);
+        }
         let (action, title) = self.start_tool(session, cwd, call);
         self.finish_tool(session, cwd, call, action, &title, stopped)
+    }
+
+    /// `memory_write`：写进全局或项目的 `memory.json`，报 `MemoryChanged`。
+    /// 读写文件失败不让工具失败——把原因回给模型，免得它反复重试。
+    fn remember(&self, session: &str, cwd: &Path, arguments: &str) -> ToolOutput {
+        use claudesktop_core::memory;
+        let (scope, entry) = match tools::parse_memory(arguments) {
+            Ok(parsed) => parsed,
+            Err(message) => return ToolOutput::fail(message, "参数无效"),
+        };
+        let (path, scope_name) = match scope {
+            memory::Scope::Global => (self.memory_path.clone(), "global"),
+            memory::Scope::Project => (Some(memory::project_file_or(cwd)), "project"),
+        };
+        let Some(path) = path else {
+            return ToolOutput::fail(
+                "Could not find the data directory, so the note was not saved.",
+                "没能保存",
+            );
+        };
+        let (mut entries, warning) = memory::load(&path);
+        if let Some(warning) = warning {
+            // 文件坏了：先把它挪开，别让新记的一条把原来的全盖掉
+            let _ = std::fs::rename(&path, path.with_extension("json.broken"));
+            self.emit(Some(session), KernelEvent::Notice(warning));
+        }
+        let mut entry = entry;
+        entry.source =
+            Some(memory::Source { session: session.to_string(), turn: self.turn_number(session) });
+        let updated = memory::upsert(&mut entries, entry.clone());
+        memory::enforce_limits(&mut entries, scope.max_entries());
+        let count = entries.len();
+        match memory::save(&path, &entries) {
+            Ok(()) => {
+                self.emit(
+                    Some(session),
+                    KernelEvent::MemoryChanged { scope: scope_name.into(), count },
+                );
+                let verb = if updated { "Updated" } else { "Saved" };
+                let scope = match scope_name {
+                    "global" => "every project",
+                    _ => "this project",
+                };
+                ToolOutput::ok(
+                    format!("{verb} for {scope}: {}", entry.text),
+                    format!("记下了：{}", entry.text),
+                )
+            }
+            Err(err) => {
+                let text = format!("没能写进 {}：{err}", path.display());
+                self.emit(Some(session), KernelEvent::Notice(text.clone()));
+                ToolOutput::fail(text, "没能保存")
+            }
+        }
     }
 
     /// 一步里的全部调用：连续的只读调用和子任务（`task`）一起并行跑，其余依次执行；结果按调用顺序返回。
@@ -1030,6 +1120,9 @@ impl Inner {
                     // 项目级停用的 MCP 服务器子会话照样停用
                     mcp_disabled: parent.mcp_disabled.clone(),
                     plugins_enabled: parent.plugins_enabled.clone(),
+                    // 子会话和主会话看同一份记忆（记不进去：工具不给它）
+                    memory_project: parent.memory_project.clone(),
+                    memory_global: parent.memory_global.clone(),
                 };
                 Some((flag, state))
             }) else {
@@ -1272,6 +1365,7 @@ impl BuiltinKernel {
             pending: Mutex::default(),
             next_request: AtomicU64::new(1),
             kernel_id,
+            memory_path: config.memory_path,
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
@@ -1356,26 +1450,30 @@ impl BuiltinKernel {
             .unwrap_or_else(|| self.inner.default_model.lock().unwrap().clone());
         let mcp_disabled = project.as_ref().map(|p| p.mcp_disabled.clone()).unwrap_or_default();
         let plugins_enabled = project.as_ref().and_then(|p| p.plugins_enabled.clone());
-        self.inner.sessions.lock().unwrap().insert(
-            session_id.clone(),
-            SessionState {
-                cwd,
-                model: model.clone(),
-                history: history.messages,
-                mode: MODE_DEFAULT.into(),
-                restored: resumed,
-                instructions,
-                skills,
-                started: false,
-                summary: history.summary,
-                measured: None,
-                turn: None,
-                turns: 0,
-                agent: None,
-                mcp_disabled,
-                plugins_enabled,
-            },
-        );
+        let mut state = SessionState {
+            cwd,
+            model: model.clone(),
+            history: history.messages,
+            mode: MODE_DEFAULT.into(),
+            restored: resumed,
+            instructions,
+            skills,
+            started: false,
+            summary: history.summary,
+            measured: None,
+            turn: None,
+            turns: 0,
+            agent: None,
+            mcp_disabled,
+            plugins_enabled,
+            memory_project: Vec::new(),
+            memory_global: Vec::new(),
+        };
+        // 记住的东西一开始就带上（之后每轮重读）
+        for warning in state.reload_memory(self.inner.memory_path.as_deref()) {
+            self.inner.emit(Some(&session_id), KernelEvent::Notice(warning));
+        }
+        self.inner.sessions.lock().unwrap().insert(session_id.clone(), state);
         self.inner.emit(
             Some(&session_id),
             KernelEvent::Started {
@@ -1406,6 +1504,8 @@ fn system_prompt(
     skills: &[Skill],
     summary: Option<&str>,
     agent: Option<&AgentDef>,
+    memory_project: &[claudesktop_core::memory::Entry],
+    memory_global: &[claudesktop_core::memory::Entry],
 ) -> String {
     // 子会话没有待办清单（计划是主会话的）
     let todo = if agent.is_none() {
@@ -1442,6 +1542,10 @@ fn system_prompt(
         );
     }
     if let Some(section) = instructions::prompt_section(project) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
+    if let Some(section) = claudesktop_core::memory::prompt_section(memory_project, memory_global) {
         prompt.push_str("\n\n");
         prompt.push_str(&section);
     }
@@ -1783,7 +1887,7 @@ impl Kernel for BuiltinKernel {
         session: &str,
         prompt: claudesktop_core::UserPrompt,
     ) -> anyhow::Result<()> {
-        let flag = {
+        let (flag, warnings) = {
             let mut sessions = self.inner.sessions.lock().unwrap();
             let state =
                 sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
@@ -1794,6 +1898,8 @@ impl Kernel for BuiltinKernel {
             state.instructions =
                 instructions::load(&state.cwd, self.inner.user_instructions.as_deref());
             state.skills = self.inner.skills(state.plugins_enabled.as_deref());
+            // 记忆文件同理：界面删掉一条，下一轮就不在提示词里了
+            let warnings = state.reload_memory(self.inner.memory_path.as_deref());
             // 文本 + 图片附件合成一条多段用户消息
             let mut parts = vec![ContentPart::Text(prompt.text)];
             for image in prompt.images {
@@ -1803,8 +1909,11 @@ impl Kernel for BuiltinKernel {
             let flag = Arc::new(AtomicBool::new(false));
             state.turn = Some(flag.clone());
             state.turns += 1;
-            flag
+            (flag, warnings)
         };
+        for warning in warnings {
+            self.inner.emit(Some(session), KernelEvent::Notice(warning));
+        }
         let inner = self.inner.clone();
         let session = session.to_string();
         std::thread::Builder::new()

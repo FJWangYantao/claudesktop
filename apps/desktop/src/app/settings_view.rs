@@ -25,20 +25,22 @@ use gpui_kit::*;
 use std::collections::HashSet;
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
-const SETTINGS_TABS: [(IconAll, &str); 6] = [
+const SETTINGS_TABS: [(IconAll, &str); 8] = [
     (IconAll::Settings, "通用"),
+    (IconAll::FolderTree, "项目"),
     (IconAll::Cpu, "内核与模型"),
     (IconAll::ShieldCheck, "权限"),
     (IconAll::Plug, "MCP"),
     (IconAll::Blocks, "插件"),
     (IconAll::ChartColumn, "用量"),
+    (IconAll::Brain, "记忆"),
 ];
 
 /// 设置页「内核与模型」分类的下标（首页配置引导、失败卡片的「打开设置」直接打开它）
-pub(super) const KERNEL_TAB: usize = 1;
+pub(super) const KERNEL_TAB: usize = 2;
 
 /// 设置页「插件」分类的下标（侧栏的「插件」入口直接打开它）
-pub(super) const PLUGINS_TAB: usize = 4;
+pub(super) const PLUGINS_TAB: usize = 5;
 
 /// 一套档案在表单里的输入框（与 `SettingsForm::profiles` 一一对应）。
 pub struct ProfileInputs {
@@ -85,7 +87,7 @@ pub struct SettingsForm {
     active: usize,
     /// 每套档案的输入框
     inputs: Vec<ProfileInputs>,
-    /// 设置页当前所在的 tab（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP / 4 插件）
+    /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量 / 7 记忆）
     pub(super) tab: usize,
     acp_command: Entity<InputState>,
     /// 一轮最多几步（自研内核的工具循环上限）
@@ -187,7 +189,7 @@ impl ChatApp {
         self.open_settings_at(tab, window, cx);
     }
 
-    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 内核与模型 / 2 权限 / 3 MCP / 4 插件 / 5 用量）。
+    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量 / 7 记忆）。
     /// 失败卡片的「打开设置」用它直接落到服务商配置。
     pub(crate) fn open_settings_at(
         &mut self,
@@ -246,6 +248,14 @@ impl ChatApp {
             .update(cx, |state, cx| state.set_value(s.acp.command.clone(), window, cx));
         self.settings_form.tab = tab;
         self.settings_open = true;
+        // 「记忆」一栏按需读两份记忆文件（内核可能刚记下一条）
+        if tab == super::memory_view::MEMORY_TAB {
+            self.reload_memory_view();
+        }
+        // 「项目」一栏重读项目根的那个配置文件（可能是手改过的）
+        if tab == super::project_view::PROJECT_TAB {
+            self.reload_project_view(window, cx);
+        }
         cx.notify();
     }
 
@@ -1192,7 +1202,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    fn text_input(state: &Entity<InputState>) -> Div {
+    pub(super) fn text_input(state: &Entity<InputState>) -> Div {
         div()
             .rounded_lg()
             .border_1()
@@ -1461,7 +1471,8 @@ impl ChatApp {
         );
         // 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）
         let mut tools = choice_panel();
-        for (i, (name, desc)) in claudesktop_builtin::RequestParams::server_tool_choices().enumerate()
+        for (i, (name, desc)) in
+            claudesktop_builtin::RequestParams::server_tool_choices().enumerate()
         {
             let on = p.params.server_tools.iter().any(|s| s == name);
             let desc = if p.protocol == Protocol::Anthropic {
@@ -1489,10 +1500,7 @@ impl ChatApp {
                                     .child(name.to_string()),
                             )
                             .child(
-                                div()
-                                    .text_size(TEXT_SMALL)
-                                    .text_color(rgb(INK_SOFT))
-                                    .child(desc),
+                                div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc),
                             ),
                     )
                     .child(
@@ -1514,22 +1522,18 @@ impl ChatApp {
                     ),
             );
         }
-        div()
-            .v_flex()
-            .gap_4()
-            .child(budget)
-            .child(form_field(
-                "服务端工具",
-                Some(
-                    if p.protocol == Protocol::Anthropic {
-                        "Anthropic 在它的服务器上执行（会按次计费），结果自动折成文本进对话"
-                    } else {
-                        "只有 Anthropic 原生协议认；其他协议选了也不生效"
-                    }
-                    .into(),
-                ),
-                tools,
-            ))
+        div().v_flex().gap_4().child(budget).child(form_field(
+            "服务端工具",
+            Some(
+                if p.protocol == Protocol::Anthropic {
+                    "Anthropic 在它的服务器上执行（会按次计费），结果自动折成文本进对话"
+                } else {
+                    "只有 Anthropic 原生协议认；其他协议选了也不生效"
+                }
+                .into(),
+            ),
+            tools,
+        ))
     }
 
     /// ACP agent：启动命令（带常用命令一键填入）和要不要经用量网关。
@@ -1641,12 +1645,20 @@ impl ChatApp {
                     .text_color(rgb(INK))
                     .when(active, |d| d.bg(rgb(SELECTED)))
                     .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER))))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         if this.settings_form.tab != i {
                             this.settings_form.tab = i;
                             this.settings_form.message = None;
                             // 「用量」停在「请求」一栏时按需读网关日志
                             this.sync_requests(cx);
+                            // 「记忆」每次进来都重读文件（内核 / 手改都可能动过它）
+                            if i == super::memory_view::MEMORY_TAB {
+                                this.reload_memory_view();
+                            }
+                            // 「项目」同理：重读项目根的配置文件
+                            if i == super::project_view::PROJECT_TAB {
+                                this.reload_project_view(window, cx);
+                            }
                             cx.notify();
                         }
                     }))
@@ -1659,11 +1671,13 @@ impl ChatApp {
         let content_w = f.content_w.get();
         let width_probe = f.content_w.probe();
         let tab_content: Div = match f.tab {
+            super::project_view::PROJECT_TAB => self.render_project(cx),
             KERNEL_TAB => self.render_kernel_tab(window, cx),
-            2 => self.render_rules(cx),
-            3 => self.render_mcp(window, cx),
+            3 => self.render_rules(cx),
+            4 => self.render_mcp(window, cx),
             PLUGINS_TAB => self.render_plugins(cx),
             super::usage_view::USAGE_TAB => self.render_usage_page(cx),
+            super::memory_view::MEMORY_TAB => self.render_memory(window, cx),
             _ => self.render_general(cx),
         };
 

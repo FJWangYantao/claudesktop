@@ -189,6 +189,18 @@ impl Harness {
         mcp_config: Option<PathBuf>,
         max_steps: usize,
     ) -> Self {
+        Self::build_full(provider, cwd, context_windows, mcp_config, max_steps, None)
+    }
+
+    /// 全部可配项（最后一项是全局记忆文件；`None` = 不读不写）。
+    fn build_full(
+        provider: ProviderConfig,
+        cwd: PathBuf,
+        context_windows: HashMap<String, u64>,
+        mcp_config: Option<PathBuf>,
+        max_steps: usize,
+        memory: Option<PathBuf>,
+    ) -> Self {
         let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
         let sink: EventSink = {
             let events = events.clone();
@@ -206,11 +218,30 @@ impl Harness {
                 max_steps,
                 // 起标题会多发一个请求，打乱剧本；专门测它的用例自己开
                 session_titles: false,
+                memory_path: memory,
             },
             sink,
         )
         .unwrap();
         Self { kernel, events }
+    }
+
+    /// 全局记忆指到临时文件（见 `memory_tests`）。
+    fn with_memory(base_url: String, cwd: PathBuf, memory: PathBuf) -> Self {
+        let provider = ProviderConfig {
+            base_url,
+            api_key: Some("test-key".into()),
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        Self::build_full(
+            provider,
+            cwd,
+            HashMap::new(),
+            None,
+            claudesktop_builtin::DEFAULT_MAX_STEPS,
+            Some(memory),
+        )
     }
 
     fn start(&self) -> String {
@@ -572,6 +603,7 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
             "list_dir",
             "glob",
             "todo_write",
+            "memory_write",
             "grep",
             "web_fetch",
             "web_search",
@@ -872,7 +904,17 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .collect();
     assert_eq!(
         names,
-        ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "web_search", "task"]
+        [
+            "read_file",
+            "list_dir",
+            "glob",
+            "todo_write",
+            "memory_write",
+            "grep",
+            "web_fetch",
+            "web_search",
+            "task"
+        ]
     );
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -2338,6 +2380,7 @@ fn session_title_comes_from_a_second_request() {
             plugins: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
             session_titles: true,
+            memory_path: None,
         },
         sink,
     )
@@ -2378,4 +2421,179 @@ fn session_title_comes_from_a_second_request() {
     assert_eq!(msgs.len(), 1);
     let prompt = msgs[0]["content"].as_str().unwrap();
     assert!(prompt.contains("把日志改成结构化") && prompt.contains("起一个简短的标题"), "{prompt}");
+}
+
+// ---------- 记忆 ----------
+
+/// 记忆里的条目数（读 JSON，按 scope 取文件）。
+fn memory_entries(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(path).expect("memory.json");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("memory.json 是 JSON");
+    value["entries"].as_array().cloned().unwrap_or_default()
+}
+
+/// 造一个项目目录（`.git` 让 `project_root` 认出来）。
+fn project_dir(name: &str) -> PathBuf {
+    let dir = workdir(name);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    dir
+}
+
+#[test]
+fn memory_write_lands_in_the_prompt_of_the_next_turn() {
+    let dir = project_dir("memory-write");
+    let global = dir.join("global-memory.json");
+    let (base, bodies) = serve(vec![
+        tool_call(
+            "m1",
+            "memory_write",
+            serde_json::json!({ "text": "构建只用 cargo test -p claudesktop-core，全量太慢", "tags": ["构建"] }),
+        ),
+        happy_stream("记下了"),
+        happy_stream("好"),
+    ]);
+    let h = Harness::with_memory(base, dir.clone(), global.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("以后构建就测试 core")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 1) 项目记忆文件里多出一条，`MemoryChanged` 报给界面；
+    //    记忆不占工具行（和 todo_write 一样是直接拦截的）
+    let path = dir.join(".claudesktop/memory.json");
+    let entries = memory_entries(&path);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["text"], "构建只用 cargo test -p claudesktop-core，全量太慢");
+    assert_eq!(entries[0]["tags"][0], "构建");
+    assert_eq!(entries[0]["source"]["turn"], 1);
+    assert_eq!(
+        h.count(
+            |e| matches!(e, KernelEvent::MemoryChanged { scope, count: 1 } if scope == "project")
+        ),
+        1
+    );
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { .. })), 0);
+
+    // 2) 下一轮的系统提示词里就有这条（记忆每轮重读，不是写进状态里常驻）
+    h.kernel.send_prompt(&sid, UserPrompt::text("再问一句")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let system = body(&bodies, 2)["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("# Memory"), "{system}");
+    assert!(system.contains("构建只用 cargo test -p claudesktop-core"), "{system}");
+    // 全局那份是空的，不该有那一段
+    assert!(!system.contains("## Everywhere"), "{system}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn memory_scope_global_is_per_user_and_project_goes_with_the_directory() {
+    let dir = project_dir("memory-scope");
+    let other = project_dir("memory-scope-other");
+    // 全局文件放在「数据目录」的位置：两个项目目录之外
+    let global = std::env::temp_dir()
+        .join(format!("claudesktop-kernel-{}-memory-global.json", std::process::id()));
+    let _ = std::fs::remove_file(&global);
+    let (base, _bodies) = serve(vec![
+        // 一条全局、一条项目
+        tool_calls(&[
+            (
+                "g1",
+                "memory_write",
+                serde_json::json!({ "text": "回复一律用中文", "scope": "global" }),
+            ),
+            (
+                "p1",
+                "memory_write",
+                serde_json::json!({ "text": "日志一律走 tracing", "scope": "project" }),
+            ),
+        ]),
+        happy_stream("记下了"),
+    ]);
+    let h = Harness::with_memory(base, dir.clone(), global.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("记两件事")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(memory_entries(&global).len(), 1);
+    assert_eq!(memory_entries(&dir.join(".claudesktop/memory.json")).len(), 1);
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::MemoryChanged { scope, count: 1 }
+            if scope == "global")),
+        1
+    );
+
+    // 换个项目目录再开一个会话：项目记忆没了，全局还在
+    let (base2, bodies2) = serve(vec![happy_stream("好")]);
+    let h2 = Harness::with_memory(base2, other.clone(), global.clone());
+    let sid2 = h2.start();
+    h2.kernel.send_prompt(&sid2, UserPrompt::text("你好")).unwrap();
+    h2.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let system = body(&bodies2, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("回复一律用中文"), "{system}");
+    assert!(!system.contains("日志一律走 tracing"), "{system}");
+    assert!(system.contains("## Everywhere") && !system.contains("## This project"), "{system}");
+    // 新目录不该凭空多出一份项目记忆文件
+    assert!(!other.join(".claudesktop/memory.json").exists());
+
+    // 原目录再开一个会话（新会话、历史为空）：两条都在
+    let (base3, bodies3) = serve(vec![happy_stream("好")]);
+    let h3 = Harness::with_memory(base3, dir.clone(), global.clone());
+    let sid3 = h3.start();
+    h3.kernel.send_prompt(&sid3, UserPrompt::text("你好")).unwrap();
+    h3.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let system = body(&bodies3, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("回复一律用中文") && system.contains("日志一律走 tracing"), "{system}");
+    let _ = std::fs::remove_file(&global);
+    for d in [&dir, &other] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn saving_the_same_note_twice_updates_one_entry() {
+    let dir = project_dir("memory-upsert");
+    let global = dir.join("global-memory.json");
+    let note = serde_json::json!({ "text": "构建只用 cargo test -p claudesktop-core，全量太慢", "tags": ["构建"] });
+    let (base, _bodies) = serve(vec![
+        tool_call("m1", "memory_write", note.clone()),
+        happy_stream("记下了"),
+        tool_call("m2", "memory_write", note.clone()),
+        happy_stream("还是那一条"),
+    ]);
+    let h = Harness::with_memory(base, dir.clone(), global);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("记一下")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = memory_entries(&dir.join(".claudesktop/memory.json"));
+    let created = first[0]["created_ms"].clone();
+
+    // 第二轮再说一遍同样的话（让 `updated_ms` 能拉开）
+    std::thread::sleep(Duration::from_millis(5));
+    h.kernel.send_prompt(&sid, UserPrompt::text("再记一遍")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let second = memory_entries(&dir.join(".claudesktop/memory.json"));
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0]["created_ms"], created);
+    assert!(second[0]["updated_ms"].as_u64() > created.as_u64(), "{second:?}");
+    // 两次都报了「一条」，不是「两条」
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::MemoryChanged { count: 1, .. })), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn broken_memory_file_still_opens_the_session_with_a_notice() {
+    let dir = project_dir("memory-broken");
+    let global = dir.join("global-memory.json");
+    std::fs::create_dir_all(dir.join(".claudesktop")).unwrap();
+    std::fs::write(dir.join(".claudesktop/memory.json"), "{ \"entries\": [ {, } ]").unwrap();
+    let (base, bodies) = serve(vec![happy_stream("好")]);
+    let h = Harness::with_memory(base, dir.clone(), global);
+    let sid = h.start();
+    // 开会话时就有一条能照着改的提示
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Notice(t) if t.contains("memory.json"))), 1);
+    h.kernel.send_prompt(&sid, UserPrompt::text("一")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 每轮重读会再报一次；提示词里没有记忆一节
+    assert!(h.count(|e| matches!(e, KernelEvent::Notice(t) if t.contains("memory.json"))) >= 1);
+    let system = body(&bodies, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(!system.contains("# Memory"), "{system}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

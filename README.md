@@ -30,6 +30,10 @@ Claude 风格的 AI 编程桌面端（Rust + GPUI），Windows 原生，**内核
 - 权限：Manual / Accept edits / Plan（只读）/ Bypass；「总是允许」按项目落盘，工作目录外的写入永远询问
 - 上下文：自动压缩（用量过窗口八成时总结较早对话），「超出上下文」报错后压缩一次重发，`/compact` 手动压缩
 - 读项目说明：`~/.claude/CLAUDE.md` + 工作目录到仓库根各层的 `AGENTS.md` / `CLAUDE.md` 进系统提示词，每轮重读
+- 项目级配置：项目根的 `.claudesktop/settings.json` 覆盖模型 / 权限规则 / 停用的 MCP / 只用哪些插件 / 说明文件，
+  设置页「项目」里改（只写和全局不一样的项）
+- 记忆：跨会话记住用户偏好 / 项目约定 / 做过的决定 / 踩过的坑，`memory_write` 记下、按预算进系统提示词，
+  全局在数据目录的 `memory.json`、项目在 `.claudesktop/memory.json`，设置页「记忆」可看可删
 - 子 agent：`task` 工具开子会话，同一步的几个并行跑，工具行缩进在各自的 Task 行下
 - 图片输入：粘贴截图或选文件，一轮最多 8 张
 
@@ -108,6 +112,7 @@ cargo run -p claudesktop
 settings.json        设置（含 provider 档案，保存后请自行保管）
 permissions.json     「总是允许」规则，按项目分组
 mcp.json             MCP 服务器配置
+memory.json          全局记忆（项目记忆在项目根的 .claudesktop/memory.json）
 plugins/             插件
 sessions/            每会话一份事件日志 + 元信息，图片附件在同级 .assets/
 gateway/<日期>.jsonl 用量日志
@@ -118,7 +123,7 @@ gateway/<日期>.jsonl 用量日志
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                                    # 235 个，不需要网络和密钥
+cargo test --workspace                                    # 302 个，不需要网络和密钥
 
 # 真实端点 / 真实 agent / 远程 MCP（默认 ignore，会花钱并需要网络）
 cargo test -p claudesktop-builtin -- --ignored
