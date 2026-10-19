@@ -34,6 +34,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
         "对话",
         &[
             ("停止这一轮（排队的消息退回输入框）", &[STOP_KEY]),
+            ("从子任务详情回到对话", &[STOP_KEY]),
             ("按权限卡上的按钮", &PERMISSION_KEYS),
             ("切换权限模式", &[CYCLE_MODE_KEY]),
             ("切换视图（摘要 / 标准 / 详细）", &[CYCLE_VIEW_KEY]),

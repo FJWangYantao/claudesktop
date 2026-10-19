@@ -5,11 +5,11 @@
 //! - 子会话和主会话共用同一个工具循环（`run_steps`），只换系统提示词和工具：工具按角色的清单筛，
 //!   不给 `task`（不嵌套）和 `todo_write`（计划是主会话的）
 //! - 子会话 ID 是 `主会话/task 调用 ID`。它的事件经 [`forward`] 转到主会话：工具行（ID 加上 task 调用的前缀、
-//!   带 `parent`，界面缩进在 task 那一行下面）、权限请求、文件改动（检查点照常记）、重试、用量；
-//!   文字、思考、压缩是子会话自己的事，不转
+//!   带 `parent`，界面收进 task 那张卡片、在子任务详情页里列出来）、回复和思考（换成 `SubagentChunk`，
+//!   只给详情页看）、权限请求、文件改动（检查点照常记）、重试、用量；压缩和一轮的结束是子会话自己的事，不转
 //! - 权限跟主会话当前的模式和「总是允许」规则；停止主会话的这一轮，子会话一起停
-//! - 同一步里的几个 `task` 一起跑（和连续的只读调用一样，见 `run_tools`）；各自的工具行在界面上
-//!   插在自己那个 task 行下面（`Session::apply_event`）
+//! - 同一步里的几个 `task` 一起跑（和连续的只读调用一样，见 `run_tools`）；各自的事件按 task 调用 ID
+//!   归到界面上自己那个子任务（`Session::subagents`）
 
 use claudesktop_core::KernelEvent;
 use claudesktop_core::plugin::{self, AgentDef};
@@ -132,6 +132,12 @@ pub fn forward(call: &str, event: KernelEvent) -> Option<KernelEvent> {
             KernelEvent::ToolCallUpdated { id: id(i), title, status, raw_output, output }
         }
         KernelEvent::ToolCallDiff { id: i, diff } => KernelEvent::ToolCallDiff { id: id(i), diff },
+        KernelEvent::AgentMessageChunk { text } => {
+            KernelEvent::SubagentChunk { task: call.to_string(), text, thought: false }
+        }
+        KernelEvent::AgentThoughtChunk { text } => {
+            KernelEvent::SubagentChunk { task: call.to_string(), text, thought: true }
+        }
         KernelEvent::PermissionRequest { id: req, title, options, tool } => {
             KernelEvent::PermissionRequest {
                 id: req,
@@ -186,7 +192,14 @@ mod tests {
                 parent: Some("t1".into()),
             })
         );
-        assert_eq!(forward("t1", KernelEvent::AgentMessageChunk { text: "x".into() }), None);
+        assert_eq!(
+            forward("t1", KernelEvent::AgentMessageChunk { text: "x".into() }),
+            Some(KernelEvent::SubagentChunk {
+                task: "t1".into(),
+                text: "x".into(),
+                thought: false
+            })
+        );
         assert_eq!(forward("t1", KernelEvent::Compacting), None);
         assert_eq!(forward("t1", KernelEvent::TurnEnded { stop_reason: "end_turn".into() }), None);
     }

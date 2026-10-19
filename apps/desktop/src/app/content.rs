@@ -1,4 +1,4 @@
-//! 内容区：输入框上方那一块（对话列表 / 首页概览 / 设置页），是独立的缓存 view（[`ContentView`]）。
+//! 内容区：输入框上方那一块（对话列表 / 首页概览 / 设置页 / 子任务详情），是独立的缓存 view（[`ContentView`]）。
 //!
 //! 打字时输入框通知它自己的 view，祖先 `ChatApp` 跟着重画；内容区不是输入框的祖先，缓存照旧复用，
 //! 所以打一个字只重画输入区、顶栏这些，不重画对话（长 markdown、代码块一帧好几毫秒）。
@@ -47,6 +47,13 @@ impl ChatApp {
             return v_flex().size_full().child(self.render_settings(window, cx)).into_any_element();
         }
         let active = self.active;
+        // 点开了子任务：详情页占内容区；那个子任务已经不在了（回退过）就回到对话
+        if let Some(task) = self.sessions[active].viewing_task.clone() {
+            if let Some(page) = self.render_task_page(&task, window, cx) {
+                return page;
+            }
+            self.sessions[active].viewing_task = None;
+        }
         // 还没发过消息的会话显示首页（与官方空会话一致，输入框在底部）
         if !self.sessions[active].has_user_message() {
             // 放大字号后放不下时整页往下长、可以滚（min_h 而不是 h：定高时居中的内容会从上下两头溢出，

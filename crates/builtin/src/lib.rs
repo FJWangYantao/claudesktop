@@ -1154,6 +1154,14 @@ impl Inner {
             sessions.insert(child.clone(), state);
             flag
         };
+        self.emit(
+            Some(session),
+            KernelEvent::SubagentStarted {
+                task: call_id.to_string(),
+                agent: agent.name.clone(),
+                prompt: prompt.to_string(),
+            },
+        );
         let result = run_steps(self, &child, &flag);
         self.sessions.lock().unwrap().remove(&child);
         match result {

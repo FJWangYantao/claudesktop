@@ -329,12 +329,23 @@ mod tests {
         let records = vec![
             Record::user("找一下"),
             started("t1", "Task 找秘密", None),
+            ev(KernelEvent::SubagentStarted {
+                task: "t1".into(),
+                agent: "general-purpose".into(),
+                prompt: "Find it".into(),
+            }),
             started("t1/c1", "Read notes.txt", Some("t1")),
             done("t1/c1", "1 行"),
+            ev(KernelEvent::SubagentChunk {
+                task: "t1".into(),
+                text: "秘密是 42".into(),
+                thought: false,
+            }),
             done("t1", "秘密是 42"),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
         ];
         let msgs = rebuild(&records).messages;
+        assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1].text().unwrap(), "[tool] Task 找秘密 → completed：秘密是 42");
     }
 
