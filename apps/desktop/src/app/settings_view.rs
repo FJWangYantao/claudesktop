@@ -2,7 +2,7 @@
 
 use super::ChatApp;
 use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
-use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::menu::{FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover};
 use super::motion::{self, Reveal};
 use super::settings_kit::*;
 use super::widgets::{MeasuredWidth, Surface};
@@ -2048,7 +2048,8 @@ fn rule_label(rule: &str) -> String {
     }
 }
 /// 界面字体下拉的条目：第一项是内嵌的 Inter，后面跟系统已装字体（可滚动，最多列一批）。
-/// 当前项打勾；列不完的靠「还有 N 款」提示，需要的话在设置文件里手写字体名。
+/// 每项用该字体本身排一行预览（`font_menu_item`），当前项打勾；
+/// 列不完的靠「还有 N 款」提示，需要的话在设置文件里手写字体名。
 fn font_family_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
@@ -2060,11 +2061,11 @@ fn font_family_menu_items(
 
     // 内嵌的 Inter：字体族为空即表示用它
     menu = menu.pick(
-        menu_item(
+        font_menu_item(
             "font-embedded",
-            IconAll::ALargeSmall,
             "Inter（内嵌）",
-            "随应用分发，中文由系统字体回退",
+            DEFAULT_SANS,
+            FONT_PREVIEW,
             current.is_none(),
         ),
         |this, cx| this.set_font_family(None, cx),
@@ -2075,7 +2076,7 @@ fn font_family_menu_items(
         let active = current.as_deref() == Some(name.as_str());
         let picked: SharedString = name.clone().into();
         menu = menu.pick(
-            menu_item(("font-item", i), IconAll::Type, name.clone(), "", active),
+            font_menu_item(("font-item", i), name.clone(), name.clone(), FONT_PREVIEW, active),
             move |this, cx| this.set_font_family(Some(picked.clone()), cx),
         );
     }

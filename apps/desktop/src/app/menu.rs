@@ -246,6 +246,65 @@ pub(super) fn menu_item(
         .when(active, |d| d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL))))
 }
 
+/// 字体预览行用的样例字：拉丁字母（字宽 / 字形差异最明显）、数字、中文
+/// （缺字形时走回退，和真正用起来的观感一致）。
+pub(super) const FONT_PREVIEW: &str = "永远保持好奇 Aa 123";
+
+/// 字体菜单条目：上面一行灰字写名称（界面字体排，始终读得清），下面用**这个字体本身**
+/// 排一行预览——挑字体看的是字形，不是一个名字。行尾当前项打勾。
+///
+/// `family` 传字体族原名（内嵌的 Inter 也传它的族名，别用 `sans()`：选着别的字体时
+/// 那一项的预览会跟着变，就不成参照了）。
+pub(super) fn font_menu_item(
+    id: impl Into<ElementId>,
+    name: impl Into<SharedString>,
+    family: impl Into<SharedString>,
+    sample: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    let family: SharedString = family.into();
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .gap_2p5()
+        .px_2p5()
+        .py_2()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(HOVER)))
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .child(name.into()),
+                )
+                .child(
+                    // 预览行：中文缺字形时按根视图的中文回退字体排，和真正用起来的观感一致
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .font_family(family)
+                        .text_size(TEXT_LEAD)
+                        .text_color(rgb(INK))
+                        .child(sample.into()),
+                ),
+        )
+        .when(active, |d| {
+            d.child(Icon::new(IconAll::Check).size_4().flex_shrink_0().text_color(rgb(CORAL)))
+        })
+}
+
 /// 组一个下拉菜单：`chip` 是 trigger，面板锚在 chip 上按 `anchor` 方向展开，
 /// 宽 `width`（rem，跟着界面字号缩放，否则放大字号后说明文字挤得折行）。`items` 每次渲染面板时调用——`app` 是当前状态快照（读数据），
 /// `handle` / `popover` 交给 [`MenuList::new`]。`focus` 传 `ChatApp::menu_focus`。
