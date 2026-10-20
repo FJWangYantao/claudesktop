@@ -231,5 +231,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   命令行（`ToolCard::shows_command`）随时可点开，展开后先列完整命令，所以行上不挂悬停提示。长文本的悬停提示用 `chat.rs` 的 `text_tip`（限宽、截断），别直接 `Tooltip::new`。
 - 逐块审查（`crates/core/src/review.rs` + `app/review.rs`）：只审最新一轮、跑完了才行；撤回 / 恢复写盘后追加带 `reverted` 的 `Record::FileChanged`（回退照常算），
   下一条消息的 `sent` 前面附 `<user-review>` 说明（`Session::review_pending` 只是提示，说明从日志现算）。磁盘现状对不上就只读，不合并。
+- 记忆（`crates/core/src/memory.rs` + `crates/builtin/src/remember.rs` + `app/memory_view.rs`）：两份 JSON（数据目录 / 项目根 `.claudesktop/`），
+  文件是唯一真相、每轮重读。**系统提示词那一节只放预算内的**（`pick_missed` 按 `pinned` → 最近用过 / 改过排），这一轮相关的另附 `<memory-context>` 在用户消息尾
+  （`Inner::attach_memory`，system 变了会废掉提示缓存）；超预算的条数写在提示词里让模型用 `memory_search` 找。
+  `used_ms` 不在每轮写（进 git 的项目记忆会一直变），只在本来就要写盘时由 `mark_used` 刷。`memory_forget` 只删本会话记下的（别的会话的让用户去设置页删）。
+  第 3 期的候选只进设置页顶部「待确认」（`KernelEvent::MemorySuggested`，不进日志、不进对话流），用户收下才落盘；开关 `memory_suggest` 默认关。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。

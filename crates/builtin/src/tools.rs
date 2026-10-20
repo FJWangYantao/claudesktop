@@ -28,6 +28,10 @@ const WEB_FETCH: &str = "web_fetch";
 const WEB_SEARCH: &str = "web_search";
 pub const TODO_WRITE: &str = "todo_write";
 pub const MEMORY_WRITE: &str = "memory_write";
+pub const MEMORY_SEARCH: &str = "memory_search";
+pub const MEMORY_FORGET: &str = "memory_forget";
+/// `memory_search` 最多返回几条
+pub const MEMORY_SEARCH_MAX: usize = 12;
 /// 待办清单最多几项
 const TODO_MAX: usize = 50;
 /// 清单里还有没做完的项、连续这么多步没更新时，提醒模型一次
@@ -35,7 +39,10 @@ pub const TODO_REMIND_STEPS: u32 = 8;
 /// 压缩摘要末尾附的清单的标题（再压缩时先去掉，免得旧清单被抄进新摘要）
 const TODO_SECTION: &str = "\n\n## Todo list at the time of compaction\n";
 
-/// 能和相邻调用并行执行的工具：只读、不问权限、互不影响。
+/// 能不能和相邻的只读调用并行跑。
+///
+/// 只收**真正走 `start_tool` + `finish_tool`** 的只读工具：`todo_write` / `memory_*` 这些在
+/// `Inner::run_tool` 里直接拦截的不能进来（并行分支 bypass 掉那段拦截，会当成普通工具解析）。
 pub fn parallel_safe(name: &str) -> bool {
     matches!(name, READ_FILE | LIST_DIR | GLOB | GREP)
 }
@@ -321,6 +328,26 @@ pub fn specs(writable: bool) -> Vec<Value> {
                 "required": ["query"]
             }),
         ),
+        f(
+            MEMORY_SEARCH,
+            "Search the notes saved for later sessions (user preferences, project conventions, \
+             decisions, pitfalls) and return the matching ones. Only the notes that fit the budget \
+             are in the system prompt; use this to look up the rest. Plain words, not a regex; \
+             case-insensitive. Read-only."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Words to look for" },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global", "all"],
+                        "description": "all (default): this project and every project"
+                    }
+                },
+                "required": ["query"]
+            }),
+        ),
     ];
     if writable {
         // 记忆会写文件（项目记忆在项目目录里），Plan 模式只读，不给
@@ -354,6 +381,30 @@ pub fn specs(writable: bool) -> Vec<Value> {
                     "pinned": { "type": "boolean", "description": "Keep it in context and never evict it" }
                 },
                 "required": ["text"]
+            }),
+        ));
+        // 删记忆是写文件，和 memory_write 一样在 Plan 模式下不给
+        tools.push(f(
+            MEMORY_FORGET,
+            "Delete a note saved earlier. Use it when a note is wrong, outdated, or the user says \
+             to forget it. You can only delete notes this same session saved (the user can delete \
+             any of them in the settings); if the note came from an earlier session, tell the user \
+             where to delete it instead of guessing."
+                .to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Words from the note (or its text), enough to pick it out"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global", "all"],
+                        "description": "all (default): this project and every project"
+                    }
+                },
+                "required": ["query"]
             }),
         ));
         tools.push(f(
@@ -606,10 +657,50 @@ pub fn parse_memory(
     Ok((scope, entry))
 }
 
+#[derive(Deserialize)]
+struct MemoryQueryArgs {
+    query: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// 记忆工具的作用范围：`all`（默认，两份都算）/ `project` / `global`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryWhere {
+    All,
+    Only(claudesktop_core::memory::Scope),
+}
+
+impl MemoryWhere {
+    /// 这个范围要不要读某一份。
+    pub fn includes(self, scope: claudesktop_core::memory::Scope) -> bool {
+        match self {
+            MemoryWhere::All => true,
+            MemoryWhere::Only(s) => s == scope,
+        }
+    }
+}
+
+/// `memory_search` / `memory_forget` 的参数 → (查什么, 查哪些范围)；错误信息回给模型。
+pub fn parse_memory_query(tool: &str, arguments: &str) -> Result<(String, MemoryWhere), String> {
+    use claudesktop_core::memory::Scope;
+    let args: MemoryQueryArgs = serde_json::from_str(arguments)
+        .map_err(|e| format!("Invalid arguments for {tool}: {e}"))?;
+    let query = args.query.trim().to_string();
+    if query.is_empty() {
+        return Err(format!("{tool}: `query` is empty"));
+    }
+    let where_ = match args.scope.as_deref().map(str::trim) {
+        None | Some("") | Some("all") => MemoryWhere::All,
+        Some(other) => MemoryWhere::Only(Scope::parse(other).ok_or_else(|| {
+            format!("{tool}: `scope` must be \"project\", \"global\" or \"all\"")
+        })?),
+    };
+    Ok((query, where_))
+}
+
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+    claudesktop_core::memory::now_ms()
 }
 
 #[derive(Deserialize)]
@@ -2294,5 +2385,42 @@ y
         assert!(seen.iter().any(|p| p == "first"), "{seen:?}");
         assert_eq!(seen.iter().filter(|p| *p == "first").count(), 1, "{seen:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 记忆工具的参数：`scope` 的三种写法、空查询、写错的 scope
+    #[test]
+    fn memory_query_args() {
+        use claudesktop_core::memory::Scope;
+        let (query, only) = parse_memory_query(MEMORY_SEARCH, r#"{"query":" 构建 "}"#).unwrap();
+        assert_eq!(query, "构建");
+        assert_eq!(only, MemoryWhere::All);
+        let (_, only) =
+            parse_memory_query(MEMORY_SEARCH, r#"{"query":"x","scope":"global"}"#).unwrap();
+        assert!(only.includes(Scope::Global) && !only.includes(Scope::Project));
+        let (_, only) =
+            parse_memory_query(MEMORY_FORGET, r#"{"query":"x","scope":"all"}"#).unwrap();
+        assert!(only.includes(Scope::Global) && only.includes(Scope::Project));
+        assert!(parse_memory_query(MEMORY_SEARCH, r#"{"query":"  "}"#).is_err());
+        assert!(parse_memory_query(MEMORY_SEARCH, r#"{"query":"x","scope":"both"}"#).is_err());
+        assert!(parse_memory_query(MEMORY_SEARCH, "{}").is_err());
+    }
+
+    /// `memory_write` 的参数：默认项目、标签截到上限、没写 scope 就是项目
+    #[test]
+    fn memory_write_args() {
+        use claudesktop_core::memory::{self, Scope};
+        let (scope, entry) =
+            parse_memory(r#"{"text":"回复用中文","tags":["偏好","语言"]}"#).unwrap();
+        assert_eq!(scope, Scope::Project);
+        assert_eq!(entry.text, "回复用中文");
+        assert_eq!(entry.tags, ["偏好", "语言"]);
+        let (scope, _) = parse_memory(r#"{"text":"x","scope":"global"}"#).unwrap();
+        assert_eq!(scope, Scope::Global);
+        assert!(parse_memory(r#"{"text":"  "}"#).is_err());
+        assert!(parse_memory(r#"{"text":"x","scope":"both"}"#).is_err());
+        let many: Vec<String> = (0..memory::MAX_TAGS + 3).map(|i| format!("t{i}")).collect();
+        let args = serde_json::json!({"text": "x", "tags": many}).to_string();
+        let (_, entry) = parse_memory(&args).unwrap();
+        assert_eq!(entry.tags.len(), memory::MAX_TAGS);
     }
 }

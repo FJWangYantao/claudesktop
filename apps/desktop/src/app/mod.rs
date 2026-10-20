@@ -171,6 +171,8 @@ pub struct ChatApp {
     mcp_form: mcp_view::McpForm,
     /// 设置页「记忆」：看哪一栏、搜索、读到的两份记忆条目
     memory_form: memory_view::MemoryForm,
+    /// 内核提炼出来的「待确认」记忆（收下才落盘；只在内存里，重启就没了）
+    memory_candidates: memory_view::MemoryCandidates,
     /// 设置页「项目」：项目根、表单值、读文件时的问题
     project_form: project_view::ProjectForm,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
@@ -427,6 +429,7 @@ impl ChatApp {
             plugins_form,
             mcp_form,
             memory_form,
+            memory_candidates: Default::default(),
             project_form,
             plugins: claudesktop_core::plugin::default_plugins_dir()
                 .map(|d| claudesktop_core::plugin::discover(&d))
@@ -1535,6 +1538,21 @@ impl ChatApp {
                 }
             }
             KernelEvent::McpStatus { servers } => slot.mcp = servers,
+            KernelEvent::MemorySuggested { candidates } => {
+                // 只进设置页顶部的待确认区，不进对话流（误记的代价比漏记大）。
+                // 来源会话用事件自己的 sessionId；第几轮按对话里的用户消息数算（和内核的轮次对齐）
+                let sid = session.clone().unwrap_or_default();
+                let turn = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.acp_id.as_deref() == Some(sid.as_str()))
+                    .map(|s| {
+                        s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count()
+                    })
+                    .unwrap_or(0) as u64;
+                self.memory_candidates.push(candidates, &sid, turn);
+                cx.notify();
+            }
             KernelEvent::BackgroundTasks { tasks } => {
                 slot.tasks = tasks;
                 cx.notify();

@@ -204,6 +204,30 @@ impl Harness {
         memory: Option<PathBuf>,
         auto: Option<claudesktop_builtin::AutoModeConfig>,
     ) -> Self {
+        Self::build_full_with(
+            provider,
+            cwd,
+            context_windows,
+            mcp_config,
+            max_steps,
+            memory,
+            false,
+            auto,
+        )
+    }
+
+    /// 同 [`Harness::build_full`]，多一个「回合结束提炼候选」的开关。
+    #[allow(clippy::too_many_arguments)]
+    fn build_full_with(
+        provider: ProviderConfig,
+        cwd: PathBuf,
+        context_windows: HashMap<String, u64>,
+        mcp_config: Option<PathBuf>,
+        max_steps: usize,
+        memory: Option<PathBuf>,
+        memory_suggest: bool,
+        auto: Option<claudesktop_builtin::AutoModeConfig>,
+    ) -> Self {
         let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
         let sink: EventSink = {
             let events = events.clone();
@@ -222,6 +246,8 @@ impl Harness {
                 // 起标题会多发一个请求，打乱剧本；专门测它的用例自己开
                 session_titles: false,
                 memory_path: memory,
+                // 提炼候选记忆也是额外一个请求；专门测它的用例自己开
+                memory_suggest,
                 auto_mode: auto,
             },
             sink,
@@ -245,6 +271,26 @@ impl Harness {
             None,
             claudesktop_builtin::DEFAULT_MAX_STEPS,
             Some(memory),
+            None,
+        )
+    }
+
+    /// 同 [`Harness::with_memory`]，另外指定要不要在每轮结束后提炼候选记忆。
+    fn with_memory_suggest(base_url: String, cwd: PathBuf, memory: PathBuf, suggest: bool) -> Self {
+        let provider = ProviderConfig {
+            base_url,
+            api_key: Some("test-key".into()),
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        Self::build_full_with(
+            provider,
+            cwd,
+            HashMap::new(),
+            None,
+            claudesktop_builtin::DEFAULT_MAX_STEPS,
+            Some(memory),
+            suggest,
             None,
         )
     }
@@ -2693,6 +2739,7 @@ fn session_title_comes_from_a_second_request() {
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
             session_titles: true,
             memory_path: None,
+            memory_suggest: false,
             auto_mode: None,
         },
         sink,
@@ -2945,6 +2992,154 @@ fn broken_memory_file_still_opens_the_session_with_a_notice() {
     assert!(h.count(|e| matches!(e, KernelEvent::Notice(t) if t.contains("memory.json"))) >= 1);
     let system = body(&bodies, 0)["messages"][0]["content"].as_str().unwrap().to_string();
     assert!(!system.contains("# Memory"), "{system}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 第 2 期：系统提示词装不下的条目，这一轮提到时另附在用户消息尾（`<memory-context>`）；
+/// `memory_search` 直接查文件、`memory_forget` 只删本会话记下的——两个都不占工具行、不用授权
+#[test]
+fn memory_context_rides_on_the_user_message_and_needs_no_permission() {
+    let dir = project_dir("memory-context");
+    let global = dir.join("global-memory.json");
+    std::fs::create_dir_all(dir.join(".claudesktop")).unwrap();
+    // 项目里一条（预算宽松，会进系统提示词）
+    std::fs::write(
+        dir.join(".claudesktop/memory.json"),
+        serde_json::json!({"entries": [{
+            "id": "m-proj", "text": "日志一律走 tracing", "tags": ["日志"],
+            "created_ms": 1, "updated_ms": 1, "used_ms": 1
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    // 全局：一条要等「这一轮提到」才带出来的（很旧，排在最后）+ 一堆占满预算的填充条目
+    let mut entries = vec![serde_json::json!({
+        "id": "m-glob", "text": "包管理用 pnpm，不用 npm", "tags": ["构建"],
+        "created_ms": 1, "updated_ms": 1, "used_ms": 1,
+        "source": { "session": "builtin-别的会话", "turn": 2 }
+    })];
+    for i in 0..40 {
+        entries.push(serde_json::json!({
+            "id": format!("fill-{i}"),
+            "text": format!("第 {i} 条与这个话题无关的占位记忆，用来把全局记忆的预算占满，内容够长"),
+            "created_ms": 5_000, "updated_ms": 5_000, "used_ms": 5_000
+        }));
+    }
+    std::fs::write(&global, serde_json::json!({ "entries": entries }).to_string()).unwrap();
+
+    let (base, bodies) = serve(vec![
+        tool_calls(&[
+            ("f1", "memory_forget", serde_json::json!({ "query": "pnpm", "scope": "all" })),
+            ("s1", "memory_search", serde_json::json!({ "query": "tracing" })),
+        ]),
+        happy_stream("好"),
+    ]);
+    let h = Harness::with_memory(base, dir.clone(), global.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("pnpm 那个锁文件怎么处理的")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 系统提示词：项目那条在、全局那条被预算挤掉了（并告诉模型还有几条没带上）
+    let first = body(&bodies, 0);
+    let system = first["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("日志一律走 tracing"), "{system}");
+    assert!(!system.contains("包管理用 pnpm"), "{system}");
+    assert!(system.contains("did not fit"), "{system}");
+    // 这一轮提到了 pnpm：附在用户消息尾，而不是塞进系统提示词
+    let user = first["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(user.contains("<memory-context>"), "{user}");
+    assert!(user.contains("包管理用 pnpm"), "{user}");
+    // 系统提示词里已经有的那条不重复附
+    assert!(!user.contains("日志一律走 tracing"), "{user}");
+
+    // 工具结果（第 2 个请求里）：搜到了项目那条；删别人的条目什么都不删
+    let tool_msg = body(&bodies, 1)["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(tool_msg.contains("日志一律走 tracing"), "{tool_msg}");
+    assert!(tool_msg.contains("nothing was deleted"), "{tool_msg}");
+    assert_eq!(memory_entries(&global).len(), 41);
+    // 两个都不占工具行、也不用授权
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { .. })), 0);
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `memory_forget` 删自己记下的：文件里那条没了，`MemoryChanged` 报给界面
+#[test]
+fn memory_forget_deletes_what_this_session_saved() {
+    let dir = project_dir("memory-forget");
+    let global = dir.join("global-memory.json");
+    let (base, _bodies) = serve(vec![
+        tool_call(
+            "m1",
+            "memory_write",
+            serde_json::json!({ "text": "构建只用 cargo test -p claudesktop-core", "tags": ["构建"] }),
+        ),
+        happy_stream("记下了"),
+        tool_call("f1", "memory_forget", serde_json::json!({ "query": "构建只用 cargo test" })),
+        happy_stream("删掉了"),
+    ]);
+    let h = Harness::with_memory(base, dir.clone(), global);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("记一下")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let path = dir.join(".claudesktop/memory.json");
+    assert_eq!(memory_entries(&path).len(), 1);
+
+    h.kernel.send_prompt(&sid, UserPrompt::text("这个别记了")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert!(memory_entries(&path).is_empty(), "{:?}", memory_entries(&path));
+    // 记下时一条、删掉时再一条（count 都是当时的条数）
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::MemoryChanged { .. })), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 第 3 期：开着 `memory_suggest` 时，一轮结束后提炼出候选（只发事件、不写文件）
+#[test]
+fn suggested_memories_are_only_candidates() {
+    let dir = project_dir("memory-suggest");
+    let global = dir.join("global-memory.json");
+    let (base, bodies) = serve(vec![
+        happy_stream("好，以后都这么做"),
+        // 提炼的那次请求：只输出一句话
+        happy_stream("- 构建只用 cargo test -p claudesktop-core，全量太慢\n"),
+    ]);
+    let h = Harness::with_memory_suggest(base, dir.clone(), global, true);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("以后构建只测 core")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 提炼是在这一轮结束之后另起一次请求：等那个事件（同 `name_session` 的测法）
+    h.wait_for("MemorySuggested", Duration::from_secs(10), |e| {
+        matches!(e, KernelEvent::MemorySuggested { .. })
+    });
+
+    // 提炼的请求带上了这一轮的两句话、不带工具
+    let second = body(&bodies, 1);
+    assert!(second["tools"].as_array().is_none_or(|t| t.is_empty()), "{second}");
+    let sent = second["messages"].as_array().unwrap()[1]["content"].as_str().unwrap().to_string();
+    assert!(sent.contains("以后构建只测 core"), "{sent}");
+    assert!(sent.contains("好，以后都这么做"), "{sent}");
+
+    // 候选只发事件：文件一条都没写
+    let candidates = h.events.lock().unwrap().iter().find_map(|r| match &r.event {
+        KernelEvent::MemorySuggested { candidates } => Some(candidates.clone()),
+        _ => None,
+    });
+    let candidates = candidates.expect("MemorySuggested");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].text, "构建只用 cargo test -p claudesktop-core，全量太慢");
+    assert!(!dir.join(".claudesktop/memory.json").exists());
+    // 也不进对话流（没有工具行）
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { .. })), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

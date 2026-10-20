@@ -8,7 +8,9 @@
 //! 这一层不依赖内核、不依赖 UI，全部可单测（和 `project` / `checkpoint` 的分层一致）。
 //!
 //! 一条记忆 = 一句话结论 + 为什么，不是流水账；`text` 硬截到 [`MAX_TEXT_CHARS`]。
-//! 进上下文时按字符预算截取（[`pick`]），不是全塞。
+//! 进上下文时按字符预算截取（[`pick`]），不是全塞；这一轮用户消息里提到的条目另附在
+//! 用户消息尾部（[`search`] + [`context_block`]，同 `prompt_hooks` 的 `<plugin-hook-context>` 写法），
+//! 系统提示词那一节保持稳定，不破坏提示缓存。
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -16,6 +18,11 @@ use std::path::{Path, PathBuf};
 
 /// 一条记忆的 `text` 最多多少字符（超了截断）
 pub const MAX_TEXT_CHARS: usize = 400;
+/// 附在用户消息尾部的 `<memory-context>` 最多多少字符
+pub const CONTEXT_BUDGET: usize = 1_200;
+/// 关键词命中的最低分：撞上一个词就算相关（中文二元组往往只重合一个），
+/// 整串出现在正文里另加 [`CONTAINS_SCORE`] 分，排到前面
+pub const MIN_SCORE: usize = 1;
 /// 一条记忆最多带几个标签
 pub const MAX_TAGS: usize = 6;
 /// 全局记忆最多多少条（超了淘汰最久没更新的，`pinned` 不淘汰）
@@ -145,6 +152,14 @@ pub fn global_path() -> Option<PathBuf> {
 /// 项目记忆文件：`<项目根>/.claudesktop/memory.json`。
 pub fn project_path(root: &Path) -> PathBuf {
     root.join(crate::project::DIR).join("memory.json")
+}
+
+/// 现在几点（毫秒，从 1970 算）。调用方给 `Entry::new` / `mark_used` / `edit` 用，
+/// 单测里换成固定值就不用等时钟。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// 工作目录对应的项目记忆文件（找不到项目根时为 None：新项目还没有任何标记）。
@@ -279,15 +294,17 @@ pub fn upsert(entries: &mut Vec<Entry>, entry: Entry) -> bool {
     false
 }
 
-/// 超上限时淘汰最久没更新的那条（`pinned` 不动）。和 [`pick`] 的顺序一致：
-/// 进上下文的是最近更新的，淘汰的就是最不会被带进去的。
+/// 超上限时淘汰「最久没被带进上下文」的那条（`pinned` 不动）。
+///
+/// 排序键取 `used_ms` 和 `updated_ms` 里大的那个：刚记下 / 刚改过的也算「最近用过」。
+/// 老文件里 `used_ms` 和 `updated_ms` 一样，退化成按更新时间淘汰。
 pub fn enforce_limits(entries: &mut Vec<Entry>, max: usize) {
     while entries.len() > max {
         let victim = entries
             .iter()
             .enumerate()
             .filter(|(_, e)| !e.pinned)
-            .min_by_key(|(_, e)| e.updated_ms)
+            .min_by_key(|(_, e)| e.used_ms.max(e.updated_ms))
             .map(|(i, _)| i);
         match victim {
             Some(i) => drop(entries.remove(i)),
@@ -297,20 +314,91 @@ pub fn enforce_limits(entries: &mut Vec<Entry>, max: usize) {
     }
 }
 
-/// 进上下文的顺序：`pinned` 优先，再按 `updated_ms` 新的在前，截到 `budget` 字符。
+/// 把「这一轮带进过上下文」的条目标成刚用过（[`enforce_limits`] 据此淘汰）。
+///
+/// **只在本来就要写盘的时候调**（记新的一条、界面上的增删改）：每轮都写一次会让
+/// 进 git 的项目记忆一天变几十次，而淘汰只差几个字节的精度。返回改了几条。
+pub fn mark_used(entries: &mut [Entry], ids: &[String], now_ms: u64) -> usize {
+    let mut touched = 0;
+    for entry in entries.iter_mut().filter(|e| ids.iter().any(|id| id == &e.id)) {
+        entry.used_ms = now_ms;
+        touched += 1;
+    }
+    touched
+}
+
+/// 删一条（`memory_forget` 工具、界面删除共用）。`needle` 是条目 id 或正文（不分大小写、
+/// 忽略标点后相等，或者正文里包含它）。
+///
+/// `only_from` 有值时只删那个会话记下的条目（`source.session` 对得上）：
+/// 模型只能删**自己这一轮 / 这个会话**记下的，误删别人的代价比误记大得多
+/// （设计说明第十二节第 3 条）。返回删掉的条数。
+pub fn forget(entries: &mut Vec<Entry>, needle: &str, only_from: Option<&str>) -> usize {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return 0;
+    }
+    let key = norm(needle);
+    let before = entries.len();
+    entries.retain(|e| {
+        let mine = only_from.is_none_or(|s| e.source.as_ref().is_some_and(|src| src.session == s));
+        if !mine {
+            return true;
+        }
+        let (same_id, same_text) =
+            (e.id == needle, !key.is_empty() && norm(&e.text).contains(&key));
+        !(same_id || same_text)
+    });
+    before - entries.len()
+}
+
+/// 改一条（界面上编辑正文 / 标签 / `pinned`）：按 id 找到，改 `text`（截到 [`MAX_TEXT_CHARS`]）
+/// 和标签、`pinned`，`updated_ms` 换新的。找不到返回 false。
+pub fn edit(
+    entries: &mut [Entry],
+    id: &str,
+    text: &str,
+    tags: Vec<String>,
+    pinned: bool,
+    now_ms: u64,
+) -> bool {
+    let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+        return false;
+    };
+    let text = clip_text(text.trim());
+    if !text.is_empty() {
+        entry.text = text;
+    }
+    entry.tags = tags
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .take(MAX_TAGS)
+        .collect();
+    entry.pinned = pinned;
+    entry.updated_ms = now_ms;
+    true
+}
+
+/// 进上下文的顺序：`pinned` 优先，再按「最近用过 / 改过」，截到 `budget` 字符。
 pub fn pick(entries: &[Entry], budget: usize) -> Vec<&Entry> {
+    pick_missed(entries, budget).0
+}
+
+/// 同 [`pick`]，另外告诉调用方还有几条没带上（提示词末尾据此让模型用 `memory_search` 找）。
+pub fn pick_missed(entries: &[Entry], budget: usize) -> (Vec<&Entry>, usize) {
     let mut sorted: Vec<&Entry> = entries.iter().collect();
     sorted.sort_by(|a, b| {
         b.pinned
             .cmp(&a.pinned)
+            .then(b.used_ms.max(b.updated_ms).cmp(&a.used_ms.max(a.updated_ms)))
             .then(b.updated_ms.cmp(&a.updated_ms))
-            .then(b.used_ms.cmp(&a.used_ms))
     });
+    let total = sorted.len();
     let mut used = 0;
     let mut out = Vec::new();
     for entry in sorted {
-        let len = entry.text.chars().count()
-            + entry.tags.iter().map(|t| t.chars().count() + 1).sum::<usize>();
+        let len = entry_len(entry);
         if used + len > budget && !out.is_empty() {
             break;
         }
@@ -320,10 +408,59 @@ pub fn pick(entries: &[Entry], budget: usize) -> Vec<&Entry> {
             break;
         }
     }
+    let missed = total.saturating_sub(out.len());
+    (out, missed)
+}
+
+/// 条目在提示词里占多少字符（正文 + 标签）。
+fn entry_len(entry: &Entry) -> usize {
+    entry.text.chars().count() + entry.tags.iter().map(|t| t.chars().count() + 1).sum::<usize>()
+}
+
+/// 按关键词找条目（`memory_search` 工具、以及挑「这一轮相关」的条目共用）。
+///
+/// 匹配是两路：`query` 抽出的词（[`keywords`]）和条目正文 / 标签抽出的词求交集，
+/// 命中的词多的在前；查询整串是条目正文的子串也直接算命中（「cargo test」这种带空格的写法）。
+/// 不分大小写、不用索引——几百条的规模上几十行就够（同 `history_search`）。
+pub fn ranked<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    query: &str,
+    min_score: usize,
+) -> Vec<(&'a Entry, usize)> {
+    let words = keywords(query);
+    let needle = norm(query);
+    if words.is_empty() && needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(&Entry, usize)> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let mut haystack = keywords(&entry.text);
+            for tag in &entry.tags {
+                haystack.extend(keywords(tag));
+            }
+            let mut score = words.iter().filter(|w| haystack.contains(w)).count();
+            // 整串命中（不分大小写、忽略标点）比凑巧撞上几个词可靠得多
+            if !needle.is_empty() && norm(&entry.text).contains(&needle) {
+                score += CONTAINS_SCORE;
+            }
+            (score >= min_score.max(1)).then_some((entry, score))
+        })
+        .collect();
+    // 分数高的在前，同分看谁最近用过 / 改过
+    out.sort_by(|a, b| {
+        b.1.cmp(&a.1).then(b.0.used_ms.max(b.0.updated_ms).cmp(&a.0.used_ms.max(a.0.updated_ms)))
+    });
     out
 }
 
+/// 整串出现在正文里的加分（比撞上几个词更可信）
+const CONTAINS_SCORE: usize = 3;
+
 /// 系统提示词里的 `# Memory` 一节；两份都空时返回 None。
+///
+/// 只放预算以内的（`pick_missed`），装不下的条数写在末尾。这一节要保持稳定（提示缓存），
+/// 所以「这一轮相关、但这里没带上的」另走 [`context`] 附在用户消息尾部。
 pub fn prompt_section(project: &[Entry], global: &[Entry]) -> Option<String> {
     if project.is_empty() && global.is_empty() {
         return None;
@@ -338,7 +475,8 @@ pub fn prompt_section(project: &[Entry], global: &[Entry]) -> Option<String> {
          when the user asks you to remember something, save it there instead of repeating the \
          conversation. Never store tokens, passwords or other credentials.",
     );
-    let project_picks = pick(project, PROJECT_BUDGET);
+    let mut missed = 0;
+    let (project_picks, project_missed) = pick_missed(project, PROJECT_BUDGET);
     if !project_picks.is_empty() {
         out.push_str("\n\n## This project\n");
         for entry in project_picks {
@@ -346,7 +484,8 @@ pub fn prompt_section(project: &[Entry], global: &[Entry]) -> Option<String> {
             out.push('\n');
         }
     }
-    let global_picks = pick(global, GLOBAL_BUDGET);
+    missed += project_missed;
+    let (global_picks, global_missed) = pick_missed(global, GLOBAL_BUDGET);
     if !global_picks.is_empty() {
         out.push_str("\n## Everywhere\n");
         for entry in global_picks {
@@ -354,10 +493,79 @@ pub fn prompt_section(project: &[Entry], global: &[Entry]) -> Option<String> {
             out.push('\n');
         }
     }
+    missed += global_missed;
+    if missed > 0 {
+        // 预算装不下的那些不是没了：告诉模型还能找回来（不然它会以为只记着上面几条）
+        out.push_str(&format!(
+            "\n{missed} more notes did not fit here; use `memory_search` to look them up when the \
+             topic comes up."
+        ));
+    }
     Some(out.trim_end().to_string())
 }
 
-/// 抽词（ASCII 词 + 中文二元组，都转小写）：第 2 期的关键词匹配用。
+/// 系统提示词那一节里**已经出现**的条目 id（`<memory-context>` 不重复附它们）。
+pub fn shown_ids(project: &[Entry], global: &[Entry]) -> Vec<String> {
+    pick(project, PROJECT_BUDGET)
+        .into_iter()
+        .chain(pick(global, GLOBAL_BUDGET))
+        .map(|e| e.id.clone())
+        .collect()
+}
+
+/// 附在**这条用户消息尾部**的相关记忆（`<memory-context>`）：和 `# Memory` 一节分开，
+/// 系统提示词保持稳定，不破坏提示缓存（同 `prompt_hooks` 的 `<plugin-hook-context>`）。
+///
+/// `exclude` 是系统提示词里已经出现过的条目 id，这里不重复；`query` 是这条用户消息。
+/// 没有相关条目、或消息是空的，返回 None。
+pub fn context_block(
+    project: &[Entry],
+    global: &[Entry],
+    query: &str,
+    exclude: &[&str],
+) -> Option<String> {
+    context(project, global, query, exclude).0
+}
+
+/// 同 [`context_block`]，另外给出进了这一节的条目 id（内核把它们记成「这一轮用过的」）。
+pub fn context(
+    project: &[Entry],
+    global: &[Entry],
+    query: &str,
+    exclude: &[&str],
+) -> (Option<String>, Vec<String>) {
+    let candidates: Vec<&Entry> =
+        project.iter().chain(global).filter(|e| !exclude.contains(&e.id.as_str())).collect();
+    let mut used = 0;
+    let mut picks: Vec<&Entry> = Vec::new();
+    for (entry, _) in ranked(candidates, query, MIN_SCORE) {
+        let len = entry_len(entry);
+        if used + len > CONTEXT_BUDGET && !picks.is_empty() {
+            break;
+        }
+        used += len;
+        picks.push(entry);
+        if used >= CONTEXT_BUDGET {
+            break;
+        }
+    }
+    if picks.is_empty() {
+        return (None, Vec::new());
+    }
+    let ids = picks.iter().map(|e| e.id.clone()).collect();
+    let lines: Vec<String> = picks.iter().map(|e| e.prompt_line()).collect();
+    (
+        Some(format!(
+            "<memory-context>\nNotes from earlier sessions that may bear on this message \
+             (background only: the instructions above win). Do not restate them.\n{}\n\
+             </memory-context>",
+            lines.join("\n")
+        )),
+        ids,
+    )
+}
+
+/// 抽词（ASCII 词 + 中文二元组，都转小写）：`ranked` 的关键词匹配、`memory_search` 都用它。
 pub fn keywords(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |word: String| {
@@ -697,6 +905,128 @@ mod tests {
         assert_eq!(keywords("构建，只用"), ["构建", "只用"]);
         assert!(keywords("  ").is_empty());
         assert_eq!(keywords("a"), Vec::<String>::new());
+    }
+
+    /// `pick` 按「最近用过 / 改过」排，超预算的条数报出来（提示词末尾据此提示 `memory_search`）
+    #[test]
+    fn pick_reports_what_did_not_fit() {
+        let mut a = entry("用过很久以前", 100);
+        a.used_ms = 9_000;
+        let mut b = entry("刚更新", 8_000);
+        b.used_ms = 0;
+        let entries = vec![a, b];
+        let (picked, missed) = pick_missed(&entries, 100);
+        assert_eq!(picked[0].text, "用过很久以前");
+        assert_eq!(missed, 0);
+        let (picked, missed) = pick_missed(&entries, 2);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(missed, 1);
+        // 提示词里说明还有几条没带上，怎么找回来
+        let section = prompt_section(&[], &entries).unwrap();
+        assert!(!section.contains("memory_search"), "{section}");
+        let many: Vec<Entry> =
+            (0..50).map(|i| entry(&format!("第 {i} 条{}", "长".repeat(60)), i)).collect();
+        let section = prompt_section(&[], &many).unwrap();
+        assert!(section.contains("memory_search"), "{section}");
+    }
+
+    /// 淘汰按 `used_ms` 和 `updated_ms` 里大的那个：刚被带进上下文的不淘汰
+    #[test]
+    fn used_time_protects_entries_from_eviction() {
+        let mut entries = vec![];
+        for i in 0..3u64 {
+            entries.push(entry(&format!("第 {i} 条"), i * 100));
+        }
+        // 最老的那条刚被带进上下文
+        let ids = vec![entries[0].id.clone()];
+        assert_eq!(mark_used(&mut entries, &ids, 5_000), 1);
+        assert_eq!(entries[0].used_ms, 5_000);
+        enforce_limits(&mut entries, 2);
+        let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["第 0 条", "第 2 条"]);
+    }
+
+    #[test]
+    fn ranked_matches_words_and_whole_phrases() {
+        let mut builds = entry("构建只用 cargo test -p claudesktop-core，全量太慢", 1);
+        builds.tags = vec!["构建".into()];
+        let chinese = entry("回复一律用中文", 2);
+        let unrelated = entry("日志一律走 tracing", 3);
+        let entries = vec![builds, chinese, unrelated];
+        // 中文二元组命中
+        let hits = ranked(&entries, "构建", 1);
+        assert_eq!(hits[0].0.text, "构建只用 cargo test -p claudesktop-core，全量太慢");
+        // 整串（带空格）命中加分
+        let hits = ranked(&entries, "cargo test", 1);
+        assert_eq!(hits[0].0.text, "构建只用 cargo test -p claudesktop-core，全量太慢");
+        // 大小写不敏感
+        assert_eq!(ranked(&entries, "TRACING", 1).len(), 1);
+        // 没有交集：什么都没匹配上
+        assert!(ranked(&entries, "python", 1).is_empty());
+        assert!(ranked(&entries, "", 1).is_empty());
+        // 门槛：整串命中加 3 分，「构建」对那条构建记忆是 1 + 3 = 4 分
+        assert_eq!(ranked(&entries, "中文", MIN_SCORE).len(), 1);
+        assert_eq!(ranked(&entries, "构建", 4).len(), 1);
+        assert!(ranked(&entries, "构建", 5).is_empty());
+    }
+
+    /// `<memory-context>`：只放相关的、系统提示词里已经有的不重复；太泛的不附
+    #[test]
+    fn context_block_only_carries_relevant_new_notes() {
+        let mut builds = entry("构建只用 cargo test -p claudesktop-core，全量太慢", 1);
+        builds.tags = vec!["构建".into()];
+        let chinese = entry("回复一律用中文", 2);
+        let project = vec![builds.clone()];
+        let global = vec![chinese.clone()];
+        let block = context_block(&project, &global, "这次构建怎么跑？", &[]).unwrap();
+        assert!(block.starts_with("<memory-context>"), "{block}");
+        assert!(block.contains("cargo test"), "{block}");
+        // 已经在系统提示词里的那条：没有再可附的了
+        assert!(
+            context_block(&project, &global, "这次构建怎么跑？", &[builds.id.as_str()]).is_none()
+        );
+        // 没关系的话不附
+        assert!(context_block(&project, &global, "今天天气怎么样", &[]).is_none());
+        assert!(context_block(&[], &[], "构建", &[]).is_none()); // 太长时截到预算
+        let many: Vec<Entry> =
+            (0..60).map(|i| entry(&format!("构建第 {i} 条{}", "很长".repeat(30)), i)).collect();
+        let block = context_block(&many, &[], "构建", &[]).unwrap();
+        assert!(block.chars().count() < CONTEXT_BUDGET + 400, "{}", block.chars().count());
+    }
+
+    /// `memory_forget` 只删本会话记下的；界面删除（`only_from` 为 None）不限来源
+    #[test]
+    fn forget_is_scoped_to_the_session_that_saved_it() {
+        let mut a = entry("构建用 pnpm", 1);
+        a.source = Some(Source { session: "s1".into(), turn: 1 });
+        let mut b = entry("回复用中文", 2);
+        b.source = Some(Source { session: "s2".into(), turn: 3 });
+        let mut entries = vec![a, b];
+        assert_eq!(forget(&mut entries, "构建用 pnpm", Some("s1")), 1);
+        assert_eq!(entries.len(), 1);
+        // 别的会话记下的：这条会话删不掉
+        assert_eq!(forget(&mut entries, "回复用中文", Some("s1")), 0);
+        assert_eq!(entries.len(), 1);
+        // 界面删除不限来源
+        assert_eq!(forget(&mut entries, "回复用中文", None), 1);
+        assert!(entries.is_empty());
+        // 空查询什么都不删
+        assert_eq!(forget(&mut entries, "  ", None), 0);
+    }
+
+    #[test]
+    fn edit_changes_text_tags_and_pin() {
+        let mut a = entry("原来的话", 1);
+        a.tags = vec!["旧".into()];
+        let mut entries = vec![a];
+        let id = entries[0].id.clone();
+        assert!(edit(&mut entries, &id, " 改过的话 ", vec!["新".into()], true, 2_000));
+        assert_eq!(entries[0].text, "改过的话");
+        assert_eq!(entries[0].tags, ["新"]);
+        assert!(entries[0].pinned);
+        assert_eq!(entries[0].updated_ms, 2_000);
+        assert_eq!(entries[0].created_ms, 1);
+        assert!(!edit(&mut entries, "没这个 id", "x", vec![], false, 3));
     }
 
     #[test]

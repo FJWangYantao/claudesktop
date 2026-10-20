@@ -269,6 +269,9 @@ pub struct Settings {
     pub next_suggestion: bool,
     /// 补全用的模型（同一端点）；空 = 跟会话的模型
     pub suggest_model: String,
+    /// 一轮结束后让模型提炼「候选」记忆（只进设置页「待确认」，收下才落盘）。默认关：
+    /// 每一轮都多一次请求
+    pub memory_suggest: bool,
 }
 
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
@@ -302,6 +305,7 @@ impl Default for Settings {
             suggestions: false,
             next_suggestion: false,
             suggest_model: String::new(),
+            memory_suggest: false,
             auto_mode: AutoModeSettings::default(),
         }
     }
@@ -630,6 +634,8 @@ impl Settings {
         config.context_windows = p.context_windows.clone().into_iter().collect();
         config.max_steps = self.max_steps;
         config.provider.gateway = self.gateway();
+        // 每轮结束提炼候选记忆（默认关，见 `remember` 模块）
+        config.memory_suggest = self.memory_suggest;
         // 「自动」模式没配好时不出现（设置页保存时会拦住，这里再兜一次）
         config.auto_mode = self.auto_mode.to_config(p);
         Ok(config)

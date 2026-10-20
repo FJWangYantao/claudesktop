@@ -118,6 +118,8 @@ pub struct SettingsForm {
     next_suggestion: bool,
     /// 输入补全用的模型；空 = 跟会话的
     suggest_model: Entity<InputState>,
+    /// 一轮结束后提炼候选记忆开着没有（保存才生效，会重启自研内核）
+    memory_suggest: bool,
     /// Brave Search API key（`web_search` 用；空 = DuckDuckGo 兜底）
     brave_key: Entity<InputState>,
     /// (是否错误, 文本)
@@ -171,6 +173,7 @@ impl SettingsForm {
             suggest_enabled: false,
             next_suggestion: false,
             suggest_model,
+            memory_suggest: false,
             brave_key,
             message: None,
             rules: Vec::new(),
@@ -263,6 +266,7 @@ impl ChatApp {
         // 输入补全
         self.settings_form.suggest_enabled = s.suggestions;
         self.settings_form.next_suggestion = s.next_suggestion;
+        self.settings_form.memory_suggest = s.memory_suggest;
         self.settings_form
             .suggest_model
             .update(cx, |state, cx| state.set_value(s.suggest_model.clone(), window, cx));
@@ -592,6 +596,7 @@ impl ChatApp {
         s.auto_mode.environment = f.auto_environment.read(cx).value().to_string();
         s.suggestions = f.suggest_enabled;
         s.next_suggestion = f.next_suggestion;
+        s.memory_suggest = f.memory_suggest;
         s.suggest_model = value(&f.suggest_model, cx);
         s.usage_gateway = f.usage_gateway;
         s.gateway_bodies = f.gateway_bodies;
@@ -693,6 +698,8 @@ impl ChatApp {
         let restart_builtin = builtin_key(&new) != builtin_key(&self.settings)
             || new.max_steps != self.settings.max_steps
             || new.usage_gateway != self.settings.usage_gateway
+            // 一轮结束的候选记忆开关变了：内核要重装才知道
+            || new.memory_suggest != self.settings.memory_suggest
             // 自动模式的开关 / 分类器模型变了：模式列表和分类器都要重装
             || new.auto_mode != self.settings.auto_mode;
         let restart_acp = new.acp != self.settings.acp;
@@ -1316,6 +1323,7 @@ impl ChatApp {
                 .child(self.render_providers(window, cx))
                 .child(self.render_auto_mode(window, cx))
                 .child(self.render_suggest(cx))
+                .child(self.render_memory_options(cx))
                 .child(section(
                     "运行",
                     "",
@@ -1437,6 +1445,28 @@ impl ChatApp {
                     div().w(rems(20.)).child(Input::new(&f.suggest_model).cleanable(true)),
                 ),
             ]),
+        )
+    }
+
+    /// 记忆：一轮结束后要不要让模型提炼「候选」（只进设置页待确认，收下才落盘）。
+    fn render_memory_options(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let suggest = Switch::new("memory-suggest")
+            .checked(f.memory_suggest)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                this.settings_form.memory_suggest = *checked;
+                cx.notify();
+            }));
+        section(
+            "记忆",
+            "跨会话记住偏好和约定：每轮带上相关的几条，置顶的永远带上；在设置页「记忆」里看、改、删",
+            None,
+            setting_group([setting_row(
+                "回合结束后提炼记忆",
+                "每轮结束多一次请求，提炼出值得记下的话放进「记忆」页顶部等你收下（默认关，关着就是它自己觉得有用时才记）",
+                suggest,
+            )]),
         )
     }
 

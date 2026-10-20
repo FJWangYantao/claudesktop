@@ -32,6 +32,7 @@ mod mcp_oauth;
 mod openai;
 mod permissions;
 mod provider;
+pub mod remember;
 pub mod request_bodies;
 pub mod responses;
 mod sse;
@@ -143,6 +144,9 @@ pub struct BuiltinConfig {
     pub session_titles: bool,
     /// 全局记忆文件（默认数据目录的 `memory.json`，见 `claudesktop_core::memory`）
     pub memory_path: Option<PathBuf>,
+    /// 每轮结束后让模型提炼「候选」记忆（只进设置页待确认，不落盘；多一次小请求）。
+    /// 默认关，见 `remember` 模块
+    pub memory_suggest: bool,
     /// 「自动」模式（分类器代替用户审批）；None = 没配置，这个模式不出现
     pub auto_mode: Option<AutoModeConfig>,
 }
@@ -161,6 +165,7 @@ impl BuiltinConfig {
             max_steps: DEFAULT_MAX_STEPS,
             session_titles: true,
             memory_path: default_memory_path(),
+            memory_suggest: false,
             auto_mode: None,
         }
     }
@@ -256,6 +261,10 @@ struct SessionState {
     memory_project: Vec<claudesktop_core::memory::Entry>,
     /// 记下的全局记忆（每轮重读）
     memory_global: Vec<claudesktop_core::memory::Entry>,
+    /// 系统提示词里已经带上的条目 id（`<memory-context>` 不再重复附）
+    memory_shown: Vec<String>,
+    /// 这一轮到目前为止带进过上下文的条目 id（`used_ms` 据此更新，只在写盘时落下去）
+    memory_used: Vec<String>,
     /// 用户说过的话（从早到晚，最近 50 条）：自动模式的分类器据此判断用户授权了什么。
     /// 只有用户的话，没有助手的话和工具结果——那是 Claude Code 的做法，避免助手把自己说服过去、
     /// 也避免工具结果里的注入内容影响判定
@@ -278,7 +287,15 @@ impl SessionState {
         let (global_entries, global_warning) = global.map(memory::load).unwrap_or_default();
         self.memory_global = global_entries;
         warnings.extend(global_warning);
+        // 系统提示词里会带哪些：这一轮 `<memory-context>` 不重复它们
+        self.memory_shown = memory::shown_ids(&self.memory_project, &self.memory_global);
         warnings
+    }
+
+    /// 这一轮开始时把两份记忆文件重读一遍（系统提示词跟着变），返回读不了的原因。
+    fn reload_memory_for_turn(&mut self, global: Option<&Path>) -> Vec<String> {
+        self.memory_used.clear();
+        self.reload_memory(global)
     }
 
     fn system_prompt(&self) -> String {
@@ -306,6 +323,8 @@ impl SessionState {
 
 struct Inner {
     provider: Arc<dyn ChatProvider>,
+    /// 构造 provider 用的配置（提炼候选记忆这类旁路请求另起一个 provider 时用）
+    provider_config: ProviderConfig,
     /// 新会话的默认模型（最近一次 `set_model` 选的，初始为配置里的）
     default_model: Mutex<String>,
     sink: EventSink,
@@ -332,6 +351,8 @@ struct Inner {
     kernel_id: u64,
     /// 全局记忆文件（见 [`BuiltinConfig::memory_path`]）
     memory_path: Option<PathBuf>,
+    /// 每轮结束后提炼候选记忆（见 [`BuiltinConfig::memory_suggest`]）
+    memory_suggest: bool,
     /// 「自动」模式的配置和分类器 provider（None = 没开这个模式）
     auto_mode: Option<AutoMode>,
 }
@@ -483,6 +504,38 @@ impl Inner {
         Some((state.model.clone(), clip(&first_user), clip(&first_reply)))
     }
 
+    /// 提炼候选记忆要的素材：模型、这一轮的用户消息、最后一段非空回复、已有的记忆正文。
+    fn turn_inputs(&self, session: &str) -> Option<(String, String, String, Vec<String>)> {
+        let sessions = self.sessions.lock().unwrap();
+        let state = sessions.get(session)?;
+        // 这一轮：最后一次用户消息之后的内容
+        let mut user = String::new();
+        let mut reply = String::new();
+        for message in state.history.iter().rev() {
+            if message.role == "user" {
+                user = message_text(message);
+                break;
+            }
+            if reply.is_empty()
+                && let Some(text) = message.text().filter(|t| !t.trim().is_empty())
+            {
+                reply = text.to_string();
+            }
+        }
+        if user.trim().is_empty() || reply.trim().is_empty() {
+            return None;
+        }
+        // 已经记下的（免得再提一遍）：系统提示词里带上过的那些
+        let known: Vec<String> = state
+            .memory_project
+            .iter()
+            .chain(&state.memory_global)
+            .filter(|e| state.memory_shown.contains(&e.id))
+            .map(|e| e.text.clone())
+            .collect();
+        Some((state.model.clone(), user, reply, known))
+    }
+
     /// 依次跑某个时机的钩子（工具类时机按 matcher 只跑管这个工具的），返回
     /// (各钩子的输出, 拦下的原因)。出错的钩子在会话里提示一行、不影响流程；有一个拦下就不再跑后面的。
     fn run_hooks(
@@ -592,15 +645,47 @@ impl Inner {
                 "\n\n<plugin-hook-context>\n{}\n</plugin-hook-context>",
                 context.join("\n\n")
             );
-            match last.parts.iter_mut().find_map(|p| match p {
-                ContentPart::Text(t) => Some(t),
-                _ => None,
-            }) {
-                Some(text) => text.push_str(&extra),
-                None => last.parts.push(ContentPart::Text(extra)),
+            append_to_last_text(last, &extra);
+        }
+        self.attach_memory(session, flag);
+        true
+    }
+
+    /// 这一轮的用户消息里提到了哪些记下的事：相关的条目附在这条消息尾部（`<memory-context>`）。
+    ///
+    /// 放这里（而不是系统提示词）是因为 system 一变整块提示缓存就失效（`anthropic.rs` 的
+    /// `cache_control: ephemeral`），钩子上下文也是这么处理的。系统提示词里已经带上的条目不重复，
+    /// 带上的记进 `memory_used`（下次写盘时刷新 `used_ms`，淘汰时不会先挑它们）。
+    fn attach_memory(&self, session: &str, flag: &AtomicBool) {
+        use claudesktop_core::memory;
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(state) = sessions.get_mut(session) else {
+            return;
+        };
+        let prompt = match state.history.last() {
+            Some(message) if message.role == "user" => message_text(message),
+            _ => return,
+        };
+        if prompt.trim().is_empty() {
+            return;
+        }
+        let shown = state.memory_shown.clone();
+        let (block, ids) = {
+            let exclude: Vec<&str> = shown.iter().map(String::as_str).collect();
+            memory::context(&state.memory_project, &state.memory_global, &prompt, &exclude)
+        };
+        // 这一轮会用到的条目：拼好的那一节 + 附上的这些
+        let mut used = shown;
+        if let Some(block) = block {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            used.extend(ids);
+            if let Some(last) = state.history.last_mut() {
+                append_to_last_text(last, &format!("\n\n{block}"));
             }
         }
-        true
+        state.memory_used = used;
     }
 
     /// 本步要发给模型的消息、当前模式、工作目录与模型；会话已不存在返回 None。
@@ -905,6 +990,23 @@ impl Inner {
             }
             return self.remember(session, cwd, &call.function.arguments);
         }
+        // 查记忆只读（哪种模式都能用）；删记忆是写文件，Plan 模式下不给
+        if call.function.name == tools::MEMORY_SEARCH
+            && self.tool_allowed(session, tools::MEMORY_SEARCH)
+        {
+            return self.search_memory(cwd, &call.function.arguments);
+        }
+        if call.function.name == tools::MEMORY_FORGET
+            && self.tool_allowed(session, tools::MEMORY_FORGET)
+        {
+            if self.mode(session) == MODE_PLAN {
+                return ToolOutput::fail(
+                    "Plan mode is active: memory_forget is not available. Present a plan instead.",
+                    "计划模式不能删记忆",
+                );
+            }
+            return self.forget_memory(session, cwd, &call.function.arguments);
+        }
         let (action, title) = self.start_tool(session, cwd, call);
         self.finish_tool(session, cwd, call, action, &title, stopped)
     }
@@ -935,9 +1037,12 @@ impl Inner {
             (scope == memory::Scope::Project).then(|| checkpoint::read_snapshot(&path)).flatten();
         // 读 → 改 → 写全程持锁（几个会话、设置页同时改不会互相覆盖）；读不了就不动文件，
         // 格式坏了挪到旁边再记（不覆盖之前挪开的）
+        let used_ids = self.used_ids(session);
         let result = memory::update(&path, memory::OnBroken::MoveAside, |entries| {
             let updated = memory::upsert(entries, entry.clone());
             memory::enforce_limits(entries, scope.max_entries());
+            // 顺手把这一轮带进过上下文的那些标成刚用过：淘汰时先挑最久没用的
+            memory::mark_used(entries, &used_ids, memory::now_ms());
             (updated, entries.len())
         });
         if let Some(before) = before
@@ -971,6 +1076,144 @@ impl Inner {
                 ToolOutput::fail(text, "没能保存")
             }
         }
+    }
+
+    /// 这一轮带进过上下文的条目 id（`used_ms` 据此刷新）。
+    fn used_ids(&self, session: &str) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|s| s.memory_used.clone())
+            .unwrap_or_default()
+    }
+
+    /// `memory_search`：在两份记忆里按词找，返回命中的条目（只读，不用授权）。
+    fn search_memory(&self, cwd: &Path, arguments: &str) -> ToolOutput {
+        use claudesktop_core::memory;
+        let (query, where_) = match tools::parse_memory_query(tools::MEMORY_SEARCH, arguments) {
+            Ok(parsed) => parsed,
+            Err(message) => return ToolOutput::fail(message, "参数无效"),
+        };
+        // (属于哪个范围, 条目)；两份文件都是现读（界面里的增删立刻生效）
+        let mut found: Vec<(memory::Scope, memory::Entry)> = Vec::new();
+        if where_.includes(memory::Scope::Project) {
+            let (entries, _) = memory::load(&memory::project_file_or(cwd));
+            found.extend(entries.into_iter().map(|e| (memory::Scope::Project, e)));
+        }
+        if where_.includes(memory::Scope::Global) {
+            let (entries, _) = self.memory_path.as_deref().map(memory::load).unwrap_or_default();
+            found.extend(entries.into_iter().map(|e| (memory::Scope::Global, e)));
+        }
+        let by_entry: std::collections::HashMap<&str, memory::Scope> =
+            found.iter().map(|(scope, e)| (e.id.as_str(), *scope)).collect();
+        let ordered: Vec<&memory::Entry> = found.iter().map(|(_, e)| e).collect();
+        let hits: Vec<(&memory::Entry, usize)> = memory::ranked(ordered, &query, memory::MIN_SCORE);
+        if hits.is_empty() {
+            return ToolOutput::ok(
+                format!("No saved note matches \"{query}\"."),
+                format!("没有匹配「{query}」的记忆"),
+            );
+        }
+        let lines: Vec<String> = hits
+            .iter()
+            .take(tools::MEMORY_SEARCH_MAX)
+            .map(|(entry, _)| {
+                let scope = by_entry.get(entry.id.as_str()).copied().unwrap_or_default();
+                let where_ = match scope {
+                    memory::Scope::Global => "global",
+                    memory::Scope::Project => "project",
+                };
+                let source = entry
+                    .source
+                    .as_ref()
+                    .map(|s| format!(" — saved in session {} (turn {})", s.session, s.turn))
+                    .unwrap_or_default();
+                format!("- [{}] {}{source}", where_, entry.text)
+            })
+            .collect();
+        ToolOutput::ok(
+            format!("Saved notes matching \"{query}\":\n{}", lines.join("\n")),
+            format!("找到 {} 条记忆", lines.len()),
+        )
+    }
+
+    /// `memory_forget`：删掉本会话记下的、和 `query` 对得上的条目（别的会话记下的删不掉，
+    /// 免得误删别人的；界面里可以删任意一条）。
+    fn forget_memory(&self, session: &str, cwd: &Path, arguments: &str) -> ToolOutput {
+        use claudesktop_core::memory;
+        let (query, where_) = match tools::parse_memory_query(tools::MEMORY_FORGET, arguments) {
+            Ok(parsed) => parsed,
+            Err(message) => return ToolOutput::fail(message, "参数无效"),
+        };
+        // 主会话 ID（子会话记不下东西，也就没有能删的）
+        let owner = subagent::split_id(session).map_or(session, |(parent, _)| parent);
+        let mut removed: Vec<String> = Vec::new();
+        let mut failed: Option<String> = None;
+        let mut scopes: Vec<(memory::Scope, Option<PathBuf>)> = Vec::new();
+        if where_.includes(memory::Scope::Project) {
+            scopes.push((memory::Scope::Project, Some(memory::project_file_or(cwd))));
+        }
+        if where_.includes(memory::Scope::Global) {
+            scopes.push((memory::Scope::Global, self.memory_path.clone()));
+        }
+        for (scope, path) in scopes {
+            let Some(path) = path else {
+                continue;
+            };
+            // 项目记忆进 git：和别的写文件工具一样交给检查点，回退时还原
+            let before = (scope == memory::Scope::Project)
+                .then(|| checkpoint::read_snapshot(&path))
+                .flatten();
+            let result = memory::update(&path, memory::OnBroken::Refuse, |entries| {
+                // 删掉的是哪些（正文）：删之前记下，删之后对比，和 `forget` 的判据永远一致
+                let texts: Vec<(String, String)> =
+                    entries.iter().map(|e| (e.id.clone(), e.text.clone())).collect();
+                let count = memory::forget(entries, &query, Some(owner));
+                let gone: Vec<String> = texts
+                    .into_iter()
+                    .filter(|(id, _)| !entries.iter().any(|e| &e.id == id))
+                    .map(|(_, text)| text)
+                    .collect();
+                (count, entries.len(), gone)
+            });
+            if let Some(before) = before
+                && let Some(after) = checkpoint::read_snapshot(&path)
+                && before != after
+            {
+                let file = path.to_string_lossy().into_owned();
+                self.emit(Some(session), KernelEvent::FileChanged { path: file, before, after });
+            }
+            match result {
+                Ok(((count, total, texts), _)) => {
+                    if count > 0 {
+                        self.emit(
+                            Some(session),
+                            KernelEvent::MemoryChanged { scope: scope.name().into(), count: total },
+                        );
+                    }
+                    removed.extend(texts);
+                }
+                Err(text) => failed = Some(text),
+            }
+        }
+        if !removed.is_empty() {
+            return ToolOutput::ok(
+                format!("Deleted {} note(s): {}", removed.len(), removed.join("; ")),
+                format!("删掉了：{}", removed.join("；")),
+            );
+        }
+        if let Some(text) = failed {
+            self.emit(Some(session), KernelEvent::Notice(text.clone()));
+            return ToolOutput::fail(text, "没能删除");
+        }
+        ToolOutput::ok(
+            "No note saved by this session matches that, so nothing was deleted. Only notes \
+             saved in this same session can be deleted here; notes from earlier sessions can be \
+             deleted on the settings page (Memory)."
+                .to_string(),
+            "没有可删的记忆（只能删本会话记下的）".to_string(),
+        )
     }
 
     /// 一步里的全部调用：连续的只读调用和子任务（`task`）一起并行跑，其余依次执行；结果按调用顺序返回。
@@ -1243,6 +1486,8 @@ impl Inner {
                     // 子会话和主会话看同一份记忆（记不进去：工具不给它）
                     memory_project: parent.memory_project.clone(),
                     memory_global: parent.memory_global.clone(),
+                    memory_shown: parent.memory_shown.clone(),
+                    memory_used: Vec::new(),
                     // 子会话的分类器判定同样要看用户说过的话
                     user_messages: parent.user_messages.clone(),
                     // 子会话没有待办清单
@@ -1705,6 +1950,7 @@ impl BuiltinKernel {
         }
         let inner = Arc::new(Inner {
             provider: make_provider(&config.provider),
+            provider_config: config.provider.clone(),
             default_model: Mutex::new(config.provider.model.clone()),
             sink,
             agent_name: agent_name.clone(),
@@ -1722,6 +1968,7 @@ impl BuiltinKernel {
             next_request: AtomicU64::new(1),
             kernel_id,
             memory_path: config.memory_path,
+            memory_suggest: config.memory_suggest,
             auto_mode: config.auto_mode.map(|config| AutoMode {
                 provider: config.model.as_ref().map(|p| make_provider(p)),
                 config,
@@ -1819,6 +2066,8 @@ impl BuiltinKernel {
             plugins_enabled,
             memory_project: Vec::new(),
             memory_global: Vec::new(),
+            memory_shown: Vec::new(),
+            memory_used: Vec::new(),
             // 续接的会话从日志里找回用户说过的话，否则分类器以为用户什么都没授权
             user_messages: recent_user_messages(history.user_messages),
             // 续接的会话接着用日志里最后那份清单
@@ -1826,7 +2075,7 @@ impl BuiltinKernel {
             steps_since_todo: 0,
         };
         // 记住的东西一开始就带上（之后每轮重读）
-        for warning in state.reload_memory(self.inner.memory_path.as_deref()) {
+        for warning in state.reload_memory_for_turn(self.inner.memory_path.as_deref()) {
             self.inner.emit(Some(&session_id), KernelEvent::Notice(warning));
         }
         self.inner.sessions.lock().unwrap().insert(session_id.clone(), state);
@@ -2015,6 +2264,33 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     // 第一轮正常结束后让模型给会话起个标题（失败静默，保留截断版）；子会话不用
     if stop == "end_turn" && inner.session_titles && inner.is_first_turn(&session) {
         name_session(&inner, &session);
+    }
+    // 一轮正常结束：提炼「候选」记忆（默认关；只进待确认区，见 `remember` 模块）
+    if stop == "end_turn" && inner.memory_suggest && subagent::split_id(&session).is_none() {
+        suggest_memories(&inner, &session);
+    }
+}
+
+/// 一轮结束后提炼候选记忆：一次小请求，读这一轮的用户消息和最后的回复。
+/// 结果作为 `MemorySuggested` 发给界面（只进「待确认」，不写文件）。
+fn suggest_memories(inner: &Inner, session: &str) {
+    let Some((model, user, reply, known)) = inner.turn_inputs(session) else {
+        return;
+    };
+    let known: Vec<&str> = known.iter().map(String::as_str).collect();
+    let no_stop = || false;
+    let candidates = remember::suggest(
+        &inner.provider_config,
+        &model,
+        session,
+        inner.turn_number(session),
+        &known,
+        &user,
+        &reply,
+        &no_stop,
+    );
+    if !candidates.is_empty() {
+        inner.emit(Some(session), KernelEvent::MemorySuggested { candidates });
     }
 }
 
@@ -2244,6 +2520,18 @@ fn plugin_servers(plugins: &[Plugin]) -> Vec<mcp::ServerConfig> {
         .collect()
 }
 
+/// 把一段补充上下文接到消息的文字部分末尾（没有文字部分时新起一段）。
+/// 钩子上下文、`<memory-context>` 都这么接在用户消息尾部。
+fn append_to_last_text(message: &mut ChatMessage, extra: &str) {
+    match message.parts.iter_mut().find_map(|p| match p {
+        ContentPart::Text(t) => Some(t),
+        _ => None,
+    }) {
+        Some(text) => text.push_str(extra),
+        None => message.parts.push(ContentPart::Text(extra.to_string())),
+    }
+}
+
 impl Kernel for BuiltinKernel {
     fn kind(&self) -> &'static str {
         "builtin"
@@ -2291,7 +2579,7 @@ impl Kernel for BuiltinKernel {
             );
             state.skills = self.inner.skills(state.plugins_enabled.as_deref());
             // 记忆文件同理：界面删掉一条，下一轮就不在提示词里了
-            let warnings = state.reload_memory(self.inner.memory_path.as_deref());
+            let warnings = state.reload_memory_for_turn(self.inner.memory_path.as_deref());
             // 自动模式的分类器靠这些判断「用户授权了什么」：只记用户说的话
             let text = prompt.text.clone();
             let mut parts = vec![ContentPart::Text(prompt.text)];

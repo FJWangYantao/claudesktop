@@ -237,6 +237,22 @@ pub enum KernelEvent {
         /// 这份文件里现在有几条
         count: usize,
     },
+    /// 一轮结束后提炼出的「候选」记忆：只进设置页顶部「待确认」，用户点「收下」才落盘。
+    /// 不进对话流、不进日志（误记的代价比漏记大：设计说明第四节）
+    MemorySuggested { candidates: Vec<MemoryCandidateView> },
+}
+
+/// 一条待确认的记忆（`KernelEvent::MemorySuggested`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCandidateView {
+    /// 结论（一句话）
+    pub text: String,
+    /// 标签
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 命中的键（同一句再来一次时不重复提示）
+    #[serde(default)]
+    pub key: String,
 }
 
 /// 一条后台命令在界面上的样子（见自研内核的 `bgtasks` 模块）。
@@ -331,6 +347,7 @@ impl KernelEvent {
             Self::TitleGenerated { .. } => "title_generated",
             Self::BackgroundTasks { .. } => "background_tasks",
             Self::MemoryChanged { .. } => "memory_changed",
+            Self::MemorySuggested { .. } => "memory_suggested",
         }
     }
 }
