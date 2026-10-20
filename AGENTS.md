@@ -210,5 +210,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   开头发 `SubagentStarted` 带任务说明；`history::rebuild` 都跳过）。同一步的几个 `task` 并行跑（`run_tools`）。
   界面上子 agent 的事件按 task 调用 ID 收进 `Session::subagents`，不进 transcript；对话里只有一张子任务卡片，
   点开是详情页（`app/subagent_view.rs`，`Session::viewing_task`）。
+- 待办清单（`todo_write`）：内核在 `SessionState::todos` 记着当前清单（续接 / 回退从日志的 `PlanReplaced` 恢复）；
+  还有没做完的项、连续 `TODO_REMIND_STEPS` 步没更新时，在那次请求的最后一条消息上临时挂提醒（不进历史，`todo_nudge`）；
+  压缩时内核把当前清单附在摘要后面（`tools::summary_with_todos`），不靠总结的模型抄。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。

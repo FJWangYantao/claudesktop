@@ -10,7 +10,7 @@
 
 use crate::ChatMessage;
 use crate::provider::ContentPart;
-use claudesktop_core::{KernelEvent, Record};
+use claudesktop_core::{KernelEvent, PlanEntryView, Record};
 
 /// 重建历史的总字符上限：超出时从最早的轮次开始丢
 const HISTORY_MAX_CHARS: usize = 200_000;
@@ -79,6 +79,8 @@ pub struct Rebuilt {
     pub messages: Vec<ChatMessage>,
     /// 用户说过的话（从早到晚，回退掉的不算；压缩前的也留着）：「自动」模式的分类器据此判断授权
     pub user_messages: Vec<String>,
+    /// 最后一次的待办清单（回退掉的不算；压缩前写的也算）
+    pub todos: Vec<PlanEntryView>,
 }
 
 /// 日志 → 对话历史。
@@ -88,6 +90,7 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut summary = None;
     let mut user_messages = Vec::new();
+    let mut todos = Vec::new();
     let mut assistant = Assistant::default();
     // 有进行中的一轮（最后一条用户消息之后还没结束）
     let mut in_turn = false;
@@ -142,12 +145,15 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
                     in_turn = false;
                 }
                 // 待办清单写成一行工具摘要，续接后模型还知道做到哪了
-                KernelEvent::PlanReplaced { entries } => assistant.segments.push(Segment::Tool {
-                    id: String::new(),
-                    title: crate::tools::TODO_WRITE.into(),
-                    status: "completed".into(),
-                    output: crate::tools::todo_summary(entries),
-                }),
+                KernelEvent::PlanReplaced { entries } => {
+                    assistant.segments.push(Segment::Tool {
+                        id: String::new(),
+                        title: crate::tools::TODO_WRITE.into(),
+                        status: "completed".into(),
+                        output: crate::tools::todo_summary(entries),
+                    });
+                    todos = entries.clone();
+                }
                 KernelEvent::Compacted { summary: text, .. } => {
                     summary = Some(text.clone());
                     if in_turn {
@@ -170,7 +176,7 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
         }
     }
     messages.extend(assistant.take());
-    Rebuilt { summary, messages: trim(messages), user_messages }
+    Rebuilt { summary, messages: trim(messages), user_messages, todos }
 }
 
 /// 超出上限时从最早的轮次丢，并保证从一条用户消息开始。
@@ -269,6 +275,39 @@ mod tests {
                 "user:算了",
             ]
         );
+    }
+
+    #[test]
+    fn keeps_the_last_todo_list_across_compaction() {
+        let plan = |items: &[(&str, &str)]| {
+            ev(KernelEvent::PlanReplaced {
+                entries: items
+                    .iter()
+                    .map(|(c, s)| PlanEntryView {
+                        content: (*c).into(),
+                        priority: "medium".into(),
+                        status: (*s).into(),
+                    })
+                    .collect(),
+            })
+        };
+        let compacted = ev(KernelEvent::Compacted { summary: "摘要".into(), context_tokens: 0 });
+        // 写清单的那步被压进摘要了，清单还在
+        let r = rebuild(&[Record::user("做"), plan(&[("读", "in_progress")]), compacted.clone()]);
+        assert_eq!(r.todos.len(), 1);
+        assert_eq!(r.todos[0].content, "读");
+        // 后写的覆盖先写的
+        let r = rebuild(&[
+            Record::user("做"),
+            plan(&[("读", "in_progress")]),
+            compacted,
+            plan(&[("读", "completed"), ("改", "in_progress")]),
+        ]);
+        assert_eq!(
+            r.todos.iter().map(|t| t.status.as_str()).collect::<Vec<_>>(),
+            ["completed", "in_progress"]
+        );
+        assert!(rebuild(&[Record::user("做")]).todos.is_empty());
     }
 
     #[test]

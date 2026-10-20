@@ -1372,6 +1372,45 @@ fn provider(base: String) -> ProviderConfig {
 }
 
 #[test]
+fn reminds_to_update_a_stale_todo_list_once_per_interval() {
+    let mut script = vec![tool_call(
+        "t0",
+        "todo_write",
+        serde_json::json!({ "todos": [
+            { "content": "读代码", "status": "completed" },
+            { "content": "改代码", "status": "in_progress" }
+        ]}),
+    )];
+    // 之后连着 9 步都没更新清单
+    for i in 1..=9 {
+        script.push(tool_call(
+            &format!("g{i}"),
+            "glob",
+            serde_json::json!({ "pattern": "*.nope" }),
+        ));
+    }
+    script.push(happy_stream("改完了"));
+    let (base, bodies) = serve(script);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("改一下")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    let has_reminder = |i: usize| bodies.lock().unwrap()[i].contains("system-reminder");
+    // 写完清单后第 8 步走完，下一次请求（第 10 个，下标 9）挂上提醒
+    for i in 0..9 {
+        assert!(!has_reminder(i), "请求 {i} 不该有提醒");
+    }
+    let reminded = body(&bodies, 9);
+    let last = reminded["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["tool_call_id"], "g8");
+    let content = last["content"].as_str().unwrap();
+    assert!(content.contains("<system-reminder>") && content.contains("[>] 改代码"), "{content}");
+    // 提醒不进历史，提醒过就重新计数
+    assert!(!has_reminder(10), "提醒只挂一次请求");
+}
+
+#[test]
 fn compacts_before_the_request_when_context_is_nearly_full() {
     let (base, bodies) = serve(vec![
         reply_with_usage("第一轮的回答", 850),
