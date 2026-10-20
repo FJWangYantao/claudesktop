@@ -187,6 +187,8 @@ impl ChatApp {
             self.settings_open = false;
             self.focus_input(window, cx);
             cx.notify();
+        } else if self.review_open() {
+            self.close_review(cx);
         } else if self.session().viewing_task.is_some() {
             // 子任务详情页：先回到对话，再按一次才停
             self.close_task(cx);

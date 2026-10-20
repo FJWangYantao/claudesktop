@@ -103,6 +103,10 @@ pub enum Record {
         before: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,
+        /// 审查页写的（见 [`crate::review`]）：写完以后这一轮 `diff(base, head)` 里处于「已撤回」的块；
+        /// agent 写的、回退写的为 None
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reverted: Option<Vec<crate::review::HunkRange>>,
     },
     /// 回退到第 `turn` 条用户消息（从 0 数，按当时的有效记录）之前。`conversation` 为真时
     /// 从那条消息起的记录作废（见 [`effective`]）；`files` 是还原了几个文件，`prompt` 是那条消息

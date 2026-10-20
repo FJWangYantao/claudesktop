@@ -67,7 +67,7 @@ impl RewindPreview {
 
 impl ChatApp {
     /// 第 `idx` 个会话的有效记录（回退折算过）；先把合并中的文本落盘。没有保存记录时为 None。
-    fn effective_records(&mut self, idx: usize) -> Option<Vec<Record>> {
+    pub(super) fn effective_records(&mut self, idx: usize) -> Option<Vec<Record>> {
         let store = self.store.as_ref()?;
         let s = &mut self.sessions[idx];
         let meta = s.meta.as_ref()?;
@@ -177,6 +177,7 @@ impl ChatApp {
                     path: path.clone(),
                     before: before.clone(),
                     after: after.clone(),
+                    reverted: None,
                 };
                 self.persist(active, record);
             }

@@ -20,6 +20,7 @@ mod plugins_view;
 mod project_view;
 mod raw_request;
 mod requests_view;
+mod review;
 mod rewind;
 mod search;
 mod settings_kit;
@@ -178,6 +179,9 @@ pub struct ChatApp {
     rewind: Option<rewind::RewindPreview>,
     /// 浮层里「冲突的文件也覆盖」勾上了
     rewind_overwrite: bool,
+    /// 审查页（最新一轮的逐块撤回，见 review.rs）：打开时算好；None = 没开
+    review: Option<review::ReviewPage>,
+    review_scroll: ScrollHandle,
     /// 命令面板里按正文搜到的消息（查询变了才重搜，见 search.rs）
     palette_hits: Vec<search::MessageHit>,
     /// 磁盘上搜到的命中（更早的会话，没载入内存；见 `search::scan_history`）
@@ -428,6 +432,8 @@ impl ChatApp {
             placeholder: SharedString::default(),
             rewind: None,
             rewind_overwrite: false,
+            review: None,
+            review_scroll: ScrollHandle::new(),
             palette_hits: Vec::new(),
             palette_history: Vec::new(),
             palette_query: String::new(),
@@ -1335,6 +1341,13 @@ impl ChatApp {
             let sent = claudesktop_core::plugin::find_command(&enabled, &prompt.text).map(
                 |(_, command, args)| claudesktop_core::plugin::expand_command(&command.body, &args),
             );
+            // 上一轮在审查页里撤回过块：发给内核的文字前面附上说明，气泡里照常只显示用户写的
+            let sent = match self.take_review_note(idx) {
+                Some(note) => {
+                    Some(format!("{note}\n\n{}", sent.as_deref().unwrap_or(&prompt.text)))
+                }
+                None => sent,
+            };
             if kernel.is_some() {
                 self.persist(
                     idx,
@@ -1678,7 +1691,7 @@ impl ChatApp {
         let save = |text: Option<String>| text.map(|t| store.save_blob(&meta.id, &t)).transpose();
         match (save(before), save(after)) {
             (Ok(before), Ok(after)) => {
-                self.persist(idx, Record::FileChanged { path, before, after })
+                self.persist(idx, Record::FileChanged { path, before, after, reverted: None })
             }
             (Err(err), _) | (_, Err(err)) => {
                 self.sessions[idx].note(format!("检查点没存上（回退时还原不了 {path}）：{err}"))

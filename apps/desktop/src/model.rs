@@ -223,7 +223,7 @@ pub fn plan_progress(rows: &[PlanRow]) -> (usize, usize, Option<&PlanRow>) {
 }
 
 /// 同一个文件的两条路径：Windows 上大小写和分隔符都不保证统一（`C:\a\B.rs` / `c:/a/b.rs`）。
-fn same_path(a: &str, b: &str) -> bool {
+pub(crate) fn same_path(a: &str, b: &str) -> bool {
     fn norm(p: &str) -> String {
         p.replace('\\', "/").to_lowercase()
     }

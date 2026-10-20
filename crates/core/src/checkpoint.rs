@@ -61,7 +61,7 @@ pub fn restore_plan(records: &[Record], turn: usize) -> Vec<FileRestore> {
     // 路径 → (最早的 before, 最晚的 after)
     let mut files: BTreeMap<&str, (Option<&String>, Option<&String>)> = BTreeMap::new();
     for record in &records[start..] {
-        if let Record::FileChanged { path, before, after } = record {
+        if let Record::FileChanged { path, before, after, .. } = record {
             files
                 .entry(path)
                 .and_modify(|(_, last)| *last = after.as_ref())
@@ -154,6 +154,7 @@ mod tests {
             path: path.into(),
             before: before.map(Into::into),
             after: after.map(Into::into),
+            reverted: None,
         }
     }
 

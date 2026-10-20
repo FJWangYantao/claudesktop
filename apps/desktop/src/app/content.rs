@@ -63,6 +63,11 @@ impl ChatApp {
             }
             self.sessions[active].viewing_task = None;
         }
+        // 审查这一轮的改动：同样占内容区；会话换了、发了新消息、又跑起来了就回到对话
+        if self.review_open() {
+            return self.render_review_page(cx);
+        }
+        self.review = None;
         // 还没发过消息的会话显示首页（与官方空会话一致，输入框在底部）
         if !self.sessions[active].has_user_message() {
             // 放大字号后放不下时整页往下长、可以滚（min_h 而不是 h：定高时居中的内容会从上下两头溢出，
