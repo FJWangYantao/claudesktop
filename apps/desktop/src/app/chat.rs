@@ -56,17 +56,42 @@ pub(super) fn step_line(icon: impl IntoElement) -> Div {
         .child(icon_cell(icon))
 }
 
-/// 单行省略的文字段（悬停看全文）。
+/// 单行省略的文字段（悬停看全文，见 [`text_tip`]）。
 pub(super) fn ellipsis(id: impl Into<ElementId>, text: SharedString) -> Stateful<Div> {
     let tip = text.clone();
-    div()
-        .id(id)
-        .min_w_0()
-        .overflow_hidden()
-        .text_ellipsis()
-        .whitespace_nowrap()
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        .child(text)
+    ellipsis_plain(id, text).tooltip(move |window, cx| text_tip(&tip, window, cx))
+}
+
+/// 单行省略、不带悬停提示（全文在别处看得到时用，如点开后的工具行）。
+pub(super) fn ellipsis_plain(id: impl Into<ElementId>, text: SharedString) -> Stateful<Div> {
+    div().id(id).min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(text)
+}
+
+/// 多行文字在单行里只显示第一行，后面还有就接个省略号。
+fn first_line(text: &str) -> SharedString {
+    let text = text.trim();
+    match text.split_once('\n') {
+        Some((first, _)) => format!("{} …", first.trim_end()).into(),
+        None => text.to_string().into(),
+    }
+}
+
+/// 悬停提示里最多放的字符数（再长的去点开看）
+const TIP_MAX_CHARS: usize = 300;
+/// 悬停提示的最大宽度，超出折行
+const TIP_W: Rems = rems(28.);
+/// 工具行点开后完整命令最多列的行数（heredoc 之类的长脚本）
+const COMMAND_PREVIEW_LINES: usize = 20;
+
+/// 长文本的悬停提示：限宽折行、超长截断。gpui-kit 的 `Tooltip` 不限宽，
+/// 一条长命令会横着铺满整个窗口。
+pub(super) fn text_tip(text: &str, window: &mut Window, cx: &mut App) -> AnyView {
+    let text = text.trim();
+    let text: SharedString = match text.char_indices().nth(TIP_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]).into(),
+        None => text.to_string().into(),
+    };
+    Tooltip::element(move |_, _| div().max_w(TIP_W).child(text.clone())).build(window, cx)
 }
 
 /// 工具行末尾的授权标记：小盾牌 + 短标签（「已允许」「总是允许」…），悬停看选的是哪一项。
@@ -507,7 +532,7 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let has_output = !card.output.trim().is_empty();
+        let has_output = card.can_open();
         let toggle = has_output && !verbose;
         let open = has_output && (card.expanded || verbose);
         let settle = motion::settle(("tool", idx), card.phase != ToolPhase::Running, window, cx);
@@ -542,11 +567,37 @@ impl ChatApp {
         col
     }
 
-    /// 工具行点开后的输出预览（等宽、卡片底），缩进到工具名下面；和标题之间的空隙算在里面。
+    /// 工具行点开后的内容（等宽、卡片底），缩进到工具名下面；和标题之间的空隙算在里面。
+    /// 命令先列完整命令（`$` 开头，折行），下面是输出（跑着时是到目前为止的最后几行）。
     pub(super) fn tool_output(card: &ToolCard) -> Div {
+        // 空行给个空格占住行高
+        let line =
+            |l: &str| div().child(if l.is_empty() { " ".to_string() } else { l.to_string() });
+        let output = card.output.trim_matches('\n');
+        let running = card.phase == ToolPhase::Running;
+        let command =
+            card.shows_command().then(|| {
+                let lines: Vec<&str> = card.arg.trim().lines().collect();
+                let shown = lines.len().min(COMMAND_PREVIEW_LINES);
+                div()
+                    .v_flex()
+                    .text_color(rgb(INK))
+                    .children(lines[..shown].iter().enumerate().map(|(i, l)| {
+                        line(&if i == 0 { format!("$ {l}") } else { (*l).to_string() })
+                    }))
+                    .when(lines.len() > shown, |d| {
+                        d.child(
+                            div()
+                                .text_color(rgb(INK_SOFT))
+                                .child(format!("… 其余 {} 行未显示", lines.len() - shown)),
+                        )
+                    })
+            });
+        let has_command = command.is_some();
         div().pt_1().pl(STEP_INDENT).child(
             div()
                 .v_flex()
+                .gap_2()
                 .px_3()
                 .py_2()
                 .rounded_lg()
@@ -557,10 +608,13 @@ impl ChatApp {
                 .text_size(TEXT_SMALL)
                 .line_height(LEADING)
                 .text_color(rgb(INK_SOFT))
-                // 空行给个空格占住行高
-                .children(card.output.lines().map(|l| {
-                    div().child(if l.is_empty() { " ".to_string() } else { l.to_string() })
-                })),
+                .children(command)
+                .when(!output.is_empty(), |d| {
+                    d.child(div().v_flex().children(output.lines().map(line)))
+                })
+                .when(has_command && output.is_empty() && running, |d| {
+                    d.child(div().text_color(rgb(INK_FAINT)).child("运行中，还没有输出…"))
+                }),
         )
     }
 
@@ -576,8 +630,14 @@ impl ChatApp {
                     .child(card.name.clone()),
             )
             // 参数和结果按各自长度一起收缩（不给固定比例，免得截断后空出一截）
+            // 能点开的（命令）点开就有全文，不再挂悬停提示
             .when(!card.arg.is_empty(), |d| {
-                d.child(ellipsis(("tool-arg", idx), card.arg.clone()).font_family(MONO))
+                let arg = if card.shows_command() {
+                    ellipsis_plain(("tool-arg", idx), first_line(&card.arg))
+                } else {
+                    ellipsis(("tool-arg", idx), card.arg.clone())
+                };
+                d.child(arg.font_family(MONO))
             })
             .when(!card.result.is_empty(), |d| {
                 d.child(
