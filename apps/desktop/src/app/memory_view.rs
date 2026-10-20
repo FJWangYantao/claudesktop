@@ -205,7 +205,7 @@ impl ChatApp {
             self.record_file_change(idx, path.to_string_lossy().into_owned(), before, after);
         }
         match result {
-            Ok((value, notice)) => {
+            Ok(((value, _), notice)) => {
                 if let Some(notice) = notice {
                     self.toast(Notification::warning(notice), cx);
                 }
@@ -324,7 +324,7 @@ impl ChatApp {
         cx.reveal_path(&target);
     }
 
-    pub(super) fn render_memory(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    pub(super) fn render_memory(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let form = &self.memory_form;
         let scope = form.scope;
         // 两栏切换 + 搜索框 + 新增
@@ -529,7 +529,7 @@ impl ChatApp {
                                                 Self::text_button("memory-edit-save", "保存", true)
                                                     .small()
                                                     .on_click(cx.listener(
-                                                        |this, _, window, cx| {
+                                                        move |this, _, window, cx| {
                                                             this.save_edit_memory(
                                                                 scope, window, cx,
                                                             );
@@ -631,8 +631,11 @@ impl ChatApp {
                         } else {
                             "置顶：永远带进对话，也不会被淘汰"
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.pin_memory(scope, target.clone(), !pinned, cx)
+                        .on_click(cx.listener({
+                            let target = target.clone();
+                            move |this, _, _, cx| {
+                                this.pin_memory(scope, target.clone(), !pinned, cx)
+                            }
                         })),
                     )
                     .child(
