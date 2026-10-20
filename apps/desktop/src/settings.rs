@@ -7,7 +7,8 @@
 //! `CLAUDESKTOP_BASE_URL` / `CLAUDESKTOP_MODEL` / `CLAUDESKTOP_API_KEY`（key 也认 `OPENAI_API_KEY`）
 //! / `CLAUDESKTOP_PROTOCOL` / `CLAUDESKTOP_TEMPERATURE` / `CLAUDESKTOP_MAX_TOKENS` /
 //! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）/ `CLAUDESKTOP_MAX_STEPS`（一轮最多几步）/
-//! `CLAUDESKTOP_GATEWAY`（`0` / `1`，用量网关）以及 `ACP_AGENT`。
+//! `CLAUDESKTOP_GATEWAY`（`0` / `1`，用量网关）/ `CLAUDESKTOP_THEME`（配色 key，见 `ThemeChoice`）
+//! 以及 `ACP_AGENT`。
 //! 设置页保存时写下的是当时界面上的值。
 
 use crate::model::ViewMode;
@@ -221,6 +222,8 @@ pub struct Settings {
     pub view_mode: ViewMode,
     /// 外观（跟随系统 / 浅色 / 深色），设置页切换后立即生效并写回
     pub appearance: Appearance,
+    /// 配色（暖纸 / 墨纸 / 玫瑰松 / 常青 / 北境 / 拿铁摩卡），每套都有浅深两版
+    pub theme: ThemeChoice,
     /// 侧栏底部列出各内核状态（「自研内核 · 已连接」），设置页切换后立即生效并写回。
     /// 默认不显示（状态另有设置页与侧栏「进行中」可看）；老设置文件里没有这一项时
     /// 容器级 `#[serde(default)]` 会用下面的 `Default` 实现补齐，这里取 `false` 干净利落。
@@ -281,6 +284,7 @@ impl Default for Settings {
             acp: AcpSettings::default(),
             view_mode: ViewMode::default(),
             appearance: Appearance::default(),
+            theme: ThemeChoice::default(),
             sidebar_kernel_status: false,
             workspace: None,
             sidebar_by_date: false,
@@ -379,6 +383,68 @@ impl Appearance {
             Appearance::Light => "浅色",
             Appearance::Dark => "深色",
         }
+    }
+}
+
+/// 配色：顺序和 `theme::PALETTES` 一致
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeChoice {
+    #[default]
+    Warm,
+    Flexoki,
+    RosePine,
+    Everforest,
+    Nord,
+    Catppuccin,
+}
+
+impl ThemeChoice {
+    pub const ALL: [ThemeChoice; 6] = [
+        Self::Warm,
+        Self::Flexoki,
+        Self::RosePine,
+        Self::Everforest,
+        Self::Nord,
+        Self::Catppuccin,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Warm => "暖纸",
+            Self::Flexoki => "墨纸",
+            Self::RosePine => "玫瑰松",
+            Self::Everforest => "常青",
+            Self::Nord => "北境",
+            Self::Catppuccin => "拿铁 / 摩卡",
+        }
+    }
+
+    pub fn desc(self) -> &'static str {
+        match self {
+            Self::Warm => "Claude 默认，暖纸底和赤陶橙",
+            Self::Flexoki => "Flexoki · 纸和墨，青绿点缀",
+            Self::RosePine => "Rosé Pine · 低饱和的玫瑰和紫灰",
+            Self::Everforest => "Everforest · 米黄底配灰绿，护眼",
+            Self::Nord => "Nord · 雪白和冰蓝，冷色",
+            Self::Catppuccin => "Catppuccin · 粉彩紫",
+        }
+    }
+
+    pub fn parse(v: &str) -> Option<Self> {
+        Some(match v.trim().to_ascii_lowercase().as_str() {
+            "warm" => Self::Warm,
+            "flexoki" => Self::Flexoki,
+            "rose_pine" | "rosepine" => Self::RosePine,
+            "everforest" => Self::Everforest,
+            "nord" => Self::Nord,
+            "catppuccin" => Self::Catppuccin,
+            _ => return None,
+        })
     }
 }
 
@@ -534,6 +600,9 @@ impl Settings {
             self.max_steps =
                 v.clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS);
         }
+        if let Some(t) = var("CLAUDESKTOP_THEME").and_then(|v| ThemeChoice::parse(&v)) {
+            self.theme = t;
+        }
         self
     }
 
@@ -682,6 +751,26 @@ mod tests {
         .unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::Dark, ViewMode::Verbose));
         assert!(!s.sidebar_kernel_status);
+    }
+
+    /// 配色：旧设置文件读出默认的暖纸，写盘回读一致。
+    #[core::prelude::v1::test]
+    fn theme_choice_default_and_roundtrip() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.theme, ThemeChoice::Warm);
+
+        let dir = std::env::temp_dir().join(format!("claudesktop-theme-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let mut s = Settings { theme: ThemeChoice::RosePine, ..Default::default() };
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(Some(&path)).0.theme, ThemeChoice::RosePine);
+        // 文件里是 key（snake_case），不是枚举名
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"rose_pine\""));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(ThemeChoice::parse("Nord"), Some(ThemeChoice::Nord));
+        assert_eq!(ThemeChoice::parse("rosepine"), Some(ThemeChoice::RosePine));
+        assert_eq!(ThemeChoice::parse("nope"), None);
     }
 
     /// 步数上限：旧设置文件缺这项时用默认 200；手改成越界的值读取时夹住；

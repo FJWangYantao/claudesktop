@@ -911,7 +911,7 @@ impl ChatApp {
                     .text_size(TEXT_BODY)
                     .when(primary, |d| {
                         d.bg(rgb(CORAL_DEEP))
-                            .text_color(rgb(WHITE))
+                            .text_color(rgb(ON_ACCENT))
                             .hover(|d| d.bg(rgb(CORAL_DEEP_HOVER)))
                     })
                     // 卡片已经有一圈边框，里面的按钮不再描边（单层边框）：其余允许项用沙色实底；

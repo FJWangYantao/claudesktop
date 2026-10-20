@@ -305,6 +305,55 @@ pub(super) fn font_menu_item(
         })
 }
 
+/// 配色菜单条目：上面一行名称 + 灰色说明，下面一行色块预览
+/// （纸底 / 侧栏 / 卡片 / 强调 / 正文），行尾当前项打勾。
+/// `palette` 是这套色板在 `theme::PALETTES` 里的下标，色块经 `theme::swatch` 取色。
+pub(super) fn theme_menu_item(
+    id: impl Into<ElementId>,
+    name: impl Into<SharedString>,
+    desc: impl Into<SharedString>,
+    palette: usize,
+    active: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .gap_2p5()
+        .px_2p5()
+        .py_2()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(HOVER)))
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(name.into()))
+                .child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .child(desc.into()),
+                )
+                .child(div().h_flex().gap_1().children(
+                    [PAPER, SAND, CARD, CORAL, INK].map(|c| {
+                        div()
+                            .size_3p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .bg(crate::theme::swatch(palette, c))
+                    }),
+                )),
+        )
+        .when(active, |d| {
+            d.child(Icon::new(IconAll::Check).size_4().flex_shrink_0().text_color(rgb(CORAL)))
+        })
+}
+
 /// 组一个下拉菜单：`chip` 是 trigger，面板锚在 chip 上按 `anchor` 方向展开，
 /// 宽 `width`（rem，跟着界面字号缩放，否则放大字号后说明文字挤得折行）。`items` 每次渲染面板时调用——`app` 是当前状态快照（读数据），
 /// `handle` / `popover` 交给 [`MenuList::new`]。`focus` 传 `ChatApp::menu_focus`。

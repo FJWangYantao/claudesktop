@@ -233,8 +233,14 @@ impl ChatApp {
             self.sessions[active].unread = false;
         }
         let mut h = DefaultHasher::new();
-        // 外观、字号、字体变了全部重画
-        (crate::theme::is_dark(), f32::from(root_font_size()).to_bits(), sans()).hash(&mut h);
+        // 外观、字号、字体、配色变了全部重画
+        (
+            crate::theme::is_dark(),
+            f32::from(root_font_size()).to_bits(),
+            crate::theme::palette_index(),
+            sans(),
+        )
+            .hash(&mut h);
         for group in self.session_groups() {
             (&group.key, &group.name).hash(&mut h);
             for i in group.members {

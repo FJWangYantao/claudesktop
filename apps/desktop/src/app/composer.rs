@@ -206,7 +206,8 @@ impl ChatApp {
             } else {
                 Icon::new(IconAll::ArrowUp)
                     .size_4()
-                    .text_color(rgb(if can_send { WHITE } else { INK_FAINT }))
+                    // CORAL 底上的箭头用 ON_ACCENT：有的配色深色版这个底很亮，白箭头看不清
+                    .text_color(rgb(if can_send { ON_ACCENT } else { INK_FAINT }))
                     .into_any_element()
             })
             .on_click(cx.listener(|this, _, window, cx| {

@@ -2,7 +2,9 @@
 
 use super::ChatApp;
 use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
-use super::menu::{FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover};
+use super::menu::{
+    FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover, theme_menu_item,
+};
 use super::motion::{self, Reveal};
 use super::settings_kit::*;
 use super::widgets::{MeasuredWidth, Surface};
@@ -356,6 +358,8 @@ impl ChatApp {
     /// 把字号缩放、字体族和色板装进组件主题。Root 每帧读 `Theme::font_size` 写进窗口的 rem，
     /// 所以这里改完，下一帧整套界面（字号 / 间距 / 圆角 / 图标）等比缩放。
     pub(crate) fn apply_font(&mut self, cx: &mut Context<Self>) {
+        // 色板先设：后面 `Theme::update` 里的 `apply_to_theme` 按它写组件配色
+        crate::theme::set_palette(self.settings.theme.index());
         crate::theme::set_font_scale(self.settings.font_scale);
         // 没装的字体族会被忽略（GPUI 排版找不到字体族时会 panic）
         if let Some(name) = self.settings.font_family_or_default()
@@ -366,6 +370,12 @@ impl ChatApp {
         crate::theme::set_font_family(cx, self.settings.font_family_or_default());
         Theme::update(cx, crate::theme::apply_to_theme);
         cx.notify();
+    }
+
+    /// 设置页换配色：立即生效，并只把这一项写回文件。
+    pub(crate) fn set_theme(&mut self, theme: ThemeChoice, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.theme = theme, cx);
+        self.apply_font(cx);
     }
 
     /// 设置页调字号（拖动和松手都走这里）：立即生效，并只把这一项写回文件。
@@ -422,8 +432,8 @@ impl ChatApp {
         let motion_row = setting_row("动画", motion_tip, motion_control);
         let appearance = setting_group([
             setting_row(
-                "主题",
-                "",
+                "明暗",
+                "跟随系统，或固定浅色 / 深色；每套配色都有这两版",
                 seg_control(
                     "appearance",
                     Appearance::ALL.map(|a| (a, a.label())),
@@ -432,6 +442,7 @@ impl ChatApp {
                     cx,
                 ),
             ),
+            self.theme_row(cx),
             motion_row,
             self.font_scale_row(),
             self.font_family_row(cx),
@@ -517,6 +528,24 @@ impl ChatApp {
             Self::key_text(ZOOM_OUT_KEY)
         );
         setting_row("界面字号", tip, slider)
+    }
+
+    /// 配色下拉：六套色板，每项下面一行色块预览。换配色即时生效。
+    fn theme_row(&self, cx: &mut Context<Self>) -> Div {
+        let app = cx.entity();
+        setting_row(
+            "配色",
+            "整套界面的底色和强调色",
+            menu_popover(
+                "theme-menu",
+                Anchor::BottomRight,
+                rems(17.5),
+                &app,
+                &self.menu_focus,
+                MenuChip::new(IconAll::Palette, self.settings.theme.label()),
+                theme_menu_items,
+            ),
+        )
     }
 
     /// 字体族下拉：内嵌的 Inter + 系统已装字体（下拉里可搜索）。
@@ -2036,6 +2065,29 @@ fn rule_label(rule: &str) -> String {
         rule.to_string()
     }
 }
+/// 配色下拉的条目：名称 + 灰色说明，下一行是这套配色在当前明暗下的色块，当前项打勾。
+fn theme_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let current = app.settings.theme;
+    let mut menu = MenuList::new("theme-list", handle, popover);
+    for t in ThemeChoice::ALL {
+        menu = menu.pick(
+            theme_menu_item(
+                ("theme-item", t.index()),
+                t.label(),
+                t.desc(),
+                t.index(),
+                t == current,
+            ),
+            move |this, cx| this.set_theme(t, cx),
+        );
+    }
+    menu
+}
+
 /// 界面字体下拉的条目：第一项是内嵌的 Inter，后面跟系统已装字体（可滚动，最多列一批）。
 /// 每项用该字体本身排一行预览（`font_menu_item`），当前项打勾；
 /// 列不完的靠「还有 N 款」提示，需要的话在设置文件里手写字体名。
