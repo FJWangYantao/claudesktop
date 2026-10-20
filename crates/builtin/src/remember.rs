@@ -6,7 +6,7 @@
 //! - 误记的代价 > 漏记的代价：漏了用户下一句提醒就行，误记要人去设置页翻、读、删，
 //!   几次之后就不看那页了（见「设计说明-记忆系统.md」第四节）。所以这里的结果先挂起。
 //! - 一次独立的小请求（`name_session` 是先例），和其他请求一样经用量网关记一笔（用途 `memory`）。
-//! - 只在**第一轮之后**跑一次、且默认关：一次请求换一句可能用得上的话，只在用户明确要的时候花。
+//! - 每轮正常结束后跑一次（子会话不跑）、且默认关：一次请求换一句可能用得上的话，只在用户明确要的时候花。
 
 use crate::{ChatMessage, ProviderConfig, RequestParams, StreamEvent};
 use claudesktop_core::MemoryCandidateView;
@@ -76,6 +76,7 @@ pub fn build_messages(known: &[&str], user: &str, assistant: &str) -> Vec<ChatMe
 /// 发一次提炼请求（阻塞，调用方放在后台线程里）。失败 / 没内容返回空表。
 ///
 /// `model` 用会话当前的模型；`session` / `turn` 只用来给用量网关的日志归类（用途 `memory`）。
+#[allow(clippy::too_many_arguments)]
 pub fn suggest(
     config: &ProviderConfig,
     model: &str,

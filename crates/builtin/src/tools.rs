@@ -2419,8 +2419,8 @@ y
         assert!(parse_memory(r#"{"text":"  "}"#).is_err());
         assert!(parse_memory(r#"{"text":"x","scope":"both"}"#).is_err());
         let many: Vec<String> = (0..memory::MAX_TAGS + 3).map(|i| format!("t{i}")).collect();
+        // 标签超上限：报错让模型自己挑（不悄悄截掉，截掉的可能正是要紧的那个）
         let args = serde_json::json!({"text": "x", "tags": many}).to_string();
-        let (_, entry) = parse_memory(&args).unwrap();
-        assert_eq!(entry.tags.len(), memory::MAX_TAGS);
+        assert!(parse_memory(&args).is_err());
     }
 }

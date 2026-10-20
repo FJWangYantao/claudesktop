@@ -525,12 +525,13 @@ impl Inner {
         if user.trim().is_empty() || reply.trim().is_empty() {
             return None;
         }
-        // 已经记下的（免得再提一遍）：系统提示词里带上过的那些
+        // 已经记下的（免得再提一遍）：这一轮带进过上下文的那些——系统提示词里的，加上
+        // 附在用户消息尾部 `<memory-context>` 里的（它们就在上面的 `user` 里，不列出来模型会当成新的再提一遍）
         let known: Vec<String> = state
             .memory_project
             .iter()
             .chain(&state.memory_global)
-            .filter(|e| state.memory_shown.contains(&e.id))
+            .filter(|e| state.memory_used.contains(&e.id) || state.memory_shown.contains(&e.id))
             .map(|e| e.text.clone())
             .collect();
         Some((state.model.clone(), user, reply, known))
@@ -1158,7 +1159,8 @@ impl Inner {
             scopes.push((memory::Scope::Global, self.memory_path.clone()));
         }
         for (scope, path) in scopes {
-            let Some(path) = path else {
+            // 文件还没建过 = 没有可删的；别为一次空删除在项目里新建 `.claudesktop/memory.json`
+            let Some(path) = path.filter(|p| p.is_file()) else {
                 continue;
             };
             // 项目记忆进 git：和别的写文件工具一样交给检查点，回退时还原

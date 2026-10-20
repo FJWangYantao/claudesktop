@@ -174,6 +174,20 @@ impl ChatApp {
         change: impl FnOnce(&mut Vec<Entry>) -> R,
     ) -> Option<R> {
         let path = self.memory_path_of(scope)?;
+        let idx = self.active;
+        self.edit_memory_at(scope, path, idx, cx, change)
+    }
+
+    /// 同 [`Self::edit_memory_file`]，但文件和记检查点的会话由调用方指定
+    /// （收下候选时写进提出它的那个会话的项目，不是设置页当前显示的那个）。
+    fn edit_memory_at<R>(
+        &mut self,
+        scope: Scope,
+        path: PathBuf,
+        idx: usize,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Vec<Entry>) -> R,
+    ) -> Option<R> {
         let snapshot = |path: &PathBuf| {
             (scope == Scope::Project)
                 .then(|| claudesktop_core::checkpoint::read_snapshot(path))
@@ -188,7 +202,6 @@ impl ChatApp {
             && let Some(after) = snapshot(&path)
             && before != after
         {
-            let idx = self.active;
             self.record_file_change(idx, path.to_string_lossy().into_owned(), before, after);
         }
         match result {
@@ -748,7 +761,17 @@ impl ChatApp {
             return;
         };
         let scope = Scope::Project;
-        self.edit_memory_file(scope, cx, |entries| {
+        // 写进提出它的那个会话的项目：待确认区跨会话共用，收下时设置页显示的可能是别的项目。
+        // 来源会话已经关掉了才退回当前显示的那份
+        let source = self
+            .sessions
+            .iter()
+            .position(|s| s.acp_id.as_deref() == Some(candidate.session.as_str()));
+        let (path, idx) = match source {
+            Some(i) => (memory::project_file_or(&self.sessions[i].cwd), i),
+            None => (self.memory_form.project_path.clone(), self.active),
+        };
+        self.edit_memory_at(scope, path, idx, cx, |entries| {
             let mut entry = Entry::new(candidate.text.clone(), memory::now_ms());
             entry.tags = candidate.tags.clone();
             if !candidate.session.is_empty() {

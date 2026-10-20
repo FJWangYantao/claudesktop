@@ -667,7 +667,9 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
             "grep",
             "web_fetch",
             "web_search",
+            "memory_search",
             "memory_write",
+            "memory_forget",
             "write_file",
             "edit_file",
             "shell",
@@ -965,7 +967,17 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .collect();
     assert_eq!(
         names,
-        ["read_file", "list_dir", "glob", "todo_write", "grep", "web_fetch", "web_search", "task"]
+        [
+            "read_file",
+            "list_dir",
+            "glob",
+            "todo_write",
+            "grep",
+            "web_fetch",
+            "web_search",
+            "memory_search",
+            "task"
+        ]
     );
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -3013,12 +3025,13 @@ fn memory_context_rides_on_the_user_message_and_needs_no_permission() {
     )
     .unwrap();
     // 全局：一条要等「这一轮提到」才带出来的（很旧，排在最后）+ 一堆占满预算的填充条目
+    // （60 条约 2100 字，超过 `GLOBAL_BUDGET` 的 1500）
     let mut entries = vec![serde_json::json!({
         "id": "m-glob", "text": "包管理用 pnpm，不用 npm", "tags": ["构建"],
         "created_ms": 1, "updated_ms": 1, "used_ms": 1,
         "source": { "session": "builtin-别的会话", "turn": 2 }
     })];
-    for i in 0..40 {
+    for i in 0..60 {
         entries.push(serde_json::json!({
             "id": format!("fill-{i}"),
             "text": format!("第 {i} 条与这个话题无关的占位记忆，用来把全局记忆的预算占满，内容够长"),
@@ -3066,7 +3079,7 @@ fn memory_context_rides_on_the_user_message_and_needs_no_permission() {
         .join("\n");
     assert!(tool_msg.contains("日志一律走 tracing"), "{tool_msg}");
     assert!(tool_msg.contains("nothing was deleted"), "{tool_msg}");
-    assert_eq!(memory_entries(&global).len(), 41);
+    assert_eq!(memory_entries(&global).len(), 61);
     // 两个都不占工具行、也不用授权
     assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { .. })), 0);
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
@@ -3100,6 +3113,25 @@ fn memory_forget_deletes_what_this_session_saved() {
     assert!(memory_entries(&path).is_empty(), "{:?}", memory_entries(&path));
     // 记下时一条、删掉时再一条（count 都是当时的条数）
     assert_eq!(h.count(|e| matches!(e, KernelEvent::MemoryChanged { .. })), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `memory_forget` 在还没有记忆文件的目录里：什么都不删，也不凭空建出 `.claudesktop/memory.json`
+#[test]
+fn memory_forget_does_not_create_missing_files() {
+    let dir = project_dir("memory-forget-missing");
+    let global = dir.join("global-memory.json");
+    let (base, _bodies) = serve(vec![
+        tool_call("f1", "memory_forget", serde_json::json!({ "query": "pnpm", "scope": "all" })),
+        happy_stream("没有可删的"),
+    ]);
+    let h = Harness::with_memory(base, dir.clone(), global.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("pnpm 那条别记了")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert!(!dir.join(".claudesktop/memory.json").exists());
+    assert!(!global.exists());
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::FileChanged { .. })), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
