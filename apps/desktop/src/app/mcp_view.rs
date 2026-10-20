@@ -259,16 +259,16 @@ impl ChatApp {
                 IconAll::Dot,
                 "headers 和 env 的值里可以写 ${环境变量}，Key 不用明文写进文件；旧版 SSE 服务把 type 写成 \"sse\"",
             ))
-            .child(note(IconAll::Dot, "\"disabled\": true 表示先不连；格式同 Claude Code 的 .mcp.json"));
-        let footer = div()
-            .v_flex()
-            .gap_1()
-            .child(self.disclosure("mcp-example", "配置示例", example, window, cx))
-            .child(note(IconAll::Braces, format!("配置文件：{path}")))
+            .child(note(IconAll::Dot, "\"disabled\": true 表示先不连；格式同 Claude Code 的 .mcp.json"))
             .child(note(
                 IconAll::ShieldCheck,
                 "调用 MCP 工具同样会弹权限卡片；模型看到的工具名是 mcp__服务器__工具。启用的插件带来的服务器也列在这里",
             ));
+        let footer = div()
+            .v_flex()
+            .gap_1()
+            .child(self.disclosure("mcp-example", "配置示例", example, window, cx))
+            .child(note(IconAll::Braces, format!("配置文件：{path}")));
 
         let running = self.kernel_of(KernelChoice::Builtin).is_some();
         let servers: Vec<McpServerView> = if running {
@@ -317,9 +317,9 @@ impl ChatApp {
             Shelf::Installed if servers.is_empty() => how_to(
                 "还没有 MCP 服务器",
                 &[
-                    "点上面的「推荐」，挑常用的点「添加」，马上就能用",
-                    "别的服务器：点右上角「编辑配置文件」，照下面的「配置示例」写上，保存",
-                    "回来点「重新加载」，这里会列出每个服务器连没连上",
+                    "在「推荐」里挑一个点「添加」",
+                    "别的服务器：「编辑配置文件」，照「配置示例」写",
+                    "点「重新加载」看连没连上",
                 ],
             ),
             Shelf::Installed => {
@@ -339,7 +339,7 @@ impl ChatApp {
         };
         section(
             "MCP 服务器",
-            "给自研内核接上外部工具，比如浏览器、数据库、GitHub",
+            "给自研内核接上浏览器、数据库等外部工具",
             Some(actions),
             div().v_flex().gap_4().child(bar).child(list).child(footer),
         )

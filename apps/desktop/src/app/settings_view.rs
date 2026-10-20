@@ -387,15 +387,23 @@ impl ChatApp {
     /// 「通用」分类：外观、字号、字体、侧栏、通知（都即时生效，不走「保存并应用」），以及设置文件在哪。
     fn render_general(&self, cx: &mut Context<Self>) -> Div {
         let motion = self.settings.motion;
-        let motion_desc = if motion == MotionPref::System && self.system_reduce_motion {
-            "展开收起、转圈这类过渡效果（Windows 里已关闭）"
+        let motion_control = seg_control(
+            "motion",
+            MotionPref::ALL.map(|m| (m, m.label())),
+            motion,
+            |this, m, _, cx| this.set_motion_pref(m, cx),
+            cx,
+        );
+        let motion_tip = if motion == MotionPref::System && self.system_reduce_motion {
+            "展开收起、转圈这类过渡效果（系统里已关闭）"
         } else {
             "展开收起、转圈这类过渡效果"
         };
+        let motion_row = setting_row("动画", motion_tip, motion_control);
         let appearance = setting_group([
             setting_row(
                 "主题",
-                "跟随系统，或固定用浅色 / 深色",
+                "",
                 seg_control(
                     "appearance",
                     Appearance::ALL.map(|a| (a, a.label())),
@@ -404,24 +412,14 @@ impl ChatApp {
                     cx,
                 ),
             ),
-            setting_row(
-                "动画",
-                motion_desc,
-                seg_control(
-                    "motion",
-                    MotionPref::ALL.map(|m| (m, m.label())),
-                    motion,
-                    |this, m, _, cx| this.set_motion_pref(m, cx),
-                    cx,
-                ),
-            ),
+            motion_row,
             self.font_scale_row(),
             self.font_family_row(cx),
         ]);
         let reminders = setting_group([
             setting_row(
                 "系统通知",
-                "窗口在后台时，回复完成、等你授权或出错会弹通知，点通知回到那个会话",
+                "后台时回复完成、等你授权或出错就提醒",
                 Switch::new("notifications")
                     .checked(self.settings.notifications)
                     .color(rgb(CORAL))
@@ -433,7 +431,7 @@ impl ChatApp {
             ),
             setting_row(
                 "侧栏显示内核状态",
-                "在侧栏底部列出已启动内核的连接状态；默认关闭，打开不影响内核运行",
+                "在侧栏底部显示内核连接状态",
                 Switch::new("sidebar-kernel-status")
                     .checked(self.settings.sidebar_kernel_status)
                     .color(rgb(CORAL))
@@ -445,7 +443,7 @@ impl ChatApp {
         div()
             .v_flex()
             .gap_8()
-            .child(section("外观", "这一页的改动立即生效", None, appearance))
+            .child(section("外观", "", None, appearance))
             .child(section("提醒", "", None, reminders))
             .child(section("数据", "", None, setting_group([self.settings_file_row(cx)])))
     }
@@ -453,19 +451,14 @@ impl ChatApp {
     /// 设置文件在哪：路径 + 「打开文件夹」。
     fn settings_file_row(&self, cx: &mut Context<Self>) -> Div {
         let path = self.settings_path.clone();
-        let desc = div()
-            .v_flex()
-            .gap_0p5()
-            .child(match &path {
-                Some(p) => {
-                    div().font_family(MONO).text_size(TEXT_META).child(p.display().to_string())
-                }
-                None => div().text_color(rgb(RED)).child("数据目录不可用，设置不会保存"),
-            })
-            .child("API Key 以明文保存；启动时设置的环境变量优先于这里");
-        setting_row(
+        let location = match &path {
+            Some(p) => div().font_family(MONO).text_size(TEXT_META).child(p.display().to_string()),
+            None => div().text_color(rgb(RED)).child("数据目录不可用，设置不会保存"),
+        };
+        setting_row_with(
             "设置文件",
-            desc,
+            "API Key 以明文保存；启动时设置的环境变量优先于这里",
+            location,
             div().when_some(path, |d, path| {
                 d.child(
                     Self::text_button("settings-reveal", "打开文件夹", false)
@@ -498,18 +491,12 @@ impl ChatApp {
                     .font_features(tabular_nums())
                     .child(format!("{percent:.0}%")),
             );
-        let desc = div().v_flex().gap_1().child("文字、间距、圆角一起等比缩放").child(
-            div()
-                .h_flex()
-                .items_center()
-                .gap_1()
-                .child(Self::kbd(ZOOM_IN_KEY))
-                .child("放大")
-                .child(div().w_1())
-                .child(Self::kbd(ZOOM_OUT_KEY))
-                .child("缩小"),
+        let tip = format!(
+            "文字、间距、圆角一起等比缩放；{} 放大，{} 缩小",
+            Self::key_text(ZOOM_IN_KEY),
+            Self::key_text(ZOOM_OUT_KEY)
         );
-        setting_row("界面字号", desc, slider)
+        setting_row("界面字号", tip, slider)
     }
 
     /// 字体族下拉：内嵌的 Inter + 系统已装字体（下拉里可搜索）。
@@ -519,7 +506,7 @@ impl ChatApp {
             self.settings.font_family_or_default().unwrap_or_else(|| "Inter（内嵌）".into());
         setting_row(
             "界面字体",
-            "代码块始终用等宽的 JetBrains Mono",
+            "代码固定用 JetBrains Mono",
             menu_popover(
                 "font-family-menu",
                 Anchor::BottomRight,
@@ -914,9 +901,9 @@ impl ChatApp {
             div().v_flex().gap_3().child(how_to(
                 "还没有记下的规则",
                 &[
-                    "自研内核要运行命令、改文件或访问网站时，对话里会弹出权限卡片问你",
-                    "选「总是允许」或「总是拒绝」，这个项目里同类的操作以后不再询问（拒绝的直接拦下）",
-                    "记下的规则列在这里；不想要了点 × 删掉，下次会重新问你",
+                    "运行命令、改文件或联网前，对话里会弹出权限卡片",
+                    "选「总是允许」或「总是拒绝」，同类操作以后不再问",
+                    "记下的规则列在这里，点 × 删掉就会重新问",
                 ],
             ))
         } else {
@@ -990,33 +977,21 @@ impl ChatApp {
             }
             list
         };
-        let body = body
-            .when_some(self.settings_form.message.clone(), |d, (error, text)| {
-                d.child(
-                    div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(if error { RED } else { GREEN }))
-                        .child(text),
-                )
-            })
-            .child(note(
-                IconAll::Info,
-                "什么时候弹权限卡片，由输入框下方的权限模式决定（如「逐项确认」）",
-            ));
-        section(
-            "总是允许的操作",
-            "在权限卡片上选「总是允许」时记下的，按项目生效；删除立即生效",
-            None,
-            body,
-        )
-        .child(section(
+        let body = body.when_some(self.settings_form.message.clone(), |d, (error, text)| {
+            d.child(
+                div()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(if error { RED } else { GREEN }))
+                    .child(text),
+            )
+        });
+        section("总是允许的操作", "按项目生效，删除立即生效", None, body).child(section(
             "网页搜索",
-            "自研内核的 `web_search` 工具：没有 key 时用 DuckDuckGo 兜底（可能被限流），\
-             填 Brave Search 的 API key 换成 Brave（api.search.brave.com 免费注册）",
+            "不填 key 时用 DuckDuckGo，可能被限流",
             None,
             setting_group([setting_row(
                 "Brave API key",
-                "存在本机数据目录；也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY",
+                "api.search.brave.com 免费注册；也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY",
                 div()
                     .h_flex()
                     .gap_2()
@@ -1116,16 +1091,10 @@ impl ChatApp {
                     .px_2()
                     .on_click(cx.listener(|this, _, _, cx| this.clear_gateway_logs(cx)))
             });
-        setting_row(
+        setting_row_with(
             "用量网关",
-            div()
-                .v_flex()
-                .gap_1()
-                .child(
-                    "记下每个请求的耗时、用量和重试（日志里不记提示词和 Key），在首页「请求」页签查看；\
-                     关掉就直连服务商",
-                )
-                .child(actions),
+            "记下每次请求的耗时、用量和重试（不记提示词和 Key），在首页「请求」页签查看；关掉就直连服务商",
+            actions,
             Switch::new("usage-gateway").checked(f.usage_gateway).color(rgb(CORAL)).on_change(
                 cx.listener(|this, checked: &bool, _, cx| {
                     this.settings_form.usage_gateway = *checked;
@@ -1140,8 +1109,7 @@ impl ChatApp {
         let f = &self.settings_form;
         setting_row(
             "保存请求原文",
-            "另存每个请求发给服务商的完整内容和返回（压缩，留 7 天），在「请求」页签点开一次请求查看；\
-             里面有对话和代码，只存在本机",
+            "另存每次请求的完整内容和返回（压缩，留 7 天），在「请求」页签点开查看；里面有对话和代码，只存本机",
             Switch::new("gateway-bodies")
                 .checked(f.gateway_bodies && f.usage_gateway)
                 .disabled(!f.usage_gateway)
@@ -1159,7 +1127,7 @@ impl ChatApp {
         let open = self.settings_form.open_help.contains(KEY);
         let row = setting_row(
             "模型单价",
-            "首页「请求」页签按它估算费用；内置的是参考价，以服务商为准",
+            "用来估算费用，内置的是参考价",
             Self::text_button("prices-edit", if open { "收起" } else { "编辑" }, false)
                 .small()
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1290,12 +1258,7 @@ impl ChatApp {
                     })),
             );
         }
-        let body = div().v_flex().gap_8().child(section(
-            "默认内核",
-            "新会话用哪种方式连模型；已经有对话的会话留在原来的内核上",
-            None,
-            kernels,
-        ));
+        let body = div().v_flex().gap_8().child(section("默认内核", "", None, kernels));
         match f.kernel {
             KernelChoice::Builtin => body
                 .child(self.render_providers(window, cx))
@@ -1307,7 +1270,7 @@ impl ChatApp {
                     setting_group([
                         setting_row(
                             "一轮最多几步",
-                            "一轮里最多请求模型几次（默认 200）；调大能跑更长的任务，也更费 token",
+                            "一轮里最多请求模型几次，默认 200；调大能跑更长的任务，也更费 token",
                             div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
                         ),
                         self.gateway_row(cx),
@@ -1339,20 +1302,11 @@ impl ChatApp {
                 cx.notify();
             }));
         let rows = setting_group([
-            setting_row(
-                "启用「自动」",
-                "权限模式里多出「自动」：分类器替你把关。工作目录内的编辑和只读操作不进分类器，\
-                 只有执行命令、联网、项目外写入这些才判；开着时新建的对话默认就用「自动」",
-                switch,
-            ),
-            setting_row(
-                "分类器跟随当前模型",
-                "跟着会话的模型走省事，但每次判定都要等大模型回话；关掉可以自己填个小模型",
-                follow_switch,
-            ),
+            setting_row("启用「自动」", "新对话默认用「自动」", switch),
+            setting_row("分类器跟随当前模型", "关掉可另填小模型，判得更快", follow_switch),
             setting_row(
                 "分类器模型",
-                "和当前服务商同一个端点，填模型名；留空 = 用会话的模型",
+                "同一端点的模型名，留空用会话的",
                 div()
                     .w(rems(20.))
                     .child(Input::new(&f.auto_model).cleanable(true))
@@ -1360,8 +1314,7 @@ impl ChatApp {
             ),
             setting_row(
                 "信任边界",
-                "哪些仓库 / 域名 / 桶算「内部」。留空时只有当前工作目录和它的 remote 算内部，\
-                 其余一律当作往外发",
+                "哪些仓库、域名算内部；留空只认工作目录",
                 div().w(rems(32.)).child(Textarea::new(&f.auto_environment).appearance(false)),
             ),
         ]);
@@ -1371,9 +1324,7 @@ impl ChatApp {
             .v_flex()
             .gap_3()
             .child(rows)
-            .when(unconfigured, |d| {
-                d.child(note(IconAll::Info, "「自动」模式开着：先在「服务商」里配好端点地址和模型"))
-            })
+            .when(unconfigured, |d| d.child(note(IconAll::Info, "先在「服务商」里配好端点和模型")))
             .child(self.disclosure(
                 "auto-mode-rules",
                 "它拦什么、放什么",
@@ -1383,9 +1334,7 @@ impl ChatApp {
             ));
         section(
             "自动模式",
-            "由分类器代替你逐项审批；默认关，开了要配好模型。开着时新建的对话默认就是「自动」，\
-             想逐项确认在下拉里改回来即可。分类器看不到助手的解释和工具结果，只按动作本身判，\
-             拦下时会把理由交给 agent",
+            "由分类器代替你逐项审批；它看不到助手的解释和工具结果，只按动作本身判，拦下时把理由交给 agent",
             None,
             body,
         )
@@ -1441,9 +1390,9 @@ impl ChatApp {
             body = body.child(how_to(
                 "三步接上模型",
                 &[
-                    "点右上角「添加」，选你在用的服务商（列表里没有的选「自定义」，自己填端点地址）",
-                    "填上服务商给你的 API Key（本机的 Ollama 不用填）",
-                    "点模型旁的「获取列表」挑一个模型，再点底部的「保存并应用」",
+                    "点右上角「添加」选服务商，没有的选「自定义」",
+                    "填 API Key（本机 Ollama 不用）",
+                    "「获取列表」挑个模型，再点「保存并应用」",
                 ],
             ));
         }
@@ -1453,7 +1402,7 @@ impl ChatApp {
         if let Some((p, inputs)) = f.current() {
             body = body.child(self.render_profile_editor(p, inputs, window, cx));
         }
-        section("服务商", "可以存多套，选中的那套在用", Some(add), body)
+        section("服务商", "选中的那套在用", Some(add), body)
     }
 
     /// 选中那套档案的表单：名称、协议、端点、Key、模型。
@@ -1485,14 +1434,10 @@ impl ChatApp {
                 .loading(self.fetching_models)
                 .on_click(cx.listener(|this, _, _, cx| this.fetch_models(true, cx))),
         );
-        let model_hint = if p.models.is_empty() {
-            "填好端点和 Key 后点「获取列表」，从服务商拿可用的模型；也可以直接填名字"
-        } else {
-            "新会话默认用它；会话里也能在输入框下方换"
-        };
         // 上次「获取列表」的结果代替说明：失败时说清改哪一项，下面带服务商的原文
         let fetch_result = self.settings_form.fetch_result.clone();
-        let model_hint = fetch_result.is_none().then(|| model_hint.into());
+        let model_hint =
+            (fetch_result.is_none() && p.models.is_empty()).then(|| "可以直接填名字".into());
         let model_row = div().v_flex().gap_1p5().child(model_row).when_some(
             fetch_result,
             |d, (error, text, raw)| {
@@ -1535,11 +1480,7 @@ impl ChatApp {
             .child(form_field("名称", None, Self::text_input(&inputs.name)))
             .child(form_field(
                 "协议",
-                Some(
-                    "大多数服务选 OpenAI 兼容；Anthropic 官方端点选原生；\
-                     OpenAI 的 Responses API（带思考摘要与内置工具）选 Responses"
-                        .into(),
-                ),
+                Some("大多数服务选 OpenAI 兼容；Anthropic 官方端点选原生；OpenAI 的 Responses API 选 Responses".into()),
                 div().h_flex().child(seg_control(
                     "protocol",
                     [
@@ -1554,7 +1495,7 @@ impl ChatApp {
             ))
             .child(form_field(
                 "端点地址",
-                Some("服务商文档里的 base URL，不带 /chat/completions 或 /messages".into()),
+                Some("不带 /chat/completions 或 /messages".into()),
                 endpoint,
             ))
             .child(form_field(
@@ -1565,29 +1506,22 @@ impl ChatApp {
                 ),
             ))
             .child(form_field("模型", model_hint, model_row))
-            .child(self.render_request_extras(p, inputs, cx))
+            .when(p.protocol == Protocol::Anthropic, |d| {
+                d.child(self.render_request_extras(p, inputs, cx))
+            })
     }
 
     /// 档案里只有 Anthropic 原生协议认的两项：思考预算 + 服务端工具。
-    /// 协议不是 Anthropic 时整块不显示（填了也不生效，免得误会）。
+    /// 协议不是 Anthropic 时整块不显示（填了也不生效，免得误会），见 `render_profile_editor`。
     fn render_request_extras(
         &self,
         p: &ProviderProfile,
         inputs: &ProfileInputs,
         cx: &mut Context<Self>,
     ) -> Div {
-        let builtin = "只有 Anthropic 原生协议认；其他协议填了也不生效";
         let budget = form_field(
             "思考预算",
-            Some(
-                if p.protocol == Protocol::Anthropic {
-                    "thinking.budget_tokens（最小 1024，需小于最大 token）；留空 = 不显式开启思考。\
-                     开启后不再发送 temperature（Anthropic 要求它为默认值 1）"
-                } else {
-                    "只有 Anthropic 原生协议认；留空 = 不显式开启思考"
-                }
-                .into(),
-            ),
+            Some("最小 1024，留空不开启".into()),
             div().w(NUMBER_INPUT_W).child(Self::text_input(&inputs.thinking_budget)),
         );
         // 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）
@@ -1596,11 +1530,6 @@ impl ChatApp {
             claudesktop_builtin::RequestParams::server_tool_choices().enumerate()
         {
             let on = p.params.server_tools.iter().any(|s| s == name);
-            let desc = if p.protocol == Protocol::Anthropic {
-                desc.to_string()
-            } else {
-                format!("{desc}（{builtin}）")
-            };
             tools = tools.child(
                 div()
                     .h_flex()
@@ -1645,14 +1574,7 @@ impl ChatApp {
         }
         div().v_flex().gap_4().child(budget).child(form_field(
             "服务端工具",
-            Some(
-                if p.protocol == Protocol::Anthropic {
-                    "Anthropic 在它的服务器上执行（会按次计费），结果自动折成文本进对话"
-                } else {
-                    "只有 Anthropic 原生协议认；其他协议选了也不生效"
-                }
-                .into(),
-            ),
+            Some("在 Anthropic 服务器上执行，按次计费".into()),
             tools,
         ))
     }
@@ -1678,21 +1600,20 @@ impl ChatApp {
         }
         let command = div().v_flex().gap_1p5().child(Self::text_input(&f.acp_command)).child(quick);
         let gateway_desc = if self.settings.usage_gateway {
-            "agent 的请求也记进首页「请求」页签：启动时把 ANTHROPIC_BASE_URL / OPENAI_BASE_URL \
-             指到本地网关，agent 不认这两个变量时不起作用"
+            "把 agent 的请求也记进「请求」页签"
         } else {
-            "用量网关关着（在自研内核的「运行」里打开），这一项不起作用"
+            "先在自研内核的「运行」里打开用量网关"
         };
         section(
             "ACP agent",
-            "claudesktop 运行这条命令启动 agent；登录和模型都在 agent 那边设置",
+            "登录和模型在 agent 那边设置",
             None,
             div()
                 .v_flex()
                 .gap_4()
                 .child(form_field(
                     "启动命令",
-                    Some("常用的两个都要先装好 Node.js；留空则用内置的演示 agent".into()),
+                    Some("需要 Node.js；留空用演示 agent".into()),
                     command,
                 ))
                 .child(setting_group([setting_row(
@@ -1716,7 +1637,7 @@ impl ChatApp {
                 div().text_color(rgb(if *error { RED } else { GREEN })).child(text.clone())
             }
             None if dirty => div().text_color(rgb(INK)).child("有未保存的改动"),
-            None => div().text_color(rgb(INK_SOFT)).child("这一页的改动点「保存并应用」后生效"),
+            None => div().text_color(rgb(INK_SOFT)).child("点「保存并应用」后生效"),
         };
         div()
             .h_flex()
@@ -1912,15 +1833,10 @@ const KERNEL_CHOICES: [(KernelChoice, IconAll, &str, &str); 3] = [
         KernelChoice::Builtin,
         IconAll::Cpu,
         "自研内核",
-        "填 API Key 直连模型服务：DeepSeek、Kimi、GLM、OpenAI、Anthropic、本机 Ollama 等",
+        "填 API Key 直连 DeepSeek、OpenAI、Ollama 等",
     ),
-    (
-        KernelChoice::Acp,
-        IconAll::SquareTerminal,
-        "ACP agent",
-        "接 Claude Code、pi 这类外部 agent，用它们自己的登录和模型",
-    ),
-    (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，只播放一段界面演示"),
+    (KernelChoice::Acp, IconAll::SquareTerminal, "ACP agent", "接 Claude Code 这类外部 agent"),
+    (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
 ];
 
 /// ACP 启动命令的常用项：(名称, 命令)；Windows 上前面补 `cmd /c`（见 [`acp_command`]）。
@@ -1940,6 +1856,7 @@ fn auto_mode_docs() -> Div {
         .gap_2()
         .child(line(IconAll::ShieldBan, "拦：往信任边界外发数据、下载并执行（curl | sh）、force push / reset --hard 丢掉没提交的改动、删它自己没建的文件、生产部署和迁移、改共享基础设施和权限、关掉安全检查、装持久化（SSH key / 计划任务）"))
         .child(line(IconAll::CircleCheck, "放：只读操作、工作目录内的编辑、构建和测试、项目自己声明的依赖安装、当前仓库的 add / commit / 分支操作"))
+        .child(line(IconAll::Info, "只判命令、联网、项目外写入；工作目录内的编辑和只读操作直接放行"))
         .child(line(IconAll::Zap, "分类器只看用户说过的话和要执行的动作：助手的解释和工具结果都剥掉，防止助手给自己找理由，也防止网页 / 文件里的注入影响它"))
         .child(line(IconAll::ShieldAlert, "硬熔断：rm -rf / 、删家目录或工作目录、写 .env / shell 启动脚本 / 包管理器配置，这些一律不执行，也不送分类器"))
         .child(line(IconAll::Info, "拦下时理由回给 agent：它要么换个安全做法，要么把打算做的事告诉你、等你回答。连着被拦 3 次或累计 20 次，自动模式会停下来等你"))

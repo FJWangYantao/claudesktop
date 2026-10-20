@@ -266,10 +266,7 @@ impl ChatApp {
             .v_flex()
             .gap_1()
             .child(note(IconAll::FolderTree, format!("项目根：{}", form.root.display())))
-            .child(note(
-                IconAll::Braces,
-                format!("配置文件：{}（没建过时保存就新建）", form.path.display()),
-            ));
+            .child(note(IconAll::Braces, format!("配置文件：{}", form.path.display())));
 
         // 模型：留空就跟全局
         let global_model = self.settings.builtin.current().model.clone();
@@ -300,14 +297,9 @@ impl ChatApp {
             )
             .child(note(
                 IconAll::Dot,
-                "一行一条：edit（改这个项目里的文件）、shell:git status（运行以它开头的命令）、\
-                 fetch:example.com（访问网站）；前面加 deny: 表示总是拒绝",
+                "一行一条，如 edit、shell:git status、fetch:example.com；前加 deny: 为拒绝",
             ))
-            .child(note(
-                IconAll::Dot,
-                "开新会话时并进权限文件（permissions.json）里这个项目的规则；\
-                 删掉这里的规则不会删权限文件里已经记下的",
-            ));
+            .child(note(IconAll::Dot, "新会话生效；删这里不影响已记下的规则"));
 
         // MCP：只列全局 mcp.json 里的服务器 + 项目里已经停用的（配置里写了但 mcp.json 没有的）
         let mut server_names = form.servers.clone();
@@ -428,10 +420,7 @@ impl ChatApp {
             .v_flex()
             .gap_1p5()
             .child(Self::text_input(&form.instructions))
-            .child(note(
-                IconAll::Dot,
-                "相对项目根的路径，默认读 AGENTS.md / CLAUDE.md 那一套；填了就在最后再追加这一份（最具体）",
-            ));
+            .child(note(IconAll::Dot, "相对项目根，在 AGENTS.md / CLAUDE.md 之后追加"));
 
         // 底部：上次写文件的结果（即时生效，没有保存按钮）
         let status: AnyElement = match &form.message {
@@ -439,19 +428,14 @@ impl ChatApp {
                 .text_color(rgb(if *error { RED } else { GREEN }))
                 .child(text.clone())
                 .into_any_element(),
-            None => div()
-                .text_color(rgb(INK_SOFT))
-                .child(
-                    "改完即生效（输入框离开时写入）；只写和全局不一样的项，全删干净时删掉这个文件",
-                )
-                .into_any_element(),
+            None => div().text_color(rgb(INK_SOFT)).child("改完即生效").into_any_element(),
         };
         let footer = div().text_size(TEXT_SMALL).line_height(LEADING).child(status);
 
         let warnings = form.warnings.clone();
         section(
             "这个项目",
-            "这一层只写和全局不一样的：同名的项项目里的值优先，没写的跟全局",
+            "只写和全局不一样的，其余跟全局",
             Some(actions),
             div()
                 .v_flex()
@@ -466,16 +450,8 @@ impl ChatApp {
                         .gap_5()
                         .child(form_field("模型", None, model))
                         .child(form_field("权限规则", None, rules))
-                        .child(form_field(
-                            "停用的 MCP",
-                            Some("只是在这个项目里不连；全局开关在「MCP」页".into()),
-                            mcp,
-                        ))
-                        .child(form_field(
-                            "插件",
-                            Some("项目只能从全局已启用的插件里挑，收窄到几个".into()),
-                            plugins,
-                        ))
+                        .child(form_field("停用的 MCP", Some("只在这个项目里不连".into()), mcp))
+                        .child(form_field("插件", Some("从全局已启用的插件里挑".into()), plugins))
                         .child(form_field("说明文件", None, instructions)),
                 )
                 .child(footer),

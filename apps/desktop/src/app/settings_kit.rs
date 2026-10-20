@@ -1,25 +1,39 @@
 //! 设置页各分类共用的排版件：分区标题、设置行、选择列表、步骤式说明、可展开的示例。
 //!
 //! 和首页一个路子：用「面」分层（沙色面板里放白色行），少描边；说明只留一句「这是干什么的」，
-//! 怎么用写成编号步骤放进空状态，格式细节收进「示例」里按需展开。
+//! 收进标题旁的 ⓘ（悬停看），怎么用写成编号步骤放进空状态，格式细节收进「示例」里按需展开。
 
 use super::ChatApp;
 use super::motion::{self, Reveal};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-/// 一个分区：标题 + 一句说明（可空），右边可挂操作按钮，下面是内容。
+/// 标题旁的 ⓘ：悬停显示说明。说明一律收在这里，页面上只留标题和控件；空说明不画。
+pub(super) fn info_tip(key: &str, tip: SharedString) -> Option<AnyElement> {
+    (!tip.is_empty()).then(|| {
+        div()
+            .id(ElementId::Name(format!("info-tip-{key}").into()))
+            .flex_none()
+            .text_color(rgb(INK_FAINT))
+            .hover(|d| d.text_color(rgb(INK_SOFT)))
+            .child(Icon::new(IconAll::Info).size_3p5())
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .into_any_element()
+    })
+}
+
+/// 一个分区：标题（说明收进旁边的 ⓘ），右边可挂操作按钮，下面是内容。
 pub(super) fn section(
     title: &'static str,
     desc: impl Into<SharedString>,
     actions: Option<AnyElement>,
     body: impl IntoElement,
 ) -> Div {
-    let desc: SharedString = desc.into();
     div()
         .v_flex()
         .gap_3()
@@ -30,10 +44,11 @@ pub(super) fn section(
                 .gap_3()
                 .child(
                     div()
-                        .v_flex()
+                        .h_flex()
+                        .items_center()
                         .flex_1()
                         .min_w_0()
-                        .gap_0p5()
+                        .gap_1p5()
                         .child(
                             div()
                                 .text_size(TEXT_LEAD)
@@ -41,25 +56,36 @@ pub(super) fn section(
                                 .text_color(rgb(INK))
                                 .child(title),
                         )
-                        .when(!desc.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .text_size(TEXT_SMALL)
-                                    .text_color(rgb(INK_SOFT))
-                                    .line_height(LEADING)
-                                    .child(desc),
-                            )
-                        }),
+                        .children(info_tip(title, desc.into())),
                 )
                 .when_some(actions, |d, a| d.child(div().flex_none().h_flex().gap_1p5().child(a))),
         )
         .child(body)
 }
 
-/// 设置项的一行：左边标题 + 灰色说明，右边控件。
+/// 设置项的一行：左边标题 + ⓘ 说明（空串不画），右边控件。
 pub(super) fn setting_row(
     title: impl Into<SharedString>,
-    desc: impl IntoElement,
+    tip: impl Into<SharedString>,
+    control: impl IntoElement,
+) -> Div {
+    row(title.into(), tip.into(), None, control)
+}
+
+/// 同 [`setting_row`]，标题下面再挂一行不算说明的东西（文件路径、日志操作按钮）。
+pub(super) fn setting_row_with(
+    title: impl Into<SharedString>,
+    tip: impl Into<SharedString>,
+    extra: impl IntoElement,
+    control: impl IntoElement,
+) -> Div {
+    row(title.into(), tip.into(), Some(extra.into_any_element()), control)
+}
+
+fn row(
+    title: SharedString,
+    tip: SharedString,
+    extra: Option<AnyElement>,
     control: impl IntoElement,
 ) -> Div {
     // 放不下时控件换到下一行：文字列按 14rem 起算参与折行（不然宽控件会把它挤成一个字宽、竖着排），
@@ -81,18 +107,27 @@ pub(super) fn setting_row(
                 .gap_0p5()
                 .child(
                     div()
-                        .text_size(TEXT_BODY)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(INK))
-                        .child(title.into()),
+                        .h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .text_size(TEXT_BODY)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(INK))
+                                .child(title.clone()),
+                        )
+                        .children(info_tip(&title, tip)),
                 )
-                .child(
-                    div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK_SOFT))
-                        .line_height(LEADING)
-                        .child(desc),
-                ),
+                .when_some(extra, |d, extra| {
+                    d.child(
+                        div()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK_SOFT))
+                            .line_height(LEADING)
+                            .child(extra),
+                    )
+                }),
         )
         .child(div().flex_none().max_w_full().child(control))
 }
@@ -108,7 +143,7 @@ pub(super) fn setting_group(rows: impl IntoIterator<Item = Div>) -> Div {
     group
 }
 
-/// 表单里的一项：左边固定宽的标签，右边输入框，下面可带一句提示。
+/// 表单里的一项：左边固定宽的标签（提示收进旁边的 ⓘ），右边输入框。
 pub(super) fn form_field(
     label: &'static str,
     hint: Option<SharedString>,
@@ -121,18 +156,18 @@ pub(super) fn form_field(
         .child(
             // 标签和输入框文字基线大致对齐：输入框上下各有内边距
             div()
-                .w(rems(5.5))
+                .w(rems(6.5))
                 .flex_none()
+                .h_flex()
+                .items_center()
+                .gap_1()
                 .pt_1p5()
                 .text_size(TEXT_BODY)
                 .text_color(rgb(INK))
-                .child(label),
+                .child(label)
+                .children(hint.and_then(|h| info_tip(label, h))),
         )
-        .child(div().v_flex().flex_1().min_w_0().gap_1p5().child(input).when_some(hint, |d, h| {
-            d.child(
-                div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).line_height(LEADING).child(h),
-            )
-        }))
+        .child(div().v_flex().flex_1().min_w_0().child(input))
 }
 
 /// 选择列表（默认内核、服务商档案）的外壳：沙色面板，和首页「先接上一个模型」同款。

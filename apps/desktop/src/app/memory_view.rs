@@ -213,18 +213,13 @@ impl ChatApp {
             .v_flex()
             .gap_1p5()
             .when(scope == Scope::Project, |d| {
-                d.child(note(
-                    IconAll::Info,
-                    "这个文件在项目目录里，会跟着仓库一起进 git，团队共享；只想自己知道的事记到「全局」",
-                ))
+                d.child(note(IconAll::Info, "跟着仓库进 git；私人偏好记到「全局」"))
             })
             .child(path_line)
             .when(total >= TIDY_HINT, |d| {
                 d.child(note(
                     IconAll::Lightbulb,
-                    format!(
-                        "已经 {total} 条了：关于怎么构建、代码规范这类该写进 AGENTS.md 的，整理过去之后可以在这里删掉"
-                    ),
+                    format!("已经 {total} 条了，构建、规范类的可以整理进 AGENTS.md"),
                 ))
             });
         let warnings = form.warnings.clone();
@@ -239,7 +234,7 @@ impl ChatApp {
             .into_any_element();
         section(
             "记住的事",
-            "跨会话记得的偏好、项目约定、做过的决定和踩过的坑；内核每轮自动带上相关的几条",
+            "跨会话记住的偏好和约定，每轮自动带上相关的",
             Some(actions),
             div().v_flex().gap_4().child(bar).child(body).child(footer).children(
                 warnings.into_iter().map(|w| {
@@ -311,17 +306,17 @@ impl ChatApp {
             Scope::Project => how_to(
                 "这个项目还没有记住的事",
                 &[
-                    "跟它说「记一下：构建只用 cargo test -p claudesktop-core」，它就把这句存进这个项目",
-                    "项目约定、试过又否掉的方案、踩过的坑，它觉得以后还用得上会自己记一条",
-                    "记下的都列在这里；点 × 删掉，下一轮对话就不再带上它了",
+                    "跟它说「记一下：……」，它就存进这个项目",
+                    "约定、踩过的坑，它觉得有用也会自己记",
+                    "点 × 删掉，下一轮就不再带上",
                 ],
             ),
             Scope::Global => how_to(
                 "还没有全局的记忆",
                 &[
-                    "全局的记忆在所有项目里都生效，比如「回复一律用中文」「别用 npm」",
-                    "只跟某个仓库有关的事让它在「这个项目」里记，那样会跟着仓库一起进 git",
-                    "这里删掉的条目立即失效：内核每轮都重读这个文件",
+                    "在所有项目里生效，比如「回复一律用中文」",
+                    "只跟某个仓库有关的，记在「这个项目」",
+                    "删掉立即失效",
                 ],
             ),
         }

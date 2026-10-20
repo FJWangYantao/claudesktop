@@ -92,6 +92,11 @@ impl ChatApp {
     pub(super) fn kbd(key: &str) -> Kbd {
         Kbd::new(Keystroke::parse(key).expect("keys.rs 里的按键串应能解析"))
     }
+
+    /// 按键串的文字写法（如「Ctrl+=」），放进悬停提示这类只收文字的地方。
+    pub(super) fn key_text(key: &str) -> String {
+        Kbd::format(&Keystroke::parse(key).expect("keys.rs 里的按键串应能解析"))
+    }
 }
 
 /// 滚动区内容的定宽。gpui 滚一格就重画整个 view，滚动区里的内容宽度不定时，

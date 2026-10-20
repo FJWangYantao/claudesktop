@@ -22,9 +22,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   不收起面板的内容用 `MenuList::child`。面板宽度用 rem。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
   `widgets.rs` 的 `message_action()`。
 - **设置页**：排版件在 `app/settings_kit.rs`——`section`（分区标题 + 一句说明 + 右侧操作）、
-  `setting_row` / `setting_group`（标题说明 + 右侧控件）、`form_field`（左标签右输入）、
+  `setting_row` / `setting_group`（标题 + 右侧控件，说明收进标题旁 ⓘ 的悬停提示；标题下要挂路径 / 按钮用 `setting_row_with`）、`form_field`（左标签右输入）、
   `choice_panel` + `choice_row`（沙色面板里的单选列表，同首页配置引导）、`seg_control`。
-  说明只写一句「这是干什么的」；怎么用写成 `how_to` 编号步骤放空状态，格式细节收进 `ChatApp::disclosure`。
+  说明只写一句「这是干什么的」（`section` / `setting_row` / `form_field` 都放进 ⓘ，页面上不铺灰字）；怎么用写成 `how_to` 编号步骤放空状态，格式细节收进 `ChatApp::disclosure`。
   「内核与模型」要点保存（底栏固定，`form_dirty` 决定能不能点），其余分类即时生效。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
@@ -106,7 +106,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
   下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
   `SessionMeta::task`），最后是「已归档」。判定在 `ChatApp::new_session`（`is_project_dir`：
-  建会话的目录是不是设置里选过的 `workspace`）；输入框上方的目录菜单里有「不选项目（任务）」
+  默认目录 `acp_base.cwd` 以外都算项目，默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）；输入框上方的目录菜单里有「不选项目（任务）」
   （`ChatApp::as_task`，已经跑在默认目录就只改归类），chip 和顶栏面包屑对任务显示「任务」。
   新增对话行状态时记得把它并进 `sync_sidebar` 的指纹。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
