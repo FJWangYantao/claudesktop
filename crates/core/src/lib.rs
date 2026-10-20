@@ -23,6 +23,7 @@ pub mod plugin;
 pub mod plugin_git;
 mod process_guard;
 pub mod project;
+pub mod review;
 mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};

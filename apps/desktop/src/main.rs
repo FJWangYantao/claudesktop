@@ -99,7 +99,7 @@ fn main() {
                     cx.background_executor().timer(Duration::from_millis(1500)).await;
                     let _ = this.update_in(cx, |app, window, cx| {
                         // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页；settings:N 打开第 N 个分类）
-                        // / fetch（并获取模型列表）/ restart（重启内核）
+                        // / fetch（并获取模型列表）/ restart（重启内核）/ review（审查页）
                         // / rename、ask-delete、delete（对侧栏第 2 个会话）
                         let open = std::env::var("CLAUDESKTOP_OPEN").unwrap_or_default();
                         match open.as_str() {
@@ -116,6 +116,11 @@ fn main() {
                             "rename" => app.start_rename(1, window, cx),
                             "ask-delete" => app.ask_delete(1, cx),
                             "delete" => app.delete_session(1, cx),
+                            // 侧栏第 2 个会话最新一轮的审查页；review:N 再把第 N 个文件的第一块撤回
+                            o if o.starts_with("review") => {
+                                let file = o.strip_prefix("review:").and_then(|n| n.parse().ok());
+                                app.debug_review(file, cx)
+                            }
                             "restart" => {
                                 let kind = app.session().kernel;
                                 app.restart_kernel(kind, cx)

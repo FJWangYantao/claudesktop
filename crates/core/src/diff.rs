@@ -78,7 +78,7 @@ impl DiffView {
     }
 }
 
-fn clip(s: &str) -> String {
+pub(crate) fn clip(s: &str) -> String {
     // tab 展开成 4 个空格，UI 里对齐更稳定
     let s = s.replace('\t', "    ");
     if s.chars().count() <= LINE_MAX_CHARS {

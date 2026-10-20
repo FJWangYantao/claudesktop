@@ -226,5 +226,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   压缩时内核把当前清单附在摘要后面（`tools::summary_with_todos`），不靠总结的模型抄。
 - 命令运行中的输出：`run_shell` 每 0.5 秒把最新几行经 `KernelEvent::ToolCallProgress` 报给界面（不进日志），跑完由最终的 `ToolCallUpdated` 覆盖；
   命令行（`ToolCard::shows_command`）随时可点开，展开后先列完整命令，所以行上不挂悬停提示。长文本的悬停提示用 `chat.rs` 的 `text_tip`（限宽、截断），别直接 `Tooltip::new`。
+- 逐块审查（`crates/core/src/review.rs` + `app/review.rs`）：只审最新一轮、跑完了才行；撤回 / 恢复写盘后追加带 `reverted` 的 `Record::FileChanged`（回退照常算），
+  下一条消息的 `sent` 前面附 `<user-review>` 说明（`Session::review_pending` 只是提示，说明从日志现算）。磁盘现状对不上就只读，不合并。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。

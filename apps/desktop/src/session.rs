@@ -113,6 +113,9 @@ pub struct Session {
     pub subagents: HashMap<String, SubagentRun>,
     /// 正在看哪个子任务的详情页（task 调用 ID）；None = 看对话。只在内存里
     pub viewing_task: Option<String>,
+    /// 最新一轮在审查页里撤回过块：下一条消息发出时附上说明（见 `claudesktop_core::review::review_note`）。
+    /// 只是「要不要去读日志」的提示，说明本身从日志现算
+    pub review_pending: bool,
 }
 
 /// 一个子任务（自研内核的 `task` 调用）的过程：子 agent 的思考、回复和工具调用。
@@ -319,6 +322,7 @@ impl Session {
             seen_seq: 0,
             subagents: HashMap::new(),
             viewing_task: None,
+            review_pending: false,
         }
     }
 
@@ -336,10 +340,13 @@ impl Session {
         // 回退过的轮次不显示（日志只追加，读的时候折算）
         for record in claudesktop_core::effective(&records) {
             match record {
-                Record::User { text, images, .. } => s.transcript.push(ChatItem::User {
-                    text: text.into(),
-                    images: images.iter().map(PathBuf::from).collect(),
-                }),
+                Record::User { text, images, .. } => {
+                    s.review_pending = false;
+                    s.transcript.push(ChatItem::User {
+                        text: text.into(),
+                        images: images.iter().map(PathBuf::from).collect(),
+                    })
+                }
                 Record::Event { event } => {
                     s.apply_event(event, None);
                 }
@@ -393,8 +400,8 @@ impl Session {
                 Record::Rewind { conversation, files, prompt, .. } => {
                     s.note(rewind_note(conversation, files, &prompt))
                 }
-                // 检查点只在回退时用，界面上不显示
-                Record::FileChanged { .. } => {}
+                // 检查点只在回退 / 审查时用，界面上不显示
+                Record::FileChanged { reverted, .. } => s.review_pending |= reverted.is_some(),
             }
         }
         // 上次退出时还在进行的东西一律收尾
@@ -2456,7 +2463,12 @@ mod tests {
             ev(KernelEvent::AgentMessageChunk { text: "答".into() }),
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::user("第二问"),
-            Record::FileChanged { path: "a.rs".into(), before: None, after: Some("h".into()) },
+            Record::FileChanged {
+                path: "a.rs".into(),
+                before: None,
+                after: Some("h".into()),
+                reverted: None,
+            },
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Rewind { turn: 1, conversation: true, files: 1, prompt: "第二问".into() },
         ];
@@ -2467,6 +2479,21 @@ mod tests {
             s.transcript.last(),
             Some(ChatItem::Note(t)) if t.as_ref() == "已回退到「第二问」之前，还原了 1 个文件"
         ));
+    }
+
+    #[core::prelude::v1::test]
+    fn replay_remembers_reverted_hunks_until_the_next_message() {
+        let reviewed = Record::FileChanged {
+            path: "a.rs".into(),
+            before: Some("h1".into()),
+            after: Some("h2".into()),
+            reverted: Some(Vec::new()),
+        };
+        let mut records = vec![Record::user("改"), reviewed];
+        assert!(Session::from_records(1, meta(), records.clone()).review_pending);
+        // 已经发过下一条（说明附在那条上了）
+        records.push(Record::user("继续"));
+        assert!(!Session::from_records(1, meta(), records).review_pending);
     }
 
     #[core::prelude::v1::test]

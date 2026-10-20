@@ -1047,51 +1047,7 @@ impl ChatApp {
         rest: Option<(ElementId, f32)>,
         tool: Option<(&ToolCard, f32)>,
     ) -> Div {
-        let line_el = |line: &claudesktop_core::DiffLineView| {
-            if line.tag == '~' {
-                return div()
-                    .h(px(18.))
-                    .pl(px(40.))
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_FAINT))
-                    .bg(rgb(SAND))
-                    .child("⋯");
-            }
-            let (bg, fg) = match line.tag {
-                '+' => (Some(DIFF_ADD_BG), DIFF_ADD_FG),
-                '-' => (Some(DIFF_DEL_BG), DIFF_DEL_FG),
-                _ => (None, INK_SOFT),
-            };
-            div()
-                .h_flex()
-                .items_start()
-                .when_some(bg, |d, c| d.bg(rgb(c)))
-                .child(
-                    div()
-                        .w(px(40.))
-                        .flex_shrink_0()
-                        .pr_2()
-                        .flex()
-                        .justify_end()
-                        .text_color(rgb(INK_FAINT))
-                        .child(format!("{}", line.no)),
-                )
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_shrink_0()
-                        .text_color(rgb(fg))
-                        .child(line.tag.to_string()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .pr_3()
-                        .text_color(rgb(if bg.is_some() { fg } else { INK }))
-                        .child(line.text.clone()),
-                )
-        };
+        let line_el = diff_line;
         let shown = preview.map_or(diff.lines.len(), |n| n.min(diff.lines.len()));
         let truncated = diff.truncated.then(|| {
             div()
@@ -1709,6 +1665,7 @@ impl ChatApp {
                     .then(|| motion::hover_opacity(("agent-actions", idx), hovered, window, cx));
                 let meta = s.turn_summary(idx).and_then(super::status::turn_meta);
                 let files = s.turn_files(idx);
+                let has_files = !files.is_empty();
                 let actions = div()
                     .h_flex()
                     .items_center()
@@ -1726,6 +1683,19 @@ impl ChatApp {
                             .child(m)
                     }))
                     .when(!files.is_empty(), |d| d.child(self.turn_files_menu(idx, files, cx)))
+                    // 最新一轮跑完了才能逐块审查（撤回记录要落在这一轮里，见 review.rs）
+                    .when(latest && has_files && self.store.is_some(), |d| {
+                        d.child(
+                            Self::message_action(
+                                ("review-turn", idx),
+                                IconAll::FileCheck,
+                                "审查",
+                                cx,
+                            )
+                            .tooltip("按块查看这一轮的改动，不要的单独撤回")
+                            .on_click(cx.listener(move |this, _, _, cx| this.open_review(idx, cx))),
+                        )
+                    })
                     .when_some(fade, |d, opacity| d.opacity(opacity));
                 div().child(
                     div()
@@ -1750,6 +1720,47 @@ impl ChatApp {
             }
         }
     }
+}
+
+/// diff 的一行：行号、+/- 标记、内容；`'~'` 是两个 hunk 之间省略的部分。
+pub(super) fn diff_line(line: &claudesktop_core::DiffLineView) -> Div {
+    if line.tag == '~' {
+        return div()
+            .h(px(18.))
+            .pl(px(40.))
+            .text_size(TEXT_META)
+            .text_color(rgb(INK_FAINT))
+            .bg(rgb(SAND))
+            .child("⋯");
+    }
+    let (bg, fg) = match line.tag {
+        '+' => (Some(DIFF_ADD_BG), DIFF_ADD_FG),
+        '-' => (Some(DIFF_DEL_BG), DIFF_DEL_FG),
+        _ => (None, INK_SOFT),
+    };
+    div()
+        .h_flex()
+        .items_start()
+        .when_some(bg, |d, c| d.bg(rgb(c)))
+        .child(
+            div()
+                .w(px(40.))
+                .flex_shrink_0()
+                .pr_2()
+                .flex()
+                .justify_end()
+                .text_color(rgb(INK_FAINT))
+                .child(format!("{}", line.no)),
+        )
+        .child(div().w(px(14.)).flex_shrink_0().text_color(rgb(fg)).child(line.tag.to_string()))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pr_3()
+                .text_color(rgb(if bg.is_some() { fg } else { INK }))
+                .child(line.text.clone()),
+        )
 }
 
 /// 列表离底部还有多远（按已量过的行高估）。
