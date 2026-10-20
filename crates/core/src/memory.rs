@@ -148,8 +148,11 @@ pub fn project_path(root: &Path) -> PathBuf {
 }
 
 /// 工作目录对应的项目记忆文件（找不到项目根时为 None：新项目还没有任何标记）。
+///
+/// 按 [`crate::project::shared_root`] 定位：worktree 里记的东西和主仓库是同一份
+/// （否则每开一个 worktree 都是一份全新的记忆）。
 pub fn project_file(cwd: &Path) -> Option<PathBuf> {
-    crate::project::project_root(cwd).map(project_path)
+    crate::project::project_root(cwd).map(|_| project_path(&crate::project::shared_root(cwd)))
 }
 
 /// 工作目录对应的项目记忆文件；没有项目根（不是 git 仓库、也没有 `.claudesktop`）时
@@ -453,6 +456,26 @@ mod tests {
 
     fn entry(text: &str, now: u64) -> Entry {
         Entry::new(text, now)
+    }
+
+    /// worktree 和主仓库共用一份项目记忆：在 worktree 里记的，回到主目录也在。
+    #[test]
+    fn worktree_shares_the_main_repo_memory_file() {
+        let dir = tmp("worktree");
+        let main = dir.join("main");
+        let wt = main.join("b1");
+        std::fs::create_dir_all(main.join(".git/worktrees/b1")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/b1").display()),
+        )
+        .unwrap();
+        let expected = project_path(&main);
+        assert_eq!(project_file(&wt), Some(expected.clone()));
+        assert_eq!(project_file(&wt.join("src")), Some(expected.clone()));
+        assert_eq!(project_file(&main), Some(expected.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

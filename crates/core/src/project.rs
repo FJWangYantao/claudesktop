@@ -81,9 +81,67 @@ pub fn root_or(cwd: &Path) -> &Path {
     project_root(cwd).unwrap_or(cwd)
 }
 
-/// 项目根（向上找几层 `.claudesktop`，工作目录本身优先）。
+/// 项目根（向上找几层 `.claudesktop` 或 git 标记，工作目录本身优先）。
+///
+/// git 标记两种都算：`.git` 是**目录**（普通仓库）或**文件**（worktree，内容是
+/// `gitdir: <主仓库>/.git/worktrees/<名>`）。worktree 自己就是根——项目配置、
+/// `instructions` 指的文件从这里读，读到的是这个分支上的版本，和代码一致。
 pub fn project_root(cwd: &Path) -> Option<&Path> {
-    climb(cwd, |d| path_in(d).is_file() || d.join(".git").is_dir())
+    climb(cwd, has_marker)
+}
+
+/// 这个目录里有没有 `.claudesktop` 或 git 标记（[`project_root`] 的判断条件）。
+fn has_marker(d: &Path) -> bool {
+    path_in(d).is_file() || d.join(".git").is_dir() || worktree_gitdir(d).is_some()
+}
+
+/// 读 `d/.git` 文件，确认是 worktree 标记后返回里面的 gitdir 路径（相对路径按 `d` 解析）。
+///
+/// 不能只看「是文件」：随便一个叫 `.git` 的文件不是仓库标记。也**不能**只认 `gitdir:`
+/// ——子模块的 `.git` 文件长这样（`gitdir: ../.git/modules/x`），它不是 worktree，
+/// 共享根不能被它引到主仓库去。判据是路径里那段 `worktrees/<名>`。
+pub fn worktree_gitdir(d: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(d.join(".git")).ok()?;
+    let rest = text.trim().strip_prefix("gitdir:")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let gitdir = PathBuf::from(rest);
+    if !gitdir.components().any(|c| c.as_os_str() == "worktrees") {
+        return None;
+    }
+    let gitdir = if gitdir.is_absolute() { gitdir } else { d.join(gitdir) };
+    Some(normalize(&gitdir))
+}
+
+/// 按组件重组路径：git 在 `.git` 文件里写的是正斜杠（`C:/repo/.git/worktrees/b1`），
+/// 而别处的 cwd 是原生分隔符。不统一的话同一个目录会有两种 `display()` 串，
+/// 权限规则（拿 `display()` 当键）会变成两张互不可见的表。
+fn normalize(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// worktree 对应的主仓库工作区根（不是 worktree、或者路径对不上 `…/.git/worktrees/<名>` 时 None）。
+fn worktree_main_root(d: &Path) -> Option<PathBuf> {
+    let gitdir = worktree_gitdir(d)?;
+    // `…/<名>` → `…/worktrees` → `…/.git` → `<主仓库>`
+    let dotgit = gitdir.parent()?.parent()?;
+    if dotgit.file_name() != Some(std::ffi::OsStr::new(".git")) {
+        return None;
+    }
+    dotgit.parent().map(Path::to_path_buf)
+}
+
+/// 项目记忆和权限规则落在哪个根下（和 [`project_root`] 不一定相同）。
+///
+/// - 普通仓库 / 没有 git：就是 [`project_root`]（没有标记时是 `cwd` 本身）；
+/// - worktree：换成**主仓库根**。在 worktree 里说过的「记住……」、点过的「始终允许」，
+///   回到主目录也算数，反之亦然（否则每开一个 worktree 都是一份全新的记忆和权限表）。
+///
+/// 纯文件解析，不调 git，可单测。
+pub fn shared_root(cwd: &Path) -> PathBuf {
+    let root = root_or(cwd);
+    worktree_main_root(root).unwrap_or_else(|| root.to_path_buf())
 }
 
 /// 从 `cwd` 往上最多 4 层找 `is_root` 为真的目录（`cwd` 本身优先）。
@@ -436,5 +494,90 @@ mod tests {
         let dir = tmp("root-or-cwd");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         assert_eq!(root_or(&dir), dir.as_path());
+    }
+
+    /// worktree 的 `.git` 是文件：它自己就是项目根（子目录也算它）。
+    #[test]
+    fn worktree_is_a_project_root() {
+        let main = tmp("wt-main");
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("b1")).unwrap();
+        let wt = main.join("b1");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/b1").display()),
+        )
+        .unwrap();
+        assert_eq!(project_root(&wt), Some(wt.as_path()));
+        assert_eq!(project_root(&wt.join("src")), Some(wt.as_path()));
+        // 项目配置读的是这个分支上的版本
+        assert_eq!(root_or(&wt.join("src")), wt.as_path());
+    }
+
+    /// 光有 `.git` 文件不算：得是 worktree 那种内容。
+    #[test]
+    fn a_junk_git_file_is_not_a_marker() {
+        let dir = tmp("junk-git");
+        std::fs::write(dir.join(".git"), "这不是 git 标记").unwrap();
+        assert_eq!(project_root(&dir), None);
+        assert!(worktree_gitdir(&dir).is_none());
+    }
+
+    /// 子模块的 `.git` 文件也以 `gitdir:` 开头，但它不是 worktree，共享根不能被它带走。
+    #[test]
+    fn submodule_gitdir_is_not_a_worktree() {
+        let main = tmp("sub-main");
+        let sub = main.join("vendor/lib");
+        std::fs::create_dir_all(main.join(".git").join("modules").join("lib")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../../.git/modules/lib\n").unwrap();
+        assert!(worktree_gitdir(&sub).is_none());
+        // 共享根就是主仓库，不是 `…/modules/lib` 的某个上级
+        assert_eq!(shared_root(&sub), main);
+    }
+
+    /// 记忆和权限跨 worktree 共享：worktree 里问出来的，回到主目录还在。
+    #[test]
+    fn shared_root_points_at_the_main_repo_for_worktrees() {
+        let main = tmp("shared-main");
+        std::fs::create_dir_all(main.join(".git/worktrees/b1")).unwrap();
+        let wt = main.join("b1");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            // 相对写法（git 默认就这么写）也要能解出来
+            format!("gitdir: {}\n", main.join(".git/worktrees/b1").display()),
+        )
+        .unwrap();
+        assert_eq!(shared_root(&wt), main);
+        assert_eq!(shared_root(&wt.join("src")), main);
+        // 主仓库自己不受影响
+        assert_eq!(shared_root(&main), main);
+    }
+
+    /// 没有 git 时共享根就是项目根（有 `.claudesktop` 的那一层，否则是 cwd）。
+    #[test]
+    fn shared_root_falls_back_to_the_project_root() {
+        let dir = tmp("shared-plain");
+        let nested = dir.join("a/b");
+        std::fs::create_dir_all(dir.join(DIR)).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(path_in(&dir), "{}").unwrap();
+        assert_eq!(shared_root(&nested), dir);
+    }
+
+    /// git 在 `.git` 文件里写正斜杠，别处是原生分隔符：共享根要走归一，
+    /// 否则同一目录两种 `display()` 串，权限规则会变成两张表。
+    #[test]
+    fn shared_root_uses_the_native_separator() {
+        let dir = tmp("shared-sep");
+        let main = dir.join("main");
+        let wt = main.join("b1");
+        std::fs::create_dir_all(main.join(".git/worktrees/b1")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let slashed = main.join(".git/worktrees/b1").display().to_string().replace('\\', "/");
+        std::fs::write(wt.join(".git"), format!("gitdir: {slashed}\n")).unwrap();
+        assert_eq!(shared_root(&wt), main);
+        assert_eq!(shared_root(&wt).display().to_string(), main.display().to_string());
     }
 }
