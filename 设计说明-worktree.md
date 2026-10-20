@@ -76,10 +76,17 @@ pub struct WorktreeMeta {
 项目配置、`instructions` 指的文件、项目记忆全都落空。
 
 - `project_root`：`.git` 是文件也算根（worktree 自己的根）。项目配置、CLAUDE.md / AGENTS.md 从这里读，
-  读到的是**这个分支上的版本**，和代码一致。
-- 新增 `project::shared_root(cwd)`：是 worktree 时解析 `.git` 文件换成主仓库根（纯文件解析，不调 git，可单测）。
-  **项目记忆**（`memory::project_file`）和**权限规则**（`permissions.rs` 的 `matching`、`lib.rs` 合并项目权限处）改用它：
-  在 worktree 里说过的「记住……」、点过的「始终允许」，回到主目录也算数，反之亦然。
+  读到的是**这个分支上的版本**，和代码一致。判据是文件内容以 `gitdir:` 开头且路径里有 `worktrees/<名>`
+  ——只看「是文件」会把随便一个同名文件当成标记；只认 `gitdir:` 又会把子模块
+  （`gitdir: ../.git/modules/x`）误当成 worktree。
+- 新增 `project::shared_root(cwd) -> PathBuf`：是 worktree 时解析 `.git` 文件换成主仓库根（纯文件解析，不调 git，可单测）。
+  **项目记忆**（`memory::project_file`）、**权限规则的存和查**（`permissions.rs` 的 `add` / `matching`、
+  `lib.rs` 合并项目权限处）都用它：在 worktree 里说过的「记住……」、点过的「始终允许」，回到主目录也算数，反之亦然。
+  存和查必须是**同一个**根，否则规则写进去了判断时却查不到。
+- 路径要**按组件归一**：git 在 `.git` 文件里写的是正斜杠（`C:/repo/.git/worktrees/b1`），
+  而别处的 `cwd` 是原生分隔符。权限规则拿 `display()` 当键，不统一就会变成两张互不可见的表。
+
+已实现（2026-10-21），测试见 `project.rs`、`memory.rs`、`permissions.rs` 里 `worktree` / `shared_root` 相关的几条。
 
 ## 六、生命周期
 
@@ -139,10 +146,14 @@ pub struct WorktreeMeta {
 
 ## 十、工作量与顺序
 
-1. `git.rs` + `project_root` / `shared_root` 修正和测试（半天）。第五节的修正单独提交，它对手动建的 worktree 也有用。
-2. `SessionMeta::worktree`、`Session::group_dir`、侧栏分组 + 行标记（半天）。
+1. ✅ `project_root` / `shared_root` 修正和测试（2026-10-21 已完成，第五节的修正单独提交过；
+   `git.rs` 还没做，归到第 2 步一起）。落地时补了两条文档里没写的：`.git` 文件必须验 `gitdir:` 内容
+   （随便一个同名文件不算标记），子模块那种 `gitdir: ../.git/modules/x` 不能当 worktree；
+   以及路径归一（git 写正斜杠，权限规则拿 `display()` 当键，不统一会变成两张表）。
+   权限规则的**存**（`PermissionRules::add`）也跟着改用 `shared_root`，否则写进去查不到。
+2. `git.rs` + `SessionMeta::worktree`、`Session::group_dir`、侧栏分组 + 行标记（半天）。
 3. 目录菜单「在新 worktree 中开始」+ 后台创建 + 排队发送 + 命令面板（半天）。
 4. 分支 chip、状态刷新、合并 / 删除 / 归档清理 / 目录丢失重接（一天）。
 5. `worktree.copy` / `worktree.setup`（半天，可以放到最后或下一期）。
 
-合计约三天。第 1、2 步不改变任何现有行为，可以先合。
+合计约三天。第 2 步本身也不改变现有行为，可以先合。
