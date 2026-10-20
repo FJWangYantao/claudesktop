@@ -224,11 +224,7 @@ impl ChatApp {
                 .spawn(async move {
                     let stale = || live.load(Ordering::Relaxed) != generation;
                     claudesktop_builtin::suggest::complete_next(
-                        &config,
-                        &asked,
-                        0,
-                        &history,
-                        &stale,
+                        &config, &asked, 0, &history, &stale,
                     )
                 })
                 .await;
@@ -334,22 +330,17 @@ impl ChatApp {
     }
 
     /// 把「猜的下一句」填进输入框（光标放到末尾），不直接发送：用户可以先改再按回车。
-    pub(super) fn accept_next_suggestion(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn accept_next_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let token = self.session().token;
         let Some(text) = self.next_suggestion.text(token).map(str::to_string) else {
             return;
         };
         self.next_suggestion.clear();
-        // `set_value` 会发一次 `Change`：那一趟只当「用户开始写了」，别再按打字续写去猜
+        // 输入框是空的，`insert` 就是整句填进去、光标留在末尾；它会发一次 `Change`
+        // （`set_value` 不发），那一趟只当「用户开始写了」，别再按打字续写去猜
         self.suggestion.just_accepted = true;
-        let column = text.chars().count() as u32;
         self.input.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
-            state.set_cursor_position(Position::new(0, column), window, cx);
+            state.insert(text, window, cx);
             state.focus(window, cx);
         });
         self.refresh_composer(cx);
@@ -448,8 +439,12 @@ impl ChatApp {
                     let mut run = window.text_style().to_run(text.len());
                     run.color = color.into();
                     let font_size = TEXT_BODY.to_pixels(window.rem_size());
-                    let line =
-                        window.text_system().shape_line(text.clone().into(), font_size, &[run], None);
+                    let line = window.text_system().shape_line(
+                        text.clone().into(),
+                        font_size,
+                        &[run],
+                        None,
+                    );
                     // 光标框比行框矮（0.85 倍），向上补半个差值就是这一行的顶
                     let caret = geometry.cursor_bounds();
                     let line_height = geometry.line_height();
