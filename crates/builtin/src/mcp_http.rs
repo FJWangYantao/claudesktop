@@ -296,13 +296,18 @@ fn send_error(url: &str, e: &ureq::Error) -> String {
     }
 }
 
-/// 非 2xx 的原因；401 / 403 提示怎么配凭据（OAuth 登录还没做）。
+/// 非 2xx 的原因。
+/// 401 先说去设置页点「登录」（走 OAuth 的托管服务都是这样），手填 headers 退为兜底：
+/// 服务器没给 Bearer 挑战时才走到这里（见 `mcp.rs` 的 `establish`），那种服务只能配凭据。
+/// 403 是凭据过了但没这个权限，点登录再多次也没用，直说。
 fn status_reason(status: u16, body: &str) -> String {
     let detail = crate::provider::error_message(body);
     match status {
-        401 | 403 => format!(
-            "HTTP {status}：服务器要求授权，在 mcp.json 这个服务的 \"headers\" 里配上凭据（如 Authorization）。{detail}"
+        401 => format!(
+            "HTTP 401：服务器要求授权。走 OAuth 的服务，在设置页「MCP」里点这个的「登录」；\
+             不走 OAuth 的，就在 mcp.json 这个服务的 \"headers\" 里配上凭据（如 Authorization）。{detail}"
         ),
+        403 => format!("HTTP 403：服务器拒绝了这次请求（凭据可能没有这个权限）。{detail}"),
         _ if detail.is_empty() => format!("HTTP {status}"),
         _ => format!("HTTP {status}：{detail}"),
     }

@@ -1,15 +1,18 @@
 # 设计说明：MCP 远程服务的 OAuth 登录
 
-> 状态：设计（2026-10-18），待实现。
-> 代码落点：`crates/builtin/src/mcp_oauth.rs`（新）、`mcp.rs` / `mcp_http.rs`、`crates/core/src/lib.rs`（`McpState`）、
+> 状态：第 1～3 期均已实现（2026-10-20）。仓库里能连上 DCR 托管的远程服务、自动刷新令牌、
+> 设置页有「登录」和「清除登录状态」。做法与前文的出入见第九章末尾。
+> 代码落点：`crates/builtin/src/mcp_oauth.rs`、`mcp.rs` / `mcp_http.rs`、`crates/core/src/lib.rs`（`McpState`）、
 > `apps/desktop/src/app/mcp_view.rs`。
 
 ## 一、要解决什么
 
-自研内核现在能连远程 MCP（Streamable HTTP / 旧版 SSE），但**认证只有一条路：在 `mcp.json` 的 `headers` 里手填**。
+自研内核原来能连远程 MCP（Streamable HTTP / 旧版 SSE），但**认证只有一条路：在 `mcp.json` 的 `headers` 里手填**。
 回 401 时界面给出的提示就是这句（`mcp_http.rs` 的 `status_reason`）：
 
 > HTTP 401：服务器要求授权，在 mcp.json 这个服务的 `headers` 里配上凭据（如 Authorization）。
+
+（实现后这句改成了「先说在设置页点『登录』、再说手填 `headers` 兜底」；下文其余部分仍是写方案时的状态。）
 
 托管型的 MCP 服务基本都不给长期 token，而是走 **OAuth 2.1 + 动态客户端注册**（官方 registry 上的多数服务、
 各家 SaaS 的 MCP 端点都是）。这类服务现在**根本连不上**：没有地方能用"登录一次"换一个 access token，
@@ -244,11 +247,11 @@ hub 后台线程                    授权服务器 (AS)                 浏览�
 
 ## 八、分期
 
-| 期 | 内容 | 主要改动 | 预计 |
+| 期 | 内容 | 主要改动 | 状态 |
 |---|---|---|---|
-| 1 | 发现 + DCR + PKCE + 回调 + 换 token + 存 token；设置页「登录」；mock 服务器的 happy path | `mcp_oauth.rs`、`mcp.rs` 的 `establish` 前段、`McpState::NeedsAuth`、`mcp_view.rs` | ~1.5 天 |
-| 2 | 刷新与 401 重试、过期后回到「需要登录」、并发刷新去重、「清除登录状态」 | `mcp_http.rs` 的 `Auth`、设置页按钮 | ~0.5 天 |
-| 3 | 手填 `client_id` / 固定 `callback_port` / `scope` 这几个配置项与错误文案 | `mcp.rs` 解析、文档 | ~0.3 天 |
+| 1 | 发现 + DCR + PKCE + 回调 + 换 token + 存 token；设置页「登录」；mock 服务器的 happy path | `mcp_oauth.rs`、`mcp.rs` 的 `establish` 前段、`McpState::NeedsAuth`、`mcp_view.rs` | 已实现 |
+| 2 | 刷新与 401 重试、过期后回到「需要登录」、并发刷新去重、「清除登录状态」 | `mcp_http.rs` 的 `Auth`、设置页按钮 | 已实现 |
+| 3 | 手填 `client_id` / 固定 `callback_port` / `scope` 这几个配置项与错误文案 | `mcp.rs` 解析、文档 | 已实现 |
 
 第 1 期做完就能连上绝大多数托管服务（它们都支持 DCR）；第 2 期决定它能不能长期用下去。
 
@@ -264,3 +267,18 @@ hub 后台线程                    授权服务器 (AS)                 浏览�
    推荐**不要**：现在就是这样（发出去、401、报错），多一轮没意义。
 5. **顺手把 `mcp_http.rs` 里 401 的文案改掉吗？**
    推荐**改**：OAuth 可用时，「配 headers」就不再是首选答案了，应该先说「点登录」。
+
+## 十、落地记录（2026-10-20）
+
+与上文设计有出入、或定稿时才定下来的几处：
+
+- **token 文件**：`<数据目录>/mcp-auth/<地址 sha256 前 16 位>.json`，按**地址**存（改服务名不丢授权）。
+  界面只经 `has_token` 判断有没有登录状态，令牌内容不交给 UI、不进日志（第七节的隐私要求靠这个守着）。
+- **401 文案**（第九章第 5 条的落地）：`status_reason` 现在分两种——401 先说「在设置页『MCP』里点这个的『登录』，
+  不走 OAuth 的才去 `mcp.json` 的 `headers` 里配凭据」，403 直说「凭据可能没有这个权限」。
+  走到 `status_reason` 的 401 意味着服务器没给 Bearer 挑战（`establish` 见过挑战就会去走 OAuth），所以兜底那句仍需保留。
+- **「登录」是显式点击**（第九章第 1 条）：401 只把状态改成 `NeedsAuth`，不自动弹浏览器；
+  一次授权超时 `LOGIN_TIMEOUT` = 10 分钟。
+- **清除登录状态**（第 2 期）：设置页对存着令牌的远程服务给一条红字按钮，删令牌文件后断开重连，要授权时重新回到「需要登录」。
+- **401 只重试一次**（第七节）：刷新失败就 `forget` 令牌并回到「需要登录」；握手期间发生的 401 交给 `establish` 重新走授权，
+  刚登录完又 401 就不再反复要登录（`signed_in` 标记）。
