@@ -115,8 +115,10 @@ struct Harness {
 }
 
 impl Harness {
+    /// 工作目录是一个新建的空目录：不能拿系统临时目录当 cwd，`glob` / `grep` 会把整个临时目录
+    /// 走一遍（CI 的 Windows 机器上临时目录很大，一次就要好几秒，测试超时）
     fn new(base_url: String) -> Self {
-        Self::with_cwd(base_url, std::env::temp_dir())
+        Self::with_cwd(base_url, empty_dir())
     }
 
     fn with_cwd(base_url: String, cwd: PathBuf) -> Self {
@@ -164,7 +166,7 @@ impl Harness {
             model: "mock-model".into(),
             ..Default::default()
         };
-        Self::build_steps(provider, std::env::temp_dir(), HashMap::new(), None, max_steps)
+        Self::build_steps(provider, empty_dir(), HashMap::new(), None, max_steps)
     }
 
     fn build(
@@ -261,7 +263,11 @@ impl Harness {
     }
 
     fn wait(&self, what: &str, pred: impl Fn(&KernelEvent) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.wait_for(what, Duration::from_secs(10), pred)
+    }
+
+    fn wait_for(&self, what: &str, limit: Duration, pred: impl Fn(&KernelEvent) -> bool) {
+        let deadline = Instant::now() + limit;
         while !self.events.lock().unwrap().iter().any(|r| pred(&r.event)) {
             assert!(
                 Instant::now() < deadline,
@@ -514,6 +520,12 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> Reply {
         ],
         gap_ms: 5,
     }
+}
+
+/// 每个 harness 一个空的工作目录（同一进程里的测试并行跑，按序号区分）。
+fn empty_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    workdir(&format!("h{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
 }
 
 fn workdir(name: &str) -> PathBuf {
@@ -1938,6 +1950,14 @@ fn mock_mcp_config(dir: &std::path::Path) -> PathBuf {
     path
 }
 
+impl Harness {
+    /// 等 mock MCP 服务器连上。起的是真的 node 进程：CI 的 Windows 机器上冷启动加上并行测试抢 CPU，
+    /// 十几秒是常事，所以按内核自己的握手超时（`mcp::INIT_TIMEOUT`，60 秒）等，不用 10 秒的通用上限
+    fn wait_mcp_ready(&self) {
+        self.wait_for("mcp ready", Duration::from_secs(60), mcp_ready);
+    }
+}
+
 fn mcp_ready(e: &KernelEvent) -> bool {
     matches!(e, KernelEvent::McpStatus { servers }
         if servers.iter().any(|s| s.name == "mock" && s.state == McpState::Ready))
@@ -1954,7 +1974,7 @@ fn mcp_tools_are_offered_asked_and_called() {
         happy_stream("失败了"),
     ]);
     let h = Harness::with_mcp(base, dir.clone(), config);
-    h.wait("mcp ready", mcp_ready);
+    h.wait_mcp_ready();
     // 禁用的服务器也列出来
     let off_listed = |e: &KernelEvent| {
         matches!(e, KernelEvent::McpStatus { servers }
@@ -1996,7 +2016,7 @@ fn mcp_read_only_tools_survive_plan_mode_and_list_changes() {
         happy_stream("好"),
     ]);
     let h = Harness::with_mcp(base, dir.clone(), config);
-    h.wait("mcp ready", mcp_ready);
+    h.wait_mcp_ready();
     let sid = h.start();
     h.kernel.set_mode(&sid, "plan").unwrap();
     h.kernel.send_prompt(&sid, UserPrompt::text("看看")).unwrap();
