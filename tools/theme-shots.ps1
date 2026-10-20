@@ -3,10 +3,10 @@
 # 明暗用独立的临时数据目录（CLAUDESKTOP_DATA_DIR）里的 settings.json 指定，
 # 不碰用户自己的 settings.json；配色用 CLAUDESKTOP_THEME。
 param(
-    [string]$OutDir = "D:\360MoveData\Users\asus\Desktop\claudesktop\tools\theme-shots",
+    [string]$OutDir = (Join-Path $PSScriptRoot "theme-shots"),
     [string]$Open = "settings:0"
 )
-$root = "D:\360MoveData\Users\asus\Desktop\claudesktop"
+$root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\debug\claudesktop.exe"
 if (-not (Test-Path $exe)) { throw "先 cargo build -p claudesktop" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

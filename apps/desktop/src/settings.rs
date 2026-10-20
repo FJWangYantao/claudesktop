@@ -400,14 +400,8 @@ pub enum ThemeChoice {
 }
 
 impl ThemeChoice {
-    pub const ALL: [ThemeChoice; 6] = [
-        Self::Warm,
-        Self::Flexoki,
-        Self::RosePine,
-        Self::Everforest,
-        Self::Nord,
-        Self::Catppuccin,
-    ];
+    pub const ALL: [ThemeChoice; 6] =
+        [Self::Warm, Self::Flexoki, Self::RosePine, Self::Everforest, Self::Nord, Self::Catppuccin];
 
     pub fn index(self) -> usize {
         self as usize

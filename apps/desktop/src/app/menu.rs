@@ -332,22 +332,15 @@ pub(super) fn theme_menu_item(
                 .min_w_0()
                 .gap_1()
                 .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(name.into()))
-                .child(
+                .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc.into()))
+                .child(div().h_flex().gap_1().children([PAPER, SAND, CARD, CORAL, INK].map(|c| {
                     div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK_SOFT))
-                        .child(desc.into()),
-                )
-                .child(div().h_flex().gap_1().children(
-                    [PAPER, SAND, CARD, CORAL, INK].map(|c| {
-                        div()
-                            .size_3p5()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .bg(crate::theme::swatch(palette, c))
-                    }),
-                )),
+                        .size_3p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(LINE))
+                        .bg(crate::theme::swatch(palette, c))
+                }))),
         )
         .when(active, |d| {
             d.child(Icon::new(IconAll::Check).size_4().flex_shrink_0().text_color(rgb(CORAL)))

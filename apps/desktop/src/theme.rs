@@ -195,7 +195,7 @@ const ROSE_PINE: Palette = Palette {
     sand: s(0xF2E9E1, 0x1F1D2E),
     sand_active: s(0xE9DFD6, 0x393552),
     card: s(0xFFFAF3, 0x2A273F),
-    coral: s(0xD7827E, 0xEA9A97),
+    coral: s(0xCF7672, 0xEA9A97),
     coral_deep: s(0x286983, 0xC4A7E7),
     coral_deep_hover: s(0x1F5468, 0xD3BDF0),
     on_accent: s(0xFFFFFF, 0x232136),
@@ -221,7 +221,7 @@ const EVERFOREST: Palette = Palette {
     sand: s(0xEFEBD4, 0x232A2E),
     sand_active: s(0xE6E2CC, 0x3D484D),
     card: s(0xFFFBEF, 0x343F44),
-    coral: s(0x8DA101, 0xA7C080),
+    coral: s(0x839700, 0xA7C080),
     coral_deep: s(0x5F7A00, 0xA7C080),
     coral_deep_hover: s(0x506800, 0xB8CE94),
     on_accent: s(0xFFFFFF, 0x2D353B),
@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(PALETTES.len(), crate::settings::ThemeChoice::ALL.len());
     }
 
-    /// 每套色板、两种明暗下，承载信息的文字都要 ≥ 4.5:1。
+    /// 每套色板、两种明暗下，承载信息的文字都要 ≥ 4.5:1，实底上的图标（发送箭头）≥ 3:1。
     #[core::prelude::v1::test]
     fn palette_contrast() {
         fn lum(v: u32) -> f64 {
@@ -709,23 +709,24 @@ mod tests {
             (x.max(y) + 0.05) / (x.min(y) + 0.05)
         };
         let pairs = [
-            (INK, PAPER),
-            (INK_SOFT, PAPER),
-            (INK_SOFT, SAND),
-            (INK_SOFT, CARD),
-            (INK_SOFT, HOVER),
-            (INK, SELECTED),
-            (INK, CODE_BG),
-            (INK, SELECTION),
-            (ON_ACCENT, CORAL_DEEP),
-            (ON_ACCENT, CORAL_DEEP_HOVER),
+            (INK, PAPER, 4.5),
+            (INK_SOFT, PAPER, 4.5),
+            (INK_SOFT, SAND, 4.5),
+            (INK_SOFT, CARD, 4.5),
+            (INK_SOFT, HOVER, 4.5),
+            (INK, SELECTED, 4.5),
+            (INK, CODE_BG, 4.5),
+            (INK, SELECTION, 4.5),
+            (ON_ACCENT, CORAL_DEEP, 4.5),
+            (ON_ACCENT, CORAL_DEEP_HOVER, 4.5),
+            (ON_ACCENT, CORAL, 3.0),
         ];
         for (i, pal) in PALETTES.iter().enumerate() {
             for dark in [false, true] {
-                for (fg, bg) in pairs {
+                for (fg, bg, min) in pairs {
                     let r = ratio(pick(pal, fg, dark), pick(pal, bg, dark));
                     assert!(
-                        r >= 4.5,
+                        r >= min,
                         "色板 {i}（{}）{fg:?} / {bg:?} 只有 {r:.2}:1",
                         if dark { "深色" } else { "浅色" }
                     );
