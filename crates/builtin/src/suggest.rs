@@ -29,6 +29,7 @@ pub fn system_prompt() -> String {
          Rules:\n\
          - Output only the continuation, in the same language as the draft and the conversation.\n\
          - No quotes, no explanation, no markdown syntax, no prefix such as \"Next:\".\n\
+         - If the continuation starts a new word after the draft, begin it with a space.\n\
          - At most about {MAX_CHARS} characters; it is a continuation, not an answer.\n\
          - If the draft is empty, write the kind of thing the user would say next (a request, a \
            correction, a follow-up question).\n\
@@ -62,26 +63,52 @@ pub fn build_messages(draft: &str, history: &[(bool, String)]) -> Vec<ChatMessag
 }
 
 /// 补全用的请求参数：补一句短话，温度稍高一点（不想要每次都是最平庸的那句），
-/// 输出只要一行。原来配置里的 `extra` 照留（有的端点没有它就报错）。
+/// 输出只要一行。原来配置里的 `extra` 照留（有的端点没有它就报错），但去掉开思考的键：
+/// 64 个 token 不够思考用，开着就补不出字。
 fn params(base: &RequestParams) -> RequestParams {
+    let mut extra = base.extra.clone();
+    if let Some(map) = extra.as_object_mut() {
+        for key in REASONING_KEYS {
+            map.remove(*key);
+        }
+    }
     RequestParams {
         temperature: Some(0.5),
         max_tokens: Some(64),
         thinking_budget: None,
         server_tools: Vec::new(),
-        extra: base.extra.clone(),
+        extra,
     }
+}
+
+/// `extra` 里开思考 / 推理的键（各家写法）
+const REASONING_KEYS: &[&str] =
+    &["thinking", "reasoning", "reasoning_effort", "enable_thinking", "chat_template_kwargs"];
+
+/// 看名字是不是总要先思考的模型（关不掉思考，补全的 64 个 token 会被思考用光）。
+/// 只认常见的几种命名；认不出的照常发，补不出来也只是没有灰字。
+pub fn is_reasoning_model(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let o_series =
+        ["o1", "o3", "o4"].iter().any(|p| name == *p || name.starts_with(&format!("{p}-")));
+    o_series
+        || name.contains("reasoner")
+        || name.contains("thinking")
+        || name.split(['-', '_', ':']).any(|part| part == "r1" || part == "qwq")
 }
 
 /// 发一次补全请求（阻塞，调用方放在后台线程里）。返回清理过的一句；没有可补的就 None。
 ///
 /// `session` / `turn` 只用来给用量网关的日志归类（用途 `suggest`），和会话本身的轮次无关。
+///
+/// `should_stop` 返回 true 时中断（用户又打字了，这次的结果用不上）。
 pub fn complete(
     config: &ProviderConfig,
     session: &str,
     turn: u64,
     draft: &str,
     history: &[(bool, String)],
+    should_stop: &dyn Fn() -> bool,
 ) -> Option<String> {
     // 温度 / 输出上限换成补全那一套（provider 在构造时就吃下参数）
     let config = ProviderConfig { params: params(&config.params), ..config.clone() };
@@ -89,15 +116,38 @@ pub fn complete(
     let messages = build_messages(draft, history);
     let mut reply = String::new();
     let _tag = crate::gateway::tag(session, "suggest", turn);
-    let outcome = provider.stream_chat(&config.model, &messages, &[], &|| false, &mut |event| {
+    let outcome = provider.stream_chat(&config.model, &messages, &[], should_stop, &mut |event| {
         if let StreamEvent::Text(text) = event {
             reply.push_str(&text);
         }
     });
     outcome.ok()?;
+    if should_stop() {
+        return None;
+    }
     let text = clean(&reply);
     // 和已经写好的那部分重复（模型把草稿复述了一遍）：不如不显示
-    (!text.is_empty() && !draft.trim_end().ends_with(text.as_str())).then_some(text)
+    if text.is_empty() || draft.trim_end().ends_with(text.as_str()) {
+        return None;
+    }
+    Some(join(draft, &reply, text))
+}
+
+/// 接在草稿后面要不要先补一个空格：[`clean`] 把回复首尾的空白都去掉了，
+/// 但英文里「新起一个词」靠的就是开头那个空格（`fix the` + ` tests`）。
+/// 模型回复开头带空白，或者草稿停在标点上、补全以字母数字开头，就补一个；
+/// 草稿已经以空白结尾、或者两边有一边是中日韩文字时不补。
+fn join(draft: &str, reply: &str, text: String) -> String {
+    let (Some(last), Some(first)) = (draft.chars().next_back(), text.chars().next()) else {
+        return text;
+    };
+    if last.is_whitespace() || !last.is_ascii() || !first.is_ascii() {
+        return text;
+    }
+    let spaced = reply.trim_start_matches(['\n', '\r']).starts_with([' ', '\t']);
+    let after_punct =
+        matches!(last, ',' | '.' | ';' | ':' | '!' | '?') && first.is_ascii_alphanumeric();
+    if spaced || after_punct { format!(" {text}") } else { text }
 }
 
 /// 清理模型的回复：去掉引号 / 代码围栏 / 「下一句：」这类前缀，压成一行，按 [`MAX_CHARS`] 截断。
@@ -114,8 +164,8 @@ pub fn clean(reply: &str) -> String {
     let text = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
     // 引号 / 方括号 / 结尾的句号
     let text = text
-        .trim_start_matches(['`', '"', '\'', '「', '『', '“', '‘', '[', ']'])
-        .trim_end_matches(['`', '"', '\'', '」', '』', '”', '’']);
+        .trim_start_matches(['`', '"', '\'', '「', '『', '“', '‘', '['])
+        .trim_end_matches(['`', '"', '\'', '」', '』', '”', '’', ']']);
     // 「下一句：」「Next:」这类前缀
     let text = text
         .strip_prefix("下一句：")
@@ -167,6 +217,52 @@ mod tests {
         assert_eq!(clean("Next: run the tests again"), "run the tests again");
         assert_eq!(clean("  \n\n "), "");
         assert_eq!(clean("line one\nline two"), "line one");
+    }
+
+    #[test]
+    fn keeps_the_space_before_a_new_word() {
+        let joined = |draft: &str, reply: &str| join(draft, reply, clean(reply));
+        // 模型回复开头的空格是「新起一个词」，不能被吃掉
+        assert_eq!(joined("fix the", " tests"), " tests");
+        // 接着半个词往下写
+        assert_eq!(joined("fix the te", "sts"), "sts");
+        // 草稿已经以空格结尾
+        assert_eq!(joined("fix the ", " tests"), "tests");
+        // 停在标点上
+        assert_eq!(joined("done.", "Now run it"), " Now run it");
+        // 中文不加空格
+        assert_eq!(joined("帮我看看", " 测试为什么挂了"), "测试为什么挂了");
+    }
+
+    #[test]
+    fn spots_models_that_always_think() {
+        for name in [
+            "deepseek-reasoner",
+            "deepseek-r1",
+            "deepseek/deepseek-r1:free",
+            "o3-mini",
+            "o1",
+            "qwq-32b",
+            "claude-3-7-sonnet-thinking",
+        ] {
+            assert!(is_reasoning_model(name), "{name}");
+        }
+        for name in
+            ["deepseek-chat", "glm-4-flash", "gpt-4o-mini", "claude-haiku-4-5", "qwen3-coder"]
+        {
+            assert!(!is_reasoning_model(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn drops_thinking_switches_from_extra() {
+        let base = RequestParams {
+            extra: serde_json::json!({"reasoning_effort": "high", "top_p": 0.9}),
+            ..Default::default()
+        };
+        let p = params(&base);
+        assert_eq!(p.extra, serde_json::json!({"top_p": 0.9}));
+        assert_eq!(p.max_tokens, Some(64));
     }
 
     #[test]
