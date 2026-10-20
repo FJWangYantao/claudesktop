@@ -36,6 +36,7 @@ pub mod request_bodies;
 pub mod responses;
 mod sse;
 mod subagent;
+pub mod suggest;
 mod tools;
 pub mod websearch;
 

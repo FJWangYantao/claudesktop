@@ -258,6 +258,8 @@ pub struct Settings {
     pub font_family: String,
     /// 动画（跟随系统的「动画效果」/ 总是播放 / 关闭），设置页切换后立即生效并写回
     pub motion: MotionPref,
+    /// 输入框的 Tab 补全：停顿一下就让模型猜一句下文，灰字画在光标后面；默认开
+    pub suggestions: bool,
 }
 
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
@@ -287,6 +289,7 @@ impl Default for Settings {
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
             motion: MotionPref::default(),
+            suggestions: yes(),
             auto_mode: AutoModeSettings::default(),
         }
     }

@@ -131,6 +131,12 @@ fn main() {
                                 .collect();
                             app.drop_paths(&paths, window, cx);
                         }
+                        // 调试钩子：CLAUDESKTOP_SUGGEST=<灰字>，不走模型直接摆出输入框补全的灰字
+                        if let Ok(text) = std::env::var("CLAUDESKTOP_SUGGEST")
+                            && !text.is_empty()
+                        {
+                            app.debug_suggestion(text, window, cx);
+                        }
                         app.autodemo_hook(cx);
                     });
                     // 压测钩子：CLAUDESKTOP_STRESS=<行数>，灌数据后逐帧滚动（先往上 150 帧再往下 150 帧，

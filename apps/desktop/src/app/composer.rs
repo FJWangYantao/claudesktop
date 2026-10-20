@@ -286,12 +286,28 @@ impl ChatApp {
                         .items_end()
                         .gap_1()
                         .child(
-                            div().flex_1().min_w_0().child(
-                                Textarea::new(&self.input)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .on_paste(paste_to_attachments(app.clone())),
-                            ),
+                            div()
+                                .relative()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    Textarea::new(&self.input)
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .on_paste(paste_to_attachments(app.clone())),
+                                )
+                                // 光标后面那句补全灰字（见 suggest.rs）：跟着光标画，只重画输入区。
+                                // 这里只看输入框有没有焦点，不看窗口在不在前台——灰字是内容，
+                                // 切走再切回来不该闪一下
+                                .children(
+                                    self.input
+                                        .read(cx)
+                                        .focus_handle(cx)
+                                        .is_focused(window)
+                                        .then(|| self.suggested_tail(cx))
+                                        .flatten()
+                                        .map(|tail| self.suggestion_ghost(tail)),
+                                ),
                         )
                         .child(send),
                 );

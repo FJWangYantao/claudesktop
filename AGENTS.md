@@ -161,6 +161,15 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `MoveUp` / `Enter` / `IndentInline` / `Escape` 动作，动作先于原始按键事件分发，所以 `on_key_down`
   截不到；要在输入框的祖先上 `capture_action`（capture 阶段从根到焦点），处理了 `cx.stop_propagation()`，
   没处理就什么都不做（放行）。见 `app/complete_view.rs`。
+- **输入框的 Tab 补全**（`app/suggest.rs` + `crates/builtin/src/suggest.rs`）：停顿一下就让模型
+  猜一句下文，灰字画在光标后面，Tab 接上（`complete_view.rs` 里 `IndentInline` 的第二个分支，
+  排在 `/` `@` 列表和首页 ghost prompt 之后）。灰字不能自己算位置——光标在第几行、横向滚了多远
+  只有输入框知道：叠在输入框上包一层 `deferred(canvas(..))`，prepaint 读
+  `state.prepaint_caret_geometry()`（当前帧的光标框 + 行高 + `input_bounds`），paint 里
+  `with_content_mask(input_bounds)` 裁边再 `shape_line().paint()`。字号用 `TEXT_BODY`
+  （gpui-kit 输入框 Medium 档就是 `text_sm`），行高取输入框排出来的那份。
+  触发条件收得很紧（光标在末尾、没有选区、一轮没在跑、`/` `@` 列表没开），接上之后不连猜。
+  调试钩子 `CLAUDESKTOP_SUGGEST=<灰字>`（值 `-` 只填草稿不摆灰字，用来前后对比截图）。
 - 文件对话框与系统联动：`cx.prompt_for_paths(PathPromptOptions)`（注意有 `prompt`
   字段）、`cx.prompt_for_new_path(dir, name)`，均返回 oneshot，配 `cx.spawn_in` +
   `this.update_in` 回 UI；`cx.reveal_path(&path)` 在资源管理器中打开。

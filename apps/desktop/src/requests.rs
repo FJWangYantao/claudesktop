@@ -148,6 +148,7 @@ pub fn purpose_label(purpose: &str) -> &'static str {
         "subagent" => "子任务",
         "compact" => "压缩上下文",
         "auto" => "自动模式判定",
+        "suggest" => "输入补全",
         "models" => "列模型",
         _ => "其他",
     }

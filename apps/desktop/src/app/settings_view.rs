@@ -278,6 +278,8 @@ impl ChatApp {
             .update(cx, |state, cx| state.set_value(s.acp.command.clone(), window, cx));
         self.settings_form.tab = tab;
         self.settings_open = true;
+        // 设置页开着时输入框不在画面上：光标后面那句灰字先撤掉（关掉设置页后接着打字会重猜）
+        self.suggestion.clear();
         // 「记忆」一栏按需读两份记忆文件（内核可能刚记下一条）
         if tab == super::memory_view::MEMORY_TAB {
             self.reload_memory_view();
@@ -384,6 +386,18 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 输入框的 Tab 补全开关（立即生效）。关掉时撤掉正显示的灰字，不排新的请求。
+    pub(crate) fn set_suggestions(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.suggestions = on, cx);
+        self.suggestion.clear();
+        if !on {
+            self.refresh_composer(cx);
+        } else {
+            self.schedule_suggestion(cx);
+        }
+        cx.notify();
+    }
+
     /// 「通用」分类：外观、字号、字体、侧栏、通知（都即时生效，不走「保存并应用」），以及设置文件在哪。
     fn render_general(&self, cx: &mut Context<Self>) -> Div {
         let motion = self.settings.motion;
@@ -438,6 +452,16 @@ impl ChatApp {
                     .on_change(cx.listener(|this, checked, _, cx| {
                         this.set_sidebar_kernel_status(*checked, cx)
                     })),
+            ),
+            setting_row(
+                "输入补全",
+                "停顿一下让模型猜一句下文，灰字画在光标后面，按 Tab 接上",
+                Switch::new("suggestions")
+                    .checked(self.settings.suggestions)
+                    .color(rgb(CORAL))
+                    .on_change(
+                        cx.listener(|this, checked, _, cx| this.set_suggestions(*checked, cx)),
+                    ),
             ),
         ]);
         div()

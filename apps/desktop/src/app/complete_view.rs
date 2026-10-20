@@ -318,11 +318,22 @@ impl ChatApp {
                     this.fill_prompt(prompt, window, cx);
                     return;
                 }
+                // 候选列表没开、光标后面有一句灰字：Tab 接上（见 suggest.rs）
+                if this.completion.open.is_none() && this.suggested_tail(cx).is_some() {
+                    cx.stop_propagation();
+                    this.accept_suggestion(window, cx);
+                    return;
+                }
                 this.accept_selected(window, cx)
             }))
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
                 if this.completion.open.take().is_some() {
                     this.completion.dismissed = Some(this.input.read(cx).value().to_string());
+                    cx.stop_propagation();
+                    this.refresh_composer(cx);
+                } else if this.suggested_tail(cx).is_some() {
+                    // 光标后面有灰字：Esc 先撤掉它（不打断打字，也不动光标）
+                    this.suggestion.clear();
                     cx.stop_propagation();
                     this.refresh_composer(cx);
                 }

@@ -28,6 +28,7 @@ mod shortcuts;
 mod sidebar;
 mod status;
 mod subagent_view;
+mod suggest;
 mod usage_view;
 mod widgets;
 
@@ -189,6 +190,8 @@ pub struct ChatApp {
     palette_timer: Option<Task<()>>,
     /// 刚从搜索结果跳过去的消息：(会话令牌, 行号, 跳过去的时刻)，那一行闪一下底色
     flash: Option<(u64, usize, Instant)>,
+    /// 输入框的 Tab 补全（模型猜的下文，灰字画在光标后面；见 suggest.rs）
+    suggestion: suggest::SuggestionState,
 }
 
 /// 一种内核的运行状态。
@@ -245,6 +248,8 @@ impl ChatApp {
                     // 打字时刷新 `/`、`@` 补全。只重画输入区，不碰对话（见 content.rs）
                     InputEvent::Change => {
                         this.update_completion(cx);
+                        // 停顿一下就猜一句下文（见 suggest.rs）
+                        this.schedule_suggestion(cx);
                         this.refresh_composer(cx);
                     }
                     // 发送按钮随输入框空 / 非空换样式；输入框卡片随聚焦换边框
@@ -429,6 +434,7 @@ impl ChatApp {
             palette_generation: 0,
             palette_timer: None,
             flash: None,
+            suggestion: suggest::SuggestionState::default(),
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
         cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
@@ -581,6 +587,8 @@ impl ChatApp {
             Some(idx) => idx,
             None => self.open_session(kind, cwd),
         };
+        // 换会话了：上一条对话猜的灰字作废
+        self.suggestion.clear();
         cx.notify();
     }
 
@@ -732,6 +740,10 @@ impl ChatApp {
         self.active = i;
         self.settings_open = false;
         self.sessions[i].wheel = None;
+        // 换会话了：上一条对话猜的灰字作废，输入框里的字留着，停顿一下会为新会话重猜
+        self.suggestion.clear();
+        self.refresh_composer(cx);
+        self.schedule_suggestion(cx);
         self.probe_context_window(i, cx);
         cx.notify();
     }
@@ -1107,6 +1119,8 @@ impl ChatApp {
             return;
         }
         let queued = QueuedPrompt { text, images: self.pending.clone() };
+        // 发出去了：光标后面那句灰字作废
+        self.suggestion.clear();
         if self.sessions[active].busy || self.sessions[active].stopping {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
@@ -1118,6 +1132,7 @@ impl ChatApp {
         if self.submit_to(active, queued.into_prompt(), cx) {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.refresh_composer(cx);
         }
     }
 
