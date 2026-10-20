@@ -196,6 +196,8 @@ pub struct ChatApp {
     flash: Option<(u64, usize, Instant)>,
     /// 输入框的 Tab 补全（模型猜的下文，灰字画在光标后面；见 suggest.rs）
     suggestion: suggest::SuggestionState,
+    /// 一轮结束后猜的「下一句」（淡色画在空输入框里，按 Tab 填入；见 suggest.rs）
+    next_suggestion: suggest::NextSuggestion,
 }
 
 /// 一种内核的运行状态。
@@ -441,6 +443,7 @@ impl ChatApp {
             palette_timer: None,
             flash: None,
             suggestion: suggest::SuggestionState::default(),
+            next_suggestion: suggest::NextSuggestion::default(),
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
         cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
@@ -748,6 +751,8 @@ impl ChatApp {
         self.sessions[i].wheel = None;
         // 换会话了：上一条对话猜的灰字作废，输入框里的字留着，停顿一下会为新会话重猜
         self.suggestion.clear();
+        // 猜的「下一句」也一样：那句话是接着另一个对话说的
+        self.next_suggestion.clear();
         self.refresh_composer(cx);
         self.schedule_suggestion(cx);
         self.probe_context_window(i, cx);
@@ -1125,8 +1130,9 @@ impl ChatApp {
             return;
         }
         let queued = QueuedPrompt { text, images: self.pending.clone() };
-        // 发出去了：光标后面那句灰字作废
+        // 发出去了：光标后面那句灰字、以及轮结束时猜的下一句都作废
         self.suggestion.clear();
+        self.next_suggestion.clear();
         if self.sessions[active].busy || self.sessions[active].stopping {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
@@ -1621,6 +1627,10 @@ impl ChatApp {
                     }
                     if clean_end {
                         self.dispatch_queued(idx, cx);
+                    }
+                    // 这一轮正常结束、输入框空着：猜用户接下来会发的那一句（见 suggest.rs）
+                    if clean_end && idx == self.active && !self.settings_open {
+                        self.schedule_next_suggestion(cx);
                     }
                 }
             }

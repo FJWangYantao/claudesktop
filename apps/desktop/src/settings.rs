@@ -261,6 +261,9 @@ pub struct Settings {
     /// 输入框的 Tab 补全：停顿一下就让模型猜一句下文，灰字画在光标后面。
     /// 默认关：每次停顿都是一次请求，开之前最好在 `suggest_model` 填个便宜的小模型
     pub suggestions: bool,
+    /// 一轮回复结束后猜「用户下一句会说什么」，空输入框里用淡色显示，按 Tab 填入。
+    /// 和 `suggestions` 各自独立：那个跟着打字走，这个每轮只猜一次
+    pub next_suggestion: bool,
     /// 补全用的模型（同一端点）；空 = 跟会话的模型
     pub suggest_model: String,
 }
@@ -293,6 +296,7 @@ impl Default for Settings {
             font_family: String::new(),
             motion: MotionPref::default(),
             suggestions: false,
+            next_suggestion: false,
             suggest_model: String::new(),
             auto_mode: AutoModeSettings::default(),
         }
@@ -715,6 +719,7 @@ mod tests {
     fn suggestions_are_off_by_default() {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert!(!s.suggestions);
+        assert!(!s.next_suggestion);
         assert!(s.suggest_model.is_empty());
     }
 

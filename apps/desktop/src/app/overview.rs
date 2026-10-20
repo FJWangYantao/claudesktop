@@ -470,13 +470,19 @@ impl ChatApp {
 
     /// 输入框的占位文字：首页是建议的提示词，跑着时说明回车会排队，刚拒绝了权限时请用户说要怎么改，
     /// 其余是操作提示。变了才写进输入框（每帧调一次）。
+    ///
+    /// 「猜的下一句」画在输入框里时占位文字让开（留空）：两句淡色字叠在同一行没法读。
     pub(super) fn sync_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let s = self.session();
-        let text: SharedString = match self.ghost_prompt() {
-            _ if s.steering => "说说要它怎么改，回车发送".into(),
-            _ if s.busy || s.stopping => "回车排队，这一轮结束后自动发出".into(),
-            Some(prompt) => format!("试试：{prompt}（Tab 填入）").into(),
-            None => PLACEHOLDER.into(),
+        let text: SharedString = if self.next_suggestion_text(cx).is_some() {
+            SharedString::default()
+        } else {
+            match self.ghost_prompt() {
+                _ if s.steering => "说说要它怎么改，回车发送".into(),
+                _ if s.busy || s.stopping => "回车排队，这一轮结束后自动发出".into(),
+                Some(prompt) => format!("试试：{prompt}（Tab 填入）").into(),
+                None => PLACEHOLDER.into(),
+            }
         };
         if text != self.placeholder {
             self.placeholder = text.clone();

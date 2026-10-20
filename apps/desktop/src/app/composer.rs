@@ -307,6 +307,12 @@ impl ChatApp {
                                         .then(|| self.suggested_tail(cx))
                                         .flatten()
                                         .map(|tail| self.suggestion_ghost(tail)),
+                                )
+                                // 一轮结束后猜的那句（见 suggest.rs）：输入框空着时用淡色画在里面，
+                                // 按 Tab 填入。占位文字已经让开了，这里画的就是顶格的第一行
+                                .children(
+                                    self.next_suggestion_text(cx)
+                                        .map(|text| self.next_suggestion_preview(text)),
                                 ),
                         )
                         .child(send),

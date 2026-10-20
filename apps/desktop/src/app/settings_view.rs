@@ -112,6 +112,8 @@ pub struct SettingsForm {
     auto_follow: bool,
     /// 输入补全开着没有（保存才生效）
     suggest_enabled: bool,
+    /// 一轮结束后猜下一句开着没有（保存才生效，和上面那个各管各的）
+    next_suggestion: bool,
     /// 输入补全用的模型；空 = 跟会话的
     suggest_model: Entity<InputState>,
     /// Brave Search API key（`web_search` 用；空 = DuckDuckGo 兜底）
@@ -165,6 +167,7 @@ impl SettingsForm {
             auto_enabled: false,
             auto_follow: true,
             suggest_enabled: false,
+            next_suggestion: false,
             suggest_model,
             brave_key,
             message: None,
@@ -257,6 +260,7 @@ impl ChatApp {
             .update(cx, |state, cx| state.set_value(auto.environment.clone(), window, cx));
         // 输入补全
         self.settings_form.suggest_enabled = s.suggestions;
+        self.settings_form.next_suggestion = s.next_suggestion;
         self.settings_form
             .suggest_model
             .update(cx, |state, cx| state.set_value(s.suggest_model.clone(), window, cx));
@@ -558,6 +562,7 @@ impl ChatApp {
         s.auto_mode.model = value(&f.auto_model, cx);
         s.auto_mode.environment = f.auto_environment.read(cx).value().to_string();
         s.suggestions = f.suggest_enabled;
+        s.next_suggestion = f.next_suggestion;
         s.suggest_model = value(&f.suggest_model, cx);
         s.usage_gateway = f.usage_gateway;
         s.gateway_bodies = f.gateway_bodies;
@@ -1359,22 +1364,44 @@ impl ChatApp {
         )
     }
 
-    /// 输入补全：开关 + 用哪个模型。每次停顿都是一次请求，所以默认关、推荐另填小模型。
+    /// 输入补全：两个独立的开关 + 用哪个模型。每次都是一次请求，所以默认关、推荐另填小模型。
     fn render_suggest(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let switch = Switch::new("suggest-on")
+        let typing = Switch::new("suggest-on")
             .checked(f.suggest_enabled)
             .color(rgb(CORAL))
             .on_change(cx.listener(|this, checked: &bool, _, cx| {
                 this.settings_form.suggest_enabled = *checked;
                 cx.notify();
             }));
+        let next = Switch::new("next-suggestion-on")
+            .checked(f.next_suggestion)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                this.settings_form.next_suggestion = *checked;
+                // 关掉时把已经猜出来的那句淡色字也撤掉
+                if !*checked {
+                    this.next_suggestion.clear();
+                    this.refresh_composer(cx);
+                }
+                cx.notify();
+            }));
         section(
             "输入补全",
-            "停顿一下让模型猜一句下文，灰字画在光标后面，按 Tab 接上",
+            "你打字时猜你这句的下一半；每轮回复结束后猜你接下来会发的那一句",
             None,
             setting_group([
-                setting_row("启用输入补全", "每次停顿发一次请求，会计入用量", switch),
+                setting_row(
+                    "打字时续写",
+                    "停顿一下发一次请求，灰字画在光标后面，按 Tab 接上",
+                    typing,
+                ),
+                setting_row(
+                    "一轮结束后猜下一句",
+                    "回复结束时发一次请求，猜出的那句话用淡色画在空输入框里，按 Tab 填入；\
+                     输入框里已有草稿时不猜",
+                    next,
+                ),
                 setting_row(
                     "补全模型",
                     "同一端点的模型名，建议填便宜、不带思考的小模型；留空用会话的",

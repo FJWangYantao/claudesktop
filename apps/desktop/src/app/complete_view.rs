@@ -318,6 +318,12 @@ impl ChatApp {
                     this.fill_prompt(prompt, window, cx);
                     return;
                 }
+                // 一轮结束后猜的那句（淡色画在空输入框里）：Tab 填入（见 suggest.rs）
+                if this.completion.open.is_none() && this.next_suggestion_text(cx).is_some() {
+                    cx.stop_propagation();
+                    this.accept_next_suggestion(window, cx);
+                    return;
+                }
                 // 候选列表没开、光标后面有一句灰字：Tab 接上（见 suggest.rs）
                 if this.completion.open.is_none() && this.suggested_tail(cx).is_some() {
                     cx.stop_propagation();
@@ -329,6 +335,11 @@ impl ChatApp {
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
                 if this.completion.open.take().is_some() {
                     this.completion.dismissed = Some(this.input.read(cx).value().to_string());
+                    cx.stop_propagation();
+                    this.refresh_composer(cx);
+                } else if this.next_suggestion_text(cx).is_some() {
+                    // 空输入框里那句猜的下一句：Esc 先撤掉它（不打断打字，也不动光标）
+                    this.next_suggestion.clear();
                     cx.stop_propagation();
                     this.refresh_composer(cx);
                 } else if this.suggested_tail(cx).is_some() {
