@@ -110,6 +110,10 @@ pub struct SettingsForm {
     auto_enabled: bool,
     /// 分类器跟随当前模型
     auto_follow: bool,
+    /// 输入补全开着没有（保存才生效）
+    suggest_enabled: bool,
+    /// 输入补全用的模型；空 = 跟会话的
+    suggest_model: Entity<InputState>,
     /// Brave Search API key（`web_search` 用；空 = DuckDuckGo 兜底）
     brave_key: Entity<InputState>,
     /// (是否错误, 文本)
@@ -138,6 +142,9 @@ impl SettingsForm {
         let auto_model =
             cx.new(|cx| InputState::new(window, cx).placeholder("如 deepseek-chat / glm-4-flash"));
         let auto_environment = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10));
+        let suggest_model = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("留空用会话的模型，如 deepseek-chat")
+        });
         let brave_key =
             cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
         Self {
@@ -157,6 +164,8 @@ impl SettingsForm {
             auto_environment,
             auto_enabled: false,
             auto_follow: true,
+            suggest_enabled: false,
+            suggest_model,
             brave_key,
             message: None,
             rules: Vec::new(),
@@ -246,6 +255,11 @@ impl ChatApp {
         self.settings_form
             .auto_environment
             .update(cx, |state, cx| state.set_value(auto.environment.clone(), window, cx));
+        // 输入补全
+        self.settings_form.suggest_enabled = s.suggestions;
+        self.settings_form
+            .suggest_model
+            .update(cx, |state, cx| state.set_value(s.suggest_model.clone(), window, cx));
         // web_search 的 Brave key（环境变量优先；文件里没有时输入框留空）
         let brave = std::env::var(claudesktop_builtin::websearch::BRAVE_KEY_ENV)
             .ok()
@@ -386,18 +400,6 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 输入框的 Tab 补全开关（立即生效）。关掉时撤掉正显示的灰字，不排新的请求。
-    pub(crate) fn set_suggestions(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.save_ui_pref(move |s| s.suggestions = on, cx);
-        self.suggestion.clear();
-        if !on {
-            self.refresh_composer(cx);
-        } else {
-            self.schedule_suggestion(cx);
-        }
-        cx.notify();
-    }
-
     /// 「通用」分类：外观、字号、字体、侧栏、通知（都即时生效，不走「保存并应用」），以及设置文件在哪。
     fn render_general(&self, cx: &mut Context<Self>) -> Div {
         let motion = self.settings.motion;
@@ -452,16 +454,6 @@ impl ChatApp {
                     .on_change(cx.listener(|this, checked, _, cx| {
                         this.set_sidebar_kernel_status(*checked, cx)
                     })),
-            ),
-            setting_row(
-                "输入补全",
-                "停顿一下让模型猜一句下文，灰字画在光标后面，按 Tab 接上",
-                Switch::new("suggestions")
-                    .checked(self.settings.suggestions)
-                    .color(rgb(CORAL))
-                    .on_change(
-                        cx.listener(|this, checked, _, cx| this.set_suggestions(*checked, cx)),
-                    ),
             ),
         ]);
         div()
@@ -565,6 +557,8 @@ impl ChatApp {
         s.auto_mode.use_session_model = f.auto_follow;
         s.auto_mode.model = value(&f.auto_model, cx);
         s.auto_mode.environment = f.auto_environment.read(cx).value().to_string();
+        s.suggestions = f.suggest_enabled;
+        s.suggest_model = value(&f.suggest_model, cx);
         s.usage_gateway = f.usage_gateway;
         s.gateway_bodies = f.gateway_bodies;
         // 单价表写错了留着原来的（`save_settings` 先报错，不会走到这里）；和内置的一样就不存
@@ -1287,6 +1281,7 @@ impl ChatApp {
             KernelChoice::Builtin => body
                 .child(self.render_providers(window, cx))
                 .child(self.render_auto_mode(window, cx))
+                .child(self.render_suggest(cx))
                 .child(section(
                     "运行",
                     "",
@@ -1361,6 +1356,31 @@ impl ChatApp {
             "由分类器代替你逐项审批；它看不到助手的解释和工具结果，只按动作本身判，拦下时把理由交给 agent",
             None,
             body,
+        )
+    }
+
+    /// 输入补全：开关 + 用哪个模型。每次停顿都是一次请求，所以默认关、推荐另填小模型。
+    fn render_suggest(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let switch = Switch::new("suggest-on")
+            .checked(f.suggest_enabled)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                this.settings_form.suggest_enabled = *checked;
+                cx.notify();
+            }));
+        section(
+            "输入补全",
+            "停顿一下让模型猜一句下文，灰字画在光标后面，按 Tab 接上",
+            None,
+            setting_group([
+                setting_row("启用输入补全", "每次停顿发一次请求，会计入用量", switch),
+                setting_row(
+                    "补全模型",
+                    "同一端点的模型名，建议填便宜、不带思考的小模型；留空用会话的",
+                    div().w(rems(20.)).child(Input::new(&f.suggest_model).cleanable(true)),
+                ),
+            ]),
         )
     }
 

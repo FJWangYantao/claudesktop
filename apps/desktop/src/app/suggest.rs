@@ -15,6 +15,8 @@
 //!   没有选区、输入不长（[`MAX_DRAFT_CHARS`]）的时候发；`/`、`@` 补全开着时不发。
 //! - 一轮跑着时（等回复）也不发：那会儿用户多半在等，不是在写。
 //! - 请求失败、没有可补的：静默，什么都不显示。
+//! - 默认关；开了也优先用设置里另填的小模型（`suggest_model`），只带最近几轮对话，
+//!   过期的请求当场中断——每次停顿都是一次计费的请求。
 
 use super::ChatApp;
 use crate::model::ChatItem;
@@ -23,14 +25,16 @@ use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::component::input::Position;
 use gpui_kit::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// 停下多久才发请求（敲字时不停被换掉，只有真停了才发）
 const DEBOUNCE_MS: u64 = 450;
 /// 输入框里已经写了这么多字就不再猜（再猜也猜不准，还费一次请求）
 const MAX_DRAFT_CHARS: usize = 400;
-/// 给模型看的用户消息最多几条、助手回复最多几段
-const MAX_USER_TURNS: usize = 8;
+/// 给模型看的最近几轮（用户消息 + 那一轮最后一段回复）；猜下一句用不着更早的
+const MAX_USER_TURNS: usize = 3;
 
 /// 当前这一句灰字（还没被接上的）。
 #[derive(Default)]
@@ -39,8 +43,9 @@ pub(super) struct SuggestionState {
     pub(super) text: Option<Suggestion>,
     /// 计时器：又敲字时换掉旧的，旧的自行取消
     timer: Option<Task<()>>,
-    /// 每次排请求 +1：回来时对不上说明已经过期
-    generation: u64,
+    /// 每次排请求 +1：回来时对不上说明已经过期。后台线程也读它，过期的请求当场中断
+    /// （不然用户接着打字时旧请求照样跑完、照样计费）
+    generation: Arc<AtomicU64>,
     /// 刚接上一句：那一次 `Change` 不为它再发请求（接着连猜会一句接一句，又费钱又吵）
     just_accepted: bool,
 }
@@ -65,7 +70,7 @@ impl SuggestionState {
     /// 换输入了（或者接上了、发出去了）：灰字立刻撤掉。
     pub(super) fn clear(&mut self) {
         self.text = None;
-        self.generation += 1;
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.timer = None;
     }
 }
@@ -95,10 +100,8 @@ impl ChatApp {
         {
             return;
         }
-        let generation = {
-            self.suggestion.generation += 1;
-            self.suggestion.generation
-        };
+        let live = self.suggestion.generation.clone();
+        let generation = live.fetch_add(1, Ordering::Relaxed) + 1;
         let history = self.suggestion_history();
         // 网关日志按会话归类；补全不占内核的一轮，所以轮次写 0
         let session_id = self.session().acp_id.clone().unwrap_or_default();
@@ -111,12 +114,14 @@ impl ChatApp {
             let text = cx
                 .background_executor()
                 .spawn(async move {
+                    let stale = || live.load(Ordering::Relaxed) != generation;
                     claudesktop_builtin::suggest::complete(
                         &config,
                         &session_id,
                         0,
                         &asked,
                         &history,
+                        &stale,
                     )
                 })
                 .await;
@@ -124,7 +129,7 @@ impl ChatApp {
             let draft = request_draft;
             this.update(cx, |app, cx| {
                 // 用户又打字了 / 换了会话 / 开关关了：这次的结果已经过期
-                if app.suggestion.generation != generation {
+                if app.suggestion.generation.load(Ordering::Relaxed) != generation {
                     return;
                 }
                 if let Some(text) = text {
@@ -147,16 +152,24 @@ impl ChatApp {
             && self.session().acp_id.is_some()
     }
 
-    /// 补全用的端点与模型：跟着当前会话的模型走（顶栏显示哪个就用哪个）。
+    /// 补全用的端点与模型：设置里填了补全模型就用它，否则跟着当前会话的模型走（顶栏显示哪个就用哪个）。
+    /// 带思考的模型不补：64 个 token 的上限多半被思考用光，灰字出不来，请求却照样计费。
     fn suggestion_config(&self) -> Option<claudesktop_builtin::ProviderConfig> {
         let profile = self.settings.builtin.current();
         if !profile.is_configured() {
             return None;
         }
         let mut config = profile.provider_config();
+        let chosen = self.settings.suggest_model.trim();
         let session_model = self.session().model_label.to_string();
-        if !session_model.trim().is_empty() && session_model != crate::session::UNKNOWN_MODEL {
+        if !chosen.is_empty() {
+            config.model = chosen.to_string();
+        } else if !session_model.trim().is_empty() && session_model != crate::session::UNKNOWN_MODEL
+        {
             config.model = session_model;
+        }
+        if claudesktop_builtin::suggest::is_reasoning_model(&config.model) {
+            return None;
         }
         // 补全的请求也经用量网关（用途 `suggest`），和「自动」模式分类器一致
         config.gateway = self.settings.gateway();

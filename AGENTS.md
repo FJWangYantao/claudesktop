@@ -169,6 +169,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `with_content_mask(input_bounds)` 裁边再 `shape_line().paint()`。字号用 `TEXT_BODY`
   （gpui-kit 输入框 Medium 档就是 `text_sm`），行高取输入框排出来的那份。
   触发条件收得很紧（光标在末尾、没有选区、一轮没在跑、`/` `@` 列表没开），接上之后不连猜。
+  每次停顿就是一次请求：默认关，开关和补全模型在「内核与模型」（`suggestions` / `suggest_model`），
+  只带最近 3 轮；过期的请求经 `should_stop` 当场中断；总要思考的模型（`suggest::is_reasoning_model`）不补。
   调试钩子 `CLAUDESKTOP_SUGGEST=<灰字>`（值 `-` 只填草稿不摆灰字，用来前后对比截图）。
 - 文件对话框与系统联动：`cx.prompt_for_paths(PathPromptOptions)`（注意有 `prompt`
   字段）、`cx.prompt_for_new_path(dir, name)`，均返回 oneshot，配 `cx.spawn_in` +

@@ -258,8 +258,11 @@ pub struct Settings {
     pub font_family: String,
     /// 动画（跟随系统的「动画效果」/ 总是播放 / 关闭），设置页切换后立即生效并写回
     pub motion: MotionPref,
-    /// 输入框的 Tab 补全：停顿一下就让模型猜一句下文，灰字画在光标后面；默认开
+    /// 输入框的 Tab 补全：停顿一下就让模型猜一句下文，灰字画在光标后面。
+    /// 默认关：每次停顿都是一次请求，开之前最好在 `suggest_model` 填个便宜的小模型
     pub suggestions: bool,
+    /// 补全用的模型（同一端点）；空 = 跟会话的模型
+    pub suggest_model: String,
 }
 
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
@@ -289,7 +292,8 @@ impl Default for Settings {
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
             motion: MotionPref::default(),
-            suggestions: yes(),
+            suggestions: false,
+            suggest_model: String::new(),
             auto_mode: AutoModeSettings::default(),
         }
     }
@@ -704,6 +708,14 @@ mod tests {
         std::fs::write(&path, r#"{"max_steps":999999}"#).unwrap();
         assert_eq!(Settings::load(Some(&path)).0.max_steps, claudesktop_builtin::MAX_MAX_STEPS);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 输入补全每次停顿都是一次请求：没写过这一项的设置文件里是关着的，补全模型留空（跟会话）。
+    #[core::prelude::v1::test]
+    fn suggestions_are_off_by_default() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.suggestions);
+        assert!(s.suggest_model.is_empty());
     }
 
     /// 「自动」模式：默认关；开着时必须配好（跟会话走 = 档案配好即可，自选模型 = 要填模型名），
