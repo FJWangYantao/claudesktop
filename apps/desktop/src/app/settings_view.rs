@@ -394,15 +394,16 @@ impl ChatApp {
             |this, m, _, cx| this.set_motion_pref(m, cx),
             cx,
         );
-        // 跟随系统而系统关了动画时才补一句，平时只留标题
-        let motion_row = if motion == MotionPref::System && self.system_reduce_motion {
-            setting_row("动画", "系统里已关闭", motion_control)
+        let motion_tip = if motion == MotionPref::System && self.system_reduce_motion {
+            "展开收起、转圈这类过渡效果（系统里已关闭）"
         } else {
-            plain_row("动画", motion_control)
+            "展开收起、转圈这类过渡效果"
         };
+        let motion_row = setting_row("动画", motion_tip, motion_control);
         let appearance = setting_group([
-            plain_row(
+            setting_row(
                 "主题",
+                "",
                 seg_control(
                     "appearance",
                     Appearance::ALL.map(|a| (a, a.label())),
@@ -450,19 +451,14 @@ impl ChatApp {
     /// 设置文件在哪：路径 + 「打开文件夹」。
     fn settings_file_row(&self, cx: &mut Context<Self>) -> Div {
         let path = self.settings_path.clone();
-        let desc = div()
-            .v_flex()
-            .gap_0p5()
-            .child(match &path {
-                Some(p) => {
-                    div().font_family(MONO).text_size(TEXT_META).child(p.display().to_string())
-                }
-                None => div().text_color(rgb(RED)).child("数据目录不可用，设置不会保存"),
-            })
-            .child("API Key 明文保存；环境变量优先");
-        setting_row(
+        let location = match &path {
+            Some(p) => div().font_family(MONO).text_size(TEXT_META).child(p.display().to_string()),
+            None => div().text_color(rgb(RED)).child("数据目录不可用，设置不会保存"),
+        };
+        setting_row_with(
             "设置文件",
-            desc,
+            "API Key 以明文保存；启动时设置的环境变量优先于这里",
+            location,
             div().when_some(path, |d, path| {
                 d.child(
                     Self::text_button("settings-reveal", "打开文件夹", false)
@@ -495,16 +491,12 @@ impl ChatApp {
                     .font_features(tabular_nums())
                     .child(format!("{percent:.0}%")),
             );
-        let desc = div()
-            .h_flex()
-            .items_center()
-            .gap_1()
-            .child(Self::kbd(ZOOM_IN_KEY))
-            .child("放大")
-            .child(div().w_1())
-            .child(Self::kbd(ZOOM_OUT_KEY))
-            .child("缩小");
-        setting_row("界面字号", desc, slider)
+        let tip = format!(
+            "文字、间距、圆角一起等比缩放；{} 放大，{} 缩小",
+            Self::key_text(ZOOM_IN_KEY),
+            Self::key_text(ZOOM_OUT_KEY)
+        );
+        setting_row("界面字号", tip, slider)
     }
 
     /// 字体族下拉：内嵌的 Inter + 系统已装字体（下拉里可搜索）。
@@ -999,7 +991,7 @@ impl ChatApp {
             None,
             setting_group([setting_row(
                 "Brave API key",
-                "api.search.brave.com 免费注册",
+                "api.search.brave.com 免费注册；也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY",
                 div()
                     .h_flex()
                     .gap_2()
@@ -1099,13 +1091,10 @@ impl ChatApp {
                     .px_2()
                     .on_click(cx.listener(|this, _, _, cx| this.clear_gateway_logs(cx)))
             });
-        setting_row(
+        setting_row_with(
             "用量网关",
-            div()
-                .v_flex()
-                .gap_1()
-                .child("记下每次请求的耗时和用量，在首页「请求」查看")
-                .child(actions),
+            "记下每次请求的耗时、用量和重试（不记提示词和 Key），在首页「请求」页签查看；关掉就直连服务商",
+            actions,
             Switch::new("usage-gateway").checked(f.usage_gateway).color(rgb(CORAL)).on_change(
                 cx.listener(|this, checked: &bool, _, cx| {
                     this.settings_form.usage_gateway = *checked;
@@ -1120,7 +1109,7 @@ impl ChatApp {
         let f = &self.settings_form;
         setting_row(
             "保存请求原文",
-            "完整请求和返回只存本机，留 7 天",
+            "另存每次请求的完整内容和返回（压缩，留 7 天），在「请求」页签点开查看；里面有对话和代码，只存本机",
             Switch::new("gateway-bodies")
                 .checked(f.gateway_bodies && f.usage_gateway)
                 .disabled(!f.usage_gateway)
@@ -1281,7 +1270,7 @@ impl ChatApp {
                     setting_group([
                         setting_row(
                             "一轮最多几步",
-                            "默认 200，调大更费 token",
+                            "一轮里最多请求模型几次，默认 200；调大能跑更长的任务，也更费 token",
                             div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
                         ),
                         self.gateway_row(cx),
@@ -1343,7 +1332,12 @@ impl ChatApp {
                 window,
                 cx,
             ));
-        section("自动模式", "让分类器代替你逐项审批", None, body)
+        section(
+            "自动模式",
+            "由分类器代替你逐项审批；它看不到助手的解释和工具结果，只按动作本身判，拦下时把理由交给 agent",
+            None,
+            body,
+        )
     }
 
     /// 自研内核的服务商：档案列表（选中的那套在用）+「添加」菜单，下面编辑选中的那套。
@@ -1486,7 +1480,7 @@ impl ChatApp {
             .child(form_field("名称", None, Self::text_input(&inputs.name)))
             .child(form_field(
                 "协议",
-                Some("不确定就选 OpenAI 兼容".into()),
+                Some("大多数服务选 OpenAI 兼容；Anthropic 官方端点选原生；OpenAI 的 Responses API 选 Responses".into()),
                 div().h_flex().child(seg_control(
                     "protocol",
                     [
