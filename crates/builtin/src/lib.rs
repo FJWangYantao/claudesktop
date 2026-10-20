@@ -72,7 +72,8 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
 
 use claudesktop_core::plugin::{self, AgentDef, HookEvent, HookOutcome, Plugin, Skill};
 use claudesktop_core::{
-    EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, Record, RoutedEvent, checkpoint,
+    EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, PlanEntryView, Record,
+    RoutedEvent, checkpoint,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -258,6 +259,10 @@ struct SessionState {
     /// 只有用户的话，没有助手的话和工具结果——那是 Claude Code 的做法，避免助手把自己说服过去、
     /// 也避免工具结果里的注入内容影响判定
     user_messages: Vec<String>,
+    /// 当前的待办清单（`todo_write` 最后一次写的）：提醒和压缩摘要要用
+    todos: Vec<PlanEntryView>,
+    /// 上次写清单之后又走了几步（每步一次请求）：到 `TODO_REMIND_STEPS` 提醒一次
+    steps_since_todo: u32,
 }
 
 impl SessionState {
@@ -679,7 +684,10 @@ impl Inner {
         let (history, previous) = {
             let sessions = self.sessions.lock().unwrap();
             let state = sessions.get(session).ok_or_else(|| anyhow::anyhow!("会话已关闭"))?;
-            (state.history.clone(), state.summary.clone())
+            // 上次附上的清单不交给模型再总结（压缩完附上最新的）
+            let previous =
+                state.summary.as_deref().map(|p| tools::summary_without_todos(p).to_string());
+            (state.history.clone(), previous)
         };
         let Some(split) = compact::split(&history, keep_budget, idle) else {
             return Ok(None);
@@ -726,16 +734,18 @@ impl Inner {
             }
         };
         // 和 commit() 一样持锁判断取消；一轮之内历史只有本线程在改，切点仍然有效
-        let context_tokens = {
+        let (summary, context_tokens) = {
             let mut sessions = self.sessions.lock().unwrap();
             let state = match sessions.get_mut(session) {
                 Some(state) if !stopped() => state,
                 _ => anyhow::bail!("cancelled"),
             };
             state.history = split.apply(&history);
+            // 写清单的调用可能被压进摘要：当前清单原样附在摘要后面，模型压缩后还知道做到哪了
+            let summary = tools::summary_with_todos(&summary, &state.todos);
             state.summary = Some(summary.clone());
             state.measured = None;
-            state.estimate_tokens()
+            (summary, state.estimate_tokens())
         };
         self.emit(Some(session), KernelEvent::Compacted { summary, context_tokens });
         Ok(Some(usage.unwrap_or_default()))
@@ -827,6 +837,28 @@ impl Inner {
         }
     }
 
+    /// 一步走完：这一步写了清单就重新计数，否则加一。
+    fn count_step(&self, session: &str, wrote_todo: bool) {
+        if let Some(state) = self.sessions.lock().unwrap().get_mut(session) {
+            state.steps_since_todo = if wrote_todo { 0 } else { state.steps_since_todo + 1 };
+        }
+    }
+
+    /// 清单还有没做完的项、又好几步没更新：返回挂在这次请求末尾的提醒（并重新计数，
+    /// 还不更新就再隔几步提醒一次）。模型干到一半常常忘了勾清单，只靠系统提示词里的一句不够。
+    fn todo_nudge(&self, session: &str) -> Option<String> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let state = sessions.get_mut(session)?;
+        if state.agent.is_some()
+            || state.steps_since_todo < tools::TODO_REMIND_STEPS
+            || !tools::todos_open(&state.todos)
+        {
+            return None;
+        }
+        state.steps_since_todo = 0;
+        Some(tools::todo_reminder(&state.todos))
+    }
+
     /// 本轮结束：清掉自己的标志（取消后可能已经开始了新的一轮）。
     fn finish(&self, session: &str, flag: &Arc<AtomicBool>) {
         if let Some(state) = self.sessions.lock().unwrap().get_mut(session)
@@ -850,6 +882,9 @@ impl Inner {
             return match tools::parse_todos(&call.function.arguments) {
                 Ok(entries) => {
                     let summary = tools::todo_summary(&entries);
+                    if let Some(state) = self.sessions.lock().unwrap().get_mut(session) {
+                        state.todos = entries.clone();
+                    }
                     self.emit(Some(session), KernelEvent::PlanReplaced { entries });
                     ToolOutput::ok(format!("Todo list updated: {summary}"), summary)
                 }
@@ -1205,6 +1240,9 @@ impl Inner {
                     memory_global: parent.memory_global.clone(),
                     // 子会话的分类器判定同样要看用户说过的话
                     user_messages: parent.user_messages.clone(),
+                    // 子会话没有待办清单
+                    todos: Vec::new(),
+                    steps_since_todo: 0,
                 };
                 Some((flag, state))
             }) else {
@@ -1778,6 +1816,9 @@ impl BuiltinKernel {
             memory_global: Vec::new(),
             // 续接的会话从日志里找回用户说过的话，否则分类器以为用户什么都没授权
             user_messages: recent_user_messages(history.user_messages),
+            // 续接的会话接着用日志里最后那份清单
+            todos: history.todos,
+            steps_since_todo: 0,
         };
         // 记住的东西一开始就带上（之后每轮重读）
         for warning in state.reload_memory(self.inner.memory_path.as_deref()) {
@@ -1828,7 +1869,8 @@ fn system_prompt(
     let Context { instructions: project, skills, memory_project, memory_global } = ctx;
     // 子会话没有待办清单（计划是主会话的）
     let todo = if agent.is_none() {
-        "For tasks with several steps, track progress with todo_write. "
+        "For tasks with several steps, track progress with todo_write and keep it current: \
+         mark each item completed as soon as it is done. "
     } else {
         ""
     };
@@ -2039,9 +2081,16 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         } else {
             just_compacted = false;
         }
-        let Some(Snapshot { messages, mode, cwd, model, agent }) = inner.snapshot(session) else {
+        let Some(Snapshot { mut messages, mode, cwd, model, agent }) = inner.snapshot(session)
+        else {
             return Steps::Stopped;
         };
+        // 提醒只挂在这次请求的最后一条（用户消息或工具结果）上，不进历史
+        if let Some(reminder) = inner.todo_nudge(session)
+            && let Some(last) = messages.last_mut().filter(|m| m.role == "user" || m.role == "tool")
+        {
+            last.append_text(&reminder);
+        }
         let mut specs = tools::specs(mode != MODE_PLAN);
         let (disabled, plugin_scope) = {
             let sessions = inner.sessions.lock().unwrap();
@@ -2151,6 +2200,7 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                 }
             })
             .collect();
+        let wrote_todo = outcome.tool_calls.iter().any(|c| c.function.name == tools::TODO_WRITE);
         let mut step = Vec::with_capacity(results.len() + 1);
         let unmeasured = results.len();
         let mut call = ChatMessage::assistant_tool_calls(text, outcome.tool_calls);
@@ -2163,6 +2213,7 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         }
         // 工具结果还没被端点数过
         inner.measure(session, step_tokens, unmeasured);
+        inner.count_step(session, wrote_todo);
     }
     Steps::Done { stop, usage, context_tokens, reply }
 }
@@ -2341,6 +2392,9 @@ impl Kernel for BuiltinKernel {
         state.summary = rebuilt.summary;
         // 撤回的消息里的授权跟着作废
         state.user_messages = recent_user_messages(rebuilt.user_messages);
+        // 清单回到回退点那时的样子
+        state.todos = rebuilt.todos;
+        state.steps_since_todo = 0;
         state.restored = true;
         state.measured = None;
         Ok(())

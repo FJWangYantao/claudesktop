@@ -186,6 +186,17 @@ impl ChatMessage {
     }
 
     /// 文本内容（各文本段拼接）；没有文本返回 None
+    /// 在文字末尾补一段（没有文字段就加一段；图片段留在原位）。请求前临时挂提醒用。
+    pub fn append_text(&mut self, extra: &str) {
+        match self.parts.iter_mut().rev().find_map(|p| match p {
+            ContentPart::Text(t) => Some(t),
+            _ => None,
+        }) {
+            Some(t) => t.push_str(extra),
+            None => self.parts.insert(0, ContentPart::Text(extra.trim_start().to_string())),
+        }
+    }
+
     pub fn text(&self) -> Option<String> {
         let mut out = String::new();
         let mut any = false;

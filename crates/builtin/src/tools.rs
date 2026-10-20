@@ -30,6 +30,10 @@ pub const TODO_WRITE: &str = "todo_write";
 pub const MEMORY_WRITE: &str = "memory_write";
 /// 待办清单最多几项
 const TODO_MAX: usize = 50;
+/// 清单里还有没做完的项、连续这么多步没更新时，提醒模型一次
+pub const TODO_REMIND_STEPS: u32 = 8;
+/// 压缩摘要末尾附的清单的标题（再压缩时先去掉，免得旧清单被抄进新摘要）
+const TODO_SECTION: &str = "\n\n## Todo list at the time of compaction\n";
 
 /// 能和相邻调用并行执行的工具：只读、不问权限、互不影响。
 pub fn parallel_safe(name: &str) -> bool {
@@ -235,8 +239,11 @@ pub fn specs(writable: bool) -> Vec<Value> {
             TODO_WRITE,
             "Create or update the task list for the current work; the user sees it as a checklist. \
              Use it for tasks with three or more steps: write the whole list up front, then call it again \
-             to mark items in_progress / completed as you go. Always send the complete list (it replaces \
-             the previous one) and keep exactly one item in_progress while working. \
+             as you go. Mark an item completed as soon as it is done (do not batch several completions), \
+             and mark the next one in_progress before starting it; keep exactly one item in_progress while \
+             working. Add items you discover along the way and remove ones that no longer apply. \
+             Always send the complete list (it replaces the previous one); an empty list clears it. \
+             Before your final reply, make sure the list matches what was actually done. \
              Do not use it for simple one-step requests."
                 .into(),
             json!({
@@ -462,6 +469,43 @@ struct ShellOutputArgs {
     wait_secs: Option<u64>,
 }
 
+/// 清单里还有没做完的项。
+pub fn todos_open(entries: &[PlanEntryView]) -> bool {
+    entries.iter().any(|e| e.status != "completed")
+}
+
+/// 清单一项一行（提醒 / 压缩摘要用）。
+fn todo_lines(entries: &[PlanEntryView]) -> String {
+    todo_marked(entries).join("\n")
+}
+
+/// 好几步没更新清单时挂在请求末尾的提醒（只进这一次请求，不进历史）。
+pub fn todo_reminder(entries: &[PlanEntryView]) -> String {
+    format!(
+        "\n\n<system-reminder>\nThe todo list has not been updated for a while. Current list:\n{}\n\
+         If you finished items, mark them completed now with {TODO_WRITE}; if the plan changed, rewrite \
+         the list; if it no longer applies, clear it. Do not mention this reminder to the user.\n\
+         </system-reminder>",
+        todo_lines(entries)
+    )
+}
+
+/// 压缩摘要：去掉上次附上的清单，再附上当前的（还有没做完的项才附）。
+/// 清单由内核附，不靠总结的模型抄：抄的会过时，附的和界面上的一致。
+pub fn summary_with_todos(summary: &str, entries: &[PlanEntryView]) -> String {
+    let body = summary_without_todos(summary);
+    if todos_open(entries) {
+        format!("{body}{TODO_SECTION}{}", todo_lines(entries))
+    } else {
+        body.to_string()
+    }
+}
+
+/// 摘要去掉附上的清单（交给模型再总结前用）。
+pub fn summary_without_todos(summary: &str) -> &str {
+    summary.split_once(TODO_SECTION).map_or(summary, |(body, _)| body)
+}
+
 #[derive(Deserialize)]
 struct TodoArgs {
     todos: Vec<TodoItem>,
@@ -498,6 +542,11 @@ pub fn parse_todos(arguments: &str) -> Result<Vec<PlanEntryView>, String> {
 
 /// 待办清单的一行摘要（日志重建上下文 / 回给模型的确认用）：`[x] 已完成; [>] 进行中; [ ] 待做`。
 pub fn todo_summary(entries: &[PlanEntryView]) -> String {
+    todo_marked(entries).join("; ")
+}
+
+/// 每项带上状态记号：`[x]` 已完成、`[>]` 进行中、`[ ]` 待做。
+fn todo_marked(entries: &[PlanEntryView]) -> Vec<String> {
     entries
         .iter()
         .map(|e| {
@@ -508,8 +557,7 @@ pub fn todo_summary(entries: &[PlanEntryView]) -> String {
             };
             format!("{mark} {}", e.content)
         })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -1974,6 +2022,28 @@ mod tests {
             .collect();
         assert!(names.contains(&"glob".to_string()) && names.contains(&"grep".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summary_carries_only_the_current_open_todo_list() {
+        let entries = parse_todos(
+            r#"{"todos":[{"content":"读代码","status":"completed"},{"content":"改; 测","status":"in_progress"}]}"#,
+        )
+        .unwrap();
+        let summary = summary_with_todos("## 摘要\n做到一半", &entries);
+        assert!(summary.starts_with("## 摘要\n做到一半"), "{summary}");
+        assert!(summary.ends_with("[x] 读代码\n[>] 改; 测"), "{summary}");
+        // 再压缩：旧清单先去掉，只留新的一份
+        let again = summary_with_todos(&summary, &entries);
+        assert_eq!(again, summary);
+        assert_eq!(summary_without_todos(&summary), "## 摘要\n做到一半");
+        // 都做完了 / 没有清单：不附
+        let done = parse_todos(r#"{"todos":[{"content":"读代码","status":"completed"}]}"#).unwrap();
+        assert!(!todos_open(&done));
+        assert_eq!(summary_with_todos(&summary, &done), "## 摘要\n做到一半");
+        assert_eq!(summary_with_todos("摘要", &[]), "摘要");
+        let reminder = todo_reminder(&entries);
+        assert!(reminder.contains("<system-reminder>") && reminder.contains("[>] 改; 测"));
     }
 
     #[test]
