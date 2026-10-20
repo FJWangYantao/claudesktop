@@ -755,7 +755,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("claudesktop-theme-{}", std::process::id()));
         let path = dir.join("settings.json");
-        let mut s = Settings { theme: ThemeChoice::RosePine, ..Default::default() };
+        let s = Settings { theme: ThemeChoice::RosePine, ..Default::default() };
         s.save(&path).unwrap();
         assert_eq!(Settings::load(Some(&path)).0.theme, ThemeChoice::RosePine);
         // 文件里是 key（snake_case），不是枚举名
