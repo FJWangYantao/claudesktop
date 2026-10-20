@@ -62,6 +62,15 @@ pub(super) fn setting_row(
     desc: impl IntoElement,
     control: impl IntoElement,
 ) -> Div {
+    row(title.into(), Some(desc.into_any_element()), control)
+}
+
+/// 只有标题的设置行（控件本身就说明了一切，如主题的分段切换）。
+pub(super) fn plain_row(title: impl Into<SharedString>, control: impl IntoElement) -> Div {
+    row(title.into(), None, control)
+}
+
+fn row(title: SharedString, desc: Option<AnyElement>, control: impl IntoElement) -> Div {
     // 放不下时控件换到下一行：文字列按 14rem 起算参与折行（不然宽控件会把它挤成一个字宽、竖着排），
     // 同一行放得下时再长满剩下的宽度
     div()
@@ -84,15 +93,17 @@ pub(super) fn setting_row(
                         .text_size(TEXT_BODY)
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(INK))
-                        .child(title.into()),
+                        .child(title),
                 )
-                .child(
-                    div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK_SOFT))
-                        .line_height(LEADING)
-                        .child(desc),
-                ),
+                .when_some(desc, |d, desc| {
+                    d.child(
+                        div()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK_SOFT))
+                            .line_height(LEADING)
+                            .child(desc),
+                    )
+                }),
         )
         .child(div().flex_none().max_w_full().child(control))
 }

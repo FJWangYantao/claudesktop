@@ -306,9 +306,9 @@ impl ChatApp {
             Shelf::Installed if self.plugins.is_empty() => body.child(how_to(
                 "还没有插件",
                 &[
-                    "点上面的「推荐」，挑一个点「安装」，装好就能用",
-                    "别的插件：在「推荐」最下面填 GitHub 的「作者/仓库」或 git 地址安装",
-                    "或者点「打开插件目录」，把插件文件夹直接放进去，再点「重新扫描」",
+                    "在「推荐」里挑一个点「安装」",
+                    "别的插件：在「推荐」最下面填「作者/仓库」或 git 地址",
+                    "也可以把插件文件夹放进插件目录，再「重新扫描」",
                 ],
             )),
             Shelf::Installed => {
@@ -337,17 +337,13 @@ impl ChatApp {
             .gap_1()
             .child(note(
                 IconAll::ShieldCheck,
-                "推荐里的是 Anthropic 官方插件，装好直接启用；填地址装的默认停用：钩子和 MCP 服务会在你的电脑上运行插件作者写的命令，看过再启用",
+                "填地址装的插件默认停用：它会在本机运行作者写的命令，看过再启用",
             ))
-            .child(note(
-                IconAll::Info,
-                "自研内核里指令、技能、子 agent、MCP 工具、钩子都生效；ACP agent（如 Claude Code）只用指令和 MCP 服务，\
-                 对之后新开的会话起作用",
-            ))
+            .child(note(IconAll::Info, "对新会话生效；ACP agent 只用其中的指令和 MCP"))
             .child(note(IconAll::Folder, format!("插件目录：{dir}")));
         section(
             "插件",
-            "加斜杠命令、技能、子 agent、MCP 服务和钩子；格式兼容 Claude Code",
+            "斜杠命令、技能、子 agent 等，兼容 Claude Code",
             Some(actions),
             body.child(notes),
         )
