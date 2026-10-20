@@ -1067,6 +1067,7 @@ impl Inner {
     fn run_checkpointed(
         &self,
         session: &str,
+        call_id: &str,
         action: &Action,
         stopped: &dyn Fn() -> bool,
     ) -> ToolOutput {
@@ -1074,7 +1075,10 @@ impl Inner {
         let before = target.as_deref().and_then(checkpoint::read_snapshot);
         // 后台任务记在这个会话名下（事件里按会话分组）
         bgtasks::set_current(self.kernel_id, session);
-        let output = action.run(stopped);
+        let output = action.run(stopped, &|output| {
+            let id = call_id.to_string();
+            self.emit(Some(session), KernelEvent::ToolCallProgress { id, output });
+        });
         if let (Some(path), Some(before)) = (target, before)
             && let Some(after) = checkpoint::read_snapshot(&path)
             && before != after
@@ -1157,7 +1161,7 @@ impl Inner {
                         Action::Task { prompt, agent, .. } => {
                             self.run_task(session, cwd, &call.id, prompt, agent.as_deref())
                         }
-                        _ => self.run_checkpointed(session, &action, stopped),
+                        _ => self.run_checkpointed(session, &call.id, &action, stopped),
                     }
                 }
                 Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),

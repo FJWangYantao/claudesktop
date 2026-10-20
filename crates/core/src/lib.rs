@@ -146,6 +146,9 @@ pub enum KernelEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
+    /// 运行中的工具到目前为止的输出（预览，见 [`output_tail_preview`]）：只给界面看，不进日志，
+    /// 跑完后由带最终输出的 `ToolCallUpdated` 替换
+    ToolCallProgress { id: String, output: String },
     /// 工具调用涉及的文件改动（可能在执行前作为预览发出，同一路径再次发出时替换）
     ToolCallDiff { id: String, diff: DiffView },
     /// 计划整体替换（ACP 语义：每次都是全量列表）
@@ -306,6 +309,7 @@ impl KernelEvent {
             Self::SubagentStarted { .. } => "subagent_started",
             Self::SubagentChunk { .. } => "subagent_chunk",
             Self::ToolCallUpdated { .. } => "tool_call_updated",
+            Self::ToolCallProgress { .. } => "tool_call_progress",
             Self::ToolCallDiff { .. } => "tool_call_diff",
             Self::PlanReplaced { .. } => "plan_replaced",
             Self::PermissionAuto { .. } => "permission_auto",
@@ -388,6 +392,22 @@ pub fn output_preview(text: &str) -> String {
         out.push_str(&format!("\n… 其余 {} 行未显示", lines.len() - rows.len()));
     }
     out
+}
+
+/// 运行中的输出预览保留的行数（看最新进展，不铺满屏）
+pub const LIVE_PREVIEW_LINES: usize = 12;
+
+/// 还在跑的命令的输出 → 预览：只留最后 [`LIVE_PREVIEW_LINES`] 行（进度条用 `\r` 覆写的行只留最后一截），
+/// 前面有省略时开头注明；其余处理同 [`output_preview`]。
+pub fn output_tail_preview(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .trim_matches(['\n', '\r'])
+        .lines()
+        .map(|l| l.trim_end_matches('\r').rsplit('\r').next().unwrap_or(""))
+        .collect();
+    let skipped = lines.len().saturating_sub(LIVE_PREVIEW_LINES);
+    let body = output_preview(&lines[skipped..].join("\n"));
+    if skipped == 0 { body } else { format!("… 前面 {skipped} 行未显示\n{body}") }
 }
 
 /// 制表符展开到下一个 4 列制表位（按字符数算列，不管中文宽度）。
@@ -575,6 +595,16 @@ mod tests {
         assert_eq!(output_preview(read), " 9  let a = 1;\n10      b();\n11");
         // 空行不参与计算共同缩进
         assert_eq!(output_preview("  a\n\n    b"), "a\n\n  b");
+    }
+
+    #[test]
+    fn output_tail_preview_keeps_the_latest_lines() {
+        assert_eq!(output_tail_preview("a\nb"), "a\nb");
+        assert_eq!(output_tail_preview("10%\r50%\r100%\ndone\n"), "100%\ndone");
+        let text = (1..=20).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let out = output_tail_preview(&text);
+        assert!(out.starts_with("… 前面 8 行未显示\n9\n"));
+        assert!(out.ends_with("\n20"));
     }
 
     #[test]

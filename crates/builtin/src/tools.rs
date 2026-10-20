@@ -49,6 +49,10 @@ const LIST_MAX: usize = 1000;
 const OUTPUT_MAX_CHARS: usize = 30_000;
 /// 每个管道最多收集的字节
 const PIPE_MAX_BYTES: usize = 2 << 20;
+/// 命令运行中多久报一次输出
+const LIVE_EVERY: Duration = Duration::from_millis(500);
+/// 报运行中输出时每路只解码末尾这么多字节
+const LIVE_TAIL_BYTES: usize = 16 << 10;
 /// 超过这个大小的文件不做 diff 预览
 const PREVIEW_MAX_BYTES: u64 = 2 << 20;
 const SHELL_TIMEOUT_DEFAULT: u64 = 120;
@@ -933,14 +937,17 @@ impl Action {
         }
     }
 
-    /// 执行；`should_stop` 用于中断长命令。
-    pub fn run(&self, should_stop: &dyn Fn() -> bool) -> ToolOutput {
+    /// 执行；`should_stop` 用于中断长命令，命令跑着时隔一阵把到目前为止的输出预览交给
+    /// `progress`（见 [`claudesktop_core::output_tail_preview`]）。
+    pub fn run(&self, should_stop: &dyn Fn() -> bool, progress: &dyn Fn(String)) -> ToolOutput {
         match self {
             Self::Read { path, offset, limit } => read_file(path, *offset, *limit),
             Self::List { path } => list_dir(path),
             Self::Write { path, content } => write_file(path, content),
             Self::Edit { path, old, new, all } => edit_file(path, old, new, *all),
-            Self::Shell { command, timeout, cwd } => run_shell(command, cwd, *timeout, should_stop),
+            Self::Shell { command, timeout, cwd } => {
+                run_shell(command, cwd, *timeout, should_stop, progress)
+            }
             Self::ShellBackground { command, cwd } => start_background(command, cwd),
             Self::ShellOutput { id, wait_secs } => {
                 match crate::bgtasks::output(id, Duration::from_secs(*wait_secs), should_stop) {
@@ -1803,6 +1810,7 @@ fn run_shell(
     cwd: &Path,
     timeout: Duration,
     should_stop: &dyn Fn() -> bool,
+    progress: &dyn Fn(String),
 ) -> ToolOutput {
     let mut child = match shell_command(command)
         .current_dir(cwd)
@@ -1838,6 +1846,26 @@ fn run_shell(
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
 
+    // 运行中的输出：每 [`LIVE_EVERY`] 看一次，有新内容就报（只取两路缓冲的末尾一截来解码）
+    let live = |seen: &mut (usize, usize)| {
+        let (out, err) = (stdout.0.lock().unwrap(), stderr.0.lock().unwrap());
+        if (out.len(), err.len()) == *seen {
+            return;
+        }
+        *seen = (out.len(), err.len());
+        let tail = |b: &[u8]| {
+            String::from_utf8_lossy(&b[b.len().saturating_sub(LIVE_TAIL_BYTES)..]).into_owned()
+        };
+        let mut text = tail(&out);
+        if !err.is_empty() {
+            let _ = write!(text, "\n[stderr]\n{}", tail(&err));
+        }
+        drop((out, err));
+        progress(claudesktop_core::output_tail_preview(&text));
+    };
+    let mut seen = (0, 0);
+    let mut last_live = Instant::now();
+
     let started = Instant::now();
     let mut interrupted = None;
     let status = loop {
@@ -1845,6 +1873,10 @@ fn run_shell(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(_) => break None,
+        }
+        if last_live.elapsed() >= LIVE_EVERY {
+            last_live = Instant::now();
+            live(&mut seen);
         }
         if should_stop() {
             interrupted = Some("cancelled");
@@ -1976,7 +2008,7 @@ mod tests {
             let a = Action::parse(name, args, &dir).unwrap();
             assert_eq!(a.access(), Access::Read);
             assert_eq!(a.kind(), "search");
-            a.run(&never)
+            a.run(&never, &|_| {})
         };
 
         // 不含 / 的模式按文件名匹配任意层级；target/ 被 .gitignore 排除
@@ -2218,10 +2250,10 @@ y
     #[test]
     fn shell_runs_and_reports_exit_code() {
         let dir = tmp("sh");
-        let ok = run_shell("echo hello", &dir, Duration::from_secs(60), &|| false);
+        let ok = run_shell("echo hello", &dir, Duration::from_secs(60), &|| false, &|_| {});
         assert!(ok.ok, "{ok:?}");
         assert_eq!(ok.summary, "hello");
-        let bad = run_shell("exit 3", &dir, Duration::from_secs(60), &|| false);
+        let bad = run_shell("exit 3", &dir, Duration::from_secs(60), &|| false, &|_| {});
         assert!(!bad.ok);
         assert!(bad.content.contains("[exit code: 3]"), "{bad:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2232,11 +2264,35 @@ y
         let dir = tmp("cancel");
         let started = Instant::now();
         let cmd = if cfg!(windows) { "Start-Sleep 30" } else { "sleep 30" };
-        let out = run_shell(cmd, &dir, Duration::from_secs(60), &|| {
-            started.elapsed() > Duration::from_millis(300)
-        });
+        let out = run_shell(
+            cmd,
+            &dir,
+            Duration::from_secs(60),
+            &|| started.elapsed() > Duration::from_millis(300),
+            &|_| {},
+        );
         assert!(!out.ok && out.content.contains("cancelled"), "{out:?}");
         assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_reports_output_while_running() {
+        let dir = tmp("live");
+        let cmd = if cfg!(windows) {
+            "Write-Output first; Start-Sleep -Milliseconds 1500; Write-Output second"
+        } else {
+            "echo first; sleep 1.5; echo second"
+        };
+        let seen = Mutex::new(Vec::new());
+        let out = run_shell(cmd, &dir, Duration::from_secs(60), &|| false, &|p| {
+            seen.lock().unwrap().push(p)
+        });
+        assert!(out.ok, "{out:?}");
+        let seen = seen.into_inner().unwrap();
+        // 跑着的时候报过只有第一行的预览，同样的内容不重复报
+        assert!(seen.iter().any(|p| p == "first"), "{seen:?}");
+        assert_eq!(seen.iter().filter(|p| *p == "first").count(), 1, "{seen:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

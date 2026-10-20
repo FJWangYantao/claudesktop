@@ -131,6 +131,9 @@ pub fn forward(call: &str, event: KernelEvent) -> Option<KernelEvent> {
         KernelEvent::ToolCallUpdated { id: i, title, status, raw_output, output } => {
             KernelEvent::ToolCallUpdated { id: id(i), title, status, raw_output, output }
         }
+        KernelEvent::ToolCallProgress { id: i, output } => {
+            KernelEvent::ToolCallProgress { id: id(i), output }
+        }
         KernelEvent::ToolCallDiff { id: i, diff } => KernelEvent::ToolCallDiff { id: id(i), diff },
         KernelEvent::AgentMessageChunk { text } => {
             KernelEvent::SubagentChunk { task: call.to_string(), text, thought: false }

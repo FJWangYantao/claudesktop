@@ -138,6 +138,16 @@ impl Grant {
 pub const DIFF_PREVIEW_ROWS: usize = 40;
 
 impl ToolCard {
+    /// 命令类工具：点开后先列完整命令（工具行上只有截断的一行）。
+    pub fn shows_command(&self) -> bool {
+        self.kind == "execute" && !self.arg.trim().is_empty()
+    }
+
+    /// 工具行能不能点开：有输出可看，或者是命令（跑着、还没输出时也能点开看完整命令）。
+    pub fn can_open(&self) -> bool {
+        self.shows_command() || !self.output.trim().is_empty()
+    }
+
     /// 记录一份 diff：同一路径替换（执行前的预览会被之后的结果覆盖）。
     pub fn set_diff(&mut self, diff: DiffView) {
         match self.diffs.iter_mut().find(|d| d.path == diff.path) {

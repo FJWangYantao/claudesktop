@@ -1205,6 +1205,13 @@ impl Session {
                     }
                 }
             }
+            KernelEvent::ToolCallProgress { id, output } => {
+                if let Some(card) = self.tool_card(&id)
+                    && card.phase == ToolPhase::Running
+                {
+                    card.output = output.into();
+                }
+            }
             KernelEvent::ToolCallDiff { id, diff } => {
                 if let Some(card) = self.tool_card(&id) {
                     card.set_diff(diff);
@@ -1798,6 +1805,47 @@ mod tests {
         // 复制整轮正文，不跨到上一轮
         assert_eq!(s.turn_text(3), "a\n\nb");
         assert_eq!(s.turn_text(6), "c");
+    }
+
+    #[core::prelude::v1::test]
+    fn running_command_shows_live_output_until_it_finishes() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.begin_turn();
+        s.apply_event(
+            KernelEvent::ToolCallStarted {
+                id: "c1".into(),
+                title: "`cargo build`".into(),
+                status: "pending".into(),
+                kind: "execute".into(),
+                parent: None,
+            },
+            None,
+        );
+        fn card(s: &Session) -> &ToolCard {
+            match s.transcript.last() {
+                Some(ChatItem::Tool(c)) => c,
+                _ => panic!("没有工具行"),
+            }
+        }
+        // 还没输出也能点开（看完整命令）
+        assert!(card(&s).can_open() && card(&s).output.is_empty());
+        let progress =
+            |text: &str| KernelEvent::ToolCallProgress { id: "c1".into(), output: text.into() };
+        s.apply_event(progress("Compiling a"), None);
+        assert_eq!(card(&s).output.as_ref(), "Compiling a");
+        s.apply_event(
+            KernelEvent::ToolCallUpdated {
+                id: "c1".into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: Some("完成".into()),
+                output: Some("Finished".into()),
+            },
+            None,
+        );
+        // 跑完后晚到的进度不覆盖最终输出
+        s.apply_event(progress("Compiling b"), None);
+        assert_eq!(card(&s).output.as_ref(), "Finished");
     }
 
     #[core::prelude::v1::test]

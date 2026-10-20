@@ -411,7 +411,7 @@ impl ChatApp {
                 Self::render_diff(diff, Some(DIFF_PREVIEW_ROWS), None, Some((card, settle)))
             }));
         }
-        let has_output = !card.output.trim().is_empty();
+        let has_output = card.can_open();
         let task_id = task.to_string();
         // 元素 ID 和对话里的工具行错开（详情页和对话不同时画，但下标空间不同）
         let line = Self::render_tool_line(100_000 + k, card, settle)
