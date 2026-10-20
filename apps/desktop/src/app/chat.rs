@@ -148,10 +148,13 @@ pub(super) fn markdown_style() -> TextViewStyle {
     TextViewStyle::default()
         .paragraph_gap(rems(0.75))
         // 标题接口只收 Pixels，所以按当前缩放换算一次
+        // 正文 15px：一级 24 / 二级 20 / 三级 17，四级起和正文同大、只靠加粗分（相邻两档拉开 3px 以上，
+        // 长回复扫一眼能看出分节）。标题上方的段间距由组件按标题字号算，字号拉开留白也跟着变大
         .heading_font_size(|level, _| {
             match level {
-                1 => TEXT_HEADING,
-                2 => TEXT_LEAD,
+                1 => TEXT_DISPLAY,
+                2 => TEXT_HEADING,
+                3 => TEXT_LEAD,
                 _ => TEXT_LARGE,
             }
             .to_pixels(crate::theme::root_font_size())

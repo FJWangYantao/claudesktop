@@ -25,9 +25,9 @@ use std::rc::Rc;
 pub(super) struct MenuChip {
     icon: Option<IconAll>,
     label: SharedString,
-    /// 纯文字（输入框下方那一行）：不带图标和展开箭头，靠悬停底色提示可点
+    /// 纯文字（输入框工具栏里的模型）：不带图标和展开箭头，靠悬停底色提示可点
     plain: bool,
-    /// 沙色实底，和输入框上方那排静态 chip 同款
+    /// 沙色实底（筛选条这类放在纸底上、要一眼看出能点的 chip）
     filled: bool,
     /// 文字后面跟着的增删行数（绿 +N、红 −M）
     stat: Option<(u32, u32)>,
@@ -46,7 +46,7 @@ impl MenuChip {
         }
     }
 
-    /// 只有文字，不带展开箭头（输入框下方的权限模式 / 模型）。
+    /// 只有文字，不带展开箭头（输入框工具栏里的模型）。
     pub(super) fn plain(label: impl Into<SharedString>) -> Self {
         Self {
             icon: None,
@@ -58,7 +58,7 @@ impl MenuChip {
         }
     }
 
-    /// 沙色实底（输入框上方的项目目录），与旁边的「本地」chip 并排不突兀。
+    /// 沙色实底（筛选条、「添加」这类放在纸底上的 chip）。
     pub(super) fn filled(mut self) -> Self {
         self.filled = true;
         self
@@ -94,7 +94,7 @@ impl RenderOnce for MenuChip {
             chip = chip.child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)));
         }
         chip = chip.child(
-            // chip 一律次要字号，与输入框上方的环境 / 项目 chip 同档
+            // chip 一律次要字号
             div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(self.label),
         );
         if let Some((added, removed)) = self.stat {

@@ -166,9 +166,9 @@ impl ChatApp {
         // 任务（建立时没选过文件夹的对话）：chip 上直说，点开可以挂到某个文件夹上
         let task = self.session().task;
         let project_chip = if task {
-            MenuChip::new(IconAll::ListTodo, "任务").filled()
+            MenuChip::new(IconAll::ListTodo, "任务")
         } else {
-            MenuChip::new(IconAll::Folder, project).filled()
+            MenuChip::new(IconAll::Folder, project)
         };
         // 焦点几乎总在输入框上（丢了由 restore_focus 找回），所以窗口不在前台时按没聚焦画：
         // 切去别的程序后输入框回到静止样子，鼠标移上来是悬停态，点回来才是聚焦态
@@ -219,29 +219,41 @@ impl ChatApp {
                 }
             }));
 
-        // 卡片下方紧贴一行：左侧权限模式 / 添加文件，右侧模型。纯文字 chip，open 状态由 Popover 自管；
-        // 左右内缩到和输入文字对齐，读起来仍是输入框的一部分
+        // 卡片底边一条工具栏：左侧项目目录 / 权限模式 / 添加文件，右侧上下文用量 / 模型 / 发送。
+        // 和输入框是一整块（对照 Claude.ai 的输入卡片），chip 的 open 状态由 Popover 自管。
+        // 中间的空白点了也把焦点给输入框（chip 和按钮自己处理点击，不挂这个）
         let toolbar = div()
             .h_flex()
             .items_center()
             .gap_0p5()
-            .px_2()
+            .child(menu_popover(
+                "workspace-menu",
+                Anchor::BottomLeft,
+                rems(20.),
+                &app,
+                &self.menu_focus,
+                project_chip,
+                workspace_menu_items,
+            ))
             .child(menu_popover(
                 "mode-menu",
                 Anchor::BottomLeft,
                 rems(20.),
                 &app,
                 &self.menu_focus,
-                MenuChip::plain(mode_name),
+                MenuChip::new(IconAll::Shield, mode_name),
                 mode_menu_items,
             ))
             .child(
-                Self::quiet_button("attach-files", IconAll::Plus, Surface::Paper, cx)
+                Self::quiet_button("attach-files", IconAll::Paperclip, Surface::Paper, cx)
                     .small()
                     .tooltip("添加文件")
                     .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))),
             )
-            .child(div().flex_1())
+            .child(div().flex_1().self_stretch().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
+            ))
             .children(self.render_context_gauge())
             .child(model_menu_popover(
                 &app,
@@ -249,11 +261,11 @@ impl ChatApp {
                 "model-menu",
                 Anchor::BottomRight,
                 MenuChip::plain(self.session().model_label.clone()),
-            ));
+            ))
+            .child(div().pl_1().child(send));
 
-        // 卡片里只有附件缩略图和随内容长高的多行输入 + 发送键（对照官方 Code 桌面端的紧凑输入框）。
-        // 三档：静止细边；悬停边框加深一档（提示整块都能点）；聚焦再深一档并加阴影。
-        // 点卡片空白处也把焦点给输入框。
+        // 一张卡片：附件缩略图、随内容长高的多行输入（至少两行），底边是工具栏。
+        // 三档：静止细边 + 淡阴影；悬停边框加深一档（提示整块都能点）；聚焦再深一档、阴影加重。
         let card =
             div()
                 .id("composer")
@@ -264,33 +276,29 @@ impl ChatApp {
                 .border_color(rgb(if focused { INK_FAINT } else { LINE }))
                 .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
                 .rounded_2xl()
-                .map(|d| if focused { d.shadow_sm() } else { d.shadow_xs() })
-                // 发送键离右边和上下都是 6px
-                .px_1p5()
-                .py_1()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
-                )
+                .map(|d| if focused { d.shadow_md() } else { d.shadow_sm() })
+                // 发送键离右边和底边都是 8px
+                .px_2()
+                .pt_1p5()
+                .pb_2()
                 // 待发送图片缩略图（点右上角 × 撤掉），左边和输入文字对齐
                 .when(!self.pending.is_empty(), |d| {
                     d.child(
-                        div().h_flex().flex_wrap().gap_1p5().px_2p5().pt_1p5().pb_1().children(
+                        div().h_flex().flex_wrap().gap_1p5().px_2().pt_1().pb_1().children(
                             (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
                         ),
                     )
                 })
-                // 发送键贴底：输入框长高后它留在右下角（单行时和文字齐平）
                 .child(
                     div()
-                        .h_flex()
-                        .items_end()
-                        .gap_1()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
+                        )
                         .child(
                             div()
                                 .relative()
-                                .flex_1()
-                                .min_w_0()
+                                .w_full()
                                 .child(
                                     Textarea::new(&self.input)
                                         .appearance(false)
@@ -315,9 +323,9 @@ impl ChatApp {
                                     self.next_suggestion_text(cx)
                                         .map(|text| self.next_suggestion_preview(text)),
                                 ),
-                        )
-                        .child(send),
-                );
+                        ),
+                )
+                .child(toolbar);
 
         div()
             .v_flex()
@@ -327,18 +335,6 @@ impl ChatApp {
             .gap_2()
             // 进行中这一轮的计划钉在最上面（对话往下走它也一直看得见）
             .children(self.render_pinned_plan(cx))
-            // 输入框上方：运行环境 + 项目目录（点开切换工作目录；任务会话是「任务」chip）
-            .child(div().h_flex().gap_1p5().child(Self::chip(IconAll::Monitor, "本地")).child(
-                menu_popover(
-                    "workspace-menu",
-                    Anchor::BottomLeft,
-                    rems(20.),
-                    &app,
-                    &self.menu_focus,
-                    project_chip,
-                    workspace_menu_items,
-                ),
-            ))
             .child(
                 div()
                     .v_flex()
@@ -350,8 +346,7 @@ impl ChatApp {
                         self.render_completion(cx).map(|list| {
                             div().absolute().left_0().right_0().bottom_full().mb_1p5().child(list)
                         }),
-                    ))
-                    .child(toolbar),
+                    )),
             )
             // 首页：输入框下方一排建议入口（见 overview.rs）
             .when(!self.session().has_user_message() && !self.settings.needs_setup(), |d| {

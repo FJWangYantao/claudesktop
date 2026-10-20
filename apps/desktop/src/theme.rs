@@ -429,10 +429,12 @@ pub const TEXT_SMALL: Rems = rems(0.8125);
 pub const TEXT_BODY: Rems = rems(0.875);
 /// 阅读正文：用户消息、助手回复、输入框（15px，也是根视图默认字号）
 pub const TEXT_LARGE: Rems = rems(0.9375);
-/// 次级标题：统计数值、回复里的二级标题（17px）
+/// 次级标题：统计数值、回复里的三级标题（17px）
 pub const TEXT_LEAD: Rems = rems(1.0625);
-/// 回复里的一级标题（20px）
+/// 分区标题、回复里的二级标题（20px）
 pub const TEXT_HEADING: Rems = rems(1.25);
+/// 回复里的一级标题（24px）
+pub const TEXT_DISPLAY: Rems = rems(1.5);
 /// 页面标题、首页问候（28px）
 pub const TEXT_TITLE: Rems = rems(1.75);
 

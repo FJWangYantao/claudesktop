@@ -608,13 +608,41 @@ impl ChatApp {
             self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
         let usage_open =
             self.settings_open && self.settings_form.tab == super::usage_view::USAGE_TAB;
+        // 品牌：赤陶底方块里一枚星芒（同首页问候语的图标）+ 名字。不是按钮，摆在拖拽区里
+        let brand = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .pl_1()
+            .child(
+                div()
+                    .size_5()
+                    .flex_shrink_0()
+                    .rounded_md()
+                    .bg(rgb(CORAL))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .child(Icon::new(IconAll::Sparkles).size_3().text_color(rgb(ON_ACCENT))),
+            )
+            .child(
+                div()
+                    .text_size(TEXT_BODY)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(INK))
+                    .child("claudesktop"),
+            );
+        // 浮起的面板：沙色底 + 细边 + 淡阴影，和纸色的会话区分出前后
         let panel = v_flex()
             .size_full()
             .rounded_xl()
             .bg(rgb(SAND))
+            .border_1()
+            .border_color(rgb(LINE))
+            .shadow_xs()
             .overflow_hidden()
             .child(
-                // 头部：侧栏开关，其余是拖拽区（与会话区顶栏同高）
+                // 头部：侧栏开关 + 品牌，其余是拖拽区（与会话区顶栏同高）
                 div()
                     .h_flex()
                     .h(CHROME_H - px(8.))
@@ -623,7 +651,7 @@ impl ChatApp {
                     .pl_2()
                     .children(traffic_light_gap())
                     .child(self.sidebar_toggle("sidebar-toggle", cx))
-                    .child(drag_area()),
+                    .child(drag_area().h_flex().items_center().child(brand)),
             )
             .child(
                 nav_item("new-chat", IconAll::Plus, "新会话", false)

@@ -237,9 +237,9 @@ impl Drop for ChatApp {
 
 impl ChatApp {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // 多行、随内容长高（最多 10 行后出滚动条）；回车发送，Shift+回车换行
+        // 多行、至少两行高、随内容长高（最多 10 行后出滚动条）；回车发送，Shift+回车换行
         let input =
-            cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 10).submit_on_enter(true));
+            cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 10).submit_on_enter(true));
 
         cx.subscribe_in(
             &input,
