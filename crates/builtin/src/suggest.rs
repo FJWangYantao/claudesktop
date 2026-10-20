@@ -38,6 +38,32 @@ pub fn system_prompt() -> String {
     )
 }
 
+/// 「一轮结束后猜下一句」的系统提示词（固定模板）。
+///
+/// 和 [`system_prompt`] 的区别：那边是「接着用户没写完的半句往下写」，这边输入框是空的，
+/// 猜的是用户看完这一轮回复之后最可能说的一句话——所以要求它给一整句能直接发出去的请求。
+pub fn next_message_prompt() -> String {
+    format!(
+        "You predict the user's next message in a chat with a coding agent working on their own \
+         computer. The agent has just finished a turn; the user has not typed anything yet.\n\
+         \n\
+         You see the recent conversation. Write the single message the user is most likely to send \
+         next, as if the user were typing it themselves.\n\
+         \n\
+         Rules:\n\
+         - Output only that one message, in the same language as the conversation.\n\
+         - No quotes, no explanation, no markdown syntax, no prefix such as \"Next:\".\n\
+         - A complete, usable message the user could send as-is; not an answer to the user's \
+           request, and never in the agent's voice.\n\
+         - When the agent asked a question or offered options, the message is the user's reply to \
+           it (a choice, a yes/no, or a follow-up detail).\n\
+         - When the agent reported a result, the message is the obvious next step (run it, fix \
+           what broke, commit, explain a piece of it).\n\
+         - At most about {MAX_CHARS} characters.\n\
+         - If you cannot guess anything useful, output nothing at all."
+    )
+}
+
 /// 拼给模型看的一次补全请求：草稿 + 最近的对话。
 ///
 /// `history` 是按时间顺序的 (是不是用户说的, 文字)，调用方只放用户消息和助手的最后一段回复。
@@ -110,10 +136,44 @@ pub fn complete(
     history: &[(bool, String)],
     should_stop: &dyn Fn() -> bool,
 ) -> Option<String> {
+    let reply = ask(config, session, turn, build_messages(draft, history), should_stop)?;
+    let text = clean(&reply);
+    // 和已经写好的那部分重复（模型把草稿复述了一遍）：不如不显示
+    if text.is_empty() || draft.trim_end().ends_with(text.as_str()) {
+        return None;
+    }
+    Some(join(draft, &reply, text))
+}
+
+/// 一轮结束后猜用户下一句会说什么（阻塞，调用方放在后台线程里）。空草稿调 [`complete`]，
+/// 只是系统提示词换成了 [`next_message_prompt`]：这里不接用户已经写的东西，给的是整句。
+pub fn complete_next(
+    config: &ProviderConfig,
+    session: &str,
+    turn: u64,
+    history: &[(bool, String)],
+    should_stop: &dyn Fn() -> bool,
+) -> Option<String> {
+    let mut messages = build_messages("", history);
+    if let Some(system) = messages.first_mut() {
+        *system = ChatMessage::new("system", next_message_prompt());
+    }
+    let reply = ask(config, session, turn, messages, should_stop)?;
+    let text = clean(&reply);
+    (!text.is_empty()).then_some(text)
+}
+
+/// 发一次流式请求，把正文拼起来（补全和「猜下一句」共用）。
+fn ask(
+    config: &ProviderConfig,
+    session: &str,
+    turn: u64,
+    messages: Vec<ChatMessage>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<String> {
     // 温度 / 输出上限换成补全那一套（provider 在构造时就吃下参数）
     let config = ProviderConfig { params: params(&config.params), ..config.clone() };
     let provider = crate::make_provider(&config);
-    let messages = build_messages(draft, history);
     let mut reply = String::new();
     let _tag = crate::gateway::tag(session, "suggest", turn);
     let outcome = provider.stream_chat(&config.model, &messages, &[], should_stop, &mut |event| {
@@ -125,12 +185,7 @@ pub fn complete(
     if should_stop() {
         return None;
     }
-    let text = clean(&reply);
-    // 和已经写好的那部分重复（模型把草稿复述了一遍）：不如不显示
-    if text.is_empty() || draft.trim_end().ends_with(text.as_str()) {
-        return None;
-    }
-    Some(join(draft, &reply, text))
+    Some(reply)
 }
 
 /// 接在草稿后面要不要先补一个空格：[`clean`] 把回复首尾的空白都去掉了，
@@ -208,6 +263,17 @@ mod tests {
         let messages = build_messages("", &[]);
         assert!(messages[1].text().unwrap().contains("first message"));
         assert!(messages[1].text().unwrap().contains("(empty)"));
+    }
+
+    /// 轮后猜下一句：系统提示词换成「写用户接下来会发的那句话」，不接用户已经写的东西。
+    #[test]
+    fn next_message_prompt_asks_for_a_whole_message() {
+        let system = next_message_prompt();
+        assert!(system.contains("most likely to send"), "{system}");
+        assert!(system.contains("same language"), "{system}");
+        assert!(!system.contains("draft"), "{system}");
+        // 用户那侧仍是「还没写」的空草稿
+        assert!(build_messages("", &[])[1].text().unwrap().contains("(empty)"));
     }
 
     #[test]

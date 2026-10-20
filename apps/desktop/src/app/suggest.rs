@@ -1,7 +1,12 @@
-//! 输入框的 Tab 补全：停一下就让模型猜「接下来大概会写什么」，灰字画在光标后面，按 Tab 接上。
+//! 输入框的补全，两件相关但独立的事：
+//!
+//! 1. **打字时续写**（[`SuggestionState`]，设置项 `suggestions`）：停一下就让模型猜「接下来大概会写
+//!    什么」，灰字画在光标后面，按 Tab 接上。
+//! 2. **一轮结束后猜下一句**（[`NextSuggestion`]，设置项 `next_suggestion`）：每轮回复结束时让模型猜
+//!    用户接下来会发的那一句，输入框空着时用淡色画在里面，按 Tab 填入。
 //!
 //! 一次补全 = 一个很小的独立请求（[`claudesktop_builtin::suggest`]），不走内核、不进会话日志，
-//! 也不占内核的「一轮」。流程：
+//! 也不占内核的「一轮」。**打字时续写**的流程：
 //!
 //! 1. 输入框内容变了（`InputEvent::Change`）→ [`ChatApp::schedule_suggestion`]：先清掉旧的那句
 //!    灰字，再排一个 [`DEBOUNCE_MS`] 的计时器。连着打字时计时器不断被换掉，只有停顿了才真发。
@@ -9,14 +14,19 @@
 //! 3. 回来时代号还对不上（用户又打字 / 换了会话 / 关了开关）就丢掉，否则存进 `Suggestion`
 //!    并只重画输入区。
 //!
+//! **一轮结束后猜下一句**不挂在敲字上，而是 `KernelEvent::TurnEnded`（正常结束）后排一次，
+//! 所以没有去抖的计时器——每轮至多一次请求。它另有一套代号：打字、发出去、换会话、开设置页
+//! 都会作废它（用户自己开始写了，猜的那句就没用了）。
+//!
 //! 几处刻意的收窄，都是「宁可不补，也不要补一句不相干的灰字」：
 //!
-//! - 请求要走网络，打字快的时候太费钱：停顿 [`DEBOUNCE_MS`] 才发，且只在光标在末尾、
+//! - 请求要走网络，打字快的时候太费钱：续写停顿 [`DEBOUNCE_MS`] 才发，且只在光标在末尾、
 //!   没有选区、输入不长（[`MAX_DRAFT_CHARS`]）的时候发；`/`、`@` 补全开着时不发。
 //! - 一轮跑着时（等回复）也不发：那会儿用户多半在等，不是在写。
+//! - 猜下一句只在输入框空着时发：有草稿时不打断（那句草稿本来就是用户要说的）。
 //! - 请求失败、没有可补的：静默，什么都不显示。
-//! - 默认关；开了也优先用设置里另填的小模型（`suggest_model`），只带最近几轮对话，
-//!   过期的请求当场中断——每次停顿都是一次计费的请求。
+//! - 两个开关默认都关；开了也优先用设置里另填的小模型（`suggest_model`），只带最近几轮对话，
+//!   过期的请求当场中断——每次都是一次计费的请求。
 
 use super::ChatApp;
 use crate::model::ChatItem;
@@ -31,6 +41,8 @@ use std::time::Duration;
 
 /// 停下多久才发请求（敲字时不停被换掉，只有真停了才发）
 const DEBOUNCE_MS: u64 = 450;
+/// 一轮结束后隔多久才去猜下一句（用户这会儿多半在读回复，晚一点发不碍事）
+const NEXT_DELAY_MS: u64 = 1_200;
 /// 输入框里已经写了这么多字就不再猜（再猜也猜不准，还费一次请求）
 const MAX_DRAFT_CHARS: usize = 400;
 /// 给模型看的最近几轮（用户消息 + 那一轮最后一段回复）；猜下一句用不着更早的
@@ -57,6 +69,37 @@ pub(super) struct Suggestion {
     draft: String,
 }
 
+/// 一轮结束后猜出的「用户下一句」（还没被接上的）。
+///
+/// 和 [`SuggestionState`] 分开存：那个跟着打字来去，这个只在轮结束时出现一次，
+/// 各有各的代号，互不影响（关掉其中一个另一个照常工作）。
+#[derive(Default)]
+pub(super) struct NextSuggestion {
+    /// 猜出来的那句；None = 没有（没猜、没猜出来、或者已经作废）
+    pub(super) text: Option<String>,
+    /// 为哪个会话猜的：换了会话就不再显示（那句话是接着另一个对话说的）
+    session: Option<u64>,
+    /// 每排一次请求 +1：作废时对不上就丢掉。后台线程也读它，过期的请求当场中断
+    generation: Arc<AtomicU64>,
+}
+
+impl NextSuggestion {
+    /// 要显示的那句淡色字：还在猜它的那个会话才算数。
+    pub(super) fn text(&self, session: u64) -> Option<&str> {
+        self.text
+            .as_deref()
+            .filter(|_| self.session == Some(session))
+            .filter(|t| !t.trim().is_empty())
+    }
+
+    /// 作废：正在跑的那次请求回来也丢掉。
+    pub(super) fn clear(&mut self) {
+        self.text = None;
+        self.session = None;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl SuggestionState {
     /// 要显示的那句灰字：输入框还是猜它的那份内容时才算数。
     pub(super) fn text(&self, draft: &str) -> Option<&str> {
@@ -78,6 +121,8 @@ impl SuggestionState {
 impl ChatApp {
     /// 输入框内容变了：撤掉旧的灰字，重新排一次补全。
     pub(super) fn schedule_suggestion(&mut self, cx: &mut Context<Self>) {
+        // 用户开始写自己那句了：轮结束时猜的下一句不再有用（它给的是「空输入框里那句话」）
+        self.next_suggestion.clear();
         // 刚才那次变化是「接上了一句」：不接着连猜，等用户再打字
         if std::mem::take(&mut self.suggestion.just_accepted) {
             self.suggestion.clear();
@@ -152,6 +197,74 @@ impl ChatApp {
             && self.session().acp_id.is_some()
     }
 
+    /// 一轮回复结束（正常结束）：让模型猜用户接下来会发的那一句。
+    ///
+    /// 和 [`Self::schedule_suggestion`] 的区别：这里不敲字也发（每轮至多一次），并且只在
+    /// 输入框空着的时候发——用户已经在写的话，那句草稿就是他要说的，不必再猜。
+    pub(super) fn schedule_next_suggestion(&mut self, cx: &mut Context<Self>) {
+        // 先作废上一轮猜的那句（它的上下文已经变了），并立刻把它从界面上撤下来
+        self.next_suggestion.clear();
+        self.refresh_composer(cx);
+        if !self.next_suggestion_enabled(cx) {
+            return;
+        }
+        let live = self.next_suggestion.generation.clone();
+        let generation = live.fetch_add(1, Ordering::Relaxed) + 1;
+        let history = self.suggestion_history();
+        let session_id = self.session().acp_id.clone().unwrap_or_default();
+        let token = self.session().token;
+        let Some(config) = self.suggestion_config() else { return };
+        self.next_suggestion.session = Some(token);
+        cx.spawn(async move |this, cx| {
+            // 回复刚写完，稍等一下：用户这时多半还在读，正好让界面先静下来
+            cx.background_executor().timer(Duration::from_millis(NEXT_DELAY_MS)).await;
+            let asked = session_id.clone();
+            let text = cx
+                .background_executor()
+                .spawn(async move {
+                    let stale = || live.load(Ordering::Relaxed) != generation;
+                    claudesktop_builtin::suggest::complete_next(
+                        &config,
+                        &asked,
+                        0,
+                        &history,
+                        &stale,
+                    )
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                // 用户又打字了 / 换了会话 / 开关关了：这次的结果已经过期
+                if app.next_suggestion.generation.load(Ordering::Relaxed) != generation {
+                    return;
+                }
+                let Some(text) = text else { return };
+                // 这期间用户开始写了：不再盖上去
+                if !app.input.read(cx).value().is_empty() {
+                    return;
+                }
+                app.next_suggestion.text = Some(text);
+                app.next_suggestion.session = Some(token);
+                // 占位文字会让开（见 overview.rs 的 sync_placeholder），输入区重画就够
+                app.refresh_composer(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 「一轮结束后猜下一句」这次要不要猜：开关开着、自研内核配好了、不在设置页、
+    /// 输入框空着，而且这一轮结束后没有接着开下一轮（排队的消息已经发出去了）。
+    fn next_suggestion_enabled(&self, cx: &App) -> bool {
+        self.settings.next_suggestion
+            && !self.settings_open
+            && !self.settings.needs_setup()
+            && self.session().kernel == KernelChoice::Builtin
+            && self.session().acp_id.is_some()
+            && !self.session().busy
+            && self.session().queued.is_empty()
+            && self.input.read(cx).value().is_empty()
+    }
+
     /// 补全用的端点与模型：设置里填了补全模型就用它，否则跟着当前会话的模型走（顶栏显示哪个就用哪个）。
     /// 带思考的模型不补：64 个 token 的上限多半被思考用光，灰字出不来，请求却照样计费。
     fn suggestion_config(&self) -> Option<claudesktop_builtin::ProviderConfig> {
@@ -220,6 +333,39 @@ impl ChatApp {
         self.refresh_composer(cx);
     }
 
+    /// 把「猜的下一句」填进输入框（光标放到末尾），不直接发送：用户可以先改再按回车。
+    pub(super) fn accept_next_suggestion(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let token = self.session().token;
+        let Some(text) = self.next_suggestion.text(token).map(str::to_string) else {
+            return;
+        };
+        self.next_suggestion.clear();
+        // `set_value` 会发一次 `Change`：那一趟只当「用户开始写了」，别再按打字续写去猜
+        self.suggestion.just_accepted = true;
+        let column = text.chars().count() as u32;
+        self.input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.set_cursor_position(Position::new(0, column), window, cx);
+            state.focus(window, cx);
+        });
+        self.refresh_composer(cx);
+    }
+
+    /// 现在该显示在空输入框里的「猜的下一句」（没有就是 None）。
+    ///
+    /// 只在输入框真的空着时给：用户开始写了，这句就是多余的（而且占位文字已经让开了）。
+    pub(super) fn next_suggestion_text(&self, cx: &App) -> Option<String> {
+        if !self.input.read(cx).value().is_empty() {
+            return None;
+        }
+        let token = self.session().token;
+        self.next_suggestion.text(token).map(str::to_string)
+    }
+
     /// 现在光标后面那句灰字（没有就是 None）。要在 UI 线程上读输入框，所以单独一个方法。
     ///
     /// 除了「输入框还是猜它的那份内容」，还要求光标仍在那份内容的末尾、没有选区：
@@ -255,6 +401,21 @@ impl ChatApp {
         self.refresh_composer(cx);
     }
 
+    /// 调试钩子 `CLAUDESKTOP_NEXT=<淡色字>`：不走模型，直接把这句话摆成「轮结束时猜的下一句」，
+    /// 用来核对它画在空输入框里的位置和占位文字让开的效果。见 `main.rs`。
+    pub(crate) fn debug_next_suggestion(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.update(cx, |state, cx| state.set_value("", window, cx));
+        let token = self.session().token;
+        self.next_suggestion.text = Some(text);
+        self.next_suggestion.session = Some(token);
+        self.refresh_composer(cx);
+    }
+
     /// 灰字的绘制层，叠在输入框上（见 `composer.rs`）。
     ///
     /// 位置不能自己算：光标在第几行、被横向滚了多远只有输入框自己知道。所以包在 `deferred` 里，
@@ -262,29 +423,42 @@ impl ChatApp {
     /// 取位置——和 gpui-kit 自己的补全菜单锚定光标是同一套做法。
     /// 文字裁到输入框的边界内：一句太长就截断，不会画到卡片外面去。
     pub(super) fn suggestion_ghost(&self, text: String) -> AnyElement {
+        self.ghost_text(text, INK_FAINT, CaretAnchor::After)
+    }
+
+    /// 「一轮结束后猜的下一句」的绘制层：输入框空着时用淡色画在光标处（就是第一行行首）。
+    ///
+    /// 和 [`Self::suggestion_ghost`] 同一套定位，只是画在光标**左边**——空输入框里光标就停在
+    /// 文字该开始的地方，右侧是插入符本身，画过去会错开一个光标宽。
+    pub(super) fn next_suggestion_preview(&self, text: String) -> AnyElement {
+        self.ghost_text(text, INK_FAINT, CaretAnchor::At)
+    }
+
+    /// 在输入框当前光标处画一段淡色文字（`anchor` 决定画在光标右/左）。
+    ///
+    /// 两处细节：字号取 `TEXT_BODY`（gpui-kit 输入框 Medium 档就是 `text_sm`），行高与光标纵向
+    /// 位置取输入框这一帧排出来的那份，这样淡色字和真输入的文字对得齐。
+    fn ghost_text(&self, text: String, color: Color, anchor: CaretAnchor) -> AnyElement {
         let input = self.input.clone();
-        let color = rgb(INK_FAINT);
+        let color = rgb(color);
         deferred(
             canvas(
                 move |_, window, cx| {
                     let geometry = input.read(cx).prepaint_caret_geometry()?;
-                    // 字体跟输入框一样从祖先继承；字号取界面正文档（gpui-kit 输入框 Medium 档
-                    // 就是 `text_sm`），行高和光标位置取输入框这一帧排出来的那份，两处文字才对得齐
                     let mut run = window.text_style().to_run(text.len());
                     run.color = color.into();
                     let font_size = TEXT_BODY.to_pixels(window.rem_size());
-                    let line = window.text_system().shape_line(
-                        text.clone().into(),
-                        font_size,
-                        &[run],
-                        None,
-                    );
+                    let line =
+                        window.text_system().shape_line(text.clone().into(), font_size, &[run], None);
                     // 光标框比行框矮（0.85 倍），向上补半个差值就是这一行的顶
                     let caret = geometry.cursor_bounds();
                     let line_height = geometry.line_height();
-                    let origin =
-                        point(caret.right(), caret.top() - (line_height - caret.size.height) / 2.);
-                    Some((line, origin, line_height, geometry.input_bounds()))
+                    let top = caret.top() - (line_height - caret.size.height) / 2.;
+                    let x = match anchor {
+                        CaretAnchor::After => caret.right(),
+                        CaretAnchor::At => caret.left(),
+                    };
+                    Some((line, point(x, top), line_height, geometry.input_bounds()))
                 },
                 |_, state, window, cx| {
                     let Some((line, origin, line_height, input_bounds)) = state else {
@@ -301,4 +475,13 @@ impl ChatApp {
         )
         .into_any_element()
     }
+}
+
+/// 淡色字画在光标的哪一侧。
+#[derive(Clone, Copy)]
+enum CaretAnchor {
+    /// 光标右边（接着已输入的草稿往下写）
+    After,
+    /// 光标处（输入框空着，光标就停在文字起点）
+    At,
 }

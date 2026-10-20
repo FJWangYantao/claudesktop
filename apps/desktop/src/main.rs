@@ -142,6 +142,12 @@ fn main() {
                         {
                             app.debug_suggestion(text, window, cx);
                         }
+                        // 调试钩子：CLAUDESKTOP_NEXT=<淡色字>，摆出「轮结束时猜的下一句」
+                        if let Ok(text) = std::env::var("CLAUDESKTOP_NEXT")
+                            && !text.is_empty()
+                        {
+                            app.debug_next_suggestion(text, window, cx);
+                        }
                         app.autodemo_hook(cx);
                     });
                     // 压测钩子：CLAUDESKTOP_STRESS=<行数>，灌数据后逐帧滚动（先往上 150 帧再往下 150 帧，
