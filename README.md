@@ -182,6 +182,7 @@ tools          # 调试与接入工具（截图脚本、mock agent、mock MCP �
 | [设计说明-插件.md](./设计说明-插件.md) | 插件目录格式、钩子、与 Claude Code 的兼容范围 |
 | [设计说明-MCP-OAuth.md](./设计说明-MCP-OAuth.md) | 远程 MCP 的 OAuth 登录流程 |
 | [想法-用量统计网关.md](./想法-用量统计网关.md) | 网关、日志格式、费用估算与峰谷价 |
+| [调研报告-GitHub接入.md](./调研报告-GitHub接入.md) | 接 GitHub 的三层做法与取舍；结论是云上执行不做 |
 
 ## tools
 
