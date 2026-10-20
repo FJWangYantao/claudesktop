@@ -116,6 +116,22 @@ pub struct Session {
     /// 最新一轮在审查页里撤回过块：下一条消息发出时附上说明（见 `claudesktop_core::review::review_note`）。
     /// 只是「要不要去读日志」的提示，说明本身从日志现算
     pub review_pending: bool,
+    /// 展开了全部文件的改动卡片（按回复末尾那一行的下标）。只在内存里
+    pub changes_open: HashSet<usize>,
+    /// 最新一轮的改动撤回到了什么程度（审查页或改动卡片上的「撤回」写盘后更新）。
+    /// 只在内存里：重启后卡片照常显示「撤回」，再点一次结果不变
+    pub undo: Option<TurnUndo>,
+}
+
+/// 某一轮的改动撤回到了什么程度，见 [`Session::undo`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TurnUndo {
+    /// 第几条用户消息那一轮（从 0 数）
+    pub turn: usize,
+    /// 能撤回的块全撤回了（否则是撤回了一部分）
+    pub all: bool,
+    /// 对着 diff 数过；重开的会话从日志只看得出「撤回过」，切过来时再数（`ChatApp::settle_undo`）
+    pub exact: bool,
 }
 
 /// 一个子任务（自研内核的 `task` 调用）的过程：子 agent 的思考、回复和工具调用。
@@ -323,6 +339,8 @@ impl Session {
             subagents: HashMap::new(),
             viewing_task: None,
             review_pending: false,
+            changes_open: HashSet::new(),
+            undo: None,
         }
     }
 
@@ -337,11 +355,14 @@ impl Session {
         s.title = meta.title.clone().into();
         s.restored = true;
         s.replaying = true;
+        // 最新一轮每个文件最后一次写盘时处于「已撤回」的块（agent 写的清空），恢复改动卡片的撤回状态
+        let mut reverted_now: HashMap<String, bool> = HashMap::new();
         // 回退过的轮次不显示（日志只追加，读的时候折算）
         for record in claudesktop_core::effective(&records) {
             match record {
                 Record::User { text, images, .. } => {
                     s.review_pending = false;
+                    reverted_now.clear();
                     s.transcript.push(ChatItem::User {
                         text: text.into(),
                         images: images.iter().map(PathBuf::from).collect(),
@@ -401,8 +422,18 @@ impl Session {
                     s.note(rewind_note(conversation, files, &prompt))
                 }
                 // 检查点只在回退 / 审查时用，界面上不显示
-                Record::FileChanged { reverted, .. } => s.review_pending |= reverted.is_some(),
+                Record::FileChanged { path, reverted, .. } => {
+                    s.review_pending |= reverted.is_some();
+                    reverted_now.insert(path, reverted.is_some_and(|r| !r.is_empty()));
+                }
             }
+        }
+        // 撤回了多少要对着 diff 才数得清，这里只知道「撤回过」：先按撤回了一部分显示，
+        // 点开审查页或再点一次「撤回」时按实际情况更新（`ChatApp::sync_undo`）
+        if reverted_now.values().any(|r| *r)
+            && let Some(turn) = s.latest_turn()
+        {
+            s.undo = Some(TurnUndo { turn, all: false, exact: false });
         }
         // 上次退出时还在进行的东西一律收尾
         s.finish_thinking();
@@ -497,6 +528,10 @@ impl Session {
             (self.is_turn_end(i), false)
         };
         (self.transcript[i].fingerprint(), view, live, layout).hash(&mut h);
+        // 回复末尾的改动卡片：展开了全部文件、撤回过，高度和按钮都会变
+        if live.0 {
+            (self.changes_open.contains(&i), self.latest_undo()).hash(&mut h);
+        }
         h.finish()
     }
 
@@ -646,6 +681,16 @@ impl Session {
             Some(_) => false,
             None => !self.busy,
         }
+    }
+
+    /// 对话里最后一条用户消息是第几条（从 0 数）。
+    pub fn latest_turn(&self) -> Option<usize> {
+        self.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count().checked_sub(1)
+    }
+
+    /// 最新一轮的撤回情况（[`Session::undo`] 记的是更早一轮时不算）。
+    pub fn latest_undo(&self) -> Option<TurnUndo> {
+        self.undo.filter(|u| Some(u.turn) == self.latest_turn())
     }
 
     /// `ix` 所在这一轮（上一条用户消息之后、下一条之前）改过的文件。
@@ -2265,6 +2310,48 @@ mod tests {
         assert!(s.task);
         let s = Session::from_records(2, meta(), vec![Record::user("问")]);
         assert!(!s.task);
+    }
+
+    #[core::prelude::v1::test]
+    fn restored_sessions_remember_undone_changes() {
+        use claudesktop_core::review::HunkRange;
+        let range = HunkRange { old_start: 1, old_len: 1, new_start: 1, new_len: 2 };
+        let changed = |path: &str, reverted: Option<Vec<HunkRange>>| Record::FileChanged {
+            path: path.into(),
+            before: Some("a".into()),
+            after: Some("b".into()),
+            reverted,
+        };
+        // 最新一轮在审查页里撤回过：先记成「撤回过、没数清」，切过来时再数
+        let s = Session::from_records(
+            1,
+            meta(),
+            vec![
+                Record::user("问"),
+                changed("a.rs", None),
+                changed("a.rs", Some(vec![range])),
+                changed("b.rs", None),
+            ],
+        );
+        assert_eq!(s.latest_undo(), Some(TurnUndo { turn: 0, all: false, exact: false }));
+        // 撤回后又全部恢复（撤回集合清空）：不算撤回过
+        let s = Session::from_records(
+            1,
+            meta(),
+            vec![
+                Record::user("问"),
+                changed("a.rs", Some(vec![range])),
+                changed("a.rs", Some(vec![])),
+            ],
+        );
+        assert_eq!(s.latest_undo(), None);
+        // 撤回的是上一轮：新的一轮不带
+        let s = Session::from_records(
+            1,
+            meta(),
+            vec![Record::user("问"), changed("a.rs", Some(vec![range])), Record::user("再问")],
+        );
+        assert_eq!(s.latest_undo(), None);
     }
 
     #[core::prelude::v1::test]

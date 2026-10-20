@@ -479,6 +479,8 @@ impl ChatApp {
         }
         recent.sort_by_key(|r| std::cmp::Reverse(r.1));
         recent.truncate(RECENT_MAX);
+        // 不满一排时补空位，卡片宽度不随个数变（只有一个时不撑满整行）
+        let fillers = RECENT_MAX - recent.len();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         let cards = recent.into_iter().map(|(i, updated)| {
             let s = &self.sessions[i];
@@ -534,7 +536,13 @@ impl ChatApp {
                 .child(
                     div().px_1().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("最近会话"),
                 )
-                .child(div().h_flex().gap_3().children(cards)),
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_3()
+                        .children(cards)
+                        .children((0..fillers).map(|_| div().flex_1().min_w_0())),
+                ),
         )
     }
 

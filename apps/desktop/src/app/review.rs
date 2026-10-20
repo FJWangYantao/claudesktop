@@ -1,4 +1,5 @@
-//! 逐块审查改动：最新一轮回复末尾的「审查」，按文件、按块撤回 / 恢复 agent 这一轮的改动。
+//! 逐块审查改动：最新一轮回复末尾改动卡片上的「审查」，按文件、按块撤回 / 恢复 agent 这一轮的改动；
+//! 卡片上的「撤回」走同一套，整轮一次撤回（[`ChatApp::undo_turn`]）。
 //!
 //! - 打开时读一次日志和 blob（[`ReviewPage`]），每次写盘后只重算那一个文件；页面占内容区，Esc 或「返回」回到对话。
 //! - 块、拼接、每个文件的 base / head / 现状在 `claudesktop_core::review`；写盘后追加一条带 `reverted`
@@ -14,6 +15,7 @@ use super::menu::diff_stat;
 use super::rewind::file_name;
 use super::widgets::Surface;
 use crate::model::{ChatItem, same_path};
+use crate::session::TurnUndo;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::Record;
@@ -89,6 +91,19 @@ fn load(
     }
 }
 
+/// 审查页上撤回了多少：一块都没撤回时为 None。
+fn undo_of(page: &ReviewPage) -> Option<TurnUndo> {
+    let (mut any, mut all) = (false, true);
+    for f in &page.files {
+        if let FileState::Ready { hunks, .. } = &f.state {
+            let n = f.reverted();
+            any |= n > 0;
+            all &= n == hunks.len();
+        }
+    }
+    any.then_some(TurnUndo { turn: page.turn, all, exact: true })
+}
+
 /// 磁盘上的现状对得上日志里最后写的样子。
 fn matches_disk(path: &str, current: &Option<String>) -> bool {
     match checkpoint::read_snapshot(Path::new(path)) {
@@ -102,26 +117,34 @@ impl ChatApp {
     pub(super) fn review_open(&self) -> bool {
         self.review.as_ref().is_some_and(|p| {
             let s = self.session();
-            p.token == s.token && !s.busy && Self::latest_turn(s) == Some(p.turn)
+            p.token == s.token && !s.busy && s.latest_turn() == Some(p.turn)
         })
     }
 
-    /// 对话里最后一条用户消息是第几条（从 0 数）。
-    fn latest_turn(s: &crate::session::Session) -> Option<usize> {
-        s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count().checked_sub(1)
+    /// 打开最新一轮的审查页；`item` 是这一轮回复末尾那一行（改动卡片所在）。
+    pub(super) fn open_review(&mut self, item: usize, cx: &mut Context<Self>) {
+        match self.review_page(item) {
+            Ok(page) => {
+                self.review = Some(page);
+                self.review_scroll = ScrollHandle::new();
+                self.sync_undo();
+                cx.notify();
+            }
+            Err(Some(msg)) => self.toast(msg, cx),
+            Err(None) => {}
+        }
     }
 
-    /// 打开最新一轮的审查页；`item` 是这一轮回复末尾那一行（「改动 N 个文件」所在）。
-    pub(super) fn open_review(&mut self, item: usize, cx: &mut Context<Self>) {
+    /// 读日志和 blob，算出最新一轮的审查页（不打开）。算不了时给出要提示用户的话（None = 不用提示）。
+    fn review_page(&mut self, item: usize) -> Result<ReviewPage, Option<&'static str>> {
         let active = self.active;
-        let Some(turn) = Self::latest_turn(&self.sessions[active]) else { return };
+        let Some(turn) = self.sessions[active].latest_turn() else { return Err(None) };
         let prompt = self.sessions[active].transcript.iter().rev().find_map(|i| match i {
             ChatItem::User { text, .. } => Some(text.to_string()),
             _ => None,
         });
         let Some(records) = self.effective_records(active) else {
-            self.toast("这个会话没有保存记录（演示回放不落盘），审查不了", cx);
-            return;
+            return Err(Some("这个会话没有保存记录（演示回放不落盘），审查不了"));
         };
         // 对话里的这一轮要和日志里的对得上，否则宁可不做
         let logged = checkpoint::user_index(&records, turn).and_then(|i| match &records[i] {
@@ -129,13 +152,12 @@ impl ChatApp {
             _ => None,
         });
         if logged.is_none() || logged != prompt {
-            self.toast("对话和保存的记录对不上，审查不了", cx);
-            return;
+            return Err(Some("对话和保存的记录对不上，审查不了"));
         }
         let (Some(store), Some(id)) =
             (self.store.clone(), self.sessions[active].meta.as_ref().map(|m| m.id.clone()))
         else {
-            return;
+            return Err(None);
         };
         let s = &self.sessions[active];
         let cwd = s.cwd.clone();
@@ -154,9 +176,67 @@ impl ChatApp {
             }
         }
         let commands = checkpoint::commands_after(&records, turn);
-        self.review = Some(ReviewPage { token: s.token, turn, files, commands });
-        self.review_scroll = ScrollHandle::new();
+        Ok(ReviewPage { token: s.token, turn, files, commands })
+    }
+
+    /// 切到一个重开的会话时：日志里只看得出最新一轮「撤回过」（`TurnUndo::exact` 为假），
+    /// 这里对着 diff 数清是全撤回了还是一部分（不打开审查页、不提示）。
+    pub(super) fn settle_undo(&mut self) {
+        let s = self.session();
+        if !s.undo.is_some_and(|u| !u.exact) {
+            return;
+        }
+        let Some(item) = (0..s.transcript.len()).rev().find(|&i| s.is_turn_end(i)) else { return };
+        let undo = self.review_page(item).ok().and_then(|page| undo_of(&page));
+        let active = self.active;
+        self.sessions[active].undo = undo;
+    }
+
+    /// 改动卡片上的「撤回」/「恢复」：不打开审查页，把这一轮能撤回的文件整个撤回（`undo`）或全部恢复。
+    /// 走审查页同一套写盘和记日志（[`Self::set_reverted`]），所以之后在审查页里还能逐块改。
+    pub(super) fn undo_turn(&mut self, item: usize, undo: bool, cx: &mut Context<Self>) {
+        let was_open = self.review_open();
+        self.open_review(item, cx);
+        if !self.review_open() {
+            return;
+        }
+        let n = self.review.as_ref().map_or(0, |p| p.files.len());
+        for i in 0..n {
+            self.revert_file(i, undo, cx);
+        }
+        let Some(page) = self.review.as_ref() else { return };
+        let ready = page
+            .files
+            .iter()
+            .filter(|f| matches!(&f.state, FileState::Ready { hunks, .. } if !hunks.is_empty()))
+            .count();
+        let stuck =
+            page.files.iter().filter(|f| !matches!(f.state, FileState::Ready { .. })).count();
+        let commands = page.commands;
+        if !was_open {
+            self.review = None;
+        }
+        let mut text = match (ready, undo) {
+            (0, _) => "这一轮的改动没有检查点快照（或改完后又被改过），撤回不了".to_string(),
+            (n, true) => format!("撤回了 {n} 个文件的改动，「审查」里可以逐块恢复"),
+            (n, false) => format!("恢复了 {n} 个文件的改动"),
+        };
+        if ready > 0 && stuck > 0 {
+            text.push_str(&format!("；{stuck} 个文件改完后又被改过或没有快照，没有动"));
+        }
+        if undo && commands > 0 {
+            text.push_str("（命令改的文件不在内）");
+        }
+        self.toast(text, cx);
         cx.notify();
+    }
+
+    /// 按审查页的现状更新会话的撤回情况（改动卡片的表头和按钮跟着它，见 `Session::undo`）。
+    fn sync_undo(&mut self) {
+        let Some(page) = &self.review else { return };
+        let undo = undo_of(page);
+        let active = self.active;
+        self.sessions[active].undo = undo;
     }
 
     /// 一个文件的审查状态：读 base / head，比对磁盘。
@@ -246,6 +326,7 @@ impl ChatApp {
         self.ensure_log(active);
         self.persist(active, record);
         self.sessions[active].review_pending = true;
+        self.sync_undo();
         cx.notify();
     }
 

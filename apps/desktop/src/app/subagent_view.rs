@@ -284,7 +284,7 @@ impl ChatApp {
                 ChatItem::Thinking { text, streaming, open, .. } => {
                     Self::render_task_thought(task, k, text, *streaming, *open, window, cx)
                 }
-                ChatItem::Tool(c) => Self::render_task_tool(task, k, c, window, cx),
+                ChatItem::Tool(c) => Self::render_task_tool(task, k, c, &s.cwd, window, cx),
                 ChatItem::Agent(text) => {
                     let streaming = running && k + 1 == run.items.len();
                     let text = if streaming { close_dangling_markup(text) } else { text.into() };
@@ -402,13 +402,14 @@ impl ChatApp {
         task: &str,
         k: usize,
         card: &ToolCard,
+        cwd: &std::path::Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let settle = motion::settle(("task-tool", k), card.phase != ToolPhase::Running, window, cx);
         if !card.diffs.is_empty() {
             return div().v_flex().gap_2().children(card.diffs.iter().map(|diff| {
-                Self::render_diff(diff, Some(DIFF_PREVIEW_ROWS), None, Some((card, settle)))
+                Self::render_diff(diff, cwd, Some(DIFF_PREVIEW_ROWS), None, Some((card, settle)))
             }));
         }
         let has_output = card.can_open();

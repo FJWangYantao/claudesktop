@@ -759,6 +759,7 @@ impl ChatApp {
         self.refresh_composer(cx);
         self.schedule_suggestion(cx);
         self.probe_context_window(i, cx);
+        self.settle_undo();
         cx.notify();
     }
 

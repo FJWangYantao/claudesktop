@@ -4,7 +4,7 @@
 //! 连续的几步收进可折叠的组（分组规则在 `Session::compute_layout`）。
 
 use super::ChatApp;
-use super::menu::{MenuChip, MenuList, diff_stat, menu_item, menu_popover};
+use super::menu::diff_stat;
 use super::motion::{self, Reveal};
 use super::rewind::file_name;
 use super::widgets::Surface;
@@ -18,14 +18,13 @@ use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::motion::{Presence, Transition};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Position;
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 同组相邻两步之间的行距
@@ -470,6 +469,7 @@ impl ChatApp {
     pub(super) fn render_tool(
         idx: usize,
         card: &ToolCard,
+        cwd: &Path,
         verbose: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -484,7 +484,8 @@ impl ChatApp {
         let mut col = div().v_flex().gap_2();
         for (k, diff) in card.diffs.iter().enumerate() {
             let rest = (ElementId::from(("diff-rest", idx * 64 + k)), rest);
-            col = col.child(Self::render_diff(diff, preview, Some(rest), Some((card, settle))));
+            col =
+                col.child(Self::render_diff(diff, cwd, preview, Some(rest), Some((card, settle))));
         }
         // diff 已经说明了改了什么；结果摘要只在失败时有用（为什么没改成）
         if card.phase == ToolPhase::Failed && !card.result.is_empty() {
@@ -991,46 +992,194 @@ impl ChatApp {
             .child(div().pl(STEP_INDENT).child(buttons))
     }
 
-    /// 回复末尾「改动 N 个文件 +a −b」：点开列出这一轮改过的文件，选一个跳到它的 diff。
-    fn turn_files_menu(&self, idx: usize, files: Vec<TurnFile>, cx: &mut Context<Self>) -> Popover {
+    /// 回复末尾的改动卡片（对照 Codex）：表头「改动了 N 个文件 +a −b」，最新一轮带「撤回」和「审查」；
+    /// 下面每个文件一行（文件名 + 所在目录 + 增删行数），点了跳到它的 diff。
+    /// 文件多时先列 [`CHANGES_PREVIEW`] 个，其余收在「显示其余 N 个」里（展开状态记在会话里，进行指纹）。
+    fn render_changes_card(
+        &self,
+        idx: usize,
+        files: Vec<TurnFile>,
+        latest: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let s = self.session();
         let (added, removed) = files.iter().fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
-        let label = match files.as_slice() {
-            [one] => format!("改动 {}", file_name(&one.path)),
-            many => format!("改动 {} 个文件", many.len()),
+        // 撤回 / 审查要读写日志：最新一轮跑完了、有保存记录才给
+        let actionable = latest && self.store.is_some() && s.meta.is_some();
+        let undo = if actionable { s.latest_undo() } else { None };
+        let title = match undo {
+            Some(u) if u.all => format!("撤回了 {} 个文件的改动", files.len()),
+            Some(_) => format!("改动了 {} 个文件 · 撤回了一部分", files.len()),
+            None => format!("改动了 {} 个文件", files.len()),
         };
-        // Popover 的展开状态按 id 存在 window 上（`use_keyed_state`），不跟着外层
-        // `div().id(("transcript", token))` 隔离：id 里带上会话 token，免得一个会话里
-        // 开着的菜单在另一个会话同一行号上「继承」成打开状态
-        let token = self.session().token;
-        let id = SharedString::from(format!("turn-files-{token}-{idx}"));
-        menu_popover(
-            id.clone(),
-            Anchor::BottomLeft,
-            rems(24.),
-            &cx.entity(),
-            &self.menu_focus,
-            MenuChip::new(IconAll::FileDiff, label).stat(added, removed),
-            move |_, handle, popover| {
-                let mut menu =
-                    MenuList::new(SharedString::from(format!("{id}-list")), handle, popover)
-                        .scroll(rems(22.5));
-                for (i, f) in files.iter().enumerate() {
-                    let item = f.item;
-                    let name = file_name(&f.path);
-                    let desc =
-                        if f.created { format!("新文件 · {}", f.path) } else { f.path.clone() };
-                    menu = menu.pick(
-                        menu_item(("turn-file", i), IconAll::FileText, name, desc, false)
-                            .child(diff_stat(f.added, f.removed)),
-                        move |this, cx| this.reveal_change(item, cx),
-                    );
-                }
-                menu
-            },
-        )
+        let header = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .pl_3()
+            .pr_2()
+            .py_1p5()
+            .child(
+                Icon::new(if undo.is_some_and(|u| u.all) {
+                    IconAll::Undo2
+                } else {
+                    IconAll::FileDiff
+                })
+                .size_3p5()
+                .flex_shrink_0()
+                .text_color(rgb(INK_SOFT)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(TEXT_BODY)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(INK))
+                    .child(title),
+            )
+            .when(undo.is_none_or(|u| !u.all), |d| d.child(diff_stat(added, removed)))
+            .child(div().flex_1())
+            .when(actionable, |d| {
+                let all_undone = undo.is_some_and(|u| u.all);
+                d.child(
+                    Self::quiet_button(
+                        ("changes-undo", idx),
+                        if all_undone { IconAll::Redo2 } else { IconAll::Undo2 },
+                        Surface::Paper,
+                        cx,
+                    )
+                    .small()
+                    .px_2()
+                    .label(if all_undone { "恢复" } else { "撤回" })
+                    .tooltip(if all_undone {
+                        "把撤回的改动全部写回去"
+                    } else {
+                        "把这一轮改的文件全部还原（不动对话；「审查」里可以逐块恢复）"
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.undo_turn(idx, !all_undone, cx)),
+                    ),
+                )
+                .child(
+                    Self::text_button(("changes-review", idx), "审查", false)
+                        .small()
+                        .with_variant(ButtonVariant::Secondary)
+                        .tooltip("按块查看这一轮的改动，不要的单独撤回")
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_review(idx, cx))),
+                )
+            });
+
+        let cwd = s.cwd.clone();
+        let total = files.len();
+        let open = s.changes_open.contains(&idx);
+        let shown = if open || total <= CHANGES_PREVIEW + 1 { total } else { CHANGES_PREVIEW };
+        let faded = undo.is_some_and(|u| u.all);
+        let rows = files.into_iter().take(shown).enumerate().map(|(n, f)| {
+            let item = f.item;
+            let (name, dir) =
+                split_path(&claudesktop_core::review::display_path(&f.path, Some(&cwd)));
+            div()
+                .id(("changes-file", idx * 64 + n))
+                .group("changes-file")
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(HOVER)))
+                .text_size(TEXT_SMALL)
+                .child(
+                    Icon::new(if f.created { IconAll::FilePlus } else { IconAll::FileText })
+                        .size_3p5()
+                        .flex_shrink_0()
+                        .text_color(rgb(INK_SOFT)),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .whitespace_nowrap()
+                        .text_color(rgb(if faded { INK_SOFT } else { INK }))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(rgb(INK_SOFT))
+                        .children(dir),
+                )
+                .when(f.created, |d| d.child(new_file_tag()))
+                .child(diff_stat(f.added, f.removed).when(faded, |d| d.opacity(0.6)))
+                // 悬停才露出的箭头：点这一行是跳到它的 diff
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .opacity(0.)
+                        .group_hover("changes-file", |d| d.opacity(1.))
+                        .child(Icon::new(IconAll::ChevronRight).size_3().text_color(rgb(INK_SOFT))),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.reveal_change(item, cx)))
+        });
+        let more = (shown < total || (open && total > CHANGES_PREVIEW + 1)).then(|| {
+            let text = if open {
+                "收起".to_string()
+            } else {
+                format!("显示其余 {} 个", total - shown)
+            };
+            div()
+                .id(("changes-more", idx))
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(HOVER)))
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(
+                    Icon::new(if open { IconAll::ChevronUp } else { IconAll::ChevronDown })
+                        .size_3p5()
+                        .flex_shrink_0(),
+                )
+                .child(text)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let active = this.active;
+                    let s = &mut this.sessions[active];
+                    if !s.changes_open.remove(&idx) {
+                        s.changes_open.insert(idx);
+                    }
+                    cx.notify();
+                }))
+        });
+        div()
+            .v_flex()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CARD))
+            .shadow_xs()
+            .overflow_hidden()
+            .child(header)
+            .child(
+                div()
+                    .v_flex()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .children(rows)
+                    .children(more),
+            )
     }
 
-    /// 从「改动 N 个文件」跳到某个文件的 diff：摘要视图里 diff 卡片是收起的。
+    /// 从改动卡片跳到某个文件的 diff：摘要视图里 diff 卡片是收起的。
     /// 只在内存里换回标准视图——这是「为看一眼」的临时切换，不能当成偏好写回设置文件
     /// （见 [`Self::set_view_mode`]）。
     fn reveal_change(&mut self, item: usize, cx: &mut Context<Self>) {
@@ -1046,6 +1195,7 @@ impl ChatApp {
     /// `tool`（工具, 结果图标的入场进度）给了时表头带上工具的状态图标和名称（兼当工具行）。
     pub(super) fn render_diff(
         diff: &DiffView,
+        cwd: &Path,
         preview: Option<usize>,
         rest: Option<(ElementId, f32)>,
         tool: Option<(&ToolCard, f32)>,
@@ -1080,6 +1230,8 @@ impl ChatApp {
                 Icon::new(IconAll::FileText).size_3p5().text_color(rgb(INK_SOFT)).into_any_element()
             }
         };
+        let (name, dir) =
+            split_path(&claudesktop_core::review::display_path(&diff.path, Some(cwd)));
         let header = div()
             .h_flex()
             .items_center()
@@ -1099,6 +1251,8 @@ impl ChatApp {
                     .text_color(rgb(INK))
                     .child(card.name.clone())
             }))
+            // 文件名在前、所在目录淡色跟在后面（同回复末尾的改动卡片），路径按工作目录写短
+            .child(div().flex_shrink_0().whitespace_nowrap().text_color(rgb(INK)).child(name))
             .child(
                 div()
                     .flex_1()
@@ -1106,10 +1260,9 @@ impl ChatApp {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .font_family(MONO)
-                    .child(diff.path.clone()),
+                    .children(dir),
             )
-            .when(diff.created, |d| d.child(div().flex_shrink_0().child("新文件")))
+            .when(diff.created, |d| d.child(new_file_tag()))
             .children(tool.and_then(|(card, _)| {
                 grant_badge(ElementId::Name(format!("diff-grant-{}", diff.path).into()), card)
             }))
@@ -1124,7 +1277,7 @@ impl ChatApp {
             );
         div()
             .v_flex()
-            .rounded_lg()
+            .rounded_xl()
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
@@ -1608,7 +1761,9 @@ impl ChatApp {
                 Self::render_info(idx, text, *open, verbose, window, cx)
             }
             ChatItem::Tool(card) if card.task => self.render_task_card(idx, card, window, cx),
-            ChatItem::Tool(card) => Self::render_tool(idx, card, verbose, window, cx),
+            ChatItem::Tool(card) => {
+                Self::render_tool(idx, card, &self.session().cwd, verbose, window, cx)
+            }
             ChatItem::AutoApproved { title, chosen } => {
                 Self::render_auto_approved(idx, title, chosen)
             }
@@ -1685,21 +1840,10 @@ impl ChatApp {
                             .font_features(tabular_nums())
                             .child(m)
                     }))
-                    .when(!files.is_empty(), |d| d.child(self.turn_files_menu(idx, files, cx)))
-                    // 最新一轮跑完了才能逐块审查（撤回记录要落在这一轮里，见 review.rs）
-                    .when(latest && has_files && self.store.is_some(), |d| {
-                        d.child(
-                            Self::message_action(
-                                ("review-turn", idx),
-                                IconAll::FileCheck,
-                                "审查",
-                                cx,
-                            )
-                            .tooltip("按块查看这一轮的改动，不要的单独撤回")
-                            .on_click(cx.listener(move |this, _, _, cx| this.open_review(idx, cx))),
-                        )
-                    })
                     .when_some(fade, |d, opacity| d.opacity(opacity));
+                // 这一轮改过文件：正文和操作行之间一张改动卡片（常显，不跟着悬停淡入淡出）
+                let changes = has_files
+                    .then(|| div().pt_3().child(self.render_changes_card(idx, files, latest, cx)));
                 div().child(
                     div()
                         .id(("agent-msg", idx))
@@ -1709,6 +1853,7 @@ impl ChatApp {
                             this.set_hovered_msg(idx, *hovered, cx)
                         }))
                         .child(body)
+                        .children(changes)
                         .child(actions),
                 )
             }
@@ -1724,6 +1869,31 @@ impl ChatApp {
         }
     }
 }
+
+/// 显示用路径拆成（文件名，所在目录）；目录为空（就在工作目录下）时为 None。
+fn split_path(shown: &str) -> (String, Option<String>) {
+    let dir = std::path::Path::new(shown)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty());
+    (file_name(shown), dir)
+}
+
+/// 「新文件」小标签（改动卡片、diff 卡片表头）：描边不填底，卡片底和沙色底上都看得清
+fn new_file_tag() -> Div {
+    div()
+        .flex_shrink_0()
+        .px_1p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(LINE_STRONG))
+        .text_size(TEXT_META)
+        .text_color(rgb(INK_SOFT))
+        .child("新文件")
+}
+
+/// 改动卡片先列几个文件（多一个时直接全列，不为一行折叠）
+const CHANGES_PREVIEW: usize = 5;
 
 /// diff 的一行：行号、+/- 标记、内容；`'~'` 是两个 hunk 之间省略的部分。
 pub(super) fn diff_line(line: &claudesktop_core::DiffLineView) -> Div {

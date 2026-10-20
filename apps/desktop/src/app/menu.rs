@@ -29,44 +29,22 @@ pub(super) struct MenuChip {
     plain: bool,
     /// 沙色实底（筛选条这类放在纸底上、要一眼看出能点的 chip）
     filled: bool,
-    /// 文字后面跟着的增删行数（绿 +N、红 −M）
-    stat: Option<(u32, u32)>,
     open: bool,
 }
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self {
-            icon: Some(icon),
-            label: label.into(),
-            plain: false,
-            filled: false,
-            stat: None,
-            open: false,
-        }
+        Self { icon: Some(icon), label: label.into(), plain: false, filled: false, open: false }
     }
 
     /// 只有文字，不带展开箭头（输入框工具栏里的模型）。
     pub(super) fn plain(label: impl Into<SharedString>) -> Self {
-        Self {
-            icon: None,
-            label: label.into(),
-            plain: true,
-            filled: false,
-            stat: None,
-            open: false,
-        }
+        Self { icon: None, label: label.into(), plain: true, filled: false, open: false }
     }
 
     /// 沙色实底（筛选条、「添加」这类放在纸底上的 chip）。
     pub(super) fn filled(mut self) -> Self {
         self.filled = true;
-        self
-    }
-
-    /// 文字后面跟上增删行数（回复末尾的「改动 N 个文件」）。
-    pub(super) fn stat(mut self, added: u32, removed: u32) -> Self {
-        self.stat = Some((added, removed));
         self
     }
 }
@@ -97,9 +75,6 @@ impl RenderOnce for MenuChip {
             // chip 一律次要字号
             div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(self.label),
         );
-        if let Some((added, removed)) = self.stat {
-            chip = chip.child(diff_stat(added, removed));
-        }
         if !self.plain {
             chip = chip.child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
         }
