@@ -610,10 +610,10 @@ impl ChatApp {
         session
     }
 
-    /// 这个目录是不是用户选过的工作目录（目录菜单里选的、记进设置的）。
-    /// 不是的话（默认目录、环境变量给的启动目录），在里面的对话算任务
-    fn is_project_dir(&self, dir: &Path) -> bool {
-        self.settings.workspace.as_deref() == Some(dir)
+    /// 这个目录是不是项目：默认目录（环境变量给的或启动目录）以外的都是用户选过的；
+    /// 默认目录本身只有在目录菜单里明确选过（记进设置）才算。不是项目的，在里面的对话算任务
+    pub(super) fn is_project_dir(&self, dir: &Path) -> bool {
+        self.settings.workspace.as_deref() == Some(dir) || dir != self.acp_base.cwd
     }
 
     /// 把一个还没对话的会话换到另一种内核上：原地换成新会话，
@@ -662,13 +662,17 @@ impl ChatApp {
     }
 
     /// 目录菜单里的「不选项目（任务）」：当前对话回到任务区（侧栏下半区）。
-    /// 已经跑在默认目录里就只改归类，否则在默认目录另开一个（对话中途不换目录）。
+    /// 已经跑在默认目录里就只改归类；还没对话就原地换到默认目录，否则在默认目录另开一个（对话中途不换目录）。
     pub(crate) fn as_task(&mut self, cx: &mut Context<Self>) {
         let default_dir = self.acp_base.cwd.clone();
-        let kind = self.session().kernel;
-        if self.session().cwd == default_dir {
+        let s = self.session();
+        let kind = s.kernel;
+        if s.cwd == default_dir {
             self.sessions[self.active].task = true;
             self.save_task(self.active);
+        } else if !s.has_user_message() && !s.busy {
+            self.replace_session(self.active, kind, default_dir);
+            self.sessions[self.active].task = true;
         } else {
             let idx = self.open_session(kind, default_dir);
             self.sessions[idx].task = true;

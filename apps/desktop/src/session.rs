@@ -1106,19 +1106,15 @@ impl Session {
                         .unwrap_or(0);
                 }
                 // 新建对话的默认模式 / 会话建立前选的模式：内核会话建立了才告诉它。
-                // 内核没报这个模式（如 ACP agent）就作罢，退回它报的那个
-                if let Some(mode) = self.pending_mode.take() {
-                    match self.modes.iter().position(|m| m.id == mode) {
-                        Some(i) => {
-                            self.permission_mode = i;
-                            if let (Some(kernel), Some(id)) = (kernel, self.acp_id.clone())
-                                && let Err(err) = kernel.set_mode(&id, &mode)
-                            {
-                                self.note(format!("切换权限模式失败：{err}"));
-                            }
-                        }
-                        // 内核不认这个模式：退回它报的那个
-                        None => self.permission_mode = 0,
+                // 内核没报这个模式（如 ACP agent）就作罢，保留上面按 `current_mode` 定下的那个
+                if let Some(mode) = self.pending_mode.take()
+                    && let Some(i) = self.modes.iter().position(|m| m.id == mode)
+                {
+                    self.permission_mode = i;
+                    if let (Some(kernel), Some(id)) = (kernel, self.acp_id.clone())
+                        && let Err(err) = kernel.set_mode(&id, &mode)
+                    {
+                        self.note(format!("切换权限模式失败：{err}"));
                     }
                 }
                 // 会话建立前在下拉里选过模型：现在告诉内核
@@ -2188,6 +2184,12 @@ mod tests {
         s.apply_event(started(&[("default", "逐项确认"), ("plan", "计划")]), None);
         assert_eq!(s.modes[s.permission_mode].id, "default");
         assert!(s.modes.iter().all(|m| m.id != MODE_AUTO_ID));
+
+        // 内核报的当前模式不在第一位：退回的是它，不是列表第一项
+        let mut s = Session::new(3, KernelChoice::Acp, PathBuf::from("."));
+        s.default_to(MODE_AUTO_ID);
+        s.apply_event(started(&[("plan", "计划"), ("default", "逐项确认")]), None);
+        assert_eq!(s.modes[s.permission_mode].id, "default");
     }
 
     #[core::prelude::v1::test]

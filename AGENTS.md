@@ -106,7 +106,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
   下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
   `SessionMeta::task`），最后是「已归档」。判定在 `ChatApp::new_session`（`is_project_dir`：
-  建会话的目录是不是设置里选过的 `workspace`）；输入框上方的目录菜单里有「不选项目（任务）」
+  默认目录 `acp_base.cwd` 以外都算项目，默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）；输入框上方的目录菜单里有「不选项目（任务）」
   （`ChatApp::as_task`，已经跑在默认目录就只改归类），chip 和顶栏面包屑对任务显示「任务」。
   新增对话行状态时记得把它并进 `sync_sidebar` 的指纹。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，

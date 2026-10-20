@@ -819,7 +819,12 @@ impl ChatApp {
                 })
                 .collect();
         }
-        let mut groups: Vec<(&Path, Vec<usize>)> = vec![(self.cwd.as_path(), Vec::new())];
+        // 当前目录是项目时它一组总在最前（空着也列出）；不是项目（对话都在任务区）就不占位
+        let mut groups: Vec<(&Path, Vec<usize>)> = if self.is_project_dir(&self.cwd) {
+            vec![(self.cwd.as_path(), Vec::new())]
+        } else {
+            Vec::new()
+        };
         for (i, s) in self.sessions.iter().enumerate().filter(|&(i, _)| listed(i)) {
             match groups.iter_mut().find(|(cwd, _)| *cwd == s.cwd.as_path()) {
                 Some((_, members)) => members.push(i),
@@ -828,12 +833,12 @@ impl ChatApp {
         }
         groups
             .into_iter()
-            .enumerate()
-            .map(|(g, (cwd, mut members))| {
+            .map(|(cwd, mut members)| {
                 if self.sessions_by_activity {
                     members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
                 }
-                let name = if g == 0 { self.project_name.clone() } else { project_label(cwd) };
+                let name =
+                    if cwd == self.cwd { self.project_name.clone() } else { project_label(cwd) };
                 SessionGroup { key: format!("dir:{}", cwd.display()), name, members }
             })
             .collect()
