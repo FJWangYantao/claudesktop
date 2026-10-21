@@ -2254,7 +2254,10 @@ fn task_runs_a_subagent_and_returns_its_report() {
         system.contains("subagent (`scout`)") && system.contains("You are a scout."),
         "{system}"
     );
-    assert!(!system.contains("todo_write"), "{system}");
+    // 只看向壳自己写的那半段：后面可能跟着项目说明（AGENTS.md），里面提到 `todo_write` 不算数
+    // ——工作目录落在某个仓库里时就会读到它
+    let harness = system.split("# User and project instructions").next().unwrap();
+    assert!(!harness.contains("todo_write"), "{harness}");
     assert_eq!(msgs.len(), 2);
     assert!(msgs[1]["content"].to_string().contains("Find the secret"));
     assert_eq!(tool_names(&child), ["read_file", "grep"]);
