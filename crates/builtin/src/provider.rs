@@ -177,7 +177,7 @@ pub enum ThinkingFormat {
         off: fn() -> Value,
     },
     /// 用户的「默认（兜底）」：能力表里没有的模型也按 [`FALLBACK_LEVELS`] 发 effort，
-    /// `apply_thinking` 这时把 `effort_for` 的写法放进 [`ThinkingFormat::field`]
+    /// `apply_thinking` 这时按协议把 `effort_for` 的取值写进对应的 effort 字段
     Default,
 }
 
@@ -197,17 +197,6 @@ impl PartialEq for ThinkingFormat {
 }
 
 impl Eq for ThinkingFormat {}
-
-impl ThinkingFormat {
-    /// 兜底（[`ThinkingFormat::Default`]）按协议发哪个 effort 字段
-    fn field(self, protocol: Protocol) -> &'static str {
-        match protocol {
-            Protocol::OpenAiCompat => "reasoning_effort",
-            Protocol::Responses => "reasoning.effort",
-            Protocol::Anthropic => "output_config.effort",
-        }
-    }
-}
 
 /// 一门协议 + 一个模型支持什么：能选哪些档位，字段怎么发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +259,13 @@ impl ThinkingSpec {
     /// 开 / 关型（`Toggle`）多一步：它只有「开 / 关」，用户选中间几档都按「开」处理，
     /// 不能因为「高」比「中」大就降成「关」——那等于把用户要的思考关掉了。
     pub fn resolve(&self, chosen: ThinkingLevel) -> Option<ThinkingLevel> {
+        // 「兜底」排在 `Ord` 最后，直接按强度降级会落成最强那档（xhigh）；
+        // 它的意思是「也发 effort」，落到能选的最低一个开档
+        let chosen = if chosen == ThinkingLevel::Default {
+            self.choices().iter().copied().find(|l| !l.is_off())?
+        } else {
+            chosen
+        };
         if !self.is_known() {
             // 兜底档位：和认得的模型一样按 [`FALLBACK_LEVELS`] 降级
             return resolve_level(chosen, FALLBACK_LEVELS);
@@ -689,15 +685,19 @@ pub fn apply_thinking(body: &mut Value, protocol: Protocol, model: &str, params:
         }
         // 认不出的模型选了「兜底」（`spec` 换成了 [`ThinkingSpec::FALLBACK`]）：
         // 只发 effort，不发厂商私有开关——那些字段写错了就是 400
-        ThinkingFormat::Default => {
-            if protocol == Protocol::Responses {
+        ThinkingFormat::Default => match protocol {
+            Protocol::OpenAiCompat => {
+                body["reasoning_effort"] = serde_json::json!(effort_for(level));
+            }
+            Protocol::Responses => {
                 body["reasoning"] =
                     serde_json::json!({ "effort": effort_for(level), "summary": "auto" });
-            } else {
-                body[ThinkingFormat::Default.field(protocol)] =
-                    serde_json::json!(effort_for(level));
             }
-        }
+            // 嵌套字段：`body["output_config.effort"]` 会写成一个带点的顶层键
+            Protocol::Anthropic => {
+                body["output_config"] = serde_json::json!({ "effort": effort_for(level) });
+            }
+        },
     }
 }
 
@@ -1459,6 +1459,14 @@ mod tests {
         let glm = RequestParams { thinking: Some(ThinkingLevel::Default), ..Default::default() };
         apply_thinking(&mut body, Protocol::OpenAiCompat, "glm-5.3", &glm);
         assert_eq!(body["thinking"], serde_json::json!({"type": "enabled"}), "{body}");
+
+        // 认得的 effort 模型上「兜底」落最低的开档，不是最强那档
+        let mut body = serde_json::json!({"max_tokens": 16_384});
+        apply_thinking(&mut body, Protocol::Anthropic, "claude-opus-4-7", &glm);
+        let spec = thinking_spec(Protocol::Anthropic, "claude-opus-4-7");
+        let lowest = spec.levels.iter().copied().find(|l| !l.is_off()).unwrap();
+        assert_eq!(body["output_config"]["effort"], effort_for(lowest), "{body}");
+        assert_ne!(body["output_config"]["effort"], "xhigh", "{body}");
     }
 
     /// Adaptive 格式：开着思考时发 `adaptive` + `display` + `output_config.effort`，不发 temperature。
