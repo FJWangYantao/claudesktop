@@ -1643,23 +1643,16 @@ impl ChatApp {
         );
         let current = self.session().kernel.clone();
         // 只给配置过的内核：启用的每一条 agent 档案都是候选（新会话在它上面开）
-        let acp_agents: Vec<KernelChoice> = self
-            .settings
-            .acp
-            .agents
-            .iter()
-            .map(|a| KernelChoice::Acp(a.id.clone()))
-            .collect();
-        let others = std::iter::once(KernelChoice::Builtin)
-            .chain(acp_agents)
-            .filter(|k| {
-                *k != current
-                    && match k {
-                        KernelChoice::Builtin => self.settings.builtin.is_configured(),
-                        KernelChoice::Acp(_) => true,
-                        KernelChoice::Demo => false,
-                    }
-            });
+        let acp_agents: Vec<KernelChoice> =
+            self.settings.acp.agents.iter().map(|a| KernelChoice::Acp(a.id.clone())).collect();
+        let others = std::iter::once(KernelChoice::Builtin).chain(acp_agents).filter(|k| {
+            *k != current
+                && match k {
+                    KernelChoice::Builtin => self.settings.builtin.is_configured(),
+                    KernelChoice::Acp(_) => true,
+                    KernelChoice::Demo => false,
+                }
+        });
         let edit_tip = if images.is_empty() {
             "放回输入框，改完重新发送"
         } else {

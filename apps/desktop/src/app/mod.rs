@@ -321,8 +321,7 @@ impl ChatApp {
             .unwrap_or_else(|| acp_base.cwd.clone());
         let project_name = project_label(&cwd);
 
-        let (ev_tx, mut ev_rx) =
-            futures::channel::mpsc::unbounded::<(String, u64, RoutedEvent)>();
+        let (ev_tx, mut ev_rx) = futures::channel::mpsc::unbounded::<(String, u64, RoutedEvent)>();
         cx.spawn(async move |this, cx| {
             while let Some((key, generation, event)) = ev_rx.next().await {
                 if this
@@ -499,8 +498,12 @@ impl ChatApp {
                     let records = store.load(&meta.id).unwrap_or_default();
                     app.usage.extend(usage::collect(&meta, &records));
                     if i < MAX_RESTORED {
-                        app.sessions
-                            .push(Session::from_records(app.next_token, meta, records, &app.settings.acp));
+                        app.sessions.push(Session::from_records(
+                            app.next_token,
+                            meta,
+                            records,
+                            &app.settings.acp,
+                        ));
                         app.next_token += 1;
                     }
                 }
@@ -891,8 +894,10 @@ impl ChatApp {
         let cwd = self.sessions[src].cwd.clone();
         let idx = self.open_session(kind.clone(), cwd);
         self.active = idx;
-        self.sessions[idx]
-            .note(format!("同一任务换到「{}」上跑（原会话：{from}）", kind.label(&self.settings.acp)));
+        self.sessions[idx].note(format!(
+            "同一任务换到「{}」上跑（原会话：{from}）",
+            kind.label(&self.settings.acp)
+        ));
         // 内核不可用时 submit_to 会给出提示
         if self.sessions[idx].ready || self.kernel_of(&kind).is_none() {
             self.submit_to(idx, prompt, cx);
@@ -1142,8 +1147,10 @@ impl ChatApp {
     /// 历史会话续接内核会话，就绪后再发待发的消息。同一个 ACP agent 才尝试；
     /// 自研内核用本地日志重建上下文，换了端点 / 模型也能续接。
     fn send_resume(&mut self, idx: usize, kernel: &Arc<dyn Kernel>) {
-        let agent_cmd =
-            self.slot(&self.sessions[idx].kernel_key).map(|s| s.agent_cmd.clone()).unwrap_or_default();
+        let agent_cmd = self
+            .slot(&self.sessions[idx].kernel_key)
+            .map(|s| s.agent_cmd.clone())
+            .unwrap_or_default();
         let s = &mut self.sessions[idx];
         s.requested = true;
         let builtin = s.kernel == KernelChoice::Builtin;
@@ -1397,11 +1404,9 @@ impl ChatApp {
             // 历史会话的内核可能还没启动
             self.ensure_kernel(&kind);
             if self.kernel_of(&kind).is_none() {
-                let status = self
-                    .slot(&kind.key())
-                    .map(|s| s.status.clone())
-                    .unwrap_or_default();
-                let reason = format!("{}不可用：{status}（可在设置里修改）", kind.label(&self.settings.acp));
+                let status = self.slot(&kind.key()).map(|s| s.status.clone()).unwrap_or_default();
+                let reason =
+                    format!("{}不可用：{status}（可在设置里修改）", kind.label(&self.settings.acp));
                 self.refuse_send(idx, reason, cx);
                 return false;
             }
@@ -1642,7 +1647,8 @@ impl ChatApp {
                     s.note(format!("创建会话失败：{message}"));
                 }
             }
-            KernelEvent::McpStatus { servers } => slot.mcp = servers,            KernelEvent::MemorySuggested { candidates } => {
+            KernelEvent::McpStatus { servers } => slot.mcp = servers,
+            KernelEvent::MemorySuggested { candidates } => {
                 // 只进设置页顶部的待确认区，不进对话流（误记的代价比漏记大）。
                 // 来源会话用事件自己的 sessionId；第几轮按对话里的用户消息数算（和内核的轮次对齐）
                 let sid = session.clone().unwrap_or_default();
@@ -1667,11 +1673,8 @@ impl ChatApp {
                 slot.status = "内核错误".into();
                 // 多半发生在刚启动时（命令找不到、agent 一起来就退出），这会儿用户常常还在首页，
                 // 对话流里的说明看不到，所以另弹一条提示
-                let text = crate::model::kernel_failure_text(
-                    &kind.label(&acp),
-                    &slot.agent_cmd,
-                    &message,
-                );
+                let text =
+                    crate::model::kernel_failure_text(&kind.label(&acp), &slot.agent_cmd, &message);
                 slot.fatal = Some(message.clone());
                 for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
                     s.on_fatal(&message, kernel.as_ref());
@@ -1782,8 +1785,10 @@ impl ChatApp {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        let agent_cmd =
-            self.slot(&self.sessions[idx].kernel_key).map(|s| s.agent_cmd.clone()).unwrap_or_default();
+        let agent_cmd = self
+            .slot(&self.sessions[idx].kernel_key)
+            .map(|s| s.agent_cmd.clone())
+            .unwrap_or_default();
         let s = &mut self.sessions[idx];
         let opened = match &s.meta {
             Some(meta) => store.append_log(&meta.id),
@@ -1906,8 +1911,7 @@ impl ChatApp {
             return;
         };
         let key = self.sessions[idx].kernel_key.clone();
-        let agent_cmd =
-            self.slot(&key).map(|slot| slot.agent_cmd.clone()).unwrap_or_default();
+        let agent_cmd = self.slot(&key).map(|slot| slot.agent_cmd.clone()).unwrap_or_default();
         let s = &mut self.sessions[idx];
         if let Some(log) = &mut s.log {
             let _ = log.flush();

@@ -474,7 +474,10 @@ impl ChatApp {
                 IconAll::Dot,
                 "上面一行一条：建 worktree 时从主目录复制过去的文件（如 .env*），相对项目根",
             ))
-            .child(note(IconAll::Dot, "下面这一行是建好之后在里面跑的初始化命令（如 npm install）"));
+            .child(note(
+                IconAll::Dot,
+                "下面这一行是建好之后在里面跑的初始化命令（如 npm install）",
+            ));
 
         // 底部：上次写文件的结果（即时生效，没有保存按钮）
         let status: AnyElement = match &form.message {

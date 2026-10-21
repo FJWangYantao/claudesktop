@@ -261,8 +261,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   旁路小请求（补全 / 记忆提炼 / 分类器）一律 `suggest::short_thinking(protocol, model)`（按实际协议查表）：能关就关、关不掉取最低一档。
   **会话级档位**：输入框工具栏的 chip（`composer.rs` 的 `thinking_menu_items`，ACP 内核不显示）改的是
   `Session::thinking`，经 `Kernel::set_thinking(session, Option<&str>)` 存进内核的 `SessionState`，
-  `run_steps` 每轮现取、覆盖档案里的那份（`None` = 跟随档案）。会话还没建立时记在 `Session::pending_thinking`，
-  `Started` 时由 `ChatApp::flush_pending_thinking` 补交。能选哪些档用 `session_thinking_spec` 按**当前模型**现算。
+  `run_steps` 每轮开头取一次、覆盖档案里的那份（`None` = 跟随档案；进行中的一轮用开头那档，工具循环中途开 / 关思考 Anthropic 报 400）。
+  会话还没建立 / 内核重连（`detach_kernel`）时记在 `Session::pending_thinking`，`Started` 时由 `ChatApp::flush_pending_thinking` 补交。
+  能选哪些档用 `session_thinking_spec` 按**当前模型**现算，高亮 / chip 文字用 `active_thinking`（实际生效的那档）；认不出的模型只给「默认 / 兜底」。
   加新模型 = 能力表加一条，同时想清楚 `can_disable`（关不掉的那代别给「关」）和 `accepts_temperature`。
 - **worktree 会话**（`crates/core/src/git.rs` + `apps/desktop/src/app/worktree.rs`，见「设计说明-worktree.md」）：
   目录在**数据目录** `worktrees/<仓库名>-<短哈希>/<分支尾段>`，不往用户仓库里塞东西；分支名 `claudesktop/<月日-时分>-<3 位随机>`。

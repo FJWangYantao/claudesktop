@@ -66,10 +66,9 @@ impl KernelChoice {
         match self {
             Self::Builtin => "自研内核".into(),
             Self::Demo => "演示回放".into(),
-            Self::Acp(id) => acp
-                .get(id)
-                .map(|a| a.display_name())
-                .unwrap_or_else(|| "ACP agent".into()),
+            Self::Acp(id) => {
+                acp.get(id).map(|a| a.display_name()).unwrap_or_else(|| "ACP agent".into())
+            }
         }
     }
 
@@ -758,8 +757,7 @@ impl Settings {
     /// 用环境变量覆盖（启动时调用一次）。
     pub fn with_env(mut self) -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        if let Some(k) =
-            var("CLAUDESKTOP_KERNEL").and_then(|v| KernelChoice::parse(&v, &self.acp))
+        if let Some(k) = var("CLAUDESKTOP_KERNEL").and_then(|v| KernelChoice::parse(&v, &self.acp))
         {
             self.kernel = Some(k);
         }
@@ -833,10 +831,9 @@ impl Settings {
     /// 一家都没启用时退回自研（设置页选了 agent 但一条档案都没勾）。
     pub fn kernel_for(&self, kind: &KernelChoice) -> KernelChoice {
         match kind {
-            KernelChoice::Acp(id) if id.is_empty() => self
-                .acp_default_id()
-                .map(KernelChoice::Acp)
-                .unwrap_or(KernelChoice::Builtin),
+            KernelChoice::Acp(id) if id.is_empty() => {
+                self.acp_default_id().map(KernelChoice::Acp).unwrap_or(KernelChoice::Builtin)
+            }
             other => other.clone(),
         }
     }
@@ -1369,10 +1366,7 @@ mod tests {
             KernelChoice::Builtin
         );
         // 老格式：命令本身就是标识，归进第一个档案
-        assert_eq!(
-            KernelChoice::of_agent("node mock.mjs", acp),
-            KernelChoice::Acp("acp-1".into())
-        );
+        assert_eq!(KernelChoice::of_agent("node mock.mjs", acp), KernelChoice::Acp("acp-1".into()));
         assert_eq!(KernelChoice::of_agent("", acp), KernelChoice::Demo);
         // 槽 key 互不相同
         let keys: Vec<String> = vec![

@@ -247,11 +247,8 @@ pub fn copy_matches(repo: &Path, pattern: &str) -> Vec<PathBuf> {
         for dir in &dirs {
             // `**`：从这一层往下所有目录都算（`**/x` 的 `x` 在每一层里找）
             let deep = *segment == "**";
-            let bases: Vec<PathBuf> = if deep {
-                walk_dirs(dir.to_path_buf())
-            } else {
-                vec![dir.clone()]
-            };
+            let bases: Vec<PathBuf> =
+                if deep { walk_dirs(dir.to_path_buf()) } else { vec![dir.clone()] };
             for base in bases {
                 for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -331,7 +328,8 @@ pub fn copy_into(repo: &Path, worktree: &Path, relative: &Path) -> Result<usize,
 /// 递归复制：普通文件按字节复制（保留权限位）；目录先建再逐个孩子；
 /// 符号链接按它的目标复制内容（跟随，避免把主仓库的路径带进 worktree）。
 fn copy_path(from: &Path, to: &Path) -> Result<usize, String> {
-    let meta = std::fs::symlink_metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?;
+    let meta =
+        std::fs::symlink_metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?;
     let meta = if meta.is_symlink() {
         std::fs::metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?
     } else {
@@ -340,7 +338,9 @@ fn copy_path(from: &Path, to: &Path) -> Result<usize, String> {
     if meta.is_dir() {
         std::fs::create_dir_all(to).map_err(|e| format!("建不了 {}：{e}", to.display()))?;
         let mut n = 0;
-        for entry in std::fs::read_dir(from).map_err(|e| format!("读不了 {}：{e}", from.display()))? {
+        for entry in
+            std::fs::read_dir(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?
+        {
             let entry = entry.map_err(|e| format!("读不了 {}：{e}", from.display()))?;
             n += copy_path(&entry.path(), &to.join(entry.file_name()))?;
         }
@@ -528,10 +528,8 @@ mod tests {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "claudesktop-project-{name}-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("claudesktop-project-{name}-{}-{stamp}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

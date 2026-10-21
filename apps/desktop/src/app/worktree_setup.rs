@@ -56,10 +56,8 @@ impl ChatApp {
         let token = self.sessions[idx].token;
         // 复制 + 初始化各记一行，边跑边显示（复制先插一张「跑着」的卡）
         if !config.copy.is_empty() {
-            self.sessions[idx].note(format!(
-                "把 {} 个模式匹配到的文件从主目录复制过来…",
-                config.copy.len()
-            ));
+            self.sessions[idx]
+                .note(format!("把 {} 个模式匹配到的文件从主目录复制过来…", config.copy.len()));
         }
         let setup = config.setup.clone();
         let patterns = config.copy.clone();
@@ -141,10 +139,7 @@ impl ChatApp {
         };
         let config = self.worktree_setup_for(&meta.repo);
         if config.copy.is_empty() {
-            self.toast(
-                Notification::warning("项目配置里还没有要复制的文件（worktree.copy）"),
-                cx,
-            );
+            self.toast(Notification::warning("项目配置里还没有要复制的文件（worktree.copy）"), cx);
             return;
         }
         let idx = self.active;
@@ -281,10 +276,7 @@ fn run_setup(cwd: &Path, command: &str) -> SetupRun {
         cmd.arg("-c").arg(command);
         (cmd, ())
     };
-    cmd.current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // 和内核的后台命令一样：别弹浏览器 / HTML 报告（用户自己设了的不覆盖）
     for (key, value) in QUIET_ENV {
         if std::env::var_os(key).is_none() {
@@ -380,8 +372,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn copies_matching_untracked_files_into_the_worktree() {
-        let base =
-            std::env::temp_dir().join(format!("cd-wt-setup-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("cd-wt-setup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         let wt = base.join("wt");

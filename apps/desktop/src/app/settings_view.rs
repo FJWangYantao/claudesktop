@@ -13,7 +13,7 @@ use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_builtin::{
-    PermissionRules, Protocol, ProviderConfig, ThinkingLevel, default_rules_path,
+    PermissionRules, Protocol, ProviderConfig, ThinkingLevel, ThinkingSpec, default_rules_path,
 };
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
@@ -355,8 +355,10 @@ impl ChatApp {
     fn detect_agents(&mut self, cx: &mut Context<Self>) {
         self.settings_form.agent_detect = AgentDetect::Running;
         cx.spawn(async move |this, cx| {
-            let found =
-                cx.background_executor().spawn(async move { claudesktop_core::agents::discover() }).await;
+            let found = cx
+                .background_executor()
+                .spawn(async move { claudesktop_core::agents::discover() })
+                .await;
             this.update(cx, |this, cx| {
                 this.settings_form.agent_detect = AgentDetect::Done(found);
                 cx.notify();
@@ -1571,12 +1573,13 @@ impl ChatApp {
             let key = kind.key();
             let id: gpui_kit::ElementId = format!("kernel-{}", key.replace(':', "-")).into();
             kernels = kernels.child(
-                choice_row(id, icon, title, desc, f.kernel.same_kind(&kind), None)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                choice_row(id, icon, title, desc, f.kernel.same_kind(&kind), None).on_click(
+                    cx.listener(move |this, _, _, cx| {
                         this.settings_form.kernel = kind.clone();
                         this.settings_form.message = None;
                         cx.notify();
-                    })),
+                    }),
+                ),
             );
         }
         let body = div().v_flex().gap_8().child(section("默认内核", "", None, kernels));
@@ -1936,17 +1939,8 @@ impl ChatApp {
         let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
         let known = spec.is_known();
         let current = p.params.thinking;
-        // 「默认」= 不发字段，排在「关」前面；认不出的模型再加一项「兜底」
-        let mut options: Vec<(Option<ThinkingLevel>, &'static str)> = vec![(None, "默认")];
-        for level in spec.choices() {
-            options.push((Some(*level), level.label()));
-        }
-        if !known {
-            options.push((Some(ThinkingLevel::Default), ThinkingLevel::Default.label()));
-        }
-        // 高亮：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档
-        //（认不出的一档都不匹配时保留原值，免得界面显示成「默认」而实际发着别的字段）
-        let active = current.and_then(|c| spec.resolve(c)).or(current);
+        let options = thinking_options(&spec);
+        let active = active_thinking(&spec, current);
         // 认不出的模型：这一档旁边的说明短一点（整段解释在 ⓘ 里，别把行撑长）
         let hint = if !known {
             if current == Some(ThinkingLevel::Default) {
@@ -1956,9 +1950,9 @@ impl ChatApp {
             }
         } else if p.protocol == Protocol::Anthropic && spec.format.budget {
             // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
-            active.filter(|l| !l.is_off()).map(|l| {
-                format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))
-            })
+            active
+                .filter(|l| !l.is_off())
+                .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l)))
         } else {
             None
         };
@@ -2073,7 +2067,9 @@ impl ChatApp {
             list = list.child(
                 choice_row(id, IconAll::SquareTerminal, preset.name, desc, enabled, None).on_click(
                     cx.listener(move |this, _, _, cx| {
-                        if let Some(at) = this.settings_form.agents.iter().position(|a| a.id == preset.id) {
+                        if let Some(at) =
+                            this.settings_form.agents.iter().position(|a| a.id == preset.id)
+                        {
                             this.settings_form.agents.remove(at);
                         } else {
                             this.settings_form.agents.push(AgentProfile::from_preset(preset));
@@ -2085,20 +2081,18 @@ impl ChatApp {
             // 风险提示常驻在这一行下面（条款风险不收进 ⓘ）
             if let Some(risk) = preset.risk {
                 list = list.child(
-                    div()
-                        .px_3()
-                        .pb_1()
-                        .text_size(TEXT_META)
-                        .text_color(rgb(INK_SOFT))
-                        .child(risk),
+                    div().px_3().pb_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk),
                 );
             }
         }
         // 检测状态行：转圈 / 重新检测
         let detect_note = match &f.agent_detect {
-            AgentDetect::Idle | AgentDetect::Running => {
-                Some(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child("正在检测本机安装的 agent…"))
-            }
+            AgentDetect::Idle | AgentDetect::Running => Some(
+                div()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child("正在检测本机安装的 agent…"),
+            ),
             AgentDetect::Done(_) => None,
         };
         let gateway_rows: Vec<_> = f
@@ -2131,9 +2125,10 @@ impl ChatApp {
             .child(list)
             .children(detect_note)
             .children(gateway_rows.is_empty().then(|| {
-                div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(
-                    "启用一家后可以单独开关「它的请求经不经过用量网关」",
-                )
+                div()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child("启用一家后可以单独开关「它的请求经不经过用量网关」")
             }))
             .when(!gateway_rows.is_empty(), |d| d.child(setting_group(gateway_rows)))
             .child(form_field(
@@ -2369,6 +2364,30 @@ fn kernel_choices() -> Vec<(KernelChoice, IconAll, &'static str, &'static str)> 
 /// Antigravity Tools 借用 Antigravity 账号的登录，Google 2026-02 起按违反条款封过这样用的账号。
 const ANTIGRAVITY_RISK: &str =
     "风险：它借用你 Antigravity 账号的登录调用模型，Google 封过这样用的账号";
+
+/// 思考强度能选的项（设置页那一排和输入框的下拉共用）：「默认」= 不发字段，排在「关」前面；
+/// 然后是这个模型的档位；认不出的模型只有「默认 / 兜底」（兜底见 `FALLBACK_LEVELS`）。
+pub(super) fn thinking_options(spec: &ThinkingSpec) -> Vec<(Option<ThinkingLevel>, &'static str)> {
+    let mut options = vec![(None, "默认")];
+    if spec.is_known() {
+        options.extend(spec.choices().iter().map(|level| (Some(*level), level.label())));
+    } else {
+        options.push((Some(ThinkingLevel::Default), ThinkingLevel::Default.label()));
+    }
+    options
+}
+
+/// 高亮哪一项：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档。
+/// 认不出的模型只有「兜底」会发字段，存着别的档（从别的模型带过来的）实际什么都不发，算「默认」。
+pub(super) fn active_thinking(
+    spec: &ThinkingSpec,
+    current: Option<ThinkingLevel>,
+) -> Option<ThinkingLevel> {
+    if !spec.is_known() {
+        return current.filter(|c| *c == ThinkingLevel::Default);
+    }
+    current.and_then(|c| spec.resolve(c)).or(current)
+}
 
 /// 「自动」模式的说明（拦什么、放什么、判不出来怎么办）。
 fn auto_mode_docs() -> Div {

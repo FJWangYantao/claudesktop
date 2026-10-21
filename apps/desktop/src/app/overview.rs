@@ -268,12 +268,10 @@ impl ChatApp {
                         .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(detail)),
                 )
                 .child(Icon::new(IconAll::ChevronRight).size_4().text_color(rgb(INK_SOFT)))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| {
-                        let kind = kind.clone();
-                        this.start_setup(kind, window, cx)
-                    }),
-                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let kind = kind.clone();
+                    this.start_setup(kind, window, cx)
+                }))
         };
         div()
             .v_flex()

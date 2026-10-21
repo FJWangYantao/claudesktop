@@ -411,8 +411,6 @@ struct Snapshot {
     mode: String,
     cwd: PathBuf,
     model: String,
-    /// 会话级覆盖的思考档位（见 [`SessionState::thinking`]）
-    thinking: Option<ThinkingLevel>,
     /// 子会话的角色
     agent: Option<AgentDef>,
 }
@@ -729,7 +727,6 @@ impl Inner {
             mode: state.mode.clone(),
             cwd: state.cwd.clone(),
             model: state.model.clone(),
-            thinking: state.thinking,
             agent: state.agent.clone(),
         })
     }
@@ -2370,6 +2367,13 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
     // 上一步刚压缩过（不连着压两次）/ 这一轮已经因为超限报错压缩过（只压一次）
     let mut just_compacted = false;
     let mut overflow_compacted = false;
+    // 会话级档位（输入框下拉选的）按轮取：一轮中途换了档，后面的步骤仍用开头那一档
+    //（工具循环中途开 / 关思考，Anthropic 会因上一条助手消息没有 thinking 块报 400）
+    let Some(thinking) = inner.sessions.lock().unwrap().get(session).map(|s| s.thinking) else {
+        return Steps::Stopped;
+    };
+    // 覆盖了档位时造的 provider，按模型缓存（一轮里一般只造一次，连接接着用）
+    let mut turn_provider: Option<(String, Arc<dyn ChatProvider>)> = None;
 
     for _ in 0..inner.max_steps {
         // 用量快到窗口：先压缩再请求
@@ -2397,8 +2401,7 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         } else {
             just_compacted = false;
         }
-        let Some(Snapshot { mut messages, mode, cwd, model, thinking, agent }) =
-            inner.snapshot(session)
+        let Some(Snapshot { mut messages, mode, cwd, model, agent }) = inner.snapshot(session)
         else {
             return Steps::Stopped;
         };
@@ -2423,38 +2426,37 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
         }
         let mut text = String::new();
-        // 会话级档位（输入框下拉选的）覆盖档案里的那份：每轮现取，中途换档下一步就生效。
-        // 没覆盖时直接用构造好的 provider（连接复用）
-        let session_provider;
+        // 会话级档位覆盖档案里的那份；没覆盖时直接用构造好的 provider
         let provider: &dyn ChatProvider = match thinking {
             Some(level) => {
-                let mut config = inner.provider_config.clone();
-                config.model = model.clone();
-                config.params.thinking = Some(level);
-                session_provider = make_provider(&config);
-                session_provider.as_ref()
+                if turn_provider.as_ref().is_none_or(|(m, _)| *m != model) {
+                    let mut config = inner.provider_config.clone();
+                    config.model = model.clone();
+                    config.params.thinking = Some(level);
+                    turn_provider = Some((model.clone(), make_provider(&config)));
+                }
+                turn_provider.as_ref().map(|(_, p)| p.as_ref()).expect("刚造好")
             }
             None => inner.provider.as_ref(),
         };
-        let result =
-            provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
-                if stopped() {
-                    return;
+        let result = provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
+            if stopped() {
+                return;
+            }
+            match event {
+                StreamEvent::Text(t) => {
+                    text.push_str(&t);
+                    inner.emit(Some(session), KernelEvent::AgentMessageChunk { text: t });
                 }
-                match event {
-                    StreamEvent::Text(t) => {
-                        text.push_str(&t);
-                        inner.emit(Some(session), KernelEvent::AgentMessageChunk { text: t });
-                    }
-                    StreamEvent::Reasoning(t) => {
-                        inner.emit(Some(session), KernelEvent::AgentThoughtChunk { text: t })
-                    }
-                    StreamEvent::Retrying { status, attempt, delay_ms, reason } => inner.emit(
-                        Some(session),
-                        KernelEvent::Retrying { status, attempt, delay_ms, reason },
-                    ),
+                StreamEvent::Reasoning(t) => {
+                    inner.emit(Some(session), KernelEvent::AgentThoughtChunk { text: t })
                 }
-            });
+                StreamEvent::Retrying { status, attempt, delay_ms, reason } => inner.emit(
+                    Some(session),
+                    KernelEvent::Retrying { status, attempt, delay_ms, reason },
+                ),
+            }
+        });
         if stopped() {
             return Steps::Stopped;
         }

@@ -223,16 +223,11 @@ impl EffortField {
 
 impl ThinkingFormat {
     /// 什么都不发（认不出的模型、`ThinkingSpec::NONE`）
-    pub const NONE: ThinkingFormat =
-        ThinkingFormat { toggle: None, effort: None, budget: false };
+    pub const NONE: ThinkingFormat = ThinkingFormat { toggle: None, effort: None, budget: false };
 
     /// 只有开 / 关，没有档位（Qwen3、GLM-4.5~5.1、DeepSeek V3 系、OpenRouter 上的旧模型）
     pub const fn toggle(key: &'static str, on: fn() -> Value, off: fn() -> Value) -> Self {
-        ThinkingFormat {
-            toggle: Some(ToggleField { key, on, off }),
-            effort: None,
-            budget: false,
-        }
+        ThinkingFormat { toggle: Some(ToggleField { key, on, off }), effort: None, budget: false }
     }
 
     /// 开关 + 档位并存（DeepSeek V4、GLM-5.2/5.3、MiniMax-M3.1、Doubao）
@@ -288,11 +283,8 @@ pub const FALLBACK_LEVELS: &[ThinkingLevel] =
 
 impl ThinkingSpec {
     /// 认不出（界面除非用户选了「默认（兜底）」否则不显示档位、请求不带思考字段）
-    pub const NONE: ThinkingSpec = ThinkingSpec {
-        levels: &[],
-        format: ThinkingFormat::NONE,
-        accepts_temperature: true,
-    };
+    pub const NONE: ThinkingSpec =
+        ThinkingSpec { levels: &[], format: ThinkingFormat::NONE, accepts_temperature: true };
 
     /// 认不出 → 用「兜底」的写法（按协议编 effort，见 `apply_thinking`）。
     /// effort 字段到编码时才按协议定（`EffortField::for_protocol`），这里先占 `TopLevel`
@@ -490,7 +482,12 @@ fn openai_spec(name: &str) -> ThinkingSpec {
                     // 不能关：`disabled` 报错
                     &[ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
                 } else {
-                    &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+                    &[
+                        ThinkingLevel::Off,
+                        ThinkingLevel::Low,
+                        ThinkingLevel::High,
+                        ThinkingLevel::Max,
+                    ]
                 },
                 format: ThinkingFormat::toggle_with_effort(
                     "thinking",
@@ -510,7 +507,7 @@ fn openai_spec(name: &str) -> ThinkingSpec {
     // DeepSeek V4（`deepseek-flash` / `deepseek-v4-pro`）：`thinking.type` + 顶层 `reasoning_effort`。
     // 官方取值 `none` / `low` / `high` / `max`，`none` 关；`minimal`→low、`medium`/`xhigh`→high、
     // `ultra`→max，所以表里只列它真认的四档（多了会被映射，看起来像生效其实不是）
-    if name.starts_with("deepseek-") && !name.contains("reasoner") && !name.contains("-r1") {
+    if is_deepseek_v4(name) {
         return ThinkingSpec {
             levels: &[
                 ThinkingLevel::Off,
@@ -527,7 +524,25 @@ fn openai_spec(name: &str) -> ThinkingSpec {
             accepts_temperature: true,
         };
     }
+    // DeepSeek V3.1+（中转站上的 `deepseek-v3.2` 这类）：只有 `thinking.type` 开 / 关，
+    // 不敢发 `reasoning_effort`（V4 之前的部署不一定认）
+    if name.starts_with("deepseek-") && !name.contains("reasoner") && !name.contains("-r1") {
+        return ThinkingSpec {
+            levels: &[ThinkingLevel::Off, ThinkingLevel::High],
+            format: ThinkingFormat::toggle(
+                "thinking",
+                || serde_json::json!({ "type": "enabled" }),
+                || serde_json::json!({ "type": "disabled" }),
+            ),
+            accepts_temperature: true,
+        };
+    }
     ThinkingSpec::NONE
+}
+
+/// DeepSeek V4 一代（`deepseek-v4-pro`、`deepseek-v4.1-flash`，官方 API 上的 `deepseek-flash` / `deepseek-pro`）。
+fn is_deepseek_v4(name: &str) -> bool {
+    ["deepseek-v4", "deepseek-flash", "deepseek-pro"].iter().any(|p| name.starts_with(p))
 }
 
 /// `gpt-5` 后面那截 → 小版本号：`""` / `-mini` / `-2025-08-07` 是 0，`.1` / `-1-codex` 是 1。
@@ -562,7 +577,9 @@ fn anthropic_spec(name: &str) -> ThinkingSpec {
         // 总要思考的模型（`deepseek-reasoner` / `*-r1`）：没有「关」这一档，
         // 连这一行都不给（OpenAI 兼容表里也是认不出的）
         let always_thinks = name.contains("reasoner") || name.contains("-r1");
-        let spec = if let Some(spec) = vendor_toggle(name) && !budget_ok {
+        let spec = if let Some(spec) = vendor_toggle(name)
+            && !budget_ok
+        {
             // 端点换成 Anthropic 格式照样发同一套字段，不能因为换了协议就没这一项。
             // 但 effort 的落点要按协议改：OpenAI 兼容是顶层 `reasoning_effort`，
             // Anthropic 兼容是 `output_config.effort`（DeepSeek / MiniMax 的 Anthropic 端点都只认这个）
@@ -711,7 +728,8 @@ pub fn parse_thinking_level(text: &str) -> anyhow::Result<ThinkingLevel> {
 }
 
 /// effort 档位的请求体取值（Anthropic 的 `output_config.effort` / OpenAI 的 `reasoning_effort`）
-fn effort_for(level: ThinkingLevel) -> &'static str {    match level {
+fn effort_for(level: ThinkingLevel) -> &'static str {
+    match level {
         ThinkingLevel::Off => "none",
         ThinkingLevel::Minimal => "minimal",
         ThinkingLevel::Low => "low",
@@ -790,11 +808,7 @@ pub fn apply_thinking(body: &mut Value, protocol: Protocol, model: &str, params:
     if let Some(field) = spec.format.effort {
         // 兜底（认不出的模型选了「Default」）拿到的 `field` 是占位的 `TopLevel`，按协议重新定。
         // 判断用「原来那张 spec 认不认得」——换成 `FALLBACK` 之后 `is_known()` 会变成真
-        let field = if known {
-            field
-        } else {
-            EffortField::for_protocol(protocol)
-        };
+        let field = if known { field } else { EffortField::for_protocol(protocol) };
         // 关：开关型模型已经发了 `disabled`（DeepSeek / GLM 的 `none` 和它是两种写法，
         // 同时发容易被解读成「关掉档位但打开思考」），这时不再塞 effort；
         // 纯 effort 的模型（gpt-5.1）才用 `none` 表达关
@@ -1445,17 +1459,12 @@ mod tests {
         // 走 Anthropic 格式的第三方端点：DeepSeek 的官方兼容页明确写 `budget_tokens` is ignored、
         // 只认 `output_config.effort`，所以它不能走预算格式
         let ds = spec("deepseek-v4-pro");
-        assert!(ds.format.budget == false, "DeepSeek 不能再发 budget_tokens");
+        assert!(!ds.format.budget, "DeepSeek 不能再发 budget_tokens");
         assert_eq!(ds.format.effort, Some(EffortField::OutputConfig));
         assert!(ds.format.has_toggle() && ds.can_disable());
         assert_eq!(
             ds.levels,
-            &[
-                ThinkingLevel::Off,
-                ThinkingLevel::Low,
-                ThinkingLevel::High,
-                ThinkingLevel::Max,
-            ]
+            &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max,]
         );
         // GLM 仍然走预算（它的 Anthropic 兼容端点还没反证过）
         assert!(spec("glm-4.6").format.budget);
@@ -1519,7 +1528,10 @@ mod tests {
         let glm52 = spec("glm-5.2");
         assert!(glm52.format.has_toggle() && glm52.format.effort.is_some());
         assert!(!glm52.is_on_off());
-        assert_eq!(glm52.levels, &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]);
+        assert_eq!(
+            glm52.levels,
+            &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+        );
         // 5.3 起关不掉（传 disabled 报错）
         let glm53 = spec("glm-5.3");
         assert!(!glm53.can_disable());
@@ -1531,13 +1543,12 @@ mod tests {
         assert_eq!(deepseek.format.effort, Some(EffortField::TopLevel));
         assert_eq!(
             deepseek.levels,
-            &[
-                ThinkingLevel::Off,
-                ThinkingLevel::Low,
-                ThinkingLevel::High,
-                ThinkingLevel::Max,
-            ]
+            &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max,]
         );
+        // V4 之前的（中转站上的 deepseek-v3.2）只给开 / 关，不发 effort
+        let v3 = spec("deepseek-v3.2");
+        assert!(v3.format.has_toggle() && v3.format.effort.is_none());
+        assert_eq!(v3.levels, &[ThinkingLevel::Off, ThinkingLevel::High]);
 
         // Responses 只换编码方式，认得的模型一样
         let responses = thinking_spec(Protocol::Responses, "gpt-5");
@@ -1794,7 +1805,8 @@ mod tests {
     /// 新增的 `Max` 档排在 `XHigh` 后面：认得出 `max` 的模型用它，
     /// 认不出的按「取不高于它的最近一档」降级
     #[test]
-    fn max_is_the_top_level() {        assert!(ThinkingLevel::Max > ThinkingLevel::XHigh);
+    fn max_is_the_top_level() {
+        assert!(ThinkingLevel::Max > ThinkingLevel::XHigh);
         // claude 没有 max：选最高 → 极高
         let claude = thinking_spec(Protocol::Anthropic, "claude-opus-4-7").levels;
         assert_eq!(resolve_level(ThinkingLevel::Max, claude), Some(ThinkingLevel::XHigh));
@@ -1810,7 +1822,8 @@ mod tests {
     fn parses_thinking_wire_names() {
         // `XHigh` 在 `snake_case` 下是 `x_high`；两种写法都收，
         // 因为这是手写设置文件里最容易写错的一个
-        for (text, level) in [            ("off", ThinkingLevel::Off),
+        for (text, level) in [
+            ("off", ThinkingLevel::Off),
             ("minimal", ThinkingLevel::Minimal),
             ("low", ThinkingLevel::Low),
             ("medium", ThinkingLevel::Medium),

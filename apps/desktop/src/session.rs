@@ -1134,6 +1134,10 @@ impl Session {
         self.restored = self.has_user_message();
         // 当前模式随新内核会话重新交回去：用户选的（或新对话默认的）模式不该因为重连丢掉
         self.pending_mode = self.modes.get(self.permission_mode).map(|m| m.id.clone());
+        // 会话级思考档位同理：新内核会话里是「默认」，选过的要重新交回去
+        if self.thinking.is_some() {
+            self.pending_thinking = Some(self.thinking);
+        }
     }
 
     /// 内核致命错误：这个会话不再可用。
@@ -2639,7 +2643,9 @@ mod tests {
             reverted: Some(Vec::new()),
         };
         let mut records = vec![Record::user("改"), reviewed];
-        assert!(Session::from_records(1, meta(), records.clone(), &Default::default()).review_pending);
+        assert!(
+            Session::from_records(1, meta(), records.clone(), &Default::default()).review_pending
+        );
         // 已经发过下一条（说明附在那条上了）
         records.push(Record::user("继续"));
         assert!(!Session::from_records(1, meta(), records, &Default::default()).review_pending);

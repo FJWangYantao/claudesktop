@@ -209,11 +209,8 @@ pub fn discover_in(
         let Some(path) = find_executable(preset.probe, paths) else {
             continue;
         };
-        let output = if preset.version_args.is_empty() {
-            None
-        } else {
-            run(&path, preset.version_args)
-        };
+        let output =
+            if preset.version_args.is_empty() { None } else { run(&path, preset.version_args) };
         let version = output.as_deref().and_then(parse_version);
         let state = if preset.needs_node && !has_node {
             DetectState::NeedsNode
@@ -351,7 +348,8 @@ pub fn parse_version(output: &str) -> Option<String> {
         let token = token.trim_start_matches('v');
         let core = token.split(['-', '+']).next().unwrap_or("");
         let parts: Vec<&str> = core.split('.').collect();
-        if parts.len() < 2 || !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        if parts.len() < 2
+            || !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         {
             continue;
         }

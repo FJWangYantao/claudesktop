@@ -826,11 +826,7 @@ impl ChatApp {
                             .whitespace_nowrap()
                             .text_size(TEXT_META)
                             .text_color(rgb(INK_SOFT))
-                            .child(format!(
-                                "{} · {}",
-                                kind.label(&self.settings.acp),
-                                slot.status
-                            )),
+                            .child(format!("{} · {}", kind.label(&self.settings.acp), slot.status)),
                     )
             })
             .collect()
@@ -1328,13 +1324,18 @@ mod tests {
             task: false,
             worktree: s.worktree.clone(),
         };
-        let restored = crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());
+        let restored =
+            crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());
         assert_eq!(restored.worktree, s.worktree);
         assert_eq!(restored.group_dir(), repo.as_path());
         // 老元信息（没有这一项）读成 None
         let mut old = meta;
         old.worktree = None;
-        assert!(crate::session::Session::from_records(4, old, Vec::new(), &Default::default()).worktree.is_none());
+        assert!(
+            crate::session::Session::from_records(4, old, Vec::new(), &Default::default())
+                .worktree
+                .is_none()
+        );
         plain.task = false;
         let _ = plain;
     }

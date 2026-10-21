@@ -5,13 +5,7 @@ use claudesktop_core::agents;
 fn discovers_what_is_installed_here() {
     let found = agents::discover();
     for d in &found {
-        println!(
-            "{} {} → {} ({:?})",
-            d.preset.name,
-            d.path.display(),
-            d.summary(),
-            d.state
-        );
+        println!("{} {} → {} ({:?})", d.preset.name, d.path.display(), d.summary(), d.state);
     }
     for p in agents::PRESETS {
         if !found.iter().any(|d| d.preset.id == p.id) {
