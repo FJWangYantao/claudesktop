@@ -230,6 +230,14 @@ impl ChatApp {
         }
         match project::save(&form.root, &config) {
             Ok(path) => {
+                // 初始化命令是用户在这里亲手改的：算确认过，建 worktree 时直接跑
+                if let Some(command) = &config.worktree.setup
+                    && config.worktree.setup != form.saved.worktree.setup
+                {
+                    let repo = claudesktop_core::git::repo_root(&form.root)
+                        .unwrap_or_else(|| form.root.clone());
+                    super::worktree_setup::trust_setup(&repo, command);
+                }
                 form.saved = config;
                 form.message = Some((
                     false,

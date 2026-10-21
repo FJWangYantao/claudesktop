@@ -62,6 +62,8 @@ pub struct Session {
     pub worktree_state: Option<Option<claudesktop_core::git::WorktreeStatus>>,
     /// 现在不能一键合并回主目录的原因（主目录脏了 / 不在 base 上），和 `worktree_state` 一起刷新
     pub worktree_blocker: Option<String>,
+    /// 项目配置里的 `worktree` 一栏（`refresh_worktree` 里读好，菜单只看这份，不在 render 里跑 git）
+    pub worktree_config: Option<claudesktop_core::project::WorktreeConfig>,
     /// 这次运行里试过重新检出丢了的 worktree 没有（只试一次，见 `ChatApp::repair_worktree`）
     pub worktree_repair_tried: bool,
     /// 持久化元信息：首条消息发出后才建档（空会话不落盘）
@@ -335,6 +337,7 @@ impl Session {
             worktree_busy: None,
             worktree_state: None,
             worktree_blocker: None,
+            worktree_config: None,
             worktree_repair_tried: false,
             meta: None,
             log: None,

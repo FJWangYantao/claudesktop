@@ -39,6 +39,7 @@ mod sse;
 mod subagent;
 pub mod suggest;
 mod tools;
+pub use tools::{ToolOutput, run_command};
 pub mod websearch;
 
 pub use anthropic::AnthropicProvider;
@@ -85,7 +86,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
-use tools::{Access, Action, ToolOutput};
+use tools::{Access, Action};
 
 /// 一轮里最多请求模型的次数的默认值（防止工具循环停不下来）。
 /// 可经 [`BuiltinConfig::max_steps`] 配置，设置页「内核与模型」里改。

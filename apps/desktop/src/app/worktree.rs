@@ -250,15 +250,20 @@ impl ChatApp {
                 let path = path.clone();
                 // 「现在不能自动合并」的原因也在这儿算好存着：菜单每次重画都跑 git 会卡界面
                 cx.background_executor().spawn(async move {
-                    (git::status(&repo, &path, &base, &branch), git::merge_blocker(&repo, &base))
+                    (
+                        git::status(&repo, &path, &base, &branch),
+                        git::merge_blocker(&repo, &base),
+                        super::worktree_setup::worktree_config(&repo),
+                    )
                 })
             };
-            let (status, blocker) = job.await;
+            let (status, blocker, config) = job.await;
             let _ = this.update(cx, |app, cx| {
                 if let Some(idx) = app.session_index(token) {
                     let s = &mut app.sessions[idx];
                     s.worktree_state = Some(status.ok());
                     s.worktree_blocker = blocker;
+                    s.worktree_config = Some(config);
                 }
                 cx.notify();
             });
@@ -372,7 +377,8 @@ impl ChatApp {
             );
         }
         // 项目里配了 worktree.copy 时给一个手动重跑：改完规则不想重开会话
-        if !app.worktree_setup_for(&repo).copy.is_empty() && path.is_dir() {
+        let config = app.session().worktree_config.clone().unwrap_or_default();
+        if !config.copy.is_empty() && path.is_dir() {
             menu = menu.pick(
                 menu_item(
                     "worktree-recopy",
@@ -382,6 +388,18 @@ impl ChatApp {
                     false,
                 ),
                 move |this, cx| this.recopy_worktree(cx),
+            );
+        }
+        if config.setup.is_some() && path.is_dir() {
+            menu = menu.pick_in(
+                menu_item(
+                    "worktree-setup",
+                    IconAll::SquareTerminal,
+                    "运行初始化命令",
+                    "按项目配置的 worktree.setup 在这个 worktree 里跑一遍（先确认命令）",
+                    false,
+                ),
+                move |this, window, cx| this.ask_run_worktree_setup(window, cx),
             );
         }
         menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick_in(

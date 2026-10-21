@@ -527,9 +527,9 @@ mod tests {
     #[test]
     fn missing_agents_are_absent() {
         let dir = tmp("none");
-        let found = discover_in(PRESETS, &[dir.clone()], |_, _| Some("1.0.0".into()));
+        let found = discover_in(PRESETS, std::slice::from_ref(&dir), |_, _| Some("1.0.0".into()));
         assert!(found.is_empty());
-        assert!(find_executable("definitely-not-here", &[dir.clone()]).is_none());
+        assert!(find_executable("definitely-not-here", std::slice::from_ref(&dir)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

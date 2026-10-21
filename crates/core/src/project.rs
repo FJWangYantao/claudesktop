@@ -252,10 +252,14 @@ pub fn copy_matches(repo: &Path, pattern: &str) -> Vec<PathBuf> {
             for base in bases {
                 for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    // `.git`（目录或 worktree 里的文件）哪一层都不算：`.*` 也不能把它带过去
+                    if name == ".git" {
+                        continue;
+                    }
                     let path = entry.path();
                     if deep {
                         // `**` 这一层不消耗路径段：把子目录继续交给后面的段
-                        if path.is_dir() {
+                        if is_real_dir(&path) {
                             next.push(path);
                         }
                         continue;
@@ -263,12 +267,12 @@ pub fn copy_matches(repo: &Path, pattern: &str) -> Vec<PathBuf> {
                     if !glob_match(segment, &name) {
                         continue;
                     }
-                    let is_dir = path.is_dir();
                     if last {
-                        if !dir_only || is_dir {
+                        if !dir_only || path.is_dir() {
                             out.push(path);
                         }
-                    } else if is_dir {
+                    } else if is_real_dir(&path) {
+                        // 往下找只走真目录：指向上层的链接（pnpm、monorepo）会绕成环
                         next.push(path);
                     }
                 }
@@ -293,13 +297,19 @@ fn walk_dirs(dir: PathBuf) -> Vec<PathBuf> {
             if entry.file_name() == ".git" {
                 continue;
             }
-            if entry.path().is_dir() {
+            // 不跟着符号链接走：链回上层的目录会让这里永远走不完
+            if is_real_dir(&entry.path()) {
                 out.push(entry.path());
                 queue.push(entry.path());
             }
         }
     }
     out
+}
+
+/// 是目录而且不是符号链接。
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// 一段路径的简单 glob：`*` 任意字符、`?` 单个字符，其余按字面比（区分大小写之外都按原样）。
@@ -319,22 +329,45 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// 把一条匹配到的文件 / 目录从 `repo` 复制到 `worktree`（同名覆盖；目录递归复制）。
 /// 返回复制了几个条目（目录按里面有几个文件算）。
+///
+/// 目标路径上不能有符号链接：分支里提交了 `config -> /etc/x` 时，往 `config/` 里写就写到 worktree 外面去了。
 pub fn copy_into(repo: &Path, worktree: &Path, relative: &Path) -> Result<usize, String> {
     let from = repo.join(relative);
-    let to = worktree.join(relative);
-    copy_path(&from, &to)
+    let mut to = worktree.to_path_buf();
+    for part in relative.components() {
+        to.push(part);
+        refuse_symlink(&to)?;
+    }
+    copy_path(&from, &to, true)
 }
 
-/// 递归复制：普通文件按字节复制（保留权限位）；目录先建再逐个孩子；
-/// 符号链接按它的目标复制内容（跟随，避免把主仓库的路径带进 worktree）。
-fn copy_path(from: &Path, to: &Path) -> Result<usize, String> {
+/// 目标已经是符号链接时不往里写（写进去等于写到链接指向的地方）。
+fn refuse_symlink(to: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(to) {
+        Ok(m) if m.file_type().is_symlink() => {
+            Err(format!("{} 在 worktree 里是符号链接，没往里复制", to.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// 递归复制：普通文件按字节复制（保留权限位）；目录先建再逐个孩子。
+/// 符号链接：规则直接点名的那一项（`follow`）按目标复制内容，避免把主仓库的路径带进 worktree；
+/// 目录里面的链接到目录的不跟（会绕成环，或把仓库外的大目录整份拷进来），链接到文件的照样复制内容。
+fn copy_path(from: &Path, to: &Path, follow: bool) -> Result<usize, String> {
     let meta =
         std::fs::symlink_metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?;
     let meta = if meta.is_symlink() {
-        std::fs::metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?
+        let target =
+            std::fs::metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?;
+        if target.is_dir() && !follow {
+            return Ok(0);
+        }
+        target
     } else {
         meta
     };
+    refuse_symlink(to)?;
     if meta.is_dir() {
         std::fs::create_dir_all(to).map_err(|e| format!("建不了 {}：{e}", to.display()))?;
         let mut n = 0;
@@ -342,7 +375,10 @@ fn copy_path(from: &Path, to: &Path) -> Result<usize, String> {
             std::fs::read_dir(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?
         {
             let entry = entry.map_err(|e| format!("读不了 {}：{e}", from.display()))?;
-            n += copy_path(&entry.path(), &to.join(entry.file_name()))?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            n += copy_path(&entry.path(), &to.join(entry.file_name()), false)?;
         }
         return Ok(n);
     }
@@ -691,6 +727,36 @@ mod tests {
         assert!(copy_matches(&dir, "C:/Windows/win.ini").is_empty());
         assert!(copy_matches(&dir, "  ").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 符号链接成环不会走不完；`.*` 不带 `.git`；worktree 里提交的链接不往里写。
+    #[cfg(unix)]
+    #[test]
+    fn copy_skips_symlink_loops_git_and_linked_targets() {
+        let base = std::env::temp_dir().join(format!("cd-copy-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (repo, wt, outside) = (base.join("repo"), base.join("wt"), base.join("outside"));
+        std::fs::create_dir_all(repo.join("pkg/node_modules")).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(repo.join("pkg/node_modules/a.txt"), "a").unwrap();
+        std::fs::write(repo.join(".env"), "K=1").unwrap();
+        // 链回上层：跟着走就是死循环
+        std::os::unix::fs::symlink(&repo, repo.join("pkg/node_modules/loop")).unwrap();
+
+        assert_eq!(copy_matches(&repo, "**/a.txt"), [repo.join("pkg/node_modules/a.txt")]);
+        assert_eq!(copy_matches(&repo, ".*"), [repo.join(".env")]);
+        assert_eq!(copy_into(&repo, &wt, Path::new("pkg")), Ok(1));
+        assert!(wt.join("pkg/node_modules/a.txt").is_file());
+
+        // worktree 里 `.env` 是指到外面的链接：不覆盖
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::os::unix::fs::symlink(outside.join("x"), wt.join(".env")).unwrap();
+        assert!(copy_into(&repo, &wt, Path::new(".env")).is_err());
+        assert!(!outside.join("x").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 复制一个目录过去：里面的文件都跟着，目标目录不存在时自动建

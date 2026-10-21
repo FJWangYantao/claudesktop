@@ -12,9 +12,9 @@ use super::ChatApp;
 use crate::model::{ChatItem, ToolCard, ToolPhase};
 use claudesktop_core::project::{self, WorktreeConfig};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// 初始化命令最多等多久（装依赖偶尔卡住；超时就把已经输出的部分记下来，进程连同子孙一起结束）。
 const SETUP_TIMEOUT_SECS: u64 = 900;
@@ -22,20 +22,94 @@ const SETUP_TIMEOUT_SECS: u64 = 900;
 /// 复制过来的文件 / 目录最多记几条（多了卡片上一屏放不下）。
 const COPY_LISTED: usize = 8;
 
+/// 读一遍项目配置里的 `worktree` 一栏（会跑 `git rev-parse`：别在 render 里调，菜单用
+/// `Session::worktree_config` 里存的那份）。工作目录在主仓库里时按主仓库读，读不到就当没配。
+pub(crate) fn worktree_config(cwd: &Path) -> WorktreeConfig {
+    let root = project::root_or(cwd);
+    let config = match project::load(root) {
+        Some(config) => config,
+        None => match claudesktop_core::git::repo_root(cwd) {
+            // 工作目录是仓库里的一个子目录、配置写在仓库根
+            Some(repo) => project::load(&repo).unwrap_or_default(),
+            None => return WorktreeConfig::default(),
+        },
+    };
+    config.worktree.normalized()
+}
+
+/// 用户确认过的初始化命令存在哪（数据目录 `trusted_setup.json`：`[主仓库根, 命令]` 的列表）。
+fn trusted_path() -> Option<PathBuf> {
+    claudesktop_core::default_data_dir().ok().map(|d| d.join("trusted_setup.json"))
+}
+
+fn trusted_list() -> Vec<(String, String)> {
+    trusted_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// 这条初始化命令在这个仓库里用户确认过没有。命令来自仓库里的项目配置：
+/// clone 来的陌生仓库写了什么都会在本机跑，所以第一次（或命令改了之后）要用户点头。
+pub(crate) fn setup_trusted(repo: &Path, command: &str) -> bool {
+    let key = (repo.to_string_lossy().to_string(), command.trim().to_string());
+    trusted_list().contains(&key)
+}
+
+/// 记下用户确认过（设置页「项目」里自己填的也算）。
+pub(crate) fn trust_setup(repo: &Path, command: &str) {
+    let key = (repo.to_string_lossy().to_string(), command.trim().to_string());
+    let mut list = trusted_list();
+    if list.contains(&key) {
+        return;
+    }
+    list.push(key);
+    if let Some(path) = trusted_path()
+        && let Ok(text) = serde_json::to_string_pretty(&list)
+    {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 impl ChatApp {
-    /// 读一遍项目配置里的 `worktree` 一栏（建 worktree 前调用）。
-    /// 工作目录在主仓库里时按主仓库读，读不到就当没配。
+    /// 见 [`worktree_config`]。
     pub(crate) fn worktree_setup_for(&self, cwd: &Path) -> WorktreeConfig {
-        let root = project::root_or(cwd);
-        let config = match project::load(root) {
-            Some(config) => config,
-            None => match claudesktop_core::git::repo_root(cwd) {
-                // 工作目录是仓库里的一个子目录、配置写在仓库根
-                Some(repo) => project::load(&repo).unwrap_or_default(),
-                None => return WorktreeConfig::default(),
-            },
+        worktree_config(cwd)
+    }
+
+    /// worktree 菜单里的「运行初始化命令」：先把命令原样给用户看，确认了记下来再跑。
+    pub(crate) fn ask_run_worktree_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let s = self.session();
+        let (Some(meta), Some(command)) =
+            (s.worktree.clone(), s.worktree_config.as_ref().and_then(|c| c.setup.clone()))
+        else {
+            return;
         };
-        config.worktree.normalized()
+        let token = s.token;
+        let app = cx.entity();
+        let description = format!(
+            "这条命令写在仓库的项目配置里，会在 worktree 目录里用系统 shell 运行：\n\n{command}\n\n确认是你认识的命令再运行。"
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (app, meta, command) = (app.clone(), meta.clone(), command.clone());
+            alert
+                .title("运行初始化命令？")
+                .description(description.clone())
+                .show_cancel(true)
+                .ok_text("运行")
+                .cancel_text("取消")
+                .on_ok(move |_, _, cx| {
+                    trust_setup(&meta.repo, &command);
+                    app.update(cx, |this, cx| {
+                        if let Some(idx) = this.session_index(token) {
+                            let config =
+                                WorktreeConfig { copy: Vec::new(), setup: Some(command.clone()) };
+                            this.run_worktree_setup(idx, meta.repo.clone(), config, cx);
+                        }
+                    });
+                    true
+                })
+        });
     }
 
     /// 在第 `idx` 个会话里执行 `worktree` 一栏的两件事（worktree 刚建好时调用）。
@@ -59,7 +133,17 @@ impl ChatApp {
             self.sessions[idx]
                 .note(format!("把 {} 个模式匹配到的文件从主目录复制过来…", config.copy.len()));
         }
-        let setup = config.setup.clone();
+        // 没确认过的初始化命令不自动跑：说一声，菜单里确认了再跑
+        let setup = config.setup.clone().filter(|command| {
+            let trusted = setup_trusted(&repo, command);
+            if !trusted {
+                self.sessions[idx].note(format!(
+                    "项目配置要在 worktree 里跑初始化命令「{command}」。它写在仓库里，第一次没自动跑：\
+                     认识这条命令的话，在分支菜单里点「运行初始化命令」"
+                ));
+            }
+            trusted
+        });
         let patterns = config.copy.clone();
         cx.spawn(async move |this, cx| {
             let job = {
@@ -255,115 +339,21 @@ pub(crate) struct SetupRun {
     pub output: String,
 }
 
-/// 在 `cwd` 里跑初始化命令：走系统的 shell（Windows 是 PowerShell），不弹窗、
-/// 带上和内核一样的「不打扰前台」环境变量；最多等 [`SETUP_TIMEOUT_SECS`] 秒。
+/// 在 `cwd` 里跑初始化命令：和内核的命令工具同一套（系统 shell、不弹窗、带「不打扰前台」的环境变量，
+/// 边跑边读输出，免得 `npm install` 这种输出多的把管道写满卡住），最多等 [`SETUP_TIMEOUT_SECS`] 秒，
+/// 超时连同子孙进程一起结束。
 fn run_setup(cwd: &Path, command: &str) -> SetupRun {
-    #[cfg(windows)]
-    let (mut cmd, _keep) = {
-        use std::os::windows::process::CommandExt as _;
-        let exe = quiet_shell();
-        let mut cmd = Command::new(exe);
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command"])
-            .arg(format!(
-                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; {command}"
-            ))
-            .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        (cmd, ())
+    let out = claudesktop_builtin::run_command(
+        command,
+        cwd,
+        std::time::Duration::from_secs(SETUP_TIMEOUT_SECS),
+    );
+    let summary = match out.summary.as_str() {
+        "超时" => format!("超时（{} 分钟）后停掉了", SETUP_TIMEOUT_SECS / 60),
+        _ if out.ok => "完成".to_string(),
+        other => other.to_string(),
     };
-    #[cfg(not(windows))]
-    let (mut cmd, _keep) = {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
-        (cmd, ())
-    };
-    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    // 和内核的后台命令一样：别弹浏览器 / HTML 报告（用户自己设了的不覆盖）
-    for (key, value) in QUIET_ENV {
-        if std::env::var_os(key).is_none() {
-            cmd.env(key, value);
-        }
-    }
-    let start = std::time::Instant::now();
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return SetupRun {
-                ok: false,
-                summary: "起不来".into(),
-                output: format!("这条命令起不来：{e}"),
-            };
-        }
-    };
-    // 等不了就杀掉（连同子孙），把已经读到的输出留着
-    let mut timed_out = false;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(e) => {
-                return SetupRun {
-                    ok: false,
-                    summary: "起不来".into(),
-                    output: format!("等这条命令时出错：{e}"),
-                };
-            }
-        }
-        if start.elapsed().as_secs() > SETUP_TIMEOUT_SECS {
-            timed_out = true;
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let output = child.wait_with_output().ok();
-    let text = match &output {
-        Some(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-            let err = String::from_utf8_lossy(&out.stderr);
-            if !err.trim().is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&err);
-            }
-            text
-        }
-        None => String::new(),
-    };
-    let code = output.as_ref().and_then(|o| o.status.code());
-    let ok = !timed_out && output.as_ref().is_some_and(|o| o.status.success());
-    let summary = if timed_out {
-        format!("超时（{} 分钟）后停掉了", SETUP_TIMEOUT_SECS / 60)
-    } else {
-        match code {
-            Some(0) => "完成".to_string(),
-            Some(code) => format!("退出码 {code}"),
-            None => "被结束了".to_string(),
-        }
-    };
-    SetupRun { ok, summary, output: claudesktop_core::output_preview(&text) }
-}
-
-/// 和内核一样的「不弹窗口」环境变量（见 `claudesktop_builtin::tools`；这里只用它跑初始化，
-/// 不依赖内核 crate 的私有项，值保持一致）。
-const QUIET_ENV: [(&str, &str); 4] = [
-    ("PLAYWRIGHT_HTML_OPEN", "never"),
-    ("PW_TEST_HTML_REPORT_OPEN", "never"),
-    ("BROWSER", "none"),
-    ("MPLBACKEND", "Agg"),
-];
-
-/// Windows 上用哪个 shell 跑初始化：有 pwsh 用 pwsh，否则 Windows PowerShell。
-#[cfg(windows)]
-fn quiet_shell() -> &'static str {
-    use std::sync::OnceLock;
-    static SHELL: OnceLock<&'static str> = OnceLock::new();
-    SHELL.get_or_init(|| {
-        let has_pwsh = std::env::var_os("PATH")
-            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("pwsh.exe").is_file()));
-        if has_pwsh { "pwsh.exe" } else { "powershell.exe" }
-    })
+    SetupRun { ok: out.ok, summary, output: claudesktop_core::output_preview(&out.content) }
 }
 
 #[cfg(test)]

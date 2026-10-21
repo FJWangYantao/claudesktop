@@ -1896,6 +1896,30 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// 界面里不经模型直接跑的命令（worktree 的初始化）：和 `run_shell` 同一套 shell、不弹窗、
+/// 边读边攒输出；在 unix 上自成一个进程组，超时连同 `npm` / `node` 这些子孙一起结束。
+pub fn run_command(command: &str, cwd: &Path, timeout: Duration) -> ToolOutput {
+    let mut cmd = shell_command(command);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    run_shell_in(cmd, cwd, timeout, &|| false, &|_| {}, cfg!(unix))
+}
+
+/// 结束整个进程组（`own_group` = 子进程是用 `process_group(0)` 起的组长）。
+fn kill_group(child: &mut std::process::Child, own_group: bool) {
+    #[cfg(unix)]
+    if own_group {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = own_group;
+    kill_tree(child);
+}
+
 fn run_shell(
     command: &str,
     cwd: &Path,
@@ -1903,7 +1927,18 @@ fn run_shell(
     should_stop: &dyn Fn() -> bool,
     progress: &dyn Fn(String),
 ) -> ToolOutput {
-    let mut child = match shell_command(command)
+    run_shell_in(shell_command(command), cwd, timeout, should_stop, progress, false)
+}
+
+fn run_shell_in(
+    mut cmd: Command,
+    cwd: &Path,
+    timeout: Duration,
+    should_stop: &dyn Fn() -> bool,
+    progress: &dyn Fn(String),
+    own_group: bool,
+) -> ToolOutput {
+    let mut child = match cmd
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1975,7 +2010,7 @@ fn run_shell(
             interrupted = Some("timed out");
         }
         if interrupted.is_some() {
-            kill_tree(&mut child);
+            kill_group(&mut child, own_group);
             break child.wait().ok();
         }
         std::thread::sleep(Duration::from_millis(30));
@@ -2035,6 +2070,21 @@ fn run_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 输出比管道缓冲大也不卡；超时连同后台的子孙一起结束（不等子孙退出才返回）。
+    #[cfg(unix)]
+    #[test]
+    fn run_command_drains_output_and_kills_the_group() {
+        let dir = std::env::temp_dir();
+        let out =
+            run_command("head -c 300000 /dev/zero | tr '\\0' x", &dir, Duration::from_secs(20));
+        assert!(out.ok, "{}", out.summary);
+        let started = Instant::now();
+        let out = run_command("sleep 30 & sleep 30", &dir, Duration::from_secs(1));
+        assert!(!out.ok);
+        assert_eq!(out.summary, "超时");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
 
     /// 跑命令默认不弹窗口：没设过的环境变量带上，用户自己设了的不覆盖。
     #[cfg(not(windows))]
