@@ -107,14 +107,20 @@ impl PermissionRules {
 
     /// 在当前项目的规则里找 `prefix` 前缀（`""` = 允许、`deny:` = 拒绝）下
     /// 与 `rule` 匹配的一条。shell 规则按词前缀匹配，其余按整串相等。
-    /// 工作目录在项目的子目录里时，项目根下的规则（项目配置并进来的就记在根下）同样算数。
+    /// 工作目录在项目的子目录里时，项目根下的规则（项目配置并进来的就记在根下）同样算数；
+    /// 在 worktree 里跑时按**主仓库根**算（[`claudesktop_core::project::shared_root`]），
+    /// 主目录点过的「始终允许」在 worktree 里也算数，反之亦然。
     fn matching(&mut self, cwd: &Path, rule: &str, command: Option<&str>, prefix: &str) -> bool {
         self.reload();
-        let mut keys = vec![Self::key(cwd)];
-        if let Some(root) = claudesktop_core::project::project_root(cwd)
-            && root != cwd
-        {
-            keys.push(Self::key(root));
+        // 记规则时按共享根（worktree 里是主仓库根），但老的 / 手写的规则可能记在工作目录或
+        // 项目根下：三个都查一遍
+        let shared = claudesktop_core::project::shared_root(cwd);
+        let mut keys = vec![Self::key(shared.as_deref().unwrap_or(cwd))];
+        for extra in [claudesktop_core::project::project_root(cwd), Some(cwd)] {
+            let key = Self::key(extra.unwrap_or(cwd));
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
         }
         let stored_prefix = format!("{prefix}shell:");
         keys.iter().filter_map(|key| self.data.projects.get(key)).any(|rules| {
@@ -129,8 +135,10 @@ impl PermissionRules {
     }
 
     /// 添加一条规则并立即落盘（原子写）。拒绝规则带 `deny:` 前缀。
+    /// 记在项目的共享根下（worktree 里就是主仓库根），这样主目录和 worktree 共用一份。
     pub fn add(&mut self, cwd: &Path, rule: String) -> io::Result<()> {
         self.reload();
+        let cwd = &claudesktop_core::project::shared_root_or(cwd);
         // 同一动作允许和拒绝不会同时存：加一边时把整串相反的那条删掉（后写的赢）；
         // shell 规则前缀重叠的细粒度情况留给用户在设置页里自己清理
         let opposite = if let Some(rest) = rule.strip_prefix(DENY_PREFIX) {
@@ -200,6 +208,35 @@ mod tests {
         assert!(rules.denies(&sub, "shell:rm", Some("rm -rf build")));
         assert!(rules.denies(&root, "shell:rm", Some("rm -rf build")));
         assert!(!rules.denies(&dir, "shell:rm", Some("rm -rf build")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 主目录和它的 worktree 共用一份规则：在哪边点过「始终允许」两边都算数
+    #[test]
+    fn rules_are_shared_between_a_repo_and_its_worktrees() {
+        let dir = std::env::temp_dir().join(format!("claudesktop-perm-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("main");
+        let tree = dir.join("wt");
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("k7f")).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}", main.join(".git").join("worktrees").join("k7f").display()),
+        )
+        .unwrap();
+        let mut rules = PermissionRules::load(Some(dir.join("permissions.json")));
+
+        // 在 worktree 里允许：记在主仓库下
+        rules.add(&tree, "edit".into()).unwrap();
+        assert_eq!(rules.list(), vec![(main.display().to_string(), vec!["edit".to_string()])]);
+        assert!(rules.allows(&tree, "edit", None));
+        assert!(rules.allows(&main, "edit", None));
+
+        // 在主目录里拒绝：worktree 里也一样，且覆盖刚才的允许
+        rules.add(&main, "deny:shell:rm".into()).unwrap();
+        assert!(rules.denies(&tree, "shell:rm", Some("rm -rf build")));
+        assert!(rules.denies(&main, "shell:rm", Some("rm -rf build")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

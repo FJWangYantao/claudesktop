@@ -29,6 +29,8 @@ enum PaletteCmd {
     NewSession,
     ToggleSidebar,
     PickWorkspace,
+    /// 在当前目录的 git 仓库里建一个 worktree，新对话在那里开始
+    Worktree,
     OpenSettings,
     /// 用量页
     Usage,
@@ -162,6 +164,8 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         )
         .key(TOGGLE_SIDEBAR_KEY),
         Entry::new(IconAll::FolderOpen, "切换工作目录…", PaletteCmd::PickWorkspace),
+        Entry::new(IconAll::GitBranch, "在新 worktree 中开始", PaletteCmd::Worktree)
+            .desc("从当前分支的最新提交开始，未提交的改动不会带过去"),
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
         Entry::new(IconAll::ChartColumn, "查看用量", PaletteCmd::Usage),
         Entry::new(IconAll::FolderOpen, "打开用量网关日志", PaletteCmd::GatewayLogs)
@@ -346,6 +350,14 @@ impl ChatApp {
             }
             PaletteCmd::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             PaletteCmd::PickWorkspace => self.pick_workspace(cx),
+            PaletteCmd::Worktree => {
+                // 空会话就在当前目录里建；已经有对话的先开一个空会话再建
+                self.settings_open = false;
+                if self.session().has_user_message() || self.session().busy {
+                    self.add_session(cx);
+                }
+                self.start_in_worktree(cx);
+            }
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
             PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),

@@ -21,6 +21,28 @@ impl ChatApp {
     pub(super) fn render_turn_status(&self) -> Option<Div> {
         let s = self.session();
         if !s.busy {
+            // 正在后台建 worktree（大仓库检出要几秒）：说一声，建好之前发的话先排队
+            if s.worktree_busy.is_some() {
+                return Some(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .child(
+                            div()
+                                .size(px(16.))
+                                .flex_shrink_0()
+                                .flex()
+                                .justify_center()
+                                .items_center()
+                                .mr_0p5()
+                                .child(super::motion::breathing_dot()),
+                        )
+                        .child("正在准备 worktree（现在发的话会等它建好再发）…"),
+                );
+            }
             // 续接历史会话（内核在重建上下文，好了才把消息发出去）：只在这里说一声，接上了就消失
             return s.resuming.then(|| {
                 div()

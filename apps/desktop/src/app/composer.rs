@@ -167,6 +167,9 @@ impl ChatApp {
         let task = self.session().task;
         let project_chip = if task {
             MenuChip::new(IconAll::ListTodo, "任务")
+        } else if let Some(branch) = self.session().worktree.as_ref().map(|w| w.repo_name()) {
+            // worktree 会话：chip 写仓库名（目录是数据目录里的 worktree，显出来没意义）
+            MenuChip::new(IconAll::GitBranch, format!("{branch} · worktree"))
         } else {
             MenuChip::new(IconAll::Folder, project)
         };
@@ -656,6 +659,19 @@ fn workspace_menu_items(
         menu = menu.pick(
             menu_item(("workspace-item", i), IconAll::Folder, label, path, active),
             move |this, cx| this.switch_workspace(dir.clone(), cx),
+        );
+    }
+    if app.git_repo_here() {
+        // 在新 worktree 中开始：从当前分支的最新提交拉一个分支，未提交的改动不会带过去
+        menu = menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick(
+            menu_item(
+                "workspace-worktree",
+                IconAll::GitBranch,
+                "在新 worktree 中开始",
+                "从当前分支的最新提交开始，未提交的改动不会带过去",
+                false,
+            ),
+            |this, cx| this.start_in_worktree(cx),
         );
     }
     menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE)))

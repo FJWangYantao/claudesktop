@@ -162,9 +162,10 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// 工作目录对应的项目记忆文件（找不到项目根时为 None：新项目还没有任何标记）。
+/// 项目记忆文件：项目根（[`crate::project::shared_root`]，worktree 里是主仓库根）下的
+/// `.claudesktop/memory.json`。
 pub fn project_file(cwd: &Path) -> Option<PathBuf> {
-    crate::project::project_root(cwd).map(project_path)
+    crate::project::shared_root(cwd).map(|root| project_path(&root))
 }
 
 /// 工作目录对应的项目记忆文件；没有项目根（不是 git 仓库、也没有 `.claudesktop`）时

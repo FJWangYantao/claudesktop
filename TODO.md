@@ -27,5 +27,7 @@ Anthropic 思考预算与服务端工具；OpenAI Responses API；`shell` 后台
 记忆系统第 2 期（预算截取与 `used_ms` 淘汰、`<memory-context>`、`memory_search` / `memory_forget`、界面新增 / 编辑 / 置顶 / 来源跳转）；
 记忆系统第 3 期（回合结束提炼候选，设置页顶部「待确认」收下才落盘，开关默认关；见 `crates/builtin/src/remember.rs`）；
 权限「自动」模式（分类器代理审批，见 `crates/builtin/src/auto.rs`，设置页「内核与模型」里配）；
+git worktree 隔离（新建会话可选「在新 worktree 中开始」，独立分支干活，分支 chip 里合并 / 删除；
+见「设计说明-worktree.md」）；
 思考强度档位（关 / 低 / 中 / 高 / 极高，按模型能力表翻译成 `thinking` / `output_config.effort` / `reasoning_effort`，
 见「设计说明-思考强度.md」）。

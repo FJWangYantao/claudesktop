@@ -32,6 +32,7 @@ mod subagent_view;
 mod suggest;
 mod usage_view;
 mod widgets;
+mod worktree;
 
 use crate::demo::*;
 use crate::model::*;
@@ -480,6 +481,12 @@ impl ChatApp {
         app.apply_appearance(window, cx);
         app.apply_motion_pref(cx);
         app.init_notifications(window, cx);
+        // 启动时的会话里，worktree 目录没了的（用户删了 / 换了电脑）：现在就把分支接回来
+        for idx in 0..app.sessions.len() {
+            if ChatApp::worktree_is_missing(&app.sessions[idx]) {
+                app.repair_worktree(idx, cx);
+            }
+        }
         app
     }
 
@@ -591,10 +598,14 @@ impl ChatApp {
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
         let cwd = self.cwd.clone();
         let kind = self.settings.kernel();
-        // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」
+        // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」；
+        // 它要是建过一个没动过的 worktree，顺手清掉（见 worktree.rs）
         let blank = self.sessions.iter().position(|s| {
             !s.has_user_message() && !s.busy && !s.renamed && s.kernel == kind && s.cwd == cwd
         });
+        if let Some(idx) = blank {
+            self.cleanup_worktree(idx);
+        }
         self.active = match blank {
             Some(idx) => idx,
             None => self.open_session(kind, cwd),
@@ -634,6 +645,13 @@ impl ChatApp {
     /// 默认目录本身只有在目录菜单里明确选过（记进设置）才算。不是项目的，在里面的对话算任务
     pub(super) fn is_project_dir(&self, dir: &Path) -> bool {
         self.settings.workspace.as_deref() == Some(dir) || dir != self.acp_base.cwd
+    }
+
+    /// 当前会话所在的目录是个 git 仓库（目录菜单里据此给「在新 worktree 中开始」）。
+    /// 只看有没有 `.git`（目录或 worktree 的文件），不在 render 里跑 git。
+    pub(super) fn git_repo_here(&self) -> bool {
+        let s = self.session();
+        s.worktree.is_none() && s.cwd.join(".git").exists()
     }
 
     /// 把一个还没对话的会话换到另一种内核上：原地换成新会话，
@@ -732,14 +750,16 @@ impl ChatApp {
     }
 
     /// 目录菜单列出的工作目录：默认目录在前，其余按会话最近活动排，已不存在的略去，最多 8 个。
+    /// worktree 会话不列（它们的 `cwd` 是数据目录里的 worktree，列出来是一串看不懂的路径）。
     pub(crate) fn recent_workspaces(&self) -> Vec<PathBuf> {
         // 无元信息的会话（刚开、还没落盘）视为最新；排序稳定，默认目录排在同为最新的前面
         let mut dirs: Vec<(&Path, u64)> = vec![(self.cwd.as_path(), u64::MAX)];
-        for s in &self.sessions {
+        for s in self.sessions.iter().filter(|s| s.worktree.is_none()) {
+            let dir = &s.cwd;
             let at = s.meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
-            match dirs.iter_mut().find(|(d, _)| *d == s.cwd.as_path()) {
+            match dirs.iter_mut().find(|(d, _)| *d == dir.as_path()) {
                 Some((_, last)) => *last = (*last).max(at),
-                None => dirs.push((s.cwd.as_path(), at)),
+                None => dirs.push((dir.as_path(), at)),
             }
         }
         dirs.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
@@ -752,6 +772,14 @@ impl ChatApp {
         self.active = i;
         self.settings_open = false;
         self.sessions[i].wheel = None;
+        // worktree 目录被用户删了 / 换了电脑：切过来时试着重新检出接上（见 worktree.rs）
+        if ChatApp::worktree_is_missing(&self.sessions[i]) {
+            self.repair_worktree(i, cx);
+        }
+        // worktree 会话：切过来时（还没读过状态的话）读一次分支现状，chip 上才显示「几个文件 / 领先几个」
+        if self.sessions[i].worktree.is_some() && self.sessions[i].worktree_state.is_none() {
+            self.refresh_worktree(i, cx);
+        }
         // 换会话了：上一条对话猜的灰字作废，输入框里的字留着，停顿一下会为新会话重猜
         self.suggestion.clear();
         // 猜的「下一句」也一样：那句话是接着另一个对话说的
@@ -1144,6 +1172,14 @@ impl ChatApp {
             cx.notify();
             return;
         }
+        // worktree 还在后台建：先排队，建好了自动发出（见 `adopt_worktree`）
+        if self.sessions[active].worktree_busy.is_some() {
+            self.input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.pending.clear();
+            self.sessions[active].queued.push(queued);
+            cx.notify();
+            return;
+        }
         // 发不出去（内核不可用、会话还没就绪）就别清空，免得写好的内容丢了
         if self.submit_to(active, queued.into_prompt(), cx) {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -1153,10 +1189,10 @@ impl ChatApp {
     }
 
     /// 第 `idx` 个会话这一轮结束（正常结束，或用户停下后内核确认了）：发出排队的第一条，
-    /// 其余等它这一轮结束再发。
+    /// 其余等它这一轮结束再发。会话还没就绪时留着（`Started` 到来时再发，见 `apply` 里的事件处理）。
     fn dispatch_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
         let s = &mut self.sessions[idx];
-        if s.busy || s.stopping || s.queued.is_empty() {
+        if s.busy || s.stopping || s.queued.is_empty() || !s.ready {
             return;
         }
         let queued = s.queued.remove(0);
@@ -1647,6 +1683,14 @@ impl ChatApp {
                     if clean_end {
                         self.dispatch_queued(idx, cx);
                     }
+                    // 一轮结束、worktree 会话：刷新分支状态（脏文件数、领先几个提交）
+                    if turn_over {
+                        self.refresh_worktree(idx, cx);
+                    }
+                    // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
+                    if matches!(event, KernelEvent::Started { .. }) {
+                        self.dispatch_queued(idx, cx);
+                    }
                     // 这一轮正常结束、输入框空着：猜用户接下来会发的那一句（见 suggest.rs）
                     if clean_end && idx == self.active && !self.settings_open {
                         self.schedule_next_suggestion(cx);
@@ -1673,8 +1717,9 @@ impl ChatApp {
             Some(meta) => store.append_log(&meta.id),
             None => store.create(&s.title, s.cwd.clone(), &agent_cmd).map(|(mut meta, log)| {
                 meta.set_kernel_session(s.acp_id.clone());
-                // 是不是任务在建档时定下来（侧栏右栏据此分组，见 sidebar.rs）
+                // 是不是任务、跑在哪个 worktree 在建档时定下来（侧栏据此分组，见 sidebar.rs）
                 meta.task = s.task;
+                meta.worktree = s.worktree.clone();
                 let _ = store.save_meta(&meta);
                 s.meta = Some(meta);
                 log
@@ -1798,6 +1843,7 @@ impl ChatApp {
             meta.title = s.title.to_string();
             meta.set_kernel_session(s.acp_id.clone());
             meta.task = s.task;
+            meta.worktree = s.worktree.clone();
             meta.updated_ms = now_ms();
             let _ = store.save_meta(meta);
         }

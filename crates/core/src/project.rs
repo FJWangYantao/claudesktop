@@ -81,9 +81,63 @@ pub fn root_or(cwd: &Path) -> &Path {
     project_root(cwd).unwrap_or(cwd)
 }
 
-/// 项目根（向上找几层 `.claudesktop`，工作目录本身优先）。
+/// 项目根（向上找几层 `.claudesktop` / `.git`，工作目录本身优先）。
+/// worktree 里的 `.git` 是**文件**（`gitdir: <主仓库>/.git/worktrees/<名>`），也算项目根：
+/// 项目配置、说明文件读到的是**这个分支上的版本**，和代码一致。
 pub fn project_root(cwd: &Path) -> Option<&Path> {
-    climb(cwd, |d| path_in(d).is_file() || d.join(".git").is_dir())
+    climb(cwd, |d| path_in(d).is_file() || d.join(".git").exists())
+}
+
+/// 共享根：项目记忆、权限规则这些「对这个项目」的东西按它算。
+/// 工作目录在 git worktree 里时是**主仓库根**（在 worktree 里记下的事回到主目录也算数，反之亦然），
+/// 其余情况和 [`project_root`] 一样。找不到项目根时为 None。
+pub fn shared_root(cwd: &Path) -> Option<PathBuf> {
+    let root = project_root(cwd)?;
+    Some(
+        gitdir_target(root)
+            .and_then(|gitdir| main_repo_of(&gitdir))
+            .unwrap_or_else(|| root.to_path_buf()),
+    )
+}
+
+/// `.git` 是文件（worktree / submodule）时，它指向的 git 目录（纯文件解析，不调 git）。
+/// `.git` 是目录（普通仓库）或没写 `gitdir:` 时返回 None。
+pub fn gitdir_target(root: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join(".git")).ok()?;
+    let target = text.trim().strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = PathBuf::from(target);
+    // git 写的是绝对路径，个别情况（`core.worktree`、手写的）是相对项目根的
+    let joined = if target.is_absolute() { target } else { root.join(target) };
+    Some(lexical(&joined))
+}
+
+/// 词法上消掉 `.` / `..`（不碰磁盘：这些路径可能已经不在，比如被手动删掉的 worktree）。
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // 盘符 / 根上没法再往上：留着，别把路径弄成相对的
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `<主仓库>/.git/worktrees/<名>` → `<主仓库>`；不是 worktree 的 git 目录（submodule 等）返回 None。
+fn main_repo_of(gitdir: &Path) -> Option<PathBuf> {
+    gitdir.file_name()?;
+    let worktrees = gitdir.parent().filter(|p| p.file_name() == Some("worktrees".as_ref()))?;
+    let dot_git = worktrees.parent().filter(|p| p.file_name() == Some(".git".as_ref()))?;
+    dot_git.parent().map(Path::to_path_buf)
 }
 
 /// 从 `cwd` 往上最多 4 层找 `is_root` 为真的目录（`cwd` 本身优先）。
@@ -98,6 +152,11 @@ fn climb(cwd: &Path, is_root: impl Fn(&Path) -> bool) -> Option<&Path> {
         dir = d.parent();
     }
     None
+}
+
+/// 共享根（项目记忆、权限规则按它算）：没有标记时就是工作目录本身。
+pub fn shared_root_or(cwd: &Path) -> PathBuf {
+    shared_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// 读项目配置；没有文件返回 None，文件坏了返回带警告的默认（还能用）。
@@ -436,5 +495,56 @@ mod tests {
         let dir = tmp("root-or-cwd");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         assert_eq!(root_or(&dir), dir.as_path());
+    }
+
+    /// worktree 里的 `.git` 是文件：项目根是 worktree 自己，共享根（记忆 / 权限）回到主仓库
+    #[test]
+    fn a_worktree_is_a_project_root_that_shares_the_main_repo() {
+        let base = tmp("worktree");
+        let main = base.join("main");
+        let tree = base.join("wt");
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("k7f")).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        // git 写的是绝对路径
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\r\n", main.join(".git").join("worktrees").join("k7f").display()),
+        )
+        .unwrap();
+        let nested = tree.join("crates/x");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // 项目配置、说明文件按 worktree 自己读（这个分支上的版本）
+        assert_eq!(project_root(&tree), Some(tree.as_path()));
+        assert_eq!(project_root(&nested), Some(tree.as_path()));
+        // 项目记忆、权限规则按主仓库算
+        assert_eq!(shared_root(&tree).as_deref(), Some(main.as_path()));
+        assert_eq!(shared_root(&nested).as_deref(), Some(main.as_path()));
+        // 普通仓库：共享根就是项目根
+        assert_eq!(shared_root(&main).as_deref(), Some(main.as_path()));
+        assert_eq!(shared_root_or(&base.join("nonexistent")), base.join("nonexistent"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `.git` 文件里写相对路径 / 不是 worktree（submodule）/ 没有 gitdir 行
+    #[test]
+    fn gitdir_files_are_parsed_leniently() {
+        let base = tmp("gitdir");
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // submodule 的 `.git` 指到主仓库的 `.git/modules/<名>`：不是 worktree，共享根就是它自己
+        let modules = base.join("main").join(".git").join("modules").join("sub");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(sub.join(".git"), format!("gitdir: {}", modules.display())).unwrap();
+        assert_eq!(shared_root(&sub).as_deref(), Some(sub.as_path()));
+        // 相对路径按项目根解析
+        std::fs::create_dir_all(base.join("main").join(".git").join("worktrees").join("w"))
+            .unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../main/.git/worktrees/w\n").unwrap();
+        assert_eq!(shared_root(&sub).as_deref(), Some(base.join("main").as_path()));
+        // 没有 `gitdir:` 行（手写的坏文件）：当普通项目根
+        std::fs::write(sub.join(".git"), "乱写的\n").unwrap();
+        assert_eq!(shared_root(&sub).as_deref(), Some(sub.as_path()));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -50,6 +50,14 @@ pub struct Session {
     /// 任务：建立时没为它选过文件夹（跑在默认目录里）。侧栏归到「任务」区，
     /// 在输入框上方的目录菜单里选个文件夹就成了项目会话
     pub task: bool,
+    /// 会话跑在自己的 git worktree 里（`cwd` 就是 worktree 目录）：侧栏仍归到主项目组，
+    /// 顶栏的分支 chip 用它（见 `app/worktree.rs`）
+    pub worktree: Option<claudesktop_core::WorktreeMeta>,
+    /// 正在后台建 worktree（建好了 `worktree` 才有值）：目录 chip 显示转圈，消息先排队
+    pub worktree_busy: Option<String>,
+    /// worktree 的最新状态（脏了几个文件、领先 / 落后）：`None` 内的 `None` = 还没读到，
+    /// 外层 `None` = 没刷过。点开分支菜单、一轮结束时刷新，不在 render 里跑
+    pub worktree_state: Option<Option<claudesktop_core::git::WorktreeStatus>>,
     /// 持久化元信息：首条消息发出后才建档（空会话不落盘）
     pub meta: Option<SessionMeta>,
     /// 追加式日志；恢复的会话在第一次写入时才打开
@@ -308,6 +316,9 @@ impl Session {
             autoprompt: None,
             cwd,
             task: false,
+            worktree: None,
+            worktree_busy: None,
+            worktree_state: None,
             meta: None,
             log: None,
             restored: false,
@@ -352,6 +363,8 @@ impl Session {
         s.pending_mode = None;
         // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
         s.task = meta.task;
+        // 跑在 git worktree 里的会话：侧栏仍归到主项目，分支 chip 用它
+        s.worktree = meta.worktree.clone();
         s.title = meta.title.clone().into();
         s.restored = true;
         s.replaying = true;
@@ -739,6 +752,12 @@ impl Session {
 
     pub fn has_user_message(&self) -> bool {
         self.transcript.iter().any(|i| matches!(i, ChatItem::User { .. }))
+    }
+
+    /// 侧栏分组按哪个目录算：worktree 会话归到**主仓库**那一组（`cwd` 是数据目录里的 worktree，
+    /// 不该单独占一组），其余就是工作目录。
+    pub fn group_dir(&self) -> &std::path::Path {
+        self.worktree.as_ref().map_or(self.cwd.as_path(), |w| w.repo.as_path())
     }
 
     /// 新会话默认的权限模式（设置里开着「自动」时是「自动」）：先把这一项补进模式表并选中
@@ -1633,6 +1652,7 @@ mod tests {
             updated_ms: 0,
             archived: false,
             task: false,
+            worktree: None,
         }
     }
 

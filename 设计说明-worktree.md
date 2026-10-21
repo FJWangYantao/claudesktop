@@ -1,9 +1,10 @@
 # 设计说明：worktree 隔离
 
-> 状态：方案（2026-10-20），未实现。第八节的取舍已按推荐定。
-> 代码落点：`crates/core/src/git.rs`（新，git 调用 + worktree 增删查）、`project.rs`（认 worktree 根）、
-> `store.rs`（`SessionMeta::worktree`）、`apps/desktop/src/app/mod.rs`（建会话）、`composer.rs`（目录菜单）、
-> `sidebar.rs`（分组、行标记、归档 / 删除时清理）、新 `app/worktree.rs`（会话顶栏的分支 chip 和操作）。
+> 状态：第 1~4 步已实施（2026-10-22）；第 5 步（`worktree.copy` / `worktree.setup`）未做。
+> 代码落点：`crates/core/src/git.rs`（git 调用 + worktree 增删查）、`project.rs`（认 worktree 根的 `.git` 文件、`shared_root`）、
+> `store.rs`（`SessionMeta::worktree`）、`apps/desktop/src/app/worktree.rs`（建 / 删 / 状态 / 分支 chip 与菜单）、
+> `mod.rs`（建会话、排队发送、目录丢失重接）、`composer.rs`（目录菜单）、`sidebar.rs`（分组、行标记、归档 / 删除时清理）、
+> `chrome.rs`（顶栏 chip）、`status.rs`（准备中的提示）。
 
 ## 一、要解决什么
 
@@ -146,3 +147,27 @@ pub struct WorktreeMeta {
 5. `worktree.copy` / `worktree.setup`（半天，可以放到最后或下一期）。
 
 合计约三天。第 1、2 步不改变任何现有行为，可以先合。
+
+## 十一、落地时改了什么（2026-10-22）
+
+和上面方案的差异，都是实现时才看清的：
+
+1. **分支 chip 不直接合并**。第六节第 4 条原本要在主目录里 `git merge --no-ff`，但那样得在主目录里跑 git
+   写操作、还要处理冲突回滚。改成菜单里「合并回主目录」= 往输入框填一句话让**这个会话的 agent** 去做
+   （它能在 worktree 里把 base 合进来、跑测试、解冲突）；主目录不在 base 或脏着的时候，菜单里直接用
+   `git::merge_blocker` 说明原因。`git::merge_into_base` 仍然实现了（带冲突 abort）并测过，留给以后一键合并。
+   连带：删 worktree、重接也用 `git::remove_worktree` / `reattach_worktree`，不手搓命令。
+2. **建 worktree 时是「原地换会话」还是「另开一个」**：会话还没发过消息就原地换（`replace_session`），
+   已经有对话了就另开一个新会话接在 worktree 里（对话不能跨目录），并 toast 说清楚原对话留在原目录。
+   建期间排队的消息（`Session::queued`）在换会话时先摘出来再放回，建好之后 `dispatch_queued` 接着发。
+3. **`dispatch_queued` 多了一个 `!s.ready` 判断**：建 worktree 期间排队的消息，会话重建后还没就绪，
+   等 `Started` 到达时再发（`mod.rs` 的事件处理里补了一次调用）。
+4. **`shared_root` 就是一句 `gitdir:` 解析**，不调 git：`<主>/.git/worktrees/<名>` → `<主>`，submodule 的
+   `.git/modules/<名>` 不算 worktree（共享根还是它自己）。相对路径按项目根解析，路径词法消掉 `..`。
+   项目记忆用 `memory::project_file`（走 `shared_root`），权限规则 `matching` 三个键都查（共享根 / 项目根 / 工作目录），
+   `add` 只写共享根 —— 老规则记在工作目录下的也照样命中。
+5. **`in_worktree()` 删了**（没人用），侧栏和顶栏直接看 `s.worktree.is_some()`。
+6. **`WorktreeStatus::is_disposable`**（干净且没有未合并提交）统一了「可以丢」的判断：菜单里显示「干净」、
+   删会话 / 归档时只在这时候顺手删空 worktree。
+7. **第 5 步（`worktree.copy` / `worktree.setup`）没做**：未跟踪文件（`.env`、依赖目录）暂时不会带过去，
+   菜单项说明里写明了「未提交的改动不会带过去」。

@@ -247,3 +247,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   所以新增 provider 只要组完体调一次 `apply_thinking`、`extra` 仍最后合。
   旁路小请求（补全 / 记忆提炼 / 分类器）一律 `suggest::short_thinking(model)`：能关就关、关不掉取最低一档。
   加新模型 = 能力表加一条，同时想清楚 `can_disable`（关不掉的那代别给「关」）和 `accepts_temperature`。
+- **worktree 会话**（`crates/core/src/git.rs` + `apps/desktop/src/app/worktree.rs`，见「设计说明-worktree.md」）：
+  目录在**数据目录** `worktrees/<仓库名>-<短哈希>/<分支尾段>`，不往用户仓库里塞东西；分支名 `claudesktop/<月日-时分>-<3 位随机>`。
+  `cwd` 就是 worktree 目录，侧栏分组用 `Session::group_dir()`（有 worktree 时是主仓库根），worktree 会话归到主项目组、行尾带 `GitBranch` 图标。
+  **项目根认 worktree**（`.git` 是文件也算，`project_root` 照样认），但**项目记忆和权限规则按 `project::shared_root`**（主仓库根），
+  在 worktree 里记的事回主目录也算数。分支状态只在**一轮结束和点开菜单时**跑 `git status`（`Session::worktree_state`），不在 render 里跑。
+  **合并不在主目录里直接 merge**：菜单「合并回主目录」往输入框填一句话让 agent 去做；主目录脏 / 不在 base 时用 `git::merge_blocker` 说原因。
+  建 worktree 期间发的消息进 `Session::queued`，会话还没就绪时 `dispatch_queued` 会留着等 `Started`。

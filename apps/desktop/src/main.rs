@@ -125,6 +125,8 @@ fn main() {
                                 let kind = app.session().kernel;
                                 app.restart_kernel(kind, cx)
                             }
+                            // 在一个临时 git 仓库里建 worktree（截图 / 自检用）
+                            "worktree" => app.debug_worktree(cx),
                             _ => {}
                         }
                         // 调试钩子：CLAUDESKTOP_DROP = 以 ; 分隔的路径，当作从资源管理器拖进来松开

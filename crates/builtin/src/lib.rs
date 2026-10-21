@@ -2011,14 +2011,15 @@ impl BuiltinKernel {
         }
         if let Some(project) = &project
             && !project.permissions.is_empty()
-            && let Some(root) = claudesktop_core::project::project_root(&cwd)
+            && let Some(root) = claudesktop_core::project::shared_root(&cwd)
         {
-            // 项目里写的权限规则并进 permissions.json（集合语义，去重后落盘）
+            // 项目里写的权限规则并进 permissions.json（集合语义，去重后落盘）；
+            // 按共享根记（worktree 里就是主仓库根），主目录和 worktree 共用一份
             if let Some(path) = &self.inner.rules.lock().unwrap().path().map(PathBuf::from) {
                 let file = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
                 let file: Value = serde_json::from_str(&file).unwrap_or_else(|_| json!({}));
                 if let Some(merged) =
-                    claudesktop_core::project::merge_permissions(&file, root, project)
+                    claudesktop_core::project::merge_permissions(&file, &root, project)
                     && serde_json::to_string_pretty(&merged)
                         .map_err(|e| e.to_string())
                         .and_then(|text| {

@@ -16,6 +16,7 @@ mod acp;
 pub mod catalog;
 pub mod checkpoint;
 mod diff;
+pub mod git;
 pub mod history_search;
 mod json_error;
 pub mod memory;
@@ -31,7 +32,8 @@ pub use diff::{DiffLineView, DiffView};
 pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
 pub use store::{
-    Record, SessionLog, SessionMeta, SessionStore, default_data_dir, effective, read_log,
+    Record, SessionLog, SessionMeta, SessionStore, WorktreeMeta, default_data_dir, effective,
+    read_log,
 };
 
 pub use plugin::Plugin;
