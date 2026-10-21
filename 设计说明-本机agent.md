@@ -1,10 +1,11 @@
 # 设计说明：发现并接入本机 agent
 
-> 状态：**方案**（2026-10-21），未实施。
-> 代码落点（计划）：`crates/core/src/agents.rs`（新增：发现与预设）、`crates/core/src/acp.rs`（登录、模型列表与切换）、
-> `crates/core/src/lib.rs`（`KernelEvent` 新增两种）、`apps/desktop/src/settings.rs`（多 agent 档案与迁移）、
-> `app/mod.rs`（内核槽按档案开）、`app/settings_view.rs`（「本机 agent」一栏）、`app/composer.rs`（模型下拉认 ACP）、
-> `app/chat.rs`（登录卡片）。
+> 状态：**部分实施**（2026-10-21）。第 1 步（`agents.rs`）、第 2 步（多档案 + 迁移 + 内核槽）、
+> 第 3 步（设置页「本机 agent」+ 首页引导 + `last_model` 记忆）已实施；
+> 第 4 步（模型列表经 ACP `config_options`）、第 5 步（登录）、第 6 步（Key 导入）未做。
+> 代码落点：`crates/core/src/agents.rs`（✅ 发现与预设）、`apps/desktop/src/settings.rs`（✅ 多 agent 档案与迁移）、
+> `app/mod.rs`（✅ 内核槽按档案 key 开）、`app/settings_view.rs`（✅「本机 agent」一栏）、
+> `crates/core/src/acp.rs`（登录、模型列表与切换，未动）、`app/composer.rs`（模型下拉认 ACP，未动）、`app/chat.rs`（登录卡片，未动）。
 
 ## 一、要解决什么
 
@@ -237,9 +238,9 @@ pub struct AgentProfile {
 
 | 步 | 内容 | 验证 |
 |---|---|---|
-| 1 | `agents.rs`：预设表 + `discover_in` / `discover` | 单测：假 PATH、`.cmd` 垫片、版本过旧、`--version` 超时 |
-| 2 | 设置：`AgentProfile` + 迁移；内核槽按档案开；`KernelChoice::Acp(id)`；会话归属 | 单测：老设置文件迁移、老会话归属；`cargo check` 全量 |
-| 3 | 设置页「本机 agent」一栏 + 首页引导 + 新建会话选 agent | 实机：检测、启用、新建会话连上 |
+| 1 | `agents.rs`：预设表 + `discover_in` / `discover` | ✅ 单测：假 PATH、`.cmd` 垫片、版本过旧、缺 Node、版本串解析；实机跑一遍 `cargo test -p claudesktop-core --test discover_agents -- --ignored` |
+| 2 | 设置：`AgentProfile` + 迁移；内核槽按档案 key 开；`KernelChoice::Acp(id)`；会话归属 | ✅ 实现；单测靠 CI |
+| 3 | 设置页「本机 agent」一栏 + 首页引导 + 选过的模型按档案记（`last_model`，`Started` 后 agent 没报就切过去） | ✅ 实现；实机待验（检测、启用、新建会话连上） |
 | 4 | 模型列表与切换（第七节） | 用 `tools/` 里的 mock ACP agent 加 `configOptions`，测 `Started.models`、`set_model`、`ConfigOptionUpdate` |
 | 5 | 登录（第六节） | mock agent 先报 `auth_required` 再接受 `authenticate`；终端方式实机试 |
 | 6 | API Key 导入（第九节） | 单测：环境变量检测 |

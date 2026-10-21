@@ -312,9 +312,9 @@ impl ChatApp {
             .child(option(
                 "setup-acp",
                 IconAll::SquareTerminal,
-                "接 Claude Code 等 ACP agent",
-                "用 agent 自己的登录和模型；已填好 Claude Code 的适配器（需要 Node.js）",
-                KernelChoice::Acp("custom-1".into()),
+                "用本机装好的 agent",
+                "Claude Code / OpenCode / pi：检测到就一键启用，登录和模型都在 agent 那边",
+                KernelChoice::Acp(String::new()),
                 cx,
             ))
     }

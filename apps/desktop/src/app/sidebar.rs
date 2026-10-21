@@ -233,12 +233,13 @@ impl ChatApp {
             self.sessions[active].unread = false;
         }
         let mut h = DefaultHasher::new();
-        // 外观、字号、字体、配色变了全部重画
+        // 外观、字号、字体、配色、当前内核（档案名显示在顶栏 / 侧栏）变了全部重画
         (
             crate::theme::is_dark(),
             f32::from(root_font_size()).to_bits(),
             crate::theme::palette_index(),
             sans(),
+            self.settings.kernel().key(),
         )
             .hash(&mut h);
         for group in self.session_groups() {

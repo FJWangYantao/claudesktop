@@ -28,6 +28,18 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::HashSet;
 
+/// 本机 agent 检测的状态：进设置页后台跑一次（要起子进程探版本）。
+#[derive(Default)]
+enum AgentDetect {
+    /// 还没测
+    #[default]
+    Idle,
+    /// 在测
+    Running,
+    /// 测完了（没装的不在列表里，界面按预设表补一行）
+    Done(Vec<claudesktop_core::agents::Detected>),
+}
+
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
 const SETTINGS_TABS: [(IconAll, &str); 8] = [
     (IconAll::Settings, "通用"),
@@ -90,14 +102,17 @@ pub struct SettingsForm {
     inputs: Vec<ProfileInputs>,
     /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量页 / 7 记忆）
     pub(super) tab: usize,
-    acp_command: Entity<InputState>,
+    /// 编辑中的 agent 档案表（保存才生效；预设的启用 / 网关在这里改）
+    agents: Vec<AgentProfile>,
+    /// 本机 agent 的检测结果（进「内核与模型」时后台跑一次）
+    agent_detect: AgentDetect,
+    /// 自定义 agent 的启动命令（空 = 没有自定义 agent）
+    custom_command: Entity<InputState>,
     /// 一轮最多几步（自研内核的工具循环上限）
     max_steps: Entity<InputState>,
     /// 用量网关开关（保存才生效，会重启自研内核）
     usage_gateway: bool,
     gateway_bodies: bool,
-    /// ACP agent 的请求也经网关（保存才生效，会重启 ACP 内核）
-    acp_gateway: bool,
     /// 点了「清空日志」，等再点一次确认
     confirm_clear_gateway: bool,
     /// 模型单价表（一行一个模型，格式见 `pricing.rs`）
@@ -138,7 +153,7 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     pub fn new(window: &mut Window, cx: &mut Context<ChatApp>) -> Self {
-        let acp_command = cx.new(|cx| {
+        let custom_command = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("如 npx -y @agentclientprotocol/claude-agent-acp")
         });
@@ -164,11 +179,12 @@ impl SettingsForm {
             active: 0,
             inputs: Vec::new(),
             tab: 0,
-            acp_command,
+            agents: Vec::new(),
+            agent_detect: AgentDetect::Idle,
+            custom_command,
             max_steps,
             usage_gateway: true,
             gateway_bodies: true,
-            acp_gateway: false,
             confirm_clear_gateway: false,
             prices,
             auto_model,
@@ -247,7 +263,6 @@ impl ChatApp {
         self.settings_form.fetch_result = None;
         self.settings_form.usage_gateway = s.usage_gateway;
         self.settings_form.gateway_bodies = s.gateway_bodies;
-        self.settings_form.acp_gateway = s.acp.gateway;
         self.settings_form.confirm_clear_gateway = false;
         let prices = crate::pricing::to_text(&crate::pricing::Table {
             prices: s.prices(),
@@ -305,9 +320,18 @@ impl ChatApp {
         self.settings_form.inputs =
             profiles.iter().map(|p| ProfileInputs::new(window, cx, p)).collect();
         self.settings_form.profiles = profiles;
+        // agent 档案表 + 自定义 agent 的命令
+        self.settings_form.agents = s.acp.agents.clone();
+        let custom = s
+            .acp
+            .agents
+            .iter()
+            .find(|a| a.preset().is_none())
+            .and_then(|a| a.command.clone())
+            .unwrap_or_default();
         self.settings_form
-            .acp_command
-            .update(cx, |state, cx| state.set_value(s.acp.command.clone(), window, cx));
+            .custom_command
+            .update(cx, |state, cx| state.set_value(custom, window, cx));
         self.settings_form.tab = tab;
         self.settings_open = true;
         // 设置页开着时输入框不在画面上：光标后面那句灰字先撤掉（关掉设置页后接着打字会重猜）
@@ -320,7 +344,25 @@ impl ChatApp {
         if tab == super::project_view::PROJECT_TAB {
             self.reload_project_view(window, cx);
         }
+        // 「内核与模型」一栏进页面时后台测一次本机的 agent（要起子进程探版本）
+        if tab == KERNEL_TAB && matches!(self.settings_form.agent_detect, AgentDetect::Idle) {
+            self.detect_agents(cx);
+        }
         cx.notify();
+    }
+
+    /// 后台探一遍本机装了哪些 agent（PATH + 常见安装目录，每家起一次子进程问版本）。
+    fn detect_agents(&mut self, cx: &mut Context<Self>) {
+        self.settings_form.agent_detect = AgentDetect::Running;
+        cx.spawn(async move |this, cx| {
+            let found =
+                cx.background_executor().spawn(async move { claudesktop_core::agents::discover() }).await;
+            this.update(cx, |this, cx| {
+                this.settings_form.agent_detect = AgentDetect::Done(found);
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
@@ -583,7 +625,6 @@ impl ChatApp {
     fn form_settings(&self, cx: &App) -> Settings {
         let f = &self.settings_form;
         let mut s = self.settings.clone();
-        s.kernel = Some(f.kernel.clone());
         let mut profiles = f.profiles.clone();
         for (p, inputs) in profiles.iter_mut().zip(&f.inputs) {
             p.name = value(&inputs.name, cx);
@@ -595,8 +636,33 @@ impl ChatApp {
         }
         s.builtin.profiles = profiles;
         s.builtin.active = f.active.min(s.builtin.profiles.len().saturating_sub(1));
-        s.acp.command = value(&f.acp_command, cx);
-        s.acp.gateway = f.acp_gateway;
+        // agent 档案表：预设行的开关直接写在表单里；自定义命令有值就保留 / 建一条档案
+        let mut agents = f.agents.clone();
+        let custom = value(&f.custom_command, cx);
+        let custom = custom.trim();
+        match agents.iter().position(|a| a.preset().is_none()) {
+            Some(at) => {
+                if custom.is_empty() {
+                    agents.remove(at);
+                } else {
+                    agents[at].command = Some(custom.to_string());
+                }
+            }
+            None if !custom.is_empty() => {
+                let n = agents
+                    .iter()
+                    .filter_map(|a| {
+                        a.id.strip_prefix("custom-").and_then(|v| v.parse::<usize>().ok())
+                    })
+                    .max()
+                    .map_or(1, |n| n + 1);
+                agents.push(AgentProfile::custom(n, custom));
+            }
+            None => {}
+        }
+        s.acp.agents = agents;
+        // 三选一只选了「本机 agent」没选档案：落第一个启用的档案（一家都没启用就在保存时拦下来）
+        s.kernel = Some(s.kernel_for(&f.kernel));
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
         s.auto_mode.enabled = f.auto_enabled;
         s.auto_mode.use_session_model = f.auto_follow;
@@ -642,7 +708,7 @@ impl ChatApp {
     }
 
     /// 首页配置引导选了一种接法：打开「内核与模型」并选好那种内核；
-    /// ACP 命令还空着时填上 Claude Code 的适配器。
+    /// 还没启用任何 agent 且本机装了 Claude Code 时顺手把它启用上。
     pub(crate) fn start_setup(
         &mut self,
         kind: KernelChoice,
@@ -652,12 +718,14 @@ impl ChatApp {
         self.open_settings_at(KERNEL_TAB, window, cx);
         self.settings_form.kernel = kind.clone();
         if matches!(kind, KernelChoice::Acp(_))
-            && self.settings_form.acp_command.read(cx).value().trim().is_empty()
+            && self.settings_form.agents.is_empty()
+            && let AgentDetect::Done(list) = &self.settings_form.agent_detect
+            && let Some(hit) = list.iter().find(|d| d.is_ready())
         {
-            let command = acp_command(ACP_PRESETS[0].1);
-            self.settings_form
-                .acp_command
-                .update(cx, |state, cx| state.set_value(command, window, cx));
+            let preset = hit.preset;
+            self.settings_form.agents.push(AgentProfile::from_preset(preset));
+            self.settings_form.message =
+                Some((false, format!("已启用本机的{}，点「保存并应用」生效", preset.name).into()));
         }
         cx.notify();
     }
@@ -669,6 +737,15 @@ impl ChatApp {
             return;
         }
         let new = self.form_settings(cx);
+        // 选了「本机 agent」却一家都没启用：先让用户勾一家（或填一条自定义命令）
+        if matches!(new.kernel(), KernelChoice::Acp(_)) && new.acp.first().is_none() {
+            self.settings_form.message = Some((
+                true,
+                "选了「本机 agent」但一家都没启用：在上面勾一家，或填一条自定义命令".into(),
+            ));
+            cx.notify();
+            return;
+        }
         if new.kernel() == KernelChoice::Builtin {
             if let Err(err) = new.builtin_config(self.cwd.clone()) {
                 self.settings_form.message = Some((true, err.to_string().into()));
@@ -711,6 +788,7 @@ impl ChatApp {
             // 自动模式的开关 / 分类器模型变了：模式列表和分类器都要重装
             || new.auto_mode != self.settings.auto_mode;
         let restart_acp = new.acp != self.settings.acp;
+        // 三选一只选了「本机 agent」没选档案：form_settings 已经落过第一个档案，这里就是具体内核
         let default = new.kernel();
         let default_changed = default != self.settings.kernel();
         // 存不存原文对已经跑着的网关立刻生效，不用重启内核
@@ -722,10 +800,22 @@ impl ChatApp {
         }
         if restart_acp {
             // 每条启用的档案各一个内核进程：都重启（设置页改的就是这一份档案表）
-            let ids: Vec<String> =
-                self.settings.acp.agents.iter().map(|a| a.id.clone()).collect();
+            let ids: Vec<String> = self.settings.acp.agents.iter().map(|a| a.id.clone()).collect();
             for id in ids {
                 self.restart_kernel(&KernelChoice::Acp(id), cx);
+            }
+            // 停用 / 删掉的档案：进程直接关（它们的会话已经全部脱离）
+            let mut removed: Vec<String> = self
+                .kernels
+                .iter()
+                .filter_map(|(k, _)| k.strip_prefix("acp:"))
+                .filter(|id| self.settings.acp.get(id).is_none())
+                .map(|id| id.to_string())
+                .collect();
+            removed.sort();
+            removed.dedup();
+            for id in removed {
+                self.shutdown_slot(&format!("acp:{id}"));
             }
         }
         // 自研内核的配置变了：顺手取一次模型列表，连不上马上告诉用户（不挡保存）
@@ -1254,7 +1344,18 @@ impl ChatApp {
 
     /// 在模型下拉里选了一个：当前会话立即切换（还没建立的会话等 Started），并记为默认。
     pub(crate) fn choose_model(&mut self, model: String, cx: &mut Context<Self>) {
-        self.update_settings(|s| s.builtin.current_mut().model = model.clone());
+        // 记住上次用的模型：自研内核记在当前 provider 档案，agent 记在它的档案上
+        // （新会话 Started 后按它切过去，见 `apply_last_model`）
+        match self.session().kernel.clone() {
+            KernelChoice::Builtin => {
+                self.update_settings(|s| s.builtin.current_mut().model = model.clone());
+            }
+            KernelChoice::Acp(id) => {
+                let model = model.clone();
+                self.update_settings(move |s| s.acp.set_last_model(&id, &model));
+            }
+            KernelChoice::Demo => {}
+        }
         let kernel = self.session_kernel(self.active);
         let s = &mut self.sessions[self.active];
         match (kernel, s.acp_id.clone()) {
@@ -1452,7 +1553,7 @@ impl ChatApp {
             return true;
         }
         let normalize = |mut s: Settings| {
-            s.kernel = Some(s.kernel());
+            s.kernel = Some(s.kernel_for(s.kernel.as_ref().unwrap_or(&KernelChoice::Builtin)));
             // 打开设置页时补上的那套空档案不算改动
             let blank = ProviderProfile::default();
             s.builtin.profiles.retain(|p| *p != blank);
@@ -1470,7 +1571,7 @@ impl ChatApp {
             let key = kind.key();
             let id: gpui_kit::ElementId = format!("kernel-{}", key.replace(':', "-")).into();
             kernels = kernels.child(
-                choice_row(id, icon, title, desc, f.kernel == kind, None)
+                choice_row(id, icon, title, desc, f.kernel.same_kind(&kind), None)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings_form.kernel = kind.clone();
                         this.settings_form.message = None;
@@ -1948,58 +2049,103 @@ impl ChatApp {
         ))
     }
 
-    /// ACP agent：启动命令（带常用命令一键填入）和要不要经用量网关。
+    /// ACP agent：本机装了哪些（后台检测的），每行一个开关；下面是自定义 agent 的命令。
+    /// 登录和模型在 agent 那边设置；保存后每条启用的档案各起一个内核进程。
     fn render_acp(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let mut quick = div().h_flex().items_center().gap_1().ml(rems(-0.5));
-        for (i, (label, command, _)) in ACP_PRESETS.into_iter().enumerate() {
-            quick = quick.child(
-                Self::quiet_button(("acp-preset", i), IconAll::SquareTerminal, Surface::Paper, cx)
-                    .xsmall()
-                    .label(format!("填入 {label}"))
-                    .px_2()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let command = acp_command(command);
-                        this.settings_form
-                            .acp_command
-                            .update(cx, |s, cx| s.set_value(command, window, cx));
+        let mut list = choice_panel();
+        // 每家预设一行：开关 = 档案表里有没有它
+        for preset in claudesktop_core::agents::PRESETS {
+            let enabled = f.agents.iter().any(|a| a.id == preset.id);
+            let detect = match &f.agent_detect {
+                AgentDetect::Idle | AgentDetect::Running => None,
+                AgentDetect::Done(found) => found.iter().find(|d| d.preset.id == preset.id),
+            };
+            // 行的说明：装没装 / 版本；「没找到」只说明探测没找到，仍可手动启用
+            let desc: String = match detect {
+                Some(d) => d.summary(),
+                None => match &f.agent_detect {
+                    AgentDetect::Idle | AgentDetect::Running => "检测中…".into(),
+                    AgentDetect::Done(_) => "本机没找到（可手动启用）".into(),
+                },
+            };
+            let id = format!("agent-{}", preset.id);
+            list = list.child(
+                choice_row(id, IconAll::SquareTerminal, preset.name, desc, enabled, None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(at) = this.settings_form.agents.iter().position(|a| a.id == preset.id) {
+                            this.settings_form.agents.remove(at);
+                        } else {
+                            this.settings_form.agents.push(AgentProfile::from_preset(preset));
+                        }
                         cx.notify();
-                    })),
+                    }),
+                ),
             );
+            // 风险提示常驻在这一行下面（条款风险不收进 ⓘ）
+            if let Some(risk) = preset.risk {
+                list = list.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .child(risk),
+                );
+            }
         }
-        let mut command =
-            div().v_flex().gap_1p5().child(Self::text_input(&f.acp_command)).child(quick);
-        for risk in ACP_PRESETS.iter().filter_map(|(_, _, risk)| *risk) {
-            command =
-                command.child(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk));
-        }
-        let gateway_desc = if self.settings.usage_gateway {
-            "把 agent 的请求也记进「请求」页签"
-        } else {
-            "先在自研内核的「运行」里打开用量网关"
+        // 检测状态行：转圈 / 重新检测
+        let detect_note = match &f.agent_detect {
+            AgentDetect::Idle | AgentDetect::Running => {
+                Some(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child("正在检测本机安装的 agent…"))
+            }
+            AgentDetect::Done(_) => None,
         };
-        section(
-            "ACP agent",
-            "登录和模型在 agent 那边设置",
-            None,
-            div()
-                .v_flex()
-                .gap_4()
-                .child(form_field(
-                    "启动命令",
-                    Some("需要 Node.js；留空用演示 agent".into()),
-                    command,
-                ))
-                .child(setting_group([setting_row(
-                    "经过用量网关",
-                    gateway_desc,
-                    Switch::new("acp-gateway").checked(f.acp_gateway).color(rgb(CORAL)).on_change(
-                        cx.listener(|this, checked: &bool, _, cx| {
-                            this.settings_form.acp_gateway = *checked;
+        let gateway_rows: Vec<_> = f
+            .agents
+            .iter()
+            .filter(|a| a.supports_gateway())
+            .map(|a| {
+                let id = a.id.clone();
+                let name = a.display_name();
+                setting_row(
+                    format!("{} 经过用量网关", name),
+                    "把它的请求也记进「请求」页签",
+                    Switch::new(format!("agent-gw-{}", id))
+                        .checked(a.gateway)
+                        .color(rgb(CORAL))
+                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                            if let Some(a) =
+                                this.settings_form.agents.iter_mut().find(|a| a.id == id)
+                            {
+                                a.gateway = *checked;
+                            }
                             cx.notify();
-                        }),
-                    ),
-                )])),
+                        })),
+                )
+            })
+            .collect();
+        let body = div()
+            .v_flex()
+            .gap_4()
+            .child(list)
+            .children(detect_note)
+            .children(gateway_rows.is_empty().then(|| {
+                div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(
+                    "启用一家后可以单独开关「它的请求经不经过用量网关」",
+                )
+            }))
+            .when(!gateway_rows.is_empty(), |d| d.child(setting_group(gateway_rows)))
+            .child(form_field(
+                "自定义 agent",
+                Some("任何说 ACP 的 agent 都能接；登录和模型在它那边设置".into()),
+                Self::text_input(&f.custom_command),
+            ));
+        section(
+            "本机 agent",
+            "直接用本机装好的 Claude Code / OpenCode 等：登录和模型都在 agent 那边，这里只管接不接",
+            None,
+            body,
         )
     }
 
@@ -2211,32 +2357,18 @@ fn kernel_choices() -> Vec<(KernelChoice, IconAll, &'static str, &'static str)> 
             "填 API Key 直连 DeepSeek、OpenAI、Ollama 等",
         ),
         (
-            KernelChoice::Acp("custom-1".into()),
+            KernelChoice::Acp(String::new()),
             IconAll::SquareTerminal,
-            "ACP agent",
-            "接 Claude Code 这类外部 agent",
+            "本机 agent",
+            "用本机装好的 Claude Code / OpenCode 等，登录和模型都在 agent 那边",
         ),
         (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
     ]
 }
 
-/// ACP 启动命令的常用项：(名称, 命令, 风险提示)；Windows 上前面补 `cmd /c`（见 [`acp_command`]）。
-const ACP_PRESETS: [(&str, &str, Option<&str>); 2] = [
-    ("Claude Code", "npx -y @agentclientprotocol/claude-agent-acp", Some(CLAUDE_CODE_RISK)),
-    ("pi", "npx -y pi-acp", None),
-];
-
-/// 适配器底层是 Agent SDK，Anthropic 2026-02 起写明订阅登录只能用在 Claude Code / Claude.ai。
-const CLAUDE_CODE_RISK: &str = "风险：Claude Code 用订阅账号登录时，Anthropic 条款不允许经第三方程序使用，账号可能被限制；用 API Key 登录不受影响";
-
 /// Antigravity Tools 借用 Antigravity 账号的登录，Google 2026-02 起按违反条款封过这样用的账号。
 const ANTIGRAVITY_RISK: &str =
     "风险：它借用你 Antigravity 账号的登录调用模型，Google 封过这样用的账号";
-
-/// npx 在 Windows 上是 .cmd，要经 `cmd /c` 才起得来。
-fn acp_command(command: &str) -> String {
-    if cfg!(windows) { format!("cmd /c {command}") } else { command.to_string() }
-}
 
 /// 「自动」模式的说明（拦什么、放什么、判不出来怎么办）。
 fn auto_mode_docs() -> Div {

@@ -608,6 +608,22 @@ impl ChatApp {
         self.kernel_of(&self.sessions[idx].kernel)
     }
 
+    /// 直接关掉一个内核槽（档案被停用 / 删除时）：绑在它上面的会话全部脱离。
+    pub(crate) fn shutdown_slot(&mut self, key: &str) {
+        let old = self.slot_mut(key).and_then(|s| s.kernel.take());
+        if let Some(slot) = self.slot_mut(key) {
+            slot.ready = false;
+            slot.started = false;
+            slot.status = "未连接内核".into();
+        }
+        for s in self.sessions.iter_mut().filter(|s| s.kernel_key == key) {
+            s.detach_kernel(old.as_ref());
+        }
+        if let Some(old) = old {
+            old.shutdown();
+        }
+    }
+
     /// 停掉一条后台命令（顶栏的小标点的）。
     pub(crate) fn stop_background(&mut self, id: &str, cx: &mut Context<Self>) {
         let kind = self.sessions[self.active].kernel.clone();
@@ -672,6 +688,10 @@ impl ChatApp {
         session.task = !self.is_project_dir(&cwd);
         if is_builtin && self.settings.auto_mode_default() {
             session.default_to(MODE_AUTO_ID);
+        }
+        // agent 档案记着上次用的模型：Started 后 agent 没报模型就切过去
+        if let KernelChoice::Acp(id) = &session.kernel {
+            session.last_model = self.settings.acp.get(id).and_then(|a| a.last_model.clone());
         }
         session
     }

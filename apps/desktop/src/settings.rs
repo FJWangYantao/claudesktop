@@ -52,6 +52,16 @@ impl KernelChoice {
         matches!(self, Self::Demo)
     }
 
+    /// 是不是同一种内核（ACP 的不比档案 ID：「默认内核」三选一只分自研 / agent / 演示）。
+    pub fn same_kind(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Builtin, Self::Builtin)
+                | (Self::Demo, Self::Demo)
+                | (Self::Acp(_), Self::Acp(_))
+        )
+    }
+
     pub fn label(&self, acp: &AcpSettings) -> String {
         match self {
             Self::Builtin => "自研内核".into(),
@@ -814,10 +824,21 @@ impl Settings {
         )
     }
 
-    /// 某一种内核的档案 ID：ACP 用第一个启用的档案（`KernelChoice::Acp` 不带档案，
-    /// 带档案的走 [`Settings::kernel_for`] / 内核槽）。
+    /// 某一种内核的档案 ID：ACP 用第一个启用的档案。
     pub fn acp_default_id(&self) -> Option<String> {
         self.acp.first().map(|a| a.id.clone())
+    }
+
+    /// 「默认内核」三选一落到具体内核：ACP 只选了种类没选档案时用第一个启用的档案。
+    /// 一家都没启用时退回自研（设置页选了 agent 但一条档案都没勾）。
+    pub fn kernel_for(&self, kind: &KernelChoice) -> KernelChoice {
+        match kind {
+            KernelChoice::Acp(id) if id.is_empty() => self
+                .acp_default_id()
+                .map(KernelChoice::Acp)
+                .unwrap_or(KernelChoice::Builtin),
+            other => other.clone(),
+        }
     }
 
     /// 新装、还没配过任何内核：没选过内核，自研内核没填端点 / 模型，也没有启用的 agent。

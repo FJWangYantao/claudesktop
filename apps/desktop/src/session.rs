@@ -74,6 +74,8 @@ pub struct Session {
     pub resuming: bool,
     /// 内核会话建立前选的模型：Started 之后再告诉内核
     pub pending_model: Option<String>,
+    /// agent 档案记的上次模型（`AcpSettings::last_model` 的快照）：Started 后 agent 没报模型就切过去
+    pub last_model: Option<String>,
     /// 待同步给内核的权限模式：新会话的默认模式（设置里开着「自动」时是 `"auto"`），
     /// 或用户在会话建立前自己选的。`Started` 时交给内核后清掉
     pub pending_mode: Option<String>,
@@ -339,6 +341,7 @@ impl Session {
             restored: false,
             resuming: false,
             pending_model: None,
+            last_model: None,
             pending_mode: None,
             thinking: None,
             pending_thinking: None,
@@ -381,6 +384,10 @@ impl Session {
     ) -> Self {
         let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent, acp), meta.cwd.clone());
         s.ready = false;
+        // agent 档案记的上次模型：续接后 agent 没报模型时切过去（`apply_event` 的 Started 分支）
+        if let KernelChoice::Acp(aid) = &s.kernel {
+            s.last_model = acp.get(aid).and_then(|a| a.last_model.clone());
+        }
         // 历史会话不该被「新对话默认自动」改掉模式：它的模式由重建的日志决定
         s.pending_mode = None;
         // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
@@ -1218,6 +1225,15 @@ impl Session {
                         Ok(()) => self.model_label = model.into(),
                         Err(err) => self.note(format!("切换模型失败：{err}")),
                     }
+                }
+                // agent 档案记着上次用的模型：新会话接上来就切过去（agent 没报模型时才补）
+                else if let Some(model) = self.last_model.clone()
+                    && self.model_label == UNKNOWN_MODEL
+                    && let Some(kernel) = kernel
+                    && let Some(id) = self.acp_id.clone()
+                    && let Err(err) = kernel.set_model(&id, &model)
+                {
+                    self.note(format!("切换模型失败：{err}"));
                 }
                 return self.autoprompt.take();
             }
