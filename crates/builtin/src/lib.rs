@@ -194,6 +194,7 @@ impl BuiltinConfig {
                 model,
                 params: RequestParams::default(),
                 gateway: None,
+                deepseek_key: None,
             },
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         ))
@@ -1954,6 +1955,8 @@ impl BuiltinKernel {
     pub fn spawn(config: BuiltinConfig, sink: EventSink) -> anyhow::Result<Self> {
         let agent_name = format!("builtin · {}", config.provider.model);
         let max_steps = config.clamped_max_steps();
+        // web_search 的 DeepSeek 后端复用这个档案的 key（界面按端点挑好填进来）
+        websearch::set_key_hint(config.provider.deepseek_key.clone());
         // 这个内核的编号（后台命令表按它分组）
         let kernel_id = NEXT_KERNEL_ID.fetch_add(1, Ordering::Relaxed);
         let mcp = {
@@ -1963,7 +1966,7 @@ impl BuiltinKernel {
             })
         };
         mcp.set_extra(plugin_servers(&config.plugins));
-        // web_search 的 Brave key 存数据目录（`brave_key` 文件），按规则文件的位置推
+        // web_search 的 key 文件和搜索后端的选择都存数据目录，按规则文件的位置推
         if let Some(dir) = config.rules_path.as_ref().and_then(|p| p.parent()) {
             websearch::set_data_dir(dir.to_path_buf());
         } else if let Ok(dir) = claudesktop_core::default_data_dir() {

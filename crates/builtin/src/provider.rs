@@ -715,6 +715,10 @@ pub struct ProviderConfig {
     pub params: RequestParams,
     /// 用量网关：有就把请求经它转发、每个请求记一行日志（见 `gateway` 模块）；None = 直连
     pub gateway: Option<crate::gateway::GatewayHandle>,
+    /// `web_search` 的 DeepSeek 后端复用哪把 key（None = 这个档案不是 DeepSeek 端点）。
+    /// 界面按档案的 base_url / 名字挑一把填进来，内核起 `set_key_hint` 交给 `websearch`；
+    /// 状态文件（搜索后端的选择）里存不了 key，所以 key 跟着 provider 配置走。
+    pub deepseek_key: Option<String>,
 }
 
 impl ProviderConfig {
@@ -1222,6 +1226,7 @@ mod tests {
             model: "m".into(),
             params: RequestParams::default(),
             gateway: None,
+            deepseek_key: None,
         };
         assert_eq!(config.identity(), "builtin:http://x/v1#m");
         config.protocol = Protocol::Anthropic;

@@ -116,8 +116,9 @@ impl ProviderProfile {
             api_key: Some(self.api_key.trim().to_string()).filter(|k| !k.is_empty()),
             model: self.model.trim().to_string(),
             params: self.params.clone(),
-            // 网关由 `Settings::builtin_config` 按开关补上
+            // 网关由 `Settings::builtin_config` 按开关补上；`web_search` 用的 DeepSeek key 也在那儿填
             gateway: None,
+            deepseek_key: None,
         }
     }
 
@@ -278,6 +279,13 @@ pub struct Settings {
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
 fn yes() -> bool {
     true
+}
+
+/// 这份档案是不是 DeepSeek 的端点（`web_search` 的 DeepSeek 后端要复用它的 key）。
+/// 按端点地址和名字认：中转点也能把 base_url 里带上 deepseek。
+pub fn is_deepseek_endpoint(p: &ProviderProfile) -> bool {
+    let hay = format!("{} {}", p.base_url.to_lowercase(), p.name.to_lowercase());
+    hay.contains("deepseek")
 }
 
 impl Default for Settings {
@@ -638,11 +646,25 @@ impl Settings {
         config.context_windows = p.context_windows.clone().into_iter().collect();
         config.max_steps = self.max_steps;
         config.provider.gateway = self.gateway();
+        // `web_search` 的 DeepSeek 后端复用哪把 key（见 `deepseek_search_key`）
+        config.provider.deepseek_key = self.deepseek_search_key();
         // 每轮结束提炼候选记忆（默认关，见 `remember` 模块）
         config.memory_suggest = self.memory_suggest;
         // 「自动」模式没配好时不出现（设置页保存时会拦住，这里再兜一次）
         config.auto_mode = self.auto_mode.to_config(p);
         Ok(config)
+    }
+
+    /// `web_search` 的 DeepSeek 后端用哪把 key：找一份 DeepSeek 端点的档案
+    /// （端点地址或名字里有 deepseek）的 key，交给内核转给 `websearch`。
+    /// 找不到就是 None——搜索时 DeepSeek 那一档按「没配 key」跳过，不报错。
+    pub fn deepseek_search_key(&self) -> Option<String> {
+        self.builtin
+            .profiles
+            .iter()
+            .filter(|p| is_deepseek_endpoint(p))
+            .map(|p| p.api_key.trim().to_string())
+            .find(|k| !k.is_empty())
     }
 
     /// 自研内核上新建的对话是否默认用「自动」模式（设置里开着并且配好了）。
@@ -1027,6 +1049,34 @@ mod tests {
         b.current_mut().model = "m".into();
         assert_eq!(b.profiles.len(), 1);
         assert!(b.is_configured());
+    }
+
+    /// `web_search` 的 DeepSeek key：从 DeepSeek 端点的档案里挑一把，挑不到就是 None。
+    #[core::prelude::v1::test]
+    fn deepseek_search_key_reuses_a_deepseek_profile() {
+        let profile = |name: &str, base: &str, key: &str| ProviderProfile {
+            name: name.into(),
+            base_url: base.into(),
+            api_key: key.into(),
+            model: "m".into(),
+            ..ProviderProfile::default()
+        };
+        let mut s = Settings::default();
+        s.builtin.profiles = vec![
+            profile("Kimi", "https://api.moonshot.cn/v1", "sk-kimi"),
+            profile("中转", "https://relay.example/deepseek", "sk-relay"),
+        ];
+        // 端点地址里有 deepseek 就认（中转点也行），第一次找到的那个
+        assert_eq!(s.deepseek_search_key().as_deref(), Some("sk-relay"));
+        // 名字里有 deepseek 也认
+        s.builtin.profiles = vec![profile("DeepSeek", "https://api.example/v1", "sk-named")];
+        assert_eq!(s.deepseek_search_key().as_deref(), Some("sk-named"));
+        // 只有别的端点：None（搜索时 DeepSeek 那一档按「没配 key」跳过）
+        s.builtin.profiles = vec![profile("Kimi", "https://api.moonshot.cn/v1", "sk-kimi")];
+        assert_eq!(s.deepseek_search_key(), None);
+        // 认出来了但 key 是空的，同样当作没有
+        s.builtin.profiles = vec![profile("DeepSeek", "https://api.deepseek.com", "")];
+        assert_eq!(s.deepseek_search_key(), None);
     }
 
     /// 字号 / 字体族：旧设置文件没有这两项时用标准档 + 内嵌字体；
