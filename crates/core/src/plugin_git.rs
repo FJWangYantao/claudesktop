@@ -121,7 +121,14 @@ pub fn subdir(repo: &Path) -> Option<String> {
 
 /// 拉最新的（只快进，本地改过就报错、不合并）；返回 git 的输出（「Already up to date.」等）。
 pub fn update(repo: &Path) -> Result<String, String> {
-    git(repo, &["pull", "--ff-only"])
+    git(repo, &["pull", "--ff-only"]).map_err(|e| {
+        // 本地改过的插件目录：插件这边最省事的出路是重装
+        if e.starts_with("目录里有本地改动") {
+            format!("{e}；或者卸载后重新安装")
+        } else {
+            e
+        }
+    })
 }
 
 /// 卸载：删掉克隆下来的目录。只删插件目录下、带 `.git` 的（手动放进来的不动）。

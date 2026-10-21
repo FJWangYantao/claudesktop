@@ -254,3 +254,5 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   在 worktree 里记的事回主目录也算数。分支状态只在**一轮结束和点开菜单时**跑 `git status`（`Session::worktree_state`），不在 render 里跑。
   **合并不在主目录里直接 merge**：菜单「合并回主目录」往输入框填一句话让 agent 去做；主目录脏 / 不在 base 时用 `git::merge_blocker` 说原因。
   建 worktree 期间发的消息进 `Session::queued`，会话还没就绪时 `dispatch_queued` 会留着等 `Started`。
+  后台 git 任务回来时按 `Session::token` 找会话（`session_index`），别存下标（删会话会挪）；菜单里的 git 结果（`worktree_blocker`）在 `refresh_worktree` 里算好，render 不跑 git。
+  删除 worktree 走 `ask_remove_worktree`：不确定干净就先弹框，确认了才 `--force` / `-D`。

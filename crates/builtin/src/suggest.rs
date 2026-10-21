@@ -95,7 +95,7 @@ pub fn build_messages(draft: &str, history: &[(bool, String)]) -> Vec<ChatMessag
 ///
 /// 档位按模型覆盖：能关就明确关（`Off`），关不掉（Opus 5.5 这类）就取它最低的一档——
 /// 补全要的是最短的那种思考，不是「跟着会话的档位」。
-fn params(base: &RequestParams, model: &str) -> RequestParams {
+fn params(base: &RequestParams, protocol: Protocol, model: &str) -> RequestParams {
     let mut extra = base.extra.clone();
     if let Some(map) = extra.as_object_mut() {
         for key in REASONING_KEYS {
@@ -105,7 +105,7 @@ fn params(base: &RequestParams, model: &str) -> RequestParams {
     RequestParams {
         temperature: Some(0.5),
         max_tokens: Some(64),
-        thinking: short_thinking(model),
+        thinking: short_thinking(protocol, model),
         thinking_budget: None,
         server_tools: Vec::new(),
         extra,
@@ -114,13 +114,11 @@ fn params(base: &RequestParams, model: &str) -> RequestParams {
 
 /// 旁路小请求（补全、记忆提炼、分类器）该用哪一档：能关就关，关不掉取最低一档。
 /// 认不出的模型给 `None`（不发思考字段）。
-pub fn short_thinking(model: &str) -> Option<ThinkingLevel> {
-    let mut spec = thinking_spec(Protocol::OpenAiCompat, model);
-    // Anthropic 原生端点的模型命名是另一张表；两张表都认不出时才真认不出
-    if !spec.is_known() {
-        spec = thinking_spec(Protocol::Anthropic, model);
-    }
-    spec.min_level()
+///
+/// 按请求实际走的协议查表：同一个名字在两张表里可能不同（`glm-5.3` 在 OpenAI 兼容下关不掉、
+/// 走 Anthropic 兼容端点时是预算格式能关），查错表会把「最低一档」翻成深度思考。
+pub fn short_thinking(protocol: Protocol, model: &str) -> Option<ThinkingLevel> {
+    thinking_spec(protocol, model).min_level()
 }
 
 /// `extra` 里开思考 / 推理的键（各家写法）
@@ -198,7 +196,10 @@ fn ask(
     should_stop: &dyn Fn() -> bool,
 ) -> Option<String> {
     // 温度 / 输出上限 / 思考档位换成补全那一套（provider 在构造时就吃下参数）
-    let config = ProviderConfig { params: params(&config.params, &config.model), ..config.clone() };
+    let config = ProviderConfig {
+        params: params(&config.params, config.protocol, &config.model),
+        ..config.clone()
+    };
     let provider = crate::make_provider(&config);
     let mut reply = String::new();
     let _tag = crate::gateway::tag(session, "suggest", turn);
@@ -357,18 +358,22 @@ mod tests {
     /// 补全请求的档位：能关就明确关，关不掉取它最低的一档，认不出就不发。
     #[test]
     fn suggest_asks_for_the_shortest_thinking() {
-        assert_eq!(short_thinking("glm-4.6"), Some(ThinkingLevel::Off));
-        assert_eq!(short_thinking("qwen3-max"), Some(ThinkingLevel::Off));
+        let openai = Protocol::OpenAiCompat;
+        let anthropic = Protocol::Anthropic;
+        assert_eq!(short_thinking(openai, "glm-4.6"), Some(ThinkingLevel::Off));
+        assert_eq!(short_thinking(openai, "qwen3-max"), Some(ThinkingLevel::Off));
         // 关不掉：最低的开档
-        assert_eq!(short_thinking("claude-opus-5-5"), Some(ThinkingLevel::Low));
-        assert_eq!(short_thinking("gpt-5"), Some(ThinkingLevel::Minimal));
-        // 认不出：不发。注意「名字里不带 claude / glm / qwen / deepseek / gpt」的模型
-        // 在 Anthropic 原生表里会落到第三方兼容端点那一支，那边认得出
-        assert_eq!(short_thinking("llama-3-8b"), Some(ThinkingLevel::Off));
-        assert_eq!(short_thinking(""), None);
+        assert_eq!(short_thinking(anthropic, "claude-opus-5-5"), Some(ThinkingLevel::Low));
+        assert_eq!(short_thinking(openai, "gpt-5"), Some(ThinkingLevel::Minimal));
+        assert_eq!(short_thinking(openai, "glm-5.3"), Some(ThinkingLevel::High));
+        // 同一个名字走 Anthropic 兼容端点：按那张表（预算格式，能关），不能拿 OpenAI 表的「高」
+        assert_eq!(short_thinking(anthropic, "glm-5.3"), Some(ThinkingLevel::Off));
+        // 认不出：不发
+        assert_eq!(short_thinking(openai, "llama-3-8b"), None);
+        assert_eq!(short_thinking(openai, ""), None);
 
         let base = RequestParams { thinking: Some(ThinkingLevel::High), ..Default::default() };
-        let p = params(&base, "claude-opus-5-5");
+        let p = params(&base, anthropic, "claude-opus-5-5");
         assert_eq!(p.thinking, Some(ThinkingLevel::Low));
     }
 
@@ -378,7 +383,7 @@ mod tests {
             extra: serde_json::json!({"reasoning_effort": "high", "top_p": 0.9}),
             ..Default::default()
         };
-        let p = params(&base, "some-model");
+        let p = params(&base, Protocol::OpenAiCompat, "some-model");
         assert_eq!(p.extra, serde_json::json!({"top_p": 0.9}));
         assert_eq!(p.max_tokens, Some(64));
     }

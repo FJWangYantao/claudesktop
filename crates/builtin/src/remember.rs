@@ -40,7 +40,7 @@ pub fn system_prompt() -> String {
 ///
 /// 档位和补全一样按模型覆盖（能关就关、关不掉取最低一档）：提炼只要长一点的判断，
 /// 不需要「跟着会话的档位」那样深度思考。
-fn params(base: &RequestParams, model: &str) -> RequestParams {
+fn params(base: &RequestParams, protocol: crate::Protocol, model: &str) -> RequestParams {
     let mut extra = base.extra.clone();
     if let Some(map) = extra.as_object_mut() {
         for key in
@@ -52,7 +52,7 @@ fn params(base: &RequestParams, model: &str) -> RequestParams {
     RequestParams {
         temperature: Some(0.2),
         max_tokens: Some(400),
-        thinking: crate::suggest::short_thinking(model),
+        thinking: crate::suggest::short_thinking(protocol, model),
         thinking_budget: None,
         server_tools: Vec::new(),
         extra,
@@ -94,7 +94,8 @@ pub fn suggest(
     if user.trim().is_empty() || assistant.trim().is_empty() {
         return Vec::new();
     }
-    let config = ProviderConfig { params: params(&config.params, model), ..config.clone() };
+    let config =
+        ProviderConfig { params: params(&config.params, config.protocol, model), ..config.clone() };
     let provider = crate::make_provider(&config);
     let mut reply = String::new();
     let _tag = crate::gateway::tag(session, "memory", turn);
@@ -233,7 +234,7 @@ mod tests {
             extra: serde_json::json!({"enable_thinking": true, "top_p": 0.9}),
             ..Default::default()
         };
-        let p = params(&base, "some-model");
+        let p = params(&base, crate::Protocol::OpenAiCompat, "some-model");
         assert_eq!(p.extra, serde_json::json!({"top_p": 0.9}));
         assert_eq!(p.max_tokens, Some(400));
     }

@@ -1828,8 +1828,9 @@ impl Inner {
         };
         // 分类器只要一句短判断：档位按模型覆盖成「能关就关、关不掉取最低一档」，
         // 别继承档案里给正式对话配的深度思考（又慢又贵，还容易被思考带偏）
+        let protocol = config.protocol;
         let provider = provider::provider_with(&config, |params| {
-            params.thinking = suggest::short_thinking(&model);
+            params.thinking = suggest::short_thinking(protocol, &model);
         });
         let mut reply = String::new();
         // 分类器的请求也记进用量网关（用途 `auto`）

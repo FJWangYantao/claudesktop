@@ -36,7 +36,7 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
     }
-    let common = git(dir, &["rev-parse", "--git-common-dir"]).ok()?;
+    let common = git_stdout(dir, &["rev-parse", "--git-common-dir"]).ok()?;
     let common = PathBuf::from(common.trim());
     let common = if common.is_absolute() { common } else { dir.join(common) };
     // `<主仓库>/.git` → `<主仓库>`；认不出（bare 仓库等）就退回到 --show-toplevel
@@ -46,17 +46,17 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     {
         return Some(normalize(parent));
     }
-    git(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| normalize(Path::new(s.trim())))
+    git_stdout(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| normalize(Path::new(s.trim())))
 }
 
 /// 当前 HEAD 叫什么：在分支上是分支名，游离时为提交号（合并目标、领先几个提交都按它算）。
 pub fn base_of(repo: &Path) -> Result<String, String> {
-    if let Ok(branch) = git(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
+    if let Ok(branch) = git_stdout(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
         && !branch.trim().is_empty()
     {
         return Ok(branch.trim().to_string());
     }
-    let head = git(repo, &["rev-parse", "HEAD"])?;
+    let head = git_stdout(repo, &["rev-parse", "HEAD"])?;
     Ok(head.trim().to_string())
 }
 
@@ -97,11 +97,11 @@ pub fn status(
     base: &str,
     branch: &str,
 ) -> Result<WorktreeStatus, String> {
-    let porcelain = git(path, &["status", "--porcelain"])?;
+    let porcelain = git_stdout(path, &["status", "--porcelain"])?;
     let dirty_files = porcelain.lines().filter(|l| !l.trim().is_empty()).count();
     // 分支没了（用户手动删了）：只报改动，不算领先
     let range = format!("{base}...{branch}");
-    let (behind, ahead) = match git(repo, &["rev-list", "--left-right", "--count", &range]) {
+    let (behind, ahead) = match git_stdout(repo, &["rev-list", "--left-right", "--count", &range]) {
         Ok(out) => {
             let mut parts = out.split_whitespace().map(|n| n.parse::<usize>().unwrap_or(0));
             (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
@@ -151,7 +151,7 @@ pub fn prune(repo: &Path) -> Result<(), String> {
 /// 把 worktree 里没提交的改动提交掉（合并前用）；没有改动时什么都不做。
 /// 返回是否真的提交了。
 pub fn commit_all(path: &Path, message: &str) -> Result<bool, String> {
-    let changes = git(path, &["status", "--porcelain"])?;
+    let changes = git_stdout(path, &["status", "--porcelain"])?;
     if !changes.lines().any(|l| !l.trim().is_empty()) {
         return Ok(false);
     }
@@ -165,10 +165,10 @@ pub fn commit_all(path: &Path, message: &str) -> Result<bool, String> {
 /// 为什么现在不能合并回主目录：主目录不在 `base` 分支上，或者有没提交的改动。
 pub fn merge_blocker(repo: &Path, base: &str) -> Option<String> {
     let current = base_of(repo).unwrap_or_default();
-    if !current.eq_ignore_ascii_case(base) {
+    if current != base {
         return Some(format!("主目录现在不在 {base} 分支上（停在 {current}）"));
     }
-    match git(repo, &["status", "--porcelain"]) {
+    match git_stdout(repo, &["status", "--porcelain"]) {
         Ok(out) if out.lines().any(|l| !l.trim().is_empty()) => {
             Some("主目录里有还没提交的改动".into())
         }
@@ -278,7 +278,20 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// 跑一条 git 命令：不弹黑框、不问密码；失败时带上 git 的报错（译成中文）。
+/// 成功时返回 stdout，stdout 为空时退回 stderr（`clone` / `pull` 的进度写在那儿）。
+/// 要解析输出的（`status --porcelain` 等）用 [`git_stdout`]，别把 stderr 的警告当成输出。
 pub fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let (out, err) = run(cwd, args)?;
+    Ok(if out.is_empty() { err } else { out })
+}
+
+/// 同 [`git`]，但只要 stdout（stderr 里的警告不混进来）。
+pub fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    run(cwd, args).map(|(out, _)| out)
+}
+
+/// 跑 git，成功时返回 (stdout, stderr)。
+fn run(cwd: &Path, args: &[&str]) -> Result<(String, String), String> {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -300,8 +313,7 @@ pub fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     })?;
     let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
     if output.status.success() {
-        let out = text(&output.stdout);
-        Ok(if out.is_empty() { text(&output.stderr) } else { out })
+        Ok((text(&output.stdout), text(&output.stderr)))
     } else {
         Err(explain_git_error(&text(&output.stderr)))
     }
@@ -333,7 +345,8 @@ pub fn explain_git_error(stderr: &str) -> String {
         return "连不上仓库：检查网络或代理设置".into();
     }
     if has("not possible to fast-forward") || has("diverging") || has("would be overwritten") {
-        return "目录里的文件在本地改过，没法直接更新：卸载后重新安装，或者在命令行里处理".into();
+        return "目录里有本地改动和这次操作冲突（会被覆盖 / 分叉了）：先在命令行里提交或处理掉这些改动"
+            .into();
     }
     let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
     let tail: Vec<&str> = tail.into_iter().rev().collect();

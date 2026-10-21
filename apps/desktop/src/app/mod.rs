@@ -776,8 +776,9 @@ impl ChatApp {
         if ChatApp::worktree_is_missing(&self.sessions[i]) {
             self.repair_worktree(i, cx);
         }
-        // worktree 会话：切过来时（还没读过状态的话）读一次分支现状，chip 上才显示「几个文件 / 领先几个」
-        if self.sessions[i].worktree.is_some() && self.sessions[i].worktree_state.is_none() {
+        // worktree 会话：切过来时读一次分支现状（后台跑），chip 上才显示「几个文件 / 领先几个」，
+        // 主目录那边的变化（换了分支、有了改动）也在这时候反映到菜单里
+        if self.sessions[i].worktree.is_some() {
             self.refresh_worktree(i, cx);
         }
         // 换会话了：上一条对话猜的灰字作废，输入框里的字留着，停顿一下会为新会话重猜

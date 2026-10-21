@@ -1629,7 +1629,8 @@ impl ChatApp {
                 ),
             ))
             .child(form_field("模型", model_hint, model_row))
-            .child(self.render_thinking_row(p, cx))
+            // 档位按模型输入框**现在**的字（`p.model` 要保存时才收进来），换模型这一排跟着变
+            .child(self.render_thinking_row(p, &value(&inputs.model, cx), cx))
             .when(p.protocol == Protocol::Anthropic, |d| {
                 d.child(self.render_server_tools(p, cx))
             })
@@ -1640,8 +1641,8 @@ impl ChatApp {
     /// 能选哪些档跟着模型输入框的**当前值**现算（不额外存 Entity、不用同步代码），
     /// 所以换模型之后这一排跟着变；存在档案里的档位如果新模型不支持，高亮和保存都按
     /// `ThinkingSpec::resolve` 降级后的那一档。
-    fn render_thinking_row(&self, p: &ProviderProfile, cx: &mut Context<Self>) -> Div {
-        let spec = claudesktop_builtin::thinking_spec(p.protocol, &p.model);
+    fn render_thinking_row(&self, p: &ProviderProfile, model: &str, cx: &mut Context<Self>) -> Div {
+        let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
         if !spec.is_known() {
             // 认不出的模型：宁可没有这个选项，也不要发个对方不认的字段导致 400
             return div();

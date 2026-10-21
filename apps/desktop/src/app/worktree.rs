@@ -13,6 +13,8 @@ use claudesktop_core::WorktreeMeta;
 use claudesktop_core::git;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::*;
@@ -68,9 +70,10 @@ impl ChatApp {
             }
         };
         let path = worktree_path(&data, &repo, &branch);
-        let active = self.active;
+        // 认会话按令牌、不按下标：建的这几秒里删了别的会话，下标会挪
+        let token = self.session().token;
         // 正在准备中：输入框照常可写，期间发的消息排队（见 `submit_to`）
-        self.sessions[active].worktree_busy = Some(branch.clone());
+        self.sessions[self.active].worktree_busy = Some(branch.clone());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let job = {
@@ -80,14 +83,17 @@ impl ChatApp {
             };
             let result = job.await;
             let _ = this.update(cx, |app, cx| {
-                // 期间多半还在同一个会话上（换会话了就不动它）
-                if active >= app.sessions.len() {
-                    return;
-                }
                 let meta = WorktreeMeta { repo: repo.clone(), branch: branch.clone(), base };
-                app.sessions[active].worktree_busy = None;
+                // 会话期间被删掉 / 换掉了：建好的 worktree 没人用，清掉（刚建的，一定是干净的）
+                let Some(idx) = app.session_index(token) else {
+                    if let Ok(path) = &result {
+                        cleanup_worktree_now(&meta, path);
+                    }
+                    return;
+                };
+                app.sessions[idx].worktree_busy = None;
                 match result {
-                    Ok(path) => app.adopt_worktree(active, path, meta, cx),
+                    Ok(path) => app.adopt_worktree(idx, path, meta, cx),
                     Err(err) => app.toast(
                         Notification::error(format!(
                             "没建成 worktree：{err}（这段对话还在原目录）"
@@ -115,10 +121,17 @@ impl ChatApp {
         if has_chat {
             // 已经有对话：换个目录就等于换个会话（对话不能跨目录），开一个新的接着来
             let kind = s.kernel;
+            // 建 worktree 期间写的消息是给新 worktree 的：跟着搬过去，别留在原会话里没人发
+            let queued = std::mem::take(&mut self.sessions[idx].queued);
             let new = self.open_session(kind, path.clone());
             self.sessions[new].worktree = Some(meta);
             self.sessions[new].task = false;
-            self.active = new;
+            self.sessions[new].queued = queued;
+            // 用户期间换到别的会话了就别把人拽回来
+            if self.active == idx {
+                self.active = new;
+            }
+            self.dispatch_queued(new, cx);
             self.toast(
                 Notification::success(
                     "worktree 建好了：新对话在它里面开始（原来的对话留在原目录）",
@@ -173,6 +186,7 @@ impl ChatApp {
         }
         let branch = meta.branch.clone();
         let (repo, path2) = (meta.repo.clone(), path.clone());
+        let token = self.sessions[idx].token;
         cx.spawn(async move |this, cx| {
             let job = {
                 let (repo, path, branch) = (repo, path2, branch);
@@ -186,9 +200,9 @@ impl ChatApp {
             };
             let result = job.await;
             let _ = this.update(cx, |app, cx| {
-                if idx >= app.sessions.len() {
+                let Some(idx) = app.session_index(token) else {
                     return;
-                }
+                };
                 match result {
                     Ok(()) => app.sessions[idx].note("已重新检出 worktree"),
                     Err(err) => app.sessions[idx].note(format!(
@@ -212,19 +226,26 @@ impl ChatApp {
             self.sessions[idx].worktree_state = None;
             return;
         }
-        self.sessions[idx].worktree_state = Some(None);
+        if self.sessions[idx].worktree_state.is_none() {
+            self.sessions[idx].worktree_state = Some(None);
+        }
+        let token = self.sessions[idx].token;
         cx.spawn(async move |this, cx| {
             let job = {
                 let (repo, base, branch) =
                     (meta.repo.clone(), meta.base.clone(), meta.branch.clone());
                 let path = path.clone();
-                cx.background_executor()
-                    .spawn(async move { git::status(&repo, &path, &base, &branch) })
+                // 「现在不能自动合并」的原因也在这儿算好存着：菜单每次重画都跑 git 会卡界面
+                cx.background_executor().spawn(async move {
+                    (git::status(&repo, &path, &base, &branch), git::merge_blocker(&repo, &base))
+                })
             };
-            let result = job.await;
+            let (status, blocker) = job.await;
             let _ = this.update(cx, |app, cx| {
-                if let Some(s) = app.sessions.get_mut(idx) {
-                    s.worktree_state = Some(result.ok());
+                if let Some(idx) = app.session_index(token) {
+                    let s = &mut app.sessions[idx];
+                    s.worktree_state = Some(status.ok());
+                    s.worktree_blocker = blocker;
                 }
                 cx.notify();
             });
@@ -277,7 +298,6 @@ impl ChatApp {
         let path_tip = path.display().to_string();
         let copy_branch = branch.clone();
         let copy_path = path_tip.clone();
-        let repo_tip = repo.display().to_string();
         let name = meta.repo_name();
         let reveal_path = path.clone();
         menu = menu
@@ -286,7 +306,7 @@ impl ChatApp {
                     "worktree-reveal",
                     IconAll::FolderOpen,
                     "在资源管理器中打开",
-                    repo_tip,
+                    path_tip.clone(),
                     false,
                 ),
                 move |_, cx| cx.reveal_path(&reveal_path),
@@ -322,9 +342,9 @@ impl ChatApp {
             ),
             move |this, window, cx| this.fill_prompt(&prompt, window, cx),
         );
-        // 夹一行说明：不能一键合并的原因
+        // 夹一行说明：不能一键合并的原因（`refresh_worktree` 在后台算好的，这里不跑 git）
         let reason = if path.is_dir() {
-            git::merge_blocker(&repo, &meta.base)
+            app.session().worktree_blocker.clone()
         } else {
             Some("worktree 目录不在".to_string())
         };
@@ -338,19 +358,19 @@ impl ChatApp {
                     .child(format!("现在不能自动合并：{reason}")),
             );
         }
-        menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick(
+        menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick_in(
             menu_item(
                 "worktree-remove",
                 IconAll::Trash,
                 "删除 worktree",
                 if path.is_dir() {
-                    "分支和目录一起删；有没提交的改动会一起丢"
+                    "分支和目录一起删；有没提交的改动或没合并的提交时会先问"
                 } else {
                     ""
                 },
                 false,
             ),
-            move |this, cx| this.remove_session_worktree(cx),
+            move |this, window, cx| this.ask_remove_worktree(window, cx),
         )
     }
 
@@ -378,9 +398,62 @@ impl ChatApp {
         self.start_in_worktree(cx);
     }
 
-    /// 删掉当前会话的 worktree 和分支（有没提交的改动时先问一句，见 `worktree.rs` 的菜单）。
-    pub(crate) fn remove_session_worktree(&mut self, cx: &mut Context<Self>) {
-        let idx = self.active;
+    /// 菜单里的「删除 worktree」：确定干净（没改动、没有未合并的提交）就直接删，
+    /// 否则先弹框说清会丢什么，用户点了「删除」才连改动一起删。
+    pub(crate) fn ask_remove_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let s = self.session();
+        if s.worktree.is_none() {
+            return;
+        }
+        if s.busy || s.worktree_busy.is_some() {
+            self.toast(Notification::warning("这一轮还在跑：先停下来再删 worktree"), cx);
+            return;
+        }
+        let token = s.token;
+        let status = s.worktree_state.flatten();
+        if status.is_some_and(|st| st.is_disposable()) {
+            // 干净的也按不强删走：状态是上一轮结束时读的，期间又改了的话 git 会拒绝，不会丢东西
+            self.remove_session_worktree(token, false, cx);
+            return;
+        }
+        let lost = match status {
+            Some(st) => {
+                let mut parts = Vec::new();
+                if st.dirty_files > 0 {
+                    parts.push(format!("{} 个文件的改动没提交", st.dirty_files));
+                }
+                if st.ahead > 0 {
+                    parts.push(format!("{} 个提交还没合并回主目录", st.ahead));
+                }
+                parts.join("，")
+            }
+            None => "读不出它现在的状态，可能有没提交的改动或没合并的提交".into(),
+        };
+        let description = format!("{lost}。删除后目录和分支一起没了，找不回来。");
+        let app = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let app = app.clone();
+            alert
+                .title("删除这个 worktree？")
+                .description(description.clone())
+                .show_cancel(true)
+                .ok_text("删除")
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text("取消")
+                .on_ok(move |_, _, cx| {
+                    app.update(cx, |this, cx| this.remove_session_worktree(token, true, cx));
+                    true
+                })
+        });
+    }
+
+    /// 删掉会话的 worktree 和分支（`force` = 连没提交的改动、没合并的提交一起删，要先经用户确认）。
+    /// 删成了：还没对话的会话原地换回主目录；有对话的断开内核，下一条消息在主目录里续接。
+    /// 没删成：worktree 原样留着，说明原因。
+    fn remove_session_worktree(&mut self, token: u64, force: bool, cx: &mut Context<Self>) {
+        let Some(idx) = self.session_index(token) else {
+            return;
+        };
         let Some(meta) = self.sessions[idx].worktree.clone() else {
             return;
         };
@@ -391,36 +464,70 @@ impl ChatApp {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let job = {
-                let (repo, path, branch) = (repo, path, branch);
+                let (repo, path, branch) = (repo.clone(), path, branch);
                 cx.background_executor().spawn(async move {
-                    let result = git::remove_worktree(&repo, &path, true);
-                    let _ = git::delete_branch(&repo, &branch, true);
-                    result
+                    git::remove_worktree(&repo, &path, force)?;
+                    // 目录删了、分支没删掉（不强删时有没合并的提交）：目录随时能从分支重新检出，不算失败
+                    Ok::<_, String>(git::delete_branch(&repo, &branch, force).err())
                 })
             };
             let result = job.await;
             let _ = this.update(cx, |app, cx| {
-                let Some(s) = app.sessions.get_mut(idx) else {
+                let Some(idx) = app.session_index(token) else {
                     return;
                 };
-                s.worktree = None;
-                s.worktree_state = None;
-                if let Some(existing) = &mut s.meta {
-                    existing.worktree = None;
-                    if let Some(store) = &app.store {
-                        let _ = store.save_meta(existing);
-                    }
-                }
                 match result {
-                    Ok(()) => s.note(format!(
-                        "worktree 和分支 {branch_name} 删掉了（改动如果没合并就一起没了）"
+                    Ok(branch_left) => {
+                        app.detach_from_worktree(idx, repo);
+                        let s = &mut app.sessions[idx];
+                        match branch_left {
+                            None => s.note(format!("worktree 和分支 {branch_name} 删掉了")),
+                            Some(err) => s.note(format!(
+                                "worktree 目录删掉了，分支 {branch_name} 留着（{err}）"
+                            )),
+                        }
+                    }
+                    Err(err) => app.sessions[idx].note(format!(
+                        "没删：{err}（worktree 原样留着；确实不要了再从菜单里删一次）"
                     )),
-                    Err(err) => s.note(format!("没删干净：{err}")),
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// worktree 删掉以后：会话回到主仓库目录（`cwd` 不再指着已经不在的目录）。
+    fn detach_from_worktree(&mut self, idx: usize, repo: PathBuf) {
+        if !self.sessions[idx].has_user_message() {
+            // 还没对话：原地换成主目录里的新会话
+            let kind = self.sessions[idx].kernel;
+            self.replace_session(idx, kind, repo);
+            return;
+        }
+        // 有对话：断开内核会话（它的工作目录已经没了），下一条消息在主目录里续接这段对话
+        let kernel = self.session_kernel(idx);
+        let s = &mut self.sessions[idx];
+        if let (Some(kernel), Some(id)) = (&kernel, s.acp_id.clone()) {
+            kernel.close_session(&id);
+        }
+        s.detach_kernel(kernel.as_ref());
+        s.cwd = repo.clone();
+        s.worktree = None;
+        s.worktree_state = None;
+        s.worktree_blocker = None;
+        if let Some(existing) = &mut s.meta {
+            existing.worktree = None;
+            existing.cwd = repo;
+            if let Some(store) = &self.store {
+                let _ = store.save_meta(existing);
+            }
+        }
+    }
+
+    /// 令牌 → 会话下标（后台任务回来时用：下标会因为删会话而挪）。
+    pub(crate) fn session_index(&self, token: u64) -> Option<usize> {
+        self.sessions.iter().position(|s| s.token == token)
     }
 
     /// 会话被丢弃 / 归档时顺手清掉它从没改过东西的 worktree（别在数据目录里堆空目录）。

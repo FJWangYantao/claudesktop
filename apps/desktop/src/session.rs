@@ -58,6 +58,8 @@ pub struct Session {
     /// worktree 的最新状态（脏了几个文件、领先 / 落后）：`None` 内的 `None` = 还没读到，
     /// 外层 `None` = 没刷过。点开分支菜单、一轮结束时刷新，不在 render 里跑
     pub worktree_state: Option<Option<claudesktop_core::git::WorktreeStatus>>,
+    /// 现在不能一键合并回主目录的原因（主目录脏了 / 不在 base 上），和 `worktree_state` 一起刷新
+    pub worktree_blocker: Option<String>,
     /// 持久化元信息：首条消息发出后才建档（空会话不落盘）
     pub meta: Option<SessionMeta>,
     /// 追加式日志；恢复的会话在第一次写入时才打开
@@ -319,6 +321,7 @@ impl Session {
             worktree: None,
             worktree_busy: None,
             worktree_state: None,
+            worktree_blocker: None,
             meta: None,
             log: None,
             restored: false,
