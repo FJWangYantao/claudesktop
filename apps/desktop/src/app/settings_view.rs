@@ -1654,32 +1654,45 @@ impl ChatApp {
             })
     }
 
-    /// 「思考强度」：档位一排（`seg_control`），三种协议下都显示，模型认不出时整行不显示。
+    /// 「思考强度」：档位一排（`seg_control`），三种协议下都显示。
     ///
     /// 能选哪些档跟着模型输入框的**当前值**现算（不额外存 Entity、不用同步代码），
     /// 所以换模型之后这一排跟着变；存在档案里的档位如果新模型不支持，高亮和保存都按
     /// `ThinkingSpec::resolve` 降级后的那一档。
+    ///
+    /// 模型认不出时照样给这一排，但只有「默认 / 兜底」两项：兜底按 `FALLBACK_LEVELS`
+    /// 发 effort，其余档位不发（见 `apply_thinking`）。以前整行不出现，用户看着设置页
+    /// 以为没地方调（其实是被能力表挡掉了）。
     fn render_thinking_row(&self, p: &ProviderProfile, model: &str, cx: &mut Context<Self>) -> Div {
         let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
-        if !spec.is_known() {
-            // 认不出的模型：宁可没有这个选项，也不要发个对方不认的字段导致 400
-            return div();
-        }
+        let known = spec.is_known();
         let current = p.params.thinking;
-        // 「默认」= 不发字段，排在「关」前面
+        // 「默认」= 不发字段，排在「关」前面；认不出的模型再加一项「兜底」
         let mut options: Vec<(Option<ThinkingLevel>, &'static str)> = vec![(None, "默认")];
-        for level in spec.levels {
+        for level in spec.choices() {
             options.push((Some(*level), level.label()));
+        }
+        if !known {
+            options.push((Some(ThinkingLevel::Default), ThinkingLevel::Default.label()));
         }
         // 高亮：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档
         //（认不出的一档都不匹配时保留原值，免得界面显示成「默认」而实际发着别的字段）
         let active = current.and_then(|c| spec.resolve(c)).or(current);
-        // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
-        let hint = match (p.protocol, spec.format) {
-            (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => active
-                .filter(|l| !l.is_off())
-                .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))),
-            _ => None,
+        // 认不出的模型：这一档旁边的说明短一点（整段解释在 ⓘ 里，别把行撑长）
+        let hint = if !known {
+            if current == Some(ThinkingLevel::Default) {
+                Some("按通用的 effort 字段发".to_string())
+            } else {
+                Some("还不知道这个模型认不认，选「兜底」试试".to_string())
+            }
+        } else {
+            match (p.protocol, spec.format) {
+                // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
+                (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => active
+                    .filter(|l| !l.is_off())
+                    .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))),
+                _ => None,
+            }
         };
         let control = div().h_flex().items_center().gap_3().child(seg_control(
             "thinking",
@@ -1702,7 +1715,13 @@ impl ChatApp {
             }
             None => control,
         };
-        form_field("思考强度", Some("让模型回答前先想多久，越高越慢、越贵".into()), control)
+        let mut field_hint: SharedString = "让模型回答前先想多久，越高越慢、越贵".into();
+        if !known {
+            field_hint = "没确认过的模型只有「兜底」可用：按通用的 effort 字段发，从「低」起；\
+                 选别的档位就不发，而不是猜一个。端点不认这个字段时一般直接忽略，不会报错"
+                .into();
+        }
+        form_field("思考强度", Some(field_hint), control)
     }
 
     /// 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）。
