@@ -1,8 +1,9 @@
 # 设计说明：worktree 隔离
 
-> 状态：第 1~4 步已实施（2026-10-22）；第 5 步（`worktree.copy` / `worktree.setup`）未做。
-> 代码落点：`crates/core/src/git.rs`（git 调用 + worktree 增删查）、`project.rs`（认 worktree 根的 `.git` 文件、`shared_root`）、
-> `store.rs`（`SessionMeta::worktree`）、`apps/desktop/src/app/worktree.rs`（建 / 删 / 状态 / 分支 chip 与菜单）、
+> 状态：第 1~5 步已实施（2026-10-22 前 4 步，`worktree.copy` / `worktree.setup` 随后补上）。
+> 代码落点：`crates/core/src/git.rs`（git 调用 + worktree 增删查）、`project.rs`（认 worktree 根的 `.git` 文件、`shared_root`、
+> `worktree` 一栏的读取与复制规则）、`store.rs`（`SessionMeta::worktree`）、`apps/desktop/src/app/worktree.rs`（建 / 删 / 状态 / 分支 chip 与菜单）、
+> `app/worktree_setup.rs`（建好之后复制未跟踪文件、跑初始化命令）、`app/project_view.rs`（设置页「项目」里的 `worktree` 一栏）、
 > `mod.rs`（建会话、排队发送、目录丢失重接）、`composer.rs`（目录菜单）、`sidebar.rs`（分组、行标记、归档 / 删除时清理）、
 > `chrome.rs`（顶栏 chip）、`status.rs`（准备中的提示）。
 
@@ -148,6 +149,29 @@ pub struct WorktreeMeta {
 
 合计约三天。第 1、2 步不改变任何现有行为，可以先合。
 
+## 十二、`worktree.copy` / `worktree.setup` 的落地（第七节第 5 条）
+
+和方案一致，细节是实施时才定的：
+
+1. **配置位置**：项目配置 `.claudesktop/settings.json` 的 `worktree` 一栏，
+   `{"worktree": {"copy": [".env*", "data/"], "setup": "npm install"}}`。
+   读取和复制规则在 `claudesktop_core::project`（`WorktreeConfig` / `copy_matches` / `copy_into`），
+   设置页「项目」里两行（复制规则一行一条、初始化命令一个单行框），和这一页其余字段一样即时生效。
+2. **复制规则**是相对主仓库根的 glob：`*` / `?` 在**一段路径**内匹配，`**` 跨层，以 `/` 结尾的只看目录；
+   绝对路径的规则直接跳过（不写警告，界面上有一句「相对项目根」）。`.git` 不参与 `**` 遍历。
+   匹配到的是目录就整份递归复制；命中了主目录里不存在的路径只会进「没匹配到」。
+3. **时机**：建 worktree 的那次（`start_in_worktree`）就把配置读好（建完会话可能已经换了），
+   `adopt_worktree` 之后在**换好的那个会话**里跑。复制先做、`setup` 后跑（命令常要读复制过去的 `.env`）。
+   两项都在后台，结果落进对话：复制成功记一张只读工具卡（点开是文件清单），`setup` 记一张命令卡
+   （失败时默认展开、输出是 `output_preview` 的预览；失败只 toast 一句，不阻塞对话）。
+4. **`setup` 怎么跑**：和内核的后台命令同一套——Windows 走 pwsh / Windows PowerShell 的
+   `-NoProfile -NonInteractive`，非 Windows 走 `sh -c`；带那份「不弹窗口」的环境变量，
+   `CREATE_NO_WINDOW`；最多 900 秒，超时就杀掉。不弹终端、不抢焦点。
+5. **菜单补了一条**「重新复制配置里的文件」（配了 `worktree.copy` 且 worktree 目录还在时才有）：
+   改完规则不想重开会话时手动补一遍。
+6. 建 worktree 期间提示里那句「未提交的改动不会带过去」仍然对——复制的是 `worktree.copy` 里列的未跟踪文件，
+   其余未提交的改动照样不过去（那是分支的语义，不是遗漏）。
+
 ## 十一、落地时改了什么（2026-10-22）
 
 和上面方案的差异，都是实现时才看清的：
@@ -169,5 +193,4 @@ pub struct WorktreeMeta {
 5. **`in_worktree()` 删了**（没人用），侧栏和顶栏直接看 `s.worktree.is_some()`。
 6. **`WorktreeStatus::is_disposable`**（干净且没有未合并提交）统一了「可以丢」的判断：菜单里显示「干净」、
    删会话 / 归档时只在这时候顺手删空 worktree。
-7. **第 5 步（`worktree.copy` / `worktree.setup`）没做**：未跟踪文件（`.env`、依赖目录）暂时不会带过去，
-   菜单项说明里写明了「未提交的改动不会带过去」。
+11. **第 5 步（`worktree.copy` / `worktree.setup`）后来补上了**（见第十二节）。

@@ -56,6 +56,9 @@ impl ChatApp {
                 return;
             }
         };
+        // 项目里配了 worktree.copy / worktree.setup 的话，建好之后要做的事现在就记下来
+        // （建完那一刻会话可能已经换了，读配置用的还是建之前的目录）
+        let setup = self.worktree_setup_for(&repo);
         let Some(data) = claudesktop_core::default_data_dir().ok() else {
             self.toast(Notification::error("找不到数据目录"), cx);
             return;
@@ -93,7 +96,13 @@ impl ChatApp {
                 };
                 app.sessions[idx].worktree_busy = None;
                 match result {
-                    Ok(path) => app.adopt_worktree(idx, path, meta, cx),
+                    Ok(path) => {
+                        let idx = app.adopt_worktree(idx, path, meta, cx);
+                        // 项目里配了 worktree.copy / worktree.setup：在换好的那个会话里跑
+                        if let Some(idx) = idx {
+                            app.run_worktree_setup(idx, repo.clone(), setup.clone(), cx);
+                        }
+                    }
                     Err(err) => app.toast(
                         Notification::error(format!(
                             "没建成 worktree：{err}（这段对话还在原目录）"
@@ -109,13 +118,14 @@ impl ChatApp {
 
     /// 建好了：会话换到 worktree 目录，并在内核上重新开一个会话（还没发过消息的原地换；
     /// 已经有对话的了另开一个对应的，见 [`Self::adopt_worktree`] 的说明）。
+    /// 返回 worktree 最后落在哪个会话（会话被删了返回 None）。
     fn adopt_worktree(
         &mut self,
         idx: usize,
         path: PathBuf,
         meta: WorktreeMeta,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<usize> {
         let s = &self.sessions[idx];
         let has_chat = s.has_user_message() || s.busy;
         if has_chat {
@@ -138,7 +148,7 @@ impl ChatApp {
                 ),
                 cx,
             );
-            return;
+            return Some(new);
         }
         let kind = s.kernel;
         // 建 worktree 期间排队的消息：换会话（`replace_session`）会新建一个 Session，先收好再放回去
@@ -161,6 +171,7 @@ impl ChatApp {
         // 建好之前写的消息接着发（会话还没就绪时留着，Started 之后由 `dispatch_queued` 带走）
         self.dispatch_queued(idx, cx);
         cx.notify();
+        Some(idx)
     }
 
     /// 会话是不是停在一个已经不存在的 worktree 目录上（用户手动删了 / 换了电脑）。
@@ -358,6 +369,19 @@ impl ChatApp {
                     .text_size(TEXT_META)
                     .text_color(rgb(INK_SOFT))
                     .child(format!("现在不能自动合并：{reason}")),
+            );
+        }
+        // 项目里配了 worktree.copy 时给一个手动重跑：改完规则不想重开会话
+        if !app.worktree_setup_for(&repo).copy.is_empty() && path.is_dir() {
+            menu = menu.pick(
+                menu_item(
+                    "worktree-recopy",
+                    IconAll::Copy,
+                    "重新复制配置里的文件",
+                    "按项目配置的 worktree.copy 再从主目录复制一遍",
+                    false,
+                ),
+                move |this, cx| this.recopy_worktree(cx),
             );
         }
         menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick_in(

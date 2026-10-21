@@ -33,6 +33,7 @@ mod suggest;
 mod usage_view;
 mod widgets;
 mod worktree;
+mod worktree_setup;
 
 use crate::demo::*;
 use crate::model::*;

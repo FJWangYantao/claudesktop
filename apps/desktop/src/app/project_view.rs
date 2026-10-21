@@ -42,6 +42,10 @@ pub(super) struct ProjectForm {
     /// 权限规则，一行一条
     rules: Entity<TextareaState>,
     instructions: Entity<InputState>,
+    /// 建 worktree 时从主目录复制过去的文件 / glob，一行一条
+    worktree_copy: Entity<TextareaState>,
+    /// 建 worktree 之后跑的初始化命令（如 `npm install`）
+    worktree_setup: Entity<InputState>,
     /// 表单里这个项目停用的 MCP 服务器
     mcp_disabled: Vec<String>,
     /// 表单里这个项目启用的插件；None = 跟全局
@@ -64,8 +68,10 @@ impl ProjectForm {
         let rules = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8));
         let instructions =
             cx.new(|cx| InputState::new(window, cx).placeholder("默认读 AGENTS.md / CLAUDE.md"));
+        let worktree_copy = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6));
+        let worktree_setup = cx.new(|cx| InputState::new(window, cx).placeholder("如 npm install"));
         // 打字时清掉上次的结果；离开输入框（或单行框里按回车）时写文件
-        for input in [&model, &instructions] {
+        for input in [&model, &instructions, &worktree_setup] {
             cx.subscribe(input, |this: &mut ChatApp, _, event: &InputEvent, cx| match event {
                 InputEvent::Change => this.project_edited(cx),
                 InputEvent::Blur | InputEvent::PressEnter { .. } => this.apply_project(cx),
@@ -79,12 +85,20 @@ impl ProjectForm {
             InputEvent::PressEnter { .. } | InputEvent::Focus => {}
         })
         .detach();
+        cx.subscribe(&worktree_copy, |this: &mut ChatApp, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => this.project_edited(cx),
+            InputEvent::Blur => this.apply_project(cx),
+            InputEvent::PressEnter { .. } | InputEvent::Focus => {}
+        })
+        .detach();
         Self {
             root: PathBuf::new(),
             path: PathBuf::new(),
             model,
             rules,
             instructions,
+            worktree_copy,
+            worktree_setup,
             mcp_disabled: Vec::new(),
             plugins: None,
             saved: ProjectConfig::default(),
@@ -109,6 +123,7 @@ fn normalize(mut config: ProjectConfig) -> ProjectConfig {
     if let Some(plugins) = &mut config.plugins_enabled {
         plugins.sort();
     }
+    config.worktree = config.worktree.normalized();
     config
 }
 
@@ -132,12 +147,16 @@ impl ChatApp {
         let rules_text = config.permissions.join("\n");
         let instructions_text =
             config.instructions.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let copy_text = config.worktree.copy.join("\n");
+        let setup_text = config.worktree.setup.clone().unwrap_or_default();
         let form = &mut self.project_form;
         form.root = root;
         form.path = path;
         form.model.update(cx, |s, cx| s.set_value(model_text, window, cx));
         form.rules.update(cx, |s, cx| s.set_value(rules_text, window, cx));
         form.instructions.update(cx, |s, cx| s.set_value(instructions_text, window, cx));
+        form.worktree_copy.update(cx, |s, cx| s.set_value(copy_text, window, cx));
+        form.worktree_setup.update(cx, |s, cx| s.set_value(setup_text, window, cx));
         form.mcp_disabled = config.mcp_disabled.clone();
         form.plugins = config.plugins_enabled.clone();
         form.warnings = config.warnings.clone();
@@ -166,6 +185,19 @@ impl ChatApp {
             mcp_disabled: form.mcp_disabled.clone(),
             plugins_enabled: form.plugins.clone(),
             instructions: (!instructions.is_empty()).then(|| PathBuf::from(instructions)),
+            worktree: claudesktop_core::project::WorktreeConfig {
+                copy: form
+                    .worktree_copy
+                    .read(cx)
+                    .value()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                setup: Some(form.worktree_setup.read(cx).value().trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            },
             warnings: Vec::new(),
             broken: false,
         }
@@ -422,6 +454,28 @@ impl ChatApp {
             .child(Self::text_input(&form.instructions))
             .child(note(IconAll::Dot, "相对项目根，在 AGENTS.md / CLAUDE.md 之后追加"));
 
+        // worktree：建 worktree 之后复制哪些文件、跑什么命令（都没配时什么都不做）
+        let worktree = div()
+            .v_flex()
+            .gap_1p5()
+            .child(
+                div()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(CARD))
+                    .px_1()
+                    .font_family(MONO)
+                    .text_size(TEXT_SMALL)
+                    .child(Textarea::new(&form.worktree_copy).appearance(false).bordered(false)),
+            )
+            .child(Self::text_input(&form.worktree_setup))
+            .child(note(
+                IconAll::Dot,
+                "上面一行一条：建 worktree 时从主目录复制过去的文件（如 .env*），相对项目根",
+            ))
+            .child(note(IconAll::Dot, "下面这一行是建好之后在里面跑的初始化命令（如 npm install）"));
+
         // 底部：上次写文件的结果（即时生效，没有保存按钮）
         let status: AnyElement = match &form.message {
             Some((error, text)) => div()
@@ -452,7 +506,12 @@ impl ChatApp {
                         .child(form_field("权限规则", None, rules))
                         .child(form_field("停用的 MCP", Some("只在这个项目里不连".into()), mcp))
                         .child(form_field("插件", Some("从全局已启用的插件里挑".into()), plugins))
-                        .child(form_field("说明文件", None, instructions)),
+                        .child(form_field("说明文件", None, instructions))
+                        .child(form_field(
+                            "worktree",
+                            Some("建 worktree 时复制哪些文件、跑什么命令".into()),
+                            worktree,
+                        )),
                 )
                 .child(footer),
         )

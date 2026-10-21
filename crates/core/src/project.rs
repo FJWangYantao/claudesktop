@@ -8,6 +8,7 @@
 //! - `mcpDisabled`：这个项目里要停用的 MCP 服务器名列表
 //! - `pluginsEnabled`：这个项目启用的插件列表（空 / 缺省 = 跟全局）
 //! - `instructions`：项目说明文件的路径（相对项目根；缺省还是 AGENTS.md / CLAUDE.md）
+//! - `worktree`：建 worktree 后要跟着过去的东西，见 [`WorktreeConfig`]
 //!
 //! 读取发生在开自研内核会话时；文件坏了给能照着改的中文错误，按没有项目配置处理。
 
@@ -40,6 +41,8 @@ pub struct ProjectConfig {
     pub plugins_enabled: Option<Vec<String>>,
     /// 项目说明文件（相对项目根）
     pub instructions: Option<PathBuf>,
+    /// 建 worktree 之后做的事（复制未跟踪文件、跑初始化命令）
+    pub worktree: WorktreeConfig,
     /// 读文件时发现的问题（不影响可用字段的生效）
     pub warnings: Vec<String>,
     /// 文件解析不了（不是 JSON、字段类型不对）：可用字段都不生效，[`save`] 也不会覆盖它
@@ -59,9 +62,21 @@ struct FileFormat {
     plugins_enabled: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worktree: Option<WorktreeFormat>,
     /// 不认识的键（`$schema`、以后的新字段、手写的备注）：读时提示，写回时原样留着
     #[serde(flatten)]
     other: serde_json::Map<String, Value>,
+}
+
+/// `worktree` 一栏的文件格式：`{"copy": [".env*", "data/"], "setup": "npm install"}`。
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct WorktreeFormat {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    copy: Vec<String>,
+    /// 初始化命令；空串（或只有空白）= 不跑
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup: Option<String>,
 }
 
 /// 编辑器常用的 `$schema` 键：认得，不提示
@@ -175,6 +190,169 @@ pub fn shared_dir(cwd: &Path) -> PathBuf {
     cwd.to_path_buf()
 }
 
+/// 建 worktree 之后要做的两件事（项目配置的 `worktree` 一栏，见「设计说明-worktree.md」第七节）：
+///
+/// - `copy`：从主目录复制过去的文件 / glob，典型是 `.env*`。未跟踪文件（`.env`、依赖目录）
+///   不会跟着 `git worktree add` 过去，而 `.env` 缺了很多项目根本跑不起来。
+/// - `setup`：初始化命令（如 `npm install`），在 worktree 里跑一遍，输出进对话里的一张工具卡。
+///
+/// 两项都没配时什么都不做，界面上也不提。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeConfig {
+    /// 要复制过去的文件 / 目录，相对主仓库根的 glob（`*` / `?` / `**` 按段匹配；
+    /// 以 `/` 结尾表示只要目录）。写绝对路径按主仓库相对算不了，会进警告。
+    pub copy: Vec<String>,
+    /// 建好之后在 worktree 里跑的初始化命令
+    pub setup: Option<String>,
+}
+
+impl WorktreeConfig {
+    /// 什么都没配：建 worktree 时不用多做任何事。
+    pub fn is_empty(&self) -> bool {
+        self.copy.iter().all(|c| c.trim().is_empty()) && self.setup.is_none()
+    }
+
+    /// 规整一下：去掉空白项、`setup` 去掉首尾空白（空串当没配）。
+    pub fn normalized(&self) -> Self {
+        Self {
+            copy: self
+                .copy
+                .iter()
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect(),
+            setup: self.setup.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+/// 从模板列出一条复制规则在 `repo` 下匹配到的路径（相对 `repo`），排序去重。
+/// 规则里 `*` / `?` 在**一段路径**内匹配，`**` 匹配任意层；以 `/` 结尾的只看目录，
+/// 其余文件和目录都算。写绝对路径的规则直接跳过（[`WorktreeConfig::copy`] 说的是相对路径）。
+pub fn copy_matches(repo: &Path, pattern: &str) -> Vec<PathBuf> {
+    let pattern = pattern.trim().trim_start_matches("./").replace('\\', "/");
+    let pattern = pattern.trim_matches('/');
+    if pattern.is_empty() || Path::new(pattern).is_absolute() {
+        return Vec::new();
+    }
+    let dir_only = pattern.ends_with('/') || pattern.ends_with("/*");
+    let pattern = pattern.trim_end_matches('/');
+    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+
+    let mut out = Vec::new();
+    let mut dirs = vec![repo.to_path_buf()];
+    for (i, segment) in segments.iter().enumerate() {
+        let last = i + 1 == segments.len();
+        let mut next = Vec::new();
+        for dir in &dirs {
+            // `**`：从这一层往下所有目录都算（`**/x` 的 `x` 在每一层里找）
+            let deep = *segment == "**";
+            let bases: Vec<PathBuf> = if deep {
+                walk_dirs(dir.to_path_buf())
+            } else {
+                vec![dir.clone()]
+            };
+            for base in bases {
+                for entry in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let path = entry.path();
+                    if deep {
+                        // `**` 这一层不消耗路径段：把子目录继续交给后面的段
+                        if path.is_dir() {
+                            next.push(path);
+                        }
+                        continue;
+                    }
+                    if !glob_match(segment, &name) {
+                        continue;
+                    }
+                    let is_dir = path.is_dir();
+                    if last {
+                        if !dir_only || is_dir {
+                            out.push(path);
+                        }
+                    } else if is_dir {
+                        next.push(path);
+                    }
+                }
+            }
+        }
+        match next.is_empty() {
+            true => break,
+            false => dirs = next,
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `dir` 自己和它下面所有子目录（`**` 用；跳过 `.git`，它不该被复制过去）。
+fn walk_dirs(dir: PathBuf) -> Vec<PathBuf> {
+    let mut out = vec![dir.clone()];
+    let mut queue = vec![dir];
+    while let Some(dir) = queue.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.path().is_dir() {
+                out.push(entry.path());
+                queue.push(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// 一段路径的简单 glob：`*` 任意字符、`?` 单个字符，其余按字面比（区分大小写之外都按原样）。
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.split_first() {
+            None => t.is_empty(),
+            Some(('*', rest)) => (0..=t.len()).any(|i| go(rest, &t[i..])),
+            Some(('?', rest)) => !t.is_empty() && go(rest, &t[1..]),
+            Some((c, rest)) => t.first() == Some(c) && go(rest, &t[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    go(&p, &t)
+}
+
+/// 把一条匹配到的文件 / 目录从 `repo` 复制到 `worktree`（同名覆盖；目录递归复制）。
+/// 返回复制了几个条目（目录按里面有几个文件算）。
+pub fn copy_into(repo: &Path, worktree: &Path, relative: &Path) -> Result<usize, String> {
+    let from = repo.join(relative);
+    let to = worktree.join(relative);
+    copy_path(&from, &to)
+}
+
+/// 递归复制：普通文件按字节复制（保留权限位）；目录先建再逐个孩子；
+/// 符号链接按它的目标复制内容（跟随，避免把主仓库的路径带进 worktree）。
+fn copy_path(from: &Path, to: &Path) -> Result<usize, String> {
+    let meta = std::fs::symlink_metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?;
+    let meta = if meta.is_symlink() {
+        std::fs::metadata(from).map_err(|e| format!("读不了 {}：{e}", from.display()))?
+    } else {
+        meta
+    };
+    if meta.is_dir() {
+        std::fs::create_dir_all(to).map_err(|e| format!("建不了 {}：{e}", to.display()))?;
+        let mut n = 0;
+        for entry in std::fs::read_dir(from).map_err(|e| format!("读不了 {}：{e}", from.display()))? {
+            let entry = entry.map_err(|e| format!("读不了 {}：{e}", from.display()))?;
+            n += copy_path(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(n);
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建不了 {}：{e}", parent.display()))?;
+    }
+    std::fs::copy(from, to).map_err(|e| format!("复制不了 {}：{e}", from.display()))?;
+    Ok(1)
+}
+
 /// 读项目配置；没有文件返回 None，文件坏了返回带警告的默认（还能用）。
 pub fn load(cwd: &Path) -> Option<ProjectConfig> {
     let root = project_root(cwd)?;
@@ -194,6 +372,10 @@ pub fn load(cwd: &Path) -> Option<ProjectConfig> {
             config.plugins_enabled = f.plugins_enabled;
             config.instructions =
                 f.instructions.filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+            if let Some(w) = f.worktree {
+                let setup = w.setup.unwrap_or_default();
+                config.worktree = WorktreeConfig { copy: w.copy, setup: Some(setup) }.normalized();
+            }
             for key in f.other.keys().filter(|k| *k != SCHEMA_KEY) {
                 config.warnings.push(format!(
                     "{} 里有不认识的字段 `{key}`（忽略；保存时原样留着）",
@@ -269,6 +451,10 @@ impl FileFormat {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .filter(|s| !s.trim().is_empty()),
+            worktree: {
+                let w = config.worktree.normalized();
+                (!w.is_empty()).then_some(WorktreeFormat { copy: w.copy, setup: w.setup })
+            },
             other: serde_json::Map::new(),
         }
     }
@@ -279,6 +465,7 @@ impl FileFormat {
             && self.mcp_disabled.is_none()
             && self.plugins_enabled.is_none()
             && self.instructions.is_none()
+            && self.worktree.is_none()
             && self.other.is_empty()
     }
 }
@@ -336,8 +523,15 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("claudesktop-project-{name}-{}", std::process::id()));
+        // 和 `git.rs` 的测试一样：按「名字 + 时间戳」建唯一目录。不能用「进程号」——并发跑的测试
+        // 同进程号，另一个测试刚把它删掉时这里会撞上正在被删的目录（Windows 上报「拒绝访问」）。
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "claudesktop-project-{name}-{}-{stamp}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -438,6 +632,88 @@ mod tests {
     fn no_file_is_none() {
         let dir = tmp("empty");
         assert!(load(&dir).is_none());
+    }
+
+    /// `worktree` 一栏：读得出来、写回去、空白项被清掉；什么都没配时文件里不出现这一栏
+    #[test]
+    fn reads_and_writes_the_worktree_section() {
+        let dir = tmp("worktree-config");
+        std::fs::create_dir_all(dir.join(".claudesktop")).unwrap();
+        std::fs::write(
+            path_in(&dir),
+            r#"{"worktree":{"copy":[".env*"," ","data/"],"setup":"  npm install  "}}"#,
+        )
+        .unwrap();
+        let mut c = load(&dir).unwrap();
+        assert_eq!(c.worktree.copy, vec![".env*".to_string(), "data/".to_string()]);
+        assert_eq!(c.worktree.setup.as_deref(), Some("npm install"));
+        assert!(!c.worktree.is_empty());
+        // 写回去还是这两项
+        c.model = None;
+        save(&dir, &c).unwrap();
+        let text = std::fs::read_to_string(path_in(&dir)).unwrap();
+        assert!(text.contains("\".env*\""), "{text}");
+        assert!(text.contains("npm install"), "{text}");
+        // 都空着：这一栏不写（一个字段都不剩时整个文件都删掉）
+        c.worktree = WorktreeConfig::default();
+        save(&dir, &c).unwrap();
+        assert!(!path_in(&dir).exists(), "全空时不该留一个空对象在仓库里");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复制规则：`*` 只在一段路径内、`**` 跨层、以 `/` 结尾的只要目录、绝对路径跳过
+    #[test]
+    fn copy_patterns_match_the_way_users_expect() {
+        let dir = tmp("copy-patterns");
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("crates/a/src")).unwrap();
+        let touch = |p: &str| std::fs::write(dir.join(p), "x").unwrap();
+        touch(".env");
+        touch(".env.local");
+        touch("config/db.json");
+        touch("crates/a/src/main.rs");
+        touch("readme.md");
+
+        let names = |pattern: &str| -> Vec<String> {
+            copy_matches(&dir, pattern)
+                .iter()
+                .map(|p| p.strip_prefix(&dir).unwrap().display().to_string().replace('\\', "/"))
+                .collect()
+        };
+        assert_eq!(names(".env*"), [".env", ".env.local"]);
+        assert_eq!(names("config/*.json"), ["config/db.json"]);
+        // `**` 跨层：每个 crates 下面的 main.rs 都算
+        assert_eq!(names("**/main.rs"), ["crates/a/src/main.rs"]);
+        // 以 / 结尾的只要目录
+        assert_eq!(names("crates/"), ["crates"]);
+        // 文件也匹配（不带 / 时）
+        assert_eq!(names("readme.md"), ["readme.md"]);
+        // 匹配不到、绝对路径、空规则都给空
+        assert!(names("nope*").is_empty());
+        assert!(copy_matches(&dir, "C:/Windows/win.ini").is_empty());
+        assert!(copy_matches(&dir, "  ").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 复制一个目录过去：里面的文件都跟着，目标目录不存在时自动建
+    #[test]
+    fn copies_a_directory_into_the_worktree() {
+        let dir = tmp("copy-into");
+        let repo = dir.join("repo");
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(repo.join("conf/nested")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(repo.join(".env"), "K=1").unwrap();
+        std::fs::write(repo.join("conf/nested/x.json"), "{}").unwrap();
+
+        assert_eq!(copy_into(&repo, &wt, Path::new(".env")).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "K=1");
+        assert_eq!(copy_into(&repo, &wt, Path::new("conf")).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(wt.join("conf/nested/x.json")).unwrap(), "{}");
+        // 源不存在：给能看懂的原因
+        let err = copy_into(&repo, &wt, Path::new("nope")).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
