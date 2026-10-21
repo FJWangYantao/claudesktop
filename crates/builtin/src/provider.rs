@@ -95,6 +95,9 @@ impl RequestParams {
 /// 思考强度档位：对外的唯一选项，预算 / effort 只是翻译出来的值。
 ///
 /// 顺序即强弱（`Ord` 用来降级，见 [`resolve_level`]）。`Off` 最小、`XHigh` 最大。
+/// 比 `"默认"` 那个 `None` 多一档「兜底」：
+/// `Default` 不是「什么都不发」（那是 `None`），它表示**能力表里没有的模型也按
+/// [`FALLBACK_LEVELS`] 发 effort**，认得的模型上则落到最低一档（见 [`ThinkingSpec::resolve`]）。
 #[derive(
     Debug,
     Clone,
@@ -117,6 +120,11 @@ pub enum ThinkingLevel {
     Medium,
     High,
     XHigh,
+    /// 「默认（兜底）」：能力表里没有的模型也发 effort（见 [`FALLBACK_LEVELS`]）。
+    ///
+    /// 排在最后是为了让 `Ord` 仍然是「越大越强」的顺序——它不是一档强度，
+    /// 用 `resolve` 换成了具体档位，别的按强度比大小的代码不会撞上它
+    Default,
 }
 
 impl ThinkingLevel {
@@ -137,6 +145,7 @@ impl ThinkingLevel {
             Self::Medium => "中",
             Self::High => "高",
             Self::XHigh => "极高",
+            Self::Default => "兜底",
         }
     }
 
@@ -167,6 +176,9 @@ pub enum ThinkingFormat {
         on: fn() -> Value,
         off: fn() -> Value,
     },
+    /// 用户的「默认（兜底）」：能力表里没有的模型也按 [`FALLBACK_LEVELS`] 发 effort，
+    /// `apply_thinking` 这时把 `effort_for` 的写法放进 [`ThinkingFormat::field`]
+    Default,
 }
 
 impl PartialEq for ThinkingFormat {
@@ -178,6 +190,7 @@ impl PartialEq for ThinkingFormat {
             | (Self::ResponsesEffort, Self::ResponsesEffort) => true,
             // 字段一样就算一样：取值函数由 `key` 唯一决定
             (Self::Toggle { key: a, .. }, Self::Toggle { key: b, .. }) => a == b,
+            (Self::Default, Self::Default) => true,
             _ => false,
         }
     }
@@ -185,10 +198,22 @@ impl PartialEq for ThinkingFormat {
 
 impl Eq for ThinkingFormat {}
 
+impl ThinkingFormat {
+    /// 兜底（[`ThinkingFormat::Default`]）按协议发哪个 effort 字段
+    fn field(self, protocol: Protocol) -> &'static str {
+        match protocol {
+            Protocol::OpenAiCompat => "reasoning_effort",
+            Protocol::Responses => "reasoning.effort",
+            Protocol::Anthropic => "output_config.effort",
+        }
+    }
+}
+
 /// 一门协议 + 一个模型支持什么：能选哪些档位，字段怎么发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThinkingSpec {
-    /// 支持的档位（升序）。空 = 认不出这个模型：界面不显示、请求里也不带
+    /// 支持的档位（升序）。空 = 认不出这个模型：请求里默认不带思考字段
+    /// （用户选了「默认（兜底）」才会按 [`FALLBACK_LEVELS`] 发）
     pub levels: &'static [ThinkingLevel],
     pub format: ThinkingFormat,
     /// 认不认非默认的 `temperature`。Opus 4.7 以后的新模型一律不认（400），
@@ -196,16 +221,37 @@ pub struct ThinkingSpec {
     pub accepts_temperature: bool,
 }
 
+/// 「默认（兜底）」：能力表里没有的模型也能选档位，按这套档位发 effort。
+///
+/// 不是凭空的猜测——这几档的取值（`low` / `medium` / `high` / `xhigh`）是 2026 年
+/// 主流推理模型的共同子集，中转点上的新模型（`cn:xxx`）基本都收。**兜底只发 effort，
+/// 不发厂商私有的开关字段**（`thinking` / `enable_thinking`）：那些字段写错了就是 400，
+/// 而 `reasoning_effort` 在 OpenAI 兼容端点上早就是通用字段，不认的模型一般直接忽略。
+pub const FALLBACK_LEVELS: &[ThinkingLevel] =
+    &[ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::XHigh];
+
 impl ThinkingSpec {
-    /// 认不出（界面整行不显示、请求不带任何思考字段）
+    /// 认不出（界面除非用户选了「默认（兜底）」否则不显示档位、请求不带思考字段）
     pub const NONE: ThinkingSpec = ThinkingSpec {
         levels: &[],
         format: ThinkingFormat::AnthropicBudget,
         accepts_temperature: true,
     };
 
+    /// 认不出 → 用「兜底」的写法（按协议编 effort，见 `apply_thinking`）
+    pub const FALLBACK: ThinkingSpec = ThinkingSpec {
+        levels: FALLBACK_LEVELS,
+        format: ThinkingFormat::Default,
+        accepts_temperature: true,
+    };
+
     pub fn is_known(&self) -> bool {
         !self.levels.is_empty()
+    }
+
+    /// 能选的全部档位：认得就用它的，认不出就用 [`FALLBACK_LEVELS`]
+    pub fn choices(&self) -> &'static [ThinkingLevel] {
+        if self.is_known() { self.levels } else { FALLBACK_LEVELS }
     }
 
     /// 能不能明确关掉思考（没有「关」这一档的模型关不掉）
@@ -224,6 +270,10 @@ impl ThinkingSpec {
     /// 开 / 关型（`Toggle`）多一步：它只有「开 / 关」，用户选中间几档都按「开」处理，
     /// 不能因为「高」比「中」大就降成「关」——那等于把用户要的思考关掉了。
     pub fn resolve(&self, chosen: ThinkingLevel) -> Option<ThinkingLevel> {
+        if !self.is_known() {
+            // 兜底档位：和认得的模型一样按 [`FALLBACK_LEVELS`] 降级
+            return resolve_level(chosen, FALLBACK_LEVELS);
+        }
         if matches!(self.format, ThinkingFormat::Toggle { .. })
             && let Some(on) = self.levels.iter().rev().find(|l| !l.is_off())
         {
@@ -241,6 +291,8 @@ impl ThinkingSpec {
 ///
 /// `anthropic/claude-opus-4-7`、`anthropic.claude-opus-4-7`、`us.anthropic.claude-opus-4-7-v1:0`、
 /// `claude-opus-4-7-20260101` 都要落成 `claude-opus-4-7`。
+/// 多模型中转点的模型名常带一层端点标签（`cn:glm-5.3`、`global:gpt-5.5`），也一起剥，
+/// 否则 `glm-` / `qwen3` / `deepseek-` 这些按厂商名开头的规则一条也认不出。
 fn model_key(model: &str) -> String {
     let mut name = model.trim().to_ascii_lowercase();
     // 供应商前缀（`vendor/`、`vendor.` 都见过；Bedrock 的 `us.anthropic.` 是两层）。
@@ -254,7 +306,13 @@ fn model_key(model: &str) -> String {
                     .filter(|i| name[*i + 1..].starts_with(|c: char| c.is_ascii_alphabetic())),
             )
             .min();
+        // 前缀那一截要像厂商名（纯字母或带连字符 / 下划线）：`qwen3-coder:free` 的 `free` 是后缀，
+        // 剥了就认不出 qwen3；`cn:` / `global:` / `deepseek_ai/` 才是前缀
         let Some(cut) = cut else { break };
+        let tag = &name[..cut];
+        if !tag.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_') {
+            break;
+        }
         let rest = &name[cut + 1..];
         if !rest.chars().any(|c| c.is_ascii_alphabetic()) {
             break;
@@ -262,6 +320,14 @@ fn model_key(model: &str) -> String {
         name = rest.to_string();
     }
     name
+}
+
+/// 认得的、靠厂商字段「开 / 关」的模型：认得就返回它那份 spec（字段写法在 [`openai_spec`] 里
+/// 同一份定义）。Anthropic 格式的第三方端点照搬这个开关字段——它和协议无关
+/// （Qwen 的 `enable_thinking`、GLM / DeepSeek 的 `thinking.type` 两条线的端点都收）。
+fn vendor_toggle(name: &str) -> Option<ThinkingSpec> {
+    let spec = openai_spec(name);
+    matches!(spec.format, ThinkingFormat::Toggle { .. }).then_some(spec)
 }
 
 /// OpenAI 兼容 / Responses 协议下的能力表（按 [`model_key`] 后的名字匹配）。
@@ -391,23 +457,34 @@ fn anthropic_spec(name: &str) -> ThinkingSpec {
         format: ThinkingFormat::AnthropicAdaptive,
         accepts_temperature,
     };
-    // 名字里不带 claude 的是 Anthropic 格式的第三方端点。只认确认过收旧格式预算的那几家
-    // （DeepSeek、GLM，和 OpenAI 兼容表里认得的同一批）；别的认不出，什么都不发
+    // 名字里不带 claude 的是 Anthropic 格式的第三方端点。认两种：
+    // - OpenAI 兼容表里靠厂商字段开 / 关的那几家（Qwen / GLM / DeepSeek）：照搬同一个字段；
+    // - 确认过收旧格式预算的 DeepSeek / GLM。
+    // 别的认不出，什么都不发
     if !name.contains("claude") {
         let budget_ok = name.starts_with("deepseek-") || name.starts_with("glm-");
-        if !budget_ok || !openai_spec(name).is_known() {
+        // 总要思考的模型（`deepseek-reasoner` / `*-r1`）：没有「关」这一档，
+        // 连这一行都不给（OpenAI 兼容表里也是认不出的）
+        let always_thinks = name.contains("reasoner") || name.contains("-r1");
+        let spec = if let Some(spec) = vendor_toggle(name) && !budget_ok {
+            // OpenAI 兼容表里靠厂商字段开 / 关的那几家（Qwen / GLM / DeepSeek）：
+            // 端点换成 Anthropic 格式照样发同一个开关字段，不能因为换了协议就没这一项
+            spec
+        } else if budget_ok {
+            ThinkingSpec {
+                levels: &[
+                    ThinkingLevel::Off,
+                    ThinkingLevel::Low,
+                    ThinkingLevel::Medium,
+                    ThinkingLevel::High,
+                ],
+                format: ThinkingFormat::AnthropicBudget,
+                accepts_temperature: true,
+            }
+        } else {
             return ThinkingSpec::NONE;
-        }
-        return ThinkingSpec {
-            levels: &[
-                ThinkingLevel::Off,
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
-            ],
-            format: ThinkingFormat::AnthropicBudget,
-            accepts_temperature: true,
         };
+        return if always_thinks { ThinkingSpec::NONE } else { spec };
     }
     // 关不掉的那一代（`disabled` 一律 400）：低 ~ 极高
     let no_off = [
@@ -519,6 +596,8 @@ pub fn thinking_budget_for(level: ThinkingLevel) -> u64 {
         ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => 2_048,
         ThinkingLevel::Medium => 8_192,
         ThinkingLevel::High | ThinkingLevel::XHigh => 16_000,
+        // 「兜底」不是一档强度，进到这里前已经由 `resolve` 换成具体档位；真到了按最低算
+        ThinkingLevel::Default => 2_048,
     }
 }
 
@@ -531,25 +610,36 @@ fn effort_for(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::XHigh => "xhigh",
+        // 「兜底」只管「发不发」，具体档位由 `resolve` 现挑；漏到这里按最低的发
+        ThinkingLevel::Default => "low",
     }
 }
 
 /// 把档位写进请求体（三个 provider 组完请求体、合 `extra` **之前**各调一次）。
 ///
 /// - `params.thinking == None`：什么都不做（用模型自己的默认）
-/// - 认不出的模型：什么都不做（宁可没有这个选项，也不要发个对方不认的字段）
+/// - 认不出的模型：只有选「默认（兜底）」（[`ThinkingLevel::Default`]）时才发，
+///   按 [`FALLBACK_LEVELS`] 换成 effort 字段，其余档位一律不动
 /// - 模型不支持选的这一档：按 [`resolve_level`] 降级后再编
 /// - 开着思考时不发 `temperature`；`accepts_temperature == false` 的模型（Opus 4.7 以后）
 ///   不管开没开都不发——这是以前「填了预算才不发」之外的另一半
-pub fn apply_thinking(body: &mut Value, protocol: Protocol, model: &str, params: &RequestParams) {
+pub fn apply_thinking(
+    body: &mut Value,
+    protocol: Protocol,
+    model: &str,
+    params: &RequestParams,
+) {
     let spec = thinking_spec(protocol, model);
     if !spec.accepts_temperature {
         body.as_object_mut().map(|o| o.remove("temperature"));
     }
     let Some(chosen) = params.thinking else { return };
-    if !spec.is_known() {
+    // 认不出的模型：只有选「默认（兜底）」才走兜底那份 spec（下面 match 的 `Default` 分支）。
+    // `"默认"`（None）的意思一直是「什么都不发」，别的具体档位也不敢猜，一律不动
+    if !spec.is_known() && chosen != ThinkingLevel::Default {
         return;
     }
+    let spec = if spec.is_known() { spec } else { ThinkingSpec::FALLBACK };
     let Some(level) = spec.resolve(chosen) else { return };
     let thinking_on = !level.is_off();
     if thinking_on {
@@ -600,6 +690,17 @@ pub fn apply_thinking(body: &mut Value, protocol: Protocol, model: &str, params:
         ThinkingFormat::Toggle { key, on, off } => {
             body[key] = if thinking_on { on() } else { off() };
         }
+        // 认不出的模型选了「兜底」（`spec` 换成了 [`ThinkingSpec::FALLBACK`]）：
+        // 只发 effort，不发厂商私有开关——那些字段写错了就是 400
+        ThinkingFormat::Default => {
+            if protocol == Protocol::Responses {
+                body["reasoning"] =
+                    serde_json::json!({ "effort": effort_for(level), "summary": "auto" });
+            } else {
+                body[ThinkingFormat::Default.field(protocol)] =
+                    serde_json::json!(effort_for(level));
+            }
+        }
     }
 }
 
@@ -614,6 +715,10 @@ pub struct ProviderConfig {
     pub params: RequestParams,
     /// 用量网关：有就把请求经它转发、每个请求记一行日志（见 `gateway` 模块）；None = 直连
     pub gateway: Option<crate::gateway::GatewayHandle>,
+    /// `web_search` 的 DeepSeek 后端复用哪把 key（None = 这个档案不是 DeepSeek 端点）。
+    /// 界面按档案的 base_url / 名字挑一把填进来，内核起 `set_key_hint` 交给 `websearch`；
+    /// 状态文件（搜索后端的选择）里存不了 key，所以 key 跟着 provider 配置走。
+    pub deepseek_key: Option<String>,
 }
 
 impl ProviderConfig {
@@ -1121,6 +1226,7 @@ mod tests {
             model: "m".into(),
             params: RequestParams::default(),
             gateway: None,
+            deepseek_key: None,
         };
         assert_eq!(config.identity(), "builtin:http://x/v1#m");
         config.protocol = Protocol::Anthropic;
@@ -1148,6 +1254,21 @@ mod tests {
         assert_eq!(model_key("glm-4.5-air"), "glm-4.5-air");
         assert_eq!(model_key("qwen3-coder"), "qwen3-coder");
         assert_eq!(model_key("deepseek_ai/deepseek-chat"), "deepseek-chat");
+        // `:free` 这类后缀不剥（前缀那一截得像个厂商名：纯字母或带连字符）
+        assert_eq!(model_key("qwen3-coder:free"), "qwen3-coder:free");
+    }
+
+    /// 多模型中转点的模型名带端点标签（`cn:` / `global:`）：剥完要落回原来的厂商名，
+    /// 否则 glm / qwen3 / deepseek 这些按厂商名开头的规则一条也认不出。
+    #[test]
+    fn model_keys_strip_relay_tags() {
+        assert_eq!(model_key("cn:glm-5.3"), "glm-5.3");
+        assert_eq!(model_key("global:gpt-5.5"), "gpt-5.5");
+        assert_eq!(model_key("cn:deepseek-v4.1-flash"), "deepseek-v4.1-flash");
+        let spec = |m: &str| thinking_spec(Protocol::OpenAiCompat, m);
+        assert!(spec("cn:glm-5.3").is_known());
+        assert!(spec("cn:deepseek-v4.1-flash").is_known());
+        assert!(spec("global:gpt-5.5").is_known());
     }
 
     /// Anthropic 原生协议：按型号给档位和编码方式。
@@ -1197,6 +1318,12 @@ mod tests {
         assert_eq!(spec("deepseek-v4-pro").format, ThinkingFormat::AnthropicBudget);
         assert!(spec("deepseek-v4-pro").can_disable());
         assert_eq!(spec("glm-5.3").format, ThinkingFormat::AnthropicBudget);
+        // 靠厂商字段开 / 关的那几家（Qwen / GLM / DeepSeek，OpenAI 兼容表里认得的）：
+        // 端点换成 Anthropic 格式照样发同一个开关字段，不能因为换了协议就没有这一项
+        let qwen = spec("qwen3-max");
+        assert!(matches!(qwen.format, ThinkingFormat::Toggle { key: "enable_thinking", .. }));
+        assert_eq!(qwen.levels, &[ThinkingLevel::Off, ThinkingLevel::High]);
+        assert!(spec("cn:glm-5.3").is_known());
         assert!(spec("claude-nonexistent-1").is_known());
         // 别家第三方端点认不出：什么都不发（和 OpenAI 兼容表同一个原则）
         assert!(!spec("kimi-k2").is_known());
@@ -1296,6 +1423,45 @@ mod tests {
         let mut body = serde_json::json!({"model": "llama-3-8b", "temperature": 0.3});
         apply_thinking(&mut body, Protocol::OpenAiCompat, "llama-3-8b", &params);
         assert_eq!(body, serde_json::json!({"model": "llama-3-8b", "temperature": 0.3}));
+    }
+
+    /// 「兜底」：能力表里没有的模型也按 `FALLBACK_LEVELS` 发 effort；
+    /// 「默认」（`None`）和别的具体档位都不发，免得猜错一个字段让端点 400。
+    #[test]
+    fn fallback_sends_effort_for_unknown_models() {
+        let params = RequestParams { thinking: Some(ThinkingLevel::Default), ..Default::default() };
+
+        // OpenAI 兼容：`reasoning_effort`，最低落到 low；开着思考不发 temperature
+        let mut body = serde_json::json!({"temperature": 0.3});
+        apply_thinking(&mut body, Protocol::OpenAiCompat, "some-relay-model", &params);
+        assert_eq!(body["reasoning_effort"], "low");
+        assert!(body.get("temperature").is_none(), "{body}");
+
+        // Responses：`reasoning.effort` + summary
+        let mut body = serde_json::json!({});
+        apply_thinking(&mut body, Protocol::Responses, "some-relay-model", &params);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+
+        // Anthropic 原生：`output_config.effort`，不发 thinking（开关字段不猜）
+        let mut body = serde_json::json!({});
+        apply_thinking(&mut body, Protocol::Anthropic, "some-relay-model", &params);
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert!(body.get("thinking").is_none(), "{body}");
+
+        // 「默认」和具体档位：认不出的模型上什么都不发（连 temperature 都不动）
+        for level in [None, Some(ThinkingLevel::High), Some(ThinkingLevel::Off)] {
+            let params = RequestParams { thinking: level, ..Default::default() };
+            let mut body = serde_json::json!({"temperature": 0.2});
+            apply_thinking(&mut body, Protocol::OpenAiCompat, "some-relay-model", &params);
+            assert_eq!(body, serde_json::json!({"temperature": 0.2}), "{level:?}");
+        }
+
+        // 认得的模型上「兜底」按强度降级：glm-5.3 只有「开」一档 → 开
+        let mut body = serde_json::json!({});
+        let glm = RequestParams { thinking: Some(ThinkingLevel::Default), ..Default::default() };
+        apply_thinking(&mut body, Protocol::OpenAiCompat, "glm-5.3", &glm);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "enabled"}), "{body}");
     }
 
     /// Adaptive 格式：开着思考时发 `adaptive` + `display` + `output_config.effort`，不发 temperature。

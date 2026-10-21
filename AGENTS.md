@@ -213,6 +213,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   每个请求记一行 `gateway/<日期>.jsonl`（按内核会话 + 第几轮归组，首页「请求」页签读它，见 `requests.rs`；费用按设置里的单价表估算，见 `pricing.rs`，分峰谷价的模型在单价行尾写 `x2`，峰时段用 `@peak` 行按本地时间或指定时区判定）。新的请求出口（新 provider、新接口）也要走 `route`，内核里新的请求用途用 `gateway::tag` 标上。
   ACP agent 可选经网关：起进程时设 base URL（`gateway::agent_env`，端点编码在 `/via/` 路径里），轮次靠 `gateway::note_turn`。
   请求体和响应原文另存（`request_bodies.rs`，日志行的 `body` 指过去），「请求」页签每次请求行尾的「原文」打开查看（`app/raw_request.rs`）。
+- 网页搜索后端在 `crates/builtin/src/websearch.rs`：`SearchBackend`（DeepSeek / Brave / DuckDuckGo，声明顺序就是固定降级顺序）
+  按 `SearchConfig::order()` 依次试，失败 / 没配 key 就退到下一个，**实际用了哪个写进结果第一行**（工具行汇总带「降级过」）。
+  选择存在数据目录的 `search.json`（`load()` 每次现读，改完即生效，不走 `Kernel::set_*`），**只存选择不存 key**：
+  Brave key 在 `brave_key` 文件，DeepSeek 搜索的 key 在 `deepseek_key` 文件，都没有就用 provider 里 DeepSeek 档案那把
+  （`Settings::deepseek_search_key` → `ProviderConfig::deepseek_key` → 内核起时 `websearch::set_key_hint`）。
+  默认 Brave + DuckDuckGo（和加 DeepSeek 之前一样，DeepSeek 按次计费，要用户自己选）。新的搜索后端 = 加一个枚举值 +
+  `order()` 里的开关 + `run()` 里一个分支，**不要做成 MCP**（见「设计说明-DeepSeek官方搜索.md」）。
 - 自研内核默认不打扰前台：系统提示词里的 `BACKGROUND` 要求测试 / 浏览器 / 截图无头跑，`tools::QUIET_ENV` 给命令带上
   不弹窗口的环境变量（用户自己设了的不覆盖）；推荐的浏览器类 MCP 带 `--headless`。
 - 用量：首页概览（`app/overview.rs`）的统计卡、热力图格子、模型行和右上角箭头都跳到用量页（`app/usage_view.rs`，

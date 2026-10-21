@@ -118,8 +118,12 @@ pub struct SettingsForm {
     suggest_model: Entity<InputState>,
     /// 一轮结束后提炼候选记忆开着没有（保存才生效，会重启自研内核）
     memory_suggest: bool,
-    /// Brave Search API key（`web_search` 用；空 = DuckDuckGo 兜底）
+    /// Brave Search API key（`web_search` 用）
     brave_key: Entity<InputState>,
+    /// `web_search` 的后端选择（存在内核那边的数据目录 `search.json`，所以不在 `Settings` 里）
+    search: claudesktop_builtin::websearch::SearchConfig,
+    /// DeepSeek 搜索单独填的 key（空 = 用「服务商」里 DeepSeek 那份的 key）
+    deepseek_search_key: Entity<InputState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
     /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
@@ -151,6 +155,10 @@ impl SettingsForm {
         });
         let brave_key =
             cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
+        let deepseek_search_key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("留空就用「服务商」里 DeepSeek 那份的 key")
+        });
         Self {
             kernel: KernelChoice::default(),
             profiles: Vec::new(),
@@ -173,6 +181,8 @@ impl SettingsForm {
             suggest_model,
             memory_suggest: false,
             brave_key,
+            search: Default::default(),
+            deepseek_search_key,
             message: None,
             rules: Vec::new(),
             open_help: HashSet::new(),
@@ -269,6 +279,12 @@ impl ChatApp {
             .or_else(claudesktop_builtin::websearch::brave_key)
             .unwrap_or_default();
         self.settings_form.brave_key.update(cx, |state, cx| state.set_value(brave, window, cx));
+        // web_search 的后端选择 + DeepSeek 搜索单独填的 key
+        self.settings_form.search = claudesktop_builtin::websearch::load();
+        let deepseek = claudesktop_builtin::websearch::own_deepseek_key().unwrap_or_default();
+        self.settings_form
+            .deepseek_search_key
+            .update(cx, |state, cx| state.set_value(deepseek, window, cx));
         // 步数上限：默认值留空时显示实际生效的数（占位符就是默认值）
         self.settings_form.max_steps.update(cx, |state, cx| {
             state.set_value(
@@ -1037,38 +1053,191 @@ impl ChatApp {
                     .child(text),
             )
         });
-        section("总是允许的操作", "按项目生效，删除立即生效", None, body).child(section(
-            "网页搜索",
-            "不填 key 时用 DuckDuckGo，可能被限流",
-            None,
-            setting_group([setting_row(
+        section("总是允许的操作", "按项目生效，删除立即生效", None, body)
+            .child(self.render_web_search(cx))
+    }
+
+    /// 「网页搜索」：先用的后端 + 允许哪些后端 + 各自的 key。
+    ///
+    /// 选择存在内核那边的数据目录 `search.json`（搜索是即时读取的，不经 `Kernel::set_*`），
+    /// 所以这里不走底栏「保存」：改了就写盘，下一轮搜索立刻用新顺序。默认顺序和加 DeepSeek
+    /// 之前一致（Brave → DuckDuckGo），DeepSeek 是按次计费的新花费，要用户自己选。
+    fn render_web_search(&self, cx: &mut Context<Self>) -> Div {
+        use claudesktop_builtin::websearch::SearchBackend;
+        let f = &self.settings_form;
+        let cfg = &f.search;
+        // 状态一行：按「配没配齐」算，不联网验（见设计说明：不做「测试」按钮）
+        let own_key = !f.deepseek_search_key.read(cx).value().trim().is_empty();
+        let deepseek_key = own_key || self.deepseek_search_key_from_profiles().is_some();
+        let brave_ready = claudesktop_builtin::websearch::brave_key().is_some();
+        let order = cfg.order();
+        let status: SharedString = if order.is_empty() {
+            "所有后端都不可用，web_search 会直接报错".into()
+        } else {
+            let names: Vec<&str> = order.iter().map(|b| b.label()).collect();
+            let mut line = format!("当前：{}", names.join(" → "));
+            if order.contains(&SearchBackend::DeepSeek) && !deepseek_key {
+                line.push_str("（DeepSeek 没配 key，会跳过它）");
+            }
+            if order.contains(&SearchBackend::Brave) && !brave_ready {
+                line.push_str("（Brave 没配 key，会跳过它）");
+            }
+            line.into()
+        };
+        let prefer = self.seg_control(
+            "search-prefer",
+            [
+                (SearchBackend::DeepSeek, "DeepSeek"),
+                (SearchBackend::Brave, "Brave"),
+                (SearchBackend::DuckDuckGo, "DuckDuckGo"),
+            ],
+            cfg.prefer,
+            cx,
+        );
+        let brave_toggle = Switch::new("search-allow-brave")
+            .checked(cfg.allow_brave)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.allow_brave = *checked;
+                this.save_search(cfg, "搜索后端已更新", cx);
+            }));
+        let ddg_toggle = Switch::new("search-allow-ddg")
+            .checked(cfg.allow_duckduckgo)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.allow_duckduckgo = *checked;
+                this.save_search(cfg, "搜索后端已更新", cx);
+            }));
+        let text_input = |input: &Entity<InputState>| {
+            div()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(CARD))
+                .px_1()
+                .child(Input::new(input).mask_toggle())
+        };
+        let body = setting_group([
+            setting_row("先用哪个", "它没配好或失败时按固定顺序退到下一个", prefer),
+            setting_row("也允许 Brave", "要自己的 API key（api.search.brave.com）", brave_toggle),
+            setting_row("也允许 DuckDuckGo", "不要 key 的最后兜底，可能被限流", ddg_toggle),
+            setting_row(
                 "Brave API key",
-                "api.search.brave.com 免费注册；也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY",
+                "也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY；保存后立即生效",
                 div()
                     .h_flex()
                     .gap_2()
-                    .child(
-                        div()
-                            .w(rems(24.))
-                            .child(Input::new(&self.settings_form.brave_key).cleanable(true)),
-                    )
+                    .child(div().w(rems(20.)).child(text_input(&f.brave_key)))
                     .child(Self::text_button("brave-key-save", "保存", false).on_click(
                         cx.listener(|this, _, window, cx| {
                             let key = this.settings_form.brave_key.read(cx).value().to_string();
                             let res = claudesktop_builtin::websearch::set_brave_key(Some(&key));
                             this.settings_form.message = Some(match res {
-                                Ok(()) => (false, "搜索后端已保存".into()),
+                                Ok(()) => (false, "Brave key 已保存".into()),
                                 Err(e) => (true, format!("保存失败：{e}").into()),
                             });
-                            // 输入框回到已保存的值（密码态）
                             this.settings_form
                                 .brave_key
                                 .update(cx, |state, cx| state.set_value(key, window, cx));
                             cx.notify();
                         }),
                     )),
-            )]),
-        ))
+            ),
+            setting_row(
+                "DeepSeek key",
+                "免费额度用完后按次计费（1000 次 $0.75）；留空就用「服务商」里 DeepSeek 那份的 key",
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(div().w(rems(20.)).child(text_input(&f.deepseek_search_key)))
+                    .child(Self::text_button("deepseek-key-save", "保存", false).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            let key =
+                                this.settings_form.deepseek_search_key.read(cx).value().to_string();
+                            let res =
+                                claudesktop_builtin::websearch::set_own_deepseek_key(Some(&key));
+                            this.settings_form.message = Some(match res {
+                                Ok(()) => {
+                                    let mut cfg = this.settings_form.search.clone();
+                                    cfg.deepseek_key =
+                                        claudesktop_builtin::websearch::own_deepseek_key().is_some();
+                                    this.settings_form.search = cfg;
+                                    (false, "DeepSeek 搜索 key 已保存".into())
+                                }
+                                Err(e) => (true, format!("保存失败：{e}").into()),
+                            });
+                            this.settings_form
+                                .deepseek_search_key
+                                .update(cx, |state, cx| state.set_value(key, window, cx));
+                            cx.notify();
+                        }),
+                    )),
+            ),
+        ]);
+        section(
+            "网页搜索",
+            "web_search 用哪个后端搜，失败时自动降级并在结果里写明用了哪个",
+            None,
+            div()
+                .v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(if order.is_empty() { RED } else { INK_SOFT }))
+                        .child(status),
+                )
+                .child(body),
+        )
+    }
+
+    /// 「先用哪个」的分段切换（保存走 `save_search`，写盘后立即生效）。
+    fn seg_control(
+        &self,
+        id: &'static str,
+        options: impl IntoIterator<Item = (claudesktop_builtin::websearch::SearchBackend, &'static str)>,
+        current: claudesktop_builtin::websearch::SearchBackend,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
+        for (i, (value, label)) in options.into_iter().enumerate() {
+            segs = segs.child(
+                div()
+                    .id((id, i))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let mut cfg = this.settings_form.search.clone();
+                        cfg.prefer = value;
+                        this.save_search(cfg, "搜索后端已更新", cx);
+                    }))
+                    .child(Self::seg(label, value == current)),
+            );
+        }
+        segs
+    }
+
+    /// 「服务商」里 DeepSeek 那份档案的 key（搜索页只说有没有，不显示内容）。
+    fn deepseek_search_key_from_profiles(&self) -> Option<String> {
+        self.settings_form
+            .profiles
+            .iter()
+            .filter(|p| crate::settings::is_deepseek_endpoint(p))
+            .map(|p| p.api_key.trim().to_string())
+            .find(|k| !k.is_empty())
+    }
+
+    /// 把搜索后端的选择写进数据目录（不用点底栏「保存」）。
+    fn save_search(&mut self, cfg: claudesktop_builtin::websearch::SearchConfig, ok: &str, cx: &mut Context<Self>) {
+        self.settings_form.message = Some(match claudesktop_builtin::websearch::save(&cfg) {
+            Ok(()) => {
+                self.settings_form.search = cfg;
+                (false, ok.to_string().into())
+            }
+            Err(e) => (true, format!("保存搜索设置失败：{e}").into()),
+        });
+        cx.notify();
     }
 
     fn import_antigravity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1652,32 +1821,45 @@ impl ChatApp {
             })
     }
 
-    /// 「思考强度」：档位一排（`seg_control`），三种协议下都显示，模型认不出时整行不显示。
+    /// 「思考强度」：档位一排（`seg_control`），三种协议下都显示。
     ///
     /// 能选哪些档跟着模型输入框的**当前值**现算（不额外存 Entity、不用同步代码），
     /// 所以换模型之后这一排跟着变；存在档案里的档位如果新模型不支持，高亮和保存都按
     /// `ThinkingSpec::resolve` 降级后的那一档。
+    ///
+    /// 模型认不出时照样给这一排，但只有「默认 / 兜底」两项：兜底按 `FALLBACK_LEVELS`
+    /// 发 effort，其余档位不发（见 `apply_thinking`）。以前整行不出现，用户看着设置页
+    /// 以为没地方调（其实是被能力表挡掉了）。
     fn render_thinking_row(&self, p: &ProviderProfile, model: &str, cx: &mut Context<Self>) -> Div {
         let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
-        if !spec.is_known() {
-            // 认不出的模型：宁可没有这个选项，也不要发个对方不认的字段导致 400
-            return div();
-        }
+        let known = spec.is_known();
         let current = p.params.thinking;
-        // 「默认」= 不发字段，排在「关」前面
+        // 「默认」= 不发字段，排在「关」前面；认不出的模型再加一项「兜底」
         let mut options: Vec<(Option<ThinkingLevel>, &'static str)> = vec![(None, "默认")];
-        for level in spec.levels {
+        for level in spec.choices() {
             options.push((Some(*level), level.label()));
+        }
+        if !known {
+            options.push((Some(ThinkingLevel::Default), ThinkingLevel::Default.label()));
         }
         // 高亮：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档
         //（认不出的一档都不匹配时保留原值，免得界面显示成「默认」而实际发着别的字段）
         let active = current.and_then(|c| spec.resolve(c)).or(current);
-        // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
-        let hint = match (p.protocol, spec.format) {
-            (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => active
-                .filter(|l| !l.is_off())
-                .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))),
-            _ => None,
+        // 认不出的模型：这一档旁边的说明短一点（整段解释在 ⓘ 里，别把行撑长）
+        let hint = if !known {
+            if current == Some(ThinkingLevel::Default) {
+                Some("按通用的 effort 字段发".to_string())
+            } else {
+                Some("还不知道这个模型认不认，选「兜底」试试".to_string())
+            }
+        } else {
+            match (p.protocol, spec.format) {
+                // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
+                (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => active
+                    .filter(|l| !l.is_off())
+                    .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))),
+                _ => None,
+            }
         };
         let control = div().h_flex().items_center().gap_3().child(seg_control(
             "thinking",
@@ -1700,7 +1882,13 @@ impl ChatApp {
             }
             None => control,
         };
-        form_field("思考强度", Some("让模型回答前先想多久，越高越慢、越贵".into()), control)
+        let mut field_hint: SharedString = "让模型回答前先想多久，越高越慢、越贵".into();
+        if !known {
+            field_hint = "没确认过的模型只有「兜底」可用：按通用的 effort 字段发，从「低」起；\
+                 选别的档位就不发，而不是猜一个。端点不认这个字段时一般直接忽略，不会报错"
+                .into();
+        }
+        form_field("思考强度", Some(field_hint), control)
     }
 
     /// 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）。
