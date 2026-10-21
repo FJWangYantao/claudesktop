@@ -324,9 +324,9 @@ impl SessionState {
 }
 
 struct Inner {
-    provider: Arc<dyn ChatProvider>,
-    /// 构造 provider 用的配置（提炼候选记忆这类旁路请求另起一个 provider 时用）
-    provider_config: ProviderConfig,
+    /// 对话用的 provider 和造它的配置（提炼候选记忆这类旁路请求另起 provider 时用配置）。
+    /// 输入框切思考强度时（`set_thinking`）换一份，进行中的请求用完手上那份
+    chat: Mutex<(ProviderConfig, Arc<dyn ChatProvider>)>,
     /// 新会话的默认模型（最近一次 `set_model` 选的，初始为配置里的）
     default_model: Mutex<String>,
     sink: EventSink,
@@ -437,6 +437,16 @@ enum Verdict {
 }
 
 impl Inner {
+    /// 对话用的 provider（切思考强度后是新的那份）。
+    fn provider(&self) -> Arc<dyn ChatProvider> {
+        self.chat.lock().unwrap().1.clone()
+    }
+
+    /// 造对话 provider 的配置（含当前思考强度）。
+    fn provider_config(&self) -> ProviderConfig {
+        self.chat.lock().unwrap().0.clone()
+    }
+
     fn emit(&self, session: Option<&str>, event: KernelEvent) {
         // 子会话的事件转到主会话（转哪些见 subagent::forward）
         if let Some((parent, call)) = session.and_then(subagent::split_id) {
@@ -877,7 +887,7 @@ impl Inner {
             );
             let mut text = String::new();
             let result =
-                self.provider.stream_chat(
+                self.provider().stream_chat(
                     model,
                     &request,
                     &[],
@@ -1839,7 +1849,7 @@ impl Inner {
         let (mut config, model) = match &auto.config.model {
             Some(config) => (config.clone(), config.model.clone()),
             None => (
-                self.provider_config.clone(),
+                self.provider_config(),
                 self.session_model(session)
                     .unwrap_or_else(|| self.default_model.lock().unwrap().clone()),
             ),
@@ -1973,8 +1983,7 @@ impl BuiltinKernel {
             websearch::set_data_dir(dir);
         }
         let inner = Arc::new(Inner {
-            provider: make_provider(&config.provider),
-            provider_config: config.provider.clone(),
+            chat: Mutex::new((config.provider.clone(), make_provider(&config.provider))),
             default_model: Mutex::new(config.provider.model.clone()),
             sink,
             agent_name: agent_name.clone(),
@@ -2305,7 +2314,7 @@ fn suggest_memories(inner: &Inner, session: &str) {
     let known: Vec<&str> = known.iter().map(String::as_str).collect();
     let no_stop = || false;
     let candidates = remember::suggest(
-        &inner.provider_config,
+        &inner.provider_config(),
         &model,
         session,
         inner.turn_number(session),
@@ -2334,7 +2343,7 @@ fn name_session(inner: &Inner, session: &str) {
     let no_stop = || false;
     let mut text = String::new();
     let _tag = gateway::tag(session, "title", 1);
-    let outcome = inner.provider.stream_chat(&model, &messages, &[], &no_stop, &mut |event| {
+    let outcome = inner.provider().stream_chat(&model, &messages, &[], &no_stop, &mut |event| {
         if let StreamEvent::Text(t) = event {
             text.push_str(&t);
         }
@@ -2413,7 +2422,7 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         }
         let mut text = String::new();
         let result =
-            inner.provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
+            inner.provider().stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
                 if stopped() {
                     return;
                 }
@@ -2685,6 +2694,22 @@ impl Kernel for BuiltinKernel {
         // 进行中的一轮用完当前模型，下一步请求起生效
         state.model = model.to_string();
         *self.inner.default_model.lock().unwrap() = model.to_string();
+        Ok(())
+    }
+
+    /// 思考强度（输入框那个下拉）：换一份 provider，下一次请求起生效，不重启内核。
+    /// `level` 是 [`ThinkingLevel`] 的 serde 名（`"high"`、`"x_high"`），None = 不发字段。
+    fn set_thinking(&self, level: Option<&str>) -> anyhow::Result<()> {
+        let level = level
+            .map(|id| serde_json::from_value::<ThinkingLevel>(Value::String(id.to_string())))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("未知的思考强度 {}", level.unwrap_or_default()))?;
+        let mut chat = self.inner.chat.lock().unwrap();
+        if chat.0.params.thinking != level {
+            let mut config = chat.0.clone();
+            config.params.thinking = level;
+            *chat = (config.clone(), make_provider(&config));
+        }
         Ok(())
     }
 

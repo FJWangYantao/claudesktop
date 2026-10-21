@@ -149,6 +149,19 @@ impl ThinkingLevel {
         }
     }
 
+    /// 档位的 ID（就是 serde 名，`Kernel::set_thinking` 按它认）。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "x_high",
+            Self::Default => "default",
+        }
+    }
+
     /// 档位里有没有「关」这一档（没有 = 模型关不掉思考，见 [`min_level`]）。
     pub fn is_off(self) -> bool {
         self == Self::Off
@@ -166,6 +179,9 @@ pub enum ThinkingFormat {
     OpenAiEffort,
     /// `reasoning:{effort, summary:"auto"}`（OpenAI Responses）
     ResponsesEffort,
+    /// DeepSeek V4：`thinking.type` 开 / 关 + `reasoning_effort` 分档（`low` / `high` / `max`）。
+    /// 「极高」发 `max`：DeepSeek 把 `xhigh` 当 `high` 处理，要最强一档得明说 `max`
+    DeepSeekEffort,
     /// 只有开 / 关的厂商字段，值为 `extra` 里那个键的内容（`true` / `{"type":"enabled"}`）。
     /// 「开」对应哪一档由能力表决定（都存成 `High`）。
     ///
@@ -187,7 +203,8 @@ impl PartialEq for ThinkingFormat {
             (Self::AnthropicAdaptive, Self::AnthropicAdaptive)
             | (Self::AnthropicBudget, Self::AnthropicBudget)
             | (Self::OpenAiEffort, Self::OpenAiEffort)
-            | (Self::ResponsesEffort, Self::ResponsesEffort) => true,
+            | (Self::ResponsesEffort, Self::ResponsesEffort)
+            | (Self::DeepSeekEffort, Self::DeepSeekEffort) => true,
             // 字段一样就算一样：取值函数由 `key` 唯一决定
             (Self::Toggle { key: a, .. }, Self::Toggle { key: b, .. }) => a == b,
             (Self::Default, Self::Default) => true,
@@ -417,19 +434,43 @@ fn openai_spec(name: &str) -> ThinkingSpec {
         }
         return thinking_of(&[ThinkingLevel::Off, ThinkingLevel::High]);
     }
-    // DeepSeek V3.1+ / V4：`thinking.type` 开 / 关（官方示例：`{"thinking":{"type":"enabled"}}`）
-    if name.starts_with("deepseek-") && !name.contains("reasoner") && !name.contains("-r1") {
+    // DeepSeek V4-Pro / V4-Flash（含 V4.1）：2026-08-13 起 `reasoning_effort` 分 low / high / max 三档，
+    // `thinking.type` 仍管开 / 关（官方 Thinking Mode 文档；`minimal`/`medium`/`xhigh` 只是别名，会被并档）
+    if is_deepseek_v4(name) {
         return ThinkingSpec {
-            levels: &[ThinkingLevel::Off, ThinkingLevel::High],
-            format: ThinkingFormat::Toggle {
-                key: "thinking",
-                on: || serde_json::json!({ "type": "enabled" }),
-                off: || serde_json::json!({ "type": "disabled" }),
-            },
+            levels: &[
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ],
+            format: ThinkingFormat::DeepSeekEffort,
             accepts_temperature: true,
         };
     }
+    // DeepSeek V3.1+：`thinking.type` 开 / 关（官方示例：`{"thinking":{"type":"enabled"}}`）
+    if name.starts_with("deepseek-") && !name.contains("reasoner") && !name.contains("-r1") {
+        return deepseek_toggle();
+    }
     ThinkingSpec::NONE
+}
+
+/// DeepSeek V4 一代（`deepseek-v4-pro`、`deepseek-v4.1-flash`，官方 API 上的 `deepseek-flash` / `deepseek-pro`）。
+fn is_deepseek_v4(name: &str) -> bool {
+    ["deepseek-v4", "deepseek-flash", "deepseek-pro"].iter().any(|p| name.starts_with(p))
+}
+
+/// DeepSeek 只认开 / 关的那一代（V3.1+），以及 V4 在 Responses 协议下（effort 的写法没核实过）。
+fn deepseek_toggle() -> ThinkingSpec {
+    ThinkingSpec {
+        levels: &[ThinkingLevel::Off, ThinkingLevel::High],
+        format: ThinkingFormat::Toggle {
+            key: "thinking",
+            on: || serde_json::json!({ "type": "enabled" }),
+            off: || serde_json::json!({ "type": "disabled" }),
+        },
+        accepts_temperature: true,
+    }
 }
 
 /// `gpt-5` 后面那截 → 小版本号：`""` / `-mini` / `-2025-08-07` 是 0，`.1` / `-1-codex` 是 1。
@@ -572,6 +613,10 @@ pub fn thinking_spec(protocol: Protocol, model: &str) -> ThinkingSpec {
                     },
                     ..spec
                 },
+                // DeepSeek V4 的分档只在 Chat Completions 上核实过；Responses 退回开 / 关
+                ThinkingFormat::DeepSeekEffort if protocol == Protocol::Responses => {
+                    deepseek_toggle()
+                }
                 _ => spec,
             }
         }
@@ -679,6 +724,18 @@ pub fn apply_thinking(body: &mut Value, protocol: Protocol, model: &str, params:
             // 不带 `summary:"auto"` 就收不到 `reasoning_summary_text.delta`，思考区是空的
             body["reasoning"] =
                 serde_json::json!({ "effort": effort_for(level), "summary": "auto" });
+        }
+        ThinkingFormat::DeepSeekEffort => {
+            body["thinking"] =
+                serde_json::json!({ "type": if thinking_on { "enabled" } else { "disabled" } });
+            if thinking_on {
+                let effort = match level {
+                    ThinkingLevel::XHigh => "max",
+                    ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
+                    _ => "high",
+                };
+                body["reasoning_effort"] = serde_json::json!(effort);
+            }
         }
         ThinkingFormat::Toggle { key, on, off } => {
             body[key] = if thinking_on { on() } else { off() };
@@ -1373,6 +1430,23 @@ mod tests {
         let deepseek = spec("deepseek-chat");
         assert_eq!(deepseek.levels, &[ThinkingLevel::Off, ThinkingLevel::High]);
 
+        // DeepSeek V4 一代：关 / 低 / 高 / 极高（effort 分档）；Responses 下退回开 / 关
+        for name in ["deepseek-v4-pro", "cn:deepseek-v4.1-flash", "deepseek-flash"] {
+            let v4 = spec(name);
+            assert_eq!(v4.format, ThinkingFormat::DeepSeekEffort, "{name}");
+            assert_eq!(
+                v4.levels,
+                &[
+                    ThinkingLevel::Off,
+                    ThinkingLevel::Low,
+                    ThinkingLevel::High,
+                    ThinkingLevel::XHigh
+                ]
+            );
+        }
+        let v4_responses = thinking_spec(Protocol::Responses, "deepseek-v4-pro");
+        assert!(matches!(v4_responses.format, ThinkingFormat::Toggle { key: "thinking", .. }));
+
         // Responses 只换编码方式，认得的模型一样
         let responses = thinking_spec(Protocol::Responses, "gpt-5");
         assert_eq!(responses.format, ThinkingFormat::ResponsesEffort);
@@ -1467,6 +1541,38 @@ mod tests {
         let lowest = spec.levels.iter().copied().find(|l| !l.is_off()).unwrap();
         assert_eq!(body["output_config"]["effort"], effort_for(lowest), "{body}");
         assert_ne!(body["output_config"]["effort"], "xhigh", "{body}");
+    }
+
+    /// `id()` 和 serde 名一致（`set_thinking` 靠 serde 把 ID 认回档位）。
+    #[test]
+    fn level_ids_match_serde() {
+        for level in
+            [ThinkingLevel::Off, ThinkingLevel::Default].into_iter().chain(ThinkingLevel::ON)
+        {
+            assert_eq!(serde_json::to_value(level).unwrap(), level.id());
+        }
+    }
+
+    /// DeepSeek V4：开着发 `thinking.type=enabled` + `reasoning_effort`，「极高」发 `max`；关只发 disabled。
+    #[test]
+    fn encodes_deepseek_effort() {
+        let encode = |level| {
+            let params = RequestParams { thinking: Some(level), ..Default::default() };
+            let mut body = serde_json::json!({"temperature": 0.3});
+            apply_thinking(&mut body, Protocol::OpenAiCompat, "cn:deepseek-v4.1-flash", &params);
+            body
+        };
+        let low = encode(ThinkingLevel::Low);
+        assert_eq!(low["thinking"]["type"], "enabled");
+        assert_eq!(low["reasoning_effort"], "low");
+        assert!(low.get("temperature").is_none(), "{low}");
+        assert_eq!(encode(ThinkingLevel::High)["reasoning_effort"], "high");
+        assert_eq!(encode(ThinkingLevel::XHigh)["reasoning_effort"], "max");
+        // 「中」这一档 DeepSeek 没有：降到「低」
+        assert_eq!(encode(ThinkingLevel::Medium)["reasoning_effort"], "low");
+        let off = encode(ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(off.get("reasoning_effort").is_none(), "{off}");
     }
 
     /// Adaptive 格式：开着思考时发 `adaptive` + `display` + `output_config.effort`，不发 temperature。

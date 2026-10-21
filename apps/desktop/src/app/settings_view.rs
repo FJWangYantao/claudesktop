@@ -13,7 +13,8 @@ use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_builtin::{
-    PermissionRules, Protocol, ProviderConfig, ThinkingFormat, ThinkingLevel, default_rules_path,
+    PermissionRules, Protocol, ProviderConfig, ThinkingFormat, ThinkingLevel, ThinkingSpec,
+    default_rules_path,
 };
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
@@ -1264,6 +1265,32 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 输入框的思考强度下拉：当前会话的模型能选哪些档、档案里现在是哪一档。
+    /// 只有自研内核有（ACP agent 的思考由它自己管），别的内核返回 None。
+    pub(super) fn composer_thinking(&self) -> Option<(ThinkingSpec, Option<ThinkingLevel>)> {
+        let session = self.session();
+        if session.kernel != KernelChoice::Builtin {
+            return None;
+        }
+        let p = self.settings.builtin.current();
+        Some((
+            claudesktop_builtin::thinking_spec(p.protocol, &session.model_label),
+            p.params.thinking,
+        ))
+    }
+
+    /// 在输入框的下拉里选了思考强度：记进当前档案（和设置页那一排是同一个值），
+    /// 跑着的自研内核换一份 provider，下一次请求起生效（不重启内核，进行中的一轮不受影响）。
+    pub(crate) fn choose_thinking(&mut self, level: Option<ThinkingLevel>, cx: &mut Context<Self>) {
+        self.update_settings(|s| s.builtin.current_mut().params.thinking = level);
+        if let Some(kernel) = self.kernel_of(KernelChoice::Builtin)
+            && let Err(err) = kernel.set_thinking(level.map(ThinkingLevel::id))
+        {
+            self.toast(Notification::error(format!("切换思考强度失败：{err}")), cx);
+        }
+        cx.notify();
+    }
+
     /// 模型下拉打开时：自研内核且还没有模型列表就顺手获取一次。
     pub(crate) fn fetch_models_for_menu(&mut self, cx: &mut Context<Self>) {
         let builtin = self.session().kernel == KernelChoice::Builtin;
@@ -1825,17 +1852,8 @@ impl ChatApp {
         let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
         let known = spec.is_known();
         let current = p.params.thinking;
-        // 「默认」= 不发字段，排在「关」前面；认不出的模型再加一项「兜底」
-        let mut options: Vec<(Option<ThinkingLevel>, &'static str)> = vec![(None, "默认")];
-        for level in spec.choices() {
-            options.push((Some(*level), level.label()));
-        }
-        if !known {
-            options.push((Some(ThinkingLevel::Default), ThinkingLevel::Default.label()));
-        }
-        // 高亮：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档
-        //（认不出的一档都不匹配时保留原值，免得界面显示成「默认」而实际发着别的字段）
-        let active = current.and_then(|c| spec.resolve(c)).or(current);
+        let options = thinking_options(&spec);
+        let active = active_thinking(&spec, current);
         // 认不出的模型：这一档旁边的说明短一点（整段解释在 ⓘ 里，别把行撑长）
         let hint = if !known {
             if current == Some(ThinkingLevel::Default) {
@@ -2218,6 +2236,30 @@ const CLAUDE_CODE_RISK: &str = "风险：Claude Code 用订阅账号登录时，
 /// Antigravity Tools 借用 Antigravity 账号的登录，Google 2026-02 起按违反条款封过这样用的账号。
 const ANTIGRAVITY_RISK: &str =
     "风险：它借用你 Antigravity 账号的登录调用模型，Google 封过这样用的账号";
+
+/// 思考强度能选的项（设置页那一排和输入框的下拉共用）：「默认」= 不发字段，排在「关」前面；
+/// 然后是这个模型的档位；认不出的模型只有「默认 / 兜底」（兜底见 `FALLBACK_LEVELS`）。
+pub(super) fn thinking_options(spec: &ThinkingSpec) -> Vec<(Option<ThinkingLevel>, &'static str)> {
+    let mut options = vec![(None, "默认")];
+    if spec.is_known() {
+        options.extend(spec.choices().iter().map(|level| (Some(*level), level.label())));
+    } else {
+        options.push((Some(ThinkingLevel::Default), ThinkingLevel::Default.label()));
+    }
+    options
+}
+
+/// 高亮哪一项：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档
+/// （认不出的模型一档都不匹配时保留原值，免得界面显示成「默认」而实际发着别的字段）。
+pub(super) fn active_thinking(
+    spec: &ThinkingSpec,
+    current: Option<ThinkingLevel>,
+) -> Option<ThinkingLevel> {
+    if !spec.is_known() {
+        return current;
+    }
+    current.and_then(|c| spec.resolve(c)).or(current)
+}
 
 /// npx 在 Windows 上是 .cmd，要经 `cmd /c` 才起得来。
 fn acp_command(command: &str) -> String {

@@ -545,6 +545,11 @@ pub trait Kernel: Send + Sync {
         let _ = (session, model);
         anyhow::bail!("当前内核不支持切换模型")
     }
+    /// 切换之后各轮的思考强度（`level` 是档位的 ID，None = 不发思考字段）；默认不支持。
+    fn set_thinking(&self, level: Option<&str>) -> anyhow::Result<()> {
+        let _ = level;
+        anyhow::bail!("当前内核不支持切换思考强度")
+    }
     /// 更新各模型的上下文窗口（模型 ID → token；界面取到模型列表后推过来，自动压缩用）。默认忽略。
     fn set_context_windows(&self, windows: std::collections::HashMap<String, u64>) {
         let _ = windows;

@@ -1,12 +1,14 @@
 //! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
 
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::settings_view::{active_thinking, thinking_options};
 use super::widgets::Surface;
 use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
+use claudesktop_builtin::ThinkingLevel;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::button::Button;
@@ -258,6 +260,22 @@ impl ChatApp {
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
             ))
             .children(self.render_context_gauge())
+            // 思考强度：只有自研内核有，和模型挨着（档位跟着模型变）
+            .when_some(self.composer_thinking(), |d, (spec, current)| {
+                let label = thinking_options(&spec)
+                    .into_iter()
+                    .find(|(level, _)| *level == active_thinking(&spec, current))
+                    .map_or("默认", |(_, label)| label);
+                d.child(menu_popover(
+                    "thinking-menu",
+                    Anchor::BottomRight,
+                    rems(17.5),
+                    &app,
+                    &self.menu_focus,
+                    MenuChip::new(IconAll::Brain, label),
+                    thinking_menu_items,
+                ))
+            })
             .child(model_menu_popover(
                 &app,
                 &self.menu_focus,
@@ -637,6 +655,32 @@ fn mode_menu_items(
         menu = menu.pick(
             menu_item(("mode-item", i), mode.icon, mode.name.clone(), mode.desc.clone(), active),
             move |this, cx| this.choose_mode(i, cx),
+        );
+    }
+    menu
+}
+
+/// 思考强度条目：「默认」+ 当前模型能选的档位（和设置页那一排同一份），当前项打勾。
+fn thinking_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let mut menu = MenuList::new("thinking-menu-list", handle, popover);
+    let Some((spec, current)) = app.composer_thinking() else {
+        return menu;
+    };
+    let active = active_thinking(&spec, current);
+    for (i, (level, label)) in thinking_options(&spec).into_iter().enumerate() {
+        let desc = match level {
+            None => "不发思考字段，用模型自己的默认",
+            Some(ThinkingLevel::Off) => "不先思考，直接回答",
+            Some(ThinkingLevel::Default) => "没确认过的模型：按通用的 effort 字段发",
+            Some(_) => "越高想得越久，越慢、越贵",
+        };
+        menu = menu.pick(
+            menu_item(("thinking-item", i), IconAll::Brain, label, desc, level == active),
+            move |this, cx| this.choose_thinking(level, cx),
         );
     }
     menu

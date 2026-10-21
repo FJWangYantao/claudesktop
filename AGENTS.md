@@ -255,6 +255,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   所以新增 provider 只要组完体调一次 `apply_thinking`、`extra` 仍最后合。
   旁路小请求（补全 / 记忆提炼 / 分类器）一律 `suggest::short_thinking(protocol, model)`（按实际协议查表）：能关就关、关不掉取最低一档。
   加新模型 = 能力表加一条，同时想清楚 `can_disable`（关不掉的那代别给「关」）和 `accepts_temperature`。
+  档位存在档案里；设置页那一排和输入框工具栏的下拉（`ChatApp::composer_thinking` / `choose_thinking`）共用 `thinking_options`，
+  输入框里切换经 `Kernel::set_thinking` 换一份 provider，下一次请求生效、不重启内核。
 - **worktree 会话**（`crates/core/src/git.rs` + `apps/desktop/src/app/worktree.rs`，见「设计说明-worktree.md」）：
   目录在**数据目录** `worktrees/<仓库名>-<短哈希>/<分支尾段>`，不往用户仓库里塞东西；分支名 `claudesktop/<月日-时分>-<3 位随机>`。
   `cwd` 就是 worktree 目录，侧栏分组用 `Session::group_dir()`（有 worktree 时是主仓库根），worktree 会话归到主项目组、行尾带 `GitBranch` 图标。
