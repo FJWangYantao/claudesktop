@@ -205,7 +205,7 @@ pub struct AgentProfile {
 检测到就在「自研内核」档案区显示一行「检测到 OPENAI_API_KEY，导入为档案？」，用户点了才建档案（Key 进设置，同手填）。
 
 现有的「从 Antigravity Tools 导入端点和 Key」（`settings::antigravity_gateway`）走的是第三方反代 Antigravity 的 OAuth，
-正是第二节说的 B 路线。**定了：保留，按钮下面常驻一句风险提示，导入后的结果消息里再说一次**（已实施，`settings_view.rs` 的 `ANTIGRAVITY_RISK`）。
+正是第二节说的 B 路线。**定了：保留，按钮下面常驻一句风险提示**（已实施，`settings_view.rs` 的 `ANTIGRAVITY_RISK`）。
 
 ## 十、界面改动一览
 

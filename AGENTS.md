@@ -25,6 +25,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `setting_row` / `setting_group`（标题 + 右侧控件，说明收进标题旁 ⓘ 的悬停提示；标题下要挂路径 / 按钮用 `setting_row_with`）、`form_field`（左标签右输入）、
   `choice_panel` + `choice_row`（沙色面板里的单选列表，同首页配置引导）、`seg_control`。
   说明只写一句「这是干什么的」（`section` / `setting_row` / `form_field` 都放进 ⓘ，页面上不铺灰字）；怎么用写成 `how_to` 编号步骤放空状态，格式细节收进 `ChatApp::disclosure`。
+  例外：条款风险提示（`ANTIGRAVITY_RISK`、`ACP_PRESETS` 的第三列）常驻显示在入口下面（`TEXT_META` + `INK_SOFT`），不收进 ⓘ。
   「内核与模型」要点保存（底栏固定，`form_dirty` 决定能不能点），其余分类即时生效。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，

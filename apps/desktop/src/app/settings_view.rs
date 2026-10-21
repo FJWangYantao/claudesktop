@@ -1083,10 +1083,8 @@ impl ChatApp {
         inputs.api_key.update(cx, |s, cx| s.set_value(key, window, cx));
         self.settings_form.message = Some((
             false,
-            format!(
-                "已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）。{ANTIGRAVITY_RISK}"
-            )
-            .into(),
+            format!("已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）")
+                .into(),
         ));
         self.fetch_models(true, cx);
     }
