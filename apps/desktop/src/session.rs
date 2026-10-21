@@ -75,6 +75,11 @@ pub struct Session {
     /// 待同步给内核的权限模式：新会话的默认模式（设置里开着「自动」时是 `"auto"`），
     /// 或用户在会话建立前自己选的。`Started` 时交给内核后清掉
     pub pending_mode: Option<String>,
+    /// 会话级思考档位（输入框那个下拉选的）；`None` = 跟随设置里的档案，
+    /// 「默认」这一项也是 `None`（不发字段）
+    pub thinking: Option<claudesktop_builtin::ThinkingLevel>,
+    /// 会话建立前选的档位：`Started` 时再交给内核（和 `pending_model` 一个套路）
+    pub pending_thinking: Option<Option<claudesktop_builtin::ThinkingLevel>>,
     /// 本轮累计的 token，一轮结束时写进日志后清零
     pub turn_usage: TurnUsage,
     /// 本轮收到、端点还没数过的输出（正文 + 思考）：流式期间状态行据此估算 token，
@@ -331,6 +336,8 @@ impl Session {
             resuming: false,
             pending_model: None,
             pending_mode: None,
+            thinking: None,
+            pending_thinking: None,
             turn_usage: TurnUsage::default(),
             turn_streamed: Streamed::default(),
             turn_started: None,

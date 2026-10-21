@@ -7,6 +7,8 @@ use crate::model::PendingImage;
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
+use claudesktop_builtin::ThinkingLevel;
+use claudesktop_core::Kernel;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::button::Button;
@@ -103,6 +105,41 @@ impl ChatApp {
             }
         }
         cx.notify();
+    }
+
+    /// 思考强度下拉里选了一档：只作用于**这个会话**，不动设置文件里的档案。
+    /// 已建立的内核会话下一轮请求起生效；还没建立的等 `Started` 再补（`flush_pending_thinking`）。
+    pub(crate) fn choose_thinking(
+        &mut self,
+        level: Option<ThinkingLevel>,
+        cx: &mut Context<Self>,
+    ) {
+        let kernel = self.session_kernel(self.active);
+        let s = &mut self.sessions[self.active];
+        s.thinking = level;
+        match (kernel, s.acp_id.clone()) {
+            (Some(kernel), Some(id)) => {
+                let wire = level.map(thinking_wire);
+                if let Err(err) = kernel.set_thinking(&id, wire.as_deref()) {
+                    s.note(format!("切换思考强度失败：{err}"));
+                }
+            }
+            _ => s.pending_thinking = Some(level),
+        }
+        cx.notify();
+    }
+
+    /// `Started` 到达：把会话建立前选的档位交给内核（和 `pending_model` / `pending_mode` 一个套路）。
+    pub(super) fn flush_pending_thinking(&mut self, idx: usize, kernel: Option<&dyn Kernel>) {
+        let (Some(kernel), Some(wanted)) = (kernel, self.sessions[idx].pending_thinking.take())
+        else {
+            return;
+        };
+        let Some(id) = self.sessions[idx].acp_id.clone() else { return };
+        let wire = wanted.map(thinking_wire);
+        if let Err(err) = kernel.set_thinking(&id, wire.as_deref()) {
+            self.sessions[idx].note(format!("切换思考强度失败：{err}"));
+        }
     }
 
     /// 输入框上方的一张待发送图片缩略图（右上角 × 撤掉）。
@@ -258,6 +295,7 @@ impl ChatApp {
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
             ))
             .children(self.render_context_gauge())
+            .children(render_thinking_chip(&app, cx))
             .child(model_menu_popover(
                 &app,
                 &self.menu_focus,
@@ -605,8 +643,7 @@ fn paste_to_attachments(
 
 /// 模型下拉：
 /// 打开时若自研内核还没有模型列表，顺手获取一次。
-fn model_menu_popover(
-    handle: &Entity<ChatApp>,
+fn model_menu_popover(    handle: &Entity<ChatApp>,
     focus: &FocusHandle,
     id: &'static str,
     anchor: Anchor,
@@ -623,6 +660,142 @@ fn model_menu_popover(
 }
 
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
+
+/// 会话级思考档位 chip 的文字：没选过就是「默认」（跟随设置里的档案）。
+fn thinking_chip(app: &ChatApp) -> Option<MenuChip> {
+    if app.session().kernel != KernelChoice::Builtin {
+        return None;
+    }
+    let label = match app.session().thinking {
+        Some(level) => level.label(),
+        None => "默认",
+    };
+    Some(MenuChip::new(IconAll::Brain, label))
+}
+
+/// 会话级思考档位 chip：ACP 内核不画（模型由 agent 自己定）。点开是 `thinking_menu_items`。
+fn render_thinking_chip(app: &Entity<ChatApp>, cx: &mut Context<ChatApp>) -> Option<AnyElement> {
+    let chip = thinking_chip(app.read(cx))?;
+    let focus = app.read(cx).menu_focus.clone();
+    Some(
+        menu_popover(
+            "thinking-menu",
+            Anchor::BottomRight,
+            rems(17.5),
+            app,
+            &focus,
+            chip,
+            thinking_menu_items,
+        )
+        .into_any_element(),
+    )
+}
+
+/// 会话当前模型的档位表：能选哪些档、字段怎么发，都以它为准
+pub(crate) fn session_thinking_spec(app: &ChatApp) -> claudesktop_builtin::ThinkingSpec {
+    let profile = app.settings.builtin.current();
+    let model = if app.session().model_label.is_empty() {
+        profile.model.as_str()
+    } else {
+        app.session().model_label.as_ref()
+    };
+    claudesktop_builtin::thinking_spec(profile.protocol, model)
+}
+
+/// 档位 → 交给内核的字符串（和设置文件里存的是同一套：`low` / `high` / `max` …）
+pub(crate) fn thinking_wire(level: ThinkingLevel) -> String {
+    serde_json::to_value(level)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "high".into())
+}
+
+/// 思考档位条目：能选哪些档跟当前模型现算（`spec.choices()`），当前项打勾。
+fn thinking_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let spec = session_thinking_spec(app);
+    let current = app.session().thinking;
+    let mut menu = MenuList::new("thinking-menu-list", handle, popover);
+    // 「默认」= 这个会话不覆盖，用设置里给档案配的那一档
+    menu = menu.pick(
+        menu_item(
+            "thinking-default",
+            IconAll::Circle,
+            "默认",
+            "用设置里「内核与模型」给这个档案配的那一档",
+            current.is_none(),
+        ),
+        |this, cx| this.choose_thinking(None, cx),
+    );
+    // `choices()` 在认不出的模型上就是兜底那一套（低 ~ 极高）
+    for level in spec.choices() {
+        let level = *level;
+        menu = menu.pick(
+            menu_item(
+                ("thinking-item", thinking_key(level)),
+                thinking_icon(level),
+                level.label(),
+                thinking_hint(level),
+                current == Some(level),
+            ),
+            move |this, cx| this.choose_thinking(Some(level), cx),
+        );
+    }
+    if !spec.is_known() {
+        // 认不出的模型：再加一条「兜底」（按通用的 effort 字段发）
+        menu = menu.pick(
+            menu_item(
+                "thinking-fallback",
+                IconAll::Sparkles,
+                ThinkingLevel::Default.label(),
+                "还不知道这个模型认不认，按通用的 effort 字段发",
+                current == Some(ThinkingLevel::Default),
+            ),
+            |this, cx| this.choose_thinking(Some(ThinkingLevel::Default), cx),
+        );
+    }
+    menu
+}
+
+/// 档位 → `MenuList` 的稳定下标（不能用文案，文案会变）
+fn thinking_key(level: ThinkingLevel) -> usize {
+    match level {
+        ThinkingLevel::Off => 0,
+        ThinkingLevel::Minimal => 1,
+        ThinkingLevel::Low => 2,
+        ThinkingLevel::Medium => 3,
+        ThinkingLevel::High => 4,
+        ThinkingLevel::XHigh => 5,
+        ThinkingLevel::Max => 6,
+        ThinkingLevel::Default => 7,
+    }
+}
+
+fn thinking_icon(level: ThinkingLevel) -> IconAll {
+    match level {
+        ThinkingLevel::Off => IconAll::Circle,
+        ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => IconAll::Gauge,
+        ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => IconAll::Zap,
+        ThinkingLevel::Default => IconAll::Sparkles,
+    }
+}
+
+/// 条目第二行的灰色说明：写「这是干什么的」，不写具体档位名（各家叫法不一样，说了反而误导）
+fn thinking_hint(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "不思考，最快也最便宜",
+        ThinkingLevel::Minimal => "极短的思考",
+        ThinkingLevel::Low => "简单任务足够",
+        ThinkingLevel::Medium => "日常任务的平衡档",
+        ThinkingLevel::High => "推理充分一些，慢一点",
+        ThinkingLevel::XHigh => "复杂任务用，明显更慢",
+        ThinkingLevel::Max => "最高档，最慢也最贵",
+        ThinkingLevel::Default => "按通用的 effort 字段发",
+    }
+}
 
 /// 权限模式条目：图标 + 名称（+说明），当前项打勾。
 fn mode_menu_items(

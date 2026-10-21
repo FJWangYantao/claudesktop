@@ -248,12 +248,21 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。
 - 思考强度（`crates/builtin/src/provider.rs` 的 `ThinkingLevel` / `thinking_spec` / `apply_thinking`）：
-  对外的唯一选项是**档位**（默认 = 不发字段 / 关 / 极低 / 低 / 中 / 高 / 极高），预算和 effort 只是翻译出来的值。
+  对外的唯一选项是**档位**（默认 = 不发字段 / 关 / 极低 / 低 / 中 / 高 / 极高 / 最高），预算和 effort 只是翻译出来的值。
+  **`ThinkingFormat` 是结构体不是枚举**：`toggle`（厂商开关字段）+ `effort`（档位字段）+ `budget`（`budget_tokens` 老格式）
+  三件事分开，因为 DeepSeek V4 / GLM-5.2+ / MiniMax-M3.1 / Doubao 都是「开关和档位一起发」（`ThinkingFormat::toggle_with_effort`）。
+  `ThinkingLevel::Max` 是最高档（`max`），`XHigh` 比它低——DeepSeek / GLM / Kimi K3 / MiniMax / Doubao / Grok 的最高就是 `max`。
   能力表按「协议 + 模型名」给能选哪些档和字段怎么写；**认不出的模型不发任何思考字段、设置页也不显示那一行**
   （发错了就是 400，宁可没这个选项）。`ThinkingSpec::accepts_temperature == false` 的模型（Opus 4.7 以后）
   不管开不开思考都不发 `temperature`，这条和「开思考不发 temperature」一起在 `apply_thinking` 里管，
   所以新增 provider 只要组完体调一次 `apply_thinking`、`extra` 仍最后合。
+  「关」的写法按格式分：有 `toggle` 的发 `disabled`（那几家默认开着思考，不发等于没关），
+  纯 effort 的才发 `none`。
   旁路小请求（补全 / 记忆提炼 / 分类器）一律 `suggest::short_thinking(protocol, model)`（按实际协议查表）：能关就关、关不掉取最低一档。
+  **会话级档位**：输入框工具栏的 chip（`composer.rs` 的 `thinking_menu_items`，ACP 内核不显示）改的是
+  `Session::thinking`，经 `Kernel::set_thinking(session, Option<&str>)` 存进内核的 `SessionState`，
+  `run_steps` 每轮现取、覆盖档案里的那份（`None` = 跟随档案）。会话还没建立时记在 `Session::pending_thinking`，
+  `Started` 时由 `ChatApp::flush_pending_thinking` 补交。能选哪些档用 `session_thinking_spec` 按**当前模型**现算。
   加新模型 = 能力表加一条，同时想清楚 `can_disable`（关不掉的那代别给「关」）和 `accepts_temperature`。
 - **worktree 会话**（`crates/core/src/git.rs` + `apps/desktop/src/app/worktree.rs`，见「设计说明-worktree.md」）：
   目录在**数据目录** `worktrees/<仓库名>-<短哈希>/<分支尾段>`，不往用户仓库里塞东西；分支名 `claudesktop/<月日-时分>-<3 位随机>`。

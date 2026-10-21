@@ -13,7 +13,7 @@ use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_builtin::{
-    PermissionRules, Protocol, ProviderConfig, ThinkingFormat, ThinkingLevel, default_rules_path,
+    PermissionRules, Protocol, ProviderConfig, ThinkingLevel, default_rules_path,
 };
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
@@ -1822,6 +1822,8 @@ impl ChatApp {
     /// 发 effort，其余档位不发（见 `apply_thinking`）。以前整行不出现，用户看着设置页
     /// 以为没地方调（其实是被能力表挡掉了）。
     fn render_thinking_row(&self, p: &ProviderProfile, model: &str, cx: &mut Context<Self>) -> Div {
+        // 档位按模型现算：各家能选的档差了不止一点（DeepSeek 没有中档、GLM-5.3 关不掉、
+        // Gemini 3 Pro 只有低/高），所以选项一律来自 `spec.choices()`，不手写固定列表
         let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
         let known = spec.is_known();
         let current = p.params.thinking;
@@ -1843,16 +1845,13 @@ impl ChatApp {
             } else {
                 Some("还不知道这个模型认不认，选「兜底」试试".to_string())
             }
+        } else if p.protocol == Protocol::Anthropic && spec.format.budget {
+            // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
+            active.filter(|l| !l.is_off()).map(|l| {
+                format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))
+            })
         } else {
-            match (p.protocol, spec.format) {
-                // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
-                (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => {
-                    active.filter(|l| !l.is_off()).map(|l| {
-                        format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))
-                    })
-                }
-                _ => None,
-            }
+            None
         };
         let control = div().h_flex().items_center().gap_3().child(seg_control(
             "thinking",

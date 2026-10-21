@@ -365,9 +365,12 @@ mod tests {
         // 关不掉：最低的开档
         assert_eq!(short_thinking(anthropic, "claude-opus-5-5"), Some(ThinkingLevel::Low));
         assert_eq!(short_thinking(openai, "gpt-5"), Some(ThinkingLevel::Minimal));
-        assert_eq!(short_thinking(openai, "glm-5.3"), Some(ThinkingLevel::High));
-        // 同一个名字走 Anthropic 兼容端点：按那张表（预算格式，能关），不能拿 OpenAI 表的「高」
+        // GLM-5.2 起能分档了，最低是「低」（5.3 关不掉，也落到低）
+        assert_eq!(short_thinking(openai, "glm-5.3"), Some(ThinkingLevel::Low));
+        // 同一个名字走 Anthropic 兼容端点：按那张表（预算格式，能关），不能拿 OpenAI 表的「低」
         assert_eq!(short_thinking(anthropic, "glm-5.3"), Some(ThinkingLevel::Off));
+        // DeepSeek V4 的开关和档位并存：能关，最低就是「关」
+        assert_eq!(short_thinking(openai, "deepseek-flash"), Some(ThinkingLevel::Off));
         // 认不出：不发
         assert_eq!(short_thinking(openai, "llama-3-8b"), None);
         assert_eq!(short_thinking(openai, ""), None);

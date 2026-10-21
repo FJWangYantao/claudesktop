@@ -49,7 +49,8 @@ pub use responses::ResponsesProvider;
 pub use provider::{
     ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, Protocol, ProviderConfig,
     RequestParams, StreamEvent, StreamOutcome, ThinkingFormat, ThinkingLevel, ThinkingSpec,
-    ToolCall, Usage, apply_thinking, resolve_level, thinking_budget_for, thinking_spec,
+    ToolCall, Usage, apply_thinking, parse_thinking_level, resolve_level, thinking_budget_for,
+    thinking_spec,
 };
 
 /// 列出端点提供的模型（阻塞，设置页在后台线程调用）。
@@ -234,6 +235,8 @@ struct SessionState {
     cwd: PathBuf,
     /// 本会话使用的模型
     model: String,
+    /// 本会话临时覆盖的思考档位（会话级 chip 选的）；None = 用档案里的
+    thinking: Option<ThinkingLevel>,
     /// 不含系统提示词的对话历史
     history: Vec<ChatMessage>,
     mode: String,
@@ -408,6 +411,8 @@ struct Snapshot {
     mode: String,
     cwd: PathBuf,
     model: String,
+    /// 会话级覆盖的思考档位（见 [`SessionState::thinking`]）
+    thinking: Option<ThinkingLevel>,
     /// 子会话的角色
     agent: Option<AgentDef>,
 }
@@ -724,6 +729,7 @@ impl Inner {
             mode: state.mode.clone(),
             cwd: state.cwd.clone(),
             model: state.model.clone(),
+            thinking: state.thinking,
             agent: state.agent.clone(),
         })
     }
@@ -1488,6 +1494,8 @@ impl Inner {
                 let state = SessionState {
                     cwd: parent.cwd.clone(),
                     model: agent.model.clone().unwrap_or_else(|| parent.model.clone()),
+                    // 子任务跟主会话的档位走（用户中途换档也跟上）
+                    thinking: parent.thinking,
                     history: vec![ChatMessage::new("user", prompt)],
                     mode: parent.mode.clone(),
                     restored: false,
@@ -2076,6 +2084,8 @@ impl BuiltinKernel {
         let mut state = SessionState {
             cwd,
             model: model.clone(),
+            // 会话级档位默认跟随档案，用户在下拉里选了才覆盖
+            thinking: None,
             history: history.messages,
             mode: MODE_DEFAULT.into(),
             restored: resumed,
@@ -2387,7 +2397,8 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         } else {
             just_compacted = false;
         }
-        let Some(Snapshot { mut messages, mode, cwd, model, agent }) = inner.snapshot(session)
+        let Some(Snapshot { mut messages, mode, cwd, model, thinking, agent }) =
+            inner.snapshot(session)
         else {
             return Steps::Stopped;
         };
@@ -2412,8 +2423,21 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
         }
         let mut text = String::new();
+        // 会话级档位（输入框下拉选的）覆盖档案里的那份：每轮现取，中途换档下一步就生效。
+        // 没覆盖时直接用构造好的 provider（连接复用）
+        let session_provider;
+        let provider: &dyn ChatProvider = match thinking {
+            Some(level) => {
+                let mut config = inner.provider_config.clone();
+                config.model = model.clone();
+                config.params.thinking = Some(level);
+                session_provider = make_provider(&config);
+                session_provider.as_ref()
+            }
+            None => inner.provider.as_ref(),
+        };
         let result =
-            inner.provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
+            provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
                 if stopped() {
                     return;
                 }
@@ -2690,6 +2714,17 @@ impl Kernel for BuiltinKernel {
 
     fn set_context_windows(&self, windows: HashMap<String, u64>) {
         *self.inner.context_windows.lock().unwrap() = windows;
+    }
+
+    /// 会话级思考档位：存进会话状态，之后每轮请求现取（见 `run_steps`）。
+    /// `None` = 回到档案里的那份。会话还没建立时由界面记着，`Started` 之后再补一次。
+    fn set_thinking(&self, session: &str, level: Option<&str>) -> anyhow::Result<()> {
+        let level = level.map(parse_thinking_level).transpose()?;
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        let state =
+            sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+        state.thinking = level;
+        Ok(())
     }
 
     /// 手动压缩：自成一轮（占着 `turn`，期间不能发消息、可以取消），全部对话进摘要。

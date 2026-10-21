@@ -881,6 +881,37 @@ fn set_model_switches_the_session_and_new_sessions() {
 }
 
 #[test]
+fn set_thinking_overrides_the_profile_for_one_session() {
+    let (base, bodies) = serve(vec![happy_stream("一"), happy_stream("二")]);
+    // 用一个能力表认得的模型：认不出的模型上任何档位都不会发字段（见 apply_thinking）
+    let h = Harness::with_config(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "gpt-5.1".into(),
+            ..Default::default()
+        },
+        empty_dir(),
+    );
+    let sid = h.start();
+    // 认不出的档位 / 不存在的会话：报错而不是悄悄忽略
+    assert!(h.kernel.set_thinking(&sid, Some("ultra")).is_err());
+    assert!(h.kernel.set_thinking("nope", Some("high")).is_err());
+
+    // 会话级覆盖：下一轮请求带上去
+    h.kernel.set_thinking(&sid, Some("high")).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("a")).unwrap();
+    h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(body(&bodies, 0)["reasoning_effort"], "high");
+
+    // 回到「默认」（不覆盖）：档案里没设就不发字段
+    h.kernel.set_thinking(&sid, None).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("b")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert!(body(&bodies, 1).get("reasoning_effort").is_none(), "{:?}", body(&bodies, 1));
+}
+
+#[test]
 fn edit_previews_diff_before_asking() {
     let dir = workdir("diff");
     std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();

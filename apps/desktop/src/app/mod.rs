@@ -1690,6 +1690,7 @@ impl ChatApp {
                     }
                     // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
                     if matches!(event, KernelEvent::Started { .. }) {
+                        self.flush_pending_thinking(idx, kernel.as_deref());
                         self.dispatch_queued(idx, cx);
                     }
                     // 这一轮正常结束、输入框空着：猜用户接下来会发的那一句（见 suggest.rs）
