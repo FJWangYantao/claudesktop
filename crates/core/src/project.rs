@@ -84,8 +84,14 @@ pub fn root_or(cwd: &Path) -> &Path {
 /// 项目根（向上找几层 `.claudesktop` / `.git`，工作目录本身优先）。
 /// worktree 里的 `.git` 是**文件**（`gitdir: <主仓库>/.git/worktrees/<名>`），也算项目根：
 /// 项目配置、说明文件读到的是**这个分支上的版本**，和代码一致。
+/// submodule 的 `.git` 也是文件，但它**不算**：在 submodule 里干活仍归外面那个项目（配置、规则照旧）。
 pub fn project_root(cwd: &Path) -> Option<&Path> {
-    climb(cwd, |d| path_in(d).is_file() || d.join(".git").exists())
+    climb(cwd, |d| path_in(d).is_file() || d.join(".git").is_dir() || is_worktree_checkout(d))
+}
+
+/// `dir` 是不是一个 git worktree 的检出目录（`.git` 文件指向 `<主仓库>/.git/worktrees/<名>`）。
+fn is_worktree_checkout(dir: &Path) -> bool {
+    dir.join(".git").is_file() && gitdir_target(dir).and_then(|g| main_repo_of(&g)).is_some()
 }
 
 /// 共享根：项目记忆、权限规则这些「对这个项目」的东西按它算。
@@ -154,9 +160,19 @@ fn climb(cwd: &Path, is_root: impl Fn(&Path) -> bool) -> Option<&Path> {
     None
 }
 
-/// 共享根（项目记忆、权限规则按它算）：没有标记时就是工作目录本身。
-pub fn shared_root_or(cwd: &Path) -> PathBuf {
-    shared_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+/// 工作目录在主仓库里对应的那个目录：worktree 里的 `<worktree>/crates/x` → `<主仓库>/crates/x`，
+/// 其余情况就是工作目录本身。权限规则按它记，在 worktree 里点的「始终允许」管的范围
+/// 和在主目录同一个子目录里点的一样大（不会因为在 worktree 里就放大到整个仓库）。
+pub fn shared_dir(cwd: &Path) -> PathBuf {
+    if let Some(root) = project_root(cwd)
+        && let Some(main) = gitdir_target(root).and_then(|g| main_repo_of(&g))
+    {
+        return match cwd.strip_prefix(root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => main.join(rel),
+            _ => main,
+        };
+    }
+    cwd.to_path_buf()
 }
 
 /// 读项目配置；没有文件返回 None，文件坏了返回带警告的默认（还能用）。
@@ -522,7 +538,11 @@ mod tests {
         assert_eq!(shared_root(&nested).as_deref(), Some(main.as_path()));
         // 普通仓库：共享根就是项目根
         assert_eq!(shared_root(&main).as_deref(), Some(main.as_path()));
-        assert_eq!(shared_root_or(&base.join("nonexistent")), base.join("nonexistent"));
+        // 工作目录对到主仓库里的同一个子目录；不在 worktree 里就是它自己
+        assert_eq!(shared_dir(&tree), main);
+        assert_eq!(shared_dir(&nested), main.join("crates/x"));
+        assert_eq!(shared_dir(&main), main);
+        assert_eq!(shared_dir(&base.join("nonexistent")), base.join("nonexistent"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -530,21 +550,25 @@ mod tests {
     #[test]
     fn gitdir_files_are_parsed_leniently() {
         let base = tmp("gitdir");
-        let sub = base.join("sub");
+        // 外面一个普通仓库，里面一个 `.git` 是文件的子目录
+        let main = base.join("main");
+        let sub = main.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        // submodule 的 `.git` 指到主仓库的 `.git/modules/<名>`：不是 worktree，共享根就是它自己
-        let modules = base.join("main").join(".git").join("modules").join("sub");
+        // submodule 的 `.git` 指到主仓库的 `.git/modules/<名>`：不算项目根，归外面那个项目
+        let modules = main.join(".git").join("modules").join("sub");
         std::fs::create_dir_all(&modules).unwrap();
         std::fs::write(sub.join(".git"), format!("gitdir: {}", modules.display())).unwrap();
-        assert_eq!(shared_root(&sub).as_deref(), Some(sub.as_path()));
-        // 相对路径按项目根解析
-        std::fs::create_dir_all(base.join("main").join(".git").join("worktrees").join("w"))
-            .unwrap();
-        std::fs::write(sub.join(".git"), "gitdir: ../main/.git/worktrees/w\n").unwrap();
-        assert_eq!(shared_root(&sub).as_deref(), Some(base.join("main").as_path()));
-        // 没有 `gitdir:` 行（手写的坏文件）：当普通项目根
+        assert_eq!(project_root(&sub), Some(main.as_path()));
+        assert_eq!(shared_root(&sub).as_deref(), Some(main.as_path()));
+        assert_eq!(shared_dir(&sub), sub);
+        // 相对路径按项目根解析：是 worktree，自己就是项目根，共享根回到主仓库
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("w")).unwrap();
+        std::fs::write(sub.join(".git"), "gitdir: ../.git/worktrees/w\n").unwrap();
+        assert_eq!(project_root(&sub), Some(sub.as_path()));
+        assert_eq!(shared_root(&sub).as_deref(), Some(main.as_path()));
+        // 没有 `gitdir:` 行（手写的坏文件）：不算项目根，归外面那个项目
         std::fs::write(sub.join(".git"), "乱写的\n").unwrap();
-        assert_eq!(shared_root(&sub).as_deref(), Some(sub.as_path()));
+        assert_eq!(project_root(&sub), Some(main.as_path()));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

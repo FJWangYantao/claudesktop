@@ -363,6 +363,23 @@ struct AutoMode {
     config: AutoModeConfig,
     /// 每个会话连续被拒绝几次 / 一共被拒绝几次（连续 3 次或累计 20 次就暂停自动模式）
     denials: Mutex<HashMap<String, Denials>>,
+    /// 分类器上次用的 provider 和造它的配置：配置没变就接着用（连接复用，不每次重新握手）
+    provider: Mutex<Option<(ProviderConfig, Arc<dyn ChatProvider>)>>,
+}
+
+impl AutoMode {
+    /// 按配置取分类器的 provider：和上次一样就复用，变了（换了模型 / 端点 / 档位）就重造。
+    fn provider_for(&self, config: &ProviderConfig) -> Arc<dyn ChatProvider> {
+        let mut cached = self.provider.lock().unwrap();
+        if let Some((used, provider)) = cached.as_ref()
+            && used == config
+        {
+            return provider.clone();
+        }
+        let provider = make_provider(config);
+        *cached = Some((config.clone(), provider.clone()));
+        provider
+    }
 }
 
 /// 拒绝计数（见 [`AutoMode::denials`]）。
@@ -1818,7 +1835,7 @@ impl Inner {
         );
         let messages = vec![ChatMessage::new("system", system), ChatMessage::new("user", user)];
         // 分类器要么用自己的模型和端点，要么跟着会话走
-        let (config, model) = match &auto.config.model {
+        let (mut config, model) = match &auto.config.model {
             Some(config) => (config.clone(), config.model.clone()),
             None => (
                 self.provider_config.clone(),
@@ -1828,10 +1845,8 @@ impl Inner {
         };
         // 分类器只要一句短判断：档位按模型覆盖成「能关就关、关不掉取最低一档」，
         // 别继承档案里给正式对话配的深度思考（又慢又贵，还容易被思考带偏）
-        let protocol = config.protocol;
-        let provider = provider::provider_with(&config, |params| {
-            params.thinking = suggest::short_thinking(protocol, &model);
-        });
+        config.params.thinking = suggest::short_thinking(config.protocol, &model);
+        let provider = auto.provider_for(&config);
         let mut reply = String::new();
         // 分类器的请求也记进用量网关（用途 `auto`）
         let _tag = gateway::tag(session, "auto", self.turn_number(session));
@@ -1975,9 +1990,11 @@ impl BuiltinKernel {
             kernel_id,
             memory_path: config.memory_path,
             memory_suggest: config.memory_suggest,
-            auto_mode: config
-                .auto_mode
-                .map(|config| AutoMode { config, denials: Mutex::default() }),
+            auto_mode: config.auto_mode.map(|config| AutoMode {
+                config,
+                denials: Mutex::default(),
+                provider: Mutex::default(),
+            }),
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });

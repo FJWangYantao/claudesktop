@@ -136,6 +136,45 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<(), Stri
     }
 }
 
+/// [`dispose_worktree`] 的结果：删到哪一步、留下了什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Disposal {
+    /// 目录和分支都删了
+    Gone,
+    /// 目录删了，分支上有没合并的提交，留着（`ahead` 读不出时为 0）
+    BranchKept { ahead: usize },
+    /// 还有没提交的改动：什么都没动
+    Dirty { files: usize },
+    /// 状态读不出 / 删不掉：什么都没动，附原因
+    Kept(String),
+}
+
+/// 不丢东西的前提下能删多少删多少（会话被删掉时用）：干净的连分支一起删；
+/// 只有没合并的提交时删目录、留分支（提交都在分支上，随时能再检出）；有没提交的改动就整个留着。
+/// 只用不强删的命令，git 认为会丢东西的一律拒绝。
+pub fn dispose_worktree(repo: &Path, path: &Path, base: &str, branch: &str) -> Disposal {
+    if !path.is_dir() {
+        // 目录早没了：清掉记录，分支有没合并的提交就留着
+        let _ = prune(repo);
+        let kept = delete_branch(repo, branch, false).is_err() && branch_exists(repo, branch);
+        return if kept { Disposal::BranchKept { ahead: 0 } } else { Disposal::Gone };
+    }
+    let status = match status(repo, path, base, branch) {
+        Ok(status) => status,
+        Err(err) => return Disposal::Kept(err),
+    };
+    if status.dirty_files > 0 {
+        return Disposal::Dirty { files: status.dirty_files };
+    }
+    if let Err(err) = remove_worktree(repo, path, false) {
+        return Disposal::Kept(err);
+    }
+    if delete_branch(repo, branch, false).is_err() && branch_exists(repo, branch) {
+        return Disposal::BranchKept { ahead: status.ahead };
+    }
+    Disposal::Gone
+}
+
 /// 删分支（`force` = 连没合并的提交一起删）。
 pub fn delete_branch(repo: &Path, branch: &str, force: bool) -> Result<(), String> {
     let _guard = lock(repo);
@@ -498,6 +537,43 @@ mod tests {
         assert!(branch_exists(&repo, "claudesktop/z"));
         delete_branch(&repo, "claudesktop/不存在", true).unwrap_or_default();
         remove_worktree(&repo, &wt, true).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 删会话时的清理：只删不会丢东西的部分
+    #[test]
+    fn disposes_only_what_can_be_recovered() {
+        let Some((base, repo)) = repo("dispose") else {
+            return;
+        };
+        // 干净的：目录和分支都删
+        let clean = base.join("clean");
+        add_worktree(&repo, &clean, "claudesktop/clean").unwrap();
+        assert_eq!(dispose_worktree(&repo, &clean, "main", "claudesktop/clean"), Disposal::Gone);
+        assert!(!clean.exists() && !branch_exists(&repo, "claudesktop/clean"));
+
+        // 有没提交的改动：原样留着
+        let dirty = base.join("dirty");
+        add_worktree(&repo, &dirty, "claudesktop/dirty").unwrap();
+        std::fs::write(dirty.join("new.txt"), "新").unwrap();
+        assert_eq!(
+            dispose_worktree(&repo, &dirty, "main", "claudesktop/dirty"),
+            Disposal::Dirty { files: 1 }
+        );
+        assert!(dirty.join("new.txt").is_file());
+
+        // 只有没合并的提交：删目录、留分支
+        commit_all(&dirty, "改").unwrap();
+        assert_eq!(
+            dispose_worktree(&repo, &dirty, "main", "claudesktop/dirty"),
+            Disposal::BranchKept { ahead: 1 }
+        );
+        assert!(!dirty.exists() && branch_exists(&repo, "claudesktop/dirty"));
+        // 目录已经没了、分支还领先：分支照样留着
+        assert_eq!(
+            dispose_worktree(&repo, &dirty, "main", "claudesktop/dirty"),
+            Disposal::BranchKept { ahead: 0 }
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

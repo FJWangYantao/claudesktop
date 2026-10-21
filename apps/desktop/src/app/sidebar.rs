@@ -1201,8 +1201,8 @@ impl ChatApp {
         }
         let removed = self.sessions.remove(idx);
         let id = removed.meta.as_ref().map(|m| m.id.clone());
-        // 从没改过东西的 worktree：顺手删掉，别在数据目录里堆空目录（有对话的交给分支菜单）
-        self.cleanup_worktree_of(&removed);
+        // 会话的 worktree：不丢东西的前提下能删多少删多少，留下的说一声（见 worktree.rs）
+        self.cleanup_worktree_of(&removed, cx);
         // 先关掉日志文件再删
         drop(removed);
         if let Some(id) = id {

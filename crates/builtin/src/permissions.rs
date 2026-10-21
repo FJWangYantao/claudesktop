@@ -108,16 +108,21 @@ impl PermissionRules {
     /// 在当前项目的规则里找 `prefix` 前缀（`""` = 允许、`deny:` = 拒绝）下
     /// 与 `rule` 匹配的一条。shell 规则按词前缀匹配，其余按整串相等。
     /// 工作目录在项目的子目录里时，项目根下的规则（项目配置并进来的就记在根下）同样算数；
-    /// 在 worktree 里跑时按**主仓库根**算（[`claudesktop_core::project::shared_root`]），
+    /// 在 worktree 里跑时对到主仓库里的同一个目录（[`claudesktop_core::project::shared_dir`]），
     /// 主目录点过的「始终允许」在 worktree 里也算数，反之亦然。
     fn matching(&mut self, cwd: &Path, rule: &str, command: Option<&str>, prefix: &str) -> bool {
         self.reload();
-        // 记规则时按共享根（worktree 里是主仓库根），但老的 / 手写的规则可能记在工作目录或
-        // 项目根下：三个都查一遍
-        let shared = claudesktop_core::project::shared_root(cwd);
-        let mut keys = vec![Self::key(shared.as_deref().unwrap_or(cwd))];
-        for extra in [claudesktop_core::project::project_root(cwd), Some(cwd)] {
-            let key = Self::key(extra.unwrap_or(cwd));
+        // 记规则时按工作目录在主仓库里对应的目录（不在 worktree 里就是工作目录本身）；
+        // 项目根下的（项目配置并进来的，worktree 里是主仓库根）也算，老的可能直接记在 worktree 目录下
+        let mut keys = Vec::new();
+        let candidates = [
+            Some(claudesktop_core::project::shared_dir(cwd)),
+            claudesktop_core::project::shared_root(cwd),
+            claudesktop_core::project::project_root(cwd).map(Path::to_path_buf),
+            Some(cwd.to_path_buf()),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            let key = Self::key(&dir);
             if !keys.contains(&key) {
                 keys.push(key);
             }
@@ -135,10 +140,11 @@ impl PermissionRules {
     }
 
     /// 添加一条规则并立即落盘（原子写）。拒绝规则带 `deny:` 前缀。
-    /// 记在项目的共享根下（worktree 里就是主仓库根），这样主目录和 worktree 共用一份。
+    /// 记在工作目录下（worktree 里换成主仓库里对应的那个目录），这样主目录和 worktree 共用一份，
+    /// 范围也和以前一样（在子目录里点的只管那个子目录）。
     pub fn add(&mut self, cwd: &Path, rule: String) -> io::Result<()> {
         self.reload();
-        let cwd = &claudesktop_core::project::shared_root_or(cwd);
+        let cwd = &claudesktop_core::project::shared_dir(cwd);
         // 同一动作允许和拒绝不会同时存：加一边时把整串相反的那条删掉（后写的赢）；
         // shell 规则前缀重叠的细粒度情况留给用户在设置页里自己清理
         let opposite = if let Some(rest) = rule.strip_prefix(DENY_PREFIX) {
@@ -237,6 +243,17 @@ mod tests {
         rules.add(&main, "deny:shell:rm".into()).unwrap();
         assert!(rules.denies(&tree, "shell:rm", Some("rm -rf build")));
         assert!(rules.denies(&main, "shell:rm", Some("rm -rf build")));
+
+        // 子目录里点的只管那个子目录：worktree 的 `crates/x` 记到主仓库的 `crates/x` 下，
+        // 不放大到整个仓库（普通项目里也一样）
+        let sub = tree.join("crates").join("x");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(main.join("crates").join("y")).unwrap();
+        rules.add(&sub, "shell:cargo".into()).unwrap();
+        assert!(rules.allows(&sub, "shell:cargo", Some("cargo test")));
+        assert!(rules.allows(&main.join("crates").join("x"), "shell:cargo", Some("cargo test")));
+        assert!(!rules.allows(&main, "shell:cargo", Some("cargo test")));
+        assert!(!rules.allows(&main.join("crates").join("y"), "shell:cargo", Some("cargo test")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

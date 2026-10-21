@@ -13,7 +13,6 @@ use crate::gateway::Route;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -280,26 +279,47 @@ fn openai_spec(name: &str) -> ThinkingSpec {
         format: ThinkingFormat::OpenAiEffort,
         accepts_temperature: true,
     };
-    // GPT-5 / o 系列：reasoning_effort 是官方参数，且这些模型关不掉思考
-    // （`none` 只有 gpt-5.1 起才认，下面单独那一支）
-    let gpt5 = name.starts_with("gpt-5") || name == "gpt-5";
+    // GPT-5 / o 系列：reasoning_effort 是官方参数
     let o_series =
         ["o1", "o3", "o4"].iter().any(|p| name == *p || name.starts_with(&format!("{p}-")));
-    // gpt-5.1 起能关（`none`），先判它
-    if name.starts_with("gpt-5-1") || name.starts_with("gpt-5.1") {
-        return ThinkingSpec {
-            levels: &[
-                ThinkingLevel::Off,
-                ThinkingLevel::Minimal,
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
-                ThinkingLevel::XHigh,
-            ],
-            ..owned()
-        };
+    if let Some(rest) = name.strip_prefix("gpt-5") {
+        // `gpt-5-chat-latest` 这类是不思考的对话模型，发 reasoning_effort 就是 400
+        if rest.contains("chat") {
+            return ThinkingSpec::NONE;
+        }
+        match gpt5_minor(rest) {
+            // gpt-5 / gpt-5-mini / gpt-5-nano：minimal ~ high，关不掉
+            Some(0) => return owned(),
+            // gpt-5.1：none / low / medium / high（官方模型页，没有 minimal 和 xhigh）
+            Some(1) => {
+                return ThinkingSpec {
+                    levels: &[
+                        ThinkingLevel::Off,
+                        ThinkingLevel::Low,
+                        ThinkingLevel::Medium,
+                        ThinkingLevel::High,
+                    ],
+                    ..owned()
+                };
+            }
+            // gpt-5.2 起：再加 xhigh（gpt-5.1-codex-max 之后的模型都认）；minimal 不认
+            Some(_) => {
+                return ThinkingSpec {
+                    levels: &[
+                        ThinkingLevel::Off,
+                        ThinkingLevel::Low,
+                        ThinkingLevel::Medium,
+                        ThinkingLevel::High,
+                        ThinkingLevel::XHigh,
+                    ],
+                    ..owned()
+                };
+            }
+            // `gpt-50` 之类：不是这一家
+            None => {}
+        }
     }
-    if gpt5 || o_series {
+    if o_series {
         return owned();
     }
     // Qwen 3 系：`enable_thinking` 布尔（阿里云百炼「混合思考」，可开关）
@@ -350,6 +370,20 @@ fn openai_spec(name: &str) -> ThinkingSpec {
     ThinkingSpec::NONE
 }
 
+/// `gpt-5` 后面那截 → 小版本号：`""` / `-mini` / `-2025-08-07` 是 0，`.1` / `-1-codex` 是 1。
+/// 不是 `gpt-5` 系列（`gpt-50`）返回 None。
+fn gpt5_minor(rest: &str) -> Option<u32> {
+    let Some(tail) = rest.strip_prefix(['.', '-']) else {
+        return rest.is_empty().then_some(0);
+    };
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    // 一两位才是小版本号；四位的是日期快照（`gpt-5-2025-08-07`）
+    match digits.len() {
+        1 | 2 => digits.parse().ok(),
+        _ => Some(0),
+    }
+}
+
 /// Anthropic 原生协议下的能力表（按 [`model_key`] 后的名字匹配，走 claude 自己的命名）。
 fn anthropic_spec(name: &str) -> ThinkingSpec {
     let adaptive = |levels: &'static [ThinkingLevel], accepts_temperature: bool| ThinkingSpec {
@@ -357,8 +391,13 @@ fn anthropic_spec(name: &str) -> ThinkingSpec {
         format: ThinkingFormat::AnthropicAdaptive,
         accepts_temperature,
     };
-    // 名字里不带 claude 的走 Anthropic 格式的第三方端点（DeepSeek、GLM……）认旧格式的预算
+    // 名字里不带 claude 的是 Anthropic 格式的第三方端点。只认确认过收旧格式预算的那几家
+    // （DeepSeek、GLM，和 OpenAI 兼容表里认得的同一批）；别的认不出，什么都不发
     if !name.contains("claude") {
+        let budget_ok = name.starts_with("deepseek-") || name.starts_with("glm-");
+        if !budget_ok || !openai_spec(name).is_known() {
+            return ThinkingSpec::NONE;
+        }
         return ThinkingSpec {
             levels: &[
                 ThinkingLevel::Off,
@@ -415,32 +454,15 @@ fn anthropic_spec(name: &str) -> ThinkingSpec {
     }
     // 4.5 及更早：`budget_tokens`
     if name.starts_with("claude-") {
-        let old = [
-            "claude-opus-4-5",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5",
-            "claude-haiku-5",
-            "claude-opus-4-1",
-        ];
+        let old = ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1"];
         if old.iter().any(|p| name.starts_with(p)) || name.contains("3-5") || name.contains("3-7") {
-            let levels: &'static [ThinkingLevel] = if name.starts_with("claude-haiku-5") {
-                &[
-                    ThinkingLevel::Off,
-                    ThinkingLevel::Low,
-                    ThinkingLevel::Medium,
-                    ThinkingLevel::High,
-                    ThinkingLevel::XHigh,
-                ]
-            } else {
-                &[
-                    ThinkingLevel::Off,
-                    ThinkingLevel::Low,
-                    ThinkingLevel::Medium,
-                    ThinkingLevel::High,
-                ]
-            };
             return ThinkingSpec {
-                levels,
+                levels: &[
+                    ThinkingLevel::Off,
+                    ThinkingLevel::Low,
+                    ThinkingLevel::Medium,
+                    ThinkingLevel::High,
+                ],
                 format: ThinkingFormat::AnthropicBudget,
                 accepts_temperature: true,
             };
@@ -873,20 +895,6 @@ pub trait ChatProvider: Send + Sync {
     fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>>;
 }
 
-/// 再造一个 provider：分类器、补全这类旁路请求要覆盖思考档位，而 provider 的配置是
-/// 构造时吃下的。`change` 拿到的是当前参数的副本。
-///
-/// 入参是 [`ProviderConfig`] 而不是 provider 自己：配置里什么都有（协议、端点、key、
-/// 网关），造一个比从 trait 对象里把配置掏出来干净。
-pub(crate) fn provider_with(
-    config: &ProviderConfig,
-    change: impl FnOnce(&mut RequestParams),
-) -> Arc<dyn ChatProvider> {
-    let mut config = config.clone();
-    change(&mut config.params);
-    crate::make_provider(&config)
-}
-
 /// 带退避重试的 SSE POST（两个 provider 共用）：非 2xx 读出错误体，
 /// 可重试状态码在出字前按 [`BACKOFF_MS`] 退避重试；成功返回响应体的行读取器。
 /// 经用量网关时每次尝试带上请求号和第几次（网关日志里重试归到同一个请求）。
@@ -1188,10 +1196,12 @@ mod tests {
         // 走 Anthropic 格式的第三方端点（DeepSeek / GLM）：认旧格式预算
         assert_eq!(spec("deepseek-v4-pro").format, ThinkingFormat::AnthropicBudget);
         assert!(spec("deepseek-v4-pro").can_disable());
-        // 认不出的模型整行不显示。注意 Anthropic 原生协议下「名字里不带 claude」会落到
-        // 第三方兼容端点那一支（DeepSeek / GLM 都这么接），那是认得的
+        assert_eq!(spec("glm-5.3").format, ThinkingFormat::AnthropicBudget);
         assert!(spec("claude-nonexistent-1").is_known());
-        assert!(spec("deepseek-v4-pro").is_known());
+        // 别家第三方端点认不出：什么都不发（和 OpenAI 兼容表同一个原则）
+        assert!(!spec("kimi-k2").is_known());
+        assert!(!spec("llama-3-8b").is_known());
+        assert!(!spec("deepseek-reasoner").is_known());
     }
 
     /// OpenAI 兼容 / Responses：认得出的模型才有档位，字段按各家写法。
@@ -1204,9 +1214,23 @@ mod tests {
         assert!(gpt5.levels.contains(&ThinkingLevel::High));
         // gpt-5 / o 系列关不掉思考（以前「补全不发」靠名字猜，现在有表）
         assert!(!gpt5.can_disable());
-        // gpt-5.1 起能关，还能到 xhigh
+        assert!(gpt5.levels.contains(&ThinkingLevel::Minimal));
+        // 日期快照还是 gpt-5
+        assert_eq!(spec("gpt-5-2025-08-07").levels, gpt5.levels);
+        // gpt-5.1：能关，没有 minimal / xhigh
         let gpt51 = spec("gpt-5.1");
-        assert!(gpt51.can_disable() && gpt51.levels.contains(&ThinkingLevel::XHigh));
+        assert_eq!(
+            gpt51.levels,
+            &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High]
+        );
+        assert_eq!(spec("gpt-5-1-codex").levels, gpt51.levels);
+        // gpt-5.2 起有 xhigh
+        let gpt52 = spec("gpt-5.2");
+        assert!(gpt52.can_disable() && gpt52.levels.contains(&ThinkingLevel::XHigh));
+        assert!(!gpt52.levels.contains(&ThinkingLevel::Minimal));
+        // 不思考的对话版、不是这一家的
+        assert!(!spec("gpt-5-chat-latest").is_known());
+        assert!(!spec("gpt-50").is_known());
 
         assert!(spec("o3-mini").is_known());
         assert!(spec("o4-mini").is_known());

@@ -174,9 +174,11 @@ impl ChatApp {
             return;
         };
         let path = self.sessions[idx].cwd.clone();
-        if path.is_dir() {
+        // 每个会话只试一次：启动时和切过来时都会叫到这里，重复试只会抢锁、在对话里叠一串同样的说明
+        if path.is_dir() || self.sessions[idx].worktree_repair_tried {
             return;
         }
+        self.sessions[idx].worktree_repair_tried = true;
         if !meta.repo.is_dir() {
             self.sessions[idx].note(format!(
                 "worktree 目录和主仓库都不在了（{}）：这段对话只能看，不能再跑",
@@ -542,15 +544,25 @@ impl ChatApp {
         cleanup_worktree_now(&meta, &self.sessions[idx].cwd);
     }
 
-    /// 同上，会话已经从列表里摘下来了（删除会话时用）。
-    pub(crate) fn cleanup_worktree_of(&self, s: &Session) {
+    /// 删除会话时处理它的 worktree（会话已经从列表里摘下来了）：只做不会丢东西的那部分——
+    /// 干净的连分支一起删；只有没合并的提交时删目录、留分支（提交都在分支上）；
+    /// 还有没提交的改动就整个留着。留下了什么用 toast 说清楚，不悄悄堆在数据目录里。
+    pub(crate) fn cleanup_worktree_of(&self, s: &Session, cx: &mut Context<Self>) {
         let Some(meta) = s.worktree.clone() else {
             return;
         };
-        if s.has_user_message() {
-            return;
-        }
-        cleanup_worktree_now(&meta, &s.cwd);
+        let path = s.cwd.clone();
+        cx.spawn(async move |this, cx| {
+            let job = {
+                let (meta, path) = (meta.clone(), path.clone());
+                cx.background_executor().spawn(async move { leftover_after_delete(&meta, &path) })
+            };
+            let Some(message) = job.await else {
+                return;
+            };
+            let _ = this.update(cx, |app, cx| app.toast(Notification::warning(message), cx));
+        })
+        .detach();
     }
 }
 
@@ -569,6 +581,25 @@ fn cleanup_worktree_now(meta: &claudesktop_core::WorktreeMeta, path: &Path) {
             let _ = git::delete_branch(&meta.repo, &meta.branch, false);
         }
     });
+}
+
+/// [`ChatApp::cleanup_worktree_of`] 的提示语：全删干净了返回 None。
+fn leftover_after_delete(meta: &WorktreeMeta, path: &Path) -> Option<String> {
+    let branch = &meta.branch;
+    let shown = path.display();
+    match git::dispose_worktree(&meta.repo, path, &meta.base, branch) {
+        git::Disposal::Gone => None,
+        git::Disposal::BranchKept { ahead } => Some(format!(
+            "会话删了，worktree 目录也删了；分支 {branch} 上还有{} 没合并的提交，留着没删",
+            if ahead > 0 { format!(" {ahead} 个") } else { String::new() }
+        )),
+        git::Disposal::Dirty { files } => Some(format!(
+            "会话删了，但 worktree 里还有 {files} 个文件的改动没提交，原样留在 {shown}（分支 {branch}）"
+        )),
+        git::Disposal::Kept(err) => {
+            Some(format!("会话删了，worktree 没删掉（{err}），留在 {shown}"))
+        }
+    }
 }
 
 /// 现在几点（毫秒）：分支名里的「月日-时分」用它。
