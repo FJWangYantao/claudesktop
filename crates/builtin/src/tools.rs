@@ -1899,9 +1899,13 @@ pub(crate) fn kill_tree(child: &mut std::process::Child) {
 /// 界面里不经模型直接跑的命令（worktree 的初始化）：和 `run_shell` 同一套 shell、不弹窗、
 /// 边读边攒输出；在 unix 上自成一个进程组，超时连同 `npm` / `node` 这些子孙一起结束。
 pub fn run_command(command: &str, cwd: &Path, timeout: Duration) -> ToolOutput {
-    let mut cmd = shell_command(command);
+    let cmd = shell_command(command);
     #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let cmd = {
+        let mut cmd = cmd;
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        cmd
+    };
     run_shell_in(cmd, cwd, timeout, &|| false, &|_| {}, cfg!(unix))
 }
 
