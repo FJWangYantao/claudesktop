@@ -1083,8 +1083,10 @@ impl ChatApp {
         inputs.api_key.update(cx, |s, cx| s.set_value(key, window, cx));
         self.settings_form.message = Some((
             false,
-            format!("已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）")
-                .into(),
+            format!(
+                "已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）。{ANTIGRAVITY_RISK}"
+            )
+            .into(),
         ));
         self.fetch_models(true, cx);
     }
@@ -1584,16 +1586,32 @@ impl ChatApp {
         let mut endpoint = div().v_flex().gap_1p5().child(Self::text_input(&inputs.base_url));
         if antigravity_gateway().is_some() {
             endpoint = endpoint.child(
-                div().h_flex().child(
-                    Self::quiet_button("import-antigravity", IconAll::Download, Surface::Paper, cx)
-                        .xsmall()
-                        .label("从 Antigravity Tools 导入端点和 Key")
-                        .px_2()
-                        .ml(rems(-0.5))
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.import_antigravity(window, cx)),
+                div()
+                    .v_flex()
+                    .gap_0p5()
+                    .child(
+                        div().h_flex().child(
+                            Self::quiet_button(
+                                "import-antigravity",
+                                IconAll::Download,
+                                Surface::Paper,
+                                cx,
+                            )
+                            .xsmall()
+                            .label("从 Antigravity Tools 导入端点和 Key")
+                            .px_2()
+                            .ml(rems(-0.5))
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.import_antigravity(window, cx),
+                            )),
                         ),
-                ),
+                    )
+                    .child(
+                        div()
+                            .text_size(TEXT_META)
+                            .text_color(rgb(INK_SOFT))
+                            .child(ANTIGRAVITY_RISK),
+                    ),
             );
         }
         div()
@@ -1748,7 +1766,7 @@ impl ChatApp {
     fn render_acp(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let mut quick = div().h_flex().items_center().gap_1().ml(rems(-0.5));
-        for (i, (label, command)) in ACP_PRESETS.into_iter().enumerate() {
+        for (i, (label, command, _)) in ACP_PRESETS.into_iter().enumerate() {
             quick = quick.child(
                 Self::quiet_button(("acp-preset", i), IconAll::SquareTerminal, Surface::Paper, cx)
                     .xsmall()
@@ -1763,7 +1781,12 @@ impl ChatApp {
                     })),
             );
         }
-        let command = div().v_flex().gap_1p5().child(Self::text_input(&f.acp_command)).child(quick);
+        let mut command =
+            div().v_flex().gap_1p5().child(Self::text_input(&f.acp_command)).child(quick);
+        for risk in ACP_PRESETS.iter().filter_map(|(_, _, risk)| *risk) {
+            command =
+                command.child(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk));
+        }
         let gateway_desc = if self.settings.usage_gateway {
             "把 agent 的请求也记进「请求」页签"
         } else {
@@ -2004,9 +2027,18 @@ const KERNEL_CHOICES: [(KernelChoice, IconAll, &str, &str); 3] = [
     (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
 ];
 
-/// ACP 启动命令的常用项：(名称, 命令)；Windows 上前面补 `cmd /c`（见 [`acp_command`]）。
-const ACP_PRESETS: [(&str, &str); 2] =
-    [("Claude Code", "npx -y @agentclientprotocol/claude-agent-acp"), ("pi", "npx -y pi-acp")];
+/// ACP 启动命令的常用项：(名称, 命令, 风险提示)；Windows 上前面补 `cmd /c`（见 [`acp_command`]）。
+const ACP_PRESETS: [(&str, &str, Option<&str>); 2] = [
+    ("Claude Code", "npx -y @agentclientprotocol/claude-agent-acp", Some(CLAUDE_CODE_RISK)),
+    ("pi", "npx -y pi-acp", None),
+];
+
+/// 适配器底层是 Agent SDK，Anthropic 2026-02 起写明订阅登录只能用在 Claude Code / Claude.ai。
+const CLAUDE_CODE_RISK: &str = "风险：Claude Code 用订阅账号登录时，Anthropic 条款不允许经第三方程序使用，账号可能被限制；用 API Key 登录不受影响";
+
+/// Antigravity Tools 借用 Antigravity 账号的登录，Google 2026-02 起按违反条款封过这样用的账号。
+const ANTIGRAVITY_RISK: &str =
+    "风险：它借用你 Antigravity 账号的登录调用模型，Google 封过这样用的账号";
 
 /// npx 在 Windows 上是 .cmd，要经 `cmd /c` 才起得来。
 fn acp_command(command: &str) -> String {

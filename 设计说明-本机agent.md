@@ -46,7 +46,7 @@
 
 | 预设 ID | 名称 | 怎么找 | 启动命令 | 登录 | 备注 |
 |---|---|---|---|---|---|
-| `claude` | Claude Code | `claude` 在 PATH | `npx -y @zed-industries/claude-code-acp`（Windows 外面套 `cmd /c`，同 `default_agent_command`） | 适配器报 `authMethods`；或终端里跑 `claude /login` | 适配器要 Node；它跑的是 Claude Code 本体，用的是用户自己的登录 |
+| `claude` | Claude Code | `claude` 在 PATH | `npx -y @agentclientprotocol/claude-agent-acp`（Windows 外面套 `cmd /c`，同设置页现有的 `ACP_PRESETS`） | 适配器报 `authMethods`；或终端里跑 `claude /login` | 适配器要 Node；它跑的是 Claude Code 本体，用的是用户自己的登录；**带风险提示**（第十一节） |
 | `opencode` | OpenCode | `opencode` 在 PATH | `opencode acp` | `opencode auth login` | 原生 ACP；它配好的各家模型都经 `configOptions` 报上来 |
 | `pi` | pi | `pi` 在 PATH，版本 ≥ 0.80.4 | `npx -y pi-acp`（社区适配器，内部跑 `pi --mode rpc`） | pi 自己 | 适配器是社区项目，MCP 还没接通；见第十一节 |
 | `gemini` | Gemini CLI | `gemini` 在 PATH | Gemini CLI 的 ACP 模式（参数名实施时核实） | 适配器报 `authMethods` | 替代 Antigravity |
@@ -77,6 +77,8 @@ pub struct AgentPreset {
     pub login: Option<&'static [&'static str]>,
     /// 经用量网关时要改的环境变量（不认网关的 agent 留空，界面不给开）
     pub gateway_env: GatewayEnv,
+    /// 条款上有风险时的一句提示：检测列表、启用确认框里都显示（第十一节）
+    pub risk: Option<&'static str>,
 }
 ```
 
@@ -118,6 +120,7 @@ pub struct Detected {
 - 「自定义命令」就是现在的那个启动命令输入框，挪到这里成为一条普通档案（老用户的设置迁移过来就落在这）。
 - 首页配置引导（还什么都没配时）也列出检测到的 agent，一键启用，同 `choice_panel` 的写法。
 - 第一次启用某家时弹一个确认框，一句话说明：「claudesktop 会在后台启动 OpenCode，用它自己的登录和模型；我们不会读取它的登录信息。」
+  预设带 `risk` 的，确认框里再加那句风险提示，列表里那一行下面也常驻显示（`TEXT_META` + `INK_SOFT`）。
 
 ## 六、登录
 
@@ -202,7 +205,7 @@ pub struct AgentProfile {
 检测到就在「自研内核」档案区显示一行「检测到 OPENAI_API_KEY，导入为档案？」，用户点了才建档案（Key 进设置，同手填）。
 
 现有的「从 Antigravity Tools 导入端点和 Key」（`settings::antigravity_gateway`）走的是第三方反代 Antigravity 的 OAuth，
-正是第二节说的 B 路线。待定：是保留并在按钮旁加一句风险提示，还是去掉（见第十一节）。
+正是第二节说的 B 路线。**定了：保留，按钮下面常驻一句风险提示，导入后的结果消息里再说一次**（已实施，`settings_view.rs` 的 `ANTIGRAVITY_RISK`）。
 
 ## 十、界面改动一览
 
@@ -216,10 +219,12 @@ pub struct AgentProfile {
 
 ## 十一、风险与待定
 
-1. **Claude Code 适配器的条款**：适配器跑的是 Claude Code 本体（Zed 就是这么接的），个人自用一般没问题；但 Anthropic 的条款提到
-   「Agent SDK 用订阅令牌接进别的产品」不允许，适配器底层正是 Agent SDK。对外发版前要再核对一次当时的条款。
-   界面上明写「使用你本机 Claude Code 的登录」，并保留自研内核 + API Key 这条路。
-2. **Antigravity Tools 导入**（第九节）：要不要保留，需要你决定。
+**原则（2026-10-21 定）：有条款风险的入口一律保留，旁边加一句风险提示，由用户自己决定用不用。**
+
+1. **Claude Code 适配器的条款**：适配器跑的是 Claude Code 本体（Zed 就是这么接的），但底层是 Agent SDK，Anthropic 的条款
+   不允许把订阅登录经第三方程序使用。保留，预设带 `risk` 提示；用 API Key 登录的不受影响。现有设置页的「填入 Claude Code」
+   下面已经加了这句（`CLAUDE_CODE_RISK`）。对外发版前再核对一次当时的条款，文案跟着改。
+2. **Antigravity Tools 导入**（第九节）：保留，加风险提示（已实施）。
 3. **pi 适配器成熟度**：社区的 `pi-acp` 还是 MVP（MCP 没接通，包名有过变动）。先用它；不够用再考虑自己写一个
    （参考 Rust 版 `pi-acpinator`，或在 `crates/` 里直接对 `pi --mode rpc` 写一层）。
 4. **Windows**：npm 装的是 `.cmd` 垫片，起进程要过 `cmd /c`；图形界面启动拿不到用户 shell 里改过的 PATH（第四节已补常见目录）；
