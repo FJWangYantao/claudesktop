@@ -1,6 +1,6 @@
 # 设计说明：MCP 远程服务的 OAuth 登录
 
-> 状态：设计（2026-10-18），待实现。
+> 状态：**已实施**（2026-10-18 方案，落地后状态行更正于 2026-10-22）。
 > 代码落点：`crates/builtin/src/mcp_oauth.rs`（新）、`mcp.rs` / `mcp_http.rs`、`crates/core/src/lib.rs`（`McpState`）、
 > `apps/desktop/src/app/mcp_view.rs`。
 
