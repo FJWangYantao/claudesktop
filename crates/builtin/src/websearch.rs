@@ -7,7 +7,7 @@
 //! 3. **DuckDuckGo HTML 版**：不要 key 的最后兜底，可能被限流，结果是抓 HTML 来的。
 //!
 //! 默认顺序是 Brave → DuckDuckGo（和加后端之前的行为一致，升级不会悄悄花钱），
-//! 用户在设置页把 DeepSeek 勾到前面才走它。选择存在数据目录的 `search.json`。
+//! 用户在设置页选了 DeepSeek（「先用哪个」或「也允许」）才走它，有没有 key 不算数。选择存在数据目录的 `search.json`。
 //!
 //! 结果渲染成带链接的摘要文本给模型（标题 + 网址 + 摘要各一行），
 //! 模型要细节再用 `web_fetch` 抓具体页面。
@@ -138,13 +138,11 @@ impl SearchBackend {
 pub struct SearchConfig {
     /// 优先用哪个后端（要它也被允许才作数）
     pub prefer: SearchBackend,
-    /// 允许哪些后端：不允许的直接跳过，也不在降级链里
+    /// 允许哪些后端：不允许的直接跳过，也不在降级链里。
+    /// DeepSeek 按次计费，**只看用户选没选**（这个开关或 `prefer`），配了 key 不算允许
+    pub allow_deepseek: bool,
     pub allow_brave: bool,
     pub allow_duckduckgo: bool,
-    /// DeepSeek 搜索单独填的 key（数据目录的 `deepseek_key` 文件里有没有 / 环境变量）
-    /// ——由 [`load`] 和保存时算出来，不写进 JSON
-    #[serde(skip)]
-    pub deepseek_key: bool,
 }
 
 impl Default for SearchConfig {
@@ -153,9 +151,9 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             prefer: SearchBackend::Brave,
+            allow_deepseek: false,
             allow_brave: true,
             allow_duckduckgo: true,
-            deepseek_key: false,
         }
     }
 }
@@ -168,7 +166,6 @@ impl SearchConfig {
             .filter(|b| match b {
                 SearchBackend::Brave => self.allow_brave,
                 SearchBackend::DuckDuckGo => self.allow_duckduckgo,
-                // DeepSeek 没有单独的开关：「优先用」选它、或者配了 key 就算允许
                 SearchBackend::DeepSeek => self.deepseek_allowed(),
             })
             .collect();
@@ -183,9 +180,9 @@ impl SearchConfig {
         list
     }
 
-    /// DeepSeek 算不算「被允许」：优先项选了它（用户明确要），或者配了能用的 key。
+    /// DeepSeek 算不算「被允许」：开关开着，或优先项选了它（都是用户明确要的）。
     fn deepseek_allowed(&self) -> bool {
-        self.prefer == SearchBackend::DeepSeek || self.deepseek_key
+        self.allow_deepseek || self.prefer == SearchBackend::DeepSeek
     }
 }
 
@@ -193,35 +190,23 @@ fn search_json() -> Option<PathBuf> {
     Some(data_dir()?.join("search.json"))
 }
 
-/// 读选择：文件没有 / 读坏了就用默认值（不报错——搜索是随时在用的），
-/// 顺手把 key 的配置情况算进 `deepseek_key`。
+/// 读选择：文件没有 / 读坏了就用默认值（不报错——搜索是随时在用的）。
 pub fn load() -> SearchConfig {
-    let mut cfg = search_json()
+    search_json()
         .and_then(|p| std::fs::read_to_string(p).ok())
         // 用户手写的 JSON：写坏了当没配，退回默认顺序
         .and_then(|text| serde_json::from_str::<SearchConfig>(&text).ok())
-        .unwrap_or_default();
-    cfg.deepseek_key = deepseek_key().is_some();
-    cfg
+        .unwrap_or_default()
 }
 
-/// 存选择（只写 `prefer` / `allow_*`，key 不落这个文件）。
+/// 存选择（只有 `prefer` / `allow_*`，key 不落这个文件）。
 pub fn save(cfg: &SearchConfig) -> std::io::Result<()> {
     let Some(dir) = data_dir() else {
         return Err(std::io::Error::other("data directory is not set"));
     };
     std::fs::create_dir_all(&dir)?;
-    let text = serde_json::to_string_pretty(&json_for_file(cfg)).unwrap_or_default();
+    let text = serde_json::to_string_pretty(cfg).unwrap_or_default();
     std::fs::write(dir.join("search.json"), text + "\n")
-}
-
-/// `search.json` 的实际内容（`deepseek_key` 那个不上盘的字段不写）。
-fn json_for_file(cfg: &SearchConfig) -> Value {
-    serde_json::json!({
-        "prefer": cfg.prefer,
-        "allow_brave": cfg.allow_brave,
-        "allow_duckduckgo": cfg.allow_duckduckgo,
-    })
 }
 
 /// DeepSeek 搜索单独的 key（数据目录的 `deepseek_key` 文件 / 环境变量）。
@@ -245,9 +230,9 @@ pub fn set_key_hint(key: Option<String>) {
     }
 }
 
-fn deepseek_key() -> Option<String> {
-    own_deepseek_key()
-        .or_else(|| KEY_HINT.read().ok().and_then(|k| k.clone()))
+/// DeepSeek 搜索实际用的 key：单独填的优先，没有就用 provider 档案那把。
+pub fn deepseek_key() -> Option<String> {
+    own_deepseek_key().or_else(|| KEY_HINT.read().ok().and_then(|k| k.clone()))
 }
 
 /// 一条搜索结果。
@@ -369,8 +354,8 @@ fn deepseek(query: &str, key: &str) -> Result<Vec<Hit>, String> {
         let text = String::from_utf8_lossy(&body);
         return Err(explain_search_error("deepseek", Some(status), &text));
     }
-    let body: Value = serde_json::from_slice(&body)
-        .map_err(|e| format!("deepseek response is not JSON: {e}"))?;
+    let body: Value =
+        serde_json::from_slice(&body).map_err(|e| format!("deepseek response is not JSON: {e}"))?;
     Ok(parse_deepseek(&body))
 }
 
@@ -384,7 +369,8 @@ fn parse_deepseek(body: &Value) -> Vec<Hit> {
         if hits.len() >= SEARCH_MAX_RESULTS {
             break;
         }
-        let pick = |name: &str| r.get(name).and_then(Value::as_str).map(str::trim).unwrap_or_default();
+        let pick =
+            |name: &str| r.get(name).and_then(Value::as_str).map(str::trim).unwrap_or_default();
         let url = pick("url");
         if url.is_empty() {
             continue;
@@ -395,7 +381,11 @@ fn parse_deepseek(body: &Value) -> Vec<Hit> {
             (m, "") => m.to_string(),
             (m, s) => format!("{m}（{s}）"),
         };
-        hits.push(Hit { title: pick("title").to_string(), url: url.to_string(), snippet: clip(&text) });
+        hits.push(Hit {
+            title: pick("title").to_string(),
+            url: url.to_string(),
+            snippet: clip(&text),
+        });
     }
     hits
 }
@@ -409,11 +399,15 @@ fn explain_search_error(backend: &str, status: Option<u16>, detail: &str) -> Str
     };
     let snippet: String = detail.trim().chars().take(200).collect();
     match status {
-        Some(400) => format!("{label} rejected the request (HTTP 400)：查询写法不合它的要求（{snippet}）"),
-        Some(401) => format!(
-            "{label} rejected the API key (HTTP 401)；去设置页「网页搜索」检查 {} 的 key",
-            if backend == "deepseek" { "DeepSeek" } else { "Brave" }
-        ),
+        Some(400) => {
+            format!("{label} rejected the request (HTTP 400)：查询写法不合它的要求（{snippet}）")
+        }
+        // DuckDuckGo 没有 key，它的 401 按普通状态码报
+        Some(401) if backend != "duckduckgo" => {
+            format!(
+                "{label} rejected the API key (HTTP 401)；去设置页「网页搜索」检查 {label} 的 key"
+            )
+        }
         Some(402) => format!("{label} account has no balance (HTTP 402)；去平台充值后重试"),
         Some(403) => format!("{label} refused the request (HTTP 403)：{snippet}"),
         Some(429) => format!("{label} rate limited (HTTP 429)；稍等一会儿再搜，或换别的后端"),
@@ -447,22 +441,23 @@ fn brave(query: &str, key: &str) -> Result<Vec<Hit>, String> {
         .header("Accept", "application/json")
         .header("X-Subscription-Token", key)
         .call()
-        .map_err(|e| format!("brave request: {e}"))?;
-    if resp.status().as_u16() != 200 {
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_vec().unwrap_or_default();
+        .map_err(|e| {
+            let reason = explain_search_error("brave", None, &e.to_string());
+            format!("brave request: {reason}")
+        })?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(SEARCH_MAX_BYTES)
+        .read_to_vec()
+        .map_err(|e| format!("brave response: {e}"))?;
+    if status != 200 {
         let detail = String::from_utf8_lossy(&body);
         return Err(explain_search_error("brave", Some(status), &detail));
     }
-    let body: Value = serde_json::from_slice(
-        &resp
-            .body_mut()
-            .with_config()
-            .limit(SEARCH_MAX_BYTES)
-            .read_to_vec()
-            .map_err(|e| format!("brave response: {e}"))?,
-    )
-    .map_err(|e| format!("brave response is not JSON: {e}"))?;
+    let body: Value =
+        serde_json::from_slice(&body).map_err(|e| format!("brave response is not JSON: {e}"))?;
     let mut hits = Vec::new();
     if let Some(results) = body.pointer("/web/results").and_then(Value::as_array) {
         for r in results {
@@ -637,7 +632,11 @@ fn render(query: &str, backend: SearchBackend, hits: &[Hit], notes: &[String]) -
             "No results for \"{query}\" ({}). 换个说法再试，或在设置页换个搜索后端。",
             backend.id()
         ));
-        let summary = if notes.is_empty() { "没有结果".to_string() } else { "没有结果（降级过）".to_string() };
+        let summary = if notes.is_empty() {
+            "没有结果".to_string()
+        } else {
+            "没有结果（降级过）".to_string()
+        };
         return ToolOutput::ok(out, summary);
     }
     out.push_str(&format!("Results for \"{query}\" via {}:\n\n", backend.id()));
@@ -730,10 +729,15 @@ mod tests {
 
     #[test]
     fn fallback_is_written_into_the_result() {
-        let hits =
-            vec![Hit { title: "T".into(), url: "https://x.example".into(), snippet: String::new() }];
-        let notes = vec!["DeepSeek failed: DeepSeek rate limited (HTTP 429)；稍等一会儿再搜，或换别的后端"
-            .to_string()];
+        let hits = vec![Hit {
+            title: "T".into(),
+            url: "https://x.example".into(),
+            snippet: String::new(),
+        }];
+        let notes = vec![
+            "DeepSeek failed: DeepSeek rate limited (HTTP 429)；稍等一会儿再搜，或换别的后端"
+                .to_string(),
+        ];
         let out = render("q", SearchBackend::Brave, &hits, &notes);
         // 说明在正文最前面，模型和用户都看得见
         assert!(out.content.starts_with("(DeepSeek failed: DeepSeek rate limited"));
@@ -801,41 +805,47 @@ mod tests {
         assert!(explain_search_error("deepseek", Some(402), "").contains("充值"));
         assert!(explain_search_error("deepseek", Some(429), "").contains("rate limited"));
         assert!(explain_search_error("brave", Some(429), "").contains("Brave"));
-        assert!(explain_search_error("deepseek", Some(500), "").contains("temporarily unavailable"));
+        assert!(
+            explain_search_error("deepseek", Some(500), "").contains("temporarily unavailable")
+        );
         assert!(explain_search_error("deepseek", None, "timeout").contains("timeout"));
     }
 
     #[test]
+    fn duckduckgo_401_does_not_blame_a_key() {
+        let text = explain_search_error("duckduckgo", Some(401), "");
+        assert!(!text.contains("key"), "{text}");
+        assert!(explain_search_error("brave", Some(401), "").contains("Brave 的 key"));
+    }
+
+    #[test]
     fn default_order_matches_old_behaviour() {
-        // 默认：Brave → DDG，DeepSeek 不参与（不悄悄花钱）
+        // 默认：Brave → DDG，DeepSeek 不参与（不悄悄花钱，配没配 key 都一样）
         let cfg = SearchConfig::default();
         assert_eq!(cfg.order(), vec![SearchBackend::Brave, SearchBackend::DuckDuckGo]);
-        // 配了 DeepSeek key 但没选它：排在最后，不会优先花这笔钱
-        let with_key = SearchConfig { deepseek_key: true, ..SearchConfig::default() };
+        // 打开「也允许 DeepSeek」但没选它先用：排在最后，不会优先花这笔钱
+        let allowed = SearchConfig { allow_deepseek: true, ..SearchConfig::default() };
         assert_eq!(
-            with_key.order(),
+            allowed.order(),
             vec![SearchBackend::Brave, SearchBackend::DuckDuckGo, SearchBackend::DeepSeek]
         );
-        // 优先项选了 DeepSeek：提到最前
-        let prefer = SearchConfig {
-            prefer: SearchBackend::DeepSeek,
-            deepseek_key: true,
-            ..SearchConfig::default()
-        };
+        // 优先项选了 DeepSeek：开关没开也算用户要它，提到最前
+        let prefer = SearchConfig { prefer: SearchBackend::DeepSeek, ..SearchConfig::default() };
         assert_eq!(
             prefer.order(),
             vec![SearchBackend::DeepSeek, SearchBackend::Brave, SearchBackend::DuckDuckGo]
         );
-        // 只允许 DeepSeek 且没 key：什么都不允许（选它也算允许，但会按「没 key」跳过）
+        // 只允许 DeepSeek（没 key 时 `run` 会按「没 key」跳过）
         let only = SearchConfig {
             prefer: SearchBackend::DeepSeek,
+            allow_deepseek: true,
             allow_brave: false,
             allow_duckduckgo: false,
-            deepseek_key: false,
         };
         assert_eq!(only.order(), vec![SearchBackend::DeepSeek]);
         // 全关：空链（`search` 报「没有可用的搜索后端」）
-        let none = SearchConfig { allow_brave: false, allow_duckduckgo: false, ..Default::default() };
+        let none =
+            SearchConfig { allow_brave: false, allow_duckduckgo: false, ..Default::default() };
         assert!(none.order().is_empty());
     }
 
@@ -843,20 +853,21 @@ mod tests {
     fn search_json_round_trips_without_keys() {
         let cfg = SearchConfig {
             prefer: SearchBackend::DeepSeek,
+            allow_deepseek: true,
             allow_brave: true,
             allow_duckduckgo: false,
-            deepseek_key: true,
         };
-        // 存的形状：选择写进去（枚举名和 Rust 里一致，反序列化回来对得上），key 的配置情况不落盘
-        let value = json_for_file(&cfg);
-        assert_eq!(value["prefer"], serde_json::json!(SearchBackend::DeepSeek));
+        // 存的形状：只有选择（枚举名和 Rust 里一致，反序列化回来对得上），没有 key
+        let value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(value["prefer"], serde_json::json!("deepseek"));
         assert_eq!(value["allow_duckduckgo"], serde_json::json!(false));
-        assert!(value.get("deepseek_key").is_none());
+        assert_eq!(value.as_object().unwrap().len(), 4);
         let back: SearchConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(back, SearchConfig { deepseek_key: false, ..cfg });
-        // 手写的 JSON 少几个字段也认（`serde(default)`）
+        assert_eq!(back, cfg);
+        // 手写的 JSON 少几个字段也认（`serde(default)`），没写 allow_deepseek 就是没允许
         let partial: SearchConfig = serde_json::from_str("{\"prefer\":\"duckduckgo\"}").unwrap();
         assert_eq!(partial.prefer, SearchBackend::DuckDuckGo);
         assert!(partial.allow_brave);
+        assert!(!partial.allow_deepseek);
     }
 }

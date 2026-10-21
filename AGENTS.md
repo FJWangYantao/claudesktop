@@ -216,9 +216,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 网页搜索后端在 `crates/builtin/src/websearch.rs`：`SearchBackend`（DeepSeek / Brave / DuckDuckGo，声明顺序就是固定降级顺序）
   按 `SearchConfig::order()` 依次试，失败 / 没配 key 就退到下一个，**实际用了哪个写进结果第一行**（工具行汇总带「降级过」）。
   选择存在数据目录的 `search.json`（`load()` 每次现读，改完即生效，不走 `Kernel::set_*`），**只存选择不存 key**：
-  Brave key 在 `brave_key` 文件，DeepSeek 搜索的 key 在 `deepseek_key` 文件，都没有就用 provider 里 DeepSeek 档案那把
+  Brave key 在 `brave_key` 文件，DeepSeek 搜索的 key 在 `deepseek_key` 文件，都没有就用 provider 里 DeepSeek 官方端点（host `api.deepseek.com`，中转站不算）档案那把
   （`Settings::deepseek_search_key` → `ProviderConfig::deepseek_key` → 内核起时 `websearch::set_key_hint`）。
-  默认 Brave + DuckDuckGo（和加 DeepSeek 之前一样，DeepSeek 按次计费，要用户自己选）。新的搜索后端 = 加一个枚举值 +
+  默认 Brave + DuckDuckGo（和加 DeepSeek 之前一样）；DeepSeek 按次计费，只看 `allow_deepseek` / `prefer`，**有 key 不算允许**。新的搜索后端 = 加一个枚举值 +
   `order()` 里的开关 + `run()` 里一个分支，**不要做成 MCP**（见「设计说明-DeepSeek官方搜索.md」）。
 - 自研内核默认不打扰前台：系统提示词里的 `BACKGROUND` 要求测试 / 浏览器 / 截图无头跑，`tools::QUIET_ENV` 给命令带上
   不弹窗口的环境变量（用户自己设了的不覆盖）；推荐的浏览器类 MCP 带 `--headless`。

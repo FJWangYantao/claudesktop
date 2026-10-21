@@ -466,7 +466,9 @@ fn anthropic_spec(name: &str) -> ThinkingSpec {
         // 总要思考的模型（`deepseek-reasoner` / `*-r1`）：没有「关」这一档，
         // 连这一行都不给（OpenAI 兼容表里也是认不出的）
         let always_thinks = name.contains("reasoner") || name.contains("-r1");
-        let spec = if let Some(spec) = vendor_toggle(name) && !budget_ok {
+        let spec = if let Some(spec) = vendor_toggle(name)
+            && !budget_ok
+        {
             // OpenAI 兼容表里靠厂商字段开 / 关的那几家（Qwen / GLM / DeepSeek）：
             // 端点换成 Anthropic 格式照样发同一个开关字段，不能因为换了协议就没这一项
             spec
@@ -623,12 +625,7 @@ fn effort_for(level: ThinkingLevel) -> &'static str {
 /// - 模型不支持选的这一档：按 [`resolve_level`] 降级后再编
 /// - 开着思考时不发 `temperature`；`accepts_temperature == false` 的模型（Opus 4.7 以后）
 ///   不管开没开都不发——这是以前「填了预算才不发」之外的另一半
-pub fn apply_thinking(
-    body: &mut Value,
-    protocol: Protocol,
-    model: &str,
-    params: &RequestParams,
-) {
+pub fn apply_thinking(body: &mut Value, protocol: Protocol, model: &str, params: &RequestParams) {
     let spec = thinking_spec(protocol, model);
     if !spec.accepts_temperature {
         body.as_object_mut().map(|o| o.remove("temperature"));

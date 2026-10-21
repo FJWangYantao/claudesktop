@@ -156,8 +156,7 @@ impl SettingsForm {
         let brave_key =
             cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
         let deepseek_search_key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("留空就用「服务商」里 DeepSeek 那份的 key")
+            InputState::new(window, cx).placeholder("留空就用「服务商」里 DeepSeek 那份的 key")
         });
         Self {
             kernel: KernelChoice::default(),
@@ -1084,16 +1083,35 @@ impl ChatApp {
             }
             line.into()
         };
-        let prefer = self.seg_control(
+        let prefer = seg_control(
             "search-prefer",
-            [
-                (SearchBackend::DeepSeek, "DeepSeek"),
-                (SearchBackend::Brave, "Brave"),
-                (SearchBackend::DuckDuckGo, "DuckDuckGo"),
-            ],
+            SearchBackend::ALL.map(|b| (b, b.label())),
             cfg.prefer,
+            |this, value, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.prefer = value;
+                // 选了先用它就是要它：对应的「也允许」一起打开，开关和实际顺序对得上
+                match value {
+                    SearchBackend::DeepSeek => cfg.allow_deepseek = true,
+                    SearchBackend::Brave => cfg.allow_brave = true,
+                    SearchBackend::DuckDuckGo => cfg.allow_duckduckgo = true,
+                }
+                this.save_search(cfg, "搜索后端已更新", cx);
+            },
             cx,
         );
+        let deepseek_toggle = Switch::new("search-allow-deepseek")
+            .checked(order.contains(&SearchBackend::DeepSeek))
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.allow_deepseek = *checked;
+                // 「先用」选着 DeepSeek 时它也算允许：关掉就把先用的退回默认
+                if !*checked && cfg.prefer == SearchBackend::DeepSeek {
+                    cfg.prefer = SearchBackend::Brave;
+                }
+                this.save_search(cfg, "搜索后端已更新", cx);
+            }));
         let brave_toggle = Switch::new("search-allow-brave")
             .checked(cfg.allow_brave)
             .color(rgb(CORAL))
@@ -1110,17 +1128,13 @@ impl ChatApp {
                 cfg.allow_duckduckgo = *checked;
                 this.save_search(cfg, "搜索后端已更新", cx);
             }));
-        let text_input = |input: &Entity<InputState>| {
-            div()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(CARD))
-                .px_1()
-                .child(Input::new(input).mask_toggle())
-        };
         let body = setting_group([
             setting_row("先用哪个", "它没配好或失败时按固定顺序退到下一个", prefer),
+            setting_row(
+                "也允许 DeepSeek",
+                "按次计费（1000 次 $0.75），打开了才会用到它，配了 key 不算",
+                deepseek_toggle,
+            ),
             setting_row("也允许 Brave", "要自己的 API key（api.search.brave.com）", brave_toggle),
             setting_row("也允许 DuckDuckGo", "不要 key 的最后兜底，可能被限流", ddg_toggle),
             setting_row(
@@ -1129,7 +1143,7 @@ impl ChatApp {
                 div()
                     .h_flex()
                     .gap_2()
-                    .child(div().w(rems(20.)).child(text_input(&f.brave_key)))
+                    .child(div().w(rems(20.)).child(Self::secret_input(&f.brave_key)))
                     .child(Self::text_button("brave-key-save", "保存", false).on_click(
                         cx.listener(|this, _, window, cx| {
                             let key = this.settings_form.brave_key.read(cx).value().to_string();
@@ -1151,7 +1165,7 @@ impl ChatApp {
                 div()
                     .h_flex()
                     .gap_2()
-                    .child(div().w(rems(20.)).child(text_input(&f.deepseek_search_key)))
+                    .child(div().w(rems(20.)).child(Self::secret_input(&f.deepseek_search_key)))
                     .child(Self::text_button("deepseek-key-save", "保存", false).on_click(
                         cx.listener(|this, _, window, cx| {
                             let key =
@@ -1159,13 +1173,7 @@ impl ChatApp {
                             let res =
                                 claudesktop_builtin::websearch::set_own_deepseek_key(Some(&key));
                             this.settings_form.message = Some(match res {
-                                Ok(()) => {
-                                    let mut cfg = this.settings_form.search.clone();
-                                    cfg.deepseek_key =
-                                        claudesktop_builtin::websearch::own_deepseek_key().is_some();
-                                    this.settings_form.search = cfg;
-                                    (false, "DeepSeek 搜索 key 已保存".into())
-                                }
+                                Ok(()) => (false, "DeepSeek 搜索 key 已保存".into()),
                                 Err(e) => (true, format!("保存失败：{e}").into()),
                             });
                             this.settings_form
@@ -1193,31 +1201,6 @@ impl ChatApp {
         )
     }
 
-    /// 「先用哪个」的分段切换（保存走 `save_search`，写盘后立即生效）。
-    fn seg_control(
-        &self,
-        id: &'static str,
-        options: impl IntoIterator<Item = (claudesktop_builtin::websearch::SearchBackend, &'static str)>,
-        current: claudesktop_builtin::websearch::SearchBackend,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let mut segs = div().h_flex().gap_0p5().p_0p5().rounded_lg().bg(rgb(SAND));
-        for (i, (value, label)) in options.into_iter().enumerate() {
-            segs = segs.child(
-                div()
-                    .id((id, i))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let mut cfg = this.settings_form.search.clone();
-                        cfg.prefer = value;
-                        this.save_search(cfg, "搜索后端已更新", cx);
-                    }))
-                    .child(Self::seg(label, value == current)),
-            );
-        }
-        segs
-    }
-
     /// 「服务商」里 DeepSeek 那份档案的 key（搜索页只说有没有，不显示内容）。
     fn deepseek_search_key_from_profiles(&self) -> Option<String> {
         self.settings_form
@@ -1229,7 +1212,12 @@ impl ChatApp {
     }
 
     /// 把搜索后端的选择写进数据目录（不用点底栏「保存」）。
-    fn save_search(&mut self, cfg: claudesktop_builtin::websearch::SearchConfig, ok: &str, cx: &mut Context<Self>) {
+    fn save_search(
+        &mut self,
+        cfg: claudesktop_builtin::websearch::SearchConfig,
+        ok: &str,
+        cx: &mut Context<Self>,
+    ) {
         self.settings_form.message = Some(match claudesktop_builtin::websearch::save(&cfg) {
             Ok(()) => {
                 self.settings_form.search = cfg;
@@ -1439,13 +1427,16 @@ impl ChatApp {
     }
 
     pub(super) fn text_input(state: &Entity<InputState>) -> Div {
-        div()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(CARD))
-            .px_1()
-            .child(Input::new(state).appearance(false).bordered(false))
+        Self::text_input_with(Input::new(state).appearance(false).bordered(false))
+    }
+
+    /// 同 [`Self::text_input`]，带显示 / 隐藏切换（key 一类）。
+    pub(super) fn secret_input(state: &Entity<InputState>) -> Div {
+        Self::text_input_with(Input::new(state).appearance(false).bordered(false).mask_toggle())
+    }
+
+    fn text_input_with(input: Input) -> Div {
+        div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).px_1().child(input)
     }
 
     /// 表单和生效中的设置有没有不同（底栏据此提示、决定「保存」能不能点）。
@@ -1855,9 +1846,11 @@ impl ChatApp {
         } else {
             match (p.protocol, spec.format) {
                 // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
-                (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => active
-                    .filter(|l| !l.is_off())
-                    .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))),
+                (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => {
+                    active.filter(|l| !l.is_off()).map(|l| {
+                        format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))
+                    })
+                }
                 _ => None,
             }
         };

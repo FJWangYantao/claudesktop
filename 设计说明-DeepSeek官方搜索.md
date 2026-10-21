@@ -53,18 +53,20 @@ pub enum SearchBackend { #[serde(rename = "deepseek")] DeepSeek, Brave, DuckDuck
 /// 存在数据目录的 `search.json`，只存选择，不存 key
 pub struct SearchConfig {
     pub prefer: SearchBackend,              // 先用哪个
+    pub allow_deepseek: bool,               // 默认关；有没有 key 不算允许
     pub allow_brave: bool,
     pub allow_duckduckgo: bool,
-    #[serde(skip)] pub deepseek_key: bool,  // 「配没配 key」算出来的，不落盘
 }
 ```
 
 - 配置存在**数据目录**的 `search.json`，读写在 `websearch.rs`，`set_data_dir` 挂上去；
   `load()` 每次搜索现读，设置页改完即生效（搜索是即时读取的，不经 `Kernel::set_*`）。
 - **默认值**：`prefer = Brave`、`allow_brave` / `allow_duckduckgo` 都开——和加后端之前的行为一致，
-  升级不会悄悄花钱。DeepSeek 要在设置页选了才进降级链。
+  升级不会悄悄花钱。DeepSeek 要在设置页选了（「也允许 DeepSeek」或「先用」它）才进降级链，
+  **配了 key 不算允许**——不然「服务商」里有 DeepSeek 档案的用户，DuckDuckGo 一被限流就开始按次扣费。
 - **key 的取法**（DeepSeek 后端）：数据目录的 `deepseek_key` 文件 / 环境变量 `CLAUDEDESKTOP_DEEPSEEK_KEY`
-  → provider 配置里 DeepSeek 档案那把（`Settings::deepseek_search_key` 在起内核时经
+  → provider 配置里 DeepSeek 官方端点档案那把（只认 host 是 `api.deepseek.com` 的，`is_deepseek_endpoint`：
+  搜索固定发往官方，中转站的 key 发过去用不了，还把凭据交给了别的服务器；`Settings::deepseek_search_key` 在起内核时经
   `ProviderConfig::deepseek_key` → `websearch::set_key_hint` 交过去）。
   第二条是「零配置」的关键：用户已经填过 DeepSeek 的 provider，就不该再填一次。
   取不到 key 时**跳过 DeepSeek、直接降级**，不报错（设置页状态行里有说明）。
@@ -112,7 +114,7 @@ fn deepseek(query: &str, key: &str) -> Result<Vec<Hit>, String> { … }
   DeepSeek key ⓘ     [ 输入框 ] [保存]   ← 留空就用「服务商」里 DeepSeek 那份的 key
 ```
 
-- 「顺序可拖」对设置页来说太重：**「先用哪个」一个分段切换 + 两个开关「也允许 …」**，
+- 「顺序可拖」对设置页来说太重：**「先用哪个」一个分段切换 + 三个开关「也允许 …」**（选了先用哪个，它的开关一起打开），
   允许的后端按固定顺序 `DeepSeek → Brave → DuckDuckGo` 排（`SearchConfig::order`）。默认 Brave + DuckDuckGo。
 - DeepSeek key 那一行**不显示 provider 里的 key 内容**，只说「留空就用「服务商」里 DeepSeek 那份的 key」。
 - 每项说明收进 ⓘ（`setting_row` 已经这样做），页面上不铺灰字。
@@ -139,7 +141,7 @@ fn deepseek(query: &str, key: &str) -> Result<Vec<Hit>, String> { … }
 
 `websearch.rs` 的 `#[cfg(test)]`（这个文件不 `use gpui_kit::*`，可以裸 `#[test]`）：
 
-1. `default_order_matches_old_behaviour`：默认 Brave → DDG；配了 DeepSeek key 但没选它时排最后；
+1. `default_order_matches_old_behaviour`：默认 Brave → DDG；允许了 DeepSeek 但没选它先用时排最后；
    选它当 `prefer` 时排最前；只允许 DeepSeek、全关（空链）各一条。
 2. `translates_search_errors`：401 / 402 / 429 / 5xx / 无状态码。
 3. `parses_deepseek_results` / `deepseek_results_are_capped`：官方样例（脱敏）、字段缺省、超 8 条、空结果。
@@ -185,7 +187,7 @@ fn deepseek(query: &str, key: &str) -> Result<Vec<Hit>, String> { … }
 ## 十、实施时的取舍（和原方案的差异）
 
 1. **`search.json` 只存选择，不存 key**。原方案想把它做成 `SearchConfig { order, deepseek_key, deepseek_base }`
-   一起落盘，实际做成了：`search.json` 存 `prefer` / `allow_brave` / `allow_duckduckgo`；
+   一起落盘，实际做成了：`search.json` 存 `prefer` / `allow_deepseek` / `allow_brave` / `allow_duckduckgo`；
    Brave key 仍在 `brave_key` 文件（不变），DeepSeek 搜索的 key 在 `deepseek_key` 文件（单独填时）；
    都没有就用 **provider 配置里 DeepSeek 档案那把**。最后这条经 `ProviderConfig::deepseek_key`
    在起内核时交给 `websearch::set_key_hint`——状态文件里放 key 既难和 provider 保持同步，

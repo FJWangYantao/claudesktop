@@ -281,11 +281,17 @@ fn yes() -> bool {
     true
 }
 
-/// 这份档案是不是 DeepSeek 的端点（`web_search` 的 DeepSeek 后端要复用它的 key）。
-/// 按端点地址和名字认：中转点也能把 base_url 里带上 deepseek。
+/// 这份档案是不是 DeepSeek 官方端点（`web_search` 的 DeepSeek 后端要复用它的 key）。
+/// 只认 host 是 `api.deepseek.com` 的：搜索请求固定发往官方，中转站的 key 发过去既用不了，
+/// 也等于把凭据交给了签发方以外的服务器；名字叫 DeepSeek 不算数。
 pub fn is_deepseek_endpoint(p: &ProviderProfile) -> bool {
-    let hay = format!("{} {}", p.base_url.to_lowercase(), p.name.to_lowercase());
-    hay.contains("deepseek")
+    let url = p.base_url.trim().to_ascii_lowercase();
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(&url);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // 去掉 userinfo 和端口
+    let host = host.rsplit('@').next().unwrap_or_default();
+    let host = host.split(':').next().unwrap_or_default();
+    host == "api.deepseek.com"
 }
 
 impl Default for Settings {
@@ -655,8 +661,8 @@ impl Settings {
         Ok(config)
     }
 
-    /// `web_search` 的 DeepSeek 后端用哪把 key：找一份 DeepSeek 端点的档案
-    /// （端点地址或名字里有 deepseek）的 key，交给内核转给 `websearch`。
+    /// `web_search` 的 DeepSeek 后端用哪把 key：找一份 DeepSeek 官方端点的档案
+    /// （见 [`is_deepseek_endpoint`]）的 key，交给内核转给 `websearch`。
     /// 找不到就是 None——搜索时 DeepSeek 那一档按「没配 key」跳过，不报错。
     pub fn deepseek_search_key(&self) -> Option<String> {
         self.builtin
@@ -1051,7 +1057,7 @@ mod tests {
         assert!(b.is_configured());
     }
 
-    /// `web_search` 的 DeepSeek key：从 DeepSeek 端点的档案里挑一把，挑不到就是 None。
+    /// `web_search` 的 DeepSeek key：只从 DeepSeek 官方端点的档案里挑，挑不到就是 None。
     #[core::prelude::v1::test]
     fn deepseek_search_key_reuses_a_deepseek_profile() {
         let profile = |name: &str, base: &str, key: &str| ProviderProfile {
@@ -1064,13 +1070,20 @@ mod tests {
         let mut s = Settings::default();
         s.builtin.profiles = vec![
             profile("Kimi", "https://api.moonshot.cn/v1", "sk-kimi"),
-            profile("中转", "https://relay.example/deepseek", "sk-relay"),
+            profile("官方", "https://api.deepseek.com/v1", "sk-official"),
+            profile("官方 2", "https://API.DeepSeek.com:443", "sk-second"),
         ];
-        // 端点地址里有 deepseek 就认（中转点也行），第一次找到的那个
-        assert_eq!(s.deepseek_search_key().as_deref(), Some("sk-relay"));
-        // 名字里有 deepseek 也认
-        s.builtin.profiles = vec![profile("DeepSeek", "https://api.example/v1", "sk-named")];
-        assert_eq!(s.deepseek_search_key().as_deref(), Some("sk-named"));
+        // 官方 host 就认（大小写、端口、路径无所谓），第一次找到的那个
+        assert_eq!(s.deepseek_search_key().as_deref(), Some("sk-official"));
+        s.builtin.profiles.remove(1);
+        assert_eq!(s.deepseek_search_key().as_deref(), Some("sk-second"));
+        // 中转站（路径或子域名里带 deepseek）、只是名字叫 DeepSeek 的：都不认，key 不能发给官方
+        s.builtin.profiles = vec![
+            profile("中转", "https://relay.example/deepseek", "sk-relay"),
+            profile("中转 2", "https://api.deepseek.com.relay.example/v1", "sk-relay2"),
+            profile("DeepSeek", "https://api.example/v1", "sk-named"),
+        ];
+        assert_eq!(s.deepseek_search_key(), None);
         // 只有别的端点：None（搜索时 DeepSeek 那一档按「没配 key」跳过）
         s.builtin.profiles = vec![profile("Kimi", "https://api.moonshot.cn/v1", "sk-kimi")];
         assert_eq!(s.deepseek_search_key(), None);
