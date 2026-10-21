@@ -11,8 +11,8 @@
 use super::ChatApp;
 use crate::model::{ChatItem, ToolCard, ToolPhase};
 use claudesktop_core::project::{self, WorktreeConfig};
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 use std::path::{Path, PathBuf};
 
@@ -150,10 +150,8 @@ impl ChatApp {
                 let (repo, worktree, patterns) = (repo.clone(), worktree.clone(), patterns.clone());
                 cx.background_executor().spawn(async move {
                     let copied = copy_patterns(&repo, &worktree, &patterns);
-                    let setup = match setup {
-                        Some(command) => Some((command.clone(), run_setup(&worktree, &command))),
-                        None => None,
-                    };
+                    let setup =
+                        setup.map(|command| (command.clone(), run_setup(&worktree, &command)));
                     (copied, setup)
                 })
             };

@@ -388,26 +388,12 @@ impl AcpSettings {
         self.agents.iter_mut().find(|a| a.id == id)
     }
 
-    /// 还能不能再加一条自定义档案（编号不复用：删掉的 `custom-2` 不会被新的顶替）。
+    /// 加一条自定义档案，返回它的 ID（编号不复用：删掉的 `custom-2` 不会被新的顶替）。
     pub fn add_custom(&mut self, command: &str) -> String {
         let profile = AgentProfile::custom(self.next_custom_index(), command);
         let id = profile.id.clone();
         self.agents.push(profile);
         id
-    }
-
-    /// 启用一个预设（已经启用过就不重复加），返回档案 ID。
-    pub fn enable(&mut self, preset: &claudesktop_core::agents::AgentPreset) -> String {
-        if let Some(existing) = self.agents.iter().find(|a| a.id == preset.id) {
-            return existing.id.clone();
-        }
-        self.agents.push(AgentProfile::from_preset(preset));
-        preset.id.to_string()
-    }
-
-    /// 停用一个档案。停用的不是第一个时，默认项自然变成第一个。
-    pub fn disable(&mut self, id: &str) {
-        self.agents.retain(|a| a.id != id);
     }
 
     /// 记下某个档案上次用的模型。
@@ -824,8 +810,11 @@ impl Settings {
             }
         }
         if let Some(v) = var("ACP_AGENT") {
-            // 环境变量还能覆盖启动命令：当成一条自定义档案（老用户脚本 / 调试用）
-            self.acp.add_custom(&v);
+            // 环境变量还能覆盖启动命令：当成一条自定义档案（老用户脚本 / 调试用）。
+            // 已经有同一条命令的档案就不再加：设置页保存会把它落盘，每次启动都加就越积越多
+            if !self.acp.agents.iter().any(|a| a.command.as_deref() == Some(v.trim())) {
+                self.acp.add_custom(&v);
+            }
         }
         if let Some(v) = var("CLAUDESKTOP_GATEWAY") {
             self.usage_gateway = v.trim() != "0";
@@ -931,6 +920,20 @@ impl Settings {
             let command = profile.command_for(cfg!(windows));
             if !command.trim().is_empty() {
                 base.command = command;
+            }
+            // 检测时也找了 PATH 以外的常见安装目录（从图形界面起来的进程 PATH 常常比终端里短）：
+            // 补进 agent 进程的 PATH，否则「检测到」的 agent（和它要的 node）照样起不来
+            let extra: Vec<PathBuf> = claudesktop_core::agents::common_install_dirs()
+                .into_iter()
+                .filter(|d| d.is_dir())
+                .collect();
+            if !extra.is_empty()
+                && !base.env.iter().any(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                && let Ok(path) = std::env::join_paths(
+                    claudesktop_core::agents::search_paths().into_iter().chain(extra),
+                )
+            {
+                base.env.push(("PATH".into(), path.to_string_lossy().into_owned()));
             }
             if profile.gateway
                 && profile.supports_gateway()

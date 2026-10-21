@@ -106,6 +106,8 @@ pub struct SettingsForm {
     agents: Vec<AgentProfile>,
     /// 本机 agent 的检测结果（进「内核与模型」时后台跑一次）
     agent_detect: AgentDetect,
+    /// 首页引导选了「本机 agent」时检测还没跑完：跑完再顺手启用（见 `start_setup`）
+    enable_on_detect: bool,
     /// 自定义 agent 的启动命令（空 = 没有自定义 agent）
     custom_command: Entity<InputState>,
     /// 一轮最多几步（自研内核的工具循环上限）
@@ -181,6 +183,7 @@ impl SettingsForm {
             tab: 0,
             agents: Vec::new(),
             agent_detect: AgentDetect::Idle,
+            enable_on_detect: false,
             custom_command,
             max_steps,
             usage_gateway: true,
@@ -361,6 +364,9 @@ impl ChatApp {
                 .await;
             this.update(cx, |this, cx| {
                 this.settings_form.agent_detect = AgentDetect::Done(found);
+                if std::mem::take(&mut this.settings_form.enable_on_detect) {
+                    this.enable_detected_agent();
+                }
                 cx.notify();
             })
         })
@@ -719,17 +725,28 @@ impl ChatApp {
     ) {
         self.open_settings_at(KERNEL_TAB, window, cx);
         self.settings_form.kernel = kind.clone();
-        if matches!(kind, KernelChoice::Acp(_))
-            && self.settings_form.agents.is_empty()
-            && let AgentDetect::Done(list) = &self.settings_form.agent_detect
-            && let Some(hit) = list.iter().find(|d| d.is_ready())
-        {
-            let preset = hit.preset;
-            self.settings_form.agents.push(AgentProfile::from_preset(preset));
-            self.settings_form.message =
-                Some((false, format!("已启用本机的{}，点「保存并应用」生效", preset.name).into()));
+        if matches!(kind, KernelChoice::Acp(_)) {
+            // 设置页刚打开时检测多半还在跑：跑完再启用
+            match self.settings_form.agent_detect {
+                AgentDetect::Done(_) => self.enable_detected_agent(),
+                _ => self.settings_form.enable_on_detect = true,
+            }
         }
         cx.notify();
+    }
+
+    /// 还没启用任何 agent、表单选的是「本机 agent」时，把检测到的第一家能用的启用上（只改表单）。
+    fn enable_detected_agent(&mut self) {
+        let f = &mut self.settings_form;
+        if !matches!(f.kernel, KernelChoice::Acp(_)) || !f.agents.is_empty() {
+            return;
+        }
+        let AgentDetect::Done(list) = &f.agent_detect else { return };
+        let Some(hit) = list.iter().find(|d| d.is_ready()) else { return };
+        let preset = hit.preset;
+        f.agents.push(AgentProfile::from_preset(preset));
+        f.message =
+            Some((false, format!("已启用本机的{}，点「保存并应用」生效", preset.name).into()));
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
@@ -789,6 +806,21 @@ impl ChatApp {
             || new.memory_suggest != self.settings.memory_suggest
             // 自动模式的开关 / 分类器模型变了：模式列表和分类器都要重装
             || new.auto_mode != self.settings.auto_mode;
+        // 只重启启动命令 / 环境变量变了的档案：改一家的网关开关不该把另一家跑着的一轮杀掉
+        //（`last_model`、显示名这些不影响进程的不算）
+        let launch = |s: &Settings, id: &str| {
+            s.acp.get(id).map(|p| {
+                let config = s.acp_config_for(self.acp_base.clone(), Some(p));
+                (config.command, config.env)
+            })
+        };
+        let changed_acp: Vec<String> = new
+            .acp
+            .agents
+            .iter()
+            .filter(|a| launch(&new, &a.id) != launch(&self.settings, &a.id))
+            .map(|a| a.id.clone())
+            .collect();
         let restart_acp = new.acp != self.settings.acp;
         // 三选一只选了「本机 agent」没选档案：form_settings 已经落过第一个档案，这里就是具体内核
         let default = new.kernel();
@@ -800,12 +832,11 @@ impl ChatApp {
         if restart_builtin {
             self.restart_kernel(&KernelChoice::Builtin, cx);
         }
+        // 用量网关总开关变了也会改 agent 的环境变量，所以不只看档案表
+        for id in changed_acp {
+            self.restart_kernel(&KernelChoice::Acp(id), cx);
+        }
         if restart_acp {
-            // 每条启用的档案各一个内核进程：都重启（设置页改的就是这一份档案表）
-            let ids: Vec<String> = self.settings.acp.agents.iter().map(|a| a.id.clone()).collect();
-            for id in ids {
-                self.restart_kernel(&KernelChoice::Acp(id), cx);
-            }
             // 停用 / 删掉的档案：进程直接关（它们的会话已经全部脱离）
             let mut removed: Vec<String> = self
                 .kernels
@@ -817,7 +848,7 @@ impl ChatApp {
             removed.sort();
             removed.dedup();
             for id in removed {
-                self.shutdown_slot(&format!("acp:{id}"));
+                self.shutdown_slot(&KernelChoice::Acp(id).key());
             }
         }
         // 自研内核的配置变了：顺手取一次模型列表，连不上马上告诉用户（不挡保存）
@@ -1350,7 +1381,7 @@ impl ChatApp {
     /// 在模型下拉里选了一个：当前会话立即切换（还没建立的会话等 Started），并记为默认。
     pub(crate) fn choose_model(&mut self, model: String, cx: &mut Context<Self>) {
         // 记住上次用的模型：自研内核记在当前 provider 档案，agent 记在它的档案上
-        // （新会话 Started 后按它切过去，见 `apply_last_model`）
+        // （新会话 Started 后按它切过去，见 `Session::apply_event` 的 Started 分支）
         match self.session().kernel.clone() {
             KernelChoice::Builtin => {
                 self.update_settings(|s| s.builtin.current_mut().model = model.clone());

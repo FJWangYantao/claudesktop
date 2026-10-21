@@ -242,6 +242,10 @@ impl ChatApp {
             self.settings.kernel().key(),
         )
             .hash(&mut h);
+        // 启用的 agent（内核状态行、会话标签按档案显示名画）：停用 / 改名也要重画
+        for agent in &self.settings.acp.agents {
+            (&agent.id, agent.display_name()).hash(&mut h);
+        }
         for group in self.session_groups() {
             (&group.key, &group.name).hash(&mut h);
             for i in group.members {

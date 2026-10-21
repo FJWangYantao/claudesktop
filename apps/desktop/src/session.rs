@@ -387,10 +387,7 @@ impl Session {
     ) -> Self {
         let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent, acp), meta.cwd.clone());
         s.ready = false;
-        // agent 档案记的上次模型：续接后 agent 没报模型时切过去（`apply_event` 的 Started 分支）
-        if let KernelChoice::Acp(aid) = &s.kernel {
-            s.last_model = acp.get(aid).and_then(|a| a.last_model.clone());
-        }
+        // 不套档案的 `last_model`：历史会话用的是它自己当时的模型，不该被别的会话最近选的改掉
         // 历史会话不该被「新对话默认自动」改掉模式：它的模式由重建的日志决定
         s.pending_mode = None;
         // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
@@ -1233,14 +1230,15 @@ impl Session {
                         Err(err) => self.note(format!("切换模型失败：{err}")),
                     }
                 }
-                // agent 档案记着上次用的模型：新会话接上来就切过去（agent 没报模型时才补）
-                else if let Some(model) = self.last_model.clone()
+                // agent 档案记着上次用的模型：新会话接上来就切过去（agent 没报模型时才补）。
+                // 切不过去（agent 那边已经没有这个模型）就算了，不往每个新对话里写一条失败
+                else if let Some(model) = self.last_model.take()
                     && self.model_label == UNKNOWN_MODEL
                     && let Some(kernel) = kernel
                     && let Some(id) = self.acp_id.clone()
-                    && let Err(err) = kernel.set_model(&id, &model)
+                    && kernel.set_model(&id, &model).is_ok()
                 {
-                    self.note(format!("切换模型失败：{err}"));
+                    self.model_label = model.into();
                 }
                 return self.autoprompt.take();
             }

@@ -274,3 +274,5 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   建 worktree 期间发的消息进 `Session::queued`，会话还没就绪时 `dispatch_queued` 会留着等 `Started`。
   后台 git 任务回来时按 `Session::token` 找会话（`session_index`），别存下标（删会话会挪）；菜单里的 git 结果（`worktree_blocker`）在 `refresh_worktree` 里算好，render 不跑 git。
   删除 worktree 走 `ask_remove_worktree`：不确定干净就先弹框，确认了才 `--force` / `-D`。
+  建好后的 `worktree.copy` / `worktree.setup` 在 `app/worktree_setup.rs`：setup 写在仓库里，**没确认过的不自动跑**
+  （确认过的记在数据目录 `trusted_setup.json`，设置页「项目」里亲手改的算确认），跑命令用 `claudesktop_builtin::run_command`；复制不跟目录链接、跳过 `.git`。

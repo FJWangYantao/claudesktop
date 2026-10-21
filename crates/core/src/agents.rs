@@ -23,7 +23,7 @@ pub struct AgentPreset {
     pub id: &'static str,
     /// 显示名
     pub name: &'static str,
-    /// 怎么判断装没装：在 PATH 里找的可执行文件名（Windows 自动补 `.cmd` / `.exe` / `.ps1`）。
+    /// 怎么判断装没装：在 PATH 里找的可执行文件名（Windows 自动补 `.exe` / `.cmd` / `.bat`）。
     /// 用 npx 起的适配器这一项是它真正要跑的那个程序（如 `claude`）
     pub probe: &'static str,
     /// 探测版本的参数（一般是 `--version`）；空 = 不探测
@@ -90,7 +90,8 @@ pub const PRESETS: &[AgentPreset] = &[
         version_args: &["--version"],
         min_version: None,
         command: "opencode acp",
-        command_windows: None,
+        // npm 装的是 `.cmd` 垫片，按名字直接起不来
+        command_windows: Some("cmd /c opencode acp"),
         needs_node: false,
         install_hint: "npm install -g opencode-ai",
         docs: "https://opencode.ai/docs/acp",
@@ -123,7 +124,7 @@ pub const PRESETS: &[AgentPreset] = &[
         min_version: None,
         // 参数名实施时核实；现在按社区用法写，起不来时用户可以自己改「自定义命令」
         command: "gemini --experimental-acp",
-        command_windows: None,
+        command_windows: Some("cmd /c gemini --experimental-acp"),
         needs_node: false,
         install_hint: "npm install -g @google/gemini-cli",
         docs: "https://github.com/google-gemini/gemini-cli",
@@ -266,7 +267,7 @@ pub fn common_install_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// 在 `paths` 里找一个可执行文件；Windows 上按 PATHEXT 补后缀。
+/// 在 `paths` 里找一个可执行文件；Windows 上补 `.exe` / `.cmd` / `.bat`（`.ps1` 起不了进程，不算）。
 pub fn find_executable(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
     let names = candidate_names(name);
     for dir in paths {
@@ -285,7 +286,7 @@ fn candidate_names(name: &str) -> Vec<String> {
     if !cfg!(windows) || Path::new(name).extension().is_some() {
         return vec![name.to_string()];
     }
-    ["exe", "cmd", "bat", "ps1", ""]
+    ["exe", "cmd", "bat", ""]
         .iter()
         .map(|ext| if ext.is_empty() { name.to_string() } else { format!("{name}.{ext}") })
         .collect()
@@ -492,14 +493,15 @@ mod tests {
         assert_eq!(version_cmp("2", "1.99.99"), Ordering::Greater);
     }
 
-    /// Windows 上 npx 起的要过 `cmd /c`；其余原样
+    /// Windows 上都要过 `cmd /c`（npx 和 npm 装的全局命令都是 `.cmd` 垫片）；别的平台原样
     #[test]
     fn windows_commands_go_through_cmd() {
-        let claude = AgentPreset::find("claude").unwrap();
-        assert!(claude.command_for(true).starts_with("cmd /c "));
-        assert!(!claude.command_for(false).starts_with("cmd "));
+        for preset in PRESETS {
+            assert!(preset.command_for(true).starts_with("cmd /c "), "{}", preset.id);
+            assert!(!preset.command_for(false).starts_with("cmd "), "{}", preset.id);
+        }
         let opencode = AgentPreset::find("opencode").unwrap();
-        assert_eq!(opencode.command_for(true), "opencode acp");
+        assert_eq!(opencode.command_for(false), "opencode acp");
         // 预设 ID 不重复
         let mut ids: Vec<&str> = PRESETS.iter().map(|p| p.id).collect();
         ids.sort_unstable();
