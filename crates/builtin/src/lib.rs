@@ -325,7 +325,7 @@ impl SessionState {
 
 struct Inner {
     /// 对话用的 provider 和造它的配置（提炼候选记忆这类旁路请求另起 provider 时用配置）。
-    /// 输入框切思考强度时（`set_thinking`）换一份，进行中的请求用完手上那份
+    /// 输入框切思考强度时（`set_thinking`）换一份，进行中的一轮用完手上那份（见 `run_steps`）
     chat: Mutex<(ProviderConfig, Arc<dyn ChatProvider>)>,
     /// 新会话的默认模型（最近一次 `set_model` 选的，初始为配置里的）
     default_model: Mutex<String>,
@@ -2369,6 +2369,9 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
     // 上一步刚压缩过（不连着压两次）/ 这一轮已经因为超限报错压缩过（只压一次）
     let mut just_compacted = false;
     let mut overflow_compacted = false;
+    // provider 按轮取：一轮中途在输入框切了思考强度，后面的步骤仍用开头那份
+    //（工具循环中途开 / 关思考，Anthropic 会因上一条助手消息没有 thinking 块报 400）
+    let provider = inner.provider();
 
     for _ in 0..inner.max_steps {
         // 用量快到窗口：先压缩再请求
@@ -2421,25 +2424,24 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
         }
         let mut text = String::new();
-        let result =
-            inner.provider().stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
-                if stopped() {
-                    return;
+        let result = provider.stream_chat(&model, &messages, &specs, &stopped, &mut |event| {
+            if stopped() {
+                return;
+            }
+            match event {
+                StreamEvent::Text(t) => {
+                    text.push_str(&t);
+                    inner.emit(Some(session), KernelEvent::AgentMessageChunk { text: t });
                 }
-                match event {
-                    StreamEvent::Text(t) => {
-                        text.push_str(&t);
-                        inner.emit(Some(session), KernelEvent::AgentMessageChunk { text: t });
-                    }
-                    StreamEvent::Reasoning(t) => {
-                        inner.emit(Some(session), KernelEvent::AgentThoughtChunk { text: t })
-                    }
-                    StreamEvent::Retrying { status, attempt, delay_ms, reason } => inner.emit(
-                        Some(session),
-                        KernelEvent::Retrying { status, attempt, delay_ms, reason },
-                    ),
+                StreamEvent::Reasoning(t) => {
+                    inner.emit(Some(session), KernelEvent::AgentThoughtChunk { text: t })
                 }
-            });
+                StreamEvent::Retrying { status, attempt, delay_ms, reason } => inner.emit(
+                    Some(session),
+                    KernelEvent::Retrying { status, attempt, delay_ms, reason },
+                ),
+            }
+        });
         if stopped() {
             return Steps::Stopped;
         }
@@ -2697,7 +2699,7 @@ impl Kernel for BuiltinKernel {
         Ok(())
     }
 
-    /// 思考强度（输入框那个下拉）：换一份 provider，下一次请求起生效，不重启内核。
+    /// 思考强度（输入框那个下拉）：换一份 provider，下一轮起生效，不重启内核。
     /// `level` 是 [`ThinkingLevel`] 的 serde 名（`"high"`、`"x_high"`），None = 不发字段。
     fn set_thinking(&self, level: Option<&str>) -> anyhow::Result<()> {
         let level = level

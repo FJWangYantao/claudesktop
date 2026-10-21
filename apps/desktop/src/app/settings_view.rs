@@ -1273,14 +1273,17 @@ impl ChatApp {
             return None;
         }
         let p = self.settings.builtin.current();
-        Some((
-            claudesktop_builtin::thinking_spec(p.protocol, &session.model_label),
-            p.params.thinking,
-        ))
+        // 内核还没报模型（刚建、没连上）时按档案的模型查，别先显示成认不出的「默认 / 兜底」
+        let model = if session.model_label == crate::session::UNKNOWN_MODEL {
+            p.model.as_str()
+        } else {
+            session.model_label.as_ref()
+        };
+        Some((claudesktop_builtin::thinking_spec(p.protocol, model), p.params.thinking))
     }
 
     /// 在输入框的下拉里选了思考强度：记进当前档案（和设置页那一排是同一个值），
-    /// 跑着的自研内核换一份 provider，下一次请求起生效（不重启内核，进行中的一轮不受影响）。
+    /// 跑着的自研内核换一份 provider，下一轮起生效（不重启内核，进行中的一轮不受影响）。
     pub(crate) fn choose_thinking(&mut self, level: Option<ThinkingLevel>, cx: &mut Context<Self>) {
         self.update_settings(|s| s.builtin.current_mut().params.thinking = level);
         if let Some(kernel) = self.kernel_of(KernelChoice::Builtin)
@@ -2249,14 +2252,14 @@ pub(super) fn thinking_options(spec: &ThinkingSpec) -> Vec<(Option<ThinkingLevel
     options
 }
 
-/// 高亮哪一项：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档
-/// （认不出的模型一档都不匹配时保留原值，免得界面显示成「默认」而实际发着别的字段）。
+/// 高亮哪一项：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档。
+/// 认不出的模型只有「兜底」会发字段，存着别的档（从别的模型带过来的）实际什么都不发，算「默认」。
 pub(super) fn active_thinking(
     spec: &ThinkingSpec,
     current: Option<ThinkingLevel>,
 ) -> Option<ThinkingLevel> {
     if !spec.is_known() {
-        return current;
+        return current.filter(|c| *c == ThinkingLevel::Default);
     }
     current.and_then(|c| spec.resolve(c)).or(current)
 }
