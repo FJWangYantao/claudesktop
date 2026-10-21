@@ -2,9 +2,9 @@
 //!
 //! 相比走 OpenAI 兼容层，原生协议补齐了：思考块（`thinking_delta`）、
 //! 提示缓存（`cache_control`，长会话省费）、图片输入，以及两种只有原生协议认的
-//! 请求能力——思考预算（`thinking.budget_tokens`，见 [`build_body`]）和
-//! Anthropic 在服务端执行的工具（[`SERVER_TOOLS`]）。请求与解析都在本模块
-//! 内完成；对上层暴露统一的 [`ChatProvider`] 接口。
+//! 请求能力——思考强度（`thinking` / `output_config.effort`，档位来自
+//! [`crate::provider::thinking_spec`]）和 Anthropic 在服务端执行的工具（[`SERVER_TOOLS`]）。
+//! 请求与解析都在本模块内完成；对上层暴露统一的 [`ChatProvider`] 接口。
 
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, ProviderConfig, RequestParams, StreamEvent,
@@ -149,10 +149,9 @@ fn server_tool_spec(name: &str) -> Option<Value> {
 /// 组装 Messages API 请求体（纯函数，测试直接比 JSON）。
 ///
 /// 几处取舍：
-/// - 思考预算（`thinking.budget_tokens`）与 `temperature` 不共存：Anthropic 要求
-///   开启 thinking 时 `temperature` 只能是默认值 1。两边都配了就**让 thinking 生效、
-///   不发 temperature**（思考预算是用户显式要的行为，temperature 常是照抄别的
-///   provider 配置留下的）。
+/// - 思考强度与 `temperature` 不共存：Anthropic 要求开启 thinking 时 `temperature` 只能是
+///   默认值 1；Opus 4.7 以后的新模型**不管开没开**都不认非默认的 `temperature`。两处判断都在
+///   [`apply_thinking`] 里（能力表的 `accepts_temperature`）
 /// - 服务端工具（[`SERVER_TOOLS`]）和客户端工具合进同一个 `tools` 数组；
 ///   缓存断点仍打在最后一个客户端工具上。
 /// - `extra` 最后浅合并，同名键覆盖上面所有默认值（留一个总开关）。
@@ -184,13 +183,12 @@ fn build_body(
         all.extend(server);
         body["tools"] = Value::Array(all);
     }
-    if let Some(budget) = params.thinking_budget.filter(|b| *b > 0) {
-        // 小于官方下限的请求会被拒，抬到下限（设置页也会先抬一次）
-        let budget = budget.max(RequestParams::MIN_THINKING_BUDGET);
-        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-    } else if let Some(t) = params.temperature {
+    if let Some(t) = params.temperature {
         body["temperature"] = json!(t);
     }
+    // 思考强度（档位 → `thinking` / `output_config`，开着时不发 temperature）；
+    // 修 temperature 的那半也在这里
+    crate::provider::apply_thinking(&mut body, crate::provider::Protocol::Anthropic, model, params);
     if let Some(extra) = params.extra.as_object() {
         for (key, value) in extra {
             body[key] = value.clone();
@@ -813,48 +811,84 @@ mod tests {
         assert!(err.contains("Overloaded"), "{err}");
     }
 
-    /// 思考预算：请求体带 `thinking`，且**不发** temperature（Anthropic 要求
-    /// 开 thinking 时 temperature 为默认值 1）。
+    /// 思考强度：老格式（4.5 那代）发 `budget_tokens`，且**不发** temperature
+    /// （Anthropic 要求开 thinking 时 temperature 为默认值 1）。
     #[test]
-    fn thinking_budget_wins_over_temperature() {
+    fn budget_thinking_wins_over_temperature() {
         let messages = vec![M::new("user", "算一下")];
         let params = RequestParams {
             temperature: Some(0.3),
-            thinking_budget: Some(8_000),
+            thinking: Some(crate::provider::ThinkingLevel::High),
             ..Default::default()
         };
         let body = build_body("claude-sonnet-4-5", &messages, &[], &params);
         assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["budget_tokens"], 8_000);
+        assert_eq!(body["thinking"]["budget_tokens"], 16_000);
         assert!(body.get("temperature").is_none(), "{body}");
         assert_eq!(body["max_tokens"], MAX_TOKENS_DEFAULT);
 
-        // 没设预算：照旧发 temperature，不发 thinking
+        // 没设档位：照旧发 temperature，不发 thinking（4.5 收非默认 temperature）
         let only_temp = RequestParams { temperature: Some(0.3), ..Default::default() };
-        let body = build_body("m", &messages, &[], &only_temp);
+        let body = build_body("claude-sonnet-4-5", &messages, &[], &only_temp);
         assert_eq!(body["temperature"], 0.3);
         assert!(body.get("thinking").is_none());
         // 都不设：两个键都不出现
         let body = build_body("m", &messages, &[], &RequestParams::default());
         assert!(body.get("thinking").is_none() && body.get("temperature").is_none());
-        // 小于 1024 的预算 API 会拒，抬到官方下限再发（仍然不发 temperature）
-        let too_small = RequestParams {
-            temperature: Some(1.0),
-            thinking_budget: Some(512),
-            ..Default::default()
-        };
-        let body = build_body("m", &messages, &[], &too_small);
-        assert_eq!(body["thinking"]["budget_tokens"], RequestParams::MIN_THINKING_BUDGET);
-        assert!(body.get("temperature").is_none());
-        // 0 当成没开（设置文件里手写 0 的样子）
-        let zero = RequestParams {
+        // 「关」：老格式不带 thinking，temperature 照发
+        let off = RequestParams {
             temperature: Some(0.2),
-            thinking_budget: Some(0),
+            thinking: Some(crate::provider::ThinkingLevel::Off),
             ..Default::default()
         };
-        let body = build_body("m", &messages, &[], &zero);
+        let body = build_body("claude-sonnet-4-5", &messages, &[], &off);
         assert!(body.get("thinking").is_none());
         assert_eq!(body["temperature"], 0.2);
+    }
+
+    /// 新格式：`adaptive` + `display` + `output_config.effort`；而且这一类模型
+    /// **无论开不开思考**都不接受非默认的 temperature（以前填了预算才不发，是 bug）。
+    #[test]
+    fn adaptive_thinking_never_sends_temperature() {
+        let messages = vec![M::new("user", "算一下")];
+        let params = RequestParams {
+            temperature: Some(0.3),
+            thinking: Some(crate::provider::ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+        let body = build_body("claude-opus-4-7", &messages, &[], &params);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert!(body.get("temperature").is_none(), "{body}");
+
+        // 只设了 temperature、没开思考：同样不发（4.7 以后不认非默认值）
+        let only_temp = RequestParams { temperature: Some(0.3), ..Default::default() };
+        let body = build_body("claude-opus-4-7", &messages, &[], &only_temp);
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("thinking").is_none());
+
+        // 关不掉思考的模型上选「关」：降到最低的开档
+        let off = RequestParams {
+            thinking: Some(crate::provider::ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let body = build_body("claude-opus-5-5", &messages, &[], &off);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    /// `extra` 里的手写字段仍然盖过档位（总开关）。
+    #[test]
+    fn extra_overrides_thinking() {
+        let messages = vec![M::new("user", "算一下")];
+        let params = RequestParams {
+            thinking: Some(crate::provider::ThinkingLevel::Low),
+            extra: json!({"thinking": {"type": "enabled", "budget_tokens": 4000}}),
+            ..Default::default()
+        };
+        let body = build_body("claude-opus-4-7", &messages, &[], &params);
+        assert_eq!(body["thinking"]["budget_tokens"], 4_000);
     }
 
     /// 服务端工具和客户端工具合进同一个 tools 数组；缓存断点仍在最后一个客户端工具上。

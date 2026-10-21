@@ -64,7 +64,7 @@ impl ChatProvider for OpenAiProvider {
         if !tools.is_empty() {
             body["tools"] = Value::from(tools.to_vec());
         }
-        apply_params(&mut body, &self.config.params);
+        apply_params(&mut body, model, &self.config.params);
         let body = body.to_string();
 
         let headers = self.auth_header().into_iter().collect::<Vec<_>>();
@@ -101,13 +101,15 @@ impl ChatProvider for OpenAiProvider {
 }
 
 /// 把设置里透传的参数合并进请求体（`extra` 最后合入，可覆盖默认键）。
-fn apply_params(body: &mut Value, params: &RequestParams) {
+fn apply_params(body: &mut Value, model: &str, params: &RequestParams) {
     if let Some(t) = params.temperature {
         body["temperature"] = serde_json::json!(t);
     }
     if let Some(n) = params.max_tokens {
         body["max_tokens"] = serde_json::json!(n);
     }
+    // 思考强度（有的模型是 `reasoning_effort`，有的是 `enable_thinking` / `thinking`）
+    crate::provider::apply_thinking(body, crate::provider::Protocol::OpenAiCompat, model, params);
     if let Some(extra) = params.extra.as_object() {
         for (key, value) in extra {
             body[key] = value.clone();
@@ -355,6 +357,7 @@ mod tests {
         let mut body = serde_json::json!({"model": "m", "messages": []});
         apply_params(
             &mut body,
+            "some-local-model",
             &RequestParams {
                 temperature: Some(0.2),
                 max_tokens: Some(4096),
@@ -367,6 +370,38 @@ mod tests {
         assert_eq!(body["top_k"], 5);
         // extra 显式覆盖默认键
         assert_eq!(body["model"], "override");
+    }
+
+    /// 思考强度跟着模型翻译成各家字段；`extra` 里手写的照样盖过它。
+    #[test]
+    fn thinking_follows_the_model() {
+        let params = RequestParams {
+            thinking: Some(crate::provider::ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+        let mut body = serde_json::json!({});
+        apply_params(&mut body, "gpt-5", &params);
+        // 模型不支持 xhigh：降到它支持的最近一档
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let mut body = serde_json::json!({});
+        apply_params(&mut body, "qwen3-max", &params);
+        assert_eq!(body["enable_thinking"], true);
+
+        // 认不出的模型：什么都不发
+        let mut body = serde_json::json!({});
+        apply_params(&mut body, "llama-3-8b", &params);
+        assert!(body.get("reasoning_effort").is_none() && body.get("enable_thinking").is_none());
+
+        // extra 里手写的 reasoning 仍然覆盖档位
+        let with_extra = RequestParams {
+            thinking: Some(crate::provider::ThinkingLevel::Low),
+            extra: serde_json::json!({"reasoning_effort": "medium"}),
+            ..Default::default()
+        };
+        let mut body = serde_json::json!({});
+        apply_params(&mut body, "gpt-5", &with_extra);
+        assert_eq!(body["reasoning_effort"], "medium");
     }
 
     #[test]

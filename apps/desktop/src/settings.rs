@@ -14,6 +14,7 @@
 use crate::model::ViewMode;
 use claudesktop_builtin::{
     AutoModeConfig, BuiltinConfig, ModelInfo, Protocol, ProviderConfig, RequestParams,
+    ThinkingLevel,
 };
 use claudesktop_core::AcpKernelConfig;
 use gpui_kit::SharedString;
@@ -515,14 +516,17 @@ impl Settings {
         s.max_steps = s
             .max_steps
             .clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS);
-        // 请求参数：思考预算 0 = 没开，低于官方下限的抬到下限（Anthropic 对更小的值直接报 400）；
-        // 服务端工具里认不得的名字丢掉（手写错的、以后版本删掉的）
+        // 请求参数：老设置文件里的「思考预算」折算成档位（`thinking` 已经有了就不动，
+        // 那说明是手改过的新格式）；服务端工具里认不得的名字丢掉（手写错的、以后版本删掉的）
         for profile in &mut s.builtin.profiles {
             let params = &mut profile.params;
-            params.thinking_budget = params
-                .thinking_budget
-                .filter(|b| *b > 0)
-                .map(|b| b.max(claudesktop_builtin::RequestParams::MIN_THINKING_BUDGET));
+            if params.thinking.is_none()
+                && let Some(budget) = params.thinking_budget.filter(|b| *b > 0)
+            {
+                params.thinking = Some(budget_to_level(budget));
+            }
+            // 折算完就清掉：这个字段只读兼容，不再写盘
+            params.thinking_budget = None;
             params
                 .server_tools
                 .retain(|name| claudesktop_builtin::RequestParams::knows_server_tool(name));
@@ -668,6 +672,15 @@ impl Settings {
     }
 }
 
+/// 老的「思考预算」折算成档位（只用于读旧设置文件）：2048 / 8192 / 16000 三档的分界。
+fn budget_to_level(budget: u64) -> ThinkingLevel {
+    match budget {
+        b if b <= 4_096 => ThinkingLevel::Low,
+        b if b <= 12_000 => ThinkingLevel::Medium,
+        _ => ThinkingLevel::High,
+    }
+}
+
 impl BuiltinSettings {
     /// 当前生效的档案（一份都没有时给空档案占位）。
     pub fn current(&self) -> &ProviderProfile {
@@ -682,6 +695,7 @@ impl BuiltinSettings {
             params: RequestParams {
                 temperature: None,
                 max_tokens: None,
+                thinking: None,
                 thinking_budget: None,
                 server_tools: Vec::new(),
                 extra: serde_json::Value::Null,
@@ -851,6 +865,49 @@ mod tests {
         assert!(s.builtin_config(PathBuf::from(".")).unwrap().auto_mode.is_some());
         s.auto_mode.enabled = false;
         assert!(s.builtin_config(PathBuf::from(".")).unwrap().auto_mode.is_none());
+    }
+
+    /// 老的「思考预算」读出来换算成档位，写回时不再有 `thinking_budget`。
+    #[core::prelude::v1::test]
+    fn legacy_thinking_budget_becomes_a_level() {
+        let dir = std::env::temp_dir().join(format!("claudesktop-thinking-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 8000 → 中档；0 / 没写 → 不指定
+        for (budget, level) in [
+            ("8000", Some(ThinkingLevel::Medium)),
+            ("2000", Some(ThinkingLevel::Low)),
+            ("16000", Some(ThinkingLevel::High)),
+            ("0", None),
+        ] {
+            let text = format!(
+                r#"{{"builtin":{{"profiles":[{{"base_url":"http://x/v1","model":"m",
+                   "params":{{"thinking_budget":{budget}}}}}]}}}}"#
+            );
+            std::fs::write(&path, text).unwrap();
+            let (s, err) = Settings::load(Some(&path));
+            assert!(err.is_none(), "{err:?}");
+            let params = &s.builtin.current().params;
+            assert_eq!(params.thinking, level, "{budget}");
+            assert_eq!(params.thinking_budget, None, "{budget}");
+
+            // 往返一次：文件里不再有 thinking_budget
+            s.save(&path).unwrap();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("thinking_budget"), "{raw}");
+        }
+
+        // 新格式（已经有 thinking）优先，老字段即使还在也不覆盖
+        std::fs::write(
+            &path,
+            r#"{"builtin":{"profiles":[{"base_url":"http://x/v1","model":"m",
+               "params":{"thinking":"high","thinking_budget":2048}}]}}"#,
+        )
+        .unwrap();
+        let s = Settings::load(Some(&path)).0;
+        assert_eq!(s.builtin.current().params.thinking, Some(ThinkingLevel::High));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[core::prelude::v1::test]

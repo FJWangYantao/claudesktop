@@ -183,7 +183,7 @@ impl ChatApp {
     /// 这里对着 diff 数清是全撤回了还是一部分（不打开审查页、不提示）。
     pub(super) fn settle_undo(&mut self) {
         let s = self.session();
-        if !s.undo.is_some_and(|u| !u.exact) {
+        if s.undo.is_none_or(|u| u.exact) {
             return;
         }
         let Some(item) = (0..s.transcript.len()).rev().find(|&i| s.is_turn_end(i)) else { return };

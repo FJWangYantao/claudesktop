@@ -239,3 +239,11 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   第 3 期的候选只进设置页顶部「待确认」（`KernelEvent::MemorySuggested`，不进日志、不进对话流），用户收下才落盘；开关 `memory_suggest` 默认关。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。
+- 思考强度（`crates/builtin/src/provider.rs` 的 `ThinkingLevel` / `thinking_spec` / `apply_thinking`）：
+  对外的唯一选项是**档位**（默认 = 不发字段 / 关 / 极低 / 低 / 中 / 高 / 极高），预算和 effort 只是翻译出来的值。
+  能力表按「协议 + 模型名」给能选哪些档和字段怎么写；**认不出的模型不发任何思考字段、设置页也不显示那一行**
+  （发错了就是 400，宁可没这个选项）。`ThinkingSpec::accepts_temperature == false` 的模型（Opus 4.7 以后）
+  不管开不开思考都不发 `temperature`，这条和「开思考不发 temperature」一起在 `apply_thinking` 里管，
+  所以新增 provider 只要组完体调一次 `apply_thinking`、`extra` 仍最后合。
+  旁路小请求（补全 / 记忆提炼 / 分类器）一律 `suggest::short_thinking(model)`：能关就关、关不掉取最低一档。
+  加新模型 = 能力表加一条，同时想清楚 `can_disable`（关不掉的那代别给「关」）和 `accepts_temperature`。

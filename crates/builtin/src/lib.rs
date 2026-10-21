@@ -48,7 +48,8 @@ pub use responses::ResponsesProvider;
 
 pub use provider::{
     ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, Protocol, ProviderConfig,
-    RequestParams, StreamEvent, StreamOutcome, ToolCall, Usage,
+    RequestParams, StreamEvent, StreamOutcome, ThinkingFormat, ThinkingLevel, ThinkingSpec,
+    ToolCall, Usage, apply_thinking, resolve_level, thinking_budget_for, thinking_spec,
 };
 
 /// 列出端点提供的模型（阻塞，设置页在后台线程调用）。
@@ -357,11 +358,9 @@ struct Inner {
     auto_mode: Option<AutoMode>,
 }
 
-/// 「自动」模式的运行时：配置 + 分类器用的 provider。
+/// 「自动」模式的运行时：配置 + 每个会话的拒绝计数。
 struct AutoMode {
     config: AutoModeConfig,
-    /// 分类器的 provider；`None` = 用会话自己的 provider 和模型
-    provider: Option<Arc<dyn ChatProvider>>,
     /// 每个会话连续被拒绝几次 / 一共被拒绝几次（连续 3 次或累计 20 次就暂停自动模式）
     denials: Mutex<HashMap<String, Denials>>,
 }
@@ -1819,15 +1818,19 @@ impl Inner {
         );
         let messages = vec![ChatMessage::new("system", system), ChatMessage::new("user", user)];
         // 分类器要么用自己的模型和端点，要么跟着会话走
-        let (provider, model) = match &auto.config.model {
-            Some(config) => (auto.provider.clone(), config.model.clone()),
+        let (config, model) = match &auto.config.model {
+            Some(config) => (config.clone(), config.model.clone()),
             None => (
-                Some(self.provider.clone()),
+                self.provider_config.clone(),
                 self.session_model(session)
                     .unwrap_or_else(|| self.default_model.lock().unwrap().clone()),
             ),
         };
-        let provider = provider.unwrap_or_else(|| self.provider.clone());
+        // 分类器只要一句短判断：档位按模型覆盖成「能关就关、关不掉取最低一档」，
+        // 别继承档案里给正式对话配的深度思考（又慢又贵，还容易被思考带偏）
+        let provider = provider::provider_with(&config, |params| {
+            params.thinking = suggest::short_thinking(&model);
+        });
         let mut reply = String::new();
         // 分类器的请求也记进用量网关（用途 `auto`）
         let _tag = gateway::tag(session, "auto", self.turn_number(session));
@@ -1971,11 +1974,9 @@ impl BuiltinKernel {
             kernel_id,
             memory_path: config.memory_path,
             memory_suggest: config.memory_suggest,
-            auto_mode: config.auto_mode.map(|config| AutoMode {
-                provider: config.model.as_ref().map(|p| make_provider(p)),
-                config,
-                denials: Mutex::default(),
-            }),
+            auto_mode: config
+                .auto_mode
+                .map(|config| AutoMode { config, denials: Mutex::default() }),
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });

@@ -12,7 +12,9 @@ use crate::model::FailureKind;
 use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
-use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
+use claudesktop_builtin::{
+    PermissionRules, Protocol, ProviderConfig, ThinkingFormat, ThinkingLevel, default_rules_path,
+};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::button::{ButtonVariant, ButtonVariants as _};
@@ -51,8 +53,6 @@ pub struct ProfileInputs {
     base_url: Entity<InputState>,
     api_key: Entity<InputState>,
     model: Entity<InputState>,
-    /// 思考预算（`thinking.budget_tokens`）；空 = 不显式开启思考
-    thinking_budget: Entity<InputState>,
 }
 
 impl ProfileInputs {
@@ -69,14 +69,12 @@ impl ProfileInputs {
                     .default_value(value)
             })
         };
-        // 思考预算：1024 是官方下限；没设就留空（占位符顺便提醒最小值）
-        let budget = p.params.thinking_budget.map(|b| b.to_string()).unwrap_or_default();
+        // 思考强度是档位（`seg_control`，跟着模型输入框现算），这里不再有输入框
         Self {
             name: make(p.name.clone(), "如 DeepSeek（可留空）", false, window, cx),
             base_url: make(p.base_url.clone(), "如 https://api.deepseek.com/v1", false, window, cx),
             api_key: make(p.api_key.clone(), "没有可留空", true, window, cx),
             model: make(p.model.clone(), "如 deepseek-chat", false, window, cx),
-            thinking_budget: make(budget, "空 = 不开启", false, window, cx),
         }
     }
 }
@@ -207,13 +205,8 @@ fn parse_max_steps(text: &str) -> usize {
         .clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS)
 }
 
-/// 设置页的「思考预算」输入 → `thinking.budget_tokens`：空着或写了非正数 = 不开启；
-/// 小于官方下限（1024）时抬到下限（请求里也会按这个下限卡一次）。
-fn parse_thinking_budget(text: &str) -> Option<u64> {
-    let text = text.trim();
-    let n = text.parse::<u64>().ok().filter(|n| *n > 0)?;
-    Some(n.max(claudesktop_builtin::RequestParams::MIN_THINKING_BUDGET))
-}
+// 设置页的「思考强度」是档位（`seg_control`），直接写在表单的档案里，不用输入框解析；
+// 老的「思考预算」在 `Settings::normalize` 里折算成档位了（见 `render_thinking_row`）。
 
 impl ChatApp {
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -582,8 +575,8 @@ impl ChatApp {
             p.base_url = value(&inputs.base_url, cx);
             p.api_key = value(&inputs.api_key, cx);
             p.model = value(&inputs.model, cx);
-            p.params.thinking_budget = parse_thinking_budget(&value(&inputs.thinking_budget, cx));
-            // 服务端工具（`p.params.server_tools`）由多选开关直接写在表单的档案里，这里不用再收
+            // 思考强度（`p.params.thinking`）由档位开关直接写在表单的档案里，这里不用再收
+            // 服务端工具（`p.params.server_tools`）同样由多选开关直接写
         }
         s.builtin.profiles = profiles;
         s.builtin.active = f.active.min(s.builtin.profiles.len().saturating_sub(1));
@@ -1636,25 +1629,66 @@ impl ChatApp {
                 ),
             ))
             .child(form_field("模型", model_hint, model_row))
+            .child(self.render_thinking_row(p, cx))
             .when(p.protocol == Protocol::Anthropic, |d| {
-                d.child(self.render_request_extras(p, inputs, cx))
+                d.child(self.render_server_tools(p, cx))
             })
     }
 
-    /// 档案里只有 Anthropic 原生协议认的两项：思考预算 + 服务端工具。
-    /// 协议不是 Anthropic 时整块不显示（填了也不生效，免得误会），见 `render_profile_editor`。
-    fn render_request_extras(
-        &self,
-        p: &ProviderProfile,
-        inputs: &ProfileInputs,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let budget = form_field(
-            "思考预算",
-            Some("最小 1024，留空不开启".into()),
-            div().w(NUMBER_INPUT_W).child(Self::text_input(&inputs.thinking_budget)),
-        );
-        // 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）
+    /// 「思考强度」：档位一排（`seg_control`），三种协议下都显示，模型认不出时整行不显示。
+    ///
+    /// 能选哪些档跟着模型输入框的**当前值**现算（不额外存 Entity、不用同步代码），
+    /// 所以换模型之后这一排跟着变；存在档案里的档位如果新模型不支持，高亮和保存都按
+    /// `ThinkingSpec::resolve` 降级后的那一档。
+    fn render_thinking_row(&self, p: &ProviderProfile, cx: &mut Context<Self>) -> Div {
+        let spec = claudesktop_builtin::thinking_spec(p.protocol, &p.model);
+        if !spec.is_known() {
+            // 认不出的模型：宁可没有这个选项，也不要发个对方不认的字段导致 400
+            return div();
+        }
+        let current = p.params.thinking;
+        // 「默认」= 不发字段，排在「关」前面
+        let mut options: Vec<(Option<ThinkingLevel>, &'static str)> = vec![(None, "默认")];
+        for level in spec.levels {
+            options.push((Some(*level), level.label()));
+        }
+        // 高亮：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档
+        //（认不出的一档都不匹配时保留原值，免得界面显示成「默认」而实际发着别的字段）
+        let active = current.and_then(|c| spec.resolve(c)).or(current);
+        // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
+        let hint = match (p.protocol, spec.format) {
+            (Protocol::Anthropic, ThinkingFormat::AnthropicBudget) => active
+                .filter(|l| !l.is_off())
+                .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l))),
+            _ => None,
+        };
+        let control = div().h_flex().items_center().gap_3().child(seg_control(
+            "thinking",
+            options,
+            active,
+            |this, level: Option<ThinkingLevel>, _, cx| {
+                if let Some(profile) =
+                    this.settings_form.profiles.get_mut(this.settings_form.active)
+                {
+                    profile.params.thinking = level;
+                    this.settings_form.message = None;
+                }
+                cx.notify();
+            },
+            cx,
+        ));
+        let control = match hint {
+            Some(hint) => {
+                control.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_FAINT)).child(hint))
+            }
+            None => control,
+        };
+        form_field("思考强度", Some("让模型回答前先想多久，越高越慢、越贵".into()), control)
+    }
+
+    /// 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）。
+    /// 只有 Anthropic 原生协议认，别的协议下整块不显示（填了也不生效，免得误会）。
+    fn render_server_tools(&self, p: &ProviderProfile, cx: &mut Context<Self>) -> Div {
         let mut tools = choice_panel();
         for (i, (name, desc)) in
             claudesktop_builtin::RequestParams::server_tool_choices().enumerate()
@@ -1702,7 +1736,7 @@ impl ChatApp {
                     ),
             );
         }
-        div().v_flex().gap_4().child(budget).child(form_field(
+        div().v_flex().gap_4().child(form_field(
             "服务端工具",
             Some("在 Anthropic 服务器上执行，按次计费".into()),
             tools,
