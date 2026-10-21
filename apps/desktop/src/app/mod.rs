@@ -554,19 +554,30 @@ impl ChatApp {
                         Err(err) => (None, format!("启动失败：{err}").into(), String::new()),
                     }
                 }
-                KernelChoice::Acp(id) => {
-                    let profile = self.settings.acp.get(id).cloned();
-                    let config =
-                        self.settings.acp_config_for(self.acp_base.clone(), profile.as_ref());
-                    let agent_cmd = config.command.clone();
-                    match AcpKernel::spawn(config, sink) {
-                        Ok(k) => {
-                            k.set_plugins(plugins);
-                            (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), agent_cmd)
+                KernelChoice::Acp(id) => match self.settings.acp.get(id).cloned() {
+                    // 档案停用 / 删掉了：别退回 `acp_base` 的命令（那是 ACP_AGENT 或仓库里的 mock agent）
+                    None => (
+                        None,
+                        "这个 agent 已停用：到设置「本机 agent」里启用，或换个内核".into(),
+                        String::new(),
+                    ),
+                    Some(profile) => {
+                        let config =
+                            self.settings.acp_config_for(self.acp_base.clone(), Some(&profile));
+                        let agent_id = crate::settings::acp_agent_id(id, &config.command);
+                        match AcpKernel::spawn(config, sink) {
+                            Ok(k) => {
+                                k.set_plugins(plugins);
+                                (
+                                    Some(Arc::new(k) as Arc<dyn Kernel>),
+                                    "内核启动中…".into(),
+                                    agent_id,
+                                )
+                            }
+                            Err(err) => (None, format!("启动失败：{err}").into(), agent_id),
                         }
-                        Err(err) => (None, format!("启动失败：{err}").into(), agent_cmd),
                     }
-                }
+                },
             };
         let slot = self.slot_entry(&key);
         slot.ready = kind.is_demo();
@@ -1158,7 +1169,8 @@ impl ChatApp {
             if builtin {
                 m.agent.starts_with("builtin:")
             } else {
-                m.agent == agent_cmd && m.kernel_session_id.is_some()
+                crate::settings::same_acp_agent(&m.agent, &agent_cmd)
+                    && m.kernel_session_id.is_some()
             }
         });
         let cwd = Some(s.cwd.clone());
@@ -1673,8 +1685,11 @@ impl ChatApp {
                 slot.status = "内核错误".into();
                 // 多半发生在刚启动时（命令找不到、agent 一起来就退出），这会儿用户常常还在首页，
                 // 对话流里的说明看不到，所以另弹一条提示
-                let text =
-                    crate::model::kernel_failure_text(&kind.label(&acp), &slot.agent_cmd, &message);
+                let text = crate::model::kernel_failure_text(
+                    &kind.label(&acp),
+                    crate::settings::agent_command(&slot.agent_cmd),
+                    &message,
+                );
                 slot.fatal = Some(message.clone());
                 for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
                     s.on_fatal(&message, kernel.as_ref());

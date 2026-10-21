@@ -918,9 +918,12 @@ impl ChatApp {
     pub(super) fn update_settings(&mut self, change: impl Fn(&mut Settings)) {
         change(&mut self.settings);
         if let Some(path) = &self.settings_path {
-            let (mut saved, _) = Settings::load(Some(path));
-            change(&mut saved);
-            let _ = saved.save(path);
+            // 盘上的文件读不出来（手改坏了、新版本的格式）时别用「默认值 + 这次改动」盖掉它
+            let (mut saved, broken) = Settings::load(Some(path));
+            if broken.is_none() {
+                change(&mut saved);
+                let _ = saved.save(path);
+            }
         }
     }
 

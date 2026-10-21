@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KernelChoice {
     /// ACP agent（带档案 ID；命令为空时用仓库内的 mock agent）
@@ -33,11 +33,34 @@ pub enum KernelChoice {
     Demo,
 }
 
-impl KernelChoice {
-    pub const BUILTIN: Self = Self::Builtin;
-    /// 演示回放（不连内核）
-    pub const DEMO: Self = Self::Demo;
+/// 手写反序列化：老设置文件里 ACP 是不带档案 ID 的 `"acp"`，派生出来的会因为
+/// 「newtype 变体读到了字符串」整份设置读失败。读成 `Acp("")`，`Settings::normalize` 再落到第一个档案。
+impl<'de> Deserialize<'de> for KernelChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Tagged {
+            Acp(String),
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bare(String),
+            Tagged(Tagged),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Bare(name) => match name.as_str() {
+                "acp" => Ok(Self::Acp(String::new())),
+                "builtin" => Ok(Self::Builtin),
+                "demo" => Ok(Self::Demo),
+                other => Err(serde::de::Error::unknown_variant(other, &["acp", "builtin", "demo"])),
+            },
+            Raw::Tagged(Tagged::Acp(id)) => Ok(Self::Acp(id)),
+        }
+    }
+}
 
+impl KernelChoice {
     /// 内核槽的键（`ChatApp::kernels`）：自研 / 演示固定，ACP 按档案 ID 各一个。
     pub fn key(&self) -> String {
         match self {
@@ -88,8 +111,14 @@ impl KernelChoice {
                 Self::Acp(acp.first().map(|a| a.id.clone()).unwrap_or_else(|| id.to_string()))
             }
         } else {
-            // 老格式：命令本身就是标识
-            Self::Acp(acp.first().map(|a| a.id.clone()).unwrap_or_else(|| "custom-1".into()))
+            // 老格式：命令本身就是标识。按命令找档案（单条命令迁成的 `custom-1` 正好对上），找不到归第一个
+            let by_command = acp.agents.iter().find(|a| a.command_for(cfg!(windows)) == agent);
+            Self::Acp(
+                by_command
+                    .or(acp.first())
+                    .map(|a| a.id.clone())
+                    .unwrap_or_else(|| "custom-1".into()),
+            )
         }
     }
 
@@ -316,12 +345,6 @@ impl AgentProfile {
             Some(preset) => preset.gateway,
             None => true,
         }
-    }
-
-    /// 写进会话元信息的 agent 标识：`acp:<档案 ID>:<命令>`。
-    /// 续接时按它判断是不是同一个 agent（命令变了就不续接，见 `send_resume`）。
-    pub fn agent_id(&self) -> String {
-        format!("acp:{}:{}", self.id, self.command_for(cfg!(windows)))
     }
 }
 
@@ -735,6 +758,12 @@ impl Settings {
         // 档案 ID 不能重（手改过文件时会撞）：留第一个
         let mut seen = std::collections::HashSet::new();
         s.acp.agents.retain(|a| !a.id.trim().is_empty() && seen.insert(a.id.clone()));
+        // 老设置的 `"kernel": "acp"`（没有档案 ID）、或选的档案已经没了 → 第一个档案，一个都没有就自研
+        if let Some(KernelChoice::Acp(id)) = &s.kernel
+            && s.acp.get(id).is_none()
+        {
+            s.kernel = Some(s.kernel_for(&KernelChoice::Acp(String::new())));
+        }
     }
 
     /// 界面字体族：空串表示用内嵌的默认字体。
@@ -912,10 +941,29 @@ impl Settings {
         }
         base
     }
+}
 
-    /// [`Settings::acp_config_for`] 的默认档案版本（第一个启用的档案）。
-    pub fn acp_config(&self, base: AcpKernelConfig) -> AcpKernelConfig {
-        self.acp_config_for(base, self.acp.first())
+/// 写进会话元信息的 ACP agent 标识：`acp:<档案 ID>:<实际启动命令>`。
+/// 重开历史会话时按档案 ID 归到对应的 agent（[`KernelChoice::of_agent`]），续接时整串比对（命令变了就不续接）。
+pub fn acp_agent_id(profile: &str, command: &str) -> String {
+    format!("acp:{profile}:{command}")
+}
+
+/// agent 标识里的启动命令（老会话的标识就是命令本身）。
+pub fn agent_command(agent: &str) -> &str {
+    match agent.strip_prefix("acp:").and_then(|rest| rest.split_once(':')) {
+        Some((_, command)) => command,
+        None => agent,
+    }
+}
+
+/// 元信息里记的 agent 和现在这个是不是同一个：新格式整串比；
+/// 老会话（只记了命令）比命令，升级后单条命令迁成的 `custom-1` 还能续接。
+pub fn same_acp_agent(recorded: &str, current: &str) -> bool {
+    if recorded.starts_with("acp:") {
+        recorded == current
+    } else {
+        !recorded.is_empty() && recorded == agent_command(current)
     }
 }
 
@@ -1170,7 +1218,8 @@ mod tests {
         // 填了 ACP 命令（含 ACP_AGENT 带进来的）→ 归进第一个启用的档案
         let mut s = Settings::default();
         s.acp.command = "npx agent".into();
-        assert_eq!(s.kernel(), KernelChoice::Acp("acp-1".into()));
+        s.acp.migrate();
+        assert_eq!(s.kernel(), KernelChoice::Acp("custom-1".into()));
         assert!(!s.needs_setup());
 
         let mut s = Settings::default();
@@ -1181,6 +1230,7 @@ mod tests {
         assert!(!s.needs_setup());
         // 两个都配了：自研优先，和以前一样
         s.acp.command = "npx agent".into();
+        s.acp.migrate();
         assert_eq!(s.kernel(), KernelChoice::Builtin);
         s.kernel = Some(KernelChoice::Demo);
         s.save(&path).unwrap();
@@ -1366,7 +1416,10 @@ mod tests {
             KernelChoice::Builtin
         );
         // 老格式：命令本身就是标识，归进第一个档案
-        assert_eq!(KernelChoice::of_agent("node mock.mjs", acp), KernelChoice::Acp("acp-1".into()));
+        assert_eq!(
+            KernelChoice::of_agent("node mock.mjs", acp),
+            KernelChoice::Acp("custom-1".into())
+        );
         assert_eq!(KernelChoice::of_agent("", acp), KernelChoice::Demo);
         // 槽 key 互不相同
         let keys: Vec<String> = vec![
@@ -1375,5 +1428,41 @@ mod tests {
             KernelChoice::Acp("x".into()).key(),
         ];
         assert_eq!(keys.len(), keys.iter().collect::<std::collections::BTreeSet<_>>().len());
+
+        // 多家 agent：新格式按档案 ID 归，不是一律给第一家
+        let mut acp = AcpSettings::default();
+        acp.agents.push(AgentProfile::custom(1, "agent-a"));
+        acp.agents.push(AgentProfile::custom(2, "agent-b"));
+        let b = acp_agent_id("custom-2", "agent-b");
+        assert_eq!(KernelChoice::of_agent(&b, &acp), KernelChoice::Acp("custom-2".into()));
+        // 老格式按命令找档案
+        assert_eq!(KernelChoice::of_agent("agent-b", &acp), KernelChoice::Acp("custom-2".into()));
+        assert_eq!(agent_command(&b), "agent-b");
+        assert!(same_acp_agent(&b, &b));
+        assert!(same_acp_agent("agent-b", &b), "升级前的会话还能续接");
+        assert!(!same_acp_agent(&acp_agent_id("custom-1", "agent-a"), &b));
+    }
+
+    /// 老设置文件里的 `"kernel": "acp"`（没有档案 ID）不能把整份设置读坏。
+    #[core::prelude::v1::test]
+    fn legacy_acp_kernel_loads() {
+        let legacy = r#"{"kernel":"acp","acp":{"command":"npx agent"},
+            "builtin":{"base_url":"http://x/v1","api_key":"k","model":"m"}}"#;
+        let dir =
+            std::env::temp_dir().join(format!("claudesktop-legacy-acp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, legacy).unwrap();
+        let (s, err) = Settings::load(Some(&path));
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(s.builtin.current().api_key, "k");
+        assert_eq!(s.kernel, Some(KernelChoice::Acp("custom-1".into())));
+        // 存回去再读：新格式也能来回
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(Some(&path)).0, s);
+        // 没有档案可落：退回自研
+        std::fs::write(&path, r#"{"kernel":"acp"}"#).unwrap();
+        assert_eq!(Settings::load(Some(&path)).0.kernel, Some(KernelChoice::Builtin));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
