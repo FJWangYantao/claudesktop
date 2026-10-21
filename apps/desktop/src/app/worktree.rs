@@ -130,7 +130,7 @@ impl ChatApp {
         let has_chat = s.has_user_message() || s.busy;
         if has_chat {
             // 已经有对话：换个目录就等于换个会话（对话不能跨目录），开一个新的接着来
-            let kind = s.kernel;
+            let kind = s.kernel.clone();
             // 建 worktree 期间写的消息是给新 worktree 的：跟着搬过去，别留在原会话里没人发
             let queued = std::mem::take(&mut self.sessions[idx].queued);
             let new = self.open_session(kind, path.clone());
@@ -150,7 +150,7 @@ impl ChatApp {
             );
             return Some(new);
         }
-        let kind = s.kernel;
+        let kind = s.kernel.clone();
         // 建 worktree 期间排队的消息：换会话（`replace_session`）会新建一个 Session，先收好再放回去
         let queued = std::mem::take(&mut self.sessions[idx].queued);
         self.replace_session(idx, kind, path.clone());
@@ -527,7 +527,7 @@ impl ChatApp {
     fn detach_from_worktree(&mut self, idx: usize, repo: PathBuf) {
         if !self.sessions[idx].has_user_message() {
             // 还没对话：原地换成主目录里的新会话
-            let kind = self.sessions[idx].kernel;
+            let kind = self.sessions[idx].kernel.clone();
             self.replace_session(idx, kind, repo);
             return;
         }

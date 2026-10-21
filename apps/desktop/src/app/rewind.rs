@@ -88,7 +88,7 @@ impl ChatApp {
             _ => String::new(),
         };
         // 历史会话的内核可能还没起来：自研内核续接时按日志重建，照样能回退
-        let conversation = match self.kernel_of(s.kernel) {
+        let conversation = match self.kernel_of(&s.kernel) {
             Some(kernel) => kernel.supports_rewind(),
             None => s.kernel == KernelChoice::Builtin,
         };

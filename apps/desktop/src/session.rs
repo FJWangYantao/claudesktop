@@ -19,6 +19,8 @@ pub struct Session {
     pub title: SharedString,
     /// 这个会话跑在哪种内核上（空会话可以换，有对话后固定）
     pub kernel: KernelChoice,
+    /// 会话绑定的内核槽 key（[`KernelChoice::key`]）：事件按它找槽
+    pub kernel_key: String,
     /// 创建时的令牌，用来把内核回的 Started / SessionFailed 对回这个会话
     pub token: u64,
     /// ACP sessionId（Started 之后才有；演示回放模式为 None）
@@ -303,13 +305,16 @@ fn new_list_state() -> ListState {
 impl Session {
     /// 新会话；演示回放不需要内核会话，直接可用。
     pub fn new(token: u64, kernel: KernelChoice, cwd: PathBuf) -> Self {
+        let kernel_key = kernel.key();
+        let is_demo = kernel == KernelChoice::Demo;
         Self {
             title: "新会话".into(),
             kernel,
+            kernel_key,
             token,
             acp_id: None,
             requested: false,
-            ready: kernel == KernelChoice::Demo,
+            ready: is_demo,
             transcript: Vec::new(),
             busy: false,
             compact_turn: false,
@@ -320,8 +325,7 @@ impl Session {
             modes: default_modes(),
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
-            model_label: if kernel == KernelChoice::Demo { "GLM-5.3" } else { UNKNOWN_MODEL }
-                .into(),
+            model_label: if is_demo { "GLM-5.3" } else { UNKNOWN_MODEL }.into(),
             autoprompt: None,
             cwd,
             task: false,
@@ -369,8 +373,13 @@ impl Session {
     }
 
     /// 从持久化记录重放出一个历史会话：事件走与实时完全相同的映射。
-    pub fn from_records(token: u64, meta: SessionMeta, records: Vec<Record>) -> Self {
-        let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent), meta.cwd.clone());
+    pub fn from_records(
+        token: u64,
+        meta: SessionMeta,
+        records: Vec<Record>,
+        acp: &crate::settings::AcpSettings,
+    ) -> Self {
+        let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent, acp), meta.cwd.clone());
         s.ready = false;
         // 历史会话不该被「新对话默认自动」改掉模式：它的模式由重建的日志决定
         s.pending_mode = None;
@@ -899,11 +908,11 @@ impl Session {
     }
 
     /// 整段对话导出为 Markdown（「分享」按钮用）。
-    pub fn to_markdown(&self) -> String {
+    pub fn to_markdown(&self, acp: &crate::settings::AcpSettings) -> String {
         let mut out = format!(
             "# {}\n\n> 内核：{} · 模型：{}\n\n",
             self.title,
-            self.kernel.label(),
+            self.kernel.label(acp),
             self.model_label
         );
         for item in &self.transcript {
@@ -1592,7 +1601,7 @@ mod tests {
         s.transcript.push(agent);
         s.transcript.push(tool);
         s.transcript.push(plan);
-        let md = s.to_markdown();
+        let md = s.to_markdown(&Default::default());
         assert!(md.starts_with("# 测试会话"));
         assert!(md.contains("## 我"));
         assert!(md.contains("你好"));
@@ -1730,7 +1739,7 @@ mod tests {
             ev(KernelEvent::AgentThoughtChunk { text: "旧的".into() }),
             permission(2),
         ];
-        let s = Session::from_records(7, meta(), records);
+        let s = Session::from_records(7, meta(), records, &Default::default());
 
         assert!(s.restored && !s.ready && !s.busy);
         assert_eq!(s.title.as_ref(), "读 README");
@@ -1829,7 +1838,7 @@ mod tests {
                 ),
             }),
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         let ChatItem::Tool(card) = &s.transcript[1] else { panic!("tool card") };
         let paths: Vec<_> = card.diffs.iter().map(|d| d.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "b.txt"]);
@@ -2086,7 +2095,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn detach_kernel_interrupts_turn_and_marks_for_resume() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.apply_event(
             KernelEvent::Started {
                 token: 1,
@@ -2131,7 +2140,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn activity_follows_turn_and_usage_accumulates() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         // 上一轮遗留的执行中工具不算进本轮
         s.transcript.push(ChatItem::User { text: "上一轮".into(), images: Vec::new() });
         s.apply_event(
@@ -2216,7 +2225,7 @@ mod tests {
     /// 状态行上的实时 token：端点报过的 + 之后还在流式（靠字数估）的，端点一报就清掉估算。
     #[core::prelude::v1::test]
     fn live_output_tokens_adds_reported_and_streamed() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.begin_turn();
         assert_eq!(s.live_output_tokens(), 0);
@@ -2247,7 +2256,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn live_thinking_is_timed_once() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.apply_event(thought("想"), None);
         s.apply_event(thought("再想"), None);
@@ -2313,14 +2322,14 @@ mod tests {
         assert_eq!(s.modes[s.permission_mode].id, "default");
 
         // 内核不认这个模式（ACP agent）：退回它报的那个，不留下「自动」
-        let mut s = Session::new(2, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(2, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.default_to(MODE_AUTO_ID);
         s.apply_event(started(&[("default", "逐项确认"), ("plan", "计划")]), None);
         assert_eq!(s.modes[s.permission_mode].id, "default");
         assert!(s.modes.iter().all(|m| m.id != MODE_AUTO_ID));
 
         // 内核报的当前模式不在第一位：退回的是它，不是列表第一项
-        let mut s = Session::new(3, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(3, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.default_to(MODE_AUTO_ID);
         s.apply_event(started(&[("plan", "计划"), ("default", "逐项确认")]), None);
         assert_eq!(s.modes[s.permission_mode].id, "default");
@@ -2330,7 +2339,7 @@ mod tests {
     fn history_sessions_keep_their_own_mode() {
         let mut meta = meta();
         meta.agent = "builtin:test".into();
-        let s = Session::from_records(1, meta, vec![Record::user("问")]);
+        let s = Session::from_records(1, meta, vec![Record::user("问")], &Default::default());
         assert!(s.pending_mode.is_none());
     }
 
@@ -2339,9 +2348,9 @@ mod tests {
         // 侧栏按元信息把对话分到项目区 / 任务区，重放时不能丢
         let mut with_task = meta();
         with_task.task = true;
-        let s = Session::from_records(1, with_task, vec![Record::user("问")]);
+        let s = Session::from_records(1, with_task, vec![Record::user("问")], &Default::default());
         assert!(s.task);
-        let s = Session::from_records(2, meta(), vec![Record::user("问")]);
+        let s = Session::from_records(2, meta(), vec![Record::user("问")], &Default::default());
         assert!(!s.task);
     }
 
@@ -2365,6 +2374,7 @@ mod tests {
                 changed("a.rs", Some(vec![range])),
                 changed("b.rs", None),
             ],
+            &Default::default(),
         );
         assert_eq!(s.latest_undo(), Some(TurnUndo { turn: 0, all: false, exact: false }));
         // 撤回后又全部恢复（撤回集合清空）：不算撤回过
@@ -2376,6 +2386,7 @@ mod tests {
                 changed("a.rs", Some(vec![range])),
                 changed("a.rs", Some(vec![])),
             ],
+            &Default::default(),
         );
         assert_eq!(s.latest_undo(), None);
         // 撤回的是上一轮：新的一轮不带
@@ -2383,13 +2394,14 @@ mod tests {
             1,
             meta(),
             vec![Record::user("问"), changed("a.rs", Some(vec![range])), Record::user("再问")],
+            &Default::default(),
         );
         assert_eq!(s.latest_undo(), None);
     }
 
     #[core::prelude::v1::test]
     fn steps_group_and_fold() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.begin_turn();
         // 只有一步：照常一行，没有组头
@@ -2436,7 +2448,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn diff_tools_and_permissions_split_groups() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.apply_event(read("a"), None);
         s.apply_event(read("b"), None);
@@ -2513,7 +2525,7 @@ mod tests {
             ev(read("d")),
             ask(3, "d"),
         ];
-        let s = Session::from_records(7, meta(), records);
+        let s = Session::from_records(7, meta(), records, &Default::default());
         let grants: Vec<Option<GrantKind>> = s
             .transcript
             .iter()
@@ -2549,7 +2561,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn plan_pins_while_turn_runs() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.begin_turn();
         let plan = |statuses: &[&str]| KernelEvent::PlanReplaced {
@@ -2593,7 +2605,7 @@ mod tests {
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Rewind { turn: 1, conversation: true, files: 1, prompt: "第二问".into() },
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         let users = s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count();
         assert_eq!(users, 1);
         assert!(matches!(
@@ -2611,10 +2623,10 @@ mod tests {
             reverted: Some(Vec::new()),
         };
         let mut records = vec![Record::user("改"), reviewed];
-        assert!(Session::from_records(1, meta(), records.clone()).review_pending);
+        assert!(Session::from_records(1, meta(), records.clone(), &Default::default()).review_pending);
         // 已经发过下一条（说明附在那条上了）
         records.push(Record::user("继续"));
-        assert!(!Session::from_records(1, meta(), records).review_pending);
+        assert!(!Session::from_records(1, meta(), records, &Default::default()).review_pending);
     }
 
     #[core::prelude::v1::test]
@@ -2632,7 +2644,7 @@ mod tests {
                 context_tokens: None,
             },
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         let summary = s.turn_summary(1).expect("回复那行有统计");
         assert_eq!(summary.elapsed_ms, Some(65_000));
         assert_eq!((summary.usage.input, summary.usage.output), (10, 2));
@@ -2664,7 +2676,7 @@ mod tests {
                 context_tokens: Some(2000),
             },
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         // 最后一次上报的模型胜出；早于它的照样能恢复
         assert_eq!(s.model_label.as_ref(), "other-model");
         assert_eq!(s.context_tokens, 2000);
@@ -2681,7 +2693,7 @@ mod tests {
                 context_tokens: Some(1508),
             },
         ];
-        let s = Session::from_records(1, meta(), first);
+        let s = Session::from_records(1, meta(), first, &Default::default());
         assert_eq!(s.model_label.as_ref(), "cn:deepseek-v4.1-flash");
 
         // 旧日志没记模型：维持「默认模型」
@@ -2696,7 +2708,7 @@ mod tests {
                 context_tokens: None,
             },
         ];
-        let s = Session::from_records(1, meta(), none);
+        let s = Session::from_records(1, meta(), none, &Default::default());
         assert_eq!(s.model_label.as_ref(), UNKNOWN_MODEL);
     }
 

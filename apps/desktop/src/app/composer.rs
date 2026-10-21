@@ -25,7 +25,7 @@ impl ChatApp {
     /// 「分享」：当前会话导出为 Markdown，系统保存对话框选位置。
     pub(crate) fn share_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active;
-        let markdown = self.sessions[idx].to_markdown();
+        let markdown = self.sessions[idx].to_markdown(&self.settings.acp);
         let suggested = format!("{}.md", self.sessions[idx].title);
         let dir = self.cwd.clone();
         let rx = cx.prompt_for_new_path(&dir, Some(&suggested));

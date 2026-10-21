@@ -227,7 +227,8 @@ impl ChatApp {
                     return;
                 };
                 let Ok(records) = store.load(&meta.id) else { return };
-                let session = Session::from_records(self.next_token, meta, records);
+                let session =
+                    Session::from_records(self.next_token, meta, records, &self.settings.acp);
                 self.next_token += 1;
                 self.sessions.push(session);
                 self.sessions.len() - 1

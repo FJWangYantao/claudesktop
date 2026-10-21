@@ -122,8 +122,8 @@ fn main() {
                                 app.debug_review(file, cx)
                             }
                             "restart" => {
-                                let kind = app.session().kernel;
-                                app.restart_kernel(kind, cx)
+                                let kind = app.session().kernel.clone();
+                                app.restart_kernel(&kind, cx)
                             }
                             // 在一个临时 git 仓库里建 worktree（截图 / 自检用）
                             "worktree" => app.debug_worktree(cx),
@@ -199,7 +199,7 @@ fn main() {
                     let rerun =
                         std::env::var("CLAUDESKTOP_RERUN").ok().and_then(|v| match v.trim() {
                             "builtin" => Some(KernelChoice::Builtin),
-                            "acp" => Some(KernelChoice::Acp),
+                            "acp" => Some(KernelChoice::Acp("custom-1".into())),
                             "demo" => Some(KernelChoice::Demo),
                             _ => None,
                         });

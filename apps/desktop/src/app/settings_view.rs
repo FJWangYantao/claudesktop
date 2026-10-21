@@ -159,7 +159,7 @@ impl SettingsForm {
             InputState::new(window, cx).placeholder("留空就用「服务商」里 DeepSeek 那份的 key")
         });
         Self {
-            kernel: KernelChoice::default(),
+            kernel: KernelChoice::Builtin,
             profiles: Vec::new(),
             active: 0,
             inputs: Vec::new(),
@@ -583,7 +583,7 @@ impl ChatApp {
     fn form_settings(&self, cx: &App) -> Settings {
         let f = &self.settings_form;
         let mut s = self.settings.clone();
-        s.kernel = Some(f.kernel);
+        s.kernel = Some(f.kernel.clone());
         let mut profiles = f.profiles.clone();
         for (p, inputs) in profiles.iter_mut().zip(&f.inputs) {
             p.name = value(&inputs.name, cx);
@@ -650,8 +650,8 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         self.open_settings_at(KERNEL_TAB, window, cx);
-        self.settings_form.kernel = kind;
-        if kind == KernelChoice::Acp
+        self.settings_form.kernel = kind.clone();
+        if matches!(kind, KernelChoice::Acp(_))
             && self.settings_form.acp_command.read(cx).value().trim().is_empty()
         {
             let command = acp_command(ACP_PRESETS[0].1);
@@ -718,10 +718,15 @@ impl ChatApp {
         self.settings = new;
         self.settings_open = false;
         if restart_builtin {
-            self.restart_kernel(KernelChoice::Builtin, cx);
+            self.restart_kernel(&KernelChoice::Builtin, cx);
         }
         if restart_acp {
-            self.restart_kernel(KernelChoice::Acp, cx);
+            // 每条启用的档案各一个内核进程：都重启（设置页改的就是这一份档案表）
+            let ids: Vec<String> =
+                self.settings.acp.agents.iter().map(|a| a.id.clone()).collect();
+            for id in ids {
+                self.restart_kernel(&KernelChoice::Acp(id), cx);
+            }
         }
         // 自研内核的配置变了：顺手取一次模型列表，连不上马上告诉用户（不挡保存）
         if restart_builtin && default == KernelChoice::Builtin {
@@ -730,14 +735,14 @@ impl ChatApp {
         if default_changed {
             // 默认内核换了：还没对话的会话跟着换，有对话的留在原来的内核上
             for idx in 0..self.sessions.len() {
-                self.rebind_session(idx, default);
+                self.rebind_session(idx, default.clone());
             }
         }
         // 首次配置：启动时没起内核（见 `open_session`），现在把等着的会话接上
-        if !self.kernels[default.index()].started
+        if !self.slot(&default.key()).is_some_and(|s| s.started)
             && self.sessions.iter().any(|s| s.kernel == default && !s.has_user_message())
         {
-            self.ensure_kernel(default);
+            self.ensure_kernel(&default);
             self.request_pending_sessions();
         }
         cx.notify();
@@ -916,7 +921,8 @@ impl ChatApp {
                         if base_url == app.settings.builtin.base_url().trim() {
                             app.update_settings(|s| s.builtin.current_mut().set_models(&models));
                             // 运行中的自研内核也要知道窗口大小（自动压缩用）
-                            if let Some(kernel) = &app.kernels[KernelChoice::Builtin.index()].kernel
+                            if let Some(kernel) =
+                                &app.kernel_of(&KernelChoice::Builtin)
                             {
                                 let windows = &app.settings.builtin.current().context_windows;
                                 kernel.set_context_windows(windows.clone().into_iter().collect());
@@ -1460,11 +1466,13 @@ impl ChatApp {
     fn render_kernel_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let mut kernels = choice_panel();
-        for (kind, icon, title, desc) in KERNEL_CHOICES {
+        for (kind, icon, title, desc) in kernel_choices() {
+            let key = kind.key();
+            let id: gpui_kit::ElementId = format!("kernel-{}", key.replace(':', "-")).into();
             kernels = kernels.child(
-                choice_row(("kernel", kind.index()), icon, title, desc, f.kernel == kind, None)
+                choice_row(id, icon, title, desc, f.kernel == kind, None)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_form.kernel = kind;
+                        this.settings_form.kernel = kind.clone();
                         this.settings_form.message = None;
                         cx.notify();
                     })),
@@ -1492,7 +1500,7 @@ impl ChatApp {
                         self.prices_row(window, cx),
                     ]),
                 )),
-            KernelChoice::Acp => body.child(self.render_acp(cx)),
+            KernelChoice::Acp(_) => body.child(self.render_acp(cx)),
             KernelChoice::Demo => body,
         }
     }
@@ -2194,16 +2202,23 @@ enum Fetch {
 }
 
 /// 「内核与模型」里默认内核的三种选择。
-const KERNEL_CHOICES: [(KernelChoice, IconAll, &str, &str); 3] = [
-    (
-        KernelChoice::Builtin,
-        IconAll::Cpu,
-        "自研内核",
-        "填 API Key 直连 DeepSeek、OpenAI、Ollama 等",
-    ),
-    (KernelChoice::Acp, IconAll::SquareTerminal, "ACP agent", "接 Claude Code 这类外部 agent"),
-    (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
-];
+fn kernel_choices() -> Vec<(KernelChoice, IconAll, &'static str, &'static str)> {
+    vec![
+        (
+            KernelChoice::Builtin,
+            IconAll::Cpu,
+            "自研内核",
+            "填 API Key 直连 DeepSeek、OpenAI、Ollama 等",
+        ),
+        (
+            KernelChoice::Acp("custom-1".into()),
+            IconAll::SquareTerminal,
+            "ACP agent",
+            "接 Claude Code 这类外部 agent",
+        ),
+        (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
+    ]
+}
 
 /// ACP 启动命令的常用项：(名称, 命令, 风险提示)；Windows 上前面补 `cmd /c`（见 [`acp_command`]）。
 const ACP_PRESETS: [(&str, &str, Option<&str>); 2] = [

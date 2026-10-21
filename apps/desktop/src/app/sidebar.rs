@@ -265,7 +265,7 @@ impl ChatApp {
             &self.cwd,
         )
             .hash(&mut h);
-        for k in &self.kernels {
+        for (_, k) in &self.kernels {
             (k.started, k.ready, k.error, &k.status).hash(&mut h);
         }
         for s in &self.sessions {
@@ -799,11 +799,11 @@ impl ChatApp {
 
     /// 每个已启动内核一行：状态点 + 「自研内核 · 已连接」
     fn kernel_status_rows(&self) -> Vec<Div> {
-        KernelChoice::ALL
-            .into_iter()
-            .filter(|k| self.kernels[k.index()].started)
-            .map(|kind| {
-                let slot = &self.kernels[kind.index()];
+        self.kernels
+            .iter()
+            .filter(|(_, slot)| slot.started)
+            .map(|(key, slot)| {
+                let kind = KernelChoice::from_key(key, &self.settings.acp);
                 let dot = if slot.error {
                     RED
                 } else if slot.ready {
@@ -825,7 +825,11 @@ impl ChatApp {
                             .whitespace_nowrap()
                             .text_size(TEXT_META)
                             .text_color(rgb(INK_SOFT))
-                            .child(format!("{} · {}", kind.label(), slot.status)),
+                            .child(format!(
+                                "{} · {}",
+                                kind.label(&self.settings.acp),
+                                slot.status
+                            )),
                     )
             })
             .collect()
@@ -1323,13 +1327,13 @@ mod tests {
             task: false,
             worktree: s.worktree.clone(),
         };
-        let restored = crate::session::Session::from_records(3, meta.clone(), Vec::new());
+        let restored = crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());
         assert_eq!(restored.worktree, s.worktree);
         assert_eq!(restored.group_dir(), repo.as_path());
         // 老元信息（没有这一项）读成 None
         let mut old = meta;
         old.worktree = None;
-        assert!(crate::session::Session::from_records(4, old, Vec::new()).worktree.is_none());
+        assert!(crate::session::Session::from_records(4, old, Vec::new(), &Default::default()).worktree.is_none());
         plain.task = false;
         let _ = plain;
     }

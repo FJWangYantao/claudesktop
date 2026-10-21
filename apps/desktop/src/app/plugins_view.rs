@@ -97,7 +97,7 @@ impl ChatApp {
     /// 把启用的插件交给已经起来的内核（没起来的启动时自己带上，见 `spawn_kernel`）。
     pub(crate) fn push_plugins(&self) {
         let enabled = self.enabled_plugins();
-        for kernel in self.kernels.iter().filter_map(|k| k.kernel.as_ref()) {
+        for kernel in self.kernels.iter().filter_map(|(_, k)| k.kernel.as_ref()) {
             kernel.set_plugins(enabled.clone());
         }
     }

@@ -147,7 +147,7 @@ impl ChatApp {
         let running: Vec<_> = self
             .kernels
             .iter()
-            .flat_map(|slot| slot.tasks.iter())
+            .flat_map(|(_, slot)| slot.tasks.iter())
             .filter(|t| t.running && s.acp_id.as_deref() == Some(t.session.as_str()))
             .collect();
         let running_count = running.len();

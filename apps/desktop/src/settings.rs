@@ -22,12 +22,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KernelChoice {
-    /// ACP agent（命令为空时用仓库内的 mock agent）
-    #[default]
-    Acp,
+    /// ACP agent（带档案 ID；命令为空时用仓库内的 mock agent）
+    Acp(String),
     /// 自研内核（OpenAI 兼容端点）
     Builtin,
     /// 纯演示回放
@@ -35,43 +34,68 @@ pub enum KernelChoice {
 }
 
 impl KernelChoice {
-    pub const ALL: [KernelChoice; 3] = [Self::Builtin, Self::Acp, Self::Demo];
+    pub const BUILTIN: Self = Self::Builtin;
+    /// 演示回放（不连内核）
+    pub const DEMO: Self = Self::Demo;
 
-    /// 内核槽下标（`ChatApp::kernels`）
-    pub fn index(self) -> usize {
+    /// 内核槽的键（`ChatApp::kernels`）：自研 / 演示固定，ACP 按档案 ID 各一个。
+    pub fn key(&self) -> String {
         match self {
-            Self::Acp => 0,
-            Self::Builtin => 1,
-            Self::Demo => 2,
+            Self::Builtin => "builtin".into(),
+            Self::Demo => "demo".into(),
+            Self::Acp(id) => format!("acp:{id}"),
         }
     }
 
-    pub fn label(self) -> &'static str {
+    /// 是不是演示回放（不需要内核会话）。
+    pub fn is_demo(&self) -> bool {
+        matches!(self, Self::Demo)
+    }
+
+    pub fn label(&self, acp: &AcpSettings) -> String {
         match self {
-            Self::Acp => "ACP agent",
-            Self::Builtin => "自研内核",
-            Self::Demo => "演示回放",
+            Self::Builtin => "自研内核".into(),
+            Self::Demo => "演示回放".into(),
+            Self::Acp(id) => acp
+                .get(id)
+                .map(|a| a.display_name())
+                .unwrap_or_else(|| "ACP agent".into()),
         }
     }
 
-    /// 历史会话属于哪种内核：按元信息里记的 agent 标识判断
-    pub fn of_agent(agent: &str) -> Self {
+    /// 历史会话属于哪种内核：按元信息里记的 agent 标识判断。
+    /// 老会话（`acp:<命令>`、没有档案 ID）归到第一个启用的档案。
+    pub fn of_agent(agent: &str, acp: &AcpSettings) -> Self {
         if agent.starts_with("builtin:") {
             Self::Builtin
         } else if agent.is_empty() {
             Self::Demo
+        } else if let Some(rest) = agent.strip_prefix("acp:") {
+            // 新格式 `acp:<档案 ID>:<命令>`
+            let id = rest.split(':').next().unwrap_or_default();
+            if acp.get(id).is_some() {
+                Self::Acp(id.to_string())
+            } else {
+                Self::Acp(acp.first().map(|a| a.id.clone()).unwrap_or_else(|| id.to_string()))
+            }
         } else {
-            Self::Acp
+            // 老格式：命令本身就是标识
+            Self::Acp(acp.first().map(|a| a.id.clone()).unwrap_or_else(|| "custom-1".into()))
         }
     }
 
-    fn parse(s: &str) -> Option<Self> {
+    fn parse(s: &str, acp: &AcpSettings) -> Option<Self> {
         match s.trim() {
-            "acp" => Some(Self::Acp),
+            "acp" => Some(Self::Acp(acp.first().map(|a| a.id.clone())?)),
             "builtin" => Some(Self::Builtin),
             "demo" => Some(Self::Demo),
-            _ => None,
+            other => other.strip_prefix("acp:").map(|id| Self::Acp(id.to_string())),
         }
+    }
+
+    /// 由槽的 key 还原（事件分发用）。档案已停用时仍带原 ID，label 退回通用称呼。
+    pub fn from_key(key: &str, acp: &AcpSettings) -> Self {
+        Self::parse(key, acp).unwrap_or(Self::Demo)
     }
 }
 
@@ -202,15 +226,164 @@ pub fn preset_profiles() -> Vec<ProviderProfile> {
     ]
 }
 
+/// ACP 相关设置：启用了哪些本机 agent（每个一条档案），以及各自的选项。
+///
+/// 一条档案 = 一个 ACP 内核进程（懒启动：用到它的会话第一次连接时才起）。可以同时启用好几家，
+/// 新建会话时选。预设档案（[`claudesktop_core::agents::AgentPreset`]）每次按预设现算启动命令，
+/// 预设改了命令跟着变；自定义档案（`custom-1`）的命存在自己身上。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AcpSettings {
-    /// agent 启动命令；空 = 仓库内 mock agent
+    /// 启用了的 agent，按添加顺序；第一项是新会话的默认
+    pub agents: Vec<AgentProfile>,
+    /// 老字段（只能填一条启动命令）：只读不写，读到非空时迁移成一条 `custom-1` 档案
+    #[serde(default, skip_serializing)]
     pub command: String,
-    /// agent 的请求也经用量网关（启动时把它的 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 指到网关）；
-    /// 默认关：改的是别的程序的网络设置，agent 不认这两个变量时不起作用。用量网关关着时也不起作用
+    /// 老字段：整个 ACP 的「经过用量网关」开关，迁移时带到那条自定义档案上
+    #[serde(default, skip_serializing)]
+    pub gateway: bool,
+}
+
+/// 启用的一家 agent（见 [`AcpSettings`]）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentProfile {
+    /// 预设 ID（`claude` / `opencode` / …），自定义档案是 `custom-<n>`
+    pub id: String,
+    /// 显示名；预设的取预设名（改不了），自定义的可以起
+    pub name: String,
+    /// 只有自定义档案有；预设档案按预设现算（预设改了命令跟着变）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// 这一家的请求也经用量网关（只有认 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 的才给开）
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub gateway: bool,
+    /// 上次在这个 agent 上选的模型（新会话 `Started` 后按它切过去）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
+}
+
+impl AgentProfile {
+    /// 预设档案：按预设 ID 建一条。
+    pub fn from_preset(preset: &claudesktop_core::agents::AgentPreset) -> Self {
+        Self { id: preset.id.to_string(), name: preset.name.to_string(), ..Default::default() }
+    }
+
+    /// 自定义档案（「自定义命令」那一栏）。
+    pub fn custom(n: usize, command: &str) -> Self {
+        Self {
+            id: format!("custom-{n}"),
+            name: "自定义 agent".into(),
+            command: Some(command.trim().to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// 对应的预设（自定义档案为 None）。
+    pub fn preset(&self) -> Option<&'static claudesktop_core::agents::AgentPreset> {
+        claudesktop_core::agents::AgentPreset::find(&self.id)
+    }
+
+    /// 显示名：预设的按预设现取（预设在之后的版本里改了名也跟着变），否则用存的。
+    pub fn display_name(&self) -> String {
+        match self.preset() {
+            Some(preset) => preset.name.to_string(),
+            None if self.name.trim().is_empty() => "自定义 agent".into(),
+            None => self.name.clone(),
+        }
+    }
+
+    /// 真正要跑的启动命令（`windows` = 当前平台是不是 Windows）。
+    pub fn command_for(&self, windows: bool) -> String {
+        match self.preset() {
+            Some(preset) => preset.command_for(windows).to_string(),
+            None => self.command.clone().unwrap_or_default(),
+        }
+    }
+
+    /// 这一家能不能经用量网关（自定义档案当它认这两个环境变量）。
+    pub fn supports_gateway(&self) -> bool {
+        match self.preset() {
+            Some(preset) => preset.gateway,
+            None => true,
+        }
+    }
+
+    /// 写进会话元信息的 agent 标识：`acp:<档案 ID>:<命令>`。
+    /// 续接时按它判断是不是同一个 agent（命令变了就不续接，见 `send_resume`）。
+    pub fn agent_id(&self) -> String {
+        format!("acp:{}:{}", self.id, self.command_for(cfg!(windows)))
+    }
+}
+
+impl AcpSettings {
+    /// 读到老的单条命令时迁移成一条自定义档案（只迁移一次：再存回去时老字段就不写了）。
+    pub fn migrate(&mut self) {
+        if self.command.trim().is_empty() {
+            return;
+        }
+        let command = std::mem::take(&mut self.command);
+        if self.agents.iter().any(|a| a.command.as_deref() == Some(command.trim())) {
+            return;
+        }
+        let mut profile = AgentProfile::custom(self.next_custom_index(), &command);
+        profile.gateway = self.gateway;
+        self.gateway = false;
+        self.agents.push(profile);
+    }
+
+    /// 下一个自定义档案的编号（`custom-<n>` 里的 n 不比现有的任何一条小）。
+    fn next_custom_index(&self) -> usize {
+        self.agents
+            .iter()
+            .filter_map(|a| a.id.strip_prefix("custom-").and_then(|n| n.parse::<usize>().ok()))
+            .max()
+            .map_or(1, |n| n + 1)
+    }
+
+    /// 第一个启用的档案（新会话的默认；老设置里 `kernel = acp` 就是这个）。
+    pub fn first(&self) -> Option<&AgentProfile> {
+        self.agents.first()
+    }
+
+    /// 按 ID 找档案。
+    pub fn get(&self, id: &str) -> Option<&AgentProfile> {
+        self.agents.iter().find(|a| a.id == id)
+    }
+
+    /// 按 ID 找档案（可改）。
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut AgentProfile> {
+        self.agents.iter_mut().find(|a| a.id == id)
+    }
+
+    /// 还能不能再加一条自定义档案（编号不复用：删掉的 `custom-2` 不会被新的顶替）。
+    pub fn add_custom(&mut self, command: &str) -> String {
+        let profile = AgentProfile::custom(self.next_custom_index(), command);
+        let id = profile.id.clone();
+        self.agents.push(profile);
+        id
+    }
+
+    /// 启用一个预设（已经启用过就不重复加），返回档案 ID。
+    pub fn enable(&mut self, preset: &claudesktop_core::agents::AgentPreset) -> String {
+        if let Some(existing) = self.agents.iter().find(|a| a.id == preset.id) {
+            return existing.id.clone();
+        }
+        self.agents.push(AgentProfile::from_preset(preset));
+        preset.id.to_string()
+    }
+
+    /// 停用一个档案。停用的不是第一个时，默认项自然变成第一个。
+    pub fn disable(&mut self, id: &str) {
+        self.agents.retain(|a| a.id != id);
+    }
+
+    /// 记下某个档案上次用的模型。
+    pub fn set_last_model(&mut self, id: &str, model: &str) {
+        if let Some(profile) = self.get_mut(id) {
+            profile.last_model = Some(model.trim().to_string());
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -548,6 +721,11 @@ impl Settings {
             params.server_tools.sort();
             params.server_tools.dedup();
         }
+        // 老设置里的单条 ACP 命令 → 一条自定义档案
+        s.acp.migrate();
+        // 档案 ID 不能重（手改过文件时会撞）：留第一个
+        let mut seen = std::collections::HashSet::new();
+        s.acp.agents.retain(|a| !a.id.trim().is_empty() && seen.insert(a.id.clone()));
     }
 
     /// 界面字体族：空串表示用内嵌的默认字体。
@@ -570,7 +748,9 @@ impl Settings {
     /// 用环境变量覆盖（启动时调用一次）。
     pub fn with_env(mut self) -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-        if let Some(k) = var("CLAUDESKTOP_KERNEL").and_then(|v| KernelChoice::parse(&v)) {
+        if let Some(k) =
+            var("CLAUDESKTOP_KERNEL").and_then(|v| KernelChoice::parse(&v, &self.acp))
+        {
             self.kernel = Some(k);
         }
         if let Some(v) = var("CLAUDESKTOP_BASE_URL") {
@@ -607,7 +787,8 @@ impl Settings {
             }
         }
         if let Some(v) = var("ACP_AGENT") {
-            self.acp.command = v;
+            // 环境变量还能覆盖启动命令：当成一条自定义档案（老用户脚本 / 调试用）
+            self.acp.add_custom(&v);
         }
         if let Some(v) = var("CLAUDESKTOP_GATEWAY") {
             self.usage_gateway = v.trim() != "0";
@@ -622,21 +803,27 @@ impl Settings {
         self
     }
 
-    /// 实际使用的内核。从没选过时：填了 ACP 命令（含 `ACP_AGENT`）用 ACP，否则自研。
+    /// 实际使用的默认内核。从没选过时：有启用的 ACP 档案且自研内核没配好就用第一个档案，否则自研。
     pub fn kernel(&self) -> KernelChoice {
-        self.kernel.unwrap_or(
-            if self.acp.command.trim().is_empty() || self.builtin.is_configured() {
+        self.kernel.clone().unwrap_or(
+            if self.acp.first().is_none() || self.builtin.is_configured() {
                 KernelChoice::Builtin
             } else {
-                KernelChoice::Acp
+                KernelChoice::Acp(self.acp_default_id().expect("first() 非空"))
             },
         )
     }
 
-    /// 新装、还没配过任何内核：没选过内核，自研内核没填端点 / 模型，ACP 也没填命令。
+    /// 某一种内核的档案 ID：ACP 用第一个启用的档案（`KernelChoice::Acp` 不带档案，
+    /// 带档案的走 [`Settings::kernel_for`] / 内核槽）。
+    pub fn acp_default_id(&self) -> Option<String> {
+        self.acp.first().map(|a| a.id.clone())
+    }
+
+    /// 新装、还没配过任何内核：没选过内核，自研内核没填端点 / 模型，也没有启用的 agent。
     /// 这时不起内核（ACP 空命令是仓库里的 mock agent，装好的程序里没有），首页换成配置引导。
     pub fn needs_setup(&self) -> bool {
-        self.kernel.is_none() && !self.builtin.is_configured() && self.acp.command.trim().is_empty()
+        self.kernel.is_none() && !self.builtin.is_configured() && self.acp.first().is_none()
     }
 
     pub fn builtin_config(&self, cwd: PathBuf) -> anyhow::Result<BuiltinConfig> {
@@ -686,17 +873,31 @@ impl Settings {
         self.usage_gateway.then(gateway::default_dir).flatten().and_then(|d| gateway::shared(&d))
     }
 
-    /// ACP 配置：命令为空时沿用默认（mock agent）；开了「经过用量网关」就给 agent 设好 base URL。
-    pub fn acp_config(&self, mut base: AcpKernelConfig) -> AcpKernelConfig {
-        if !self.acp.command.trim().is_empty() {
-            base.command = self.acp.command.trim().to_string();
-        }
-        if self.acp.gateway
-            && let Some(gateway) = self.gateway()
-        {
-            base.env.extend(claudesktop_builtin::gateway::agent_env(&gateway));
+    /// ACP 配置：按档案填启动命令；开了「经过用量网关」且这一家认那两个环境变量时给 agent 设好 base URL。
+    /// `profile` 为 None 时不动命令（沿用 `base` 里的，即环境变量 / mock agent）。
+    pub fn acp_config_for(
+        &self,
+        mut base: AcpKernelConfig,
+        profile: Option<&AgentProfile>,
+    ) -> AcpKernelConfig {
+        if let Some(profile) = profile {
+            let command = profile.command_for(cfg!(windows));
+            if !command.trim().is_empty() {
+                base.command = command;
+            }
+            if profile.gateway
+                && profile.supports_gateway()
+                && let Some(gateway) = self.gateway()
+            {
+                base.env.extend(claudesktop_builtin::gateway::agent_env(&gateway));
+            }
         }
         base
+    }
+
+    /// [`Settings::acp_config_for`] 的默认档案版本（第一个启用的档案）。
+    pub fn acp_config(&self, base: AcpKernelConfig) -> AcpKernelConfig {
+        self.acp_config_for(base, self.acp.first())
     }
 }
 
@@ -948,10 +1149,10 @@ mod tests {
         assert_eq!(s.kernel(), KernelChoice::Builtin);
         assert!(s.needs_setup());
 
-        // 填了 ACP 命令（含 ACP_AGENT 带进来的）→ 用它
+        // 填了 ACP 命令（含 ACP_AGENT 带进来的）→ 归进第一个启用的档案
         let mut s = Settings::default();
         s.acp.command = "npx agent".into();
-        assert_eq!(s.kernel(), KernelChoice::Acp);
+        assert_eq!(s.kernel(), KernelChoice::Acp("acp-1".into()));
         assert!(!s.needs_setup());
 
         let mut s = Settings::default();
@@ -1139,16 +1340,25 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn kernel_of_history_and_slots() {
-        assert_eq!(KernelChoice::of_agent("builtin:http://x/v1#m"), KernelChoice::Builtin);
+        let acp = AcpSettings::default();
+        let acp = &acp;
+        assert_eq!(KernelChoice::of_agent("builtin:http://x/v1#m", acp), KernelChoice::Builtin);
         assert_eq!(
-            KernelChoice::of_agent("builtin:anthropic:http://x/v1#m"),
+            KernelChoice::of_agent("builtin:anthropic:http://x/v1#m", acp),
             KernelChoice::Builtin
         );
-        assert_eq!(KernelChoice::of_agent("node mock.mjs"), KernelChoice::Acp);
-        assert_eq!(KernelChoice::of_agent(""), KernelChoice::Demo);
-        // 槽下标互不相同且都在 0..3
-        let mut idx: Vec<usize> = KernelChoice::ALL.iter().map(|k| k.index()).collect();
-        idx.sort();
-        assert_eq!(idx, vec![0, 1, 2]);
+        // 老格式：命令本身就是标识，归进第一个档案
+        assert_eq!(
+            KernelChoice::of_agent("node mock.mjs", acp),
+            KernelChoice::Acp("acp-1".into())
+        );
+        assert_eq!(KernelChoice::of_agent("", acp), KernelChoice::Demo);
+        // 槽 key 互不相同
+        let keys: Vec<String> = vec![
+            KernelChoice::Builtin.key(),
+            KernelChoice::Demo.key(),
+            KernelChoice::Acp("x".into()).key(),
+        ];
+        assert_eq!(keys.len(), keys.iter().collect::<std::collections::BTreeSet<_>>().len());
     }
 }

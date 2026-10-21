@@ -1641,16 +1641,25 @@ impl ChatApp {
             window,
             cx,
         );
-        let current = self.session().kernel;
-        // 只给配置过的内核：ACP 的启动命令空着时跑的是仓库里的演示 agent，新用户那里没有
-        let others = KernelChoice::ALL.into_iter().filter(|k| {
-            *k != current
-                && match k {
-                    KernelChoice::Builtin => self.settings.builtin.is_configured(),
-                    KernelChoice::Acp => !self.settings.acp.command.trim().is_empty(),
-                    KernelChoice::Demo => false,
-                }
-        });
+        let current = self.session().kernel.clone();
+        // 只给配置过的内核：启用的每一条 agent 档案都是候选（新会话在它上面开）
+        let acp_agents: Vec<KernelChoice> = self
+            .settings
+            .acp
+            .agents
+            .iter()
+            .map(|a| KernelChoice::Acp(a.id.clone()))
+            .collect();
+        let others = std::iter::once(KernelChoice::Builtin)
+            .chain(acp_agents)
+            .filter(|k| {
+                *k != current
+                    && match k {
+                        KernelChoice::Builtin => self.settings.builtin.is_configured(),
+                        KernelChoice::Acp(_) => true,
+                        KernelChoice::Demo => false,
+                    }
+            });
         let edit_tip = if images.is_empty() {
             "放回输入框，改完重新发送"
         } else {
@@ -1675,15 +1684,18 @@ impl ChatApp {
                     ),
             )
             .child(self.rewind_action(idx, cx));
-        for kind in others {
+        for (n, kind) in others.into_iter().enumerate() {
             actions = actions.child(
                 Self::message_action(
-                    ("rerun", idx * 4 + kind.index()),
+                    ("rerun", idx * 4 + n),
                     IconAll::RefreshCw,
-                    format!("在「{}」上重跑", kind.label()),
+                    format!("在「{}」上重跑", kind.label(&self.settings.acp)),
                     cx,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.rerun_on(idx, kind, cx))),
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let kind = kind.clone();
+                    this.rerun_on(idx, kind, cx)
+                })),
             );
         }
         // 气泡：有文字才画文本气泡，图片另起一行缩略图（丢了文件就跳过）。

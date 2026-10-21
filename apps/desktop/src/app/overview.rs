@@ -269,7 +269,10 @@ impl ChatApp {
                 )
                 .child(Icon::new(IconAll::ChevronRight).size_4().text_color(rgb(INK_SOFT)))
                 .on_click(
-                    cx.listener(move |this, _, window, cx| this.start_setup(kind, window, cx)),
+                    cx.listener(move |this, _, window, cx| {
+                        let kind = kind.clone();
+                        this.start_setup(kind, window, cx)
+                    }),
                 )
         };
         div()
@@ -311,7 +314,7 @@ impl ChatApp {
                 IconAll::SquareTerminal,
                 "接 Claude Code 等 ACP agent",
                 "用 agent 自己的登录和模型；已填好 Claude Code 的适配器（需要 Node.js）",
-                KernelChoice::Acp,
+                KernelChoice::Acp("custom-1".into()),
                 cx,
             ))
     }
