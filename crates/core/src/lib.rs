@@ -13,6 +13,7 @@
 //! （内核线程调用），指令经 channel（UI 线程投递）。
 
 mod acp;
+pub mod agents;
 pub mod catalog;
 pub mod checkpoint;
 mod diff;
@@ -28,6 +29,7 @@ pub mod review;
 mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
+pub use agents::{AgentPreset, DetectState, Detected};
 pub use diff::{DiffLineView, DiffView};
 pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
