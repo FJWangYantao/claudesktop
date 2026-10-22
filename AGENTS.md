@@ -231,6 +231,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   费用、缓存命中从网关日志算（`request_costs`）。跑着的轮也要算进去：读用量统计用 `ChatApp::usage_stats`，不直接读 `usage`；
   网关日志在报用量、一轮结束时自动重读（`refresh_requests_soon`）。新的用量入口一律走 `ChatApp::open_usage`。
 - 子 agent 在 `crates/builtin/src/subagent.rs`：`task` 工具开子会话（ID `主会话/调用 ID`），和主会话共用 `run_steps`；
+  内置角色 `general-purpose` / `explore`（只读），何时派写在主会话提示词（`subagent::DELEGATION`）；子会话模型按「角色写的 → 设置 `subagent_model` → 跟主会话」取。
   子会话的事件经 `subagent::forward` 转到主会话（工具行带 `parent`，回复 / 思考换成 `SubagentChunk`，
   开头发 `SubagentStarted` 带任务说明；`history::rebuild` 都跳过）。同一步的几个 `task` 并行跑（`run_tools`）。
   界面上子 agent 的事件按 task 调用 ID 收进 `Session::subagents`，不进 transcript；对话里只有一张子任务卡片，

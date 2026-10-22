@@ -462,6 +462,8 @@ pub struct Settings {
     pub next_suggestion: bool,
     /// 补全用的模型（同一端点）；空 = 跟会话的模型
     pub suggest_model: String,
+    /// 子任务（自研内核的 `task`）用的模型（同一端点）；空 = 跟主会话。插件角色自己写了模型的以角色为准
+    pub subagent_model: String,
     /// 一轮结束后让模型提炼「候选」记忆（只进设置页「待确认」，收下才落盘）。默认关：
     /// 每一轮都多一次请求
     pub memory_suggest: bool,
@@ -585,6 +587,7 @@ impl Default for Settings {
             suggestions: false,
             next_suggestion: false,
             suggest_model: String::new(),
+            subagent_model: String::new(),
             memory_suggest: false,
             auto_mode: AutoModeSettings::default(),
             space: Space::default(),
@@ -972,6 +975,9 @@ impl Settings {
         config.provider.deepseek_key = self.deepseek_search_key();
         // 每轮结束提炼候选记忆（默认关，见 `remember` 模块）
         config.memory_suggest = self.memory_suggest;
+        // 子任务用的模型（空 = 跟主会话）
+        config.subagent_model =
+            Some(self.subagent_model.trim().to_string()).filter(|m| !m.is_empty());
         // 「自动」模式没配好时不出现（设置页保存时会拦住，这里再兜一次）
         config.auto_mode = self.auto_mode.to_config(p);
         // 聊天空间：模型（空 = 跟档案）、默认联网、聊天说明文件
@@ -1256,6 +1262,7 @@ mod tests {
         assert!(!s.suggestions);
         assert!(!s.next_suggestion);
         assert!(s.suggest_model.is_empty());
+        assert!(s.subagent_model.is_empty());
     }
 
     /// 「自动」模式：默认关；开着时必须配好（跟会话走 = 档案配好即可，自选模型 = 要填模型名），

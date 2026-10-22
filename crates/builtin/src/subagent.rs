@@ -1,7 +1,9 @@
 //! 子 agent（`task` 工具）：主模型把一个自成一体的子任务交给子会话，子会话在自己的上下文里跑完，
 //! 最后一条回复当工具结果交回主会话。
 //!
-//! - 角色：内置一个通用的（[`GENERAL`]），其余来自启用的插件的 `agents/*.md`（格式同 Claude Code）
+//! - 角色：内置通用的（[`GENERAL`]）和只读调研的（[`EXPLORE`]），其余来自启用的插件的 `agents/*.md`
+//!   （格式同 Claude Code；插件里有同名的就用插件的）
+//! - 什么时候派子任务写在主会话的系统提示词里（[`DELEGATION`]），工具说明里只讲怎么用
 //! - 子会话和主会话共用同一个工具循环（`run_steps`），只换系统提示词和工具：工具按角色的清单筛，
 //!   不给 `task`（不嵌套）和 `todo_write`（计划是主会话的）
 //! - 子会话 ID 是 `主会话/task 调用 ID`。它的事件经 [`forward`] 转到主会话：工具行（ID 加上 task 调用的前缀、
@@ -18,6 +20,19 @@ use serde_json::{Value, json};
 
 pub const TASK: &str = "task";
 pub const GENERAL: &str = "general-purpose";
+pub const EXPLORE: &str = "explore";
+/// 只读调研角色能用的工具：只看不改，读文件、搜代码不用审批（联网照常按模式问）
+const EXPLORE_TOOLS: [&str; 7] =
+    ["read_file", "list_dir", "glob", "grep", "web_fetch", "web_search", "memory_search"];
+
+/// 主会话系统提示词里的一段：什么时候该派子任务。不写的话模型几乎只自己搜，
+/// 中间过程全堆在主上下文里。
+pub const DELEGATION: &str = "Delegate with the task tool to keep your own context focused: \
+    use an `explore` subagent for open-ended investigation that will take several rounds of \
+    searching and reading (finding where something is implemented across the codebase, tracing how a \
+    feature works, surveying usages before a refactor), and launch several in one step when the \
+    questions are independent. Do it yourself when you already know the file or a single glob / grep \
+    will answer it, and when you need the exact file contents in front of you to edit them.";
 /// 工具行摘要最多几个字
 const SUMMARY_CHARS: usize = 80;
 
@@ -30,7 +45,12 @@ pub struct TaskArgs {
     pub subagent_type: Option<String>,
 }
 
-/// 内置的通用角色（插件里有同名的就用插件的）。
+/// 内置的角色（插件里有同名的就用插件的），按在工具说明里的顺序。
+pub fn builtin() -> [AgentDef; 2] {
+    [general(), explore()]
+}
+
+/// 内置的通用角色。
 pub fn general() -> AgentDef {
     AgentDef {
         name: GENERAL.into(),
@@ -46,6 +66,26 @@ pub fn general() -> AgentDef {
     }
 }
 
+/// 内置的只读调研角色：搜、读、查网页，不改文件不跑命令，交回结论和出处。
+pub fn explore() -> AgentDef {
+    AgentDef {
+        name: EXPLORE.into(),
+        description: "Read-only research agent for open-ended questions about the codebase: finds \
+                      where things are implemented, traces how a feature works across files, and \
+                      surveys usages. Cannot change files or run commands. Say how thorough to be."
+            .into(),
+        tools: Some(EXPLORE_TOOLS.map(String::from).to_vec()),
+        model: None,
+        prompt: "You are read-only: search and read, never try to change anything. Start broad \
+                 (glob, grep with several phrasings and naming conventions), then read the relevant \
+                 parts. Issue independent searches together in one step. In the report, lead with \
+                 the answer, then the evidence as `path:line` references with short excerpts; say \
+                 what you looked for but did not find."
+            .into(),
+        plugin: String::new(),
+    }
+}
+
 /// 子会话 ID → (主会话 ID, task 调用 ID)；主会话返回 None。
 pub fn split_id(session: &str) -> Option<(&str, &str)> {
     session.split_once('/')
@@ -54,13 +94,17 @@ pub fn split_id(session: &str) -> Option<(&str, &str)> {
 /// `task` 的工具定义：说明里列出可选的角色。
 pub fn spec(agents: &[AgentDef]) -> Value {
     let mut description = String::from(
-        "Launch a subagent to carry out a self-contained task in its own context, such as a broad \
-         search across the codebase or an investigation whose intermediate steps you don't need \
-         to keep. The subagent does not see this conversation: the prompt must contain everything \
-         it needs (the goal, relevant paths, constraints, and what to report back). It returns a \
-         single final report that only you see, so relay what matters to the user. To run several \
+        "Launch a subagent to carry out a self-contained task in its own context window. Only its \
+         final report comes back to you, so the searching and reading it does along the way does \
+         not fill up your context. Good uses: open-ended searches across the codebase, tracing how \
+         something works through several files, surveying usages, researching a question on the \
+         web, or any independent piece of work you can describe completely up front. To run several \
          independent subtasks at once, call task several times in the same response: they run in \
-         parallel. Their tool calls still need the user's approval.\n\nAvailable agents:",
+         parallel.\n\n\
+         The subagent does not see this conversation: the prompt must contain everything it needs \
+         (the goal, relevant paths and what you already know, constraints, and what to report \
+         back). The report is seen only by you, so relay what matters to the user. Its tool calls \
+         follow the same permission rules as yours.\n\nAvailable agents:",
     );
     for agent in agents {
         description.push_str(&format!("\n- {}: {}", agent.name, agent.description));
@@ -219,6 +263,29 @@ mod tests {
         assert!(allows(&agent, "read_file"));
         assert!(allows(&agent, "mcp__db__query"));
         assert!(!allows(&agent, "edit_file"));
+    }
+
+    #[test]
+    fn explore_is_read_only() {
+        let agent = explore();
+        for tool in ["read_file", "grep", "glob", "list_dir", "web_fetch"] {
+            assert!(allows(&agent, tool), "{tool}");
+        }
+        for tool in ["edit_file", "write_file", "shell", "shell_background", TASK] {
+            assert!(!allows(&agent, tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn spec_lists_builtin_agents_and_when_to_use_them() {
+        let spec = spec(&builtin());
+        let doc = spec["function"]["description"].as_str().unwrap();
+        assert!(doc.contains("- general-purpose:") && doc.contains("- explore:"), "{doc}");
+        assert!(doc.contains("Good uses"), "{doc}");
+        assert_eq!(
+            spec["function"]["parameters"]["properties"]["subagent_type"]["enum"],
+            json!([GENERAL, EXPLORE])
+        );
     }
 
     #[test]

@@ -18,8 +18,9 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-/// 内置通用角色的名字（`crates/builtin` 的 `subagent::GENERAL`），界面上叫「通用」
+/// 内置角色的名字（`crates/builtin` 的 `subagent::GENERAL` / `EXPLORE`），界面上叫「通用」「调研」
 const GENERAL: &str = "general-purpose";
+const EXPLORE: &str = "explore";
 
 /// 卡片 / 详情页标题：task 的说明（标题里带的「（角色）」去掉，角色另画成标签）。
 fn task_title(card: &ToolCard, agent: &str) -> SharedString {
@@ -36,6 +37,7 @@ fn agent_label(agent: &str) -> Option<SharedString> {
     match agent {
         "" => None,
         GENERAL => Some("通用".into()),
+        EXPLORE => Some("调研".into()),
         name => Some(name.to_string().into()),
     }
 }
@@ -495,6 +497,7 @@ mod tests {
         assert_eq!(task_title(&c, "").as_ref(), "找秘密（scout）");
         assert_eq!(task_title(&card("", ToolPhase::Running, ""), "").as_ref(), "子任务");
         assert_eq!(agent_label(GENERAL).as_deref(), Some("通用"));
+        assert_eq!(agent_label(EXPLORE).as_deref(), Some("调研"));
         assert_eq!(agent_label(""), None);
     }
 

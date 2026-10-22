@@ -13,7 +13,7 @@
 //! - MCP：数据目录 `mcp.json` 里配的工具服务器，工具和内置工具一起交给模型（见 `mcp` 模块）
 //! - 插件（`claudesktop_core::plugin`）：MCP 服务并进上面那批；技能列进系统提示词；
 //!   钩子在会话开始、提交消息、执行工具前后、一轮结束时跑（退出码 2 = 拦下）
-//! - 子 agent：`task` 工具开子会话跑子任务，角色内置一个通用的、其余来自插件（见 `subagent` 模块）
+//! - 子 agent：`task` 工具开子会话跑子任务，角色内置通用和只读调研两个、其余来自插件（见 `subagent` 模块）
 //!
 //! 线程模型：每轮对话一个线程（阻塞读 SSE 流、执行工具、等权限应答）；
 //! 取消 = 置该轮的标志位，各阻塞点轮询检查，取消后不再发出任何事件。
@@ -156,6 +156,8 @@ pub struct BuiltinConfig {
     pub auto_mode: Option<AutoModeConfig>,
     /// 聊天会话用的模型；None = 跟随全局默认模型
     pub chat_model: Option<String>,
+    /// 子任务（`task`）用的模型（同一端点）；None = 跟主会话。角色自己写了模型的以角色为准
+    pub subagent_model: Option<String>,
     /// 新建的聊天会话默认开不开联网（输入框里随时能改）
     pub chat_web: bool,
     /// 用户的「聊天说明」文件（每轮重读）：每次聊天都带上的话
@@ -180,6 +182,7 @@ impl BuiltinConfig {
             memory_suggest: false,
             auto_mode: None,
             chat_model: None,
+            subagent_model: None,
             chat_web: true,
             chat_instructions: None,
         }
@@ -390,6 +393,8 @@ struct Inner {
     auto_mode: Option<AutoMode>,
     /// 聊天会话用的模型（None = 跟随全局默认）
     chat_model: Option<String>,
+    /// 子任务用的模型（见 [`BuiltinConfig::subagent_model`]）
+    subagent_model: Option<String>,
     /// 新建聊天会话默认的联网开关
     chat_web: bool,
     /// 用户的「聊天说明」文件（每轮重读）
@@ -505,7 +510,7 @@ impl Inner {
             .collect()
     }
 
-    /// 可用的子 agent 角色：插件提供的，加上内置的通用角色（插件里没有同名的时候）。
+    /// 可用的子 agent 角色：内置的（插件里没有同名的时候）排在前面，然后是插件提供的。
     /// `only` 同 [`Inner::skills`]。
     fn agents(&self, only: Option<&[String]>) -> Vec<AgentDef> {
         let mut agents: Vec<AgentDef> = self
@@ -516,9 +521,11 @@ impl Inner {
             .filter(|p| only.is_none_or(|names| names.iter().any(|n| n == &p.name)))
             .flat_map(|p| p.agents.iter().cloned())
             .collect();
-        if !agents.iter().any(|a| a.name == subagent::GENERAL) {
-            agents.insert(0, subagent::general());
-        }
+        let builtin: Vec<AgentDef> = subagent::builtin()
+            .into_iter()
+            .filter(|b| !agents.iter().any(|a| a.name == b.name))
+            .collect();
+        agents.splice(0..0, builtin);
         agents
     }
 
@@ -1629,7 +1636,12 @@ impl Inner {
                     // （聊天里没有 task 工具，目前开不出聊天的子会话，免得以后漏掉）
                     kind: parent.kind,
                     web: parent.web,
-                    model: agent.model.clone().unwrap_or_else(|| parent.model.clone()),
+                    // 角色写了模型 → 设置里的子任务模型 → 跟主会话
+                    model: agent
+                        .model
+                        .clone()
+                        .or_else(|| self.subagent_model.clone())
+                        .unwrap_or_else(|| parent.model.clone()),
                     // 子任务跟主会话的档位走（用户中途换档也跟上）
                     thinking: parent.thinking,
                     history: vec![ChatMessage::new("user", prompt)],
@@ -2165,6 +2177,7 @@ impl BuiltinKernel {
                 provider: Mutex::default(),
             }),
             chat_model: config.chat_model,
+            subagent_model: config.subagent_model,
             chat_web: config.chat_web,
             chat_instructions: config.chat_instructions,
         });
@@ -2342,13 +2355,15 @@ fn system_prompt(
     ctx: Context<'_>,
 ) -> String {
     let Context { instructions: project, skills, memory_project, memory_global } = ctx;
-    // 子会话没有待办清单（计划是主会话的）
+    // 子会话没有待办清单（计划是主会话的），也不能再派子任务
     let todo = if agent.is_none() {
         "For tasks with several steps, track progress with todo_write and keep it current: \
          mark each item completed as soon as it is done. "
     } else {
         ""
     };
+    let delegation =
+        if agent.is_none() { format!("{}\n", subagent::DELEGATION) } else { String::new() };
     let mut prompt = format!(
         "You are a coding agent running inside claudesktop, a desktop agent harness, \
          working on the user's machine.\n\
@@ -2361,6 +2376,7 @@ fn system_prompt(
          when it makes sense. {todo}\
          Tool calls that change things may need the user's approval; \
          if one is denied, do not retry it and ask the user instead.\n\
+         {delegation}\
          {BACKGROUND}\n\
          Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
         cwd.display(),
@@ -2411,6 +2427,13 @@ fn system_prompt(
              Investigate, then present a concrete step-by-step plan for the user to approve. \
              Do not attempt to modify anything.",
         );
+        if agent.is_none() {
+            prompt.push_str(
+                " When the change touches parts of the codebase you have not seen yet, map them \
+                 first with `explore` subagents (in parallel when they are independent) and build \
+                 the plan on their findings.",
+            );
+        }
     }
     if mode == MODE_AUTO {
         prompt.push_str(
