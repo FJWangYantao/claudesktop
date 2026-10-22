@@ -292,7 +292,7 @@ impl ChatApp {
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
             ))
             .children(self.render_context_gauge())
-            .children(render_thinking_chip(&app, cx))
+            .children(render_thinking_chip(self, &app))
             .child(model_menu_popover(
                 &app,
                 &self.menu_focus,
@@ -671,16 +671,17 @@ fn thinking_chip(app: &ChatApp) -> Option<MenuChip> {
 }
 
 /// 会话级思考档位 chip：ACP 内核不画（模型由 agent 自己定）。点开是 `thinking_menu_items`。
-fn render_thinking_chip(app: &Entity<ChatApp>, cx: &mut Context<ChatApp>) -> Option<AnyElement> {
-    let chip = thinking_chip(app.read(cx))?;
-    let focus = app.read(cx).menu_focus.clone();
+/// 在 `ChatApp` 自己的 render 里调：状态直接从 `this` 读，别 `handle.read(cx)`
+///（实体正在 update，再读一次就是 double lease，一打开窗口就崩）。
+fn render_thinking_chip(this: &ChatApp, handle: &Entity<ChatApp>) -> Option<AnyElement> {
+    let chip = thinking_chip(this)?;
     Some(
         menu_popover(
             "thinking-menu",
             Anchor::BottomRight,
             rems(17.5),
-            app,
-            &focus,
+            handle,
+            &this.menu_focus,
             chip,
             thinking_menu_items,
         )
