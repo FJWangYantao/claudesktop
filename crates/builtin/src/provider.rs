@@ -975,6 +975,23 @@ impl ChatMessage {
     fn has_image(&self) -> bool {
         self.parts.iter().any(|p| matches!(p, ContentPart::Image { .. }))
     }
+
+    /// 把图片段换成文字占位（当前模型看不了图时，见设计说明 7.3）。
+    /// 只影响这一份请求里的副本，历史不动。
+    pub fn replace_images_with_placeholder(&mut self) {
+        if !self.has_image() {
+            return;
+        }
+        self.parts = std::mem::take(&mut self.parts)
+            .into_iter()
+            .map(|part| match part {
+                ContentPart::Image { .. } => ContentPart::Text(
+                    "[image omitted: the current model cannot view images]".into(),
+                ),
+                other => other,
+            })
+            .collect();
+    }
 }
 
 /// 序列化为 OpenAI Chat Completions 的消息形状。
@@ -1315,6 +1332,25 @@ mod tests {
         assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
         // 文本段拼接
         assert_eq!(m.text().as_deref(), Some("看图"));
+    }
+
+    #[test]
+    fn images_become_placeholder_text_for_text_only_models() {
+        // 当前模型看不了图：图片段换成占位文字，原来的文字段还在，序列化回字符串
+        let mut m = ChatMessage::with_parts(
+            "user",
+            vec![
+                ContentPart::Text("看图".into()),
+                ContentPart::Image { media_type: "image/png".into(), data: "QUJD".into() },
+            ],
+        );
+        m.replace_images_with_placeholder();
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(v["content"].is_string(), "{v}");
+        let text = v["content"].as_str().unwrap();
+        assert!(text.contains("[image omitted"), "{text}");
+        assert!(text.contains("看图"), "{text}");
+        assert!(!v.to_string().contains("image_url"), "{v}");
     }
 
     #[test]

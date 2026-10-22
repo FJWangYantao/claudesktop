@@ -539,6 +539,20 @@ impl Inner {
         sessions.get(session).is_some_and(|s| s.kind == SessionKind::Chat)
     }
 
+    /// 这个模型能不能看图片（能力表 + 端点报过的 `input_modalities`）。
+    /// `Some(false)` 时请求里的图片换成占位文字（见设计说明 7.3）。
+    fn model_blind_to_images(&self, model: &str) -> bool {
+        // 能力表（`image_prep::vision_support`，和思考档位一个写法）：认得出才算数
+        claudesktop_core::image_prep::vision_support(
+            match self.provider_config.protocol {
+                Protocol::OpenAiCompat => "openai",
+                Protocol::Anthropic => "anthropic",
+                Protocol::Responses => "responses",
+            },
+            model,
+        ) == Some(false)
+    }
+
     /// 这是会话的第一轮吗（给标题起名用）；子会话 / 不存在的会话返回 false。
     fn is_first_turn(&self, session: &str) -> bool {
         let sessions = self.sessions.lock().unwrap();
@@ -2630,6 +2644,13 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             && let Some(last) = messages.last_mut().filter(|m| m.role == "user" || m.role == "tool")
         {
             last.append_text(&reminder);
+        }
+        // 当前模型看不了图（能力表知道，或被 400 记过）：历史里的图片换成文字占位，
+        // 不让整轮报错。只影响发出去的请求，日志不动（换回能看图的模型又是原图）
+        if inner.model_blind_to_images(&model) {
+            for m in &mut messages {
+                m.replace_images_with_placeholder();
+            }
         }
         let (disabled, plugin_scope) = {
             let sessions = inner.sessions.lock().unwrap();

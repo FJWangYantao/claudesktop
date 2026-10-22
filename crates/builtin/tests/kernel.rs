@@ -2031,6 +2031,43 @@ fn image_prompt_reaches_wire() {
     assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
 }
 
+/// 当前模型看不了图（能力表说的是文本型号）时，历史里的图片换成占位文字，不让整轮报错。
+#[test]
+fn images_are_omitted_for_text_only_models() {
+    let (base, bodies) = serve(vec![happy_stream("好的")]);
+    // 能力表里 deepseek-chat 是「只看文字」
+    let h = Harness::with_config(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "deepseek-chat".into(),
+            ..Default::default()
+        },
+        workdir("text-only-model"),
+    );
+    let sid = h.start();
+    let prompt = claudesktop_core::UserPrompt {
+        text: "看图".into(),
+        images: vec![claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        }],
+        attachments: Vec::new(),
+    };
+    h.kernel.send_prompt(&sid, prompt).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = body(&bodies, 0);
+    let content = &first["messages"][1]["content"];
+    // 只有文字：图片换成了占位说明，用户打的字还在
+    let text = match content {
+        serde_json::Value::String(s) => s.clone(),
+        other => other[0]["text"].as_str().unwrap_or_default().to_string(),
+    };
+    assert!(text.contains("[image omitted"), "{text}");
+    assert!(text.contains("看图"), "{text}");
+    assert!(!first.to_string().contains("image_url"), "{first}");
+}
+
 /// Anthropic 原生协议下，图片走 `image` / `source.base64` 分段。
 #[test]
 fn anthropic_image_prompt_reaches_wire() {
