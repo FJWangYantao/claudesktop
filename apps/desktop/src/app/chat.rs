@@ -2283,6 +2283,31 @@ mod tests {
         assert_eq!(close_dangling_markup("**a\nb"), "**a\nb");
     }
 
+    /// 中文避头尾是 vendor 里 gpui-pre 的补丁（见 `vendor/README.md`）：升级 gpui-kit 时补丁丢了这里会挂。
+    /// 用 `NoopTextSystem`（每个字等宽）驱动真的 `LineWrapper`。
+    #[core::prelude::v1::test]
+    fn cjk_wrap_follows_kinsoku() {
+        let system = std::sync::Arc::new(TextSystem::new(std::sync::Arc::new(NoopTextSystem)));
+        let mut wrapper = system.line_wrapper(font("Inter"), px(16.));
+        // 第一行之后各行的开头：按 `fits` 那么宽折行（`NoopTextSystem` 里每个字都是 0.6em）
+        let mut wrap = |text: &str, fits: &str| {
+            let width = px(16. * 0.6 * fits.chars().count() as f32 + 0.5);
+            wrapper
+                .wrap_line(&[LineFragment::text(text)], width, IndentAdjustment::default())
+                .map(|boundary| text[boundary.ix..].to_string())
+                .collect::<Vec<_>>()
+        };
+        // 普通汉字之间照样能断
+        assert_eq!(wrap("一二三四五六", "一二三"), ["四五六"]);
+        // 收尾标点不落行首：前一个字跟着下去
+        assert_eq!(wrap("一二三，四", "一二三"), ["三，四"]);
+        assert_eq!(wrap("一二三）、", "一二三"), ["三）、"]);
+        // 开头标点不留行尾
+        assert_eq!(wrap("一二三（四五", "一二三（"), ["（四五"]);
+        // `——` 不断开
+        assert_eq!(wrap("一二——三", "一二—"), ["——三"]);
+    }
+
     #[core::prelude::v1::test]
     fn spaces_beside_fullwidth_punct_are_squeezed() {
         let tidy = |s| tidy_cjk_spacing(s).into_owned();

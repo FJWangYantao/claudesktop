@@ -85,7 +85,11 @@ impl LineWrapper {
                             }
                         } else {
                             // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
+                            // (claudesktop patch: except where kinsoku forbids it)
+                            if c != ' '
+                                && first_non_whitespace_ix.is_some()
+                                && !Self::is_cjk_break_forbidden(prev_c, c)
+                            {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
                             }
@@ -433,7 +437,11 @@ impl LineWrapper {
                     last_candidate_ix = ix;
                     last_candidate_width = width;
                 }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
+            } else if c != ' '
+                && first_non_whitespace_ix.is_some()
+                // claudesktop patch: CJK kinsoku
+                && !Self::is_cjk_break_forbidden(prev_c, c)
+            {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
             }
@@ -494,6 +502,36 @@ impl LineWrapper {
 
         // Text fits within max_lines without truncation.
         (text, Cow::Borrowed(runs))
+    }
+
+    /// claudesktop patch: CJK line-breaking rules (kinsoku shori). Between
+    /// two characters where at least one is not a word character, a break is
+    /// still forbidden before closing punctuation (`，。、）」` …), after
+    /// opening punctuation (`（「“` …) and inside a `——` dash, so a comma
+    /// never starts a line and an opening bracket never ends one.
+    pub(crate) fn is_cjk_break_forbidden(prev: char, c: char) -> bool {
+        Self::is_cjk_line_start_forbidden(c)
+            || Self::is_cjk_line_end_forbidden(prev)
+            || (prev == '—' && c == '—')
+    }
+
+    /// Closing punctuation that must not begin a line.
+    fn is_cjk_line_start_forbidden(c: char) -> bool {
+        matches!(
+            c,
+            '，' | '。' | '、' | '；' | '：' | '？' | '！' | '．' | '％'
+                | '）' | '］' | '｝' | '】' | '》' | '」' | '』' | '〕' | '〉' | '〗' | '〙' | '〛'
+                | '”' | '’' | '…' | '‥' | '·' | '・' | '～' | '々' | 'ー'
+        )
+    }
+
+    /// Opening punctuation that must not end a line.
+    fn is_cjk_line_end_forbidden(c: char) -> bool {
+        matches!(
+            c,
+            '（' | '［' | '｛' | '【' | '《' | '「' | '『' | '〔' | '〈' | '〖' | '〘' | '〚' | '“'
+                | '‘'
+        )
     }
 
     /// Any character in this list should be treated as a word character,

@@ -235,7 +235,11 @@ impl LineLayout {
                     last_candidate_x = x;
                 }
             } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
+                // claudesktop patch: CJK kinsoku, see `LineWrapper::is_cjk_break_forbidden`
+                if ch != ' '
+                    && first_non_whitespace_ix.is_some()
+                    && !LineWrapper::is_cjk_break_forbidden(prev_ch, ch)
+                {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
                 }
