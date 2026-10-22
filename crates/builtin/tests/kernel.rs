@@ -1981,7 +1981,13 @@ fn anthropic_protocol_streams_and_runs_tools() {
                 reasoning_tokens,
                 context_tokens,
                 cache_read_tokens,
-            } => Some((*input_tokens, *output_tokens, *reasoning_tokens, *context_tokens, *cache_read_tokens)),
+            } => Some((
+                *input_tokens,
+                *output_tokens,
+                *reasoning_tokens,
+                *context_tokens,
+                *cache_read_tokens,
+            )),
             _ => None,
         })
         .collect();
