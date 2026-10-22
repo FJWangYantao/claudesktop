@@ -14,6 +14,7 @@ mod assets;
 mod complete;
 mod demo;
 mod fonts;
+mod http;
 mod model;
 mod pricing;
 mod requests;
@@ -68,7 +69,11 @@ fn main() {
     }
     let t_job = t0.elapsed();
 
-    gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
+    gpui_kit::application()
+        .with_assets(assets::Assets)
+        // 回复里的远程图片要走这里取字节（`img()` 的 URI 分支），见 http.rs
+        .with_http_client(http::UreqHttpClient::shared())
+        .run(move |cx| {
         let t_gpui_run = t0.elapsed();
         gpui_kit::init(cx);
         // 系统通知要有应用身份（Windows AppUserModelID，通知上显示的应用名）

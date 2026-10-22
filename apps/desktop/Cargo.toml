@@ -19,6 +19,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 base64 = "0.22"
+# 远程图片的 HTTP 客户端（见 http.rs）：和内核用同一个 HTTP 栈
+ureq = "3"
+# 远程图片要认格式再登记（见 app/remote_image.rs、assets.rs）
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 
 [build-dependencies]
 embed-resource = "3"

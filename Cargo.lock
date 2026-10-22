@@ -927,8 +927,10 @@ dependencies = [
  "embed-resource",
  "futures",
  "gpui-kit",
+ "image",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

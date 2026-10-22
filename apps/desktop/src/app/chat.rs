@@ -38,6 +38,17 @@ pub(super) const STEP_INDENT: Pixels = px(24.);
 /// 输入框上方的计划最多露出几条
 const PINNED_PLAN_ROWS: usize = 5;
 
+/// 一张能点开看大图的图片：用户发的那张（本地路径），或者回复里加载过的远程图。
+///
+/// 远程图不存路径：字节已经按内容哈希登记在 `crate::assets` 里，这里按地址回查。
+#[derive(Clone)]
+pub(super) enum ImageView {
+    /// 本地文件
+    Path(PathBuf),
+    /// 远程图片的地址
+    Remote(String),
+}
+
 /// 步骤行左侧的图标格：固定宽度居中，转圈 / 种类图标 / 失败叉都放这里，文字才对得齐。
 pub(super) fn icon_cell(icon: impl IntoElement) -> Div {
     div().w(ICON_COL).flex_shrink_0().flex().justify_center().items_center().child(icon)
@@ -661,24 +672,86 @@ impl ChatApp {
             .child(div().flex_shrink_0().child(format!("· {chosen}")))
     }
 
-    /// 权限请求：待处理时是醒目的卡片（标题说清动作和对象，按钮从常用到危险）；
-    /// 应答后收成一行，不留大块残骸。
-    /// 图片大图：gpui-kit 的对话框，宽约窗口八成，图按原比例缩进去（小图不放大）。
-    fn open_image(path: PathBuf, window: &mut Window, cx: &mut App) {
+    /// 图片大图：gpui-kit 的对话框，宽约窗口八成，图按原比例缩进去（小图不放大），
+    /// 底部「另存为…」（本地图写文件，远程图写已经取回的字节）。
+    pub(super) fn open_image(image: ImageView, window: &mut Window, cx: &mut App) {
         let viewport = window.viewport_size();
         let width = (viewport.width * 0.8).min(px(1200.));
         let height = viewport.height * 0.72;
-        window.open_dialog(cx, move |dialog, _, _| {
+        let dialog_image = image.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let light: AnyElement = match &dialog_image {
+                ImageView::Path(path) => {
+                    img(path.clone()).size_full().object_fit(ObjectFit::ScaleDown).into_any_element()
+                }
+                ImageView::Remote(url) => super::remote_image::registered_name(url).map_or_else(
+                    || div().text_color(rgb(INK_SOFT)).child("这张图还没加载").into_any_element(),
+                    |name| img(name).size_full().object_fit(ObjectFit::ScaleDown).into_any_element(),
+                ),
+            };
+            let save = dialog_image.clone();
+            let save_button = Button::new("save-image")
+                .label("另存为…")
+                .small()
+                .cursor_pointer()
+                .on_click(move |_, window, cx| Self::save_image(save.clone(), window, cx));
             dialog.w(width).margin_top(viewport.height * 0.06).child(
                 div()
+                    .v_flex()
+                    .gap_3()
                     .w_full()
-                    .h(height)
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .child(img(path.clone()).size_full().object_fit(ObjectFit::ScaleDown)),
+                    .child(
+                        div()
+                            .w_full()
+                            .h(height)
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .child(light),
+                    )
+                    .child(div().h_flex().justify_end().child(save_button)),
             )
         });
+    }
+
+    /// 「另存为…」：弹系统保存对话框再把字节写下去（远程图写的是已经取回的那份）。
+    pub(super) fn save_image(image: ImageView, window: &mut Window, cx: &mut App) {
+        let (bytes, suggested) = match &image {
+            ImageView::Path(path) => match std::fs::read(path) {
+                Ok(bytes) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "image.png".into());
+                    (Some(bytes), name)
+                }
+                Err(err) => (None, format!("读不了这张图：{err}")),
+            },
+            ImageView::Remote(url) => {
+                let name = format!("{}.png", super::remote_image::RemoteImage::host_of(url));
+                (crate::assets::cached(url), name)
+            }
+        };
+        let Some(bytes) = bytes else {
+            // 失败原因本身就是一句话（本地读不了 / 还没加载）
+            let note = Notification::error(suggested);
+            window.push_notification(note, cx);
+            return;
+        };
+        let dir = std::env::current_dir().unwrap_or_default();
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+        // 这里只有 `App`（浮层回调给的是 `&mut App`），用窗口句柄回推提示
+        let handle = window.window_handle();
+        cx.spawn(async move |cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let note = match std::fs::write(&path, &bytes) {
+                    Ok(()) => Notification::success(format!("已保存：{}", path.display())),
+                    Err(err) => Notification::error(format!("保存失败：{err}")),
+                };
+                let _ = handle.update(cx, |_, window, cx| window.push_notification(note, cx));
+            }
+        })
+        .detach();
     }
 
     /// 上下文压缩：两侧细线、中间一行字，标出「从这里往前的对话换成了摘要」；完成后点一下展开摘要。
@@ -1843,7 +1916,7 @@ impl ChatApp {
                         .rounded_md()
                         .hover(|d| d.opacity(0.85))
                         .on_click(cx.listener(move |_, _, window, cx| {
-                            Self::open_image(path.clone(), window, cx)
+                            Self::open_image(ImageView::Path(path.clone()), window, cx)
                         }))
                         .child(img(p.clone()).size_20().rounded_md().object_fit(ObjectFit::Cover))
                 }),

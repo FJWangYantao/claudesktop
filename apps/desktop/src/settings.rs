@@ -454,6 +454,10 @@ pub struct Settings {
     pub font_family: String,
     /// 动画（跟随系统的「动画效果」/ 总是播放 / 关闭），设置页切换后立即生效并写回
     pub motion: MotionPref,
+    /// 回复里的网络图片自动加载（默认关）。关着时 `![](https://…)` 先摆占位卡
+    /// 「图片 · example.com」+「加载」，点了才请求——不点就把用户的 IP 和
+    /// 「正在看这条回复」告诉了图片服务器（见「设计说明-聊天与Code分离.md」7.5 节）
+    pub auto_load_images: bool,
     /// 输入框的 Tab 补全：停顿一下就让模型猜一句下文，灰字画在光标后面。
     /// 默认关：每次停顿都是一次请求，开之前最好在 `suggest_model` 填个便宜的小模型
     pub suggestions: bool,
@@ -584,6 +588,8 @@ impl Default for Settings {
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
             motion: MotionPref::default(),
+            // 默认关：远程图片会把用户的 IP 和「正在看这条回复」告诉图片服务器
+            auto_load_images: false,
             suggestions: false,
             next_suggestion: false,
             suggest_model: String::new(),

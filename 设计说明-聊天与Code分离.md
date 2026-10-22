@@ -1,17 +1,19 @@
 # 设计说明：聊天与 Code 模式分离
 
-> 状态：**第 1～3 步已落地**（`f59665c`）；**第 4～7 步在 PR #32**（+ 第 6 步的「历史图片换占位」另一次提交）；第 8 步（回复里的网络图片）没做。
+> 状态：**第 1～8 步全部落地**（第 1～3 步 `f59665c`；第 4～7 步 PR #32；第 8 步「回复里的网络图片」本批）。
 > 写于 2026-10-22。第十二节的十一件事已按文中的「推荐」实现。
 > 代码落点：`crates/core/src/store.rs`（`SessionKind`、`SessionMeta::kind`）、`crates/core/src/lib.rs`（`Kernel` 的 `SessionSpec`）、
 > `crates/builtin/src/lib.rs`（聊天会话的起法、系统提示词、工具集）、`crates/builtin/src/tools.rs`（`chat_specs`）、
-> `apps/desktop/src/session.rs`（`Session::kind`）、`settings.rs`（`chat` 一栏、`space`）、`app/mod.rs`（建会话按空间）、
+> `apps/desktop/src/session.rs`（`Session::kind`）、`settings.rs`（`chat` 一栏、`space`、`auto_load_images`）、`app/mod.rs`（建会话按空间）、
 > `app/sidebar.rs`（两个空间、按日期分组）、`app/overview.rs`（聊天首页）、`app/composer.rs`（工具栏按会话类型取舍）、
 > `app/attach.rs`（新增：聊天附件内联）、`app/chrome.rs`（面包屑）、`app/rewind.rs`（聊天只回退对话）、
-> `app/settings_view.rs`（「内核与模型」里的「聊天」一组）、`app/palette.rs`；
+> `app/settings_view.rs`（「内核与模型」里的「聊天」一组、「外观」里的「自动加载回复里的网络图片」）、`app/palette.rs`；
 > 公式（两种会话共用）：`crates/core/src/math.rs`（新增：RaTeX 排版、写法归一、缓存）、`app/math.rs`（新增：`MarkdownPlugin` + SVG 资源）、
 > `main.rs`（`AssetSource` 包一层）、`app/chat.rs`（`TextView` 挂插件）；
 > 图片（两种会话共用）：`crates/core/src/image_prep.rs`（新增：转正 / 缩小 / 重编码）、`crates/builtin/src/provider.rs`（`ModelInfo::vision`、能力表）、
-> `model.rs`（`PendingImage` 异步处理）、`app/composer.rs`（附件按钮、看不了图的提示）、`app/chat.rs`（回复里的图片）。
+> `model.rs`（`PendingImage` 异步处理）、`app/composer.rs`（附件按钮、看不了图的提示）、`app/chat.rs`（回复里的图片）；
+> 远程图片（第 8 步）：`src/http.rs`（新增：gpui 的 `HttpClient`，走 `ureq`）、`app/remote_image.rs`（新增：占位卡 + 加载状态 + `MarkdownPlugin`）、
+> `assets.rs`（`register_image` / `cached`，按内容哈希登记字节）、`app/chat.rs`（`ImageView` + 图片浮层的「另存为…」）。
 
 ## 一、要解决什么
 
@@ -425,11 +427,16 @@ Code 会话的提示词不加（不改现有缓存命中），靠 6.4 的归一�
 
 ### 7.5 回复里的图片
 
-- 点回复里的图片同样打开 `open_image` 浮层，浮层里加「另存为…」（`cx.prompt_for_new_path`）。
-- **远程图片**（`https://…`）：给 gpui 配一个 HTTP 客户端（实现 `gpui` 的 `HttpClient`，底下复用 `ureq`，走系统代理）。
+- 点回复里的图片同样打开 `open_image` 浮层，浮层里加「另存为…」（`cx.prompt_for_new_path`，
+  本地图读文件、远程图写已经取回的那份字节）。
+- **远程图片**（`https://…`）：给 gpui 配一个 HTTP 客户端（`src/http.rs` 的 `UreqHttpClient`，
+  实现 `gpui` 的 `HttpClient`，底下复用 `ureq`，代理按 `ureq` 的默认规则读环境变量）。
   但**默认不自动加载**：远程图片会把用户的 IP 和「正在看这条回复」告诉图片所在的服务器，模型给的链接也可能是编的。
   默认显示一张占位卡「图片 · example.com」+「加载」，设置「外观」里一个开关「自动加载回复里的网络图片」（默认关）。
-  这一条工作量独立（约 1 天），可以放到最后或下一期。
+  落地时多做了一步：**真图不走 `img("https://…")` 的隐式加载**——`app/remote_image.rs` 的 `MarkdownPlugin`
+  把远程地址认领成自定义节点，点了「加载」（或开关打开）才用 `crate::http::get_bytes` 取字节，
+  按内容哈希登记进 `assets::register_image` 再交给 `img()`。这样「先问用户」是结构上的保证，
+  同一张图只请求一次、只占一份内存，失败也能在卡片上写清原因（HTTP 状态、主机名解析不了、超过 4 MiB）。
 - 不做：模型生成图片（文生图）、图片编辑、PDF（以后走 Anthropic 的 document 块 / OpenAI 的 file 输入，另写一期）。
 
 ## 八、聊天转 Code
@@ -497,7 +504,8 @@ Code 会话的提示词不加（不改现有缓存命中），靠 6.4 的归一�
    但要拉进整个 Typst 编译器，LaTeX 的边角写法转不过去。
 10. **图片默认清晰度**：推荐**「标准」**（长边 1568 px、约 1.15 MP，两家的建议值）。密密麻麻的小字截图可能要「原图」，
     做成设置项，默认标准。
-11. **回复里的网络图片**：推荐**默认不自动加载**，点「加载」才请求（隐私，也防模型编的链接）；或者干脆这期不做远程图片。
+11. **回复里的网络图片**：按推荐做了**默认不自动加载**，点「加载」才请求（隐私，也防模型编的链接）；
+   设置「外观」里的开关默认关。
 
 ## 十三、测试
 
@@ -523,6 +531,12 @@ Code 会话的提示词不加（不改现有缓存命中），靠 6.4 的归一�
   BMP → PNG；带透明的保持 PNG；输出不含 EXIF；超大图兜底降到 3.75 MB 以内；HEIC 报「读不了」。
   provider：能力表、`input_modalities` 解析、「不支持图片」的 400 认得出并翻译；看不了图的模型请求里历史图片换成占位文字。
 - **手工**：同一个端点分别开聊天和 Code 会话问同一句话，在「请求」页签的原文里对比请求体大小（聊天应该少几千 token）。
+- **远程图片**（`app/remote_image.rs` 单测）：只有 `http(s)` 认领（`file://` / `data:` / 相对路径放行给 gpui）；
+  主机名取裸域名（端口、`user:pass@`、查询串都剥掉），取不出来时退回整条地址、截到 60 字符；
+  状态按地址各算各的；「自动加载」默认关。`assets.rs`：字节按内容哈希登记、同图同名、非图片字节返回 `None`。
+  手工：回复里放一个 `![](https://…)` → 先出占位卡，点「加载」才发请求（可在代理 / 抓包里确认）；
+  关掉网络或写个 404 地址时卡片上显示原因并能「重试」；点开的浮层里「另存为…」存下来的是真实图片；
+  设置打开「自动加载」后重开对话直接出图。
 
 ## 十四、工作量与顺序
 
@@ -535,7 +549,7 @@ Code 会话的提示词不加（不改现有缓存命中），靠 6.4 的归一�
 | 5 | **公式**：`math.rs`（RaTeX 排版 + 写法归一 + 货币规则 + 缓存）、`MarkdownPlugin`（行内 / 块）、`AssetSource` 包一层、出错与流式、复制 LaTeX、测试与压测 | 2 天 |
 | 6 | **图片**：`image_prep.rs`、后台处理与占位、附件按钮收图、`ModelInfo::vision` + 能力表 + 400 识别与记忆、历史图片占位、待发送缩略图可点开、回复里的图片另存为 | 2 天 |
 | 7 | 聊天转 Code（复制日志续接） | 半天 |
-| 8 | （可选）回复里的网络图片：gpui `HttpClient`、占位卡与「加载」、设置开关 | 1 天 |
+| 8 | 回复里的网络图片：gpui `HttpClient`（`http.rs`）、占位卡与「加载」（`remote_image.rs`）、`assets` 登记、浮层「另存为…」、设置开关 | 1 天 |
 
 聊天分离本身（第 1～4 步）约 4 天；加上公式、图片和聊天转 Code 约 8.5 天，带上第 8 步约 9.5 天。
 

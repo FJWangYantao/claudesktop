@@ -544,6 +544,7 @@ impl ChatApp {
             ),
             self.theme_row(cx),
             motion_row,
+            self.auto_load_images_row(cx),
             self.font_scale_row(),
             self.font_family_row(cx),
         ]);
@@ -597,6 +598,23 @@ impl ChatApp {
                         .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&path))),
                 )
             }),
+        )
+    }
+
+    /// 「自动加载回复里的网络图片」：默认关，关着时远程图片先摆占位卡等用户点「加载」。
+    fn auto_load_images_row(&self, cx: &mut Context<Self>) -> Div {
+        setting_row(
+            "自动加载回复里的网络图片",
+            "关着时先显示「图片 · 域名」和「加载」，点一次才去取；打开后一出现就请求",
+            Switch::new("auto-load-images")
+                .checked(self.settings.auto_load_images)
+                .color(rgb(CORAL))
+                .on_change(cx.listener(|this, checked, _, cx| {
+                    let on = *checked;
+                    crate::app::remote_image::set_auto_load(on);
+                    this.save_ui_pref(move |s| s.auto_load_images = on, cx);
+                    cx.notify();
+                })),
         )
     }
 

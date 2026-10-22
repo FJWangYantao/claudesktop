@@ -182,9 +182,13 @@ pub fn hash_of(bytes: &str) -> String {
     format!("{:016x}.svg", hasher.finish())
 }
 
-/// 给所有画回复的 `TextView` 挂上的扩展：行内 + 块级公式。
+/// 给所有画回复的 `TextView` 挂上的扩展：行内 + 块级公式，加上回复里的远程图片。
 ///
 /// 每帧重建 `MarkdownExtensions` 不会重排文档：`parser_revision` 固定，gpui-kit 只换渲染句柄。
 pub fn extensions() -> MarkdownExtensions {
-    MarkdownExtensions::default().plugin(InlineMath).plugin(BlockMath).parser_revision(1)
+    MarkdownExtensions::default()
+        .plugin(InlineMath)
+        .plugin(BlockMath)
+        .plugin(super::remote_image::RemoteImagePlugin)
+        .parser_revision(2)
 }

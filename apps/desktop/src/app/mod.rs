@@ -23,6 +23,7 @@ mod plugin_versions;
 mod plugins_view;
 mod project_view;
 mod raw_request;
+pub(crate) mod remote_image;
 mod requests_view;
 mod review;
 mod rewind;
@@ -349,6 +350,8 @@ impl ChatApp {
         let (settings, settings_error) = Settings::load(settings_path.as_deref());
         let settings = settings.with_env();
         claudesktop_builtin::request_bodies::set_enabled(settings.gateway_bodies);
+        // 回复里的网络图片：默认不自动加载（隐私，见 remote_image.rs），这里把设置同步过去
+        remote_image::set_auto_load(settings.auto_load_images);
         // 默认工作目录：环境变量 ACP_CWD 优先，其次上次选的（目录还在的话），最后是启动目录
         let cwd = settings
             .workspace
