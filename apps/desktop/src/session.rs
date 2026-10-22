@@ -113,7 +113,8 @@ pub struct Session {
     pub turn_summaries: HashMap<usize, TurnSummary>,
     /// 输入框上方的计划收成一行
     pub plan_folded: bool,
-    /// 上下文里的 token（最近一轮结束时内核报告的；0 = 不知道，输入框旁不显示用量）
+    /// 上下文里的 token（最近一次请求结束时内核报告的；0 = 不知道，输入框旁不显示用量）。
+    /// 自研内核每走完一步工具循环就更新一次，跑着的时候也跟着涨
     pub context_tokens: u64,
     /// 正在从日志重放：新的思考块不计时（用时从日志里的 `Record::Thought` 取）
     replaying: bool,
@@ -464,7 +465,7 @@ impl Session {
                         };
                         s.turn_summaries.insert(user, TurnSummary { elapsed_ms, usage });
                     }
-                    if let Some(n) = context_tokens {
+                    if let Some(n) = context_tokens.filter(|n| *n > 0) {
                         s.context_tokens = n;
                     }
                 }
@@ -1142,7 +1143,7 @@ impl Session {
         self.turn_summaries.retain(|&i, _| i < idx);
         self.open_groups.retain(|&i| i < idx);
         self.plan_folded = false;
-        // 上下文变短了，用量等下一轮结束时内核再报
+        // 上下文变短了，用量等下一轮第一步请求完内核再报
         self.context_tokens = 0;
         self.cache_hit = None;
     }

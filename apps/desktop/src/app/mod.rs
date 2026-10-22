@@ -2250,8 +2250,12 @@ impl ChatApp {
                             self.push_no_vision_models();
                         }
                     }
-                    // 网关又记了请求：用量页的费用、请求跟着刷新（不用等这一轮跑完再手动重读）
-                    if turn_over || matches!(event, KernelEvent::UsageUpdated { .. }) {
+                    // 网关又记了请求：用量页的费用、请求跟着刷新（不用等这一轮跑完再手动重读）。
+                    // 工具循环每一步都会报用量，只在请求日志真看得见时才读（它自己攒 2 秒）
+                    if turn_over
+                        || (self.requests_shown()
+                            && matches!(event, KernelEvent::UsageUpdated { .. }))
+                    {
                         self.refresh_requests_soon(cx);
                     }
                     // 模型起了标题：元信息也跟着更新（TurnEnded 时写的还是旧标题）

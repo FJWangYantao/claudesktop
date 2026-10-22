@@ -370,7 +370,8 @@ fn streams_reasoning_text_usage_and_ends_turn() {
                 cache_read_tokens: 0
             }
         )),
-        1
+        1,
+        "一次请求报一次（以前是整轮结束时补报）"
     );
     assert_eq!(
         h.count(
@@ -569,6 +570,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> Reply {
             delta("content", "我先看看。"),
             format!("data: {call}"),
             finish("tool_calls"),
+            r#"data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":8}}"#.into(),
             "data: [DONE]".into(),
         ],
         gap_ms: 5,
@@ -1966,18 +1968,27 @@ fn anthropic_protocol_streams_and_runs_tools() {
 
     assert_eq!(h.text(true), "想想");
     assert_eq!(h.text(false), "文件里是 77。");
-    assert_eq!(
-        h.count(|e| matches!(
-            e,
+    // 每一步请求的用量当场报（两步各报一次），最后一次就是此刻的上下文大小
+    let usage: Vec<_> = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match &r.event {
             KernelEvent::UsageUpdated {
-                input_tokens: 39,
-                output_tokens: 17,
-                reasoning_tokens: 0,
-                context_tokens: 35,
-                cache_read_tokens: 0
-            }
-        )),
-        1
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                context_tokens,
+                cache_read_tokens,
+            } => Some((*input_tokens, *output_tokens, *reasoning_tokens, *context_tokens, *cache_read_tokens)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage,
+        [(9, 12, 0, 21, 0), (30, 5, 0, 35, 0)],
+        "每走一步报一次，最后一步的输入 + 输出就是上下文大小"
     );
     assert_eq!(
         h.count(
@@ -2599,8 +2610,13 @@ fn task_runs_a_subagent_and_returns_its_report() {
     assert_eq!(h.tool_status("t1/c1").as_deref(), Some("completed"));
     assert_eq!(h.tool_status("t1").as_deref(), Some("completed"));
     assert_eq!(h.text(false), "我先看看。子任务说秘密是 42。");
-    // 子会话的用量另报一次（不带上下文大小），主会话结束时再报自己的
-    assert_eq!(h.count(|e| matches!(e, KernelEvent::UsageUpdated { context_tokens: 0, .. })), 1);
+    // 子会话每步的用量都并进主会话这一轮，但不带上下文大小（那个是主会话自己的）；
+    // 子会话走了两步（读文件、交报告），所以有两条
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::UsageUpdated { context_tokens: 0, .. })),
+        2,
+        "子会话两步的用量，不带上下文大小"
+    );
 
     // 子会话的请求：角色的系统提示词、只有清单里的工具、上下文里只有任务本身
     let child = body(&bodies, 1);

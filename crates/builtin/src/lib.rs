@@ -452,11 +452,11 @@ struct Snapshot {
 /// 工具循环（[`run_steps`]）怎么结束的。
 enum Steps {
     /// 模型不再调用工具（或到了步数上限）
+    ///
+    /// 不带用量：每一次请求的用量在 `run_steps` 里立刻报给界面（`Inner::report_usage`），
+    /// 不然跑着的时候上下文用量要等整轮结束才涨。
     Done {
         stop: String,
-        usage: Option<Usage>,
-        /// 最后一次请求时的上下文大小
-        context_tokens: u64,
         /// 最后一段非空的回复
         reply: String,
     },
@@ -841,6 +841,26 @@ impl Inner {
         if let Some(state) = self.sessions.lock().unwrap().get_mut(session) {
             state.measured = Some((tokens, state.history.len().saturating_sub(unmeasured)));
         }
+    }
+
+    /// 把一次请求（或一次压缩）的用量报给界面。
+    ///
+    /// 工具循环每走一步就报一次，输入框旁的用量圆环跑着的时候就跟着涨；
+    /// `context` 是这次请求结束时上下文里有多少 token（输入 + 输出），不知道时报 0——
+    /// 界面把 0 当成「这次不更新上下文」，只并进本轮累计（压缩、子会话的用量都这样报）。
+    fn report_usage(&self, session: &str, u: Usage, context: u64) {
+        // 子会话的用量转进主会话的累计里，但它自己的上下文大小和主会话无关
+        let context = if subagent::split_id(session).is_some() { 0 } else { context };
+        self.emit(
+            Some(session),
+            KernelEvent::UsageUpdated {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                reasoning_tokens: u.reasoning_tokens,
+                context_tokens: context,
+                cache_read_tokens: u.cache_read_tokens,
+            },
+        );
     }
 }
 
@@ -1652,20 +1672,8 @@ impl Inner {
             Steps::Failed(message) => {
                 ToolOutput::fail(format!("The subagent failed: {message}"), "子任务出错")
             }
-            Steps::Done { stop, usage, reply, .. } => {
-                // 子会话的用量算进主会话这一轮（上下文大小是主会话自己的，不报）
-                if let Some(u) = usage {
-                    self.emit(
-                        Some(session),
-                        KernelEvent::UsageUpdated {
-                            input_tokens: u.input_tokens,
-                            output_tokens: u.output_tokens,
-                            reasoning_tokens: u.reasoning_tokens,
-                            context_tokens: 0,
-                            cache_read_tokens: u.cache_read_tokens,
-                        },
-                    );
-                }
+            Steps::Done { stop, reply } => {
+                // 量已经按步报进主会话的累计了（见 `run_steps` 里的 `report_usage`），这里不再报
                 self.run_hooks(
                     session,
                     cwd,
@@ -2495,12 +2503,12 @@ fn transcript_budget(window: Option<u64>) -> usize {
     })
 }
 
-/// 一轮对话（在独立线程里运行）：先跑提交消息的钩子，再走工具循环，最后报告用量和结束。
+/// 一轮对话（在独立线程里运行）：先跑提交消息的钩子，再走工具循环（用量逐步当场报），最后结束。
 fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     if !inner.prompt_hooks(&session, &flag) {
         return;
     }
-    let (stop, usage, context_tokens) = match run_steps(&inner, &session, &flag) {
+    let stop = match run_steps(&inner, &session, &flag) {
         Steps::Stopped => return, // cancel() 已经报告过 TurnEnded
         Steps::Failed(message) => {
             // 和从日志重建的历史一致（见 history::rebuild）：失败也占一条 assistant 消息，
@@ -2514,22 +2522,10 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
             inner.emit(Some(&session), KernelEvent::PromptFailed { message });
             return;
         }
-        Steps::Done { stop, usage, context_tokens, .. } => (stop, usage, context_tokens),
+        Steps::Done { stop, .. } => stop,
     };
 
     inner.finish(&session, &flag);
-    if let Some(u) = usage {
-        inner.emit(
-            Some(&session),
-            KernelEvent::UsageUpdated {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                reasoning_tokens: u.reasoning_tokens,
-                context_tokens,
-                cache_read_tokens: u.cache_read_tokens,
-            },
-        );
-    }
     let cwd = inner.sessions.lock().unwrap().get(&session).map(|s| s.cwd.clone());
     inner.emit(Some(&session), KernelEvent::TurnEnded { stop_reason: stop.clone() });
     // 「一轮结束」钩子只是通知：这一轮已经结束了，结果不影响什么
@@ -2597,14 +2593,12 @@ fn name_session(inner: &Inner, session: &str) {
 }
 
 /// 工具循环：请求模型 → 执行工具 → 再请求，直到不再调用工具。主会话的一轮和子任务（子会话）都走这里。
+/// 每一步的用量当场报给界面（`Inner::report_usage`），不攒到一轮结束。
 fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
     let stopped = || flag.load(Ordering::SeqCst);
     // 用量网关的日志按会话、用途归类（子任务的 ID 是 `主会话/调用 ID`）
     let purpose = if subagent::split_id(session).is_some() { "subagent" } else { "turn" };
     let _tag = gateway::tag(session, purpose, inner.turn_number(session));
-    let mut usage: Option<Usage> = None;
-    // 最后一次请求的输入 + 输出 = 此刻上下文的大小（之前各步都包含在这次的输入里）
-    let mut context_tokens = 0;
     let mut stop = "max_turn_requests".to_string();
     let mut reply = String::new();
     // 上一步刚压缩过（不连着压两次）/ 这一轮已经因为超限报错压缩过（只压一次）
@@ -2633,7 +2627,8 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                     window * compact::KEEP_PERCENT / 100,
                     transcript_budget(Some(window)),
                 ) {
-                    Ok(Some(u)) => usage.get_or_insert_default().add(u),
+                    // 压缩本身的用量也并进这一轮（上下文大小由 `Compacted` 报，这里报 0）
+                    Ok(Some(u)) => inner.report_usage(session, u, 0),
                     Ok(None) => {}
                     // 压缩失败（已报给界面）就带着原样的上下文接着请求
                     Err(_) if !stopped() => {}
@@ -2736,7 +2731,7 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                         transcript_budget(window),
                     ) {
                         Ok(Some(u)) => {
-                            usage.get_or_insert_default().add(u);
+                            inner.report_usage(session, u, 0);
                             just_compacted = true;
                             continue;
                         }
@@ -2748,11 +2743,12 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                 return Steps::Failed(message);
             }
         };
+        // 这一步的用量当场报：输入 + 输出就是此刻上下文的大小（之前各步都含在这次的输入里），
+        // 界面跑着的时候就能看到上下文涨到多少，不用等整轮结束
         let mut step_tokens = 0;
         if let Some(u) = outcome.usage {
-            usage.get_or_insert_default().add(u);
             step_tokens = u.input_tokens + u.output_tokens;
-            context_tokens = step_tokens;
+            inner.report_usage(session, u, step_tokens);
         }
         if !text.trim().is_empty() {
             reply = text.clone();
@@ -2803,7 +2799,7 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         inner.measure(session, step_tokens, unmeasured);
         inner.count_step(session, wrote_todo);
     }
-    Steps::Done { stop, usage, context_tokens, reply }
+    Steps::Done { stop, reply }
 }
 
 /// 一条消息里的文字部分（给钩子看用户说了什么）。
@@ -3084,16 +3080,8 @@ impl Kernel for BuiltinKernel {
                 }
                 inner.finish(&session, &flag);
                 if let Ok(Some(u)) = result {
-                    inner.emit(
-                        Some(&session),
-                        KernelEvent::UsageUpdated {
-                            input_tokens: u.input_tokens,
-                            output_tokens: u.output_tokens,
-                            reasoning_tokens: u.reasoning_tokens,
-                            context_tokens: 0,
-                            cache_read_tokens: u.cache_read_tokens,
-                        },
-                    );
+                    // 上下文大小由 `Compacted` 报过，这里只并用量
+                    inner.report_usage(&session, u, 0);
                 }
                 // 失败已经以 CompactFailed 报过，这一轮照常结束
                 inner.emit(

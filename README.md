@@ -28,7 +28,8 @@ Claude 风格的 AI 编程桌面端（Rust + GPUI），Windows 原生，**内核
 - 工具：`read_file` / `list_dir` / `write_file` / `edit_file` / `shell`（pwsh，超时、取消连子进程一起结束）/
   `glob` / `grep` / `web_fetch` / `todo_write` / `task`；同一步的只读调用并行执行
 - 权限：Manual / Accept edits / Plan（只读）/ Bypass；「总是允许」按项目落盘，工作目录外的写入永远询问
-- 上下文：自动压缩（用量过窗口八成时总结较早对话），「超出上下文」报错后压缩一次重发，`/compact` 手动压缩
+- 上下文：自动压缩（用量过窗口八成时总结较早对话），「超出上下文」报错后压缩一次重发，`/compact` 手动压缩；
+  每走完一步就把用量和当前上下文大小报给界面，跑着的时候用量环跟着涨
 - 读项目说明：`~/.claude/CLAUDE.md` + 工作目录到仓库根各层的 `AGENTS.md` / `CLAUDE.md` 进系统提示词，每轮重读
 - 项目级配置：项目根的 `.claudesktop/settings.json` 覆盖模型 / 权限规则 / 停用的 MCP / 只用哪些插件 / 说明文件，
   设置页「项目」里改（只写和全局不一样的项）

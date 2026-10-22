@@ -220,14 +220,15 @@ pub enum KernelEvent {
     FsWrite { path: String, ok: bool },
     /// 一轮对话结束（`session/prompt` 响应到达）
     TurnEnded { stop_reason: String },
-    /// 本轮 token 用量（provider 报告时才有）
+    /// 本轮 token 用量（provider 报告时才有）。自研内核每走完一步工具循环就报一次，
+    /// 跑着的时候就能看到用量和上下文在涨；ACP agent 通常只在轮末报
     UsageUpdated {
         input_tokens: u64,
         output_tokens: u64,
         /// 其中思考消耗的 token（不报告为 0）
         reasoning_tokens: u64,
-        /// 本轮最后一次请求结束时上下文里的 token（输入 + 输出），即下一轮大约要带上的量；
-        /// 0 = 不知道
+        /// 最近一次请求结束时上下文里的 token（输入 + 输出），即下一次请求大约要带上的量；
+        /// 0 = 这次不更新（压缩、子会话的用量只并进累计）
         #[serde(default)]
         context_tokens: u64,
         /// 本轮输入里命中提示缓存的部分（包含在 `input_tokens` 里；不报告为 0）

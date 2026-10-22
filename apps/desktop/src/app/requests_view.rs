@@ -113,14 +113,19 @@ struct DerivedKey {
 }
 
 impl ChatApp {
-    /// 在首页「请求」页签上或用量页开着、日志还没按当前范围读过：在后台读。
-    pub(super) fn sync_requests(&mut self, cx: &mut Context<Self>) {
-        // 用量页整页都要（费用、缓存命中也从请求日志算）
-        let shown = if self.settings_open {
+    /// 用量页或首页「请求」页签正开着（请求日志只在它开着时才值得读）。
+    pub(super) fn requests_shown(&self) -> bool {
+        if self.settings_open {
             self.settings_form.tab == super::usage_view::USAGE_TAB
         } else {
             self.overview_tab == 2
-        };
+        }
+    }
+
+    /// 在首页「请求」页签上或用量页开着、日志还没按当前范围读过：在后台读。
+    pub(super) fn sync_requests(&mut self, cx: &mut Context<Self>) {
+        // 用量页整页都要（费用、缓存命中也从请求日志算）
+        let shown = self.requests_shown();
         let v = &self.requests_view;
         if shown && !v.loading && v.loaded_range != Some(self.overview_range) {
             self.load_requests(cx);
