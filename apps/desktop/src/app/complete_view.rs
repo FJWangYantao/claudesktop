@@ -359,11 +359,11 @@ impl ChatApp {
     ///
     /// 1. 补全列表开着且有 **两项以上** → 选上 / 下一项。只有一项时不截键：
     ///    截了却没有可选项会变成「按了没反应」。
-    /// 2. 光标在第一行开头按 ↑ / 末尾按 ↓（且正翻着历史）→ 回溯输入历史（见 `history.rs`）；
-    ///    没有上一条 / 下一条时**什么都不做**。
-    /// 3. 单行输入：↑ 到开头、↓ 到末尾（光标在中间就只走这一步）。
-    /// 4. 其余（多行的行内移动）→ 放行，由输入框自己上下移光标。
-    ///    走到第一行开头 / 最后一行末尾之后**再按一次**才换历史。
+    /// 2. 光标在全文开头按 ↑ / 末尾按 ↓（且正翻着历史）→ 回溯输入历史（见 `history.rs`）；
+    ///    没有上一条 / 下一条时**什么都不做**。有选区时不换历史，交给输入框收起选区。
+    /// 3. 其余放行，由输入框自己按**显示行**上下移光标（自动折行的长段落也是一行一行走）；
+    ///    移完光标没动（已经在第一 / 最后一个显示行）就补一步：↑ 到开头、↓ 到末尾。
+    ///    走到开头 / 末尾之后**再按一次**才换历史。
     fn step_completion(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         // 1. 补全列表：两项以上才接管
         if let Some(c) = self.completion.open.as_mut()
@@ -375,46 +375,51 @@ impl ChatApp {
             self.refresh_composer(cx);
             return;
         }
-        let (text, cursor) = {
+        let (text, cursor, has_selection) = {
             let input = self.input.read(cx);
-            (input.value().to_string(), input.cursor())
+            (input.value().to_string(), input.cursor(), !input.selected_range().is_empty())
         };
-        let (line, _column) = cursor_line_column(&text, cursor);
-        let last_line = text.matches('\n').count();
-        let single_line = last_line == 0;
-        let at_start = cursor == 0;
-        let at_end = cursor == text.len();
+        // 输入框被别处改过（「编辑」、插入文件路径都走 `set_value`，不发 `Change`）：退出回溯，
+        // 否则下面按 ↓ 会拿下一条历史把改好的内容冲掉
+        self.history.sync(&text);
 
-        // 2. 句首：回溯历史；已经是第一行开头但没有上一条 → 什么都不做
-        //    （多行时只有走到第一行开头才换历史，行内移动留给下面的放行分支）
-        if at_start && delta < 0 && (single_line || line == 0) {
-            if let Some(prev) = self.history.prev(&text).map(str::to_string) {
-                self.fill_history(&prev, false, window, cx);
-                cx.stop_propagation();
+        if !has_selection {
+            // 2. 开头：回溯历史；已经是最早一条 → 什么都不做
+            if cursor == 0 && delta < 0 {
+                if let Some(prev) = self.history.prev(&text).map(str::to_string) {
+                    self.fill_history(&prev, false, window, cx);
+                    cx.stop_propagation();
+                }
+                return;
             }
-            return;
-        }
-        // 2b. 句末且正翻着历史：下一条（走到最新一条之后再按就拿回草稿）
-        if at_end && delta > 0 && self.history.browsing() {
-            if let Some(next) = self.history.next(&text) {
-                self.fill_history(&next, true, window, cx);
-                cx.stop_propagation();
+            // 2b. 末尾且正翻着历史：下一条（走到最新一条之后再按就拿回草稿）
+            if cursor == text.len() && delta > 0 && self.history.browsing() {
+                if let Some(next) = self.history.next(&text) {
+                    self.fill_history(&next, true, window, cx);
+                    cx.stop_propagation();
+                }
+                return;
             }
-            return;
         }
 
-        // 3. 单行输入：↑ 到开头、↓ 到末尾（光标在中间就只走这一步）
-        if single_line && delta < 0 && !at_start {
-            self.move_caret(0, window, cx);
-            cx.stop_propagation();
+        // 3. 放行给输入框按显示行移动；在第一 / 最后一个显示行上它不动光标，这时补到开头 / 末尾。
+        //    显示行（含自动折行）只有输入框知道，所以不预判，等它移完再看
+        if has_selection {
             return;
         }
-        if single_line && delta > 0 && !at_end {
-            self.move_caret(text.len(), window, cx);
-            cx.stop_propagation();
-        }
-
-        // 4. 其余放行：多行编辑的行内移动不丢（走到第一行开头 / 最后一行末尾后再按才换历史）
+        cx.defer_in(window, move |this, window, cx| {
+            let (now_text, now_cursor) = {
+                let input = this.input.read(cx);
+                (input.value().to_string(), input.cursor())
+            };
+            if now_text != text || now_cursor != cursor {
+                return;
+            }
+            let edge = if delta < 0 { 0 } else { text.len() };
+            if cursor != edge {
+                this.move_caret(edge, window, cx);
+            }
+        });
     }
 
     /// 把光标挪到 `offset`（字节）；多行按行列换算。

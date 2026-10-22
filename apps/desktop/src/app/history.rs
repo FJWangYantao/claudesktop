@@ -2,14 +2,16 @@
 //!
 //! 行为（用户定的设计，见「设计说明-输入框方向键.md」第七节）：
 //!
-//! - 光标在文字中间（不在行首 / 行尾）时，↑ 把光标移到**行首**，↓ 移到**行尾**——只在
-//!   多行输入框的第一行按 ↑、最后一行按 ↓ 才这么走，其余行由输入框自己上下移光标
-//!   （多行的行内移动不能丢）。
-//! - 光标已经**在第一行开头**（`cursor == 0`）时再按 ↑，换成上一条历史，光标置于开头；
-//!   已经是最早一条就什么都不做（`cx.propagate()` 放行）。
-//! - 光标已经**在末尾**（`cursor == len`）时再按 ↓，换成下一条历史，光标置于末尾；
-//!   已经是最新一条就什么都不做。
+//! - 光标不在开头 / 末尾时，↑ ↓ 交给输入框按**显示行**移动（多行、自动折行的长段落都一样）；
+//!   已经在第一个显示行再按 ↑，光标移到**开头**，在最后一个显示行再按 ↓，移到**末尾**。
+//! - 光标已经**在开头**（`cursor == 0`）时再按 ↑，换成上一条历史，光标置于开头；
+//!   已经是最早一条就什么都不做（不截键）。
+//! - 光标已经**在末尾**（`cursor == len`）且正翻着历史时再按 ↓，换成下一条历史，光标置于末尾；
+//!   翻过最新一条就拿回草稿。
 //! - 开始回溯前输入框里的草稿先存进 [`InputHistory::draft`]，按 ↓ 回到最新一条之后拿回来。
+//! - 有选区时不换历史（交给输入框收起选区）。
+//! - 输入框里的字和停着的那条历史对不上（用户打了字，或者别处用 `set_value` 改了）就退出回溯，
+//!   见 [`InputHistory::sync`]。
 //!
 //! 记的是「发出去的消息」：`send()` 走到底（含排队、worktree 建设期排队）才入表，
 //! 发了没发成的不入（见 `ChatApp::remember_input`）。相邻重复只留一条。
@@ -65,8 +67,8 @@ impl InputHistory {
         self.entries.get(next).map(String::as_str)
     }
 
-    /// 下一条。走到最近一条之后（`index` 回到 `None`）返回存下来的草稿。
-    /// 没在回溯、或者有草稿但输入框已经被改过（`draft` 对不上）时返回 `None`。
+    /// 下一条。走到最近一条之后（`index` 回到 `None`）返回存下来的草稿；
+    /// 草稿和输入框现在的内容一样（换了也看不出变化）时返回 `None`。没在回溯时返回 `None`。
     pub(super) fn next(&mut self, current: &str) -> Option<String> {
         let i = self.index?;
         let next = i + 1;
@@ -88,6 +90,18 @@ impl InputHistory {
     pub(super) fn touch(&mut self) {
         self.index = None;
         self.draft.clear();
+    }
+
+    /// 输入框现在的全文和停着的那条历史对不上就退出回溯。
+    ///
+    /// 用户打字会发 `InputEvent::Change`（走 [`touch`](Self::touch)），但「编辑」、插入文件路径
+    /// 这些用 `set_value` 改输入框的地方不发，所以按键时再对一次，免得 ↓ 把改好的内容冲掉。
+    pub(super) fn sync(&mut self, current: &str) {
+        if let Some(i) = self.index
+            && self.entries.get(i).is_none_or(|entry| entry != current)
+        {
+            self.touch();
+        }
     }
 
     /// 正在回溯（输入框里的内容来自历史，不是用户写的）
@@ -163,6 +177,23 @@ mod tests {
         assert!(!h.browsing());
         assert_eq!(h.prev("第二份草稿"), Some("旧消息"));
         assert_eq!(h.next("旧消息"), Some("第二份草稿".to_string()));
+    }
+
+    #[core::prelude::v1::test]
+    fn sync_leaves_browsing_when_the_input_was_rewritten() {
+        let mut h = InputHistory::default();
+        h.push("甲");
+        h.push("乙");
+        assert_eq!(h.prev("草稿"), Some("乙"));
+        // 内容还是那条历史：继续回溯
+        h.sync("乙");
+        assert!(h.browsing());
+        // 被「编辑」之类改过：退出回溯，↓ 不再换内容，↑ 从最新一条重来、存的是新内容
+        h.sync("乙\n改过的");
+        assert!(!h.browsing());
+        assert_eq!(h.next("乙\n改过的"), None);
+        assert_eq!(h.prev("乙\n改过的"), Some("乙"));
+        assert_eq!(h.next("乙"), Some("乙\n改过的".to_string()));
     }
 
     #[core::prelude::v1::test]

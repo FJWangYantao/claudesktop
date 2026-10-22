@@ -49,8 +49,8 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
             ("指令 / 引用文件", &["/", "@"]),
             ("填入建议的提示词 / 接上补全的灰字", &["tab"]),
             ("选补全列表的上一项 / 下一项", &INPUT_HISTORY_KEYS),
-            ("光标在行首时回上一条输入 / 在末尾时取下一条", &INPUT_HISTORY_KEYS),
-            ("光标在文字中间：移到开头 / 移到末尾", &INPUT_HISTORY_KEYS),
+            ("光标在开头时回上一条输入 / 在末尾时取下一条", &INPUT_HISTORY_KEYS),
+            ("光标在第一行 / 最后一行：移到开头 / 移到末尾", &INPUT_HISTORY_KEYS),
         ],
     ),
 ];
