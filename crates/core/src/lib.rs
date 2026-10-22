@@ -20,6 +20,7 @@ pub mod checkpoint;
 mod diff;
 pub mod git;
 pub mod history_search;
+pub mod image_prep;
 mod json_error;
 pub mod math;
 pub mod memory;

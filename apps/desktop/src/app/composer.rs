@@ -218,8 +218,11 @@ impl ChatApp {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_web(!on, cx)))
     }
 
-    /// 输入框上方的一张待发送图片缩略图（右上角 × 撤掉）。
+    /// 输入框上方的一张待发送图片缩略图（右上角 × 撤掉）。还在后台转正 / 缩小时半透明。
     fn pending_image_thumb(&self, i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let image = &self.pending[i];
+        let preparing = image.preparing;
+        let tip = image.tip();
         div()
             .id(("pending-image", i))
             .relative()
@@ -229,15 +232,9 @@ impl ChatApp {
             .overflow_hidden()
             .border_1()
             .border_color(rgb(LINE))
-            .tooltip({
-                let name = self.pending[i].name.clone();
-                move |window, cx| Tooltip::new(name.clone()).build(window, cx)
-            })
-            .child(
-                img(Arc::new(self.pending[i].preview.clone()))
-                    .size_full()
-                    .object_fit(ObjectFit::Cover),
-            )
+            .when(preparing, |d| d.opacity(0.55))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .child(img(Arc::new(image.preview.clone())).size_full().object_fit(ObjectFit::Cover))
             .child(
                 div()
                     .id(("pending-image-x", i))
@@ -358,9 +355,11 @@ impl ChatApp {
             window.is_window_active() && self.input.read(cx).focus_handle(cx).is_focused(window);
 
         // 发送按钮三态：空（淡、不可点）/ 可发送（赤陶）/ 忙（深色停止方块，同 Esc）
-        let can_send = !self.input.read(cx).value().trim().is_empty()
+        // 还有图在后台处理时也按「不可点」画
+        let can_send = (!self.input.read(cx).value().trim().is_empty()
             || !self.pending.is_empty()
-            || !self.pending_files.is_empty();
+            || !self.pending_files.is_empty())
+            && !self.pending.iter().any(|p| p.preparing);
         let send_bg = match (busy, can_send) {
             (true, _) => INK,
             (false, true) => CORAL,
@@ -408,6 +407,7 @@ impl ChatApp {
         // 中间的空白点了也把焦点给输入框（chip 和按钮自己处理点击，不挂这个）。
         // 聊天空间没有工作目录和权限模式（没有工具要批），那两个 chip 不画，换成「联网」开关
         let chat = self.session().is_chat();
+        let unviewable = self.pending_images_unviewable();
         let toolbar = div()
             .h_flex()
             .items_center()
@@ -456,69 +456,77 @@ impl ChatApp {
 
         // 一张卡片：附件缩略图、随内容长高的多行输入（至少两行），底边是工具栏。
         // 三档：静止细边 + 淡阴影；悬停边框加深一档（提示整块都能点）；聚焦再深一档、阴影加重。
-        let card =
-            div()
-                .id("composer")
-                .v_flex()
-                .w_full()
-                .bg(rgb(CARD))
-                .border_1()
-                .border_color(rgb(if focused { INK_FAINT } else { LINE }))
-                .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
-                .rounded_2xl()
-                .map(|d| if focused { d.shadow_md() } else { d.shadow_sm() })
-                // 发送键离右边和底边都是 8px
-                .px_2()
-                .pt_1p5()
-                .pb_2()
-                // 待发送附件：图片缩略图 + 文本文件 chip（点右上角 × 撤掉），左边和输入文字对齐
-                .when(!self.pending.is_empty() || !self.pending_files.is_empty(), |d| {
-                    d.child(
-                        div().h_flex().flex_wrap().gap_1p5().px_2().pt_1().pb_1()
-                            .children((0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)))
-                            .children(
-                                (0..self.pending_files.len())
-                                    .map(|i| self.pending_file_chip(i, cx)),
-                            ),
-                    )
-                })
-                .child(
+        let card = div()
+            .id("composer")
+            .v_flex()
+            .w_full()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(if focused { INK_FAINT } else { LINE }))
+            .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
+            .rounded_2xl()
+            .map(|d| if focused { d.shadow_md() } else { d.shadow_sm() })
+            // 发送键离右边和底边都是 8px
+            .px_2()
+            .pt_1p5()
+            .pb_2()
+            // 待发送附件：图片缩略图 + 文本文件 chip（点右上角 × 撤掉），左边和输入文字对齐
+            .when(!self.pending.is_empty() || !self.pending_files.is_empty(), |d| {
+                d.child(
                     div()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
-                        )
-                        .child(
-                            div()
-                                .relative()
-                                .w_full()
-                                .child(
-                                    Textarea::new(&self.input)
-                                        .appearance(false)
-                                        .bordered(false)
-                                        .on_paste(paste_to_attachments(app.clone())),
-                                )
-                                // 光标后面那句补全灰字（见 suggest.rs）：跟着光标画，只重画输入区。
-                                // 这里只看输入框有没有焦点，不看窗口在不在前台——灰字是内容，
-                                // 切走再切回来不该闪一下
-                                .children(
-                                    self.input
-                                        .read(cx)
-                                        .focus_handle(cx)
-                                        .is_focused(window)
-                                        .then(|| self.suggested_tail(cx))
-                                        .flatten()
-                                        .map(|tail| self.suggestion_ghost(tail)),
-                                )
-                                // 一轮结束后猜的那句（见 suggest.rs）：输入框空着时用淡色画在里面，
-                                // 按 Tab 填入。占位文字已经让开了，这里画的就是顶格的第一行
-                                .children(
-                                    self.next_suggestion_text(cx)
-                                        .map(|text| self.next_suggestion_preview(text)),
-                                ),
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .px_2()
+                        .pt_1()
+                        .pb_1()
+                        .children((0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)))
+                        .children(
+                            (0..self.pending_files.len()).map(|i| self.pending_file_chip(i, cx)),
                         ),
                 )
-                .child(toolbar);
+            })
+            // 当前模型看不了图：说在前面，图留在输入框里（换模型后再发）
+            .when_some(unviewable, |d, why| {
+                d.child(div().px_2().pb_1().child(super::settings_kit::note(IconAll::Info, why)))
+            })
+            .child(
+                div()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .child(
+                                Textarea::new(&self.input)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .on_paste(paste_to_attachments(app.clone())),
+                            )
+                            // 光标后面那句补全灰字（见 suggest.rs）：跟着光标画，只重画输入区。
+                            // 这里只看输入框有没有焦点，不看窗口在不在前台——灰字是内容，
+                            // 切走再切回来不该闪一下
+                            .children(
+                                self.input
+                                    .read(cx)
+                                    .focus_handle(cx)
+                                    .is_focused(window)
+                                    .then(|| self.suggested_tail(cx))
+                                    .flatten()
+                                    .map(|tail| self.suggestion_ghost(tail)),
+                            )
+                            // 一轮结束后猜的那句（见 suggest.rs）：输入框空着时用淡色画在里面，
+                            // 按 Tab 填入。占位文字已经让开了，这里画的就是顶格的第一行
+                            .children(
+                                self.next_suggestion_text(cx)
+                                    .map(|text| self.next_suggestion_preview(text)),
+                            ),
+                    ),
+            )
+            .child(toolbar);
 
         div()
             .v_flex()
@@ -729,7 +737,10 @@ impl ChatApp {
         .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
             this.drop_paths(paths.paths(), window, cx)
         }))
-        .when(self.file_drag, |d| d.child(Self::render_drop_hint(chat)))
+        .when(self.file_drag, |d| {
+            let chat = self.session().is_chat();
+            d.child(Self::render_drop_hint(chat))
+        })
     }
 
     pub(crate) fn drop_paths(
@@ -792,16 +803,11 @@ impl ChatApp {
                 .rounded_2xl()
                 .child(Icon::new(IconAll::Plus).size_6().text_color(rgb(CORAL)))
                 .child(div().text_size(TEXT_LEAD).font_medium().child("松开即可添加"))
-                .child(
-                    div()
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK_SOFT))
-                        .child(if chat {
-                            "图片作为附件，文本文件的内容一起发过去"
-                        } else {
-                            "图片作为附件，其他文件和文件夹插入 @ 引用"
-                        }),
-                ),
+                .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(if chat {
+                    "图片作为附件，文本文件的内容一起发过去"
+                } else {
+                    "图片作为附件，其他文件和文件夹插入 @ 引用"
+                })),
         )
     }
 }

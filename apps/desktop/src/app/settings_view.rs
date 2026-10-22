@@ -309,9 +309,9 @@ impl ChatApp {
         self.settings_form
             .chat_model
             .update(cx, |state, cx| state.set_value(s.chat.model.clone(), window, cx));
-        self.settings_form.chat_instructions.update(cx, |state, cx| {
-            state.set_value(s.chat.instructions.clone(), window, cx)
-        });
+        self.settings_form
+            .chat_instructions
+            .update(cx, |state, cx| state.set_value(s.chat.instructions.clone(), window, cx));
         // web_search 的 Brave key（环境变量优先；文件里没有时输入框留空）
         let brave = std::env::var(claudesktop_builtin::websearch::BRAVE_KEY_ENV)
             .ok()
@@ -1734,36 +1734,32 @@ impl ChatApp {
     fn render_chat(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let path = f.chat_instructions.read(cx).value().trim().to_string();
-        let pick = Self::quiet_button(
-            "chat-instructions-pick",
-            IconAll::FolderOpen,
-            Surface::Paper,
-            cx,
-        )
-            .small()
-            .tooltip("选择一个说明文件")
-            .on_click(cx.listener(|_, _, window, cx| {
-                let rx = cx.prompt_for_paths(PathPromptOptions {
-                    files: true,
-                    directories: false,
-                    multiple: false,
-                    prompt: Some("选择聊天说明文件".into()),
-                });
-                cx.spawn_in(window, async move |this, cx| {
-                    if let Ok(Ok(Some(paths))) = rx.await
-                        && let Some(path) = paths.into_iter().next()
-                    {
-                        let _ = this.update_in(cx, |app, window, cx| {
-                            let text = path.to_string_lossy().into_owned();
-                            app.settings_form.chat_instructions.update(cx, |state, cx| {
-                                state.set_value(text, window, cx)
+        let pick =
+            Self::quiet_button("chat-instructions-pick", IconAll::FolderOpen, Surface::Paper, cx)
+                .small()
+                .tooltip("选择一个说明文件")
+                .on_click(cx.listener(|_, _, window, cx| {
+                    let rx = cx.prompt_for_paths(PathPromptOptions {
+                        files: true,
+                        directories: false,
+                        multiple: false,
+                        prompt: Some("选择聊天说明文件".into()),
+                    });
+                    cx.spawn_in(window, async move |this, cx| {
+                        if let Ok(Ok(Some(paths))) = rx.await
+                            && let Some(path) = paths.into_iter().next()
+                        {
+                            let _ = this.update_in(cx, |app, window, cx| {
+                                let text = path.to_string_lossy().into_owned();
+                                app.settings_form
+                                    .chat_instructions
+                                    .update(cx, |state, cx| state.set_value(text, window, cx));
+                                cx.notify();
                             });
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
-            }));
+                        }
+                    })
+                    .detach();
+                }));
         // 填了路径但文件不在：说在前面（不然聊天提示词里悄悄少一截）
         let missing = !path.is_empty() && !std::path::Path::new(&path).is_file();
         section(
@@ -1804,7 +1800,56 @@ impl ChatApp {
                 ]))
                 .when(missing, |d| {
                     d.child(note(IconAll::Info, "这个文件不存在，聊天不会带上它"))
-                }),
+                })
+                .children(self.render_no_vision(cx)),
+        )
+    }
+
+    /// 被端点回过 400、确认看不了图片的模型：列出来，能清掉（万一是误判）。
+    fn render_no_vision(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let models = self.settings.no_vision_models.clone();
+        if models.is_empty() {
+            return None;
+        }
+        let mut chips = div().h_flex().flex_wrap().gap_1p5();
+        for (i, model) in models.iter().enumerate() {
+            let name: SharedString = model.clone().into();
+            let picked = model.clone();
+            chips = chips.child(
+                div()
+                    .id(("no-vision", i))
+                    .h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .pl_2()
+                    .pr_1()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(SAND))
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK_SOFT))
+                    .child(div().font_family(MONO).child(name))
+                    .child(
+                        Self::quiet_button(("no-vision-drop", i), IconAll::X, Surface::Sand, cx)
+                            .xsmall()
+                            .tooltip("这个模型其实能看图")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let gone = picked.clone();
+                                this.save_ui_pref(
+                                    move |s| s.no_vision_models.retain(|m| *m != gone),
+                                    cx,
+                                );
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .v_flex()
+                .gap_2()
+                .child(note(IconAll::Info, "这些模型发图时被端点拒过，之后附上图会先提醒你换模型"))
+                .child(chips),
         )
     }
 

@@ -468,6 +468,9 @@ pub struct Settings {
     /// 当前空间（侧栏顶部「聊天 | 代码」）；切换即写回，下次启动回到上次那个。
     /// 默认 Code：升级后打开还是熟悉的样子
     pub space: Space,
+    /// 被端点回过 400、确认看不了图片的模型（下次直接按「看不了」处理）。
+    /// 自动记的，设置页模型那一行能看到、能清掉（万一是误判）
+    pub no_vision_models: Vec<String>,
     /// 聊天空间的一组设置（见 [`ChatSettings`]）
     pub chat: ChatSettings,
 }
@@ -585,6 +588,7 @@ impl Default for Settings {
             memory_suggest: false,
             auto_mode: AutoModeSettings::default(),
             space: Space::default(),
+            no_vision_models: Vec::new(),
             chat: ChatSettings::default(),
         }
     }

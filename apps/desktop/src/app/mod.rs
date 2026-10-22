@@ -1380,6 +1380,16 @@ impl ChatApp {
         if text.trim().is_empty() && self.pending.is_empty() && self.pending_files.is_empty() {
             return;
         }
+        // 还有图在后台转正 / 缩小：等处理完再发（缩略图上半透明占位，发送键也置灰）
+        if self.pending.iter().any(|p| p.preparing) {
+            self.toast(Notification::warning("图片还在处理，稍等一下再发"), cx);
+            return;
+        }
+        // 这个模型明确看不了图：不发，图留在输入框里（换模型后再发）
+        if let Some(why) = self.pending_images_unviewable() {
+            self.toast(Notification::warning(why), cx);
+            return;
+        }
         let active = self.active;
         // 还没接模型：默认内核起不来，发出去也只会石沉大海。留着输入框里的字，先指去配置
         if self.settings.needs_setup() && self.sessions[active].kernel != KernelChoice::Demo {
@@ -1525,6 +1535,72 @@ impl ChatApp {
         }
         self.pending.extend(images.into_iter().take(room));
         self.refresh_composer(cx);
+        // 新来的图片在后台转正 / 缩小（粘贴、拖放、选文件都走这里）
+        self.prepare_pending_images(cx);
+    }
+
+    /// 把刚收下的图片放到后台去转正 / 缩小 / 重编码（一张 1200 万像素的照片要一两百毫秒）。
+    ///
+    /// 处理期间缩略图先按原图半透明显示（不放转圈：输入区画在 `ChatApp` 里，循环动画会
+    /// 带着内容区一起重画，见 AGENTS.md「动效」）；还有图没处理完时发送键置灰。
+    pub(crate) fn prepare_pending_images(&mut self, cx: &mut Context<Self>) {
+        if !self.pending.iter().any(|p| p.preparing) {
+            return;
+        }
+        // 只处理还没处理过的那些，按下标找回（后台跑的时候列表可能被删过）
+        let jobs: Vec<(usize, SharedString, Vec<u8>)> = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.preparing)
+            .filter_map(|(i, p)| {
+                use base64::Engine as _;
+                let raw =
+                    base64::engine::general_purpose::STANDARD.decode(p.data.as_bytes()).ok()?;
+                Some((i, p.name.clone(), raw))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let quality = claudesktop_core::image_prep::Quality::Standard;
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    jobs.into_iter()
+                        .map(|(i, name, raw)| {
+                            let out = claudesktop_core::image_prep::prepare(&name, &raw, quality);
+                            (i, name, out)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                let mut failed: Vec<String> = Vec::new();
+                for (i, name, out) in results {
+                    let Some(slot) = app.pending.get_mut(i) else { continue };
+                    // 处理期间那一格被别人删了：跳过（下标可能已经变了，用名字再对一次）
+                    if slot.name != name {
+                        continue;
+                    }
+                    match out {
+                        Ok(prepared) => *slot = PendingImage::from_prepared(name, &prepared),
+                        Err(err) => {
+                            failed.push(err.message());
+                            slot.preparing = false;
+                        }
+                    }
+                }
+                for why in failed {
+                    app.toast(Notification::warning(why), cx);
+                }
+                // 处理失败的也留着（用户可以自己删），只是不再挂着「处理中」
+                app.refresh_composer(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 撤掉第 `i` 张待发送图片。
@@ -1537,8 +1613,26 @@ impl ChatApp {
 
     // ---------- 文本附件（只有聊天会话用：内容内联进消息） ----------
 
-    /// 把这些路径当聊天附件收下（文本内联，图片走图片附件，其余 toast 说明）。
-    /// 代码会话不走这里：那边还是把路径贴进输入框，等 agent 自己读。
+    /// 在当前会话的模型上，这些待发送图片有没有「看不了」的问题；返回提示里要说的那句话。
+    ///
+    /// 两种来源：能力表知道这个模型只吃文字（`vision_support == Some(false)`），或者用户
+    /// 之前被端点回过 400、已经记进 `no_vision_models`（见设置）。
+    pub(crate) fn pending_images_unviewable(&self) -> Option<String> {
+        if self.pending.is_empty() || self.sessions[self.active].kernel != KernelChoice::Builtin {
+            return None;
+        }
+        let model = &self.sessions[self.active].model_label;
+        let protocol = self.settings.builtin.current().protocol;
+        let known_bad =
+            self.settings.no_vision_models.iter().any(|m| m.eq_ignore_ascii_case(model.as_ref()));
+        let support = claudesktop_core::image_prep::vision_support(
+            &serde_json::to_string(&protocol).unwrap_or_default(),
+            model,
+        );
+        (known_bad || support == Some(false))
+            .then(|| format!("当前模型 {model} 看不了图片，换一个能看图的模型再发"))
+    }
+
     pub(crate) fn add_pending_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
         use claudesktop_core::attach;
         let mut images = Vec::new();
@@ -2015,6 +2109,19 @@ impl ChatApp {
                         }
                     }
                     let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
+                    // 端点回了「这个模型看不了图片」：把这轮用过的模型记进设置，
+                    // 下次附上图时直接按「看不了」提醒（设置页里能清掉）
+                    if let KernelEvent::PromptFailed { message } = &event
+                        && claudesktop_core::image_prep::image_rejection(message)
+                    {
+                        let model = self.sessions[idx].model_label.to_string();
+                        if !model.is_empty()
+                            && !self.settings.no_vision_models.iter().any(|m| *m == model)
+                        {
+                            let record = model.clone();
+                            self.save_ui_pref(move |s| s.no_vision_models.push(record.clone()), cx);
+                        }
+                    }
                     // 网关又记了请求：用量页的费用、请求跟着刷新（不用等这一轮跑完再手动重读）
                     if turn_over || matches!(event, KernelEvent::UsageUpdated { .. }) {
                         self.refresh_requests_soon(cx);

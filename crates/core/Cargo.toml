@@ -18,6 +18,9 @@ ratex-parser = "0.1.15"
 ratex-layout = "0.1.15"
 ratex-types = "0.1.15"
 ratex-svg = { version = "0.1.15", features = ["standalone", "embed-fonts"] }
+# 图片处理（见「设计说明-聊天与Code分离.md」第七章）：转正 / 缩小 / 重编码。
+# 版本和 gpui 依赖的那份一致（Cargo.lock 里已经有了），按需开格式特性
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 futures = { workspace = true }
 smol = { workspace = true }
 
