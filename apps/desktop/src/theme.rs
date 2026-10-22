@@ -511,6 +511,8 @@ pub fn apply_to_theme(theme: &mut gpui_kit::component::theme::Theme) {
     // 字体族每次都写：换回内嵌的 Inter 时，组件主题里还留着上一套，
     // 不覆盖的话输入框 / 开关会和根视图用两种字体
     theme.font_family = sans();
+    // Markdown 的行内代码 / 代码块取这一项（不设是平台默认：Windows 上 Consolas），和工具行统一用内嵌的等宽
+    theme.mono_font_family = MONO.into();
     // 组件圆角是 Pixels 不是 rem，按当前根字号换算，才跟着界面缩放：
     // 一般控件（按钮、输入框）对应 `rounded_lg`，对话框 / 通知对应 `rounded_xl`
     theme.radius = rems(0.5).to_pixels(root_font_size());

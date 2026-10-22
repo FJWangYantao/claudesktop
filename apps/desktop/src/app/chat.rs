@@ -404,10 +404,10 @@ impl ChatApp {
         // 和标题之间的空隙算在正文里，收到底时不剩一截
         let progress = motion::reveal_progress(("think", idx), open, window, cx);
         if progress > 0. && has_text {
-            let text = if streaming { close_dangling_markup(text) } else { Cow::Borrowed(text) };
+            let text = reading_markdown(text.trim(), streaming);
             // 字号 / 颜色要设在 TextView 自己身上（它按主题取默认值，不继承外层）
             let body = div().pt_1().pl(STEP_INDENT).child(
-                TextView::markdown(("think-md", idx), SharedString::from(text.trim().to_string()))
+                TextView::markdown(("think-md", idx), text)
                     .style(markdown_style().paragraph_gap(rems(0.5)))
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
@@ -744,11 +744,14 @@ impl ChatApp {
                     .border_color(rgb(LINE))
                     .bg(rgb(CARD))
                     .child(
-                        TextView::markdown(("compaction-summary", idx), summary.clone())
-                            .style(markdown_style())
-                            .text_size(TEXT_BODY)
-                            .text_color(rgb(INK))
-                            .line_height(LEADING),
+                        TextView::markdown(
+                            ("compaction-summary", idx),
+                            reading_markdown(summary, false),
+                        )
+                        .style(markdown_style())
+                        .text_size(TEXT_BODY)
+                        .text_color(rgb(INK))
+                        .line_height(LEADING),
                     ),
             );
             col = col.child(Reveal::new(("compaction-body", idx), progress, body));
@@ -1906,8 +1909,7 @@ impl ChatApp {
             ChatItem::Agent(text) => {
                 let s = self.session();
                 let streaming = s.busy && idx + 1 == s.transcript.len();
-                let text =
-                    if streaming { close_dangling_markup(text).into_owned() } else { text.clone() };
+                let text = reading_markdown(text, streaming);
                 // 代码块右上角：语言名 + 「复制」（点完短暂变对勾，和消息下方的复制同一套状态）
                 let token = s.token;
                 let copied_block = match self.copied {
@@ -1917,7 +1919,7 @@ impl ChatApp {
                 let copied_at = self.copied_at;
                 let app = cx.entity().downgrade();
                 let body = div().min_w_0().text_size(TEXT_LARGE).line_height(LEADING).child(
-                    TextView::markdown(("agent", idx), SharedString::from(text))
+                    TextView::markdown(("agent", idx), text)
                         .style(markdown_style())
                         .stream_fade(true)
                         .code_block_actions(move |block, window, cx| {
@@ -2080,6 +2082,12 @@ fn distance_to_end(list: &ListState) -> Pixels {
     (list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y).max(px(0.))
 }
 
+/// 回复 / 思考 / 摘要交给 `TextView` 前的整理：流式中补齐半截标记，再收掉全角标点旁的空格。
+pub(super) fn reading_markdown(text: &str, streaming: bool) -> SharedString {
+    let text = if streaming { close_dangling_markup(text) } else { Cow::Borrowed(text) };
+    SharedString::from(tidy_cjk_spacing(&text).into_owned())
+}
+
 /// 流式输出停在半截标记上时（`` `foo `` 或没收尾的 ``` 围栏、`**粗体`），渲染前临时补齐，
 /// 免得标记原样露出来、等收尾后整段又跳成代码 / 粗体样式。
 pub(super) fn close_dangling_markup(text: &str) -> Cow<'_, str> {
@@ -2104,6 +2112,114 @@ pub(super) fn close_dangling_markup(text: &str) -> Cow<'_, str> {
         Cow::Owned(format!("{text}`"))
     } else {
         close_dangling_bold(text)
+    }
+}
+
+/// 全角标点（自带半个字宽的留白）：旁边再有半角空格，间隙就显得比别处宽。
+fn is_fullwidth_punct(c: char) -> bool {
+    "，。、；：？！（）【】《》「」『』〔〕〈〉〖〗".contains(c)
+}
+
+/// 渲染前去掉紧挨全角标点的半角空格（`提交： \`a\``、`grants （24`），全角标点自己的留白够了。
+/// 代码（围栏、行内）原样不动；行首的缩进和块标记（`- `、`1. `、`> `、`# `）、行尾空格（硬换行）不动，
+/// 只删两边都有字的行中空格。复制仍取原文。
+pub(super) fn tidy_cjk_spacing(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(is_fullwidth_punct) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let fence = line.trim_start();
+        if fence.starts_with("```") || fence.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        let start = block_prefix_len(line);
+        out.push_str(&line[..start]);
+        tidy_line(&line[start..], &mut out);
+    }
+    if out == text { Cow::Borrowed(text) } else { Cow::Owned(out) }
+}
+
+/// 行首缩进 + 块标记（引用、列表、标题）连同后面的空格一共多少字节：这段不碰，
+/// 否则 `- （注）` 删了空格就不再是列表。
+fn block_prefix_len(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let spaces = |mut i: usize| {
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        i
+    };
+    let mut i = spaces(0);
+    loop {
+        let rest = &bytes[i..];
+        let marker = match rest.first() {
+            Some(b'>') => 1,
+            Some(b'-' | b'*' | b'+') if rest.get(1).is_some_and(|b| *b == b' ') => 1,
+            Some(b'#') => {
+                let n = rest.iter().take_while(|b| **b == b'#').count();
+                if rest.get(n).is_some_and(|b| *b == b' ') { n } else { 0 }
+            }
+            Some(b'0'..=b'9') => {
+                let n = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+                let dot = rest.get(n).is_some_and(|b| *b == b'.' || *b == b')');
+                if dot && rest.get(n + 1).is_some_and(|b| *b == b' ') { n + 1 } else { 0 }
+            }
+            _ => 0,
+        };
+        if marker == 0 {
+            return i;
+        }
+        i = spaces(i + marker);
+    }
+}
+
+/// 一行正文（块标记之后）：行内代码原样抄，代码外删紧挨全角标点的空格。
+fn tidy_line(line: &str, out: &mut String) {
+    let mut rest = line;
+    // 上一个写出去的字（代码段算普通字，不是全角标点）
+    let mut prev: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        if c == '`' {
+            let ticks = rest.len() - rest.trim_start_matches('`').len();
+            let fence = &rest[..ticks];
+            // 找恰好同样长度的一串反引号收尾；找不到就当普通字符
+            let body = &rest[ticks..];
+            let close = body.match_indices(fence).find(|(at, _)| {
+                !body[at + ticks..].starts_with('`') && !body[..*at].ends_with('`')
+            });
+            let span = match close {
+                Some((at, _)) => ticks + at + ticks,
+                None => ticks,
+            };
+            out.push_str(&rest[..span]);
+            prev = Some('`');
+            rest = &rest[span..];
+            continue;
+        }
+        if c == ' ' {
+            let run = rest.len() - rest.trim_start_matches(' ').len();
+            let next = rest[run..].chars().next().filter(|n| *n != '\n' && *n != '\r');
+            let squeeze = match (prev, next) {
+                (Some(p), Some(n)) => is_fullwidth_punct(p) || is_fullwidth_punct(n),
+                _ => false,
+            };
+            if !squeeze {
+                out.push_str(&rest[..run]);
+            }
+            rest = &rest[run..];
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
     }
 }
 
@@ -2165,5 +2281,56 @@ mod tests {
         // 行内代码里的星号、上一行的星号不算
         assert_eq!(close_dangling_markup("用 `**` 表示粗体"), "用 `**` 表示粗体");
         assert_eq!(close_dangling_markup("**a\nb"), "**a\nb");
+    }
+
+    /// 中文避头尾是 vendor 里 gpui-pre 的补丁（见 `vendor/README.md`）：升级 gpui-kit 时补丁丢了这里会挂。
+    /// 用 `NoopTextSystem`（每个字等宽）驱动真的 `LineWrapper`。
+    #[core::prelude::v1::test]
+    fn cjk_wrap_follows_kinsoku() {
+        let system = std::sync::Arc::new(TextSystem::new(std::sync::Arc::new(NoopTextSystem)));
+        let mut wrapper = system.line_wrapper(font("Inter"), px(16.));
+        // 第一行之后各行的开头：按 `fits` 那么宽折行（`NoopTextSystem` 里每个字都是 0.6em）
+        let mut wrap = |text: &str, fits: &str| {
+            let width = px(16. * 0.6 * fits.chars().count() as f32 + 0.5);
+            wrapper
+                .wrap_line(&[LineFragment::text(text)], width, IndentAdjustment::default())
+                .map(|boundary| text[boundary.ix..].to_string())
+                .collect::<Vec<_>>()
+        };
+        // 普通汉字之间照样能断
+        assert_eq!(wrap("一二三四五六", "一二三"), ["四五六"]);
+        // 收尾标点不落行首：前一个字跟着下去
+        assert_eq!(wrap("一二三，四", "一二三"), ["三，四"]);
+        assert_eq!(wrap("一二三）、", "一二三"), ["三）、"]);
+        // 开头标点不留行尾
+        assert_eq!(wrap("一二三（四五", "一二三（"), ["（四五"]);
+        // `——` 不断开
+        assert_eq!(wrap("一二——三", "一二—"), ["——三"]);
+    }
+
+    #[core::prelude::v1::test]
+    fn spaces_beside_fullwidth_punct_are_squeezed() {
+        let tidy = |s| tidy_cjk_spacing(s).into_owned();
+        assert_eq!(
+            tidy("- 提交： `8486c35` （24 个文件，+12 / −2）"),
+            "- 提交：`8486c35`（24 个文件，+12 / −2）"
+        );
+        assert_eq!(tidy("通过 。下一步"), "通过。下一步");
+        // 没有全角标点：原样
+        assert!(matches!(tidy_cjk_spacing("a  b `c`"), Cow::Borrowed(_)));
+        // 块标记后面的空格、缩进、行尾硬换行不动
+        assert_eq!(
+            tidy("- （注）\n1. 「a」\n> ：b\n## 《c》\n  - （d）"),
+            "- （注）\n1. 「a」\n> ：b\n## 《c》\n  - （d）"
+        );
+        assert_eq!(tidy("完成。  \n下一行"), "完成。  \n下一行");
+        // 代码里的不动
+        assert_eq!(tidy("用 `a ，b` 和 ``x （`y`） z`` 。"), "用 `a ，b` 和 ``x （`y`） z``。");
+        assert_eq!(
+            tidy("```\nlet s = \"a ，b\";\n```\n完 。"),
+            "```\nlet s = \"a ，b\";\n```\n完。"
+        );
+        // 没收尾的反引号当普通字
+        assert_eq!(tidy("单个 ` ，号"), "单个 `，号");
     }
 }
