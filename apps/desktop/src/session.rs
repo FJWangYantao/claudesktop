@@ -19,6 +19,8 @@ pub struct Session {
     pub title: SharedString,
     /// 这个会话跑在哪种内核上（空会话可以换，有对话后固定）
     pub kernel: KernelChoice,
+    /// 会话绑定的内核槽 key（[`KernelChoice::key`]）：事件按它找槽
+    pub kernel_key: String,
     /// 创建时的令牌，用来把内核回的 Started / SessionFailed 对回这个会话
     pub token: u64,
     /// ACP sessionId（Started 之后才有；演示回放模式为 None）
@@ -50,6 +52,20 @@ pub struct Session {
     /// 任务：建立时没为它选过文件夹（跑在默认目录里）。侧栏归到「任务」区，
     /// 在输入框上方的目录菜单里选个文件夹就成了项目会话
     pub task: bool,
+    /// 会话跑在自己的 git worktree 里（`cwd` 就是 worktree 目录）：侧栏仍归到主项目组，
+    /// 顶栏的分支 chip 用它（见 `app/worktree.rs`）
+    pub worktree: Option<claudesktop_core::WorktreeMeta>,
+    /// 正在后台建 worktree（建好了 `worktree` 才有值）：目录 chip 显示转圈，消息先排队
+    pub worktree_busy: Option<String>,
+    /// worktree 的最新状态（脏了几个文件、领先 / 落后）：`None` 内的 `None` = 还没读到，
+    /// 外层 `None` = 没刷过。点开分支菜单、一轮结束时刷新，不在 render 里跑
+    pub worktree_state: Option<Option<claudesktop_core::git::WorktreeStatus>>,
+    /// 现在不能一键合并回主目录的原因（主目录脏了 / 不在 base 上），和 `worktree_state` 一起刷新
+    pub worktree_blocker: Option<String>,
+    /// 项目配置里的 `worktree` 一栏（`refresh_worktree` 里读好，菜单只看这份，不在 render 里跑 git）
+    pub worktree_config: Option<claudesktop_core::project::WorktreeConfig>,
+    /// 这次运行里试过重新检出丢了的 worktree 没有（只试一次，见 `ChatApp::repair_worktree`）
+    pub worktree_repair_tried: bool,
     /// 持久化元信息：首条消息发出后才建档（空会话不落盘）
     pub meta: Option<SessionMeta>,
     /// 追加式日志；恢复的会话在第一次写入时才打开
@@ -60,9 +76,16 @@ pub struct Session {
     pub resuming: bool,
     /// 内核会话建立前选的模型：Started 之后再告诉内核
     pub pending_model: Option<String>,
+    /// agent 档案记的上次模型（`AcpSettings::last_model` 的快照）：Started 后 agent 没报模型就切过去
+    pub last_model: Option<String>,
     /// 待同步给内核的权限模式：新会话的默认模式（设置里开着「自动」时是 `"auto"`），
     /// 或用户在会话建立前自己选的。`Started` 时交给内核后清掉
     pub pending_mode: Option<String>,
+    /// 会话级思考档位（输入框那个下拉选的）；`None` = 跟随设置里的档案，
+    /// 「默认」这一项也是 `None`（不发字段）
+    pub thinking: Option<claudesktop_builtin::ThinkingLevel>,
+    /// 会话建立前选的档位：`Started` 时再交给内核（和 `pending_model` 一个套路）
+    pub pending_thinking: Option<Option<claudesktop_builtin::ThinkingLevel>>,
     /// 本轮累计的 token，一轮结束时写进日志后清零
     pub turn_usage: TurnUsage,
     /// 本轮收到、端点还没数过的输出（正文 + 思考）：流式期间状态行据此估算 token，
@@ -116,6 +139,22 @@ pub struct Session {
     /// 最新一轮在审查页里撤回过块：下一条消息发出时附上说明（见 `claudesktop_core::review::review_note`）。
     /// 只是「要不要去读日志」的提示，说明本身从日志现算
     pub review_pending: bool,
+    /// 展开了全部文件的改动卡片（按回复末尾那一行的下标）。只在内存里
+    pub changes_open: HashSet<usize>,
+    /// 最新一轮的改动撤回到了什么程度（审查页或改动卡片上的「撤回」写盘后更新）。
+    /// 只在内存里：重启后卡片照常显示「撤回」，再点一次结果不变
+    pub undo: Option<TurnUndo>,
+}
+
+/// 某一轮的改动撤回到了什么程度，见 [`Session::undo`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TurnUndo {
+    /// 第几条用户消息那一轮（从 0 数）
+    pub turn: usize,
+    /// 能撤回的块全撤回了（否则是撤回了一部分）
+    pub all: bool,
+    /// 对着 diff 数过；重开的会话从日志只看得出「撤回过」，切过来时再数（`ChatApp::settle_undo`）
+    pub exact: bool,
 }
 
 /// 一个子任务（自研内核的 `task` 调用）的过程：子 agent 的思考、回复和工具调用。
@@ -270,13 +309,16 @@ fn new_list_state() -> ListState {
 impl Session {
     /// 新会话；演示回放不需要内核会话，直接可用。
     pub fn new(token: u64, kernel: KernelChoice, cwd: PathBuf) -> Self {
+        let kernel_key = kernel.key();
+        let is_demo = kernel == KernelChoice::Demo;
         Self {
             title: "新会话".into(),
             kernel,
+            kernel_key,
             token,
             acp_id: None,
             requested: false,
-            ready: kernel == KernelChoice::Demo,
+            ready: is_demo,
             transcript: Vec::new(),
             busy: false,
             compact_turn: false,
@@ -287,17 +329,25 @@ impl Session {
             modes: default_modes(),
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
-            model_label: if kernel == KernelChoice::Demo { "GLM-5.3" } else { UNKNOWN_MODEL }
-                .into(),
+            model_label: if is_demo { "GLM-5.3" } else { UNKNOWN_MODEL }.into(),
             autoprompt: None,
             cwd,
             task: false,
+            worktree: None,
+            worktree_busy: None,
+            worktree_state: None,
+            worktree_blocker: None,
+            worktree_config: None,
+            worktree_repair_tried: false,
             meta: None,
             log: None,
             restored: false,
             resuming: false,
             pending_model: None,
+            last_model: None,
             pending_mode: None,
+            thinking: None,
+            pending_thinking: None,
             turn_usage: TurnUsage::default(),
             turn_streamed: Streamed::default(),
             turn_started: None,
@@ -323,25 +373,38 @@ impl Session {
             subagents: HashMap::new(),
             viewing_task: None,
             review_pending: false,
+            changes_open: HashSet::new(),
+            undo: None,
         }
     }
 
     /// 从持久化记录重放出一个历史会话：事件走与实时完全相同的映射。
-    pub fn from_records(token: u64, meta: SessionMeta, records: Vec<Record>) -> Self {
-        let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent), meta.cwd.clone());
+    pub fn from_records(
+        token: u64,
+        meta: SessionMeta,
+        records: Vec<Record>,
+        acp: &crate::settings::AcpSettings,
+    ) -> Self {
+        let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent, acp), meta.cwd.clone());
         s.ready = false;
+        // 不套档案的 `last_model`：历史会话用的是它自己当时的模型，不该被别的会话最近选的改掉
         // 历史会话不该被「新对话默认自动」改掉模式：它的模式由重建的日志决定
         s.pending_mode = None;
         // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
         s.task = meta.task;
+        // 跑在 git worktree 里的会话：侧栏仍归到主项目，分支 chip 用它
+        s.worktree = meta.worktree.clone();
         s.title = meta.title.clone().into();
         s.restored = true;
         s.replaying = true;
+        // 最新一轮每个文件最后一次写盘时处于「已撤回」的块（agent 写的清空），恢复改动卡片的撤回状态
+        let mut reverted_now: HashMap<String, bool> = HashMap::new();
         // 回退过的轮次不显示（日志只追加，读的时候折算）
         for record in claudesktop_core::effective(&records) {
             match record {
                 Record::User { text, images, .. } => {
                     s.review_pending = false;
+                    reverted_now.clear();
                     s.transcript.push(ChatItem::User {
                         text: text.into(),
                         images: images.iter().map(PathBuf::from).collect(),
@@ -401,8 +464,18 @@ impl Session {
                     s.note(rewind_note(conversation, files, &prompt))
                 }
                 // 检查点只在回退 / 审查时用，界面上不显示
-                Record::FileChanged { reverted, .. } => s.review_pending |= reverted.is_some(),
+                Record::FileChanged { path, reverted, .. } => {
+                    s.review_pending |= reverted.is_some();
+                    reverted_now.insert(path, reverted.is_some_and(|r| !r.is_empty()));
+                }
             }
+        }
+        // 撤回了多少要对着 diff 才数得清，这里只知道「撤回过」：先按撤回了一部分显示，
+        // 点开审查页或再点一次「撤回」时按实际情况更新（`ChatApp::sync_undo`）
+        if reverted_now.values().any(|r| *r)
+            && let Some(turn) = s.latest_turn()
+        {
+            s.undo = Some(TurnUndo { turn, all: false, exact: false });
         }
         // 上次退出时还在进行的东西一律收尾
         s.finish_thinking();
@@ -497,6 +570,10 @@ impl Session {
             (self.is_turn_end(i), false)
         };
         (self.transcript[i].fingerprint(), view, live, layout).hash(&mut h);
+        // 回复末尾的改动卡片：展开了全部文件、撤回过，高度和按钮都会变
+        if live.0 {
+            (self.changes_open.contains(&i), self.latest_undo()).hash(&mut h);
+        }
         h.finish()
     }
 
@@ -648,6 +725,16 @@ impl Session {
         }
     }
 
+    /// 对话里最后一条用户消息是第几条（从 0 数）。
+    pub fn latest_turn(&self) -> Option<usize> {
+        self.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count().checked_sub(1)
+    }
+
+    /// 最新一轮的撤回情况（[`Session::undo`] 记的是更早一轮时不算）。
+    pub fn latest_undo(&self) -> Option<TurnUndo> {
+        self.undo.filter(|u| Some(u.turn) == self.latest_turn())
+    }
+
     /// `ix` 所在这一轮（上一条用户消息之后、下一条之前）改过的文件。
     pub fn turn_files(&self, ix: usize) -> Vec<TurnFile> {
         let is_user = |i: &ChatItem| matches!(i, ChatItem::User { .. });
@@ -694,6 +781,12 @@ impl Session {
 
     pub fn has_user_message(&self) -> bool {
         self.transcript.iter().any(|i| matches!(i, ChatItem::User { .. }))
+    }
+
+    /// 侧栏分组按哪个目录算：worktree 会话归到**主仓库**那一组（`cwd` 是数据目录里的 worktree，
+    /// 不该单独占一组），其余就是工作目录。
+    pub fn group_dir(&self) -> &std::path::Path {
+        self.worktree.as_ref().map_or(self.cwd.as_path(), |w| w.repo.as_path())
     }
 
     /// 新会话默认的权限模式（设置里开着「自动」时是「自动」）：先把这一项补进模式表并选中
@@ -822,11 +915,11 @@ impl Session {
     }
 
     /// 整段对话导出为 Markdown（「分享」按钮用）。
-    pub fn to_markdown(&self) -> String {
+    pub fn to_markdown(&self, acp: &crate::settings::AcpSettings) -> String {
         let mut out = format!(
             "# {}\n\n> 内核：{} · 模型：{}\n\n",
             self.title,
-            self.kernel.label(),
+            self.kernel.label(acp),
             self.model_label
         );
         for item in &self.transcript {
@@ -1041,6 +1134,10 @@ impl Session {
         self.restored = self.has_user_message();
         // 当前模式随新内核会话重新交回去：用户选的（或新对话默认的）模式不该因为重连丢掉
         self.pending_mode = self.modes.get(self.permission_mode).map(|m| m.id.clone());
+        // 会话级思考档位同理：新内核会话里是「默认」，选过的要重新交回去
+        if self.thinking.is_some() {
+            self.pending_thinking = Some(self.thinking);
+        }
     }
 
     /// 内核致命错误：这个会话不再可用。
@@ -1132,6 +1229,16 @@ impl Session {
                         Ok(()) => self.model_label = model.into(),
                         Err(err) => self.note(format!("切换模型失败：{err}")),
                     }
+                }
+                // agent 档案记着上次用的模型：新会话接上来就切过去（agent 没报模型时才补）。
+                // 切不过去（agent 那边已经没有这个模型）就算了，不往每个新对话里写一条失败
+                else if let Some(model) = self.last_model.take()
+                    && self.model_label == UNKNOWN_MODEL
+                    && let Some(kernel) = kernel
+                    && let Some(id) = self.acp_id.clone()
+                    && kernel.set_model(&id, &model).is_ok()
+                {
+                    self.model_label = model.into();
                 }
                 return self.autoprompt.take();
             }
@@ -1324,7 +1431,8 @@ impl Session {
             | KernelEvent::FileChanged { .. }
             | KernelEvent::McpStatus { .. }
             | KernelEvent::BackgroundTasks { .. }
-            | KernelEvent::MemoryChanged { .. } => {}
+            | KernelEvent::MemoryChanged { .. }
+            | KernelEvent::MemorySuggested { .. } => {}
             KernelEvent::TitleGenerated { title } => {
                 // 模型起的标题替换截断版（用户手动改过的不覆盖）
                 if !self.renamed {
@@ -1514,7 +1622,7 @@ mod tests {
         s.transcript.push(agent);
         s.transcript.push(tool);
         s.transcript.push(plan);
-        let md = s.to_markdown();
+        let md = s.to_markdown(&Default::default());
         assert!(md.starts_with("# 测试会话"));
         assert!(md.contains("## 我"));
         assert!(md.contains("你好"));
@@ -1587,6 +1695,7 @@ mod tests {
             updated_ms: 0,
             archived: false,
             task: false,
+            worktree: None,
         }
     }
 
@@ -1651,7 +1760,7 @@ mod tests {
             ev(KernelEvent::AgentThoughtChunk { text: "旧的".into() }),
             permission(2),
         ];
-        let s = Session::from_records(7, meta(), records);
+        let s = Session::from_records(7, meta(), records, &Default::default());
 
         assert!(s.restored && !s.ready && !s.busy);
         assert_eq!(s.title.as_ref(), "读 README");
@@ -1750,7 +1859,7 @@ mod tests {
                 ),
             }),
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         let ChatItem::Tool(card) = &s.transcript[1] else { panic!("tool card") };
         let paths: Vec<_> = card.diffs.iter().map(|d| d.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "b.txt"]);
@@ -2007,7 +2116,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn detach_kernel_interrupts_turn_and_marks_for_resume() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.apply_event(
             KernelEvent::Started {
                 token: 1,
@@ -2052,7 +2161,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn activity_follows_turn_and_usage_accumulates() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         // 上一轮遗留的执行中工具不算进本轮
         s.transcript.push(ChatItem::User { text: "上一轮".into(), images: Vec::new() });
         s.apply_event(
@@ -2137,7 +2246,7 @@ mod tests {
     /// 状态行上的实时 token：端点报过的 + 之后还在流式（靠字数估）的，端点一报就清掉估算。
     #[core::prelude::v1::test]
     fn live_output_tokens_adds_reported_and_streamed() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.begin_turn();
         assert_eq!(s.live_output_tokens(), 0);
@@ -2168,7 +2277,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn live_thinking_is_timed_once() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.apply_event(thought("想"), None);
         s.apply_event(thought("再想"), None);
@@ -2234,14 +2343,14 @@ mod tests {
         assert_eq!(s.modes[s.permission_mode].id, "default");
 
         // 内核不认这个模式（ACP agent）：退回它报的那个，不留下「自动」
-        let mut s = Session::new(2, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(2, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.default_to(MODE_AUTO_ID);
         s.apply_event(started(&[("default", "逐项确认"), ("plan", "计划")]), None);
         assert_eq!(s.modes[s.permission_mode].id, "default");
         assert!(s.modes.iter().all(|m| m.id != MODE_AUTO_ID));
 
         // 内核报的当前模式不在第一位：退回的是它，不是列表第一项
-        let mut s = Session::new(3, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(3, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.default_to(MODE_AUTO_ID);
         s.apply_event(started(&[("plan", "计划"), ("default", "逐项确认")]), None);
         assert_eq!(s.modes[s.permission_mode].id, "default");
@@ -2251,7 +2360,7 @@ mod tests {
     fn history_sessions_keep_their_own_mode() {
         let mut meta = meta();
         meta.agent = "builtin:test".into();
-        let s = Session::from_records(1, meta, vec![Record::user("问")]);
+        let s = Session::from_records(1, meta, vec![Record::user("问")], &Default::default());
         assert!(s.pending_mode.is_none());
     }
 
@@ -2260,15 +2369,60 @@ mod tests {
         // 侧栏按元信息把对话分到项目区 / 任务区，重放时不能丢
         let mut with_task = meta();
         with_task.task = true;
-        let s = Session::from_records(1, with_task, vec![Record::user("问")]);
+        let s = Session::from_records(1, with_task, vec![Record::user("问")], &Default::default());
         assert!(s.task);
-        let s = Session::from_records(2, meta(), vec![Record::user("问")]);
+        let s = Session::from_records(2, meta(), vec![Record::user("问")], &Default::default());
         assert!(!s.task);
     }
 
     #[core::prelude::v1::test]
+    fn restored_sessions_remember_undone_changes() {
+        use claudesktop_core::review::HunkRange;
+        let range = HunkRange { old_start: 1, old_len: 1, new_start: 1, new_len: 2 };
+        let changed = |path: &str, reverted: Option<Vec<HunkRange>>| Record::FileChanged {
+            path: path.into(),
+            before: Some("a".into()),
+            after: Some("b".into()),
+            reverted,
+        };
+        // 最新一轮在审查页里撤回过：先记成「撤回过、没数清」，切过来时再数
+        let s = Session::from_records(
+            1,
+            meta(),
+            vec![
+                Record::user("问"),
+                changed("a.rs", None),
+                changed("a.rs", Some(vec![range])),
+                changed("b.rs", None),
+            ],
+            &Default::default(),
+        );
+        assert_eq!(s.latest_undo(), Some(TurnUndo { turn: 0, all: false, exact: false }));
+        // 撤回后又全部恢复（撤回集合清空）：不算撤回过
+        let s = Session::from_records(
+            1,
+            meta(),
+            vec![
+                Record::user("问"),
+                changed("a.rs", Some(vec![range])),
+                changed("a.rs", Some(vec![])),
+            ],
+            &Default::default(),
+        );
+        assert_eq!(s.latest_undo(), None);
+        // 撤回的是上一轮：新的一轮不带
+        let s = Session::from_records(
+            1,
+            meta(),
+            vec![Record::user("问"), changed("a.rs", Some(vec![range])), Record::user("再问")],
+            &Default::default(),
+        );
+        assert_eq!(s.latest_undo(), None);
+    }
+
+    #[core::prelude::v1::test]
     fn steps_group_and_fold() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.begin_turn();
         // 只有一步：照常一行，没有组头
@@ -2315,7 +2469,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn diff_tools_and_permissions_split_groups() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.apply_event(read("a"), None);
         s.apply_event(read("b"), None);
@@ -2392,7 +2546,7 @@ mod tests {
             ev(read("d")),
             ask(3, "d"),
         ];
-        let s = Session::from_records(7, meta(), records);
+        let s = Session::from_records(7, meta(), records, &Default::default());
         let grants: Vec<Option<GrantKind>> = s
             .transcript
             .iter()
@@ -2428,7 +2582,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn plan_pins_while_turn_runs() {
-        let mut s = Session::new(1, KernelChoice::Acp, PathBuf::from("."));
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
         s.begin_turn();
         let plan = |statuses: &[&str]| KernelEvent::PlanReplaced {
@@ -2472,7 +2626,7 @@ mod tests {
             ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
             Record::Rewind { turn: 1, conversation: true, files: 1, prompt: "第二问".into() },
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         let users = s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count();
         assert_eq!(users, 1);
         assert!(matches!(
@@ -2490,10 +2644,12 @@ mod tests {
             reverted: Some(Vec::new()),
         };
         let mut records = vec![Record::user("改"), reviewed];
-        assert!(Session::from_records(1, meta(), records.clone()).review_pending);
+        assert!(
+            Session::from_records(1, meta(), records.clone(), &Default::default()).review_pending
+        );
         // 已经发过下一条（说明附在那条上了）
         records.push(Record::user("继续"));
-        assert!(!Session::from_records(1, meta(), records).review_pending);
+        assert!(!Session::from_records(1, meta(), records, &Default::default()).review_pending);
     }
 
     #[core::prelude::v1::test]
@@ -2511,7 +2667,7 @@ mod tests {
                 context_tokens: None,
             },
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         let summary = s.turn_summary(1).expect("回复那行有统计");
         assert_eq!(summary.elapsed_ms, Some(65_000));
         assert_eq!((summary.usage.input, summary.usage.output), (10, 2));
@@ -2543,7 +2699,7 @@ mod tests {
                 context_tokens: Some(2000),
             },
         ];
-        let s = Session::from_records(1, meta(), records);
+        let s = Session::from_records(1, meta(), records, &Default::default());
         // 最后一次上报的模型胜出；早于它的照样能恢复
         assert_eq!(s.model_label.as_ref(), "other-model");
         assert_eq!(s.context_tokens, 2000);
@@ -2560,7 +2716,7 @@ mod tests {
                 context_tokens: Some(1508),
             },
         ];
-        let s = Session::from_records(1, meta(), first);
+        let s = Session::from_records(1, meta(), first, &Default::default());
         assert_eq!(s.model_label.as_ref(), "cn:deepseek-v4.1-flash");
 
         // 旧日志没记模型：维持「默认模型」
@@ -2575,7 +2731,7 @@ mod tests {
                 context_tokens: None,
             },
         ];
-        let s = Session::from_records(1, meta(), none);
+        let s = Session::from_records(1, meta(), none, &Default::default());
         assert_eq!(s.model_label.as_ref(), UNKNOWN_MODEL);
     }
 

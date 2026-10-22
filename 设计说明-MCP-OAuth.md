@@ -1,6 +1,6 @@
 # 设计说明：MCP 远程服务的 OAuth 登录
 
-> 状态：第 1～3 期均已实现（2026-10-20）。仓库里能连上 DCR 托管的远程服务、自动刷新令牌、
+> 状态：第 1～3 期均已实现（2026-10-20，状态行更正于 2026-10-22）。仓库里能连上 DCR 托管的远程服务、自动刷新令牌、
 > 设置页有「登录」和「清除登录状态」。做法与前文的出入见第九章末尾。
 > 代码落点：`crates/builtin/src/mcp_oauth.rs`、`mcp.rs` / `mcp_http.rs`、`crates/core/src/lib.rs`（`McpState`）、
 > `apps/desktop/src/app/mcp_view.rs`。

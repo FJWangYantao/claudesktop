@@ -25,48 +25,26 @@ use std::rc::Rc;
 pub(super) struct MenuChip {
     icon: Option<IconAll>,
     label: SharedString,
-    /// 纯文字（输入框下方那一行）：不带图标和展开箭头，靠悬停底色提示可点
+    /// 纯文字（输入框工具栏里的模型）：不带图标和展开箭头，靠悬停底色提示可点
     plain: bool,
-    /// 沙色实底，和输入框上方那排静态 chip 同款
+    /// 沙色实底（筛选条这类放在纸底上、要一眼看出能点的 chip）
     filled: bool,
-    /// 文字后面跟着的增删行数（绿 +N、红 −M）
-    stat: Option<(u32, u32)>,
     open: bool,
 }
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self {
-            icon: Some(icon),
-            label: label.into(),
-            plain: false,
-            filled: false,
-            stat: None,
-            open: false,
-        }
+        Self { icon: Some(icon), label: label.into(), plain: false, filled: false, open: false }
     }
 
-    /// 只有文字，不带展开箭头（输入框下方的权限模式 / 模型）。
+    /// 只有文字，不带展开箭头（输入框工具栏里的模型）。
     pub(super) fn plain(label: impl Into<SharedString>) -> Self {
-        Self {
-            icon: None,
-            label: label.into(),
-            plain: true,
-            filled: false,
-            stat: None,
-            open: false,
-        }
+        Self { icon: None, label: label.into(), plain: true, filled: false, open: false }
     }
 
-    /// 沙色实底（输入框上方的项目目录），与旁边的「本地」chip 并排不突兀。
+    /// 沙色实底（筛选条、「添加」这类放在纸底上的 chip）。
     pub(super) fn filled(mut self) -> Self {
         self.filled = true;
-        self
-    }
-
-    /// 文字后面跟上增删行数（回复末尾的「改动 N 个文件」）。
-    pub(super) fn stat(mut self, added: u32, removed: u32) -> Self {
-        self.stat = Some((added, removed));
         self
     }
 }
@@ -94,12 +72,9 @@ impl RenderOnce for MenuChip {
             chip = chip.child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)));
         }
         chip = chip.child(
-            // chip 一律次要字号，与输入框上方的环境 / 项目 chip 同档
+            // chip 一律次要字号
             div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(self.label),
         );
-        if let Some((added, removed)) = self.stat {
-            chip = chip.child(diff_stat(added, removed));
-        }
         if !self.plain {
             chip = chip.child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
         }
@@ -299,6 +274,48 @@ pub(super) fn font_menu_item(
                         .text_color(rgb(INK))
                         .child(sample.into()),
                 ),
+        )
+        .when(active, |d| {
+            d.child(Icon::new(IconAll::Check).size_4().flex_shrink_0().text_color(rgb(CORAL)))
+        })
+}
+
+/// 配色菜单条目：上面一行名称 + 灰色说明，下面一行色块预览
+/// （纸底 / 侧栏 / 卡片 / 强调 / 正文），行尾当前项打勾。
+/// `palette` 是这套色板在 `theme::PALETTES` 里的下标，色块经 `theme::swatch` 取色。
+pub(super) fn theme_menu_item(
+    id: impl Into<ElementId>,
+    name: impl Into<SharedString>,
+    desc: impl Into<SharedString>,
+    palette: usize,
+    active: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h_flex()
+        .items_center()
+        .gap_2p5()
+        .px_2p5()
+        .py_2()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(HOVER)))
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(name.into()))
+                .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc.into()))
+                .child(div().h_flex().gap_1().children([PAPER, SAND, CARD, CORAL, INK].map(|c| {
+                    div()
+                        .size_3p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(LINE))
+                        .bg(crate::theme::swatch(palette, c))
+                }))),
         )
         .when(active, |d| {
             d.child(Icon::new(IconAll::Check).size_4().flex_shrink_0().text_color(rgb(CORAL)))

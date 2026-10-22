@@ -32,6 +32,8 @@ mod subagent_view;
 mod suggest;
 mod usage_view;
 mod widgets;
+mod worktree;
+mod worktree_setup;
 
 use crate::demo::*;
 use crate::model::*;
@@ -97,9 +99,10 @@ pub struct ChatApp {
     completion: complete_view::CompletionState,
     /// 侧栏里等待确认删除的会话（令牌）
     confirm_delete: Option<u64>,
-    /// 内核槽，按 [`KernelChoice::index`]：用到时才启动，可以同时在线，会话各自绑定一个
-    kernels: [KernelSlot; 3],
-    ev_tx: UnboundedSender<(KernelChoice, u64, RoutedEvent)>,
+    /// 内核槽，按 [`KernelChoice::key`] 找：用到时才启动，可以同时在线，会话各自绑定一个
+    kernels: Vec<(String, KernelSlot)>,
+    /// 事件从哪条内核来（内核 key：`builtin` / `demo` / `acp:<档案 ID>`）
+    ev_tx: UnboundedSender<(String, u64, RoutedEvent)>,
     /// 环境变量给的 ACP 基础配置（工作目录、调试开关）
     acp_base: AcpKernelConfig,
     /// 生效中的设置（启动时已合并环境变量）
@@ -171,6 +174,8 @@ pub struct ChatApp {
     mcp_form: mcp_view::McpForm,
     /// 设置页「记忆」：看哪一栏、搜索、读到的两份记忆条目
     memory_form: memory_view::MemoryForm,
+    /// 内核提炼出来的「待确认」记忆（收下才落盘；只在内存里，重启就没了）
+    memory_candidates: memory_view::MemoryCandidates,
     /// 设置页「项目」：项目根、表单值、读文件时的问题
     project_form: project_view::ProjectForm,
     /// 输入框当前的占位文字（首页是建议的提示词，见 `overview.rs` 的 `sync_placeholder`）
@@ -226,7 +231,7 @@ pub(crate) struct KernelSlot {
 impl Drop for ChatApp {
     fn drop(&mut self) {
         for slot in &self.kernels {
-            if let Some(kernel) = &slot.kernel {
+            if let Some(kernel) = &slot.1.kernel {
                 kernel.shutdown();
             }
         }
@@ -234,10 +239,36 @@ impl Drop for ChatApp {
 }
 
 impl ChatApp {
+    /// 按槽的 key 找（只读）。
+    pub(crate) fn slot(&self, key: &str) -> Option<&KernelSlot> {
+        self.kernels.iter().find(|(k, _)| k == key).map(|(_, s)| s)
+    }
+
+    /// 按槽的 key 找（可改）。
+    pub(crate) fn slot_mut(&mut self, key: &str) -> Option<&mut KernelSlot> {
+        self.kernels.iter_mut().find(|(k, _)| k == key).map(|(_, s)| s)
+    }
+
+    /// 找不到就补一个空槽（懒启动的入口）。
+    fn slot_entry(&mut self, key: &str) -> &mut KernelSlot {
+        if !self.kernels.iter().any(|(k, _)| k == key) {
+            self.kernels.push((key.to_string(), KernelSlot::default()));
+        }
+        self.slot_mut(key).expect("刚补过")
+    }
+
+    pub(crate) fn kernel_of(&self, kind: &KernelChoice) -> Option<Arc<dyn Kernel>> {
+        self.kernel_by_key(&kind.key())
+    }
+
+    pub(crate) fn kernel_by_key(&self, key: &str) -> Option<Arc<dyn Kernel>> {
+        self.slot(key).and_then(|s| s.kernel.clone())
+    }
+
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // 多行、随内容长高（最多 10 行后出滚动条）；回车发送，Shift+回车换行
+        // 多行、至少两行高、随内容长高（最多 10 行后出滚动条）；回车发送，Shift+回车换行
         let input =
-            cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 10).submit_on_enter(true));
+            cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 10).submit_on_enter(true));
 
         cx.subscribe_in(
             &input,
@@ -290,14 +321,16 @@ impl ChatApp {
             .unwrap_or_else(|| acp_base.cwd.clone());
         let project_name = project_label(&cwd);
 
-        let (ev_tx, mut ev_rx) =
-            futures::channel::mpsc::unbounded::<(KernelChoice, u64, RoutedEvent)>();
+        let (ev_tx, mut ev_rx) = futures::channel::mpsc::unbounded::<(String, u64, RoutedEvent)>();
         cx.spawn(async move |this, cx| {
-            while let Some((kind, generation, event)) = ev_rx.next().await {
+            while let Some((key, generation, event)) = ev_rx.next().await {
                 if this
                     .update(cx, |app, cx| {
-                        if generation == app.kernels[kind.index()].generation {
-                            app.on_kernel_event(kind, event, cx);
+                        // 迟到事件：槽不在了（档案停用）或代号对不上都丢掉
+                        if let Some(slot) = app.slot(&key)
+                            && generation == slot.generation
+                        {
+                            app.on_kernel_event(key, event, cx);
                         }
                     })
                     .is_err()
@@ -427,6 +460,7 @@ impl ChatApp {
             plugins_form,
             mcp_form,
             memory_form,
+            memory_candidates: Default::default(),
             project_form,
             plugins: claudesktop_core::plugin::default_plugins_dir()
                 .map(|d| claudesktop_core::plugin::discover(&d))
@@ -464,7 +498,12 @@ impl ChatApp {
                     let records = store.load(&meta.id).unwrap_or_default();
                     app.usage.extend(usage::collect(&meta, &records));
                     if i < MAX_RESTORED {
-                        app.sessions.push(Session::from_records(app.next_token, meta, records));
+                        app.sessions.push(Session::from_records(
+                            app.next_token,
+                            meta,
+                            records,
+                            &app.settings.acp,
+                        ));
                         app.next_token += 1;
                     }
                 }
@@ -477,18 +516,26 @@ impl ChatApp {
         app.apply_appearance(window, cx);
         app.apply_motion_pref(cx);
         app.init_notifications(window, cx);
+        // 启动时的会话里，worktree 目录没了的（用户删了 / 换了电脑）：现在就把分支接回来
+        for idx in 0..app.sessions.len() {
+            if ChatApp::worktree_is_missing(&app.sessions[idx]) {
+                app.repair_worktree(idx, cx);
+            }
+        }
         app
     }
 
     /// 按当前设置启动某种内核（不处理会话，见 [`Self::restart_kernel`]）。
-    fn spawn_kernel(&mut self, kind: KernelChoice) {
-        let slot = &mut self.kernels[kind.index()];
+    fn spawn_kernel(&mut self, kind: &KernelChoice) {
+        let key = kind.key();
+        let slot = self.slot_entry(&key);
         slot.started = true;
         slot.generation += 1;
         let generation = slot.generation;
+        let ev_key = key.clone();
         let tx = self.ev_tx.clone();
         let sink: EventSink = Arc::new(move |event| {
-            let _ = tx.unbounded_send((kind, generation, event));
+            let _ = tx.unbounded_send((ev_key.clone(), generation, event));
         });
         // 启用的插件：自研内核启动时就带上（MCP 只连一次），ACP 内核起来后交给它
         let plugins = self.enabled_plugins();
@@ -507,21 +554,34 @@ impl ChatApp {
                         Err(err) => (None, format!("启动失败：{err}").into(), String::new()),
                     }
                 }
-                KernelChoice::Acp => {
-                    let config = self.settings.acp_config(self.acp_base.clone());
-                    let agent_cmd = config.command.clone();
-                    match AcpKernel::spawn(config, sink) {
-                        Ok(k) => {
-                            k.set_plugins(plugins);
-                            (Some(Arc::new(k) as Arc<dyn Kernel>), "内核启动中…".into(), agent_cmd)
+                KernelChoice::Acp(id) => match self.settings.acp.get(id).cloned() {
+                    // 档案停用 / 删掉了：别退回 `acp_base` 的命令（那是 ACP_AGENT 或仓库里的 mock agent）
+                    None => (
+                        None,
+                        "这个 agent 已停用：到设置「本机 agent」里启用，或换个内核".into(),
+                        String::new(),
+                    ),
+                    Some(profile) => {
+                        let config =
+                            self.settings.acp_config_for(self.acp_base.clone(), Some(&profile));
+                        let agent_id = crate::settings::acp_agent_id(id, &config.command);
+                        match AcpKernel::spawn(config, sink) {
+                            Ok(k) => {
+                                k.set_plugins(plugins);
+                                (
+                                    Some(Arc::new(k) as Arc<dyn Kernel>),
+                                    "内核启动中…".into(),
+                                    agent_id,
+                                )
+                            }
+                            Err(err) => (None, format!("启动失败：{err}").into(), agent_id),
                         }
-                        Err(err) => (None, format!("启动失败：{err}").into(), agent_cmd),
                     }
-                }
+                },
             };
-        let slot = &mut self.kernels[kind.index()];
-        slot.ready = kind == KernelChoice::Demo;
-        slot.error = kernel.is_none() && kind != KernelChoice::Demo;
+        let slot = self.slot_entry(&key);
+        slot.ready = kind.is_demo();
+        slot.error = kernel.is_none() && !kind.is_demo();
         slot.kernel = kernel;
         slot.status = status;
         slot.agent_cmd = agent_cmd;
@@ -530,8 +590,9 @@ impl ChatApp {
     }
 
     /// 还没启动过就启动。
-    fn ensure_kernel(&mut self, kind: KernelChoice) {
-        if !self.kernels[kind.index()].started {
+    fn ensure_kernel(&mut self, kind: &KernelChoice) {
+        let key = kind.key();
+        if !self.slot(&key).is_some_and(|s| s.started) {
             self.spawn_kernel(kind);
         }
     }
@@ -539,12 +600,13 @@ impl ChatApp {
     /// 某种内核的设置改了：关掉旧的，绑在它上面的会话全部脱离；
     /// 有对话的会话下次发消息时按「历史会话」续接，空会话等新连接就绪后重新创建。
     /// 没启动过的内核什么也不做（用到时自然按新设置启动）。
-    pub(crate) fn restart_kernel(&mut self, kind: KernelChoice, cx: &mut Context<Self>) {
-        if !self.kernels[kind.index()].started {
+    pub(crate) fn restart_kernel(&mut self, kind: &KernelChoice, cx: &mut Context<Self>) {
+        let key = kind.key();
+        if !self.slot(&key).is_some_and(|s| s.started) {
             return;
         }
-        let old = self.kernels[kind.index()].kernel.take();
-        for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
+        let old = self.slot_mut(&key).and_then(|s| s.kernel.take());
+        for s in self.sessions.iter_mut().filter(|s| &s.kernel == kind) {
             s.detach_kernel(old.as_ref());
         }
         if let Some(old) = old {
@@ -555,19 +617,31 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(crate) fn kernel_of(&self, kind: KernelChoice) -> Option<Arc<dyn Kernel>> {
-        self.kernels[kind.index()].kernel.clone()
-    }
-
     /// 第 `idx` 个会话绑定的内核
     pub(crate) fn session_kernel(&self, idx: usize) -> Option<Arc<dyn Kernel>> {
-        self.kernel_of(self.sessions[idx].kernel)
+        self.kernel_of(&self.sessions[idx].kernel)
+    }
+
+    /// 直接关掉一个内核槽（档案被停用 / 删除时）：绑在它上面的会话全部脱离。
+    pub(crate) fn shutdown_slot(&mut self, key: &str) {
+        let old = self.slot_mut(key).and_then(|s| s.kernel.take());
+        if let Some(slot) = self.slot_mut(key) {
+            slot.ready = false;
+            slot.started = false;
+            slot.status = "未连接内核".into();
+        }
+        for s in self.sessions.iter_mut().filter(|s| s.kernel_key == key) {
+            s.detach_kernel(old.as_ref());
+        }
+        if let Some(old) = old {
+            old.shutdown();
+        }
     }
 
     /// 停掉一条后台命令（顶栏的小标点的）。
     pub(crate) fn stop_background(&mut self, id: &str, cx: &mut Context<Self>) {
-        let kind = self.sessions[self.active].kernel;
-        if let Some(kernel) = self.kernel_of(kind)
+        let kind = self.sessions[self.active].kernel.clone();
+        if let Some(kernel) = self.kernel_of(&kind)
             && kernel.kind() == "builtin"
         {
             kernel.stop_background_task(id);
@@ -588,10 +662,14 @@ impl ChatApp {
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
         let cwd = self.cwd.clone();
         let kind = self.settings.kernel();
-        // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」
+        // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」；
+        // 它要是建过一个没动过的 worktree，顺手清掉（见 worktree.rs）
         let blank = self.sessions.iter().position(|s| {
             !s.has_user_message() && !s.busy && !s.renamed && s.kernel == kind && s.cwd == cwd
         });
+        if let Some(idx) = blank {
+            self.cleanup_worktree(idx);
+        }
         self.active = match blank {
             Some(idx) => idx,
             None => self.open_session(kind, cwd),
@@ -606,7 +684,7 @@ impl ChatApp {
     fn open_session(&mut self, kind: KernelChoice, cwd: PathBuf) -> usize {
         // 还没配置时先不起内核，配好保存时再起（见 `save_settings`）
         if !self.settings.needs_setup() {
-            self.ensure_kernel(kind);
+            self.ensure_kernel(&kind);
         }
         let token = self.next_token;
         self.next_token += 1;
@@ -619,10 +697,15 @@ impl ChatApp {
     /// 先改界面上的选中项，内核会话建立（Started）后再交给内核。
     /// 没为 `cwd` 选过文件夹的会话算**任务**（侧栏归到「任务」区，见 `sidebar.rs`）
     fn new_session(&self, kind: KernelChoice, cwd: PathBuf, token: u64) -> Session {
+        let is_builtin = kind == KernelChoice::Builtin;
         let mut session = Session::new(token, kind, cwd.clone());
         session.task = !self.is_project_dir(&cwd);
-        if kind == KernelChoice::Builtin && self.settings.auto_mode_default() {
+        if is_builtin && self.settings.auto_mode_default() {
             session.default_to(MODE_AUTO_ID);
+        }
+        // agent 档案记着上次用的模型：Started 后 agent 没报模型就切过去
+        if let KernelChoice::Acp(id) = &session.kernel {
+            session.last_model = self.settings.acp.get(id).and_then(|a| a.last_model.clone());
         }
         session
     }
@@ -631,6 +714,13 @@ impl ChatApp {
     /// 默认目录本身只有在目录菜单里明确选过（记进设置）才算。不是项目的，在里面的对话算任务
     pub(super) fn is_project_dir(&self, dir: &Path) -> bool {
         self.settings.workspace.as_deref() == Some(dir) || dir != self.acp_base.cwd
+    }
+
+    /// 当前会话所在的目录是个 git 仓库（目录菜单里据此给「在新 worktree 中开始」）。
+    /// 只看有没有 `.git`（目录或 worktree 的文件），不在 render 里跑 git。
+    pub(super) fn git_repo_here(&self) -> bool {
+        let s = self.session();
+        s.worktree.is_none() && s.cwd.join(".git").exists()
     }
 
     /// 把一个还没对话的会话换到另一种内核上：原地换成新会话，
@@ -648,7 +738,7 @@ impl ChatApp {
     fn replace_session(&mut self, idx: usize, kind: KernelChoice, cwd: PathBuf) {
         let old = self.session_kernel(idx);
         self.sessions[idx].cancel_pending_permissions(old.as_ref());
-        self.ensure_kernel(kind);
+        self.ensure_kernel(&kind);
         let token = self.next_token;
         self.next_token += 1;
         self.sessions[idx] = self.new_session(kind, cwd, token);
@@ -667,7 +757,7 @@ impl ChatApp {
             if s.has_user_message() || s.busy {
                 self.active = self.open_session(self.settings.kernel(), dir);
             } else {
-                let kind = s.kernel;
+                let kind = s.kernel.clone();
                 self.replace_session(self.active, kind, dir);
             }
         } else if self.sessions[self.active].task {
@@ -683,7 +773,7 @@ impl ChatApp {
     pub(crate) fn as_task(&mut self, cx: &mut Context<Self>) {
         let default_dir = self.acp_base.cwd.clone();
         let s = self.session();
-        let kind = s.kernel;
+        let kind = s.kernel.clone();
         if s.cwd == default_dir {
             self.sessions[self.active].task = true;
             self.save_task(self.active);
@@ -729,14 +819,16 @@ impl ChatApp {
     }
 
     /// 目录菜单列出的工作目录：默认目录在前，其余按会话最近活动排，已不存在的略去，最多 8 个。
+    /// worktree 会话不列（它们的 `cwd` 是数据目录里的 worktree，列出来是一串看不懂的路径）。
     pub(crate) fn recent_workspaces(&self) -> Vec<PathBuf> {
         // 无元信息的会话（刚开、还没落盘）视为最新；排序稳定，默认目录排在同为最新的前面
         let mut dirs: Vec<(&Path, u64)> = vec![(self.cwd.as_path(), u64::MAX)];
-        for s in &self.sessions {
+        for s in self.sessions.iter().filter(|s| s.worktree.is_none()) {
+            let dir = &s.cwd;
             let at = s.meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
-            match dirs.iter_mut().find(|(d, _)| *d == s.cwd.as_path()) {
+            match dirs.iter_mut().find(|(d, _)| *d == dir.as_path()) {
                 Some((_, last)) => *last = (*last).max(at),
-                None => dirs.push((s.cwd.as_path(), at)),
+                None => dirs.push((dir.as_path(), at)),
             }
         }
         dirs.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
@@ -749,6 +841,15 @@ impl ChatApp {
         self.active = i;
         self.settings_open = false;
         self.sessions[i].wheel = None;
+        // worktree 目录被用户删了 / 换了电脑：切过来时试着重新检出接上（见 worktree.rs）
+        if ChatApp::worktree_is_missing(&self.sessions[i]) {
+            self.repair_worktree(i, cx);
+        }
+        // worktree 会话：切过来时读一次分支现状（后台跑），chip 上才显示「几个文件 / 领先几个」，
+        // 主目录那边的变化（换了分支、有了改动）也在这时候反映到菜单里
+        if self.sessions[i].worktree.is_some() {
+            self.refresh_worktree(i, cx);
+        }
         // 换会话了：上一条对话猜的灰字作废，输入框里的字留着，停顿一下会为新会话重猜
         self.suggestion.clear();
         // 猜的「下一句」也一样：那句话是接着另一个对话说的
@@ -756,6 +857,7 @@ impl ChatApp {
         self.refresh_composer(cx);
         self.schedule_suggestion(cx);
         self.probe_context_window(i, cx);
+        self.settle_undo();
         cx.notify();
     }
 
@@ -801,11 +903,14 @@ impl ChatApp {
         };
         let from = self.sessions[src].title.clone();
         let cwd = self.sessions[src].cwd.clone();
-        let idx = self.open_session(kind, cwd);
+        let idx = self.open_session(kind.clone(), cwd);
         self.active = idx;
-        self.sessions[idx].note(format!("同一任务换到「{}」上跑（原会话：{from}）", kind.label()));
+        self.sessions[idx].note(format!(
+            "同一任务换到「{}」上跑（原会话：{from}）",
+            kind.label(&self.settings.acp)
+        ));
         // 内核不可用时 submit_to 会给出提示
-        if self.sessions[idx].ready || self.kernel_of(kind).is_none() {
+        if self.sessions[idx].ready || self.kernel_of(&kind).is_none() {
             self.submit_to(idx, prompt, cx);
         } else {
             self.sessions[idx].autoprompt = Some(prompt);
@@ -1028,7 +1133,9 @@ impl ChatApp {
     /// 向内核要还没要过的会话（`session/new`），以及要续接的历史会话。连接未就绪的内核先跳过。
     pub(crate) fn request_pending_sessions(&mut self) {
         for idx in 0..self.sessions.len() {
-            let slot = &self.kernels[self.sessions[idx].kernel.index()];
+            let Some(slot) = self.slot(&self.sessions[idx].kernel_key) else {
+                continue;
+            };
             let Some(kernel) = slot.kernel.clone().filter(|_| slot.ready) else {
                 continue;
             };
@@ -1051,15 +1158,19 @@ impl ChatApp {
     /// 历史会话续接内核会话，就绪后再发待发的消息。同一个 ACP agent 才尝试；
     /// 自研内核用本地日志重建上下文，换了端点 / 模型也能续接。
     fn send_resume(&mut self, idx: usize, kernel: &Arc<dyn Kernel>) {
+        let agent_cmd = self
+            .slot(&self.sessions[idx].kernel_key)
+            .map(|s| s.agent_cmd.clone())
+            .unwrap_or_default();
         let s = &mut self.sessions[idx];
-        let agent_cmd = &self.kernels[s.kernel.index()].agent_cmd;
         s.requested = true;
         let builtin = s.kernel == KernelChoice::Builtin;
         let resumable = s.meta.as_ref().filter(|m| {
             if builtin {
                 m.agent.starts_with("builtin:")
             } else {
-                m.agent == *agent_cmd && m.kernel_session_id.is_some()
+                crate::settings::same_acp_agent(&m.agent, &agent_cmd)
+                    && m.kernel_session_id.is_some()
             }
         });
         let cwd = Some(s.cwd.clone());
@@ -1140,6 +1251,14 @@ impl ChatApp {
             cx.notify();
             return;
         }
+        // worktree 还在后台建：先排队，建好了自动发出（见 `adopt_worktree`）
+        if self.sessions[active].worktree_busy.is_some() {
+            self.input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.pending.clear();
+            self.sessions[active].queued.push(queued);
+            cx.notify();
+            return;
+        }
         // 发不出去（内核不可用、会话还没就绪）就别清空，免得写好的内容丢了
         if self.submit_to(active, queued.into_prompt(), cx) {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -1149,10 +1268,10 @@ impl ChatApp {
     }
 
     /// 第 `idx` 个会话这一轮结束（正常结束，或用户停下后内核确认了）：发出排队的第一条，
-    /// 其余等它这一轮结束再发。
+    /// 其余等它这一轮结束再发。会话还没就绪时留着（`Started` 到来时再发，见 `apply` 里的事件处理）。
     fn dispatch_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
         let s = &mut self.sessions[idx];
-        if s.busy || s.stopping || s.queued.is_empty() {
+        if s.busy || s.stopping || s.queued.is_empty() || !s.ready {
             return;
         }
         let queued = s.queued.remove(0);
@@ -1289,16 +1408,17 @@ impl ChatApp {
         prompt: UserPrompt,
         cx: &mut Context<Self>,
     ) -> bool {
-        let kind = self.sessions[idx].kernel;
+        let kind = self.sessions[idx].kernel.clone();
         if self.sessions[idx].busy {
             return false;
         }
-        if kind != KernelChoice::Demo {
+        if !kind.is_demo() {
             // 历史会话的内核可能还没启动
-            self.ensure_kernel(kind);
-            if self.kernel_of(kind).is_none() {
-                let status = self.kernels[kind.index()].status.clone();
-                let reason = format!("{}不可用：{status}（可在设置里修改）", kind.label());
+            self.ensure_kernel(&kind);
+            if self.kernel_of(&kind).is_none() {
+                let status = self.slot(&kind.key()).map(|s| s.status.clone()).unwrap_or_default();
+                let reason =
+                    format!("{}不可用：{status}（可在设置里修改）", kind.label(&self.settings.acp));
                 self.refuse_send(idx, reason, cx);
                 return false;
             }
@@ -1319,9 +1439,9 @@ impl ChatApp {
             if kernel.is_some() && !s.ready {
                 // 内核已经报错退出了（多半是命令找不到）：重新启动一次，用户可能已经把问题修好了
                 // （比如刚装上 Node.js）；还是起不来的话内核会再报错，弹出原因
-                let reason = if self.kernels[kind.index()].fatal.is_some() {
-                    self.restart_kernel(kind, cx);
-                    format!("正在重新启动「{}」，稍等一下再发送", kind.label())
+                let reason = if self.slot(&kind.key()).is_some_and(|s| s.fatal.is_some()) {
+                    self.restart_kernel(&kind, cx);
+                    format!("正在重新启动「{}」，稍等一下再发送", kind.label(&self.settings.acp))
                 } else {
                     "会话还在连接内核，稍等一下再发送".into()
                 };
@@ -1334,7 +1454,7 @@ impl ChatApp {
             }
             // 图片附件先落盘（需要会话元信息），路径进记录与气泡
             let stored = self.store_images(idx, &prompt.images);
-            if !prompt.images.is_empty() && stored.is_empty() && kind == KernelChoice::Demo {
+            if !prompt.images.is_empty() && stored.is_empty() && kind.is_demo() {
                 self.sessions[idx].note("演示回放不保存图片附件，本轮只发送文字");
             }
             let image_paths = stored.iter().map(PathBuf::from).collect::<Vec<_>>();
@@ -1370,7 +1490,7 @@ impl ChatApp {
             match (&kernel, s.acp_id.clone()) {
                 (Some(kernel), Some(id)) => {
                     // ACP agent 经用量网关时，网关据此把这个会话接下来的请求归到这一轮
-                    if s.kernel == KernelChoice::Acp {
+                    if matches!(s.kernel, KernelChoice::Acp(_)) {
                         let turn =
                             s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. }));
                         claudesktop_builtin::gateway::note_turn(&id, turn.count() as u64);
@@ -1508,13 +1628,18 @@ impl ChatApp {
     /// 内核事件分发：连接级事件自己处理，会话级事件在绑定这个内核的会话里按 sessionId / token 找。
     pub(crate) fn on_kernel_event(
         &mut self,
-        kind: KernelChoice,
+        key: String,
         routed: RoutedEvent,
         cx: &mut Context<Self>,
     ) {
         let RoutedEvent { session, event } = routed;
-        let kernel = self.kernel_of(kind);
-        let slot = &mut self.kernels[kind.index()];
+        let kernel = self.kernel_by_key(&key);
+        let acp = self.settings.acp.clone();
+        let kind = KernelChoice::from_key(&key, &acp);
+        let Some(slot) = self.slot_mut(&key) else {
+            return;
+        };
+        let slot = &mut *slot;
         match event {
             KernelEvent::Connected { agent_name } => {
                 slot.ready = true;
@@ -1535,6 +1660,21 @@ impl ChatApp {
                 }
             }
             KernelEvent::McpStatus { servers } => slot.mcp = servers,
+            KernelEvent::MemorySuggested { candidates } => {
+                // 只进设置页顶部的待确认区，不进对话流（误记的代价比漏记大）。
+                // 来源会话用事件自己的 sessionId；第几轮按对话里的用户消息数算（和内核的轮次对齐）
+                let sid = session.clone().unwrap_or_default();
+                let turn = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.acp_id.as_deref() == Some(sid.as_str()))
+                    .map(|s| {
+                        s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count()
+                    })
+                    .unwrap_or(0) as u64;
+                self.memory_candidates.push(candidates, &sid, turn);
+                cx.notify();
+            }
             KernelEvent::BackgroundTasks { tasks } => {
                 slot.tasks = tasks;
                 cx.notify();
@@ -1545,8 +1685,11 @@ impl ChatApp {
                 slot.status = "内核错误".into();
                 // 多半发生在刚启动时（命令找不到、agent 一起来就退出），这会儿用户常常还在首页，
                 // 对话流里的说明看不到，所以另弹一条提示
-                let text =
-                    crate::model::kernel_failure_text(kind.label(), &slot.agent_cmd, &message);
+                let text = crate::model::kernel_failure_text(
+                    &kind.label(&acp),
+                    crate::settings::agent_command(&slot.agent_cmd),
+                    &message,
+                );
                 slot.fatal = Some(message.clone());
                 for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
                     s.on_fatal(&message, kernel.as_ref());
@@ -1628,6 +1771,15 @@ impl ChatApp {
                     if clean_end {
                         self.dispatch_queued(idx, cx);
                     }
+                    // 一轮结束、worktree 会话：刷新分支状态（脏文件数、领先几个提交）
+                    if turn_over {
+                        self.refresh_worktree(idx, cx);
+                    }
+                    // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
+                    if matches!(event, KernelEvent::Started { .. }) {
+                        self.flush_pending_thinking(idx, kernel.as_deref());
+                        self.dispatch_queued(idx, cx);
+                    }
                     // 这一轮正常结束、输入框空着：猜用户接下来会发的那一句（见 suggest.rs）
                     if clean_end && idx == self.active && !self.settings_open {
                         self.schedule_next_suggestion(cx);
@@ -1648,14 +1800,18 @@ impl ChatApp {
         let Some(store) = self.store.as_ref() else {
             return;
         };
+        let agent_cmd = self
+            .slot(&self.sessions[idx].kernel_key)
+            .map(|s| s.agent_cmd.clone())
+            .unwrap_or_default();
         let s = &mut self.sessions[idx];
-        let agent_cmd = self.kernels[s.kernel.index()].agent_cmd.clone();
         let opened = match &s.meta {
             Some(meta) => store.append_log(&meta.id),
             None => store.create(&s.title, s.cwd.clone(), &agent_cmd).map(|(mut meta, log)| {
                 meta.set_kernel_session(s.acp_id.clone());
-                // 是不是任务在建档时定下来（侧栏右栏据此分组，见 sidebar.rs）
+                // 是不是任务、跑在哪个 worktree 在建档时定下来（侧栏据此分组，见 sidebar.rs）
                 meta.task = s.task;
+                meta.worktree = s.worktree.clone();
                 let _ = store.save_meta(&meta);
                 s.meta = Some(meta);
                 log
@@ -1769,16 +1925,19 @@ impl ChatApp {
         let Some(store) = &self.store else {
             return;
         };
+        let key = self.sessions[idx].kernel_key.clone();
+        let agent_cmd = self.slot(&key).map(|slot| slot.agent_cmd.clone()).unwrap_or_default();
         let s = &mut self.sessions[idx];
         if let Some(log) = &mut s.log {
             let _ = log.flush();
         }
         if let Some(meta) = &mut s.meta {
             // 续接到别的 agent 后，会话就归新的 agent 了
-            meta.agent = self.kernels[s.kernel.index()].agent_cmd.clone();
+            meta.agent = agent_cmd;
             meta.title = s.title.to_string();
             meta.set_kernel_session(s.acp_id.clone());
             meta.task = s.task;
+            meta.worktree = s.worktree.clone();
             meta.updated_ms = now_ms();
             let _ = store.save_meta(meta);
         }

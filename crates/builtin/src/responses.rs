@@ -6,7 +6,8 @@
 //! - 流式事件：`response.output_text.delta` / `response.reasoning_summary_text.delta` /
 //!   `response.output_item.added`（函数调用的完整参数一次到齐）/
 //!   `response.completed`（用量在这里）
-//! - 思考力度：`reasoning: {"effort": …}`，从 `RequestParams::extra` 或 [`PROTOCOL_NAME`] 那套设置里取
+//! - 思考力度：`reasoning: {"effort": …}`，由档位经
+//!   [`crate::provider::thinking_spec`] 翻译而来（`extra` 里手写的仍然覆盖它）
 //!
 //! 工具调用在 Responses 里不是「delta 拼接」而是整项到达，所以不共用
 //! [`crate::openai`] 的累加器。
@@ -195,6 +196,8 @@ pub(crate) fn request_body(
         // Responses 叫 max_output_tokens
         body["max_output_tokens"] = json!(n);
     }
+    // 思考强度：`reasoning:{effort, summary}`（档位来自能力表，见 `provider::thinking_spec`）
+    crate::provider::apply_thinking(&mut body, crate::provider::Protocol::Responses, model, params);
     if let Some(extra) = params.extra.as_object() {
         for (key, value) in extra {
             body[key] = value.clone();
@@ -436,6 +439,28 @@ mod tests {
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["output"], "内容");
+    }
+
+    /// 思考强度：`reasoning:{effort, summary}`；`extra` 里手写的仍然盖过它。
+    #[test]
+    fn body_carries_reasoning_effort() {
+        let messages = vec![ChatMessage::new("user", "算一下")];
+        let params = RequestParams {
+            thinking: Some(crate::provider::ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let body = request_body("gpt-5", &messages, &[], &params);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        // 不带 summary 就收不到思考摘要
+        assert_eq!(body["reasoning"]["summary"], "auto");
+
+        let with_extra = RequestParams {
+            thinking: Some(crate::provider::ThinkingLevel::Low),
+            extra: json!({"reasoning": {"effort": "high"}}),
+            ..Default::default()
+        };
+        let body = request_body("o3", &messages, &[], &with_extra);
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 
     #[test]

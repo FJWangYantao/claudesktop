@@ -90,6 +90,7 @@ pub fn allows(agent: &AgentDef, tool: &str) -> bool {
         && tool != crate::tools::TODO_WRITE
         // 子会话记下的东西没有归属（算谁的会话、哪一轮都不明确），不给它
         && tool != crate::tools::MEMORY_WRITE
+        && tool != crate::tools::MEMORY_FORGET
         && agent.tools.as_ref().is_none_or(|t| plugin::tool_listed(t, tool))
 }
 

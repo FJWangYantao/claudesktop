@@ -233,8 +233,19 @@ impl ChatApp {
             self.sessions[active].unread = false;
         }
         let mut h = DefaultHasher::new();
-        // 外观、字号、字体变了全部重画
-        (crate::theme::is_dark(), f32::from(root_font_size()).to_bits(), sans()).hash(&mut h);
+        // 外观、字号、字体、配色、当前内核（档案名显示在顶栏 / 侧栏）变了全部重画
+        (
+            crate::theme::is_dark(),
+            f32::from(root_font_size()).to_bits(),
+            crate::theme::palette_index(),
+            sans(),
+            self.settings.kernel().key(),
+        )
+            .hash(&mut h);
+        // 启用的 agent（内核状态行、会话标签按档案显示名画）：停用 / 改名也要重画
+        for agent in &self.settings.acp.agents {
+            (&agent.id, agent.display_name()).hash(&mut h);
+        }
         for group in self.session_groups() {
             (&group.key, &group.name).hash(&mut h);
             for i in group.members {
@@ -259,13 +270,22 @@ impl ChatApp {
             &self.cwd,
         )
             .hash(&mut h);
-        for k in &self.kernels {
+        for (_, k) in &self.kernels {
             (k.started, k.ready, k.error, &k.status).hash(&mut h);
         }
         for s in &self.sessions {
             let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
             let archived = s.meta.as_ref().is_some_and(|m| m.archived);
-            (&s.title, s.busy, s.busy && s.waiting_permission(), s.unread, age, archived, s.task)
+            (
+                &s.title,
+                s.busy,
+                s.busy && s.waiting_permission(),
+                s.unread,
+                age,
+                archived,
+                s.task,
+                s.worktree.as_ref().map(|w| (&w.branch, &w.repo)),
+            )
                 .hash(&mut h);
         }
         let key = h.finish();
@@ -455,7 +475,9 @@ impl ChatApp {
                 .h_flex()
                 .items_center()
                 .gap_1()
-                .px_4()
+                // 外边距 + 内边距（而不是整段内边距）：任务区的分隔线和会话行一样两头缩进，不顶到面板边上
+                .mx_2()
+                .px_2()
                 .pt(px(if g == 0 { 10. } else { 16. }))
                 .pb_1()
                 // 任务区前一道分隔线：上面是项目，下面是任务
@@ -602,13 +624,41 @@ impl ChatApp {
             self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
         let usage_open =
             self.settings_open && self.settings_form.tab == super::usage_view::USAGE_TAB;
+        // 品牌：赤陶底方块里一枚星芒（同首页问候语的图标）+ 名字。不是按钮，摆在拖拽区里
+        let brand = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .pl_1()
+            .child(
+                div()
+                    .size_5()
+                    .flex_shrink_0()
+                    .rounded_md()
+                    .bg(rgb(CORAL))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .child(Icon::new(IconAll::Sparkles).size_3().text_color(rgb(ON_ACCENT))),
+            )
+            .child(
+                div()
+                    .text_size(TEXT_BODY)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(INK))
+                    .child("claudesktop"),
+            );
+        // 浮起的面板：沙色底 + 细边 + 淡阴影，和纸色的会话区分出前后
         let panel = v_flex()
             .size_full()
             .rounded_xl()
             .bg(rgb(SAND))
+            .border_1()
+            .border_color(rgb(LINE))
+            .shadow_xs()
             .overflow_hidden()
             .child(
-                // 头部：侧栏开关，其余是拖拽区（与会话区顶栏同高）
+                // 头部：侧栏开关 + 品牌，其余是拖拽区（与会话区顶栏同高）
                 div()
                     .h_flex()
                     .h(CHROME_H - px(8.))
@@ -617,7 +667,7 @@ impl ChatApp {
                     .pl_2()
                     .children(traffic_light_gap())
                     .child(self.sidebar_toggle("sidebar-toggle", cx))
-                    .child(drag_area()),
+                    .child(drag_area().h_flex().items_center().child(brand)),
             )
             .child(
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
@@ -754,11 +804,11 @@ impl ChatApp {
 
     /// 每个已启动内核一行：状态点 + 「自研内核 · 已连接」
     fn kernel_status_rows(&self) -> Vec<Div> {
-        KernelChoice::ALL
-            .into_iter()
-            .filter(|k| self.kernels[k.index()].started)
-            .map(|kind| {
-                let slot = &self.kernels[kind.index()];
+        self.kernels
+            .iter()
+            .filter(|(_, slot)| slot.started)
+            .map(|(key, slot)| {
+                let kind = KernelChoice::from_key(key, &self.settings.acp);
                 let dot = if slot.error {
                     RED
                 } else if slot.ready {
@@ -780,7 +830,7 @@ impl ChatApp {
                             .whitespace_nowrap()
                             .text_size(TEXT_META)
                             .text_color(rgb(INK_SOFT))
-                            .child(format!("{} · {}", kind.label(), slot.status)),
+                            .child(format!("{} · {}", kind.label(&self.settings.acp), slot.status)),
                     )
             })
             .collect()
@@ -826,9 +876,10 @@ impl ChatApp {
             Vec::new()
         };
         for (i, s) in self.sessions.iter().enumerate().filter(|&(i, _)| listed(i)) {
-            match groups.iter_mut().find(|(cwd, _)| *cwd == s.cwd.as_path()) {
+            let dir = s.group_dir();
+            match groups.iter_mut().find(|(cwd, _)| *cwd == dir) {
                 Some((_, members)) => members.push(i),
-                None => groups.push((s.cwd.as_path(), vec![i])),
+                None => groups.push((dir, vec![i])),
             }
         }
         groups
@@ -999,6 +1050,18 @@ impl ChatApp {
                     .when(active, |d| d.font_weight(FontWeight::MEDIUM))
                     .child(s.title.clone()),
             )
+            // 跑在自己 worktree 里的会话：行尾一个小分支图标（悬停显示分支名）
+            .when_some(s.worktree.as_ref().map(|w| w.branch.clone()), |row, branch| {
+                let tip = format!("git worktree：{branch}");
+                row.child(
+                    div()
+                        .id(("session-worktree", i))
+                        .flex_shrink_0()
+                        .text_color(rgb(INK_SOFT))
+                        .tooltip(move |window, cx| super::chat::text_tip(&tip, window, cx))
+                        .child(Icon::new(IconAll::GitBranch).size_3p5()),
+                )
+            })
             .when_some(age, |row, age| {
                 row.child(
                     div().flex_shrink_0().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(age),
@@ -1075,6 +1138,10 @@ impl ChatApp {
     /// 归档 / 取消归档第 `idx` 个会话（写进元信息）。归档的是正看着的会话时换走：
     /// 有还没发过消息的新会话就切过去，没有就开一个，免得它留在眼前像没归档成功。
     pub(crate) fn set_archived(&mut self, idx: usize, archived: bool, cx: &mut Context<Self>) {
+        // 归档一个建过 worktree 但什么都没改的会话：顺手清掉那个空目录
+        if archived {
+            self.cleanup_worktree(idx);
+        }
         let Some(meta) = self.sessions.get_mut(idx).and_then(|s| s.meta.as_mut()) else {
             return;
         };
@@ -1139,6 +1206,8 @@ impl ChatApp {
         }
         let removed = self.sessions.remove(idx);
         let id = removed.meta.as_ref().map(|m| m.id.clone());
+        // 会话的 worktree：不丢东西的前提下能删多少删多少，留下的说一声（见 worktree.rs）
+        self.cleanup_worktree_of(&removed, cx);
         // 先关掉日志文件再删
         drop(removed);
         if let Some(id) = id {
@@ -1222,6 +1291,57 @@ mod tests {
         // 折叠：只剩要紧的，「显示全部」也不管用
         assert_eq!(shown(3, true, false, &[]), (vec![], 3));
         assert_eq!(shown(10, true, true, &[2, 8]), (vec![2, 8], 8));
+    }
+
+    #[core::prelude::v1::test]
+    fn worktree_sessions_join_the_main_repo_group() {
+        // 主仓库根和一个 worktree 目录：分组按主仓库算，worktree 会话归到它那一组
+        let repo = std::path::PathBuf::from("/proj/app");
+        let mut s = crate::session::Session::new(
+            1,
+            crate::settings::KernelChoice::Demo,
+            std::path::PathBuf::from("/data/worktrees/app-1234abcd/1020-1432-k7f"),
+        );
+        s.worktree = Some(claudesktop_core::WorktreeMeta {
+            repo: repo.clone(),
+            branch: "claudesktop/1020-1432-k7f".into(),
+            base: "main".into(),
+        });
+        assert_eq!(s.group_dir(), repo.as_path());
+        let mut plain = crate::session::Session::new(
+            2,
+            crate::settings::KernelChoice::Demo,
+            std::path::PathBuf::from("/proj/app"),
+        );
+        assert_eq!(plain.group_dir(), plain.cwd.as_path());
+        // 元信息里的 worktree 从日志恢复回来
+        let meta = claudesktop_core::SessionMeta {
+            id: "s".into(),
+            title: "t".into(),
+            cwd: s.cwd.clone(),
+            agent: "builtin:x".into(),
+            kernel_session_id: None,
+            kernel_sessions: Vec::new(),
+            created_ms: 0,
+            updated_ms: 0,
+            archived: false,
+            task: false,
+            worktree: s.worktree.clone(),
+        };
+        let restored =
+            crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());
+        assert_eq!(restored.worktree, s.worktree);
+        assert_eq!(restored.group_dir(), repo.as_path());
+        // 老元信息（没有这一项）读成 None
+        let mut old = meta;
+        old.worktree = None;
+        assert!(
+            crate::session::Session::from_records(4, old, Vec::new(), &Default::default())
+                .worktree
+                .is_none()
+        );
+        plain.task = false;
+        let _ = plain;
     }
 
     #[core::prelude::v1::test]

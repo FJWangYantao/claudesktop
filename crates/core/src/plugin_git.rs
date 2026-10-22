@@ -9,8 +9,8 @@
 //!
 //! 都是阻塞调用（界面在后台线程跑）。git 不会弹窗要密码：私有仓库要先在命令行配好凭据。
 
+use crate::git::git;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// 用户填的地址 → 交给 git 的地址；`作者/仓库` 补成 GitHub 的 https 地址。
 pub fn normalize_url(input: &str) -> Result<String, String> {
@@ -121,7 +121,14 @@ pub fn subdir(repo: &Path) -> Option<String> {
 
 /// 拉最新的（只快进，本地改过就报错、不合并）；返回 git 的输出（「Already up to date.」等）。
 pub fn update(repo: &Path) -> Result<String, String> {
-    git(repo, &["pull", "--ff-only"])
+    git(repo, &["pull", "--ff-only"]).map_err(|e| {
+        // 本地改过的插件目录：插件这边最省事的出路是重装
+        if e.starts_with("目录里有本地改动") {
+            format!("{e}；或者卸载后重新安装")
+        } else {
+            e
+        }
+    })
 }
 
 /// 卸载：删掉克隆下来的目录。只删插件目录下、带 `.git` 的（手动放进来的不动）。
@@ -134,79 +141,14 @@ pub fn uninstall(dir: &Path, repo: &Path) -> Result<(), String> {
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
-
-/// 跑一条 git 命令：不弹黑框、不问密码；失败时带上 git 的报错（最后几行）。
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        // 要凭据时直接失败，别等一个看不见的输入（Git Credential Manager 也别弹窗）
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let output = command.output().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => "找不到 git：先安装 Git，并确认它在 PATH 里".to_string(),
-        _ => format!("git 起不来：{e}"),
-    })?;
-    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
-    if output.status.success() {
-        let out = text(&output.stdout);
-        Ok(if out.is_empty() { text(&output.stderr) } else { out })
-    } else {
-        Err(explain_git_error(&text(&output.stderr)))
-    }
-}
-
-/// git 的报错 → 中文原因：常见的几种（仓库不存在 / 要登录 / 连不上 / 本地改过）说人话，
-/// 其余留 git 原文的最后几行。
-fn explain_git_error(stderr: &str) -> String {
-    let lower = stderr.to_ascii_lowercase();
-    let has = |needle: &str| lower.contains(needle);
-    if has("could not read username")
-        || has("terminal prompts disabled")
-        || has("authentication failed")
-    {
-        return "这个仓库要登录才能访问：私有仓库请先在命令行里配好 git 凭据（装的时候不会弹窗要密码）"
-            .into();
-    }
-    if has("repository not found")
-        || has("does not appear to be a git repository")
-        || has("correct access rights")
-    {
-        return "找不到这个仓库，或者没有访问权限：检查地址拼写；私有仓库请先在命令行里配好 git 凭据"
-            .into();
-    }
-    if has("could not resolve host") {
-        return "连不上仓库所在的网站：检查网络和地址拼写".into();
-    }
-    if has("connection timed out") || has("failed to connect") || has("connection refused") {
-        return "连不上仓库：检查网络或代理设置".into();
-    }
-    if has("not possible to fast-forward") || has("diverging") || has("would be overwritten") {
-        return "插件目录里的文件在本地改过，没法直接更新：卸载后重新安装，或者在命令行里处理"
-            .into();
-    }
-    let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
-    let tail: Vec<&str> = tail.into_iter().rev().collect();
-    if tail.is_empty() { "git 失败了".into() } else { tail.join("\n") }
+    crate::git::same_dir(a, b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::explain_git_error;
+    use std::process::Command;
 
     #[test]
     fn addresses_and_folder_names() {

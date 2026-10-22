@@ -147,7 +147,7 @@ impl ChatApp {
         let running: Vec<_> = self
             .kernels
             .iter()
-            .flat_map(|slot| slot.tasks.iter())
+            .flat_map(|(_, slot)| slot.tasks.iter())
             .filter(|t| t.running && s.acp_id.as_deref() == Some(t.session.as_str()))
             .collect();
         let running_count = running.len();
@@ -165,6 +165,11 @@ impl ChatApp {
                     .child(self.sidebar_toggle("header-sidebar-toggle", cx))
             })
             .child(drag_area().pl_4().pr_2().child(crumb))
+            // 跑在 git worktree 里：面包屑后面一个分支 chip（点开是打开目录 / 合并 / 删除）
+            .when_some(
+                super::worktree::render_worktree_chip(self, &cx.entity(), &self.menu_focus),
+                |d, chip| d.child(div().mr_1().child(chip)),
+            )
             // 后台命令在跑：一个小标（悬停看命令行，点一下停掉）
             .when(running_count > 0, |d| {
                 d.child(

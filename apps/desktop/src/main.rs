@@ -29,10 +29,37 @@ use std::time::Duration;
 
 pub(crate) static STARTUP_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// 崩溃时把原因和调用栈追加到数据目录的 `crash.log`：release 版没有控制台，
+/// 不记下来的话用户只看到窗口闪一下就没了，没有任何线索。
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(dir) = claudesktop_core::default_data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let text = format!(
+                "[unix {} · v{}] {info}\n{}\n\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                env!("CARGO_PKG_VERSION"),
+                std::backtrace::Backtrace::force_capture()
+            );
+            if let Ok(mut file) =
+                std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log"))
+            {
+                use std::io::Write as _;
+                let _ = file.write_all(text.as_bytes());
+            }
+        }
+        default(info);
+    }));
+}
+
 fn main() {
     let t0 = std::time::Instant::now();
     let bench = std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok();
     let _ = STARTUP_T0.set(t0);
+    log_panics();
 
     // 先于任何子进程：应用退出（含被强杀）时连带结束 agent 进程树
     if let Err(err) = claudesktop_core::kill_children_on_exit() {
@@ -122,9 +149,11 @@ fn main() {
                                 app.debug_review(file, cx)
                             }
                             "restart" => {
-                                let kind = app.session().kernel;
-                                app.restart_kernel(kind, cx)
+                                let kind = app.session().kernel.clone();
+                                app.restart_kernel(&kind, cx)
                             }
+                            // 在一个临时 git 仓库里建 worktree（截图 / 自检用）
+                            "worktree" => app.debug_worktree(cx),
                             _ => {}
                         }
                         // 调试钩子：CLAUDESKTOP_DROP = 以 ; 分隔的路径，当作从资源管理器拖进来松开
@@ -197,7 +226,7 @@ fn main() {
                     let rerun =
                         std::env::var("CLAUDESKTOP_RERUN").ok().and_then(|v| match v.trim() {
                             "builtin" => Some(KernelChoice::Builtin),
-                            "acp" => Some(KernelChoice::Acp),
+                            "acp" => Some(KernelChoice::Acp("custom-1".into())),
                             "demo" => Some(KernelChoice::Demo),
                             _ => None,
                         });

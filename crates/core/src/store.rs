@@ -44,6 +44,27 @@ pub struct SessionMeta {
     /// 老元信息没有这一项，读成 false（留在项目区，和加这一项之前一样）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub task: bool,
+    /// 会话跑在自己的 git worktree 里（`cwd` 就是 worktree 目录），见 [`WorktreeMeta`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeMeta>,
+}
+
+/// 会话的 git worktree：[`SessionMeta::cwd`] 是检出目录，这里记它从哪个仓库、哪个分支分出来。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeMeta {
+    /// 主仓库根目录：侧栏按它分组，项目记忆 / 权限规则也按它算
+    pub repo: PathBuf,
+    /// 这个 worktree 的分支（`claudesktop/<月日-时分>-<3 位随机>`）
+    pub branch: String,
+    /// 从哪儿分出来的（分支名，游离 HEAD 时是提交号）：合并目标、「领先几个提交」都按它算
+    pub base: String,
+}
+
+impl WorktreeMeta {
+    /// 侧栏上给用户看的「仓库名」。
+    pub fn repo_name(&self) -> String {
+        self.repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+    }
 }
 
 impl SessionMeta {
@@ -218,6 +239,7 @@ impl SessionStore {
             updated_ms: now,
             archived: false,
             task: false,
+            worktree: None,
         };
         self.save_meta(&meta)?;
         let log = self.append_log(&meta.id)?;

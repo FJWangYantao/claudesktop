@@ -545,6 +545,7 @@ mod tests {
             updated_ms: 99,
             archived: false,
             task: false,
+            worktree: None,
         }
     }
 

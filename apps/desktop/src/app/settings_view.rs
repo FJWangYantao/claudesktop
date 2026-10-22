@@ -2,7 +2,9 @@
 
 use super::ChatApp;
 use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
-use super::menu::{FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover};
+use super::menu::{
+    FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover, theme_menu_item,
+};
 use super::motion::{self, Reveal};
 use super::settings_kit::*;
 use super::widgets::{MeasuredWidth, Surface};
@@ -10,7 +12,9 @@ use crate::model::FailureKind;
 use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;
-use claudesktop_builtin::{PermissionRules, Protocol, ProviderConfig, default_rules_path};
+use claudesktop_builtin::{
+    PermissionRules, Protocol, ProviderConfig, ThinkingLevel, ThinkingSpec, default_rules_path,
+};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::button::{ButtonVariant, ButtonVariants as _};
@@ -23,6 +27,18 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::HashSet;
+
+/// 本机 agent 检测的状态：进设置页后台跑一次（要起子进程探版本）。
+#[derive(Default)]
+enum AgentDetect {
+    /// 还没测
+    #[default]
+    Idle,
+    /// 在测
+    Running,
+    /// 测完了（没装的不在列表里，界面按预设表补一行）
+    Done(Vec<claudesktop_core::agents::Detected>),
+}
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
 const SETTINGS_TABS: [(IconAll, &str); 8] = [
@@ -49,8 +65,6 @@ pub struct ProfileInputs {
     base_url: Entity<InputState>,
     api_key: Entity<InputState>,
     model: Entity<InputState>,
-    /// 思考预算（`thinking.budget_tokens`）；空 = 不显式开启思考
-    thinking_budget: Entity<InputState>,
 }
 
 impl ProfileInputs {
@@ -67,14 +81,12 @@ impl ProfileInputs {
                     .default_value(value)
             })
         };
-        // 思考预算：1024 是官方下限；没设就留空（占位符顺便提醒最小值）
-        let budget = p.params.thinking_budget.map(|b| b.to_string()).unwrap_or_default();
+        // 思考强度是档位（`seg_control`，跟着模型输入框现算），这里不再有输入框
         Self {
             name: make(p.name.clone(), "如 DeepSeek（可留空）", false, window, cx),
             base_url: make(p.base_url.clone(), "如 https://api.deepseek.com/v1", false, window, cx),
             api_key: make(p.api_key.clone(), "没有可留空", true, window, cx),
             model: make(p.model.clone(), "如 deepseek-chat", false, window, cx),
-            thinking_budget: make(budget, "空 = 不开启", false, window, cx),
         }
     }
 }
@@ -90,14 +102,19 @@ pub struct SettingsForm {
     inputs: Vec<ProfileInputs>,
     /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核与模型 / 3 权限 / 4 MCP / 5 插件 / 6 用量页 / 7 记忆）
     pub(super) tab: usize,
-    acp_command: Entity<InputState>,
+    /// 编辑中的 agent 档案表（保存才生效；预设的启用 / 网关在这里改）
+    agents: Vec<AgentProfile>,
+    /// 本机 agent 的检测结果（进「内核与模型」时后台跑一次）
+    agent_detect: AgentDetect,
+    /// 首页引导选了「本机 agent」时检测还没跑完：跑完再顺手启用（见 `start_setup`）
+    enable_on_detect: bool,
+    /// 自定义 agent 的启动命令（空 = 没有自定义 agent）
+    custom_command: Entity<InputState>,
     /// 一轮最多几步（自研内核的工具循环上限）
     max_steps: Entity<InputState>,
     /// 用量网关开关（保存才生效，会重启自研内核）
     usage_gateway: bool,
     gateway_bodies: bool,
-    /// ACP agent 的请求也经网关（保存才生效，会重启 ACP 内核）
-    acp_gateway: bool,
     /// 点了「清空日志」，等再点一次确认
     confirm_clear_gateway: bool,
     /// 模型单价表（一行一个模型，格式见 `pricing.rs`）
@@ -116,8 +133,14 @@ pub struct SettingsForm {
     next_suggestion: bool,
     /// 输入补全用的模型；空 = 跟会话的
     suggest_model: Entity<InputState>,
-    /// Brave Search API key（`web_search` 用；空 = DuckDuckGo 兜底）
+    /// 一轮结束后提炼候选记忆开着没有（保存才生效，会重启自研内核）
+    memory_suggest: bool,
+    /// Brave Search API key（`web_search` 用）
     brave_key: Entity<InputState>,
+    /// `web_search` 的后端选择（存在内核那边的数据目录 `search.json`，所以不在 `Settings` 里）
+    search: claudesktop_builtin::websearch::SearchConfig,
+    /// DeepSeek 搜索单独填的 key（空 = 用「服务商」里 DeepSeek 那份的 key）
+    deepseek_search_key: Entity<InputState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
     /// 已保存的「总是允许」规则：(项目目录, 规则)；删除即时生效，不等「保存」
@@ -132,7 +155,7 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     pub fn new(window: &mut Window, cx: &mut Context<ChatApp>) -> Self {
-        let acp_command = cx.new(|cx| {
+        let custom_command = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("如 npx -y @agentclientprotocol/claude-agent-acp")
         });
@@ -149,17 +172,22 @@ impl SettingsForm {
         });
         let brave_key =
             cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
+        let deepseek_search_key = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("留空就用「服务商」里 DeepSeek 那份的 key")
+        });
         Self {
-            kernel: KernelChoice::default(),
+            kernel: KernelChoice::Builtin,
             profiles: Vec::new(),
             active: 0,
             inputs: Vec::new(),
             tab: 0,
-            acp_command,
+            agents: Vec::new(),
+            agent_detect: AgentDetect::Idle,
+            enable_on_detect: false,
+            custom_command,
             max_steps,
             usage_gateway: true,
             gateway_bodies: true,
-            acp_gateway: false,
             confirm_clear_gateway: false,
             prices,
             auto_model,
@@ -169,7 +197,10 @@ impl SettingsForm {
             suggest_enabled: false,
             next_suggestion: false,
             suggest_model,
+            memory_suggest: false,
             brave_key,
+            search: Default::default(),
+            deepseek_search_key,
             message: None,
             rules: Vec::new(),
             open_help: HashSet::new(),
@@ -202,13 +233,8 @@ fn parse_max_steps(text: &str) -> usize {
         .clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS)
 }
 
-/// 设置页的「思考预算」输入 → `thinking.budget_tokens`：空着或写了非正数 = 不开启；
-/// 小于官方下限（1024）时抬到下限（请求里也会按这个下限卡一次）。
-fn parse_thinking_budget(text: &str) -> Option<u64> {
-    let text = text.trim();
-    let n = text.parse::<u64>().ok().filter(|n| *n > 0)?;
-    Some(n.max(claudesktop_builtin::RequestParams::MIN_THINKING_BUDGET))
-}
+// 设置页的「思考强度」是档位（`seg_control`），直接写在表单的档案里，不用输入框解析；
+// 老的「思考预算」在 `Settings::normalize` 里折算成档位了（见 `render_thinking_row`）。
 
 impl ChatApp {
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -240,7 +266,6 @@ impl ChatApp {
         self.settings_form.fetch_result = None;
         self.settings_form.usage_gateway = s.usage_gateway;
         self.settings_form.gateway_bodies = s.gateway_bodies;
-        self.settings_form.acp_gateway = s.acp.gateway;
         self.settings_form.confirm_clear_gateway = false;
         let prices = crate::pricing::to_text(&crate::pricing::Table {
             prices: s.prices(),
@@ -261,6 +286,7 @@ impl ChatApp {
         // 输入补全
         self.settings_form.suggest_enabled = s.suggestions;
         self.settings_form.next_suggestion = s.next_suggestion;
+        self.settings_form.memory_suggest = s.memory_suggest;
         self.settings_form
             .suggest_model
             .update(cx, |state, cx| state.set_value(s.suggest_model.clone(), window, cx));
@@ -270,6 +296,12 @@ impl ChatApp {
             .or_else(claudesktop_builtin::websearch::brave_key)
             .unwrap_or_default();
         self.settings_form.brave_key.update(cx, |state, cx| state.set_value(brave, window, cx));
+        // web_search 的后端选择 + DeepSeek 搜索单独填的 key
+        self.settings_form.search = claudesktop_builtin::websearch::load();
+        let deepseek = claudesktop_builtin::websearch::own_deepseek_key().unwrap_or_default();
+        self.settings_form
+            .deepseek_search_key
+            .update(cx, |state, cx| state.set_value(deepseek, window, cx));
         // 步数上限：默认值留空时显示实际生效的数（占位符就是默认值）
         self.settings_form.max_steps.update(cx, |state, cx| {
             state.set_value(
@@ -291,9 +323,18 @@ impl ChatApp {
         self.settings_form.inputs =
             profiles.iter().map(|p| ProfileInputs::new(window, cx, p)).collect();
         self.settings_form.profiles = profiles;
+        // agent 档案表 + 自定义 agent 的命令
+        self.settings_form.agents = s.acp.agents.clone();
+        let custom = s
+            .acp
+            .agents
+            .iter()
+            .find(|a| a.preset().is_none())
+            .and_then(|a| a.command.clone())
+            .unwrap_or_default();
         self.settings_form
-            .acp_command
-            .update(cx, |state, cx| state.set_value(s.acp.command.clone(), window, cx));
+            .custom_command
+            .update(cx, |state, cx| state.set_value(custom, window, cx));
         self.settings_form.tab = tab;
         self.settings_open = true;
         // 设置页开着时输入框不在画面上：光标后面那句灰字先撤掉（关掉设置页后接着打字会重猜）
@@ -306,7 +347,30 @@ impl ChatApp {
         if tab == super::project_view::PROJECT_TAB {
             self.reload_project_view(window, cx);
         }
+        // 「内核与模型」一栏进页面时后台测一次本机的 agent（要起子进程探版本）
+        if tab == KERNEL_TAB && matches!(self.settings_form.agent_detect, AgentDetect::Idle) {
+            self.detect_agents(cx);
+        }
         cx.notify();
+    }
+
+    /// 后台探一遍本机装了哪些 agent（PATH + 常见安装目录，每家起一次子进程问版本）。
+    fn detect_agents(&mut self, cx: &mut Context<Self>) {
+        self.settings_form.agent_detect = AgentDetect::Running;
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { claudesktop_core::agents::discover() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.settings_form.agent_detect = AgentDetect::Done(found);
+                if std::mem::take(&mut this.settings_form.enable_on_detect) {
+                    this.enable_detected_agent();
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
@@ -356,6 +420,8 @@ impl ChatApp {
     /// 把字号缩放、字体族和色板装进组件主题。Root 每帧读 `Theme::font_size` 写进窗口的 rem，
     /// 所以这里改完，下一帧整套界面（字号 / 间距 / 圆角 / 图标）等比缩放。
     pub(crate) fn apply_font(&mut self, cx: &mut Context<Self>) {
+        // 色板先设：后面 `Theme::update` 里的 `apply_to_theme` 按它写组件配色
+        crate::theme::set_palette(self.settings.theme.index());
         crate::theme::set_font_scale(self.settings.font_scale);
         // 没装的字体族会被忽略（GPUI 排版找不到字体族时会 panic）
         if let Some(name) = self.settings.font_family_or_default()
@@ -366,6 +432,12 @@ impl ChatApp {
         crate::theme::set_font_family(cx, self.settings.font_family_or_default());
         Theme::update(cx, crate::theme::apply_to_theme);
         cx.notify();
+    }
+
+    /// 设置页换配色：立即生效，并只把这一项写回文件。
+    pub(crate) fn set_theme(&mut self, theme: ThemeChoice, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.theme = theme, cx);
+        self.apply_font(cx);
     }
 
     /// 设置页调字号（拖动和松手都走这里）：立即生效，并只把这一项写回文件。
@@ -422,8 +494,8 @@ impl ChatApp {
         let motion_row = setting_row("动画", motion_tip, motion_control);
         let appearance = setting_group([
             setting_row(
-                "主题",
-                "",
+                "明暗",
+                "跟随系统，或固定浅色 / 深色；每套配色都有这两版",
                 seg_control(
                     "appearance",
                     Appearance::ALL.map(|a| (a, a.label())),
@@ -432,6 +504,7 @@ impl ChatApp {
                     cx,
                 ),
             ),
+            self.theme_row(cx),
             motion_row,
             self.font_scale_row(),
             self.font_family_row(cx),
@@ -519,6 +592,24 @@ impl ChatApp {
         setting_row("界面字号", tip, slider)
     }
 
+    /// 配色下拉：六套色板，每项下面一行色块预览。换配色即时生效。
+    fn theme_row(&self, cx: &mut Context<Self>) -> Div {
+        let app = cx.entity();
+        setting_row(
+            "配色",
+            "整套界面的底色和强调色",
+            menu_popover(
+                "theme-menu",
+                Anchor::BottomRight,
+                rems(17.5),
+                &app,
+                &self.menu_focus,
+                MenuChip::new(IconAll::Palette, self.settings.theme.label()),
+                theme_menu_items,
+            ),
+        )
+    }
+
     /// 字体族下拉：内嵌的 Inter + 系统已装字体（下拉里可搜索）。
     fn font_family_row(&self, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
@@ -542,20 +633,44 @@ impl ChatApp {
     fn form_settings(&self, cx: &App) -> Settings {
         let f = &self.settings_form;
         let mut s = self.settings.clone();
-        s.kernel = Some(f.kernel);
         let mut profiles = f.profiles.clone();
         for (p, inputs) in profiles.iter_mut().zip(&f.inputs) {
             p.name = value(&inputs.name, cx);
             p.base_url = value(&inputs.base_url, cx);
             p.api_key = value(&inputs.api_key, cx);
             p.model = value(&inputs.model, cx);
-            p.params.thinking_budget = parse_thinking_budget(&value(&inputs.thinking_budget, cx));
-            // 服务端工具（`p.params.server_tools`）由多选开关直接写在表单的档案里，这里不用再收
+            // 思考强度（`p.params.thinking`）由档位开关直接写在表单的档案里，这里不用再收
+            // 服务端工具（`p.params.server_tools`）同样由多选开关直接写
         }
         s.builtin.profiles = profiles;
         s.builtin.active = f.active.min(s.builtin.profiles.len().saturating_sub(1));
-        s.acp.command = value(&f.acp_command, cx);
-        s.acp.gateway = f.acp_gateway;
+        // agent 档案表：预设行的开关直接写在表单里；自定义命令有值就保留 / 建一条档案
+        let mut agents = f.agents.clone();
+        let custom = value(&f.custom_command, cx);
+        let custom = custom.trim();
+        match agents.iter().position(|a| a.preset().is_none()) {
+            Some(at) => {
+                if custom.is_empty() {
+                    agents.remove(at);
+                } else {
+                    agents[at].command = Some(custom.to_string());
+                }
+            }
+            None if !custom.is_empty() => {
+                let n = agents
+                    .iter()
+                    .filter_map(|a| {
+                        a.id.strip_prefix("custom-").and_then(|v| v.parse::<usize>().ok())
+                    })
+                    .max()
+                    .map_or(1, |n| n + 1);
+                agents.push(AgentProfile::custom(n, custom));
+            }
+            None => {}
+        }
+        s.acp.agents = agents;
+        // 三选一只选了「本机 agent」没选档案：落第一个启用的档案（一家都没启用就在保存时拦下来）
+        s.kernel = Some(s.kernel_for(&f.kernel));
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
         s.auto_mode.enabled = f.auto_enabled;
         s.auto_mode.use_session_model = f.auto_follow;
@@ -563,6 +678,7 @@ impl ChatApp {
         s.auto_mode.environment = f.auto_environment.read(cx).value().to_string();
         s.suggestions = f.suggest_enabled;
         s.next_suggestion = f.next_suggestion;
+        s.memory_suggest = f.memory_suggest;
         s.suggest_model = value(&f.suggest_model, cx);
         s.usage_gateway = f.usage_gateway;
         s.gateway_bodies = f.gateway_bodies;
@@ -600,7 +716,7 @@ impl ChatApp {
     }
 
     /// 首页配置引导选了一种接法：打开「内核与模型」并选好那种内核；
-    /// ACP 命令还空着时填上 Claude Code 的适配器。
+    /// 还没启用任何 agent 且本机装了 Claude Code 时顺手把它启用上。
     pub(crate) fn start_setup(
         &mut self,
         kind: KernelChoice,
@@ -608,16 +724,29 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         self.open_settings_at(KERNEL_TAB, window, cx);
-        self.settings_form.kernel = kind;
-        if kind == KernelChoice::Acp
-            && self.settings_form.acp_command.read(cx).value().trim().is_empty()
-        {
-            let command = acp_command(ACP_PRESETS[0].1);
-            self.settings_form
-                .acp_command
-                .update(cx, |state, cx| state.set_value(command, window, cx));
+        self.settings_form.kernel = kind.clone();
+        if matches!(kind, KernelChoice::Acp(_)) {
+            // 设置页刚打开时检测多半还在跑：跑完再启用
+            match self.settings_form.agent_detect {
+                AgentDetect::Done(_) => self.enable_detected_agent(),
+                _ => self.settings_form.enable_on_detect = true,
+            }
         }
         cx.notify();
+    }
+
+    /// 还没启用任何 agent、表单选的是「本机 agent」时，把检测到的第一家能用的启用上（只改表单）。
+    fn enable_detected_agent(&mut self) {
+        let f = &mut self.settings_form;
+        if !matches!(f.kernel, KernelChoice::Acp(_)) || !f.agents.is_empty() {
+            return;
+        }
+        let AgentDetect::Done(list) = &f.agent_detect else { return };
+        let Some(hit) = list.iter().find(|d| d.is_ready()) else { return };
+        let preset = hit.preset;
+        f.agents.push(AgentProfile::from_preset(preset));
+        f.message =
+            Some((false, format!("已启用本机的{}，点「保存并应用」生效", preset.name).into()));
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
@@ -627,6 +756,15 @@ impl ChatApp {
             return;
         }
         let new = self.form_settings(cx);
+        // 选了「本机 agent」却一家都没启用：先让用户勾一家（或填一条自定义命令）
+        if matches!(new.kernel(), KernelChoice::Acp(_)) && new.acp.first().is_none() {
+            self.settings_form.message = Some((
+                true,
+                "选了「本机 agent」但一家都没启用：在上面勾一家，或填一条自定义命令".into(),
+            ));
+            cx.notify();
+            return;
+        }
         if new.kernel() == KernelChoice::Builtin {
             if let Err(err) = new.builtin_config(self.cwd.clone()) {
                 self.settings_form.message = Some((true, err.to_string().into()));
@@ -664,9 +802,27 @@ impl ChatApp {
         let restart_builtin = builtin_key(&new) != builtin_key(&self.settings)
             || new.max_steps != self.settings.max_steps
             || new.usage_gateway != self.settings.usage_gateway
+            // 一轮结束的候选记忆开关变了：内核要重装才知道
+            || new.memory_suggest != self.settings.memory_suggest
             // 自动模式的开关 / 分类器模型变了：模式列表和分类器都要重装
             || new.auto_mode != self.settings.auto_mode;
+        // 只重启启动命令 / 环境变量变了的档案：改一家的网关开关不该把另一家跑着的一轮杀掉
+        //（`last_model`、显示名这些不影响进程的不算）
+        let launch = |s: &Settings, id: &str| {
+            s.acp.get(id).map(|p| {
+                let config = s.acp_config_for(self.acp_base.clone(), Some(p));
+                (config.command, config.env)
+            })
+        };
+        let changed_acp: Vec<String> = new
+            .acp
+            .agents
+            .iter()
+            .filter(|a| launch(&new, &a.id) != launch(&self.settings, &a.id))
+            .map(|a| a.id.clone())
+            .collect();
         let restart_acp = new.acp != self.settings.acp;
+        // 三选一只选了「本机 agent」没选档案：form_settings 已经落过第一个档案，这里就是具体内核
         let default = new.kernel();
         let default_changed = default != self.settings.kernel();
         // 存不存原文对已经跑着的网关立刻生效，不用重启内核
@@ -674,10 +830,26 @@ impl ChatApp {
         self.settings = new;
         self.settings_open = false;
         if restart_builtin {
-            self.restart_kernel(KernelChoice::Builtin, cx);
+            self.restart_kernel(&KernelChoice::Builtin, cx);
+        }
+        // 用量网关总开关变了也会改 agent 的环境变量，所以不只看档案表
+        for id in changed_acp {
+            self.restart_kernel(&KernelChoice::Acp(id), cx);
         }
         if restart_acp {
-            self.restart_kernel(KernelChoice::Acp, cx);
+            // 停用 / 删掉的档案：进程直接关（它们的会话已经全部脱离）
+            let mut removed: Vec<String> = self
+                .kernels
+                .iter()
+                .filter_map(|(k, _)| k.strip_prefix("acp:"))
+                .filter(|id| self.settings.acp.get(id).is_none())
+                .map(|id| id.to_string())
+                .collect();
+            removed.sort();
+            removed.dedup();
+            for id in removed {
+                self.shutdown_slot(&KernelChoice::Acp(id).key());
+            }
         }
         // 自研内核的配置变了：顺手取一次模型列表，连不上马上告诉用户（不挡保存）
         if restart_builtin && default == KernelChoice::Builtin {
@@ -686,14 +858,14 @@ impl ChatApp {
         if default_changed {
             // 默认内核换了：还没对话的会话跟着换，有对话的留在原来的内核上
             for idx in 0..self.sessions.len() {
-                self.rebind_session(idx, default);
+                self.rebind_session(idx, default.clone());
             }
         }
         // 首次配置：启动时没起内核（见 `open_session`），现在把等着的会话接上
-        if !self.kernels[default.index()].started
+        if !self.slot(&default.key()).is_some_and(|s| s.started)
             && self.sessions.iter().any(|s| s.kernel == default && !s.has_user_message())
         {
-            self.ensure_kernel(default);
+            self.ensure_kernel(&default);
             self.request_pending_sessions();
         }
         cx.notify();
@@ -777,9 +949,12 @@ impl ChatApp {
     pub(super) fn update_settings(&mut self, change: impl Fn(&mut Settings)) {
         change(&mut self.settings);
         if let Some(path) = &self.settings_path {
-            let (mut saved, _) = Settings::load(Some(path));
-            change(&mut saved);
-            let _ = saved.save(path);
+            // 盘上的文件读不出来（手改坏了、新版本的格式）时别用「默认值 + 这次改动」盖掉它
+            let (mut saved, broken) = Settings::load(Some(path));
+            if broken.is_none() {
+                change(&mut saved);
+                let _ = saved.save(path);
+            }
         }
     }
 
@@ -872,7 +1047,8 @@ impl ChatApp {
                         if base_url == app.settings.builtin.base_url().trim() {
                             app.update_settings(|s| s.builtin.current_mut().set_models(&models));
                             // 运行中的自研内核也要知道窗口大小（自动压缩用）
-                            if let Some(kernel) = &app.kernels[KernelChoice::Builtin.index()].kernel
+                            if let Some(kernel) =
+                                &app.kernel_of(&KernelChoice::Builtin)
                             {
                                 let windows = &app.settings.builtin.current().context_windows;
                                 kernel.set_context_windows(windows.clone().into_iter().collect());
@@ -1008,38 +1184,180 @@ impl ChatApp {
                     .child(text),
             )
         });
-        section("总是允许的操作", "按项目生效，删除立即生效", None, body).child(section(
-            "网页搜索",
-            "不填 key 时用 DuckDuckGo，可能被限流",
-            None,
-            setting_group([setting_row(
+        section("总是允许的操作", "按项目生效，删除立即生效", None, body)
+            .child(self.render_web_search(cx))
+    }
+
+    /// 「网页搜索」：先用的后端 + 允许哪些后端 + 各自的 key。
+    ///
+    /// 选择存在内核那边的数据目录 `search.json`（搜索是即时读取的，不经 `Kernel::set_*`），
+    /// 所以这里不走底栏「保存」：改了就写盘，下一轮搜索立刻用新顺序。默认顺序和加 DeepSeek
+    /// 之前一致（Brave → DuckDuckGo），DeepSeek 是按次计费的新花费，要用户自己选。
+    fn render_web_search(&self, cx: &mut Context<Self>) -> Div {
+        use claudesktop_builtin::websearch::SearchBackend;
+        let f = &self.settings_form;
+        let cfg = &f.search;
+        // 状态一行：按「配没配齐」算，不联网验（见设计说明：不做「测试」按钮）
+        let own_key = !f.deepseek_search_key.read(cx).value().trim().is_empty();
+        let deepseek_key = own_key || self.deepseek_search_key_from_profiles().is_some();
+        let brave_ready = claudesktop_builtin::websearch::brave_key().is_some();
+        let order = cfg.order();
+        let status: SharedString = if order.is_empty() {
+            "所有后端都不可用，web_search 会直接报错".into()
+        } else {
+            let names: Vec<&str> = order.iter().map(|b| b.label()).collect();
+            let mut line = format!("当前：{}", names.join(" → "));
+            if order.contains(&SearchBackend::DeepSeek) && !deepseek_key {
+                line.push_str("（DeepSeek 没配 key，会跳过它）");
+            }
+            if order.contains(&SearchBackend::Brave) && !brave_ready {
+                line.push_str("（Brave 没配 key，会跳过它）");
+            }
+            line.into()
+        };
+        let prefer = seg_control(
+            "search-prefer",
+            SearchBackend::ALL.map(|b| (b, b.label())),
+            cfg.prefer,
+            |this, value, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.prefer = value;
+                // 选了先用它就是要它：对应的「也允许」一起打开，开关和实际顺序对得上
+                match value {
+                    SearchBackend::DeepSeek => cfg.allow_deepseek = true,
+                    SearchBackend::Brave => cfg.allow_brave = true,
+                    SearchBackend::DuckDuckGo => cfg.allow_duckduckgo = true,
+                }
+                this.save_search(cfg, "搜索后端已更新", cx);
+            },
+            cx,
+        );
+        let deepseek_toggle = Switch::new("search-allow-deepseek")
+            .checked(order.contains(&SearchBackend::DeepSeek))
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.allow_deepseek = *checked;
+                // 「先用」选着 DeepSeek 时它也算允许：关掉就把先用的退回默认
+                if !*checked && cfg.prefer == SearchBackend::DeepSeek {
+                    cfg.prefer = SearchBackend::Brave;
+                }
+                this.save_search(cfg, "搜索后端已更新", cx);
+            }));
+        let brave_toggle = Switch::new("search-allow-brave")
+            .checked(cfg.allow_brave)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.allow_brave = *checked;
+                this.save_search(cfg, "搜索后端已更新", cx);
+            }));
+        let ddg_toggle = Switch::new("search-allow-ddg")
+            .checked(cfg.allow_duckduckgo)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                let mut cfg = this.settings_form.search.clone();
+                cfg.allow_duckduckgo = *checked;
+                this.save_search(cfg, "搜索后端已更新", cx);
+            }));
+        let body = setting_group([
+            setting_row("先用哪个", "它没配好或失败时按固定顺序退到下一个", prefer),
+            setting_row(
+                "也允许 DeepSeek",
+                "按次计费（1000 次 $0.75），打开了才会用到它，配了 key 不算",
+                deepseek_toggle,
+            ),
+            setting_row("也允许 Brave", "要自己的 API key（api.search.brave.com）", brave_toggle),
+            setting_row("也允许 DuckDuckGo", "不要 key 的最后兜底，可能被限流", ddg_toggle),
+            setting_row(
                 "Brave API key",
-                "api.search.brave.com 免费注册；也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY",
+                "也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY；保存后立即生效",
                 div()
                     .h_flex()
                     .gap_2()
-                    .child(
-                        div()
-                            .w(rems(24.))
-                            .child(Input::new(&self.settings_form.brave_key).cleanable(true)),
-                    )
+                    .child(div().w(rems(20.)).child(Self::secret_input(&f.brave_key)))
                     .child(Self::text_button("brave-key-save", "保存", false).on_click(
                         cx.listener(|this, _, window, cx| {
                             let key = this.settings_form.brave_key.read(cx).value().to_string();
                             let res = claudesktop_builtin::websearch::set_brave_key(Some(&key));
                             this.settings_form.message = Some(match res {
-                                Ok(()) => (false, "搜索后端已保存".into()),
+                                Ok(()) => (false, "Brave key 已保存".into()),
                                 Err(e) => (true, format!("保存失败：{e}").into()),
                             });
-                            // 输入框回到已保存的值（密码态）
                             this.settings_form
                                 .brave_key
                                 .update(cx, |state, cx| state.set_value(key, window, cx));
                             cx.notify();
                         }),
                     )),
-            )]),
-        ))
+            ),
+            setting_row(
+                "DeepSeek key",
+                "免费额度用完后按次计费（1000 次 $0.75）；留空就用「服务商」里 DeepSeek 那份的 key",
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(div().w(rems(20.)).child(Self::secret_input(&f.deepseek_search_key)))
+                    .child(Self::text_button("deepseek-key-save", "保存", false).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            let key =
+                                this.settings_form.deepseek_search_key.read(cx).value().to_string();
+                            let res =
+                                claudesktop_builtin::websearch::set_own_deepseek_key(Some(&key));
+                            this.settings_form.message = Some(match res {
+                                Ok(()) => (false, "DeepSeek 搜索 key 已保存".into()),
+                                Err(e) => (true, format!("保存失败：{e}").into()),
+                            });
+                            this.settings_form
+                                .deepseek_search_key
+                                .update(cx, |state, cx| state.set_value(key, window, cx));
+                            cx.notify();
+                        }),
+                    )),
+            ),
+        ]);
+        section(
+            "网页搜索",
+            "web_search 用哪个后端搜，失败时自动降级并在结果里写明用了哪个",
+            None,
+            div()
+                .v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(if order.is_empty() { RED } else { INK_SOFT }))
+                        .child(status),
+                )
+                .child(body),
+        )
+    }
+
+    /// 「服务商」里 DeepSeek 那份档案的 key（搜索页只说有没有，不显示内容）。
+    fn deepseek_search_key_from_profiles(&self) -> Option<String> {
+        self.settings_form
+            .profiles
+            .iter()
+            .filter(|p| crate::settings::is_deepseek_endpoint(p))
+            .map(|p| p.api_key.trim().to_string())
+            .find(|k| !k.is_empty())
+    }
+
+    /// 把搜索后端的选择写进数据目录（不用点底栏「保存」）。
+    fn save_search(
+        &mut self,
+        cfg: claudesktop_builtin::websearch::SearchConfig,
+        ok: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_form.message = Some(match claudesktop_builtin::websearch::save(&cfg) {
+            Ok(()) => {
+                self.settings_form.search = cfg;
+                (false, ok.to_string().into())
+            }
+            Err(e) => (true, format!("保存搜索设置失败：{e}").into()),
+        });
+        cx.notify();
     }
 
     fn import_antigravity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1062,7 +1380,18 @@ impl ChatApp {
 
     /// 在模型下拉里选了一个：当前会话立即切换（还没建立的会话等 Started），并记为默认。
     pub(crate) fn choose_model(&mut self, model: String, cx: &mut Context<Self>) {
-        self.update_settings(|s| s.builtin.current_mut().model = model.clone());
+        // 记住上次用的模型：自研内核记在当前 provider 档案，agent 记在它的档案上
+        // （新会话 Started 后按它切过去，见 `Session::apply_event` 的 Started 分支）
+        match self.session().kernel.clone() {
+            KernelChoice::Builtin => {
+                self.update_settings(|s| s.builtin.current_mut().model = model.clone());
+            }
+            KernelChoice::Acp(id) => {
+                let model = model.clone();
+                self.update_settings(move |s| s.acp.set_last_model(&id, &model));
+            }
+            KernelChoice::Demo => {}
+        }
         let kernel = self.session_kernel(self.active);
         let s = &mut self.sessions[self.active];
         match (kernel, s.acp_id.clone()) {
@@ -1241,13 +1570,16 @@ impl ChatApp {
     }
 
     pub(super) fn text_input(state: &Entity<InputState>) -> Div {
-        div()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(CARD))
-            .px_1()
-            .child(Input::new(state).appearance(false).bordered(false))
+        Self::text_input_with(Input::new(state).appearance(false).bordered(false))
+    }
+
+    /// 同 [`Self::text_input`]，带显示 / 隐藏切换（key 一类）。
+    pub(super) fn secret_input(state: &Entity<InputState>) -> Div {
+        Self::text_input_with(Input::new(state).appearance(false).bordered(false).mask_toggle())
+    }
+
+    fn text_input_with(input: Input) -> Div {
+        div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).px_1().child(input)
     }
 
     /// 表单和生效中的设置有没有不同（底栏据此提示、决定「保存」能不能点）。
@@ -1257,7 +1589,7 @@ impl ChatApp {
             return true;
         }
         let normalize = |mut s: Settings| {
-            s.kernel = Some(s.kernel());
+            s.kernel = Some(s.kernel_for(s.kernel.as_ref().unwrap_or(&KernelChoice::Builtin)));
             // 打开设置页时补上的那套空档案不算改动
             let blank = ProviderProfile::default();
             s.builtin.profiles.retain(|p| *p != blank);
@@ -1271,14 +1603,17 @@ impl ChatApp {
     fn render_kernel_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let mut kernels = choice_panel();
-        for (kind, icon, title, desc) in KERNEL_CHOICES {
+        for (kind, icon, title, desc) in kernel_choices() {
+            let key = kind.key();
+            let id: gpui_kit::ElementId = format!("kernel-{}", key.replace(':', "-")).into();
             kernels = kernels.child(
-                choice_row(("kernel", kind.index()), icon, title, desc, f.kernel == kind, None)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_form.kernel = kind;
+                choice_row(id, icon, title, desc, f.kernel.same_kind(&kind), None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.settings_form.kernel = kind.clone();
                         this.settings_form.message = None;
                         cx.notify();
-                    })),
+                    }),
+                ),
             );
         }
         let body = div().v_flex().gap_8().child(section("默认内核", "", None, kernels));
@@ -1287,6 +1622,7 @@ impl ChatApp {
                 .child(self.render_providers(window, cx))
                 .child(self.render_auto_mode(window, cx))
                 .child(self.render_suggest(cx))
+                .child(self.render_memory_options(cx))
                 .child(section(
                     "运行",
                     "",
@@ -1302,7 +1638,7 @@ impl ChatApp {
                         self.prices_row(window, cx),
                     ]),
                 )),
-            KernelChoice::Acp => body.child(self.render_acp(cx)),
+            KernelChoice::Acp(_) => body.child(self.render_acp(cx)),
             KernelChoice::Demo => body,
         }
     }
@@ -1408,6 +1744,28 @@ impl ChatApp {
                     div().w(rems(20.)).child(Input::new(&f.suggest_model).cleanable(true)),
                 ),
             ]),
+        )
+    }
+
+    /// 记忆：一轮结束后要不要让模型提炼「候选」（只进设置页待确认，收下才落盘）。
+    fn render_memory_options(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let suggest = Switch::new("memory-suggest")
+            .checked(f.memory_suggest)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                this.settings_form.memory_suggest = *checked;
+                cx.notify();
+            }));
+        section(
+            "记忆",
+            "跨会话记住偏好和约定：每轮带上相关的几条，置顶的永远带上；在设置页「记忆」里看、改、删",
+            None,
+            setting_group([setting_row(
+                "回合结束后提炼记忆",
+                "每轮结束多一次请求，提炼出值得记下的话放进「记忆」页顶部等你收下（默认关，关着就是它自己觉得有用时才记）",
+                suggest,
+            )]),
         )
     }
 
@@ -1532,16 +1890,32 @@ impl ChatApp {
         let mut endpoint = div().v_flex().gap_1p5().child(Self::text_input(&inputs.base_url));
         if antigravity_gateway().is_some() {
             endpoint = endpoint.child(
-                div().h_flex().child(
-                    Self::quiet_button("import-antigravity", IconAll::Download, Surface::Paper, cx)
-                        .xsmall()
-                        .label("从 Antigravity Tools 导入端点和 Key")
-                        .px_2()
-                        .ml(rems(-0.5))
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.import_antigravity(window, cx)),
+                div()
+                    .v_flex()
+                    .gap_0p5()
+                    .child(
+                        div().h_flex().child(
+                            Self::quiet_button(
+                                "import-antigravity",
+                                IconAll::Download,
+                                Surface::Paper,
+                                cx,
+                            )
+                            .xsmall()
+                            .label("从 Antigravity Tools 导入端点和 Key")
+                            .px_2()
+                            .ml(rems(-0.5))
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.import_antigravity(window, cx),
+                            )),
                         ),
-                ),
+                    )
+                    .child(
+                        div()
+                            .text_size(TEXT_META)
+                            .text_color(rgb(INK_SOFT))
+                            .child(ANTIGRAVITY_RISK),
+                    ),
             );
         }
         div()
@@ -1577,25 +1951,78 @@ impl ChatApp {
                 ),
             ))
             .child(form_field("模型", model_hint, model_row))
+            // 档位按模型输入框**现在**的字（`p.model` 要保存时才收进来），换模型这一排跟着变
+            .child(self.render_thinking_row(p, &value(&inputs.model, cx), cx))
             .when(p.protocol == Protocol::Anthropic, |d| {
-                d.child(self.render_request_extras(p, inputs, cx))
+                d.child(self.render_server_tools(p, cx))
             })
     }
 
-    /// 档案里只有 Anthropic 原生协议认的两项：思考预算 + 服务端工具。
-    /// 协议不是 Anthropic 时整块不显示（填了也不生效，免得误会），见 `render_profile_editor`。
-    fn render_request_extras(
-        &self,
-        p: &ProviderProfile,
-        inputs: &ProfileInputs,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let budget = form_field(
-            "思考预算",
-            Some("最小 1024，留空不开启".into()),
-            div().w(NUMBER_INPUT_W).child(Self::text_input(&inputs.thinking_budget)),
-        );
-        // 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）
+    /// 「思考强度」：档位一排（`seg_control`），三种协议下都显示。
+    ///
+    /// 能选哪些档跟着模型输入框的**当前值**现算（不额外存 Entity、不用同步代码），
+    /// 所以换模型之后这一排跟着变；存在档案里的档位如果新模型不支持，高亮和保存都按
+    /// `ThinkingSpec::resolve` 降级后的那一档。
+    ///
+    /// 模型认不出时照样给这一排，但只有「默认 / 兜底」两项：兜底按 `FALLBACK_LEVELS`
+    /// 发 effort，其余档位不发（见 `apply_thinking`）。以前整行不出现，用户看着设置页
+    /// 以为没地方调（其实是被能力表挡掉了）。
+    fn render_thinking_row(&self, p: &ProviderProfile, model: &str, cx: &mut Context<Self>) -> Div {
+        // 档位按模型现算：各家能选的档差了不止一点（DeepSeek 没有中档、GLM-5.3 关不掉、
+        // Gemini 3 Pro 只有低/高），所以选项一律来自 `spec.choices()`，不手写固定列表
+        let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
+        let known = spec.is_known();
+        let current = p.params.thinking;
+        let options = thinking_options(&spec);
+        let active = active_thinking(&spec, current);
+        // 认不出的模型：这一档旁边的说明短一点（整段解释在 ⓘ 里，别把行撑长）
+        let hint = if !known {
+            if current == Some(ThinkingLevel::Default) {
+                Some("按通用的 effort 字段发".to_string())
+            } else {
+                Some("还不知道这个模型认不认，选「兜底」试试".to_string())
+            }
+        } else if p.protocol == Protocol::Anthropic && spec.format.budget {
+            // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
+            active
+                .filter(|l| !l.is_off())
+                .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l)))
+        } else {
+            None
+        };
+        let control = div().h_flex().items_center().gap_3().child(seg_control(
+            "thinking",
+            options,
+            active,
+            |this, level: Option<ThinkingLevel>, _, cx| {
+                if let Some(profile) =
+                    this.settings_form.profiles.get_mut(this.settings_form.active)
+                {
+                    profile.params.thinking = level;
+                    this.settings_form.message = None;
+                }
+                cx.notify();
+            },
+            cx,
+        ));
+        let control = match hint {
+            Some(hint) => {
+                control.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_FAINT)).child(hint))
+            }
+            None => control,
+        };
+        let mut field_hint: SharedString = "让模型回答前先想多久，越高越慢、越贵".into();
+        if !known {
+            field_hint = "没确认过的模型只有「兜底」可用：按通用的 effort 字段发，从「低」起；\
+                 选别的档位就不发，而不是猜一个。端点不认这个字段时一般直接忽略，不会报错"
+                .into();
+        }
+        form_field("思考强度", Some(field_hint), control)
+    }
+
+    /// 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）。
+    /// 只有 Anthropic 原生协议认，别的协议下整块不显示（填了也不生效，免得误会）。
+    fn render_server_tools(&self, p: &ProviderProfile, cx: &mut Context<Self>) -> Div {
         let mut tools = choice_panel();
         for (i, (name, desc)) in
             claudesktop_builtin::RequestParams::server_tool_choices().enumerate()
@@ -1643,60 +2070,111 @@ impl ChatApp {
                     ),
             );
         }
-        div().v_flex().gap_4().child(budget).child(form_field(
+        div().v_flex().gap_4().child(form_field(
             "服务端工具",
             Some("在 Anthropic 服务器上执行，按次计费".into()),
             tools,
         ))
     }
 
-    /// ACP agent：启动命令（带常用命令一键填入）和要不要经用量网关。
+    /// ACP agent：本机装了哪些（后台检测的），每行一个开关；下面是自定义 agent 的命令。
+    /// 登录和模型在 agent 那边设置；保存后每条启用的档案各起一个内核进程。
     fn render_acp(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let mut quick = div().h_flex().items_center().gap_1().ml(rems(-0.5));
-        for (i, (label, command)) in ACP_PRESETS.into_iter().enumerate() {
-            quick = quick.child(
-                Self::quiet_button(("acp-preset", i), IconAll::SquareTerminal, Surface::Paper, cx)
-                    .xsmall()
-                    .label(format!("填入 {label}"))
-                    .px_2()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let command = acp_command(command);
-                        this.settings_form
-                            .acp_command
-                            .update(cx, |s, cx| s.set_value(command, window, cx));
+        let mut list = choice_panel();
+        // 每家预设一行：开关 = 档案表里有没有它
+        for preset in claudesktop_core::agents::PRESETS {
+            let enabled = f.agents.iter().any(|a| a.id == preset.id);
+            let detect = match &f.agent_detect {
+                AgentDetect::Idle | AgentDetect::Running => None,
+                AgentDetect::Done(found) => found.iter().find(|d| d.preset.id == preset.id),
+            };
+            // 行的说明：装没装 / 版本；「没找到」只说明探测没找到，仍可手动启用
+            let desc: String = match detect {
+                Some(d) => d.summary(),
+                None => match &f.agent_detect {
+                    AgentDetect::Idle | AgentDetect::Running => "检测中…".into(),
+                    AgentDetect::Done(_) => "本机没找到（可手动启用）".into(),
+                },
+            };
+            let id = format!("agent-{}", preset.id);
+            list = list.child(
+                choice_row(id, IconAll::SquareTerminal, preset.name, desc, enabled, None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(at) =
+                            this.settings_form.agents.iter().position(|a| a.id == preset.id)
+                        {
+                            this.settings_form.agents.remove(at);
+                        } else {
+                            this.settings_form.agents.push(AgentProfile::from_preset(preset));
+                        }
                         cx.notify();
-                    })),
+                    }),
+                ),
             );
+            // 风险提示常驻在这一行下面（条款风险不收进 ⓘ）
+            if let Some(risk) = preset.risk {
+                list = list.child(
+                    div().px_3().pb_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk),
+                );
+            }
         }
-        let command = div().v_flex().gap_1p5().child(Self::text_input(&f.acp_command)).child(quick);
-        let gateway_desc = if self.settings.usage_gateway {
-            "把 agent 的请求也记进「请求」页签"
-        } else {
-            "先在自研内核的「运行」里打开用量网关"
+        // 检测状态行：转圈 / 重新检测
+        let detect_note = match &f.agent_detect {
+            AgentDetect::Idle | AgentDetect::Running => Some(
+                div()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child("正在检测本机安装的 agent…"),
+            ),
+            AgentDetect::Done(_) => None,
         };
-        section(
-            "ACP agent",
-            "登录和模型在 agent 那边设置",
-            None,
-            div()
-                .v_flex()
-                .gap_4()
-                .child(form_field(
-                    "启动命令",
-                    Some("需要 Node.js；留空用演示 agent".into()),
-                    command,
-                ))
-                .child(setting_group([setting_row(
-                    "经过用量网关",
-                    gateway_desc,
-                    Switch::new("acp-gateway").checked(f.acp_gateway).color(rgb(CORAL)).on_change(
-                        cx.listener(|this, checked: &bool, _, cx| {
-                            this.settings_form.acp_gateway = *checked;
+        let gateway_rows: Vec<_> = f
+            .agents
+            .iter()
+            .filter(|a| a.supports_gateway())
+            .map(|a| {
+                let id = a.id.clone();
+                let name = a.display_name();
+                setting_row(
+                    format!("{} 经过用量网关", name),
+                    "把它的请求也记进「请求」页签",
+                    Switch::new(format!("agent-gw-{}", id))
+                        .checked(a.gateway)
+                        .color(rgb(CORAL))
+                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                            if let Some(a) =
+                                this.settings_form.agents.iter_mut().find(|a| a.id == id)
+                            {
+                                a.gateway = *checked;
+                            }
                             cx.notify();
-                        }),
-                    ),
-                )])),
+                        })),
+                )
+            })
+            .collect();
+        let body = div()
+            .v_flex()
+            .gap_4()
+            .child(list)
+            .children(detect_note)
+            .children(gateway_rows.is_empty().then(|| {
+                div()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child("启用一家后可以单独开关「它的请求经不经过用量网关」")
+            }))
+            .when(!gateway_rows.is_empty(), |d| d.child(setting_group(gateway_rows)))
+            .child(form_field(
+                "自定义 agent",
+                Some("任何说 ACP 的 agent 都能接；登录和模型在它那边设置".into()),
+                Self::text_input(&f.custom_command),
+            ));
+        section(
+            "本机 agent",
+            "直接用本机装好的 Claude Code / OpenCode 等：登录和模型都在 agent 那边，这里只管接不接",
+            None,
+            body,
         )
     }
 
@@ -1899,24 +2377,50 @@ enum Fetch {
 }
 
 /// 「内核与模型」里默认内核的三种选择。
-const KERNEL_CHOICES: [(KernelChoice, IconAll, &str, &str); 3] = [
-    (
-        KernelChoice::Builtin,
-        IconAll::Cpu,
-        "自研内核",
-        "填 API Key 直连 DeepSeek、OpenAI、Ollama 等",
-    ),
-    (KernelChoice::Acp, IconAll::SquareTerminal, "ACP agent", "接 Claude Code 这类外部 agent"),
-    (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
-];
+fn kernel_choices() -> Vec<(KernelChoice, IconAll, &'static str, &'static str)> {
+    vec![
+        (
+            KernelChoice::Builtin,
+            IconAll::Cpu,
+            "自研内核",
+            "填 API Key 直连 DeepSeek、OpenAI、Ollama 等",
+        ),
+        (
+            KernelChoice::Acp(String::new()),
+            IconAll::SquareTerminal,
+            "本机 agent",
+            "用本机装好的 Claude Code / OpenCode 等，登录和模型都在 agent 那边",
+        ),
+        (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
+    ]
+}
 
-/// ACP 启动命令的常用项：(名称, 命令)；Windows 上前面补 `cmd /c`（见 [`acp_command`]）。
-const ACP_PRESETS: [(&str, &str); 2] =
-    [("Claude Code", "npx -y @agentclientprotocol/claude-agent-acp"), ("pi", "npx -y pi-acp")];
+/// Antigravity Tools 借用 Antigravity 账号的登录，Google 2026-02 起按违反条款封过这样用的账号。
+const ANTIGRAVITY_RISK: &str =
+    "风险：它借用你 Antigravity 账号的登录调用模型，Google 封过这样用的账号";
 
-/// npx 在 Windows 上是 .cmd，要经 `cmd /c` 才起得来。
-fn acp_command(command: &str) -> String {
-    if cfg!(windows) { format!("cmd /c {command}") } else { command.to_string() }
+/// 思考强度能选的项（设置页那一排和输入框的下拉共用）：「默认」= 不发字段，排在「关」前面；
+/// 然后是这个模型的档位；认不出的模型只有「默认 / 兜底」（兜底见 `FALLBACK_LEVELS`）。
+pub(super) fn thinking_options(spec: &ThinkingSpec) -> Vec<(Option<ThinkingLevel>, &'static str)> {
+    let mut options = vec![(None, "默认")];
+    if spec.is_known() {
+        options.extend(spec.choices().iter().map(|level| (Some(*level), level.label())));
+    } else {
+        options.push((Some(ThinkingLevel::Default), ThinkingLevel::Default.label()));
+    }
+    options
+}
+
+/// 高亮哪一项：None 就是「默认」；Some(x) 落到这个模型实际生效的那一档。
+/// 认不出的模型只有「兜底」会发字段，存着别的档（从别的模型带过来的）实际什么都不发，算「默认」。
+pub(super) fn active_thinking(
+    spec: &ThinkingSpec,
+    current: Option<ThinkingLevel>,
+) -> Option<ThinkingLevel> {
+    if !spec.is_known() {
+        return current.filter(|c| *c == ThinkingLevel::Default);
+    }
+    current.and_then(|c| spec.resolve(c)).or(current)
 }
 
 /// 「自动」模式的说明（拦什么、放什么、判不出来怎么办）。
@@ -2036,6 +2540,29 @@ fn rule_label(rule: &str) -> String {
         rule.to_string()
     }
 }
+/// 配色下拉的条目：名称 + 灰色说明，下一行是这套配色在当前明暗下的色块，当前项打勾。
+fn theme_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let current = app.settings.theme;
+    let mut menu = MenuList::new("theme-list", handle, popover);
+    for t in ThemeChoice::ALL {
+        menu = menu.pick(
+            theme_menu_item(
+                ("theme-item", t.index()),
+                t.label(),
+                t.desc(),
+                t.index(),
+                t == current,
+            ),
+            move |this, cx| this.set_theme(t, cx),
+        );
+    }
+    menu
+}
+
 /// 界面字体下拉的条目：第一项是内嵌的 Inter，后面跟系统已装字体（可滚动，最多列一批）。
 /// 每项用该字体本身排一行预览（`font_menu_item`），当前项打勾；
 /// 列不完的靠「还有 N 款」提示，需要的话在设置文件里手写字体名。

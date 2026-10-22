@@ -1,9 +1,11 @@
 # 设计说明：worktree 隔离
 
-> 状态：方案（2026-10-20），未实现。第八节的取舍已按推荐定。
-> 代码落点：`crates/core/src/git.rs`（新，git 调用 + worktree 增删查）、`project.rs`（认 worktree 根）、
-> `store.rs`（`SessionMeta::worktree`）、`apps/desktop/src/app/mod.rs`（建会话）、`composer.rs`（目录菜单）、
-> `sidebar.rs`（分组、行标记、归档 / 删除时清理）、新 `app/worktree.rs`（会话顶栏的分支 chip 和操作）。
+> 状态：第 1~5 步已实施（2026-10-22 前 4 步，`worktree.copy` / `worktree.setup` 随后补上）。
+> 代码落点：`crates/core/src/git.rs`（git 调用 + worktree 增删查）、`project.rs`（认 worktree 根的 `.git` 文件、`shared_root`、
+> `worktree` 一栏的读取与复制规则）、`store.rs`（`SessionMeta::worktree`）、`apps/desktop/src/app/worktree.rs`（建 / 删 / 状态 / 分支 chip 与菜单）、
+> `app/worktree_setup.rs`（建好之后复制未跟踪文件、跑初始化命令）、`app/project_view.rs`（设置页「项目」里的 `worktree` 一栏）、
+> `mod.rs`（建会话、排队发送、目录丢失重接）、`composer.rs`（目录菜单）、`sidebar.rs`（分组、行标记、归档 / 删除时清理）、
+> `chrome.rs`（顶栏 chip）、`status.rs`（准备中的提示）。
 
 ## 一、要解决什么
 
@@ -79,12 +81,13 @@ pub struct WorktreeMeta {
   读到的是**这个分支上的版本**，和代码一致。判据是文件内容以 `gitdir:` 开头且路径里有 `worktrees/<名>`
   ——只看「是文件」会把随便一个同名文件当成标记；只认 `gitdir:` 又会把子模块
   （`gitdir: ../.git/modules/x`）误当成 worktree。
-- 新增 `project::shared_root(cwd) -> PathBuf`：是 worktree 时解析 `.git` 文件换成主仓库根（纯文件解析，不调 git，可单测）。
+- 新增 `project::shared_root(cwd) -> Option<PathBuf>`：是 worktree 时解析 `.git` 文件换成主仓库根（纯文件解析，不调 git，可单测）。
   **项目记忆**（`memory::project_file`）、**权限规则的存和查**（`permissions.rs` 的 `add` / `matching`、
   `lib.rs` 合并项目权限处）都用它：在 worktree 里说过的「记住……」、点过的「始终允许」，回到主目录也算数，反之亦然。
-  存和查必须是**同一个**根，否则规则写进去了判断时却查不到。
-- 路径要**按组件归一**：git 在 `.git` 文件里写的是正斜杠（`C:/repo/.git/worktrees/b1`），
-  而别处的 `cwd` 是原生分隔符。权限规则拿 `display()` 当键，不统一就会变成两张互不可见的表。
+- 另加 `project::shared_dir(cwd)`：worktree 里的 `<worktree>/crates/x` 对到 `<主仓库>/crates/x`，
+  权限规则**按它记**，在子目录里点的「始终允许」范围和在主目录同一个子目录里点的一样大（不放大到整个仓库）。
+  `matching` 查共享根 / 项目根 / 工作目录几个键（老规则可能直接记在 worktree 目录下），`add` 只写 `shared_dir`。
+- 路径词法上消掉 `..`（worktree 的 git 目录可能已经不在，比如被手动删掉的 checkout）。
 
 已实现（2026-10-21），测试见 `project.rs`、`memory.rs`、`permissions.rs` 里 `worktree` / `shared_root` 相关的几条。
 
@@ -150,10 +153,58 @@ pub struct WorktreeMeta {
    `git.rs` 还没做，归到第 2 步一起）。落地时补了两条文档里没写的：`.git` 文件必须验 `gitdir:` 内容
    （随便一个同名文件不算标记），子模块那种 `gitdir: ../.git/modules/x` 不能当 worktree；
    以及路径归一（git 写正斜杠，权限规则拿 `display()` 当键，不统一会变成两张表）。
-   权限规则的**存**（`PermissionRules::add`）也跟着改用 `shared_root`，否则写进去查不到。
+   权限规则的**存**（`PermissionRules::add`）改成按 `shared_dir` 记（worktree 里换成主仓库里对应的目录），
+   `matching` 把共享根 / 项目根 / 工作目录几个键都查一遍（老规则记在哪都能命中）。
 2. `git.rs` + `SessionMeta::worktree`、`Session::group_dir`、侧栏分组 + 行标记（半天）。
 3. 目录菜单「在新 worktree 中开始」+ 后台创建 + 排队发送 + 命令面板（半天）。
 4. 分支 chip、状态刷新、合并 / 删除 / 归档清理 / 目录丢失重接（一天）。
 5. `worktree.copy` / `worktree.setup`（半天，可以放到最后或下一期）。
 
 合计约三天。第 2 步本身也不改变现有行为，可以先合。
+
+## 十二、`worktree.copy` / `worktree.setup` 的落地（第七节第 5 条）
+
+和方案一致，细节是实施时才定的：
+
+1. **配置位置**：项目配置 `.claudesktop/settings.json` 的 `worktree` 一栏，
+   `{"worktree": {"copy": [".env*", "data/"], "setup": "npm install"}}`。
+   读取和复制规则在 `claudesktop_core::project`（`WorktreeConfig` / `copy_matches` / `copy_into`），
+   设置页「项目」里两行（复制规则一行一条、初始化命令一个单行框），和这一页其余字段一样即时生效。
+2. **复制规则**是相对主仓库根的 glob：`*` / `?` 在**一段路径**内匹配，`**` 跨层，以 `/` 结尾的只看目录；
+   绝对路径的规则直接跳过（不写警告，界面上有一句「相对项目根」）。`.git` 不参与 `**` 遍历。
+   匹配到的是目录就整份递归复制；命中了主目录里不存在的路径只会进「没匹配到」。
+3. **时机**：建 worktree 的那次（`start_in_worktree`）就把配置读好（建完会话可能已经换了），
+   `adopt_worktree` 之后在**换好的那个会话**里跑。复制先做、`setup` 后跑（命令常要读复制过去的 `.env`）。
+   两项都在后台，结果落进对话：复制成功记一张只读工具卡（点开是文件清单），`setup` 记一张命令卡
+   （失败时默认展开、输出是 `output_preview` 的预览；失败只 toast 一句，不阻塞对话）。
+4. **`setup` 怎么跑**：和内核的后台命令同一套——Windows 走 pwsh / Windows PowerShell 的
+   `-NoProfile -NonInteractive`，非 Windows 走 `sh -c`；带那份「不弹窗口」的环境变量，
+   `CREATE_NO_WINDOW`；最多 900 秒，超时就杀掉。不弹终端、不抢焦点。
+5. **菜单补了一条**「重新复制配置里的文件」（配了 `worktree.copy` 且 worktree 目录还在时才有）：
+   改完规则不想重开会话时手动补一遍。
+6. 建 worktree 期间提示里那句「未提交的改动不会带过去」仍然对——复制的是 `worktree.copy` 里列的未跟踪文件，
+   其余未提交的改动照样不过去（那是分支的语义，不是遗漏）。
+
+## 十一、落地时改了什么（2026-10-22）
+
+和上面方案的差异，都是实现时才看清的：
+
+1. **分支 chip 不直接合并**。第六节第 4 条原本要在主目录里 `git merge --no-ff`，但那样得在主目录里跑 git
+   写操作、还要处理冲突回滚。改成菜单里「合并回主目录」= 往输入框填一句话让**这个会话的 agent** 去做
+   （它能在 worktree 里把 base 合进来、跑测试、解冲突）；主目录不在 base 或脏着的时候，菜单里直接用
+   `git::merge_blocker` 说明原因。`git::merge_into_base` 仍然实现了（带冲突 abort）并测过，留给以后一键合并。
+   连带：删 worktree、重接也用 `git::remove_worktree` / `reattach_worktree`，不手搓命令。
+2. **建 worktree 时是「原地换会话」还是「另开一个」**：会话还没发过消息就原地换（`replace_session`），
+   已经有对话了就另开一个新会话接在 worktree 里（对话不能跨目录），并 toast 说清楚原对话留在原目录。
+   建期间排队的消息（`Session::queued`）在换会话时先摘出来再放回，建好之后 `dispatch_queued` 接着发。
+3. **`dispatch_queued` 多了一个 `!s.ready` 判断**：建 worktree 期间排队的消息，会话重建后还没就绪，
+   等 `Started` 到达时再发（`mod.rs` 的事件处理里补了一次调用）。
+4. **`shared_root` 就是一句 `gitdir:` 解析**，不调 git：`<主>/.git/worktrees/<名>` → `<主>`，submodule 的
+   `.git/modules/<名>` 不算 worktree（共享根还是它自己）。相对路径按项目根解析，路径词法消掉 `..`。
+   项目记忆用 `memory::project_file`（走 `shared_root`）。权限规则的 `add` 写 `shared_dir`（worktree 里对到主仓库里
+   同一层目录，范围和在主目录里点的一样），`matching` 查 `shared_dir` / `shared_root` / 项目根 / 工作目录四个键
+   —— 老规则记在 worktree 目录下的也照样命中。
+5. **`in_worktree()` 删了**（没人用），侧栏和顶栏直接看 `s.worktree.is_some()`。
+6. **`WorktreeStatus::is_disposable`**（干净且没有未合并提交）统一了「可以丢」的判断：菜单里显示「干净」、
+   删会话 / 归档时只在这时候顺手删空 worktree。
+11. **第 5 步（`worktree.copy` / `worktree.setup`）后来补上了**（见第十二节）。

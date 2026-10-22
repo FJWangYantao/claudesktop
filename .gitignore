@@ -6,3 +6,6 @@
 
 # Debug screenshots captured while probing layout (not source)
 tools/*.png
+# One-off probes for those shots (kept out of the repo: hard-coded local paths)
+tools/scan.ps1
+tools/shot_one.ps1

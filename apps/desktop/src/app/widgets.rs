@@ -53,18 +53,6 @@ impl ChatApp {
         Button::new(id).label(label).cursor_pointer().when(primary, |b| b.primary())
     }
 
-    pub(super) fn chip(icon: IconAll, label: impl Into<SharedString>) -> Div {
-        div()
-            .h_flex()
-            .gap_1p5()
-            .px_2p5()
-            .py_1()
-            .rounded_md()
-            .bg(rgb(SAND))
-            .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
-            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(label.into()))
-    }
-
     /// 消息下方的小操作按钮（复制 / 编辑 / 重跑）：图标 + 元信息字号文字，悬停出底色。
     pub(super) fn message_action(
         id: impl Into<ElementId>,

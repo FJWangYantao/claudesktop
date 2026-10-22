@@ -199,16 +199,16 @@ impl ChatApp {
 
     /// 重新读配置、重连全部服务器；自研内核还没起来就把它起来（起来时自己会连）。
     fn reload_mcp(&mut self, cx: &mut Context<Self>) {
-        match self.kernel_of(KernelChoice::Builtin) {
+        match self.kernel_of(&KernelChoice::Builtin) {
             Some(kernel) => kernel.reload_mcp(),
-            None => self.ensure_kernel(KernelChoice::Builtin),
+            None => self.ensure_kernel(&KernelChoice::Builtin),
         }
         cx.notify();
     }
 
     /// 重连一个没连上的服务。
     fn reconnect_mcp(&mut self, name: &str, cx: &mut Context<Self>) {
-        if let Some(kernel) = self.kernel_of(KernelChoice::Builtin) {
+        if let Some(kernel) = self.kernel_of(&KernelChoice::Builtin) {
             kernel.reconnect_mcp(name);
         }
         cx.notify();
@@ -217,7 +217,7 @@ impl ChatApp {
     /// 清除一个远程服务存着的登录状态（OAuth 令牌）：内核删掉令牌文件、断开并重连，
     /// 服务器要授权的话会重新走到「需要登录」。结果用提示消息报（不属于任何对话）。
     fn clear_mcp_auth(&mut self, name: &str, cx: &mut Context<Self>) {
-        let Some(kernel) = self.kernel_of(KernelChoice::Builtin) else {
+        let Some(kernel) = self.kernel_of(&KernelChoice::Builtin) else {
             self.toast(
                 Notification::error("自研内核没在运行，清除不了登录状态；先发一条消息把内核起来"),
                 cx,
@@ -270,9 +270,9 @@ impl ChatApp {
             .child(self.disclosure("mcp-example", "配置示例", example, window, cx))
             .child(note(IconAll::Braces, format!("配置文件：{path}")));
 
-        let running = self.kernel_of(KernelChoice::Builtin).is_some();
+        let running = self.kernel_of(&KernelChoice::Builtin).is_some();
         let servers: Vec<McpServerView> = if running {
-            self.kernels[KernelChoice::Builtin.index()].mcp.clone()
+            self.slot(&KernelChoice::Builtin.key()).map(|s| s.mcp.clone()).unwrap_or_default()
         } else {
             // 内核没起来：照配置文件列出来，状态写「未连接」
             match default_mcp_config().map(|p| mcp::load_config(&p)) {

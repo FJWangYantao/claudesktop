@@ -6,23 +6,309 @@ use gpui_kit::{
 };
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 // ---------- 色板 ----------
-// 每个颜色是浅色 / 深色一对，界面里一律写 `rgb(INK)`：这里的 `rgb` 遮住了 gpui 的同名函数，
-// 按当前外观取值（各文件要 `use crate::theme::rgb;`，否则和 `gpui_kit::*` 里的重名）。
-// 直接传十六进制会编译不过——新颜色先加到这里，浅色 / 深色都给值，并校对对比度。
-// 深色基于 claude.ai 的暖炭灰（不是纯黑），赤陶橙两边同色。
+// `Color` 是语义 token（不是色值）：界面里照旧写 `rgb(INK)`，取值查当前色板 + 当前明暗
+// （这里的 `rgb` 遮住了 gpui 的同名函数，各文件要 `use crate::theme::rgb;`）。
+// 新颜色：在 `Color` 和 `Palette` 各加一项，`WARM` 给值；别的色板不写就继承 `WARM`
+// （状态色、diff 就是这么继承的），要写就浅色 / 深色都给，并让 `palette_contrast` 测试通过。
 
 /// 一个语义颜色的浅色 / 深色取值（`0xRRGGBB`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Color {
+pub struct Shade {
     pub light: u32,
     pub dark: u32,
 }
 
-const fn c(light: u32, dark: u32) -> Color {
-    Color { light, dark }
+const fn s(light: u32, dark: u32) -> Shade {
+    Shade { light, dark }
+}
+
+/// 语义颜色 token。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Color {
+    Paper,
+    Sand,
+    SandActive,
+    Card,
+    Coral,
+    CoralDeep,
+    CoralDeepHover,
+    OnAccent,
+    Ink,
+    InkSoft,
+    InkFaint,
+    Line,
+    LineStrong,
+    CodeBg,
+    Hover,
+    HoverStrong,
+    Selection,
+    Heat1,
+    Heat2,
+    Heat3,
+    Heat4,
+    Green,
+    Red,
+    Danger,
+    White,
+    DiffAddBg,
+    DiffAddFg,
+    DiffDelBg,
+    DiffDelFg,
+}
+
+/// 一套配色：每个 token 的浅色 / 深色取值。
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub paper: Shade,
+    pub sand: Shade,
+    pub sand_active: Shade,
+    pub card: Shade,
+    pub coral: Shade,
+    pub coral_deep: Shade,
+    pub coral_deep_hover: Shade,
+    pub on_accent: Shade,
+    pub ink: Shade,
+    pub ink_soft: Shade,
+    pub ink_faint: Shade,
+    pub line: Shade,
+    pub line_strong: Shade,
+    pub code_bg: Shade,
+    pub hover: Shade,
+    pub hover_strong: Shade,
+    pub selection: Shade,
+    pub heat1: Shade,
+    pub heat2: Shade,
+    pub heat3: Shade,
+    pub heat4: Shade,
+    pub green: Shade,
+    pub red: Shade,
+    pub danger: Shade,
+    pub white: Shade,
+    pub diff_add_bg: Shade,
+    pub diff_add_fg: Shade,
+    pub diff_del_bg: Shade,
+    pub diff_del_fg: Shade,
+}
+
+impl Palette {
+    /// 穷尽 match：`Color` 加了项而这里没接上会编译不过。
+    pub const fn shade(&self, color: Color) -> Shade {
+        match color {
+            Color::Paper => self.paper,
+            Color::Sand => self.sand,
+            Color::SandActive => self.sand_active,
+            Color::Card => self.card,
+            Color::Coral => self.coral,
+            Color::CoralDeep => self.coral_deep,
+            Color::CoralDeepHover => self.coral_deep_hover,
+            Color::OnAccent => self.on_accent,
+            Color::Ink => self.ink,
+            Color::InkSoft => self.ink_soft,
+            Color::InkFaint => self.ink_faint,
+            Color::Line => self.line,
+            Color::LineStrong => self.line_strong,
+            Color::CodeBg => self.code_bg,
+            Color::Hover => self.hover,
+            Color::HoverStrong => self.hover_strong,
+            Color::Selection => self.selection,
+            Color::Heat1 => self.heat1,
+            Color::Heat2 => self.heat2,
+            Color::Heat3 => self.heat3,
+            Color::Heat4 => self.heat4,
+            Color::Green => self.green,
+            Color::Red => self.red,
+            Color::Danger => self.danger,
+            Color::White => self.white,
+            Color::DiffAddBg => self.diff_add_bg,
+            Color::DiffAddFg => self.diff_add_fg,
+            Color::DiffDelBg => self.diff_del_bg,
+            Color::DiffDelFg => self.diff_del_fg,
+        }
+    }
+}
+
+/// 暖纸（Claude 品牌：暖纸底 + 赤陶橙）
+const WARM: Palette = Palette {
+    paper: s(0xFAF9F5, 0x262624),
+    sand: s(0xF0EEE6, 0x1F1E1D),
+    sand_active: s(0xE8E3D6, 0x33322F),
+    card: s(0xFFFFFF, 0x30302E),
+    coral: s(0xD97757, 0xD97757),
+    coral_deep: s(0xBF502B, 0xBF502B),
+    coral_deep_hover: s(0xAF4928, 0xAF4928),
+    on_accent: s(0xFFFFFF, 0xFFFFFF),
+    ink: s(0x1F1E1D, 0xF5F4EE),
+    ink_soft: s(0x6E6B65, 0xBDB9AE),
+    ink_faint: s(0xB5B0A4, 0x6E6C66),
+    line: s(0xE5E1D5, 0x3D3C38),
+    line_strong: s(0xD3CEC1, 0x55534E),
+    code_bg: s(0xEDE9DF, 0x1A1918),
+    hover: s(0xF0EEE6, 0x3A3936),
+    hover_strong: s(0xDCD6C6, 0x45443F),
+    selection: s(0xF3D9CD, 0x5C3B2E),
+    heat1: s(0xF3D9CD, 0x4A3329),
+    heat2: s(0xEBB39C, 0x7A4632),
+    heat3: s(0xD97757, 0xB85F42),
+    heat4: s(0xAE5236, 0xE3866A),
+    green: s(0x7A9A65, 0x94B07E),
+    red: s(0xC0504D, 0xE5726C),
+    danger: s(0xC0504D, 0xB8433F),
+    white: s(0xFFFFFF, 0xFFFFFF),
+    diff_add_bg: s(0xE4F3DE, 0x243222),
+    diff_add_fg: s(0x3C6B2E, 0x9FCC8C),
+    diff_del_bg: s(0xFBE3DF, 0x3A2422),
+    diff_del_fg: s(0xA4443A, 0xF19B90),
+};
+
+/// 墨纸（Flexoki：底更黄、墨更黑，青绿强调）
+const FLEXOKI: Palette = Palette {
+    paper: s(0xFFFCF0, 0x1C1B1A),
+    sand: s(0xF2F0E5, 0x100F0F),
+    sand_active: s(0xE6E4D9, 0x343331),
+    card: s(0xFFFFFF, 0x282726),
+    coral: s(0x24837B, 0x3AA99F),
+    coral_deep: s(0x24837B, 0x3AA99F),
+    coral_deep_hover: s(0x1C6C66, 0x5ABDAC),
+    on_accent: s(0xFFFFFF, 0x100F0F),
+    ink: s(0x100F0F, 0xCECDC3),
+    ink_soft: s(0x64635E, 0xA8A69E),
+    ink_faint: s(0xB7B5AC, 0x575653),
+    line: s(0xE6E4D9, 0x343331),
+    line_strong: s(0xCECDC3, 0x4D4B48),
+    code_bg: s(0xF2F0E5, 0x100F0F),
+    hover: s(0xF2F0E5, 0x343331),
+    hover_strong: s(0xDAD8CE, 0x403E3C),
+    selection: s(0xBFE8D9, 0x164743),
+    heat1: s(0xBFE8D9, 0x143F3C),
+    heat2: s(0x87D3C3, 0x1C6C66),
+    heat3: s(0x3AA99F, 0x24837B),
+    heat4: s(0x1C6C66, 0x5ABDAC),
+    ..WARM
+};
+
+/// 玫瑰松（Rosé Pine Dawn / Moon：低饱和的玫瑰和紫灰）
+const ROSE_PINE: Palette = Palette {
+    paper: s(0xFAF4ED, 0x232136),
+    sand: s(0xF2E9E1, 0x1F1D2E),
+    sand_active: s(0xE9DFD6, 0x393552),
+    card: s(0xFFFAF3, 0x2A273F),
+    coral: s(0xCF7672, 0xEA9A97),
+    coral_deep: s(0x286983, 0xC4A7E7),
+    coral_deep_hover: s(0x1F5468, 0xD3BDF0),
+    on_accent: s(0xFFFFFF, 0x232136),
+    ink: s(0x575279, 0xE0DEF4),
+    ink_soft: s(0x625E7E, 0xA8A4C0),
+    ink_faint: s(0x9893A5, 0x6E6A86),
+    line: s(0xDFDAD9, 0x44415A),
+    line_strong: s(0xCECACD, 0x56526E),
+    code_bg: s(0xF2E9E1, 0x1F1D2E),
+    hover: s(0xF4EDE8, 0x393552),
+    hover_strong: s(0xDFDAD9, 0x44415A),
+    selection: s(0xF2D9D4, 0x44415A),
+    heat1: s(0xF2D9D4, 0x4A3A4F),
+    heat2: s(0xE8B3AE, 0x7A5566),
+    heat3: s(0xD7827E, 0xB97A80),
+    heat4: s(0xB4637A, 0xEA9A97),
+    ..WARM
+};
+
+/// 常青（Everforest：米黄底配灰绿，护眼）
+const EVERFOREST: Palette = Palette {
+    paper: s(0xFDF6E3, 0x2D353B),
+    sand: s(0xEFEBD4, 0x232A2E),
+    sand_active: s(0xE6E2CC, 0x3D484D),
+    card: s(0xFFFBEF, 0x343F44),
+    coral: s(0x839700, 0xA7C080),
+    coral_deep: s(0x5F7A00, 0xA7C080),
+    coral_deep_hover: s(0x506800, 0xB8CE94),
+    on_accent: s(0xFFFFFF, 0x2D353B),
+    ink: s(0x4F5B62, 0xD3C6AA),
+    ink_soft: s(0x56645B, 0xB0BBB2),
+    ink_faint: s(0xA6B0A0, 0x7A8478),
+    line: s(0xE0DCC7, 0x475258),
+    line_strong: s(0xBDC3AF, 0x56635F),
+    code_bg: s(0xF4F0D9, 0x232A2E),
+    hover: s(0xF4F0D9, 0x3D484D),
+    hover_strong: s(0xE0DCC7, 0x475258),
+    selection: s(0xEAEDC8, 0x425047),
+    heat1: s(0xDCE3AE, 0x425047),
+    heat2: s(0xB9C766, 0x5E7356),
+    heat3: s(0x8DA101, 0x83996A),
+    heat4: s(0x5F7A00, 0xA7C080),
+    ..WARM
+};
+
+/// 北境（Nord：雪白 + 冰蓝，唯一冷色系）
+const NORD: Palette = Palette {
+    paper: s(0xECEFF4, 0x2E3440),
+    sand: s(0xE5E9F0, 0x272C36),
+    sand_active: s(0xD8DEE9, 0x3B4252),
+    card: s(0xF8F9FB, 0x3B4252),
+    coral: s(0x5E81AC, 0x88C0D0),
+    coral_deep: s(0x4C6A92, 0x88C0D0),
+    coral_deep_hover: s(0x3F5A7D, 0x9DCBD8),
+    on_accent: s(0xFFFFFF, 0x2E3440),
+    ink: s(0x2E3440, 0xECEFF4),
+    ink_soft: s(0x4C566A, 0xB4BCCB),
+    ink_faint: s(0x9AA3B5, 0x616E88),
+    line: s(0xD8DEE9, 0x434C5E),
+    line_strong: s(0xC2CAD8, 0x4C566A),
+    code_bg: s(0xE5E9F0, 0x272C36),
+    hover: s(0xE5E9F0, 0x434C5E),
+    hover_strong: s(0xCBD3E0, 0x4C566A),
+    selection: s(0xCFDCEC, 0x434C5E),
+    heat1: s(0xC9D8E8, 0x3E5566),
+    heat2: s(0x9DB8D4, 0x4F7A8C),
+    heat3: s(0x5E81AC, 0x6FA3B4),
+    heat4: s(0x3F5A7D, 0x88C0D0),
+    ..WARM
+};
+
+/// 拿铁 / 摩卡（Catppuccin Latte / Mocha：粉彩紫，最活泼）
+const CATPPUCCIN: Palette = Palette {
+    paper: s(0xEFF1F5, 0x1E1E2E),
+    sand: s(0xE6E9EF, 0x181825),
+    sand_active: s(0xDCE0E8, 0x313244),
+    card: s(0xFFFFFF, 0x313244),
+    coral: s(0x8839EF, 0xCBA6F7),
+    coral_deep: s(0x8839EF, 0xCBA6F7),
+    coral_deep_hover: s(0x7529D6, 0xD8BCFA),
+    on_accent: s(0xFFFFFF, 0x1E1E2E),
+    ink: s(0x4C4F69, 0xCDD6F4),
+    ink_soft: s(0x5C5F77, 0xBAC2DE),
+    ink_faint: s(0x9CA0B0, 0x6C7086),
+    line: s(0xCCD0DA, 0x45475A),
+    line_strong: s(0xBCC0CC, 0x585B70),
+    code_bg: s(0xE6E9EF, 0x181825),
+    hover: s(0xE6E9EF, 0x45475A),
+    hover_strong: s(0xCCD0DA, 0x585B70),
+    selection: s(0xDCCBF7, 0x4B3F66),
+    heat1: s(0xDCCBF7, 0x45385E),
+    heat2: s(0xB98CF5, 0x6E5394),
+    heat3: s(0x8839EF, 0x9C7BC8),
+    heat4: s(0x6A1FCF, 0xCBA6F7),
+    ..WARM
+};
+
+/// 顺序和 `settings::ThemeChoice::ALL` 一致（`ThemeChoice::index` 取下标）。
+pub static PALETTES: [Palette; 6] = [WARM, FLEXOKI, ROSE_PINE, EVERFOREST, NORD, CATPPUCCIN];
+
+static PALETTE: AtomicUsize = AtomicUsize::new(0);
+
+/// 换配色（之后要重写组件主题并重绘，见 `ChatApp::apply_font`）。
+pub fn set_palette(index: usize) {
+    PALETTE.store(index.min(PALETTES.len() - 1), Ordering::Relaxed);
+}
+
+pub fn palette_index() -> usize {
+    PALETTE.load(Ordering::Relaxed)
+}
+
+fn palette() -> &'static Palette {
+    &PALETTES[palette_index()]
 }
 
 static DARK: AtomicBool = AtomicBool::new(false);
@@ -36,74 +322,81 @@ pub fn is_dark() -> bool {
     DARK.load(Ordering::Relaxed)
 }
 
-/// 按当前外观取颜色。
-pub fn rgb(color: Color) -> Rgba {
-    gpui_kit::rgb(if is_dark() { color.dark } else { color.light })
+/// 某套色板里某个 token 在给定明暗下的取值。
+fn pick(palette: &Palette, color: Color, dark: bool) -> u32 {
+    let shade = palette.shade(color);
+    if dark { shade.dark } else { shade.light }
 }
 
+/// 按当前色板和外观取颜色。
+pub fn rgb(color: Color) -> Rgba {
+    gpui_kit::rgb(pick(palette(), color, is_dark()))
+}
+
+/// 配色菜单的色块：画别的色板（不是当前这套）在当前明暗下的颜色。
+pub fn swatch(index: usize, color: Color) -> Rgba {
+    gpui_kit::rgb(pick(&PALETTES[index.min(PALETTES.len() - 1)], color, is_dark()))
+}
+
+// 常量名保留，调用点不用改
 /// 主区底色（纸）
-pub const PAPER: Color = c(0xFAF9F5, 0x262624);
+pub const PAPER: Color = Color::Paper;
 /// 凹下去的面：侧栏、用户气泡、代码块、概览面板、chip（深色下比主区更暗）
-pub const SAND: Color = c(0xF0EEE6, 0x1F1E1D);
-pub const SAND_ACTIVE: Color = c(0xE8E3D6, 0x33322F);
+pub const SAND: Color = Color::Sand;
+pub const SAND_ACTIVE: Color = Color::SandActive;
 /// 浮起来的面：输入框、卡片、弹层
-pub const CARD: Color = c(0xFFFFFF, 0x30302E);
-pub const CORAL: Color = c(0xD97757, 0xD97757);
-/// 带文字的主按钮底色：与 CORAL 同色相、压暗一档（白字 4.8:1）。
-/// CORAL 上的白字只有 3.1:1，只够图标用（如发送按钮）
-pub const CORAL_DEEP: Color = c(0xBF502B, 0xBF502B);
-/// 带文字的主按钮悬停（白字 5.5:1）
-pub const CORAL_DEEP_HOVER: Color = c(0xAF4928, 0xAF4928);
-// 文字色取自原型（更深的墨色）
-pub const INK: Color = c(0x1F1E1D, 0xF5F4EE);
-/// 次要文字：说明、元信息、时间（浅色：纸底 5.0:1、沙色底 4.6:1；深色：各底 ≥ 5.9:1）
-pub const INK_SOFT: Color = c(0x6E6B65, 0xBDB9AE);
+pub const CARD: Color = Color::Card;
+pub const CORAL: Color = Color::Coral;
+/// 带文字的主按钮底色：与 CORAL 同色相、压暗一档（白字 ≥ 4.5:1）。
+/// CORAL 上的白字只有 3:1 上下，只够图标用（如发送按钮）
+pub const CORAL_DEEP: Color = Color::CoralDeep;
+/// 带文字的主按钮悬停
+pub const CORAL_DEEP_HOVER: Color = Color::CoralDeepHover;
+/// 主按钮（CORAL_DEEP / CORAL 底）上的文字：有的配色深色版按钮底很亮，白字看不清
+pub const ON_ACCENT: Color = Color::OnAccent;
+pub const INK: Color = Color::Ink;
+/// 次要文字：说明、元信息、时间（各色板各外观都 ≥ 4.5:1）
+pub const INK_SOFT: Color = Color::InkSoft;
 /// 只给占位、禁用、分隔符和装饰用（纸底上约 2–3:1）——承载信息的文字用 `INK_SOFT`
-pub const INK_FAINT: Color = c(0xB5B0A4, 0x6E6C66);
-pub const LINE: Color = c(0xE5E1D5, 0x3D3C38);
+pub const INK_FAINT: Color = Color::InkFaint;
+pub const LINE: Color = Color::Line;
 /// 悬停时加深一档的边框（输入框），介于 `LINE` 和聚焦用的 `INK_FAINT` 之间
-pub const LINE_STRONG: Color = c(0xD3CEC1, 0x55534E);
-pub const GREEN: Color = c(0x7A9A65, 0x94B07E);
+pub const LINE_STRONG: Color = Color::LineStrong;
+pub const GREEN: Color = Color::Green;
 /// 红色文字 / 小圆点（深色下提亮，只适合放在底色上当前景）
-pub const RED: Color = c(0xC0504D, 0xE5726C);
-/// 危险操作的实色按钮底（白字 4.7 / 5.4:1）：删除确认、窗口关闭悬停
-pub const DANGER: Color = c(0xC0504D, 0xB8433F);
+pub const RED: Color = Color::Red;
+/// 危险操作的实色按钮底：删除确认、窗口关闭悬停
+pub const DANGER: Color = Color::Danger;
 /// 实色按钮上的图标 / 文字（两种外观都是白）
-pub const WHITE: Color = c(0xFFFFFF, 0xFFFFFF);
+pub const WHITE: Color = Color::White;
 /// 透明（配 gpui 的 `rgba` 用，与外观无关）
 pub const CLEAR: u32 = 0x00000000;
 /// 行内代码底色
-pub const CODE_BG: Color = c(0xEDE9DF, 0x1A1918);
-/// 用量热力图：0 = 空白格，1..=4 由浅到深（深色下由暗到亮）的赤陶色
-pub const HEAT: [Color; 5] = [
-    SAND_ACTIVE,
-    c(0xF3D9CD, 0x4A3329),
-    c(0xEBB39C, 0x7A4632),
-    c(0xD97757, 0xB85F42),
-    c(0xAE5236, 0xE3866A),
-];
+pub const CODE_BG: Color = Color::CodeBg;
+/// 用量热力图：0 = 空白格，1..=4 由浅到深（深色下由暗到亮）的强调色
+pub const HEAT: [Color; 5] = [SAND_ACTIVE, Color::Heat1, Color::Heat2, Color::Heat3, Color::Heat4];
 
 // ---------- 交互态 ----------
 // 同一种底上的悬停永远是同一个颜色；不要再用 LINE / PAPER / 透明度充当悬停。
 
 /// 纸底 / 卡片上的悬停
-pub const HOVER: Color = c(0xF0EEE6, 0x3A3936);
+pub const HOVER: Color = Color::Hover;
 /// 选中态，以及沙色底（侧栏、概览面板）上的悬停
 pub const SELECTED: Color = SAND_ACTIVE;
 /// 已经是 `SELECTED` 的行里再叠一层的悬停（侧栏会话行上的小图标按钮）
-pub const HOVER_STRONG: Color = c(0xDCD6C6, 0x45443F);
+pub const HOVER_STRONG: Color = Color::HoverStrong;
 // 字体：官方的 Styrene 无法分发，用 OFL 近似款，内嵌见 `fonts.rs`。
 // 官方 Code 桌面端正文是无衬线，不再用衬线（中文回退成雅黑后会和衬线拉丁字母混排）。
 /// 默认界面字体族（`fonts.rs` 内嵌的 Inter）
 pub const DEFAULT_SANS: &str = "Inter";
 /// 代码 / 工具行的等宽字体（`fonts.rs` 内嵌；不随设置变化，代码靠它对齐）
 pub const MONO: &str = "JetBrains Mono";
-pub const DIFF_ADD_BG: Color = c(0xE4F3DE, 0x243222);
-pub const DIFF_ADD_FG: Color = c(0x3C6B2E, 0x9FCC8C);
-pub const DIFF_DEL_BG: Color = c(0xFBE3DF, 0x3A2422);
-pub const DIFF_DEL_FG: Color = c(0xA4443A, 0xF19B90);
-/// 文字选区底色（输入框、Markdown）：淡赤陶（浅色上墨色字 12:1，深色上 8.9:1）
-pub const SELECTION: Color = c(0xF3D9CD, 0x5C3B2E);
+pub const DIFF_ADD_BG: Color = Color::DiffAddBg;
+pub const DIFF_ADD_FG: Color = Color::DiffAddFg;
+pub const DIFF_DEL_BG: Color = Color::DiffDelBg;
+pub const DIFF_DEL_FG: Color = Color::DiffDelFg;
+/// 文字选区底色（输入框、Markdown）：淡强调色
+pub const SELECTION: Color = Color::Selection;
 
 /// 中文回退字体（内嵌字体只含拉丁字形）。按顺序取第一个装了的；都没有时交给系统回退。
 /// 不定死的话 DirectWrite 会按系统区域挑，可能落到宋体或日文字形。
@@ -136,10 +429,12 @@ pub const TEXT_SMALL: Rems = rems(0.8125);
 pub const TEXT_BODY: Rems = rems(0.875);
 /// 阅读正文：用户消息、助手回复、输入框（15px，也是根视图默认字号）
 pub const TEXT_LARGE: Rems = rems(0.9375);
-/// 次级标题：统计数值、回复里的二级标题（17px）
+/// 次级标题：统计数值、回复里的三级标题（17px）
 pub const TEXT_LEAD: Rems = rems(1.0625);
-/// 回复里的一级标题（20px）
+/// 分区标题、回复里的二级标题（20px）
 pub const TEXT_HEADING: Rems = rems(1.25);
+/// 回复里的一级标题（24px）
+pub const TEXT_DISPLAY: Rems = rems(1.5);
 /// 页面标题、首页问候（28px）
 pub const TEXT_TITLE: Rems = rems(1.75);
 
@@ -222,20 +517,18 @@ pub fn apply_to_theme(theme: &mut gpui_kit::component::theme::Theme) {
     theme.radius_lg = rems(0.75).to_pixels(root_font_size());
     // `Theme::change` 切外观时会重新载入 gpui-kit 自带主题，配色要在它之后每次重写
     let dark = theme.mode.is_dark();
-    apply_colors(&mut theme.colors, dark);
+    apply_colors(&mut theme.colors, palette(), dark);
 }
 
 /// 把色板写进 gpui-kit 组件主题的语义色，让 `Button` / `TabBar` / `Kbd` / 弹层 / 滚动条
-/// 这些组件直接用就是纸底 + 赤陶橙，不用再逐个覆盖颜色。
+/// 这些组件直接用就是纸底 + 强调色，不用再逐个覆盖颜色。
 ///
 /// 字段语义沿用 shadcn（见 `gpui-component` 的 `theme/default-theme.json`）。
 /// `button_*` 这类派生色在 gpui-kit 里只在载入主题文件时从 `primary` 等推出来，
 /// 这里改完基色不会自动跟着变，所以要一并写。
 /// 色板里没有对应物的（图表、info / warning / success、基础色相、拖放）保留 gpui-kit 默认。
-fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, dark: bool) {
-    let p = |color: Color| -> gpui_kit::Hsla {
-        gpui_kit::rgb(if dark { color.dark } else { color.light }).into()
-    };
+fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, pal: &Palette, dark: bool) {
+    let p = |color: Color| -> gpui_kit::Hsla { gpui_kit::rgb(pick(pal, color, dark)).into() };
 
     // 底、文字、边框
     t.background = p(PAPER);
@@ -256,11 +549,12 @@ fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, dark: bool) {
     t.link_active = p(INK);
     t.window_border = p(LINE);
 
-    // 主按钮：带文字的用 CORAL_DEEP（CORAL 上白字只有 3.1:1）
+    // 主按钮：带文字的用 CORAL_DEEP（CORAL 上白字只有 3:1 上下）；文字用 ON_ACCENT
+    // （有的配色深色版按钮底很亮，白字看不清）
     t.primary = p(CORAL_DEEP);
     t.primary_hover = p(CORAL_DEEP_HOVER);
     t.primary_active = p(CORAL_DEEP_HOVER);
-    t.primary_foreground = p(WHITE);
+    t.primary_foreground = p(ON_ACCENT);
     t.button_primary = t.primary;
     t.button_primary_hover = t.primary_hover;
     t.button_primary_active = t.primary_active;
@@ -336,7 +630,7 @@ fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, dark: bool) {
     t.sidebar_accent = p(SELECTED);
     t.sidebar_accent_foreground = p(INK);
     t.sidebar_primary = p(CORAL_DEEP);
-    t.sidebar_primary_foreground = p(WHITE);
+    t.sidebar_primary_foreground = p(ON_ACCENT);
     t.group_box = p(SAND);
     t.group_box_foreground = p(INK);
     t.accordion = p(CARD);
@@ -381,14 +675,66 @@ mod tests {
     use super::*;
 
     #[core::prelude::v1::test]
-    fn rgb_follows_appearance() {
+    fn rgb_follows_palette_and_appearance() {
+        set_palette(0);
         set_dark(false);
         assert_eq!(rgb(PAPER), gpui_kit::rgb(0xFAF9F5));
         set_dark(true);
         assert_eq!(rgb(PAPER), gpui_kit::rgb(0x262624));
+        set_palette(1);
+        assert_eq!(rgb(PAPER), gpui_kit::rgb(0x1C1B1A));
+        assert_eq!(rgb(GREEN), gpui_kit::rgb(0x94B07E)); // 状态色继承暖纸
+        set_palette(0);
+        set_dark(false);
         // 赤陶橙两边同色
         assert_eq!(rgb(CORAL), gpui_kit::rgb(0xD97757));
-        set_dark(false);
+    }
+
+    /// 色板顺序要和设置里的选项一一对应（`ThemeChoice::index` 取下标）。
+    #[core::prelude::v1::test]
+    fn palettes_line_up_with_settings() {
+        assert_eq!(PALETTES.len(), crate::settings::ThemeChoice::ALL.len());
+    }
+
+    /// 每套色板、两种明暗下，承载信息的文字都要 ≥ 4.5:1，实底上的图标（发送箭头）≥ 3:1。
+    #[core::prelude::v1::test]
+    fn palette_contrast() {
+        fn lum(v: u32) -> f64 {
+            let ch = |s: u32| {
+                let x = ((v >> s) & 0xFF) as f64 / 255.;
+                if x <= 0.03928 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
+        }
+        let ratio = |a, b| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        let pairs = [
+            (INK, PAPER, 4.5),
+            (INK_SOFT, PAPER, 4.5),
+            (INK_SOFT, SAND, 4.5),
+            (INK_SOFT, CARD, 4.5),
+            (INK_SOFT, HOVER, 4.5),
+            (INK, SELECTED, 4.5),
+            (INK, CODE_BG, 4.5),
+            (INK, SELECTION, 4.5),
+            (ON_ACCENT, CORAL_DEEP, 4.5),
+            (ON_ACCENT, CORAL_DEEP_HOVER, 4.5),
+            (ON_ACCENT, CORAL, 3.0),
+        ];
+        for (i, pal) in PALETTES.iter().enumerate() {
+            for dark in [false, true] {
+                for (fg, bg, min) in pairs {
+                    let r = ratio(pick(pal, fg, dark), pick(pal, bg, dark));
+                    assert!(
+                        r >= min,
+                        "色板 {i}（{}）{fg:?} / {bg:?} 只有 {r:.2}:1",
+                        if dark { "深色" } else { "浅色" }
+                    );
+                }
+            }
+        }
     }
 
     /// 缩放：标准档是 16px，改倍率后根字号等比变，且越界会被夹住。
@@ -417,19 +763,20 @@ mod tests {
     #[core::prelude::v1::test]
     fn component_colors_follow_palette() {
         let hsla = |v: u32| -> gpui_kit::Hsla { gpui_kit::rgb(v).into() };
+        let pal = &PALETTES[0];
         let mut t = gpui_kit::component::theme::ThemeColor::default();
 
-        apply_colors(&mut t, false);
-        assert_eq!(t.background, hsla(PAPER.light));
-        assert_eq!(t.primary, hsla(CORAL_DEEP.light));
+        apply_colors(&mut t, pal, false);
+        assert_eq!(t.background, hsla(pick(pal, PAPER, false)));
+        assert_eq!(t.primary, hsla(pick(pal, CORAL_DEEP, false)));
         assert_eq!(t.button_primary, t.primary);
-        assert_eq!(t.button_primary_foreground, hsla(WHITE.light));
-        assert_eq!(t.button_secondary_hover, hsla(SELECTED.light));
+        assert_eq!(t.button_primary_foreground, hsla(pick(pal, ON_ACCENT, false)));
+        assert_eq!(t.button_secondary_hover, hsla(pick(pal, SELECTED, false)));
 
-        apply_colors(&mut t, true);
-        assert_eq!(t.background, hsla(PAPER.dark));
-        assert_eq!(t.foreground, hsla(INK.dark));
-        assert_eq!(t.danger, hsla(DANGER.dark));
+        apply_colors(&mut t, pal, true);
+        assert_eq!(t.background, hsla(pick(pal, PAPER, true)));
+        assert_eq!(t.foreground, hsla(pick(pal, INK, true)));
+        assert_eq!(t.danger, hsla(pick(pal, DANGER, true)));
         assert_eq!(t.button_danger, t.danger);
     }
 

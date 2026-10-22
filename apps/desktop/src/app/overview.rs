@@ -46,6 +46,7 @@ impl ChatApp {
             .p_3()
             .rounded_lg()
             .bg(rgb(CARD))
+            .shadow_xs()
             .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(c.label))
             .child(
                 div()
@@ -267,9 +268,10 @@ impl ChatApp {
                         .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(detail)),
                 )
                 .child(Icon::new(IconAll::ChevronRight).size_4().text_color(rgb(INK_SOFT)))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.start_setup(kind, window, cx)),
-                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let kind = kind.clone();
+                    this.start_setup(kind, window, cx)
+                }))
         };
         div()
             .v_flex()
@@ -308,9 +310,9 @@ impl ChatApp {
             .child(option(
                 "setup-acp",
                 IconAll::SquareTerminal,
-                "接 Claude Code 等 ACP agent",
-                "用 agent 自己的登录和模型；已填好 Claude Code 的适配器（需要 Node.js）",
-                KernelChoice::Acp,
+                "用本机装好的 agent",
+                "Claude Code / OpenCode / pi：检测到就一键启用，登录和模型都在 agent 那边",
+                KernelChoice::Acp(String::new()),
                 cx,
             ))
     }
@@ -354,6 +356,7 @@ impl ChatApp {
                     ),
             )
             .children(setup)
+            .children((!needs_setup).then(|| self.render_recent(cx)).flatten())
             .when(!needs_setup, |d| {
                 d.child(
                     div()
@@ -455,7 +458,95 @@ impl ChatApp {
     }
 }
 
+/// 首页「最近会话」最多列几张
+const RECENT_MAX: usize = 3;
+
 impl ChatApp {
+    /// 首页问候语下面一排「最近会话」：最近活动的几个（不含已归档和当前这个），点了切过去接着聊。
+    /// 一个都没有（新装）时不画。
+    fn render_recent(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let mut recent: Vec<(usize, u64)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != self.active && !s.title.is_empty())
+            .filter_map(|(i, s)| {
+                let meta = s.meta.as_ref().filter(|m| !m.archived)?;
+                Some((i, meta.updated_ms))
+            })
+            .collect();
+        if recent.is_empty() {
+            return None;
+        }
+        recent.sort_by_key(|r| std::cmp::Reverse(r.1));
+        recent.truncate(RECENT_MAX);
+        // 不满一排时补空位，卡片宽度不随个数变（只有一个时不撑满整行）
+        let fillers = RECENT_MAX - recent.len();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let cards = recent.into_iter().map(|(i, updated)| {
+            let s = &self.sessions[i];
+            let (icon, place): (IconAll, SharedString) = if s.task {
+                (IconAll::ListTodo, "任务".into())
+            } else {
+                (IconAll::Folder, super::project_label(&s.cwd))
+            };
+            div()
+                .id(("recent-session", i))
+                .v_flex()
+                .gap_1()
+                // 等分整行，和下面的统计卡片对齐成列
+                .flex_1()
+                .min_w_0()
+                .px_3()
+                .py_2p5()
+                .rounded_lg()
+                .bg(rgb(CARD))
+                .border_1()
+                .border_color(rgb(LINE))
+                .shadow_xs()
+                .cursor_pointer()
+                .hover(|d| d.border_color(rgb(LINE_STRONG)))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(TEXT_BODY)
+                        .text_color(rgb(INK))
+                        .child(s.title.clone()),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_1()
+                        .items_center()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .child(Icon::new(icon).size_3().flex_shrink_0())
+                        .child(div().min_w_0().overflow_hidden().text_ellipsis().child(place))
+                        .child(div().flex_1())
+                        .child(div().flex_shrink_0().child(ago(now, updated))),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.activate_session(i, cx)))
+        });
+        Some(
+            div()
+                .v_flex()
+                .gap_2()
+                .w(OVERVIEW_W)
+                .child(
+                    div().px_1().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("最近会话"),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_3()
+                        .children(cards)
+                        .children((0..fillers).map(|_| div().flex_1().min_w_0())),
+                ),
+        )
+    }
+
     /// 当前会话是首页（还没发过消息）。
     pub(super) fn on_home(&self) -> bool {
         !self.settings_open && !self.session().has_user_message()
@@ -537,6 +628,17 @@ impl ChatApp {
 }
 
 /// 「下午好，WYT」：时段 + 系统用户名（取不到就不带名字）
+/// 「3 分钟前」「2 天前」这样的相对时间。
+fn ago(now_ms: u64, at_ms: u64) -> String {
+    let mins = now_ms.saturating_sub(at_ms) / 60_000;
+    match mins {
+        0 => "刚刚".into(),
+        m if m < 60 => format!("{m} 分钟前"),
+        m if m < 60 * 24 => format!("{} 小时前", m / 60),
+        m => format!("{} 天前", m / (60 * 24)),
+    }
+}
+
 fn greeting() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
         + usage::local_offset_secs();

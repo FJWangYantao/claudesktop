@@ -9,7 +9,7 @@ use super::ChatApp;
 use super::keys::{NEW_SESSION_KEY, SHORTCUTS_KEY, TOGGLE_SIDEBAR_KEY};
 use super::project_label;
 use crate::model::ViewMode;
-use crate::settings::KernelChoice;
+use crate::settings::{KernelChoice, ThemeChoice};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
@@ -29,6 +29,8 @@ enum PaletteCmd {
     NewSession,
     ToggleSidebar,
     PickWorkspace,
+    /// 在当前目录的 git 仓库里建一个 worktree，新对话在那里开始
+    Worktree,
     OpenSettings,
     /// 用量页
     Usage,
@@ -43,6 +45,8 @@ enum PaletteCmd {
     /// 跳到磁盘上某个更早的会话的第几条用户消息（会话 ID, 轮次）
     History(String, usize),
     View(ViewMode),
+    /// 配色
+    Theme(ThemeChoice),
     Mode(usize),
     Model(String),
 }
@@ -160,6 +164,8 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         )
         .key(TOGGLE_SIDEBAR_KEY),
         Entry::new(IconAll::FolderOpen, "切换工作目录…", PaletteCmd::PickWorkspace),
+        Entry::new(IconAll::GitBranch, "在新 worktree 中开始", PaletteCmd::Worktree)
+            .desc("从当前分支的最新提交开始，未提交的改动不会带过去"),
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
         Entry::new(IconAll::ChartColumn, "查看用量", PaletteCmd::Usage),
         Entry::new(IconAll::FolderOpen, "打开用量网关日志", PaletteCmd::GatewayLogs)
@@ -231,6 +237,15 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         })
         .collect();
 
+    let themes = ThemeChoice::ALL
+        .into_iter()
+        .map(|t| {
+            Entry::new(IconAll::Palette, format!("配色：{}", t.label()), PaletteCmd::Theme(t))
+                .desc(t.desc())
+                .checked(t == app.settings.theme)
+        })
+        .collect();
+
     let modes = s
         .modes
         .iter()
@@ -265,6 +280,7 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         ("消息", messages),
         ("历史", history),
         ("视图", views),
+        ("配色", themes),
         ("权限模式", modes),
         ("模型", models),
     ]
@@ -334,6 +350,14 @@ impl ChatApp {
             }
             PaletteCmd::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             PaletteCmd::PickWorkspace => self.pick_workspace(cx),
+            PaletteCmd::Worktree => {
+                // 空会话就在当前目录里建；已经有对话的先开一个空会话再建
+                self.settings_open = false;
+                if self.session().has_user_message() || self.session().busy {
+                    self.add_session(cx);
+                }
+                self.start_in_worktree(cx);
+            }
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
             PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),
@@ -359,6 +383,7 @@ impl ChatApp {
                 }
             }
             PaletteCmd::View(mode) => self.set_view_mode(mode, cx),
+            PaletteCmd::Theme(theme) => self.set_theme(theme, cx),
             PaletteCmd::Mode(i) => self.choose_mode(i, cx),
             PaletteCmd::Model(model) => self.choose_model(model, cx),
         }

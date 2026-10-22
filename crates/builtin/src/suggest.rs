@@ -11,7 +11,8 @@
 //! - **只输出那句补全本身**，不加引号、不解释。模型多写了就把这些清理掉（见 [`clean`]）；
 //!   清理之后太长、或者和已经写了的重复，直接当没有（宁可没有，也不要一句驴唇不对马嘴的灰字）。
 
-use crate::{ChatMessage, ProviderConfig, RequestParams, StreamEvent};
+use crate::provider::ThinkingLevel;
+use crate::{ChatMessage, Protocol, ProviderConfig, RequestParams, StreamEvent, thinking_spec};
 
 /// 补全最多多少个字（超了截到最后一个标点或词边界，见 [`clean`]）
 pub const MAX_CHARS: usize = 60;
@@ -91,7 +92,10 @@ pub fn build_messages(draft: &str, history: &[(bool, String)]) -> Vec<ChatMessag
 /// 补全用的请求参数：补一句短话，温度稍高一点（不想要每次都是最平庸的那句），
 /// 输出只要一行。原来配置里的 `extra` 照留（有的端点没有它就报错），但去掉开思考的键：
 /// 64 个 token 不够思考用，开着就补不出字。
-fn params(base: &RequestParams) -> RequestParams {
+///
+/// 档位按模型覆盖：能关就明确关（`Off`），关不掉（Opus 5.5 这类）就取它最低的一档——
+/// 补全要的是最短的那种思考，不是「跟着会话的档位」。
+fn params(base: &RequestParams, protocol: Protocol, model: &str) -> RequestParams {
     let mut extra = base.extra.clone();
     if let Some(map) = extra.as_object_mut() {
         for key in REASONING_KEYS {
@@ -101,10 +105,20 @@ fn params(base: &RequestParams) -> RequestParams {
     RequestParams {
         temperature: Some(0.5),
         max_tokens: Some(64),
+        thinking: short_thinking(protocol, model),
         thinking_budget: None,
         server_tools: Vec::new(),
         extra,
     }
+}
+
+/// 旁路小请求（补全、记忆提炼、分类器）该用哪一档：能关就关，关不掉取最低一档。
+/// 认不出的模型给 `None`（不发思考字段）。
+///
+/// 按请求实际走的协议查表：同一个名字在两张表里可能不同（`glm-5.3` 在 OpenAI 兼容下关不掉、
+/// 走 Anthropic 兼容端点时是预算格式能关），查错表会把「最低一档」翻成深度思考。
+pub fn short_thinking(protocol: Protocol, model: &str) -> Option<ThinkingLevel> {
+    thinking_spec(protocol, model).min_level()
 }
 
 /// `extra` 里开思考 / 推理的键（各家写法）
@@ -112,8 +126,18 @@ const REASONING_KEYS: &[&str] =
     &["thinking", "reasoning", "reasoning_effort", "enable_thinking", "chat_template_kwargs"];
 
 /// 看名字是不是总要先思考的模型（关不掉思考，补全的 64 个 token 会被思考用光）。
-/// 只认常见的几种命名；认不出的照常发，补不出来也只是没有灰字。
+///
+/// 两步：能力表里档位非空且不含「关」的（Opus 5.5、Sonnet 5.5、Fable、GLM-5.3、o 系列……）
+/// 算关不掉；认不出的再按常见命名猜（只认几种，认不出的照常发——补不出来也只是没有灰字）。
 pub fn is_reasoning_model(model: &str) -> bool {
+    // 两张表都查：同一个名字在 Anthropic 原生和 OpenAI 兼容下的档位可能不同，
+    // 只要有一张说「关不掉」就不补（宁可不补，也别把 64 个 token 全喂给思考）
+    for protocol in [Protocol::OpenAiCompat, Protocol::Anthropic] {
+        let spec = thinking_spec(protocol, model);
+        if spec.is_known() && !spec.can_disable() {
+            return true;
+        }
+    }
     let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
     let o_series =
         ["o1", "o3", "o4"].iter().any(|p| name == *p || name.starts_with(&format!("{p}-")));
@@ -171,8 +195,11 @@ fn ask(
     messages: Vec<ChatMessage>,
     should_stop: &dyn Fn() -> bool,
 ) -> Option<String> {
-    // 温度 / 输出上限换成补全那一套（provider 在构造时就吃下参数）
-    let config = ProviderConfig { params: params(&config.params), ..config.clone() };
+    // 温度 / 输出上限 / 思考档位换成补全那一套（provider 在构造时就吃下参数）
+    let config = ProviderConfig {
+        params: params(&config.params, config.protocol, &config.model),
+        ..config.clone()
+    };
     let provider = crate::make_provider(&config);
     let mut reply = String::new();
     let _tag = crate::gateway::tag(session, "suggest", turn);
@@ -318,6 +345,39 @@ mod tests {
         {
             assert!(!is_reasoning_model(name), "{name}");
         }
+        // 能力表里关不掉思考的那一代也不补（以前只能靠名字猜，现在按表）
+        for name in ["claude-opus-5-5", "claude-fable-5", "glm-5.3", "gpt-5", "o4-mini"] {
+            assert!(is_reasoning_model(name), "{name}");
+        }
+        // 表里能关的（GLM 4.x、Qwen、DeepSeek chat）照常补
+        for name in ["glm-4.6", "qwen3-max", "deepseek-v4-pro", "claude-opus-4-7"] {
+            assert!(!is_reasoning_model(name), "{name}");
+        }
+    }
+
+    /// 补全请求的档位：能关就明确关，关不掉取它最低的一档，认不出就不发。
+    #[test]
+    fn suggest_asks_for_the_shortest_thinking() {
+        let openai = Protocol::OpenAiCompat;
+        let anthropic = Protocol::Anthropic;
+        assert_eq!(short_thinking(openai, "glm-4.6"), Some(ThinkingLevel::Off));
+        assert_eq!(short_thinking(openai, "qwen3-max"), Some(ThinkingLevel::Off));
+        // 关不掉：最低的开档
+        assert_eq!(short_thinking(anthropic, "claude-opus-5-5"), Some(ThinkingLevel::Low));
+        assert_eq!(short_thinking(openai, "gpt-5"), Some(ThinkingLevel::Minimal));
+        // GLM-5.2 起能分档了，最低是「低」（5.3 关不掉，也落到低）
+        assert_eq!(short_thinking(openai, "glm-5.3"), Some(ThinkingLevel::Low));
+        // 同一个名字走 Anthropic 兼容端点：按那张表（预算格式，能关），不能拿 OpenAI 表的「低」
+        assert_eq!(short_thinking(anthropic, "glm-5.3"), Some(ThinkingLevel::Off));
+        // DeepSeek V4 的开关和档位并存：能关，最低就是「关」
+        assert_eq!(short_thinking(openai, "deepseek-flash"), Some(ThinkingLevel::Off));
+        // 认不出：不发
+        assert_eq!(short_thinking(openai, "llama-3-8b"), None);
+        assert_eq!(short_thinking(openai, ""), None);
+
+        let base = RequestParams { thinking: Some(ThinkingLevel::High), ..Default::default() };
+        let p = params(&base, anthropic, "claude-opus-5-5");
+        assert_eq!(p.thinking, Some(ThinkingLevel::Low));
     }
 
     #[test]
@@ -326,7 +386,7 @@ mod tests {
             extra: serde_json::json!({"reasoning_effort": "high", "top_p": 0.9}),
             ..Default::default()
         };
-        let p = params(&base);
+        let p = params(&base, Protocol::OpenAiCompat, "some-model");
         assert_eq!(p.extra, serde_json::json!({"top_p": 0.9}));
         assert_eq!(p.max_tokens, Some(64));
     }

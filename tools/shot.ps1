@@ -1,5 +1,5 @@
 param(
-    [string]$Out = "C:\Users\WYT\Desktop\claudesktop\tools\shot.png",
+    [string]$Out = (Join-Path $PSScriptRoot "shot.png"),
     [int]$X = -1,
     [int]$Y = -1,
     # 需要真的点一下界面时才加：会移动光标并抢焦点（会打断你手头的事）

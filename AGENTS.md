@@ -25,6 +25,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `setting_row` / `setting_group`（标题 + 右侧控件，说明收进标题旁 ⓘ 的悬停提示；标题下要挂路径 / 按钮用 `setting_row_with`）、`form_field`（左标签右输入）、
   `choice_panel` + `choice_row`（沙色面板里的单选列表，同首页配置引导）、`seg_control`。
   说明只写一句「这是干什么的」（`section` / `setting_row` / `form_field` 都放进 ⓘ，页面上不铺灰字）；怎么用写成 `how_to` 编号步骤放空状态，格式细节收进 `ChatApp::disclosure`。
+  例外：条款风险提示（`ANTIGRAVITY_RISK`、`ACP_PRESETS` 的第三列）常驻显示在入口下面（`TEXT_META` + `INK_SOFT`），不收进 ⓘ。
   「内核与模型」要点保存（底栏固定，`form_dirty` 决定能不能点），其余分类即时生效。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
@@ -54,9 +55,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   带边框的容器（卡片、权限卡、输入框）里的按钮不再描边（单层边框）：次级用 `SAND` 实底
   （悬停 `SELECTED`），拒绝 / 危险项只留 `RED` 字、悬停出底色（红字在 `SAND` 上只有 4.0:1）。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
-  - 每个常量是浅色 / 深色一对（`Color`），界面里写 `rgb(INK)`；这个 `rgb` 是 `theme::rgb`（按当前外观取值），
+  - `Color` 是语义 token，取值查当前色板（六套配色，设置页「外观 · 配色」切换）；新颜色在 `Palette` 加一项、
+    `WARM` 给值，别的色板不写就继承，写了要过 `palette_contrast` 测试。
+  - 每个常量是浅色 / 深色一对（`Shade`），界面里写 `rgb(INK)`；这个 `rgb` 是 `theme::rgb`（按当前色板 + 外观取值），
     文件里要 `use crate::theme::rgb;`，否则和 `gpui_kit::*` 里的同名函数冲突。新颜色两种外观都要给值并校对对比度。
   - 前景放在会随外观反转的实底上（如 `INK` 底的停止按钮）时用 `PAPER` 当前景，不用固定的 `WHITE`；
+    强调色实底（`CORAL` / `CORAL_DEEP`）上的文字用 `ON_ACCENT`（有的配色深色版按钮底很亮）；
     `RED` 是前景色（深色下提亮），危险操作的实色按钮底用 `DANGER`。
   - 交互态：纸底 / 卡片上悬停用 `HOVER`，选中态和沙色底上悬停用 `SELECTED`，已选中行里再叠一层用
     `HOVER_STRONG`；不要拿 `LINE` / `PAPER` / 透明度当悬停。
@@ -106,7 +110,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
   下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
   `SessionMeta::task`），最后是「已归档」。判定在 `ChatApp::new_session`（`is_project_dir`：
-  默认目录 `acp_base.cwd` 以外都算项目，默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）；输入框上方的目录菜单里有「不选项目（任务）」
+  默认目录 `acp_base.cwd` 以外都算项目，默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）；输入框工具栏的目录菜单里有「不选项目（任务）」
   （`ChatApp::as_task`，已经跑在默认目录就只改归类），chip 和顶栏面包屑对任务显示「任务」。
   新增对话行状态时记得把它并进 `sync_sidebar` 的指纹。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
@@ -209,6 +213,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   每个请求记一行 `gateway/<日期>.jsonl`（按内核会话 + 第几轮归组，首页「请求」页签读它，见 `requests.rs`；费用按设置里的单价表估算，见 `pricing.rs`，分峰谷价的模型在单价行尾写 `x2`，峰时段用 `@peak` 行按本地时间或指定时区判定）。新的请求出口（新 provider、新接口）也要走 `route`，内核里新的请求用途用 `gateway::tag` 标上。
   ACP agent 可选经网关：起进程时设 base URL（`gateway::agent_env`，端点编码在 `/via/` 路径里），轮次靠 `gateway::note_turn`。
   请求体和响应原文另存（`request_bodies.rs`，日志行的 `body` 指过去），「请求」页签每次请求行尾的「原文」打开查看（`app/raw_request.rs`）。
+- 网页搜索后端在 `crates/builtin/src/websearch.rs`：`SearchBackend`（DeepSeek / Brave / DuckDuckGo，声明顺序就是固定降级顺序）
+  按 `SearchConfig::order()` 依次试，失败 / 没配 key 就退到下一个，**实际用了哪个写进结果第一行**（工具行汇总带「降级过」）。
+  选择存在数据目录的 `search.json`（`load()` 每次现读，改完即生效，不走 `Kernel::set_*`），**只存选择不存 key**：
+  Brave key 在 `brave_key` 文件，DeepSeek 搜索的 key 在 `deepseek_key` 文件，都没有就用 provider 里 DeepSeek 官方端点（host `api.deepseek.com`，中转站不算）档案那把
+  （`Settings::deepseek_search_key` → `ProviderConfig::deepseek_key` → 内核起时 `websearch::set_key_hint`）。
+  默认 Brave + DuckDuckGo（和加 DeepSeek 之前一样）；DeepSeek 按次计费，只看 `allow_deepseek` / `prefer`，**有 key 不算允许**。新的搜索后端 = 加一个枚举值 +
+  `order()` 里的开关 + `run()` 里一个分支，**不要做成 MCP**（见「设计说明-DeepSeek官方搜索.md」）。
 - 自研内核默认不打扰前台：系统提示词里的 `BACKGROUND` 要求测试 / 浏览器 / 截图无头跑，`tools::QUIET_ENV` 给命令带上
   不弹窗口的环境变量（用户自己设了的不覆盖）；推荐的浏览器类 MCP 带 `--headless`。
 - 用量：首页概览（`app/overview.rs`）的统计卡、热力图格子、模型行和右上角箭头都跳到用量页（`app/usage_view.rs`，
@@ -228,5 +239,40 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   命令行（`ToolCard::shows_command`）随时可点开，展开后先列完整命令，所以行上不挂悬停提示。长文本的悬停提示用 `chat.rs` 的 `text_tip`（限宽、截断），别直接 `Tooltip::new`。
 - 逐块审查（`crates/core/src/review.rs` + `app/review.rs`）：只审最新一轮、跑完了才行；撤回 / 恢复写盘后追加带 `reverted` 的 `Record::FileChanged`（回退照常算），
   下一条消息的 `sent` 前面附 `<user-review>` 说明（`Session::review_pending` 只是提示，说明从日志现算）。磁盘现状对不上就只读，不合并。
+  入口在回复末尾的改动卡片（`render_changes_card`）：整轮「撤回」/「恢复」也走这套（`undo_turn`），撤回状态记在 `Session::undo`（进行指纹）。
+- 记忆（`crates/core/src/memory.rs` + `crates/builtin/src/remember.rs` + `app/memory_view.rs`）：两份 JSON（数据目录 / 项目根 `.claudesktop/`），
+  文件是唯一真相、每轮重读。**系统提示词那一节只放预算内的**（`pick_missed` 按 `pinned` → 最近用过 / 改过排），这一轮相关的另附 `<memory-context>` 在用户消息尾
+  （`Inner::attach_memory`，system 变了会废掉提示缓存）；超预算的条数写在提示词里让模型用 `memory_search` 找。
+  `used_ms` 不在每轮写（进 git 的项目记忆会一直变），只在本来就要写盘时由 `mark_used` 刷。`memory_forget` 只删本会话记下的（别的会话的让用户去设置页删）。
+  第 3 期的候选只进设置页顶部「待确认」（`KernelEvent::MemorySuggested`，不进日志、不进对话流），用户收下才落盘；开关 `memory_suggest` 默认关。
 - 内核新增会写文件的工具时，执行前后各 `checkpoint::read_snapshot` 一次并发 `KernelEvent::FileChanged`，
   否则检查点回退还原不了它改的文件（见「设计说明-检查点与回退.md」）。
+- 思考强度（`crates/builtin/src/provider.rs` 的 `ThinkingLevel` / `thinking_spec` / `apply_thinking`）：
+  对外的唯一选项是**档位**（默认 = 不发字段 / 关 / 极低 / 低 / 中 / 高 / 极高 / 最高），预算和 effort 只是翻译出来的值。
+  **`ThinkingFormat` 是结构体不是枚举**：`toggle`（厂商开关字段）+ `effort`（档位字段）+ `budget`（`budget_tokens` 老格式）
+  三件事分开，因为 DeepSeek V4 / GLM-5.2+ / MiniMax-M3.1 / Doubao 都是「开关和档位一起发」（`ThinkingFormat::toggle_with_effort`）。
+  `ThinkingLevel::Max` 是最高档（`max`），`XHigh` 比它低——DeepSeek / GLM / Kimi K3 / MiniMax / Doubao / Grok 的最高就是 `max`。
+  能力表按「协议 + 模型名」给能选哪些档和字段怎么写；**认不出的模型不发任何思考字段、设置页也不显示那一行**
+  （发错了就是 400，宁可没这个选项）。`ThinkingSpec::accepts_temperature == false` 的模型（Opus 4.7 以后）
+  不管开不开思考都不发 `temperature`，这条和「开思考不发 temperature」一起在 `apply_thinking` 里管，
+  所以新增 provider 只要组完体调一次 `apply_thinking`、`extra` 仍最后合。
+  「关」的写法按格式分：有 `toggle` 的发 `disabled`（那几家默认开着思考，不发等于没关），
+  纯 effort 的才发 `none`。
+  旁路小请求（补全 / 记忆提炼 / 分类器）一律 `suggest::short_thinking(protocol, model)`（按实际协议查表）：能关就关、关不掉取最低一档。
+  **会话级档位**：输入框工具栏的 chip（`composer.rs` 的 `thinking_menu_items`，ACP 内核不显示）改的是
+  `Session::thinking`，经 `Kernel::set_thinking(session, Option<&str>)` 存进内核的 `SessionState`，
+  `run_steps` 每轮开头取一次、覆盖档案里的那份（`None` = 跟随档案；进行中的一轮用开头那档，工具循环中途开 / 关思考 Anthropic 报 400）。
+  会话还没建立 / 内核重连（`detach_kernel`）时记在 `Session::pending_thinking`，`Started` 时由 `ChatApp::flush_pending_thinking` 补交。
+  能选哪些档用 `session_thinking_spec` 按**当前模型**现算，高亮 / chip 文字用 `active_thinking`（实际生效的那档）；认不出的模型只给「默认 / 兜底」。
+  加新模型 = 能力表加一条，同时想清楚 `can_disable`（关不掉的那代别给「关」）和 `accepts_temperature`。
+- **worktree 会话**（`crates/core/src/git.rs` + `apps/desktop/src/app/worktree.rs`，见「设计说明-worktree.md」）：
+  目录在**数据目录** `worktrees/<仓库名>-<短哈希>/<分支尾段>`，不往用户仓库里塞东西；分支名 `claudesktop/<月日-时分>-<3 位随机>`。
+  `cwd` 就是 worktree 目录，侧栏分组用 `Session::group_dir()`（有 worktree 时是主仓库根），worktree 会话归到主项目组、行尾带 `GitBranch` 图标。
+  **项目根认 worktree**（`.git` 是文件也算，`project_root` 照样认），但**项目记忆和权限规则按 `project::shared_root`**（主仓库根），
+  在 worktree 里记的事回主目录也算数。分支状态只在**一轮结束和点开菜单时**跑 `git status`（`Session::worktree_state`），不在 render 里跑。
+  **合并不在主目录里直接 merge**：菜单「合并回主目录」往输入框填一句话让 agent 去做；主目录脏 / 不在 base 时用 `git::merge_blocker` 说原因。
+  建 worktree 期间发的消息进 `Session::queued`，会话还没就绪时 `dispatch_queued` 会留着等 `Started`。
+  后台 git 任务回来时按 `Session::token` 找会话（`session_index`），别存下标（删会话会挪）；菜单里的 git 结果（`worktree_blocker`）在 `refresh_worktree` 里算好，render 不跑 git。
+  删除 worktree 走 `ask_remove_worktree`：不确定干净就先弹框，确认了才 `--force` / `-D`。
+  建好后的 `worktree.copy` / `worktree.setup` 在 `app/worktree_setup.rs`：setup 写在仓库里，**没确认过的不自动跑**
+  （确认过的记在数据目录 `trusted_setup.json`，设置页「项目」里亲手改的算确认），跑命令用 `claudesktop_builtin::run_command`；复制不跟目录链接、跳过 `.git`。

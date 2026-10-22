@@ -230,7 +230,7 @@ pub(crate) fn same_path(a: &str, b: &str) -> bool {
     a == b || norm(a) == norm(b)
 }
 
-/// 一轮里改过的一个文件（回复末尾「改动 N 个文件」的列表）。
+/// 一轮里改过的一个文件（回复末尾改动卡片里的一行）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnFile {
     pub path: String,

@@ -1,12 +1,15 @@
 //! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
 
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::settings_view::active_thinking;
 use super::widgets::Surface;
 use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
+use claudesktop_builtin::ThinkingLevel;
+use claudesktop_core::Kernel;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::button::Button;
@@ -23,7 +26,7 @@ impl ChatApp {
     /// 「分享」：当前会话导出为 Markdown，系统保存对话框选位置。
     pub(crate) fn share_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active;
-        let markdown = self.sessions[idx].to_markdown();
+        let markdown = self.sessions[idx].to_markdown(&self.settings.acp);
         let suggested = format!("{}.md", self.sessions[idx].title);
         let dir = self.cwd.clone();
         let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
@@ -105,6 +108,37 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 思考强度下拉里选了一档：只作用于**这个会话**，不动设置文件里的档案。
+    /// 已建立的内核会话下一轮请求起生效；还没建立的等 `Started` 再补（`flush_pending_thinking`）。
+    pub(crate) fn choose_thinking(&mut self, level: Option<ThinkingLevel>, cx: &mut Context<Self>) {
+        let kernel = self.session_kernel(self.active);
+        let s = &mut self.sessions[self.active];
+        s.thinking = level;
+        match (kernel, s.acp_id.clone()) {
+            (Some(kernel), Some(id)) => {
+                let wire = level.map(thinking_wire);
+                if let Err(err) = kernel.set_thinking(&id, wire.as_deref()) {
+                    s.note(format!("切换思考强度失败：{err}"));
+                }
+            }
+            _ => s.pending_thinking = Some(level),
+        }
+        cx.notify();
+    }
+
+    /// `Started` 到达：把会话建立前选的档位交给内核（和 `pending_model` / `pending_mode` 一个套路）。
+    pub(super) fn flush_pending_thinking(&mut self, idx: usize, kernel: Option<&dyn Kernel>) {
+        let (Some(kernel), Some(wanted)) = (kernel, self.sessions[idx].pending_thinking.take())
+        else {
+            return;
+        };
+        let Some(id) = self.sessions[idx].acp_id.clone() else { return };
+        let wire = wanted.map(thinking_wire);
+        if let Err(err) = kernel.set_thinking(&id, wire.as_deref()) {
+            self.sessions[idx].note(format!("切换思考强度失败：{err}"));
+        }
+    }
+
     /// 输入框上方的一张待发送图片缩略图（右上角 × 撤掉）。
     fn pending_image_thumb(&self, i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
@@ -166,9 +200,12 @@ impl ChatApp {
         // 任务（建立时没选过文件夹的对话）：chip 上直说，点开可以挂到某个文件夹上
         let task = self.session().task;
         let project_chip = if task {
-            MenuChip::new(IconAll::ListTodo, "任务").filled()
+            MenuChip::new(IconAll::ListTodo, "任务")
+        } else if let Some(branch) = self.session().worktree.as_ref().map(|w| w.repo_name()) {
+            // worktree 会话：chip 写仓库名（目录是数据目录里的 worktree，显出来没意义）
+            MenuChip::new(IconAll::GitBranch, format!("{branch} · worktree"))
         } else {
-            MenuChip::new(IconAll::Folder, project).filled()
+            MenuChip::new(IconAll::Folder, project)
         };
         // 焦点几乎总在输入框上（丢了由 restore_focus 找回），所以窗口不在前台时按没聚焦画：
         // 切去别的程序后输入框回到静止样子，鼠标移上来是悬停态，点回来才是聚焦态
@@ -206,7 +243,8 @@ impl ChatApp {
             } else {
                 Icon::new(IconAll::ArrowUp)
                     .size_4()
-                    .text_color(rgb(if can_send { WHITE } else { INK_FAINT }))
+                    // CORAL 底上的箭头用 ON_ACCENT：有的配色深色版这个底很亮，白箭头看不清
+                    .text_color(rgb(if can_send { ON_ACCENT } else { INK_FAINT }))
                     .into_any_element()
             })
             .on_click(cx.listener(|this, _, window, cx| {
@@ -218,41 +256,54 @@ impl ChatApp {
                 }
             }));
 
-        // 卡片下方紧贴一行：左侧权限模式 / 添加文件，右侧模型。纯文字 chip，open 状态由 Popover 自管；
-        // 左右内缩到和输入文字对齐，读起来仍是输入框的一部分
+        // 卡片底边一条工具栏：左侧项目目录 / 权限模式 / 添加文件，右侧上下文用量 / 模型 / 发送。
+        // 和输入框是一整块（对照 Claude.ai 的输入卡片），chip 的 open 状态由 Popover 自管。
+        // 中间的空白点了也把焦点给输入框（chip 和按钮自己处理点击，不挂这个）
         let toolbar = div()
             .h_flex()
             .items_center()
             .gap_0p5()
-            .px_2()
+            .child(menu_popover(
+                "workspace-menu",
+                Anchor::BottomLeft,
+                rems(20.),
+                &app,
+                &self.menu_focus,
+                project_chip,
+                workspace_menu_items,
+            ))
             .child(menu_popover(
                 "mode-menu",
                 Anchor::BottomLeft,
                 rems(20.),
                 &app,
                 &self.menu_focus,
-                MenuChip::plain(mode_name),
+                MenuChip::new(IconAll::Shield, mode_name),
                 mode_menu_items,
             ))
             .child(
-                Self::quiet_button("attach-files", IconAll::Plus, Surface::Paper, cx)
+                Self::quiet_button("attach-files", IconAll::Paperclip, Surface::Paper, cx)
                     .small()
                     .tooltip("添加文件")
                     .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))),
             )
-            .child(div().flex_1())
+            .child(div().flex_1().self_stretch().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
+            ))
             .children(self.render_context_gauge())
+            .children(render_thinking_chip(self, &app))
             .child(model_menu_popover(
                 &app,
                 &self.menu_focus,
                 "model-menu",
                 Anchor::BottomRight,
                 MenuChip::plain(self.session().model_label.clone()),
-            ));
+            ))
+            .child(div().pl_1().child(send));
 
-        // 卡片里只有附件缩略图和随内容长高的多行输入 + 发送键（对照官方 Code 桌面端的紧凑输入框）。
-        // 三档：静止细边；悬停边框加深一档（提示整块都能点）；聚焦再深一档并加阴影。
-        // 点卡片空白处也把焦点给输入框。
+        // 一张卡片：附件缩略图、随内容长高的多行输入（至少两行），底边是工具栏。
+        // 三档：静止细边 + 淡阴影；悬停边框加深一档（提示整块都能点）；聚焦再深一档、阴影加重。
         let card =
             div()
                 .id("composer")
@@ -263,33 +314,29 @@ impl ChatApp {
                 .border_color(rgb(if focused { INK_FAINT } else { LINE }))
                 .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
                 .rounded_2xl()
-                .map(|d| if focused { d.shadow_sm() } else { d.shadow_xs() })
-                // 发送键离右边和上下都是 6px
-                .px_1p5()
-                .py_1()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
-                )
+                .map(|d| if focused { d.shadow_md() } else { d.shadow_sm() })
+                // 发送键离右边和底边都是 8px
+                .px_2()
+                .pt_1p5()
+                .pb_2()
                 // 待发送图片缩略图（点右上角 × 撤掉），左边和输入文字对齐
                 .when(!self.pending.is_empty(), |d| {
                     d.child(
-                        div().h_flex().flex_wrap().gap_1p5().px_2p5().pt_1p5().pb_1().children(
+                        div().h_flex().flex_wrap().gap_1p5().px_2().pt_1().pb_1().children(
                             (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
                         ),
                     )
                 })
-                // 发送键贴底：输入框长高后它留在右下角（单行时和文字齐平）
                 .child(
                     div()
-                        .h_flex()
-                        .items_end()
-                        .gap_1()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
+                        )
                         .child(
                             div()
                                 .relative()
-                                .flex_1()
-                                .min_w_0()
+                                .w_full()
                                 .child(
                                     Textarea::new(&self.input)
                                         .appearance(false)
@@ -314,9 +361,9 @@ impl ChatApp {
                                     self.next_suggestion_text(cx)
                                         .map(|text| self.next_suggestion_preview(text)),
                                 ),
-                        )
-                        .child(send),
-                );
+                        ),
+                )
+                .child(toolbar);
 
         div()
             .v_flex()
@@ -326,18 +373,6 @@ impl ChatApp {
             .gap_2()
             // 进行中这一轮的计划钉在最上面（对话往下走它也一直看得见）
             .children(self.render_pinned_plan(cx))
-            // 输入框上方：运行环境 + 项目目录（点开切换工作目录；任务会话是「任务」chip）
-            .child(div().h_flex().gap_1p5().child(Self::chip(IconAll::Monitor, "本地")).child(
-                menu_popover(
-                    "workspace-menu",
-                    Anchor::BottomLeft,
-                    rems(20.),
-                    &app,
-                    &self.menu_focus,
-                    project_chip,
-                    workspace_menu_items,
-                ),
-            ))
             .child(
                 div()
                     .v_flex()
@@ -349,8 +384,7 @@ impl ChatApp {
                         self.render_completion(cx).map(|list| {
                             div().absolute().left_0().right_0().bottom_full().mb_1p5().child(list)
                         }),
-                    ))
-                    .child(toolbar),
+                    )),
             )
             // 首页：输入框下方一排建议入口（见 overview.rs）
             .when(!self.session().has_user_message() && !self.settings.needs_setup(), |d| {
@@ -625,6 +659,144 @@ fn model_menu_popover(
 
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
 
+/// 会话级思考档位 chip 的文字：没选过就是「默认」（跟随设置里的档案）。
+/// 显示的是这个模型上实际生效的那一档（换了模型后存着的档位可能被降级，或在认不出的模型上不发）
+fn thinking_chip(app: &ChatApp) -> Option<MenuChip> {
+    if app.session().kernel != KernelChoice::Builtin {
+        return None;
+    }
+    let spec = session_thinking_spec(app);
+    let label = active_thinking(&spec, app.session().thinking).map_or("默认", ThinkingLevel::label);
+    Some(MenuChip::new(IconAll::Brain, label))
+}
+
+/// 会话级思考档位 chip：ACP 内核不画（模型由 agent 自己定）。点开是 `thinking_menu_items`。
+/// 在 `ChatApp` 自己的 render 里调：状态直接从 `this` 读，别 `handle.read(cx)`
+///（实体正在 update，再读一次就是 double lease，一打开窗口就崩）。
+fn render_thinking_chip(this: &ChatApp, handle: &Entity<ChatApp>) -> Option<AnyElement> {
+    let chip = thinking_chip(this)?;
+    Some(
+        menu_popover(
+            "thinking-menu",
+            Anchor::BottomRight,
+            rems(17.5),
+            handle,
+            &this.menu_focus,
+            chip,
+            thinking_menu_items,
+        )
+        .into_any_element(),
+    )
+}
+
+/// 会话当前模型的档位表：能选哪些档、字段怎么发，都以它为准
+pub(crate) fn session_thinking_spec(app: &ChatApp) -> claudesktop_builtin::ThinkingSpec {
+    let profile = app.settings.builtin.current();
+    // 内核还没报模型（刚建、没连上）时按档案的模型查，别先显示成认不出的「默认 / 兜底」
+    let model = if app.session().model_label == crate::session::UNKNOWN_MODEL {
+        profile.model.as_str()
+    } else {
+        app.session().model_label.as_ref()
+    };
+    claudesktop_builtin::thinking_spec(profile.protocol, model)
+}
+
+/// 档位 → 交给内核的字符串（和设置文件里存的是同一套：`low` / `high` / `max` …）
+pub(crate) fn thinking_wire(level: ThinkingLevel) -> String {
+    serde_json::to_value(level)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "high".into())
+}
+
+/// 思考档位条目：能选哪些档跟当前模型现算，实际生效的那一档打勾。
+/// 认不出的模型只有「默认 / 兜底」：别的档位在它上面什么都不发（见 `apply_thinking`），列出来是误导
+fn thinking_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let spec = session_thinking_spec(app);
+    let active = active_thinking(&spec, app.session().thinking);
+    let mut menu = MenuList::new("thinking-menu-list", handle, popover);
+    // 「默认」= 这个会话不覆盖，用设置里给档案配的那一档
+    menu = menu.pick(
+        menu_item(
+            "thinking-default",
+            IconAll::Circle,
+            "默认",
+            "用设置里「内核与模型」给这个档案配的那一档",
+            active.is_none(),
+        ),
+        |this, cx| this.choose_thinking(None, cx),
+    );
+    if spec.is_known() {
+        for level in spec.choices() {
+            let level = *level;
+            menu = menu.pick(
+                menu_item(
+                    ("thinking-item", thinking_key(level)),
+                    thinking_icon(level),
+                    level.label(),
+                    thinking_hint(level),
+                    active == Some(level),
+                ),
+                move |this, cx| this.choose_thinking(Some(level), cx),
+            );
+        }
+    } else {
+        // 认不出的模型：只有「兜底」（按通用的 effort 字段发）
+        menu = menu.pick(
+            menu_item(
+                "thinking-fallback",
+                IconAll::Sparkles,
+                ThinkingLevel::Default.label(),
+                "还不知道这个模型认不认，按通用的 effort 字段发",
+                active == Some(ThinkingLevel::Default),
+            ),
+            |this, cx| this.choose_thinking(Some(ThinkingLevel::Default), cx),
+        );
+    }
+    menu
+}
+
+/// 档位 → `MenuList` 的稳定下标（不能用文案，文案会变）
+fn thinking_key(level: ThinkingLevel) -> usize {
+    match level {
+        ThinkingLevel::Off => 0,
+        ThinkingLevel::Minimal => 1,
+        ThinkingLevel::Low => 2,
+        ThinkingLevel::Medium => 3,
+        ThinkingLevel::High => 4,
+        ThinkingLevel::XHigh => 5,
+        ThinkingLevel::Max => 6,
+        ThinkingLevel::Default => 7,
+    }
+}
+
+fn thinking_icon(level: ThinkingLevel) -> IconAll {
+    match level {
+        ThinkingLevel::Off => IconAll::Circle,
+        ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => IconAll::Gauge,
+        ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => IconAll::Zap,
+        ThinkingLevel::Default => IconAll::Sparkles,
+    }
+}
+
+/// 条目第二行的灰色说明：写「这是干什么的」，不写具体档位名（各家叫法不一样，说了反而误导）
+fn thinking_hint(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "不思考，最快也最便宜",
+        ThinkingLevel::Minimal => "极短的思考",
+        ThinkingLevel::Low => "简单任务足够",
+        ThinkingLevel::Medium => "日常任务的平衡档",
+        ThinkingLevel::High => "推理充分一些，慢一点",
+        ThinkingLevel::XHigh => "复杂任务用，明显更慢",
+        ThinkingLevel::Max => "最高档，最慢也最贵",
+        ThinkingLevel::Default => "按通用的 effort 字段发",
+    }
+}
+
 /// 权限模式条目：图标 + 名称（+说明），当前项打勾。
 fn mode_menu_items(
     app: &ChatApp,
@@ -660,6 +832,19 @@ fn workspace_menu_items(
         menu = menu.pick(
             menu_item(("workspace-item", i), IconAll::Folder, label, path, active),
             move |this, cx| this.switch_workspace(dir.clone(), cx),
+        );
+    }
+    if app.git_repo_here() {
+        // 在新 worktree 中开始：从当前分支的最新提交拉一个分支，未提交的改动不会带过去
+        menu = menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick(
+            menu_item(
+                "workspace-worktree",
+                IconAll::GitBranch,
+                "在新 worktree 中开始",
+                "从当前分支的最新提交开始，未提交的改动不会带过去",
+                false,
+            ),
+            |this, cx| this.start_in_worktree(cx),
         );
     }
     menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE)))

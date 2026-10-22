@@ -13,9 +13,11 @@
 //! （内核线程调用），指令经 channel（UI 线程投递）。
 
 mod acp;
+pub mod agents;
 pub mod catalog;
 pub mod checkpoint;
 mod diff;
+pub mod git;
 pub mod history_search;
 mod json_error;
 pub mod memory;
@@ -27,11 +29,13 @@ pub mod review;
 mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
+pub use agents::{AgentPreset, DetectState, Detected};
 pub use diff::{DiffLineView, DiffView};
 pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
 pub use store::{
-    Record, SessionLog, SessionMeta, SessionStore, default_data_dir, effective, read_log,
+    Record, SessionLog, SessionMeta, SessionStore, WorktreeMeta, default_data_dir, effective,
+    read_log,
 };
 
 pub use plugin::Plugin;
@@ -237,6 +241,22 @@ pub enum KernelEvent {
         /// 这份文件里现在有几条
         count: usize,
     },
+    /// 一轮结束后提炼出的「候选」记忆：只进设置页顶部「待确认」，用户点「收下」才落盘。
+    /// 不进对话流、不进日志（误记的代价比漏记大：设计说明第四节）
+    MemorySuggested { candidates: Vec<MemoryCandidateView> },
+}
+
+/// 一条待确认的记忆（`KernelEvent::MemorySuggested`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCandidateView {
+    /// 结论（一句话）
+    pub text: String,
+    /// 标签
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 命中的键（同一句再来一次时不重复提示）
+    #[serde(default)]
+    pub key: String,
 }
 
 /// 一条后台命令在界面上的样子（见自研内核的 `bgtasks` 模块）。
@@ -331,6 +351,7 @@ impl KernelEvent {
             Self::TitleGenerated { .. } => "title_generated",
             Self::BackgroundTasks { .. } => "background_tasks",
             Self::MemoryChanged { .. } => "memory_changed",
+            Self::MemorySuggested { .. } => "memory_suggested",
         }
     }
 }
@@ -525,6 +546,12 @@ pub trait Kernel: Send + Sync {
     fn set_model(&self, session: &str, model: &str) -> anyhow::Result<()> {
         let _ = (session, model);
         anyhow::bail!("当前内核不支持切换模型")
+    }
+    /// 临时覆盖某会话的思考档位（`None` = 回到档案里的那份）；默认不支持。
+    /// 只作用于这一轮之后发出的请求，不改设置文件
+    fn set_thinking(&self, session: &str, level: Option<&str>) -> anyhow::Result<()> {
+        let _ = (session, level);
+        anyhow::bail!("当前内核不支持切换思考强度")
     }
     /// 更新各模型的上下文窗口（模型 ID → token；界面取到模型列表后推过来，自动压缩用）。默认忽略。
     fn set_context_windows(&self, windows: std::collections::HashMap<String, u64>) {
