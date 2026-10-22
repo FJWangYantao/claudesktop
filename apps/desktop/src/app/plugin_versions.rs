@@ -1,7 +1,8 @@
 //! 插件卡片上的版本 chip：`v1.2.0 ▾`，点开列全部 tag（当前那版打勾），选中就 `git checkout` 过去。
 //!
-//! tag 列表来自本地克隆（`plugin_git::versions`），**点开菜单时**在后台线程读一次、记在
-//! [`VersionForm`] 里——不在 render 里跑 git，也不在 render 里读 `ChatApp`（正在借用）。
+//! tag 列表来自远端（`plugin_git::versions`），**点开菜单时**在后台线程读一次、记在
+//! [`VersionForm`] 里——不在 render 里跑 git，也不在 render 里读 `ChatApp`（render 时它正被借用，
+//! `Entity::read` 会 panic）：表单状态在菜单的 `content` 闭包里读（那时借用的是 Popover）。
 //!
 //! 菜单的开关状态由 gpui-kit `Popover` 自己持有，不往 `ChatApp` 里加 `*_open`。
 
@@ -124,7 +125,6 @@ pub(super) fn version_chip(
     p: &Plugin,
     handle: Entity<ChatApp>,
     focus: FocusHandle,
-    cx: &mut Context<ChatApp>,
 ) -> AnyElement {
     let current = p.version.clone();
     let Some(repo) = p.repo.clone() else {
@@ -138,11 +138,6 @@ pub(super) fn version_chip(
             None => div().into_any_element(),
         };
     };
-    let form = handle.read(cx);
-    let form = form.version_form();
-    let loading = form.loading(&repo);
-    let tags = form.tags(&repo);
-    let busy = form.busy();
     let label: SharedString = match current.as_deref() {
         Some(v) => version_label(v).into(),
         None => "版本".into(),
@@ -163,6 +158,8 @@ pub(super) fn version_chip(
             }
         })
         .content(move |_, _, cx| {
+            let form = handle.read(cx).version_form();
+            let (loading, tags, busy) = (form.loading(&repo), form.tags(&repo), form.busy());
             let popover = cx.entity();
             let mut list = MenuList::new(("plugin-version-list", i), &handle, &popover);
             match (&tags, loading) {

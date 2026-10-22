@@ -622,12 +622,12 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 第 `idx` 个会话绑定的内核
     /// 插件卡片上版本菜单的状态（读到的 tag 列表、正在换到哪一版）
     pub(super) fn version_form(&self) -> &plugin_versions::VersionForm {
         &self.plugin_versions
     }
 
+    /// 第 `idx` 个会话绑定的内核
     pub(crate) fn session_kernel(&self, idx: usize) -> Option<Arc<dyn Kernel>> {
         self.kernel_of(&self.sessions[idx].kernel)
     }
@@ -1586,11 +1586,20 @@ impl ChatApp {
     }
 
     /// 排队的压缩（`Session::compact_queued`）：一轮正常结束后、发排队的消息**之前**压成一轮。
-    /// 返回是不是这会儿接着压（调用方据此别再往下走）。
-    fn queued_compaction(&mut self, idx: usize, _cx: &mut Context<Self>) -> bool {
-        if !std::mem::take(&mut self.sessions[idx].compact_queued) {
+    /// 返回是不是这会儿接着压（调用方据此别再往下走）。和 [`Self::dispatch_queued`] 同样的前提：
+    /// 会话忙着、正在停、还没就绪时不动它，留着等下一个时机（一轮结束 / `Started`）。
+    fn queued_compaction(&mut self, idx: usize) -> bool {
+        let s = &self.sessions[idx];
+        if !s.compact_queued || s.busy || s.stopping || !s.ready {
             return false;
         }
+        self.sessions[idx].compact_queued = false;
+        self.start_compaction(idx, "这个会话还没接上内核：压缩没有做")
+    }
+
+    /// 让内核把第 `idx` 个会话的上下文压成摘要，自成一轮；返回压起来了没有。
+    /// `unbound` 是会话还没接上内核时记进对话的说明。
+    fn start_compaction(&mut self, idx: usize, unbound: &str) -> bool {
         let kernel = self.session_kernel(idx);
         let s = &mut self.sessions[idx];
         match (kernel, s.acp_id.clone()) {
@@ -1606,7 +1615,7 @@ impl ChatApp {
                 }
             },
             _ => {
-                s.note("这个会话还没接上内核：压缩没有做");
+                s.note(unbound);
                 false
             }
         }
@@ -1616,28 +1625,15 @@ impl ChatApp {
     /// 一轮跑着时排到这一轮后面（和排队的消息一样，见 `ChatApp::queued_compaction`）。
     pub(crate) fn compact_session(&mut self, cx: &mut Context<Self>) {
         let active = self.active;
-        let kernel = self.session_kernel(active);
         let s = &mut self.sessions[active];
         // 发出去了：光标后面那句灰字作废（它按上下文猜的，压完就不成立了）
         self.suggestion.clear();
         if s.busy || s.stopping {
-            if s.compact_queued {
-                return;
-            }
             s.compact_queued = true;
             cx.notify();
             return;
         }
-        match (kernel, s.acp_id.clone()) {
-            (Some(kernel), Some(id)) => match kernel.compact(&id) {
-                Ok(()) => {
-                    s.begin_turn();
-                    s.compact_turn = true;
-                }
-                Err(err) => s.note(format!("压缩上下文失败：{err}")),
-            },
-            _ => s.note("这个会话还没接上内核：先发一条消息，再压缩"),
-        }
+        self.start_compaction(active, "这个会话还没接上内核：先发一条消息，再压缩");
         cx.notify();
     }
 
@@ -1667,9 +1663,7 @@ impl ChatApp {
             self.persist(active, Record::Thought { elapsed_ms: ms });
         }
         // 停下通常是要改主意：排着的压缩也撤掉，说明一句
-        if std::mem::take(&mut self.sessions[active].compact_queued) {
-            self.sessions[active].note("已停下：排着的「压缩上下文」也撤掉了，需要的话再发一次");
-        }
+        self.sessions[active].drop_queued_compaction("已停下");
         self.unqueue(None, window, cx);
         cx.notify();
     }
@@ -1791,15 +1785,10 @@ impl ChatApp {
                     if turn_over {
                         self.record_turn(idx);
                         self.touch_meta(idx);
-                        // 上一轮没有正常结束（出错 / 停了）：排着的压缩丢掉，说明一句；
-                        // 排队的消息不自动发，由用户看着决定（见输入框上方的队列）
-                        if !clean_end && std::mem::take(&mut self.sessions[idx].compact_queued) {
-                            let stopped = self.sessions[idx].stopping;
-                            self.sessions[idx].note(if stopped {
-                                "这一轮停下来了：排着的「压缩上下文」也撤掉了，需要的话再发一次"
-                            } else {
-                                "这一轮出错了：排着的「压缩上下文」也撤掉了，需要的话再发一次"
-                            });
+                        // 上一轮出错了：排着的压缩丢掉，说明一句；排队的消息不自动发，
+                        // 由用户看着决定（见输入框上方的队列）。用户停下的在 `stop` 里已经撤掉了
+                        if !clean_end {
+                            self.sessions[idx].drop_queued_compaction("这一轮出错了");
                         }
                     }
                     let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
@@ -1829,7 +1818,7 @@ impl ChatApp {
                     }
                     if clean_end {
                         // 排着的压缩先压（它自成一轮），压起来了排队的话等压完再发
-                        if !self.queued_compaction(idx, cx) {
+                        if !self.queued_compaction(idx) {
                             self.dispatch_queued(idx, cx);
                             // 这一轮正常结束、输入框空着：猜用户接下来会发的那一句（见 suggest.rs）
                             if idx == self.active && !self.settings_open {
@@ -1844,7 +1833,7 @@ impl ChatApp {
                     // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
                     if matches!(event, KernelEvent::Started { .. }) {
                         self.flush_pending_thinking(idx, kernel.as_deref());
-                        if !self.queued_compaction(idx, cx) {
+                        if !self.queued_compaction(idx) {
                             self.dispatch_queued(idx, cx);
                         }
                     }

@@ -80,14 +80,11 @@ pub struct PermissionOptionView {
 /// 按块部分同意：这次只放行这些块，其余块不写盘（等用户先看）。
 ///
 /// 只对自研内核的写文件 / 改文件工具开放（其它内核的工具结果不归我们写，做不到）。
-/// `paths` 为空 = 所有文件都按同一份块编号放行；给了就只对这几个文件生效。
+/// 写 / 改文件一次只动一个文件，块编号就是那个文件的。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialGrant {
     /// 放行的块编号（[`PermissionHunks`] 里的 `index`）
     pub hunks: Vec<u32>,
-    /// 只对这些文件生效；空 = 全部
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<String>,
 }
 
 /// 权限请求里「可以按块同意」的那部分：这次要写哪些文件、每个文件的块。

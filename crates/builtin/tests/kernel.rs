@@ -812,7 +812,7 @@ fn partial_permission_writes_only_the_selected_hunks() {
         .resolve_permission_with(
             req,
             Some("allow_once".into()),
-            Some(claudesktop_core::PartialGrant { hunks: vec![1], paths: Vec::new() }),
+            Some(claudesktop_core::PartialGrant { hunks: vec![1] }),
         )
         .unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));

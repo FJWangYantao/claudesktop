@@ -437,7 +437,7 @@ enum Steps {
 enum Verdict {
     Allow,
     /// 只放行这些块（写文件 / 改文件按块同意），其余块不写盘
-    Partial(Vec<u32>),
+    Partial(tools::KeepHunks),
     /// 拒绝；内容回给模型
     Deny(String),
 }
@@ -1345,7 +1345,7 @@ impl Inner {
         call_id: &str,
         action: &Action,
         stopped: &dyn Fn() -> bool,
-        keep: Option<&[u32]>,
+        keep: Option<&tools::KeepHunks>,
     ) -> ToolOutput {
         let target = action.written_path().map(Path::to_path_buf);
         let before = target.as_deref().and_then(checkpoint::read_snapshot);
@@ -1453,7 +1453,7 @@ impl Inner {
                                 &call.id,
                                 &action,
                                 stopped,
-                                keep.as_deref(),
+                                keep.as_ref(),
                             ),
                         }
                     }
@@ -1696,13 +1696,13 @@ impl Inner {
 
         // 写 / 改文件：把这次的块一并交给权限卡，用户可以在上面逐块勾选
         let hunks = action.permission_hunks(cwd);
-        let answer = self.ask(session, title, tool, options, hunks, stopped);
+        let answer = self.ask(session, title, tool, options, hunks.clone(), stopped);
         let choice = answer.as_ref().map(|a| a.option.as_str());
         match choice {
-            Some("allow_once") => match answer.and_then(|a| a.hunks) {
-                // 只勾了一部分：只写这几块
-                Some(keep) => Verdict::Partial(keep),
-                None => Verdict::Allow,
+            Some("allow_once") => match (answer.and_then(|a| a.hunks), &hunks) {
+                // 只勾了一部分：只写这几块（写之前核对文件还是问的时候那样）
+                (Some(keep), Some(asked)) => Verdict::Partial(tools::KeepHunks::new(keep, asked)),
+                _ => Verdict::Allow,
             },
             Some("allow_always") => {
                 if let Some(rule) = rule

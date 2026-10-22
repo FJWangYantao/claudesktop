@@ -566,10 +566,19 @@ impl ChatItem {
                 c.grant.as_ref().map(|g| g.kind),
             )
                 .hash(&mut h),
-            Self::Permission { title, options, resolved, merged, .. } => {
-                (4u8, title.len(), options.len(), resolved.as_ref().map(|r| r.len()), merged)
-                    .hash(&mut h)
-            }
+            // 按块同意：块数 / 行数决定卡片多高，勾掉几块会换标题文字（可能多折一行）
+            Self::Permission { title, options, resolved, merged, hunks, keep, .. } => (
+                4u8,
+                title.len(),
+                options.len(),
+                resolved.as_ref().map(|r| r.len()),
+                merged,
+                hunks.as_ref().map(|h| {
+                    h.files.iter().flat_map(|f| &f.hunks).map(|x| x.lines.len() + 1).sum::<usize>()
+                }),
+                keep.as_ref().map(Vec::len),
+            )
+                .hash(&mut h),
             Self::Plan(rows) => {
                 5u8.hash(&mut h);
                 for r in rows {

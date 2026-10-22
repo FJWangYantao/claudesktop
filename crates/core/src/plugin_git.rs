@@ -222,9 +222,59 @@ pub fn version(repo: &Path) -> Option<String> {
 }
 
 /// 这个仓库能装哪些版本：远端的 tag，新的在前（按 git 给的版本序，`v1.2.0` > `v1.1.9`）。
+/// 跟最新装的是 `--depth 1` 浅克隆，本地只有最新那个提交上的 tag，所以问远端（`ls-remote`）；
+/// 连不上远端时退回本地有的 tag。
 pub fn versions(repo: &Path) -> Result<Vec<String>, String> {
-    let out = git(repo, &["tag", "--list", "--sort=-v:refname"])?;
-    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+    let lines = |out: String| -> Vec<String> {
+        out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
+    };
+    match git_stdout(repo, &["ls-remote", "--tags", "--refs", "--sort=-v:refname", "origin"]) {
+        Ok(out) => Ok(lines(out)
+            .iter()
+            .filter_map(|l| l.split_whitespace().nth(1)?.strip_prefix("refs/tags/"))
+            .map(str::to_string)
+            .collect()),
+        Err(_) => git_stdout(repo, &["tag", "--list", "--sort=-v:refname"]).map(lines),
+    }
+}
+
+/// 浅克隆（`--depth 1` 装的）没有历史，拉东西时也只拉那一个提交。
+fn is_shallow(repo: &Path) -> bool {
+    git_stdout(repo, &["rev-parse", "--is-shallow-repository"]).is_ok_and(|s| s.trim() == "true")
+}
+
+/// 本地还没有 `rev` 就从远端拉下来：tag 优先，再按分支 / 提交；浅克隆只拉那一个提交。
+/// 拉不到不在这里报错，接下来的 `checkout` 会说清楚。
+fn fetch_rev(repo: &Path, rev: &str) {
+    let has = |r: &str| {
+        git_stdout(repo, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_ok()
+    };
+    if has(&format!("refs/tags/{rev}")) || has(rev) {
+        return;
+    }
+    let depth: &[&str] = if is_shallow(repo) { &["--depth", "1"] } else { &[] };
+    let tag = format!("refs/tags/{rev}:refs/tags/{rev}");
+    let fetch = |what: &str| {
+        let args: Vec<&str> = ["fetch", "--no-tags"]
+            .into_iter()
+            .chain(depth.iter().copied())
+            .chain(["origin", what])
+            .collect();
+        git(repo, &args)
+    };
+    if fetch(&tag).is_err() {
+        let _ = fetch(rev);
+    }
+}
+
+/// 插件目录本来就不该改：有本地改动（或换版本后多出来的文件）就不动它，让用户卸载重装。
+fn ensure_clean(repo: &Path) -> Result<(), String> {
+    let dirty = git_stdout(repo, &["status", "--porcelain"])?;
+    if dirty.trim().is_empty() {
+        Ok(())
+    } else {
+        Err("插件目录里有本地改动（或者装了别的版本后新出现的文件）：先卸载再按这个版本重装".into())
+    }
 }
 
 /// 换到别的版本（tag / 分支 / 提交）。本地改过的先 stash 不行——插件目录本来就不该改，
@@ -234,12 +284,8 @@ pub fn checkout(repo: &Path, rev: &str) -> Result<String, String> {
     if rev.is_empty() {
         return Err("先选一个版本".into());
     }
-    let dirty = git_stdout(repo, &["status", "--porcelain"])?;
-    if !dirty.trim().is_empty() {
-        return Err(
-            "插件目录里有本地改动（或者装了别的版本后新出现的文件）：先卸载再按这个版本重装".into(),
-        );
-    }
+    ensure_clean(repo)?;
+    fetch_rev(repo, rev);
     git(repo, &["checkout", "--detach", &format!("refs/tags/{rev}")])
         .or_else(|_| git(repo, &["checkout", "--detach", rev]))?;
     // 稀疏克隆：换版本后子目录还在，重新写一遍免得工作区展开成整仓库
@@ -250,8 +296,14 @@ pub fn checkout(repo: &Path, rev: &str) -> Result<String, String> {
 }
 
 /// 拉最新的（只快进，本地改过就报错、不合并）；返回 git 的输出（「Already up to date.」等）。
+/// 按版本装的、换过版本的停在某个提交上（detached HEAD），`pull` 用不了：回到远端默认分支的头。
 pub fn update(repo: &Path) -> Result<String, String> {
-    git(repo, &["pull", "--ff-only"]).map_err(|e| {
+    let result = if git_stdout(repo, &["symbolic-ref", "-q", "HEAD"]).is_ok() {
+        git(repo, &["pull", "--ff-only"])
+    } else {
+        to_branch_head(repo)
+    };
+    result.map_err(|e| {
         // 本地改过的插件目录：插件这边最省事的出路是重装
         if e.starts_with("目录里有本地改动") {
             format!("{e}；或者卸载后重新安装")
@@ -259,6 +311,30 @@ pub fn update(repo: &Path) -> Result<String, String> {
             e
         }
     })
+}
+
+/// 从某个版本回到远端默认分支（`origin/HEAD` 指的那个）的最新提交，并重新跟踪它（之后 `pull` 照常）。
+fn to_branch_head(repo: &Path) -> Result<String, String> {
+    ensure_clean(repo)?;
+    let head =
+        |repo: &Path| git_stdout(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    let head = head(repo).or_else(|_| {
+        git(repo, &["remote", "set-head", "origin", "--auto"])?;
+        head(repo)
+    })?;
+    let head = head.trim();
+    let branch = head.strip_prefix("origin/").unwrap_or(head);
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    if is_shallow(repo) {
+        git(repo, &["fetch", "--no-tags", "--depth", "1", "origin", &refspec])?;
+    } else {
+        git(repo, &["fetch", "origin", &refspec])?;
+    }
+    git(repo, &["checkout", "-B", branch, "--track", &format!("origin/{branch}")])?;
+    if let Some(sub) = subdir(repo) {
+        git(repo, &["sparse-checkout", "set", &sub])?;
+    }
+    Ok(format!("回到 {branch} 最新的提交（{}）", version(repo).unwrap_or_default()))
 }
 
 /// 卸载：删掉克隆下来的目录。只删插件目录下、带 `.git` 的（手动放进来的不动）。
@@ -473,6 +549,15 @@ mod tests {
         assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 2);
         assert_eq!(checkout(&dest, "v1.0.0").unwrap(), "v1.0.0");
         assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 1);
+        // 停在某个版本上点「更新」：回到 main 的头，之后远端再有新提交照常快进
+        assert!(update(&dest).unwrap().contains("main"), "从版本回到分支");
+        assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 2);
+        write(remote.join("plugins/alpha/commands/third.md"), "第三");
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-qm", "three"]);
+        update(&dest).unwrap();
+        assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 3);
+        assert!(!dest.join("plugins/beta").exists(), "回到分支后仍只检出那个子目录");
         // 本地改过：不让换（免得把改动悄悄冲掉）
         write(dest.join("plugins/alpha/commands/local.md"), "本地");
         assert!(checkout(&dest, "v2.0.0").is_err());
@@ -480,6 +565,62 @@ mod tests {
         let bad = plugins.join("beta");
         assert!(install_at(&plugins, &url, "v9.9.9", None, "beta").is_err());
         assert!(!bad.exists());
+        uninstall(&plugins, &dest).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 跟最新装的（`--depth 1` 浅克隆）本地只有最新那个提交：版本列表要问远端，
+    /// 换到老版本要先把它拉下来，换完还能「更新」回分支的头。
+    #[test]
+    fn shallow_install_lists_and_switches_to_remote_tags() {
+        let run = |cwd: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("cd-plugin-shallow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let remote = base.join("market");
+        let write = |p: PathBuf, t: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, t).unwrap();
+        };
+        write(
+            remote.join(".claude-plugin/marketplace.json"),
+            r#"{"name": "m", "plugins": [{"name": "alpha", "source": "./plugins/alpha"}]}"#,
+        );
+        write(remote.join("plugins/alpha/commands/go.md"), "出发");
+        run(&remote, &["init", "--initial-branch=main"]);
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-qm", "one"]);
+        run(&remote, &["tag", "v1.0.0"]);
+        write(remote.join("plugins/alpha/commands/again.md"), "再来");
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-qm", "two"]);
+        run(&remote, &["tag", "v2.0.0"]);
+        write(remote.join("plugins/alpha/commands/third.md"), "第三");
+        run(&remote, &["add", "."]);
+        run(&remote, &["commit", "-qm", "three"]);
+
+        let plugins = base.join("plugins");
+        let url = format!("file://{}", remote.to_string_lossy().replace('\\', "/"));
+        let dest = install_at(&plugins, &url, "", Some("plugins/alpha"), "alpha").unwrap();
+        assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 3);
+        // 本地只有最新的提交，版本列表照样有远端的全部 tag
+        assert_eq!(versions(&dest).unwrap(), vec!["v2.0.0".to_string(), "v1.0.0".to_string()]);
+        assert_eq!(checkout(&dest, "v1.0.0").unwrap(), "v1.0.0");
+        assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 1);
+        assert!(!dest.join("plugins/beta").exists());
+        assert!(update(&dest).unwrap().contains("main"));
+        assert_eq!(crate::plugin::discover(&plugins)[0].commands.len(), 3);
         uninstall(&plugins, &dest).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }

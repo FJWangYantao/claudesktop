@@ -4,7 +4,7 @@
 //! 给模型看的说明与结果用英文（与系统提示词一致），给 UI 的摘要用中文。
 
 use claudesktop_core::memory::MAX_TEXT_CHARS;
-use claudesktop_core::{DiffView, PlanEntryView};
+use claudesktop_core::{DiffHunk, DiffView, PermissionHunks, PlanEntryView};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -1044,7 +1044,10 @@ impl Action {
             _ => return None,
         };
         let hunks = claudesktop_core::hunks_with_context(old.as_deref().unwrap_or(""), &new);
-        if hunks.is_empty() {
+        // 太大的改动（生成的大文件之类）不给按块勾：块要整份进权限事件和会话日志、权限卡每帧都要画，
+        // 这时权限卡退回整段放行 / 拒绝（预览走 `DiffView`，有行数上限）
+        let lines: usize = hunks.iter().map(|h| h.lines.len()).sum();
+        if hunks.is_empty() || lines > PERMISSION_HUNK_MAX_LINES {
             return None;
         }
         let path = self.written_path().map(|p| display(cwd, p)).unwrap_or_default();
@@ -1061,7 +1064,7 @@ impl Action {
         &self,
         should_stop: &dyn Fn() -> bool,
         progress: &dyn Fn(String),
-        keep: Option<&[u32]>,
+        keep: Option<&KeepHunks>,
     ) -> ToolOutput {
         match self {
             Self::Read { path, offset, limit } => read_file(path, *offset, *limit),
@@ -1719,18 +1722,62 @@ fn list_dir(path: &Path) -> ToolOutput {
     ToolOutput::ok(out, format!("{total} 项"))
 }
 
-fn write_file(path: &Path, content: &str, keep: Option<&[u32]>) -> ToolOutput {
+/// 按块同意时最多给多少行（各块连上下文的行数加起来）；再大就只能整段放行 / 拒绝。
+const PERMISSION_HUNK_MAX_LINES: usize = 400;
+
+/// 按块同意的结果：放行哪几块，以及问的时候给用户看的是哪些块。
+/// 写盘时按当时的文件重新分块，和问的时候对不上（文件在这期间被改过，块的编号指的已经是别的改动）就不写。
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeepHunks {
+    /// 放行的块编号（[`DiffHunk::index`]）
+    pub hunks: Vec<u32>,
+    /// 问的时候算出来的块
+    pub asked: Vec<DiffHunk>,
+}
+
+impl KeepHunks {
+    /// 用户在权限卡上勾的块 + 那张卡上列的块。
+    pub fn new(hunks: Vec<u32>, asked: &PermissionHunks) -> Self {
+        let asked = asked.files.iter().flat_map(|f| f.hunks.iter().cloned()).collect();
+        Self { hunks, asked }
+    }
+}
+
+/// 按块写盘前的核对：文件现在的块和问的时候不一样，就把整次写入拒掉。
+fn check_hunks(old: &str, new: &str, keep: &KeepHunks, path: &Path) -> Result<(), ToolOutput> {
+    if claudesktop_core::hunks_with_context(old, new) == keep.asked {
+        return Ok(());
+    }
+    Err(ToolOutput::fail(
+        format!(
+            "{} changed after the user approved some of the hunks, so nothing was written. \
+             Read the file again and redo the change.",
+            path.display()
+        ),
+        "文件在授权后又被改过，没写",
+    ))
+}
+
+/// 按块写入时给模型和用户的说明：写了几块、几块没写（`None` = 全写了）。
+fn partial_note(taken: usize, skipped: usize) -> Option<String> {
+    (skipped > 0).then(|| format!("只写了 {taken} 块，另有 {skipped} 块没写：用户没同意"))
+}
+
+fn write_file(path: &Path, content: &str, keep: Option<&KeepHunks>) -> ToolOutput {
     let existed = path.exists();
     // 按块同意：只把放行的块写进去，其余块保持文件原来的内容
-    let content = match keep {
-        None => content.to_string(),
+    let (content, note) = match keep {
+        None => (content.to_string(), None),
         Some(keep) => {
             let old = std::fs::read_to_string(path).ok();
-            let text = splices(old.as_deref(), content, keep);
-            if text.is_empty() && old.is_none() {
+            if let Err(out) = check_hunks(old.as_deref().unwrap_or(""), content, keep, path) {
+                return out;
+            }
+            let partial = splice_partial(old.as_deref(), content, &keep.hunks);
+            if partial.text.is_empty() && old.is_none() {
                 return ToolOutput::fail("Nothing was approved to write", "没有放行任何改动");
             }
-            text
+            (partial.text, partial_note(partial.taken, partial.skipped))
         }
     };
     let content = content.as_str();
@@ -1742,17 +1789,17 @@ fn write_file(path: &Path, content: &str, keep: Option<&[u32]>) -> ToolOutput {
     match std::fs::write(path, content) {
         Ok(()) => {
             let lines = content.lines().count();
-            // 按块写入时在摘要里说清楚：模型和用户都要知道只写了几块
-            let partial = match keep {
-                Some(k) => format!(" · 只写了 {} 块", k.len()),
-                None => String::new(),
+            // 按块写入时说清楚：模型和用户都要知道只写了几块（模型不知道的话会以为整份都落盘了）
+            let (for_model, for_user) = match &note {
+                Some(n) => (format!(". {n}"), format!(" · {n}")),
+                None => (String::new(), String::new()),
             };
             ToolOutput::ok(
-                format!("Wrote {lines} lines to {}", path.display()),
+                format!("Wrote {lines} lines to {}{for_model}", path.display()),
                 if existed {
-                    format!("覆盖 · {lines} 行{partial}")
+                    format!("覆盖 · {lines} 行{for_user}")
                 } else {
-                    format!("新建 · {lines} 行{partial}")
+                    format!("新建 · {lines} 行{for_user}")
                 },
             )
         }
@@ -1762,22 +1809,12 @@ fn write_file(path: &Path, content: &str, keep: Option<&[u32]>) -> ToolOutput {
 
 /// 按块拼出要写入的内容：`keep` 里放行的块取新内容，其余块保留旧内容
 /// （块的划分在 `claudesktop_core::hunk_ranges`，和权限卡上列的一致）。
-fn splices(old: Option<&str>, new: &str, keep: &[u32]) -> String {
-    claudesktop_core::splice_ranges(old, new, Some(keep))
-}
-
-/// 按块拼出改文件的结果：`replaced` 是整份改完的内容，`original` 是改之前的，
-/// `keep` 给了就只把放行的块写进去（其余块保持改之前的样子）。
-fn splice_edit(original: &str, replaced: &str, keep: Option<&[u32]>) -> Partial {
-    match keep {
-        None => Partial { text: replaced.to_string(), taken: 0, skipped: 0 },
-        Some(keep) => {
-            let text = splices(Some(original), replaced, keep);
-            // 块总数：放行的 + 没放行的
-            let total = claudesktop_core::hunk_ranges(original, replaced).len();
-            Partial { text, taken: keep.len().min(total), skipped: total - keep.len().min(total) }
-        }
-    }
+/// 块数按实际有的算：重复的、超出范围的编号不算。
+fn splice_partial(old: Option<&str>, new: &str, keep: &[u32]) -> Partial {
+    let text = claudesktop_core::splice_ranges(old, new, Some(keep));
+    let total = claudesktop_core::hunk_ranges(old.unwrap_or(""), new).len();
+    let taken = (0..total as u32).filter(|i| keep.contains(i)).count();
+    Partial { text, taken, skipped: total - taken }
 }
 
 /// 按块写盘的结果：写下去的全文和放行 / 没放行的块数。
@@ -1841,7 +1878,7 @@ fn replace_in(
     Ok(Replaced { text, count: if all { count } else { 1 }, old, new })
 }
 
-fn edit_file(path: &Path, old: &str, new: &str, all: bool, keep: Option<&[u32]>) -> ToolOutput {
+fn edit_file(path: &Path, old: &str, new: &str, all: bool, keep: Option<&KeepHunks>) -> ToolOutput {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -1853,17 +1890,20 @@ fn edit_file(path: &Path, old: &str, new: &str, all: bool, keep: Option<&[u32]>)
         Err(out) => return out,
     };
     // 按块同意：只把放行的块写进去，其余块保持改之前的样子
-    let partial = splice_edit(&text, &r.text, keep);
-    match std::fs::write(path, &partial.text) {
+    let (written_text, note) = match keep {
+        None => (r.text.clone(), None),
+        Some(keep) => {
+            if let Err(out) = check_hunks(&text, &r.text, keep, path) {
+                return out;
+            }
+            let partial = splice_partial(Some(&text), &r.text, &keep.hunks);
+            (partial.text, partial_note(partial.taken, partial.skipped))
+        }
+    };
+    match std::fs::write(path, &written_text) {
         Ok(()) => {
             let (minus, plus) = (r.old.lines().count(), r.new.lines().count());
-            let written = match keep {
-                Some(_) if partial.skipped > 0 => format!(
-                    "（只写了 {} 块，另有 {} 块没写：用户还没同意）",
-                    partial.taken, partial.skipped
-                ),
-                _ => String::new(),
-            };
+            let written = note.map(|n| format!("（{n}）")).unwrap_or_default();
             ToolOutput::ok(
                 format!(
                     "Replaced {} occurrence(s) in {}{}",
@@ -2534,36 +2574,76 @@ y
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 按块写盘：只写放行的块，其余块保持文件原来的内容；摘要里说清楚写了几块。
+    /// 按块写盘：只写放行的块，其余块保持文件原来的内容；模型看的结果和摘要里都说清楚写了几块。
     #[test]
     fn partial_write_keeps_unselected_hunks() {
         let dir = tmp("partial");
         let file = dir.join("a.txt");
         std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
         // 改两处（第 0 块把 b 改成 B，第 1 块把 e 改成 E）：只放行第 1 块
-        let edit =
-            Action::Edit { path: file.clone(), old: "b".into(), new: "B".into(), all: false };
-        assert!(edit.permission_hunks(&dir).is_none() || edit.permission_hunks(&dir).is_some());
         let full = Action::Write { path: file.clone(), content: "a\nB\nc\nd\nE\n".into() };
+        let keep = |k: &[u32]| KeepHunks::new(k.to_vec(), &full.permission_hunks(&dir).unwrap());
         let hunks = full.permission_hunks(&dir).expect("能按块同意");
         assert_eq!(hunks.files.len(), 1);
         assert_eq!(hunks.files[0].hunks.len(), 2, "{:?}", hunks.files[0].hunks);
         assert!(!hunks.files[0].whole_file);
-        let out = full.run(&|| false, &|_| {}, Some(&[1]));
+        let out = full.run(&|| false, &|_| {}, Some(&keep(&[1])));
         assert!(out.ok, "{out:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc\nd\nE\n");
         assert!(out.summary.contains("只写了 1 块"), "{}", out.summary);
-        // 全部放行 = 整份写
-        full.run(&|| false, &|_| {}, Some(&[0, 1]));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nB\nc\nd\nE\n");
-        // 一块不放：文件保持现在的内容（只有一块变了时另外两块自然留下）
+        // 模型看的结果里也要有：不然它以为整份都写下去了
+        assert!(out.content.contains("只写了 1 块，另有 1 块没写"), "{}", out.content);
+        // 全部放行 = 整份写，不再提「只写了」
         std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
-        full.run(&|| false, &|_| {}, Some(&[]));
+        let out = full.run(&|| false, &|_| {}, Some(&keep(&[0, 1, 1, 7])));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nB\nc\nd\nE\n");
+        assert!(!out.content.contains("只写了"), "重复、越界的编号不算数：{}", out.content);
+        // 一块不放：文件保持现在的内容
+        std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
+        full.run(&|| false, &|_| {}, Some(&keep(&[])));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc\nd\ne\n");
-        // 改文件同样按块：`replace_all` 的两处替换是两块
-        let edit =
-            Action::Edit { path: file.clone(), old: "e".into(), new: "E".into(), all: false };
-        assert!(edit.permission_hunks(&dir).is_some());
+        // 改文件同样按块，模型看的结果里写明没写的块
+        let edit = Action::Edit {
+            path: file.clone(),
+            old: "b\nc\nd\ne".into(),
+            new: "B\nc\nd\nE".into(),
+            all: false,
+        };
+        let asked = edit.permission_hunks(&dir).expect("改文件也能按块同意");
+        assert_eq!(asked.files[0].hunks.len(), 2);
+        let out = edit.run(&|| false, &|_| {}, Some(&KeepHunks::new(vec![0], &asked)));
+        assert!(out.ok, "{out:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nB\nc\nd\ne\n");
+        assert!(out.content.contains("只写了 1 块"), "{}", out.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 问过之后文件又被改了（并行的子任务写了同一个文件）：块的编号指的已经是别的改动，整次不写。
+    #[test]
+    fn partial_write_refuses_when_file_changed_after_asking() {
+        let dir = tmp("partial-stale");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
+        let full = Action::Write { path: file.clone(), content: "a\nB\nc\nd\nE\n".into() };
+        let keep = KeepHunks::new(vec![1], &full.permission_hunks(&dir).unwrap());
+        // 用户勾选的时候，另一边把文件改了
+        std::fs::write(&file, "x\na\nb\nc\nd\ne\n").unwrap();
+        let out = full.run(&|| false, &|_| {}, Some(&keep));
+        assert!(!out.ok, "{out:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\na\nb\nc\nd\ne\n", "一个字都不写");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 很大的改动（生成的大文件）不给按块勾：块要整份进权限事件和会话日志。
+    #[test]
+    fn huge_writes_are_not_offered_per_hunk() {
+        let dir = tmp("partial-huge");
+        let big: String =
+            (0..PERMISSION_HUNK_MAX_LINES + 50).map(|i| format!("line {i}\n")).collect();
+        let write = Action::Write { path: dir.join("gen.txt"), content: big };
+        assert!(write.permission_hunks(&dir).is_none());
+        let small = Action::Write { path: dir.join("small.txt"), content: "hi\n".into() };
+        assert!(small.permission_hunks(&dir).is_some_and(|h| h.files[0].whole_file));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -566,7 +566,6 @@ impl ChatApp {
                             p,
                             cx.entity(),
                             self.menu_focus.clone(),
-                            cx,
                         ))
                         .child(
                             Self::text_button(("plugin-update", i), "更新", false)
