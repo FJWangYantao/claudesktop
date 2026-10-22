@@ -254,6 +254,7 @@ impl Harness {
                 memory_suggest,
                 auto_mode: auto,
                 chat_model: None,
+                subagent_model: None,
                 chat_web: true,
                 chat_instructions: None,
             },
@@ -2524,6 +2525,7 @@ fn chat_kernel(
             memory_suggest: false,
             auto_mode: None,
             chat_model: None,
+            subagent_model: None,
             chat_web,
             chat_instructions,
         },
@@ -2657,6 +2659,64 @@ fn task_runs_a_subagent_and_returns_its_report() {
     let result = last["messages"].as_array().unwrap().last().unwrap();
     assert_eq!(result["role"], "tool");
     assert_eq!(result["content"], "秘密是 42");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 设置里填了子任务模型：子会话的请求用它，主会话照旧用自己的。
+#[test]
+fn subagents_use_the_configured_subagent_model() {
+    let dir = workdir("subagent-model");
+    let (base, bodies) = serve(vec![
+        tool_call(
+            "t1",
+            "task",
+            serde_json::json!({ "description": "看看", "prompt": "Look around", "subagent_type": "explore" }),
+        ),
+        happy_stream("什么都没有"),
+        happy_stream("看完了。"),
+    ]);
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |e| events.lock().unwrap().push(e))
+    };
+    let kernel = BuiltinKernel::spawn(
+        BuiltinConfig {
+            provider: provider(base),
+            cwd: dir.clone(),
+            rules_path: None,
+            user_instructions: None,
+            context_windows: HashMap::new(),
+            no_vision_models: Vec::new(),
+            mcp_config: None,
+            plugins: Vec::new(),
+            max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
+            session_titles: false,
+            memory_path: None,
+            memory_suggest: false,
+            auto_mode: None,
+            chat_model: None,
+            subagent_model: Some("small-model".into()),
+            chat_web: true,
+            chat_instructions: None,
+        },
+        sink,
+    )
+    .unwrap();
+    let h = Harness { kernel, events };
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(body(&bodies, 0)["model"], "mock-model");
+    let child = body(&bodies, 1);
+    assert_eq!(child["model"], "small-model");
+    // explore 只读：没有改文件、跑命令的工具
+    let tools = tool_names(&child);
+    assert!(
+        tools.contains(&"grep".to_string()) && !tools.contains(&"edit_file".to_string()),
+        "{tools:?}"
+    );
+    assert_eq!(body(&bodies, 2)["model"], "mock-model");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3144,6 +3204,7 @@ fn session_title_comes_from_a_second_request() {
             memory_suggest: false,
             auto_mode: None,
             chat_model: None,
+            subagent_model: None,
             chat_web: true,
             chat_instructions: None,
         },

@@ -156,6 +156,8 @@ pub struct BuiltinConfig {
     pub auto_mode: Option<AutoModeConfig>,
     /// 聊天会话用的模型；None = 跟随全局默认模型
     pub chat_model: Option<String>,
+    /// 子任务（`task`）用的模型（同一端点）；None = 跟主会话。角色自己写了模型的以角色为准
+    pub subagent_model: Option<String>,
     /// 新建的聊天会话默认开不开联网（输入框里随时能改）
     pub chat_web: bool,
     /// 用户的「聊天说明」文件（每轮重读）：每次聊天都带上的话
@@ -180,6 +182,7 @@ impl BuiltinConfig {
             memory_suggest: false,
             auto_mode: None,
             chat_model: None,
+            subagent_model: None,
             chat_web: true,
             chat_instructions: None,
         }
@@ -390,6 +393,8 @@ struct Inner {
     auto_mode: Option<AutoMode>,
     /// 聊天会话用的模型（None = 跟随全局默认）
     chat_model: Option<String>,
+    /// 子任务用的模型（见 [`BuiltinConfig::subagent_model`]）
+    subagent_model: Option<String>,
     /// 新建聊天会话默认的联网开关
     chat_web: bool,
     /// 用户的「聊天说明」文件（每轮重读）
@@ -1631,7 +1636,12 @@ impl Inner {
                     // （聊天里没有 task 工具，目前开不出聊天的子会话，免得以后漏掉）
                     kind: parent.kind,
                     web: parent.web,
-                    model: agent.model.clone().unwrap_or_else(|| parent.model.clone()),
+                    // 角色写了模型 → 设置里的子任务模型 → 跟主会话
+                    model: agent
+                        .model
+                        .clone()
+                        .or_else(|| self.subagent_model.clone())
+                        .unwrap_or_else(|| parent.model.clone()),
                     // 子任务跟主会话的档位走（用户中途换档也跟上）
                     thinking: parent.thinking,
                     history: vec![ChatMessage::new("user", prompt)],
@@ -2167,6 +2177,7 @@ impl BuiltinKernel {
                 provider: Mutex::default(),
             }),
             chat_model: config.chat_model,
+            subagent_model: config.subagent_model,
             chat_web: config.chat_web,
             chat_instructions: config.chat_instructions,
         });

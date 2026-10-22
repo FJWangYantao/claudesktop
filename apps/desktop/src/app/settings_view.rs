@@ -133,6 +133,7 @@ pub struct SettingsForm {
     next_suggestion: bool,
     /// 输入补全用的模型；空 = 跟会话的
     suggest_model: Entity<InputState>,
+    subagent_model: Entity<InputState>,
     /// 一轮结束后提炼候选记忆开着没有（保存才生效，会重启自研内核）
     memory_suggest: bool,
     /// 聊天用的模型；空 = 跟档案的默认模型
@@ -176,6 +177,9 @@ impl SettingsForm {
         let suggest_model = cx.new(|cx| {
             InputState::new(window, cx).placeholder("留空用会话的模型，如 deepseek-chat")
         });
+        let subagent_model = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("留空用会话的模型，如 deepseek-chat")
+        });
         let chat_model = cx.new(|cx| {
             InputState::new(window, cx).placeholder("留空用上面默认模型，如 deepseek-chat")
         });
@@ -208,6 +212,7 @@ impl SettingsForm {
             suggest_enabled: false,
             next_suggestion: false,
             suggest_model,
+            subagent_model,
             memory_suggest: false,
             chat_model,
             chat_web: true,
@@ -304,6 +309,9 @@ impl ChatApp {
         self.settings_form
             .suggest_model
             .update(cx, |state, cx| state.set_value(s.suggest_model.clone(), window, cx));
+        self.settings_form
+            .subagent_model
+            .update(cx, |state, cx| state.set_value(s.subagent_model.clone(), window, cx));
         // 聊天空间的一组（模型 / 默认联网 / 聊天说明文件）
         self.settings_form.chat_web = s.chat.web;
         self.settings_form
@@ -710,6 +718,7 @@ impl ChatApp {
         s.next_suggestion = f.next_suggestion;
         s.memory_suggest = f.memory_suggest;
         s.suggest_model = value(&f.suggest_model, cx);
+        s.subagent_model = value(&f.subagent_model, cx);
         // 聊天空间：模型（空 = 跟档案）、默认联网、聊天说明文件
         s.chat.model = value(&f.chat_model, cx);
         s.chat.web = f.chat_web;
@@ -838,6 +847,8 @@ impl ChatApp {
             || new.usage_gateway != self.settings.usage_gateway
             // 一轮结束的候选记忆开关变了：内核要重装才知道
             || new.memory_suggest != self.settings.memory_suggest
+            // 子任务模型：内核开子会话时读
+            || new.subagent_model != self.settings.subagent_model
             // 聊天空间的一组（模型 / 默认联网 / 说明文件）也要重装才知道
             || new.chat != self.settings.chat
             // 自动模式的开关 / 分类器模型变了：模式列表和分类器都要重装
@@ -1669,6 +1680,12 @@ impl ChatApp {
                             "一轮最多几步",
                             "一轮里最多请求模型几次，默认 200；调大能跑更长的任务，也更费 token",
                             div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
+                        ),
+                        setting_row(
+                            "子任务模型",
+                            "派出去的子 agent（如只读调研）用哪个模型，同一端点；\
+                             填个快一点、便宜一点的能省钱提速，留空用会话的",
+                            div().w(rems(20.)).child(Input::new(&f.subagent_model).cleanable(true)),
                         ),
                         self.gateway_row(cx),
                         self.bodies_row(cx),
