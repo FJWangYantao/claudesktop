@@ -546,6 +546,7 @@ mod tests {
             archived: false,
             task: false,
             worktree: None,
+            kind: claudesktop_core::SessionKind::Code,
         }
     }
 

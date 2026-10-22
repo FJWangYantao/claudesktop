@@ -6,7 +6,8 @@
 
 use claudesktop_builtin::gateway;
 use claudesktop_core::{
-    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent, UserPrompt,
+    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent, SessionSpec,
+    UserPrompt,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -106,7 +107,7 @@ fn live_agent_through_gateway_and_resume() {
 
     // 第一轮：新会话
     let (kernel, events) = spawn(&cwd, &gw);
-    kernel.new_session(1, None).unwrap();
+    kernel.new_session(1, SessionSpec::default()).unwrap();
     let (sid, _) = started(&events, 1);
     let reply = turn(&kernel, &events, &sid, 1, "Remember the word PAPAYA. Reply with just: ok");
     println!("第 1 轮：{reply}");
@@ -136,7 +137,7 @@ fn live_agent_through_gateway_and_resume() {
 
     // 第二轮：新起一个 agent 进程续接，看上下文还在不在
     let (kernel, events) = spawn(&cwd, &gw);
-    kernel.resume_session(2, &sid, None, &[]).unwrap();
+    kernel.resume_session(2, &sid, SessionSpec::default(), &[]).unwrap();
     let (resumed_sid, resumed) = started(&events, 2);
     println!("续接：resumed={resumed} 同一会话={}", resumed_sid == sid);
     let reply = turn(

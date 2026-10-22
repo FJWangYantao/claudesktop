@@ -139,6 +139,70 @@ impl ChatApp {
         }
     }
 
+    /// 聊天会话的「联网」开关（输入框工具栏的 chip）：会话级，下一轮开头生效。
+    /// 已建立的内核会话立刻交给内核；还没建立的等 `Started` 再补（`flush_pending_web`）。
+    pub(crate) fn toggle_web(&mut self, on: bool, cx: &mut Context<Self>) {
+        let kernel = self.session_kernel(self.active);
+        let s = &mut self.sessions[self.active];
+        if !s.is_chat() {
+            return;
+        }
+        s.web = on;
+        match (kernel, s.acp_id.clone()) {
+            (Some(kernel), Some(id)) if kernel.supports_chat() => {
+                if let Err(err) = kernel.set_web(&id, on) {
+                    s.note(format!("切换联网失败：{err}"));
+                }
+            }
+            _ => s.pending_web = Some(on),
+        }
+        cx.notify();
+    }
+
+    /// `Started` 到达：把会话建立前选的联网开关交给内核。
+    pub(super) fn flush_pending_web(&mut self, idx: usize, kernel: Option<&dyn Kernel>) {
+        let (Some(kernel), Some(wanted)) = (kernel, self.sessions[idx].pending_web.take()) else {
+            return;
+        };
+        if !kernel.supports_chat() {
+            return;
+        }
+        let Some(id) = self.sessions[idx].acp_id.clone() else { return };
+        if let Err(err) = kernel.set_web(&id, wanted) {
+            self.sessions[idx].note(format!("切换联网失败：{err}"));
+        }
+    }
+
+    /// 聊天会话的「联网」开关（`Globe`）：会话级，下一轮开头生效。
+    /// 关着时联网工具根本不在工具定义里（见 `tools::chat_specs`）。
+    fn render_web_chip(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let on = self.session().web;
+        div()
+            .id("web-chip")
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .h(px(22.))
+            .rounded_md()
+            .cursor_pointer()
+            .when(on, |d| d.bg(rgb(SELECTED)))
+            .hover(|d| d.bg(rgb(if on { SELECTED } else { HOVER })))
+            .text_size(TEXT_SMALL)
+            .text_color(rgb(if on { INK } else { INK_SOFT }))
+            .tooltip(move |window, cx| {
+                Tooltip::new(if on {
+                    "联网开着：能搜网页、读链接。点了关掉"
+                } else {
+                    "联网关着：这一轮不发给它联网工具。点了打开"
+                })
+                .build(window, cx)
+            })
+            .child(Icon::new(IconAll::Globe).size_3p5())
+            .child("联网")
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_web(!on, cx)))
+    }
+
     /// 输入框上方的一张待发送图片缩略图（右上角 × 撤掉）。
     fn pending_image_thumb(&self, i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
@@ -258,35 +322,40 @@ impl ChatApp {
 
         // 卡片底边一条工具栏：左侧项目目录 / 权限模式 / 添加文件，右侧上下文用量 / 模型 / 发送。
         // 和输入框是一整块（对照 Claude.ai 的输入卡片），chip 的 open 状态由 Popover 自管。
-        // 中间的空白点了也把焦点给输入框（chip 和按钮自己处理点击，不挂这个）
+        // 中间的空白点了也把焦点给输入框（chip 和按钮自己处理点击，不挂这个）。
+        // 聊天空间没有工作目录和权限模式（没有工具要批），那两个 chip 不画，换成「联网」开关
+        let chat = self.session().is_chat();
         let toolbar = div()
             .h_flex()
             .items_center()
             .gap_0p5()
-            .child(menu_popover(
-                "workspace-menu",
-                Anchor::BottomLeft,
-                rems(20.),
-                &app,
-                &self.menu_focus,
-                project_chip,
-                workspace_menu_items,
-            ))
-            .child(menu_popover(
-                "mode-menu",
-                Anchor::BottomLeft,
-                rems(20.),
-                &app,
-                &self.menu_focus,
-                MenuChip::new(IconAll::Shield, mode_name),
-                mode_menu_items,
-            ))
+            .when(!chat, |d| {
+                d.child(menu_popover(
+                    "workspace-menu",
+                    Anchor::BottomLeft,
+                    rems(20.),
+                    &app,
+                    &self.menu_focus,
+                    project_chip,
+                    workspace_menu_items,
+                ))
+                .child(menu_popover(
+                    "mode-menu",
+                    Anchor::BottomLeft,
+                    rems(20.),
+                    &app,
+                    &self.menu_focus,
+                    MenuChip::new(IconAll::Shield, mode_name),
+                    mode_menu_items,
+                ))
+            })
             .child(
                 Self::quiet_button("attach-files", IconAll::Paperclip, Surface::Paper, cx)
                     .small()
                     .tooltip("添加文件")
                     .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))),
             )
+            .when(chat, |d| d.child(self.render_web_chip(cx)))
             .child(div().flex_1().self_stretch().on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),

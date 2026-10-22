@@ -4,7 +4,10 @@
 //! `CLAUDESKTOP_BASE_URL=… CLAUDESKTOP_MODEL=… CLAUDESKTOP_API_KEY=… cargo test -p claudesktop-builtin -- --ignored`
 
 use claudesktop_builtin::{BuiltinConfig, BuiltinKernel, Protocol, ProviderConfig};
-use claudesktop_core::{EventSink, Kernel, KernelEvent, McpState, Record, RoutedEvent, UserPrompt};
+use claudesktop_core::{
+    EventSink, Kernel, KernelEvent, McpState, Record, RoutedEvent, SessionKind, SessionSpec,
+    UserPrompt,
+};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -249,6 +252,9 @@ impl Harness {
                 // 提炼候选记忆也是额外一个请求；专门测它的用例自己开
                 memory_suggest,
                 auto_mode: auto,
+                chat_model: None,
+                chat_web: true,
+                chat_instructions: None,
             },
             sink,
         )
@@ -296,7 +302,7 @@ impl Harness {
     }
 
     fn start(&self) -> String {
-        self.kernel.new_session(1, None).unwrap();
+        self.kernel.new_session(1, SessionSpec::default()).unwrap();
         self.events
             .lock()
             .unwrap()
@@ -924,7 +930,7 @@ fn set_model_switches_the_session_and_new_sessions() {
     assert_eq!(body(&bodies, 0)["model"], "mock-model");
     assert_eq!(body(&bodies, 1)["model"], "m2");
     // 新会话沿用最近选的模型
-    h.kernel.new_session(2, None).unwrap();
+    h.kernel.new_session(2, SessionSpec::default()).unwrap();
     h.wait_n("second session", 2, |e| matches!(e, KernelEvent::Started { .. }));
     let models: Vec<_> = h
         .events
@@ -1088,7 +1094,7 @@ fn classifier_says(json: &str) -> Reply {
 fn auto_mode_is_hidden_until_configured() {
     let (base, _bodies) = serve(vec![]);
     let h = Harness::new(base);
-    h.kernel.new_session(1, None).unwrap();
+    h.kernel.new_session(1, SessionSpec::default()).unwrap();
     h.wait("started", |e| matches!(e, KernelEvent::Started { .. }));
     let modes: Vec<String> = h
         .events
@@ -1767,7 +1773,7 @@ fn resume_rebuilds_context_from_log() {
         },
         Record::Event { event: KernelEvent::TurnEnded { stop_reason: "end_turn".into() } },
     ];
-    h.kernel.resume_session(1, "builtin-old-1", None, &log).unwrap();
+    h.kernel.resume_session(1, "builtin-old-1", SessionSpec::default(), &log).unwrap();
     let sid = h
         .events
         .lock()
@@ -1791,7 +1797,7 @@ fn resume_rebuilds_context_from_log() {
     assert_eq!(msgs[1..], ["user:秘密是 42，记住", "assistant:好的，记住了。", "user:秘密是多少"]);
 
     // 空日志 = 普通新会话
-    h.kernel.resume_session(2, "x", None, &[]).unwrap();
+    h.kernel.resume_session(2, "x", SessionSpec::default(), &[]).unwrap();
     assert_eq!(h.count(|e| matches!(e, KernelEvent::Started { token: 2, resumed: false, .. })), 1);
 }
 
@@ -2284,6 +2290,165 @@ fn tool_names(body: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// 聊天会话：工具只有联网（开着时）和记忆，系统提示词里没有工作目录。
+#[test]
+fn chat_session_gets_only_web_and_memory_tools() {
+    let (base, bodies) = serve(vec![happy_stream("好的"), happy_stream("再看一次")]);
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+    let kernel = chat_kernel(base, Arc::clone(&events), None, true);
+    kernel.new_session(1, SessionSpec { cwd: None, kind: SessionKind::Chat }).unwrap();
+    let sid = session_id(&events);
+    // 聊天没有权限模式：模式表为空
+    events.lock().unwrap().iter().for_each(|r| {
+        if let KernelEvent::Started { modes, current_mode, .. } = &r.event {
+            assert!(modes.is_empty(), "{modes:?}");
+            assert!(current_mode.is_none());
+        }
+    });
+
+    kernel.send_prompt(&sid, UserPrompt::text("你好")).unwrap();
+    wait_turn_end(&events);
+    let first = first_body(&bodies);
+    assert_eq!(
+        tool_names(&first),
+        ["web_fetch", "web_search", "memory_search", "memory_write", "memory_forget"]
+    );
+    // 聊天里记记忆一律全局，所以没有 scope 参数
+    let write = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "memory_write")
+        .unwrap();
+    assert!(write["function"]["parameters"]["properties"].get("scope").is_none(), "{write}");
+    let system = first["messages"][0]["content"].as_str().unwrap();
+    assert!(!system.contains("Working directory"), "{system}");
+    assert!(!system.contains("coding agent"), "{system}");
+    assert!(system.contains("helpful assistant"), "{system}");
+
+    // 关掉联网：下一轮工具只剩记忆
+    kernel.set_web(&sid, false).unwrap();
+    kernel.send_prompt(&sid, UserPrompt::text("再想想")).unwrap();
+    wait_second_body(&bodies, 2);
+    let second = tool_names(&serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap());
+    assert_eq!(second, ["memory_search", "memory_write", "memory_forget"]);
+}
+
+/// 聊天会话：模型硬调工作目录那套工具时回错误结果，不发权限请求、不执行。
+#[test]
+fn chat_session_rejects_code_tools() {
+    let dir = workdir("chat-tools");
+    let (base, bodies) = serve(vec![
+        tool_call("c1", "shell", serde_json::json!({ "command": "echo hi" })),
+        happy_stream("这个工具用不了"),
+    ]);
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+    let kernel = chat_kernel(base, Arc::clone(&events), None, true);
+    kernel.new_session(1, SessionSpec { cwd: None, kind: SessionKind::Chat }).unwrap();
+    let sid = session_id(&events);
+    kernel.send_prompt(&sid, UserPrompt::text("跑个命令")).unwrap();
+    wait_turn_end(&events);
+    let events = events.lock().unwrap();
+    assert!(!events.iter().any(|r| matches!(r.event, KernelEvent::PermissionRequest { .. })));
+    drop(events);
+    // 第二步请求里带着错误结果，命令没执行（聊天里这种工具连行都不占）
+    wait_second_body(&bodies, 2);
+    let second: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap();
+    let messages = second["messages"].as_array().unwrap();
+    let result = messages.iter().find(|m| m["role"] == "tool").expect("tool result").to_string();
+    assert!(result.contains("not available in a chat conversation"), "{result}");
+    assert!(!dir.join("hi").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 聊天会话不读项目说明，用户的「聊天说明」进提示词。
+#[test]
+fn chat_session_uses_chat_instructions() {
+    let dir = workdir("chat-instructions");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "项目里的约定不该进聊天").unwrap();
+    let chat_file = dir.join("chat-instructions.md");
+    std::fs::write(&chat_file, "回答尽量简短").unwrap();
+    let (base, bodies) = serve(vec![happy_stream("好")]);
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+    let kernel = chat_kernel(base, Arc::clone(&events), Some(chat_file), true);
+    kernel.new_session(1, SessionSpec { cwd: None, kind: SessionKind::Chat }).unwrap();
+    let sid = session_id(&events);
+    kernel.send_prompt(&sid, UserPrompt::text("你好")).unwrap();
+    wait_turn_end(&events);
+    let body = first_body(&bodies);
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("回答尽量简短"), "{system}");
+    assert!(!system.contains("项目里的约定不该进聊天"), "{system}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 一个能开聊天会话的内核（`chat_kernel` 的公共部分：Harness 的构造器不带聊天那几项）。
+fn chat_kernel(
+    base: String,
+    events: Arc<Mutex<Vec<RoutedEvent>>>,
+    chat_instructions: Option<PathBuf>,
+    chat_web: bool,
+) -> BuiltinKernel {
+    let sink: EventSink = Arc::new(move |e| events.lock().unwrap().push(e));
+    BuiltinKernel::spawn(
+        BuiltinConfig {
+            provider: provider(base),
+            cwd: empty_dir(),
+            rules_path: None,
+            user_instructions: None,
+            context_windows: HashMap::new(),
+            mcp_config: None,
+            plugins: Vec::new(),
+            max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
+            session_titles: false,
+            memory_path: None,
+            memory_suggest: false,
+            auto_mode: None,
+            chat_model: None,
+            chat_web,
+            chat_instructions,
+        },
+        sink,
+    )
+    .unwrap()
+}
+
+fn session_id(events: &Arc<Mutex<Vec<RoutedEvent>>>) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(id) = events.lock().unwrap().iter().find_map(|r| match &r.event {
+            KernelEvent::Started { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        }) {
+            return id;
+        }
+        assert!(Instant::now() < deadline, "timeout waiting for Started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_turn_end(events: &Arc<Mutex<Vec<RoutedEvent>>>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !events.lock().unwrap().iter().any(|r| matches!(r.event, KernelEvent::TurnEnded { .. })) {
+        assert!(Instant::now() < deadline, "timeout waiting for TurnEnded: {events:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_second_body(bodies: &Arc<Mutex<Vec<String>>>, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while bodies.lock().unwrap().len() < n {
+        assert!(Instant::now() < deadline, "timeout waiting for request {n}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn first_body(bodies: &Arc<Mutex<Vec<String>>>) -> serde_json::Value {
+    wait_second_body(bodies, 1);
+    serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap()
+}
+
 #[test]
 fn task_runs_a_subagent_and_returns_its_report() {
     let dir = workdir("subagent");
@@ -2562,7 +2727,7 @@ fn gateway_stream_timing() {
         builtin.user_instructions = None;
         builtin.mcp_config = None;
         let kernel = BuiltinKernel::spawn(builtin, sink).unwrap();
-        kernel.new_session(1, None).unwrap();
+        kernel.new_session(1, SessionSpec::default()).unwrap();
         let sid = format!("builtin-{}-1", std::process::id());
         let sent = Instant::now();
         kernel.send_prompt(&sid, UserPrompt::text("数数")).unwrap();
@@ -2846,11 +3011,14 @@ fn session_title_comes_from_a_second_request() {
             memory_path: None,
             memory_suggest: false,
             auto_mode: None,
+            chat_model: None,
+            chat_web: true,
+            chat_instructions: None,
         },
         sink,
     )
     .unwrap();
-    kernel.new_session(1, None).unwrap();
+    kernel.new_session(1, SessionSpec::default()).unwrap();
     let sid = events
         .lock()
         .unwrap()
@@ -3345,7 +3513,9 @@ fn auto_mode_classifier_sees_resumed_messages_but_not_rewound_ones() {
         ev(KernelEvent::AgentMessageChunk { text: "好".into() }),
         ended(),
     ];
-    h.kernel.resume_session(1, "builtin-old-1", Some(dir.clone()), &log).unwrap();
+    h.kernel
+        .resume_session(1, "builtin-old-1", SessionSpec::code(Some(dir.clone())), &log)
+        .unwrap();
     let sid = h
         .events
         .lock()

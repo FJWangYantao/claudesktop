@@ -21,9 +21,10 @@ use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
 use super::{ChatApp, project_label};
-use crate::settings::KernelChoice;
+use crate::settings::{KernelChoice, Space};
 use crate::theme::rgb;
 use crate::theme::*;
+use claudesktop_core::SessionKind;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::motion::{Transition, transition};
 use gpui_kit::component::button::Button;
@@ -271,6 +272,11 @@ impl ChatApp {
             &self.cwd,
         )
             .hash(&mut h);
+        // 空间切换（分段高亮、小点）和会话类型
+        self.settings.space.hash(&mut h);
+        for s in &self.sessions {
+            (s.kind, s.is_chat() && s.busy, s.is_chat() && s.unread).hash(&mut h);
+        }
         for (_, k) in &self.kernels {
             (k.started, k.ready, k.error, &k.status).hash(&mut h);
         }
@@ -491,26 +497,32 @@ impl ChatApp {
             let header = if g == 0 && (filter != SidebarFilter::All || folded) {
                 header.child(self.sidebar_filter_menu(cx))
             } else if g == 0 {
+                // 聊天空间只有按日期这一种分法（没有工作目录），组名旁不给分组 / 排序切换
+                let chat = self.space().kind() == SessionKind::Chat;
                 let sort_on = self.sessions_by_activity;
-                let by_date = self.settings.sidebar_by_date;
+                let by_date = self.settings.sidebar_by_date || chat;
                 header
                     .child(self.sidebar_filter_menu(cx))
-                    .child(
-                        Self::sidebar_icon_button(
-                            "group-by-date",
-                            IconAll::CalendarDays,
-                            if by_date { "按项目分组" } else { "按日期分组" },
-                            by_date,
-                            cx,
+                    .when(!chat, |d| {
+                        d.child(
+                            Self::sidebar_icon_button(
+                                "group-by-date",
+                                IconAll::CalendarDays,
+                                if by_date { "按项目分组" } else { "按日期分组" },
+                                by_date,
+                                cx,
+                            )
+                            .when(!by_date, |d| {
+                                d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.save_ui_pref(move |s| s.sidebar_by_date = !by_date, cx);
+                                    cx.notify();
+                                },
+                            )),
                         )
-                        .when(!by_date, |d| {
-                            d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.save_ui_pref(move |s| s.sidebar_by_date = !by_date, cx);
-                            cx.notify();
-                        })),
-                    )
+                    })
                     // 按日期分组时组内总是按最近活动排，排序切换没有意义
                     .when(!by_date, |d| {
                         d.child(
@@ -534,21 +546,24 @@ impl ChatApp {
                             })),
                         )
                     })
-                    .child(
-                        Self::sidebar_icon_button(
-                            "open-workspace",
-                            IconAll::FolderOpen,
-                            "在资源管理器中打开",
-                            false,
-                            cx,
+                    // 聊天没有工作目录，没有「在资源管理器中打开」
+                    .when(!chat, |d| {
+                        d.child(
+                            Self::sidebar_icon_button(
+                                "open-workspace",
+                                IconAll::FolderOpen,
+                                "在资源管理器中打开",
+                                false,
+                                cx,
+                            )
+                            .opacity(0.)
+                            .group_hover("group-header", |d| d.opacity(1.))
+                            .on_click({
+                                let cwd = self.cwd.clone();
+                                move |_, _, cx: &mut App| cx.reveal_path(&cwd)
+                            }),
                         )
-                        .opacity(0.)
-                        .group_hover("group-header", |d| d.opacity(1.))
-                        .on_click({
-                            let cwd = self.cwd.clone();
-                            move |_, _, cx: &mut App| cx.reveal_path(&cwd)
-                        }),
-                    )
+                    })
             } else {
                 header
             };
@@ -655,6 +670,9 @@ impl ChatApp {
                     .child(self.sidebar_toggle("sidebar-toggle", cx))
                     .child(drag_area().h_flex().items_center().child(brand)),
             )
+            // 空间切换：聊天 | 代码（品牌行下面一格，见「设计说明-聊天与Code分离.md」5.1）。
+            // 另一个空间有会话在跑 / 等授权时，那一格带个小点，别切走了就忘了它
+            .child(self.render_space_switch(cx))
             .child(
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
                     .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
@@ -733,6 +751,66 @@ impl ChatApp {
 
         // 侧栏是浮在窗口底色上的圆角面板，四周留一圈窗口底色
         div().w(SIDEBAR_W).flex_shrink_0().h_full().pl_2().py_2().child(panel)
+    }
+
+    /// 空间切换（品牌行下面那格）：聊天 | 代码。
+    /// 另一个空间里有会话在跑 / 等授权时，那一格带个小点（等授权红、其余赤陶），
+    /// 别切走了就忘了它在跑。
+    fn render_space_switch(&self, cx: &mut Context<Self>) -> Div {
+        let current = self.space();
+        // 每个空间的「有动静」：跑着的算一个（等授权的优先标红），待查看的算一个
+        let dot = |space: Space| {
+            let (busy, waiting, unread) = self
+                .sessions
+                .iter()
+                .filter(|s| Space::of(s.kind) == space)
+                .fold((false, false, false), |(b, w, u), s| {
+                    (b || s.busy, w || (s.busy && s.waiting_permission()), u || s.unread)
+                });
+            if waiting {
+                Some(RED)
+            } else if busy || unread {
+                Some(CORAL)
+            } else {
+                None
+            }
+        };
+        let mut segs = div().h_flex().flex_1().min_w_0().gap_0p5().p_0p5();
+        for (n, space) in [Space::Chat, Space::Code].into_iter().enumerate() {
+            let active = space == current;
+            let marker = dot(space);
+            segs = segs.child(
+                div()
+                    .id(("space", n))
+                    .flex_1()
+                    .h_flex()
+                    .justify_center()
+                    .items_center()
+                    .gap_1()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(TEXT_META)
+                    .bg(if active { rgb(CARD) } else { rgba(CLEAR) })
+                    .text_color(rgb(if active { INK } else { INK_SOFT }))
+                    .when(active, |d| {
+                        d.font_weight(FontWeight::MEDIUM)
+                            .shadow_xs()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                    })
+                    .when(!active, |d| d.hover(|d| d.bg(rgb(SELECTED))))
+                    .child(space.label())
+                    .when_some(marker, |d, color| {
+                        d.child(div().size(px(5.)).flex_shrink_0().rounded_full().bg(rgb(color)))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.switch_space(space, cx))),
+            );
+        }
+        div()
+            .px_2()
+            .pb_1()
+            .child(div().h_flex().items_center().rounded_md().bg(rgb(PAPER)).p_0p5().child(segs))
     }
 
     /// 侧栏分组标题上的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
@@ -822,22 +900,38 @@ impl ChatApp {
             .collect()
     }
 
-    /// 侧栏分组：(组名, 会话下标)。上半区是项目：当前工作目录一组在最前，其余工作目录按最近活动排；
-    /// 下半区是任务（[`TASKS_KEY`]）、最后是已归档。
+    /// 侧栏分组：(组名, 会话下标)，只列**当前空间**的会话。
+    /// 代码空间：上半区是项目，下半区是任务（[`TASKS_KEY`]），最后是已归档；
+    /// 聊天空间没有工作目录，一律按日期分组（见 [`Session::kind`]）。
     /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
     pub(super) fn session_groups(&self) -> Vec<SessionGroup> {
+        let space = self.space().kind();
         let archived = |i: usize| self.sessions[i].meta.as_ref().is_some_and(|m| m.archived);
         let is_task = |i: usize| self.sessions[i].task;
         let groups = self.active_session_groups(|i| !archived(i) && !is_task(i));
-        let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
-        assemble_groups(groups, self.sessions.len(), activity, is_task, archived)
+        assemble_groups(
+            groups,
+            self.sessions.len(),
+            |i| self.session_activity(i),
+            is_task,
+            archived,
+            |i| self.sessions[i].kind == space,
+        )
     }
 
-    /// 没归档的会话（`listed`）按工作目录或日期分组。
+    /// 某个会话最近活动的时刻（没落盘的算最新）。
+    fn session_activity(&self, i: usize) -> u64 {
+        self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms)
+    }
+
+    /// 没归档的会话（`listed`）按工作目录或日期分组（只列当前空间的）。
     fn active_session_groups(&self, listed: impl Fn(usize) -> bool) -> Vec<SessionGroup> {
         // 无元信息的会话（刚开、还没落盘）视为最新
-        let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
-        if self.settings.sidebar_by_date {
+        let activity = |i: usize| self.session_activity(i);
+        let space = self.space().kind();
+        let listed = |i: usize| listed(i) && self.sessions[i].kind == space;
+        // 聊天空间只有按日期这一种分法（没有工作目录）
+        if self.settings.sidebar_by_date || space == SessionKind::Chat {
             let now =
                 SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
             let offset = crate::usage::local_offset_secs();
@@ -1138,9 +1232,15 @@ impl ChatApp {
             self.toast(Notification::error(format!("保存会话失败：{err}")), cx);
         }
         if archived && idx == self.active {
-            match self.sessions.iter().position(|s| !s.has_user_message()) {
+            // 换到同空间里还没发过消息的新会话，没有就在这个空间新开一个
+            let space = self.space();
+            let fresh = self
+                .sessions
+                .iter()
+                .position(|s| !s.has_user_message() && Space::of(s.kind) == space);
+            match fresh {
                 Some(fresh) => self.activate_session(fresh, cx),
-                None => self.add_session(cx),
+                None => self.open_in_space(space, cx),
             }
         }
         cx.notify();
@@ -1205,9 +1305,8 @@ impl ChatApp {
             }
         }
         if self.sessions.is_empty() {
-            let cwd = self.cwd.clone();
-            self.open_session(self.settings.kernel(), cwd);
-            self.active = 0;
+            let space = self.space();
+            self.open_in_space(space, cx);
         } else if idx < self.active || self.active >= self.sessions.len() {
             self.active = self.active.saturating_sub(1);
         }
@@ -1216,23 +1315,27 @@ impl ChatApp {
 }
 
 /// 侧栏分组的收尾：在项目分组后面补「任务」和「已归档」两组。
-/// `projects` 是 `active_session_groups` 排好的项目分组，其余参数从会话列表里读。
+/// `projects` 是 `active_session_groups` 排好的项目分组，其余参数从会话列表里读；
+/// `in_space` 决定一个会话在不在当前空间（聊天空间里没有任务组）。
 fn assemble_groups(
     mut projects: Vec<SessionGroup>,
     total: usize,
     activity: impl Fn(usize) -> u64,
     is_task: impl Fn(usize) -> bool,
     archived: impl Fn(usize) -> bool,
+    in_space: impl Fn(usize) -> bool,
 ) -> Vec<SessionGroup> {
-    // 任务区：建立时没为它选过文件夹的对话，按最近活动排（最近在上）
-    let mut tasks: Vec<usize> = (0..total).filter(|&i| !archived(i) && is_task(i)).collect();
+    // 任务区：建立时没为它选过文件夹的对话，按最近活动排（最近在上）。
+    // 聊天会话恒不是任务（没有工作目录），所以只在代码空间里有这一组
+    let mut tasks: Vec<usize> =
+        (0..total).filter(|&i| in_space(i) && !archived(i) && is_task(i)).collect();
     if !tasks.is_empty() {
         tasks.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
         projects
             .push(SessionGroup { key: TASKS_KEY.into(), name: "任务".into(), members: tasks });
     }
-    // 已归档：最近归档 / 用过的在前
-    let mut old: Vec<usize> = (0..total).filter(|&i| archived(i)).collect();
+    // 已归档：最近归档 / 用过的在前（也是当前空间的）
+    let mut old: Vec<usize> = (0..total).filter(|&i| in_space(i) && archived(i)).collect();
     if !old.is_empty() {
         old.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
         projects.push(SessionGroup {
@@ -1313,6 +1416,7 @@ mod tests {
             archived: false,
             task: false,
             worktree: s.worktree.clone(),
+            kind: claudesktop_core::SessionKind::Code,
         };
         let restored =
             crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());
@@ -1339,6 +1443,7 @@ mod tests {
             |i| i as u64,
             |i| i == 2 || i == 3,
             |i| i == 4,
+            |_| true,
         );
         let order: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
         assert_eq!(order, ["dir:a", TASKS_KEY, ARCHIVED_KEY]);
@@ -1346,7 +1451,7 @@ mod tests {
         assert_eq!(groups[1].members, [3, 2]);
         assert_eq!(groups[1].name.as_ref(), "任务");
         // 只有两边都空时才不出现这两组
-        let only_tasks = assemble_groups(Vec::new(), 2, |_| 0, |_| true, |_| false);
+        let only_tasks = assemble_groups(Vec::new(), 2, |_| 0, |_| true, |_| false, |_| true);
         assert_eq!(only_tasks.len(), 1);
         assert_eq!(only_tasks[0].members, [0, 1]);
     }

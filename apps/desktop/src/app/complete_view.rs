@@ -81,6 +81,12 @@ impl ChatApp {
             self.refresh_composer(cx);
             return;
         };
+        // 聊天会话没有工作目录：`@` 文件补全不弹（附件是内联的，不走 `@路径`，见「设计说明-聊天与Code分离.md」5.5）
+        if trigger.kind == TriggerKind::Mention && self.session().is_chat() {
+            self.completion.open = None;
+            self.refresh_composer(cx);
+            return;
+        }
         // 已经写完插件命令名、在写参数了：不再弹列表（否则回车会再选一次命令，参数被冲掉）
         if trigger.kind == TriggerKind::Slash
             && trigger.query.contains(char::is_whitespace)

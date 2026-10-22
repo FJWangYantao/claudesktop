@@ -48,7 +48,7 @@ use crate::usage::{self, TurnStat};
 use claudesktop_builtin::BuiltinKernel;
 use claudesktop_core::{
     AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PromptImage, Record, RoutedEvent,
-    SessionStore, UserPrompt,
+    SessionKind, SessionSpec, SessionStore, UserPrompt,
 };
 use content::ContentView;
 use futures::StreamExt;
@@ -210,6 +210,9 @@ pub struct ChatApp {
     suggestion: suggest::SuggestionState,
     /// 一轮结束后猜的「下一句」（淡色画在空输入框里，按 Tab 填入；见 suggest.rs）
     next_suggestion: suggest::NextSuggestion,
+    /// 每个空间上次看的是哪个会话（[0] 代码 / [1] 聊天；按 `Session::token` 记，
+    /// 删会话不会错位）。切空间时回到它，见 `ChatApp::switch_space`
+    last_active: [Option<u64>; 2],
 }
 
 /// 一种内核的运行状态。
@@ -489,14 +492,18 @@ impl ChatApp {
             flash: None,
             suggestion: suggest::SuggestionState::default(),
             next_suggestion: suggest::NextSuggestion::default(),
+            last_active: [None, None],
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
         cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
             .detach();
-        // 第一个会话用默认内核：连接就绪（Connected）后统一补发 session/new；
+        // 第一个会话用当前空间的内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
-        let cwd = app.cwd.clone();
-        app.open_session(app.settings.kernel(), cwd);
+        let space = app.settings.space;
+        let sk = space.kind();
+        let (kind, dir) = app.space_defaults(space);
+        app.open_session_of(kind, dir, sk);
+        app.remember_space(space);
         // 启动时的问题不自动消失：用户可能还没看窗口
         if let Some(err) = settings_error {
             app.toast(Notification::error(err).autohide(false), cx);
@@ -674,49 +681,146 @@ impl ChatApp {
         &self.sessions[self.active]
     }
 
-    /// 新建一个会话并切过去（用默认内核）。
+    /// 当前空间（侧栏顶部「聊天 | 代码」）。
+    pub(crate) fn space(&self) -> Space {
+        self.settings.space
+    }
+
+    /// 聊天会话的占位目录：数据目录下的 `chat/`（建好、空着）。
+    /// 漏网的相对路径落进这里而不是用户的启动目录（见「设计说明-聊天与Code分离.md」第三章）。
+    pub(crate) fn chat_dir(&self) -> PathBuf {
+        claudesktop_core::default_data_dir()
+            .map(|d| d.join("chat"))
+            .unwrap_or_else(|_| self.cwd.join(".chat"))
+    }
+
+    /// 新会话跑在哪个目录：聊天是占位目录，其余是当前工作目录。
+    fn new_session_dir(&self, kind: SessionKind) -> PathBuf {
+        match kind {
+            SessionKind::Chat => self.chat_dir(),
+            SessionKind::Code => self.cwd.clone(),
+        }
+    }
+
+    /// 某个空间新会话的内核和目录：聊天空间只能是自研内核、目录是占位目录。
+    fn space_defaults(&self, space: Space) -> (KernelChoice, PathBuf) {
+        (self.settings.kernel_for_space(space), self.new_session_dir(space.kind()))
+    }
+
+    /// 某个空间在 `last_active` 里的下标（[0] 代码 / [1] 聊天）。
+    fn space_slot(space: Space) -> usize {
+        match space {
+            Space::Code => 0,
+            Space::Chat => 1,
+        }
+    }
+
+    /// 记下某个空间此刻看的是哪个会话（按令牌记，删会话不会错位）。
+    fn remember_space(&mut self, space: Space) {
+        let token = self.sessions[self.active].token;
+        self.last_active[Self::space_slot(space)] = Some(token);
+    }
+
+    /// 切空间（侧栏顶部「聊天 | 代码」）：回到那个空间上次看的会话，
+    /// 没有就开一个空会话；空间本身写回设置，下次启动回到这里。
+    pub(crate) fn switch_space(&mut self, space: Space, cx: &mut Context<Self>) {
+        if space == self.space() {
+            return;
+        }
+        self.remember_space(self.space());
+        self.settings.space = space;
+        self.update_settings(|s| s.space = space);
+        let token = self.last_active[Self::space_slot(space)];
+        match token.and_then(|t| self.sessions.iter().position(|s| s.token == t)) {
+            Some(idx) => self.activate_session(idx, cx),
+            None => {
+                // 那个空间还没有会话：开着设置页就先不建（首页在那儿），只换空间
+                self.open_in_space(space, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 在某个空间里开一个新会话（用该空间的默认内核和目录），并切过去。
+    fn open_in_space(&mut self, space: Space, cx: &mut Context<Self>) {
+        let (kind, cwd) = self.space_defaults(space);
+        let idx = self.open_session_of(kind, cwd, space.kind());
+        self.active = idx;
+        self.remember_space(space);
+        self.refresh_composer(cx);
+    }
+
+    /// 新建一个会话并切过去（在当前空间里：聊天空间建聊天，代码空间按设置的默认内核）。
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.cwd.clone();
-        let kind = self.settings.kernel();
+        let space = self.space();
+        let kind_of_session = space.kind();
+        let (kind, cwd) = self.space_defaults(space);
         // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」；
         // 它要是建过一个没动过的 worktree，顺手清掉（见 worktree.rs）
         let blank = self.sessions.iter().position(|s| {
-            !s.has_user_message() && !s.busy && !s.renamed && s.kernel == kind && s.cwd == cwd
+            !s.has_user_message()
+                && !s.busy
+                && !s.renamed
+                && s.kernel == kind
+                && s.cwd == cwd
+                && s.kind == kind_of_session
         });
         if let Some(idx) = blank {
             self.cleanup_worktree(idx);
         }
         self.active = match blank {
             Some(idx) => idx,
-            None => self.open_session(kind, cwd),
+            None => self.open_session_of(kind, cwd, kind_of_session),
         };
+        self.remember_space(space);
         // 换会话了：上一条对话猜的灰字作废
         self.suggestion.clear();
         cx.notify();
     }
 
+    /// 在某种内核上开一个 Code 会话，返回下标（`rerun_on` / worktree 那几处用）。
+    fn open_session(&mut self, kind: KernelChoice, cwd: PathBuf) -> usize {
+        self.open_session_of(kind, cwd, SessionKind::Code)
+    }
+
     /// 在某种内核上开一个会话，返回下标。内核没启动就先启动；
     /// 连接已就绪就立刻向内核要会话，否则等 Connected 时补发。
-    fn open_session(&mut self, kind: KernelChoice, cwd: PathBuf) -> usize {
+    fn open_session_of(&mut self, kind: KernelChoice, cwd: PathBuf, sk: SessionKind) -> usize {
         // 还没配置时先不起内核，配好保存时再起（见 `save_settings`）
         if !self.settings.needs_setup() {
             self.ensure_kernel(&kind);
         }
         let token = self.next_token;
         self.next_token += 1;
-        self.sessions.push(self.new_session(kind, cwd, token));
+        self.sessions.push(self.new_session_of(kind, cwd, token, sk));
         self.request_pending_sessions();
         self.sessions.len() - 1
     }
 
     /// 新建一个会话（还没向内核要）。设置里开着「自动」（自研内核）时，新对话默认就用它：
     /// 先改界面上的选中项，内核会话建立（Started）后再交给内核。
-    /// 没为 `cwd` 选过文件夹的会话算**任务**（侧栏归到「任务」区，见 `sidebar.rs`）
+    /// 没为 `cwd` 选过文件夹的会话算**任务**（侧栏归到「任务」区，见 `sidebar.rs`）；
+    /// 聊天会话没有工作目录，恒为任务之外（`task = false`，侧栏按日期分组）
     fn new_session(&self, kind: KernelChoice, cwd: PathBuf, token: u64) -> Session {
+        self.new_session_of(kind, cwd, token, SessionKind::Code)
+    }
+
+    fn new_session_of(
+        &self,
+        kind: KernelChoice,
+        cwd: PathBuf,
+        token: u64,
+        sk: SessionKind,
+    ) -> Session {
         let is_builtin = kind == KernelChoice::Builtin;
-        let mut session = Session::new(token, kind, cwd.clone());
-        session.task = !self.is_project_dir(&cwd);
-        if is_builtin && self.settings.auto_mode_default() {
+        let mut session = Session::of_kind(token, kind, cwd.clone(), sk);
+        session.task = sk == SessionKind::Code && !self.is_project_dir(&cwd);
+        if sk == SessionKind::Chat {
+            // 联网默认值取设置里的「默认联网」，用户可以在输入框里随时关
+            session.web = self.settings.chat.web;
+            session.pending_web = Some(session.web);
+        }
+        if is_builtin && sk == SessionKind::Code && self.settings.auto_mode_default() {
             session.default_to(MODE_AUTO_ID);
         }
         // agent 档案记着上次用的模型：Started 后 agent 没报模型就切过去
@@ -856,6 +960,13 @@ impl ChatApp {
     pub(crate) fn activate_session(&mut self, i: usize, cx: &mut Context<Self>) {
         self.active = i;
         self.settings_open = false;
+        // 从搜索结果、系统通知点进别的空间的会话时自动切过去（空间本来就是它那个）
+        let space = Space::of(self.sessions[i].kind);
+        if space != self.space() {
+            self.settings.space = space;
+            self.update_settings(|s| s.space = space);
+        }
+        self.last_active[Self::space_slot(space)] = Some(self.sessions[i].token);
         self.sessions[i].wheel = None;
         // worktree 目录被用户删了 / 换了电脑：切过来时试着重新检出接上（见 worktree.rs）
         if ChatApp::worktree_is_missing(&self.sessions[i]) {
@@ -1163,7 +1274,8 @@ impl ChatApp {
                 self.send_resume(idx, &kernel);
             } else if !s.restored && s.acp_id.is_none() {
                 s.requested = true;
-                if let Err(err) = kernel.new_session(s.token, Some(s.cwd.clone())) {
+                let spec = SessionSpec { cwd: Some(s.cwd.clone()), kind: s.kind };
+                if let Err(err) = kernel.new_session(s.token, spec) {
                     s.requested = false;
                     s.note(format!("创建会话失败：{err}"));
                 }
@@ -1190,6 +1302,7 @@ impl ChatApp {
             }
         });
         let cwd = Some(s.cwd.clone());
+        let kind = s.kind;
         let sent = match resumable {
             Some(meta) => {
                 let history = match &self.store {
@@ -1197,9 +1310,9 @@ impl ChatApp {
                     _ => Vec::new(),
                 };
                 let previous = meta.kernel_session_id.clone().unwrap_or_default();
-                kernel.resume_session(s.token, &previous, cwd, &history)
+                kernel.resume_session(s.token, &previous, SessionSpec { cwd, kind }, &history)
             }
-            None => kernel.new_session(s.token, cwd),
+            None => kernel.new_session(s.token, SessionSpec { cwd, kind }),
         };
         if let Err(err) = sent {
             s.requested = false;
@@ -1845,6 +1958,7 @@ impl ChatApp {
                     // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
                     if matches!(event, KernelEvent::Started { .. }) {
                         self.flush_pending_thinking(idx, kernel.as_deref());
+                        self.flush_pending_web(idx, kernel.as_deref());
                         if !self.queued_compaction(idx) {
                             self.dispatch_queued(idx, cx);
                         }
@@ -1874,9 +1988,11 @@ impl ChatApp {
             Some(meta) => store.append_log(&meta.id),
             None => store.create(&s.title, s.cwd.clone(), &agent_cmd).map(|(mut meta, log)| {
                 meta.set_kernel_session(s.acp_id.clone());
-                // 是不是任务、跑在哪个 worktree 在建档时定下来（侧栏据此分组，见 sidebar.rs）
+                // 是不是任务、跑在哪个 worktree 在建档时定下来（侧栏据此分组，见 sidebar.rs）；
+                // 会话类型也在这里写死（建好就不再改）
                 meta.task = s.task;
                 meta.worktree = s.worktree.clone();
+                meta.kind = s.kind;
                 let _ = store.save_meta(&meta);
                 s.meta = Some(meta);
                 log
@@ -2003,6 +2119,7 @@ impl ChatApp {
             meta.set_kernel_session(s.acp_id.clone());
             meta.task = s.task;
             meta.worktree = s.worktree.clone();
+            meta.kind = s.kind;
             meta.updated_ms = now_ms();
             let _ = store.save_meta(meta);
         }

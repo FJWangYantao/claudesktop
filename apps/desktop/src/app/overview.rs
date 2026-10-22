@@ -5,7 +5,7 @@ use super::ChatApp;
 use super::mascot::brand_mark;
 use super::widgets::Surface;
 use crate::model::*;
-use crate::settings::KernelChoice;
+use crate::settings::{KernelChoice, Space};
 use crate::theme::rgb;
 use crate::theme::*;
 use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
@@ -17,8 +17,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 首页的建议：(图标, 入口上的短名, 填进输入框的提示词)
-const SUGGESTIONS: [(IconAll, &str, &str); 4] = [
+/// 代码空间首页的建议：(图标, 入口上的短名, 填进输入框的提示词)
+const CODE_SUGGESTIONS: [(IconAll, &str, &str); 4] = [
     (IconAll::FolderTree, "梳理项目结构", "梳理这个项目的结构：主要模块、入口和它们之间的关系"),
     (IconAll::Bug, "排查潜在问题", "通读最近改动的代码，找出可能的 bug 和没处理的边界情况"),
     (IconAll::FlaskConical, "补单元测试", "给核心逻辑补上单元测试，先列出要覆盖的情况再写"),
@@ -29,10 +29,93 @@ const SUGGESTIONS: [(IconAll, &str, &str); 4] = [
     ),
 ];
 
-/// 输入框平时的占位文字
+/// 聊天空间首页的建议：(图标, 入口上的短名, 填进输入框的提示词)
+const CHAT_SUGGESTIONS: [(IconAll, &str, &str); 4] = [
+    (IconAll::MessageSquare, "帮我改写", "把下面这段话改得更清楚、更简洁，保留原意："),
+    (IconAll::Globe, "翻译", "把下面这段翻译成英文，语气自然："),
+    (IconAll::Lightbulb, "解释一个概念", "用通俗的话解释一下：（概念），再举一个例子"),
+    (IconAll::ListChecks, "列个计划", "帮我列一个计划：（目标），按先后排好，写清每一步要多久"),
+];
+
+/// 输入框平时的占位文字（代码空间）
 const PLACEHOLDER: &str = "描述要做的事，回车发送，Shift+回车换行";
 
+/// 输入框平时的占位文字（聊天空间）
+const CHAT_PLACEHOLDER: &str = "有什么想聊的？回车发送，Shift+回车换行";
+
 impl ChatApp {
+    /// 首页问候语：小陶 + 「下午好，WYT」。
+    fn render_greeting(&self) -> Div {
+        div().h_flex().gap_2p5().items_center().child(brand_mark(rems(2.5))).child(
+            div()
+                .text_size(TEXT_TITLE)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(INK))
+                .child(greeting()),
+        )
+    }
+
+    /// 聊天接不上模型（没配自研内核的端点，只配了 ACP agent）时的引导卡：
+    /// 聊天直接连模型，得先在设置里填端点。分段切换照样显示，别藏起来。
+    fn render_chat_setup(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .v_flex()
+            .gap_3()
+            .w(OVERVIEW_W)
+            .p_5()
+            .rounded_xl()
+            .bg(rgb(SAND))
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .pb_1()
+                    .child(
+                        div()
+                            .text_size(TEXT_LEAD)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(INK))
+                            .child("聊天要先接上一个模型"),
+                    )
+                    .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
+                        "聊天直接连模型，不需要工作目录；本机装的 agent 是写代码的，跑不了聊天。",
+                    )),
+            )
+            .child(
+                div()
+                    .id("chat-setup-builtin")
+                    .h_flex()
+                    .gap_3()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(CARD))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(HOVER)))
+                    .child(Icon::new(IconAll::Cpu).size_5().flex_shrink_0().text_color(rgb(CORAL)))
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_0p5()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(TEXT_LARGE)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(INK))
+                                    .child("设定点和密钥"),
+                            )
+                            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
+                                "DeepSeek、Kimi、GLM、Anthropic、OpenAI 等，或本机的 Ollama",
+                            )),
+                    )
+                    .child(Icon::new(IconAll::ChevronRight).size_4().text_color(rgb(INK_SOFT)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_setup(KernelChoice::Builtin, window, cx)
+                    })),
+            )
+    }
+
     pub(super) fn heat_color(v: u8) -> Color {
         HEAT[(v as usize).min(HEAT.len() - 1)]
     }
@@ -333,6 +416,22 @@ impl ChatApp {
             2 => self.render_usage_requests(false, cx),
             _ => Self::render_usage_cards(&o, cx),
         };
+        // 聊天空间：问候语 + 最近会话，**不放用量概览**（用量在侧栏「用量」里）。
+        // 聊天接不上模型（只配了 ACP agent）时换成一张引导卡
+        let chat = self.space() == Space::Chat;
+        if chat {
+            let can_chat = self.settings.chat_available();
+            return div()
+                .v_flex()
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .gap_6()
+                .child(self.render_greeting())
+                .children((!can_chat).then(|| self.render_chat_setup(cx)))
+                .children(self.render_recent(cx));
+        }
 
         div()
             .v_flex()
@@ -341,16 +440,7 @@ impl ChatApp {
             .items_center()
             .justify_center()
             .gap_6()
-            .child(
-                // 问候语
-                div().h_flex().gap_2p5().items_center().child(brand_mark(rems(2.5))).child(
-                    div()
-                        .text_size(TEXT_TITLE)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(INK))
-                        .child(greeting()),
-                ),
-            )
+            .child(self.render_greeting())
             .children(setup)
             .children((!needs_setup).then(|| self.render_recent(cx)).flatten())
             .when(!needs_setup, |d| {
@@ -550,9 +640,20 @@ impl ChatApp {
 
     /// 首页空输入框里建议的提示词：每个会话固定一条（按会话令牌轮换）。
     pub(super) fn ghost_prompt(&self) -> Option<&'static str> {
-        // 还没配内核时不引人发消息（发了也只会报没配置）
-        (self.on_home() && !self.settings.needs_setup())
-            .then(|| SUGGESTIONS[self.session().token as usize % SUGGESTIONS.len()].2)
+        let ready = match self.space() {
+            // 聊天要有能用的自研内核端点
+            Space::Chat => self.settings.chat_available(),
+            Space::Code => !self.settings.needs_setup(),
+        };
+        (self.on_home() && ready).then(|| self.suggestions()[self.session().token as usize % 4].2)
+    }
+
+    /// 当前空间的首页建议。
+    pub(super) fn suggestions(&self) -> &'static [(IconAll, &'static str, &'static str); 4] {
+        match self.space() {
+            Space::Chat => &CHAT_SUGGESTIONS,
+            Space::Code => &CODE_SUGGESTIONS,
+        }
     }
 
     /// 输入框的占位文字：首页是建议的提示词，跑着时说明回车会排队，刚拒绝了权限时请用户说要怎么改，
@@ -568,7 +669,11 @@ impl ChatApp {
                 _ if s.steering => "说说要它怎么改，回车发送".into(),
                 _ if s.busy || s.stopping => "回车排队，这一轮结束后自动发出".into(),
                 Some(prompt) => format!("试试：{prompt}（Tab 填入）").into(),
-                None => PLACEHOLDER.into(),
+                None => match self.space() {
+                    Space::Chat => CHAT_PLACEHOLDER,
+                    Space::Code => PLACEHOLDER,
+                }
+                .into(),
             }
         };
         if text != self.placeholder {
@@ -598,7 +703,7 @@ impl ChatApp {
     /// 首页输入框下方的一排建议入口，点了把提示词填进输入框。
     pub(super) fn render_suggestions(&self, cx: &mut Context<Self>) -> Div {
         div().h_flex().flex_wrap().justify_center().gap_2().pt_1().children(
-            SUGGESTIONS.iter().enumerate().map(|(i, &(icon, label, prompt))| {
+            self.suggestions().iter().enumerate().map(|(i, &(icon, label, prompt))| {
                 div()
                     .id(("suggestion", i))
                     .h_flex()

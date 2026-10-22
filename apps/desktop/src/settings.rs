@@ -465,6 +465,77 @@ pub struct Settings {
     /// 一轮结束后让模型提炼「候选」记忆（只进设置页「待确认」，收下才落盘）。默认关：
     /// 每一轮都多一次请求
     pub memory_suggest: bool,
+    /// 当前空间（侧栏顶部「聊天 | 代码」）；切换即写回，下次启动回到上次那个。
+    /// 默认 Code：升级后打开还是熟悉的样子
+    pub space: Space,
+    /// 聊天空间的一组设置（见 [`ChatSettings`]）
+    pub chat: ChatSettings,
+}
+
+/// 当前空间：侧栏顶部「聊天 | 代码」那段切换。
+///
+/// 和 [`claudesktop_core::SessionKind`] 一一对应，但那是会话的类型（存进元信息），
+/// 这是界面此刻在看哪个空间（存进设置），两者的默认值也不同（这里默认 Code）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Space {
+    /// 写代码的会话（有工作目录、全套工具）
+    #[default]
+    Code,
+    /// 纯聊天
+    Chat,
+}
+
+impl Space {
+    pub fn kind(self) -> claudesktop_core::SessionKind {
+        match self {
+            Self::Code => claudesktop_core::SessionKind::Code,
+            Self::Chat => claudesktop_core::SessionKind::Chat,
+        }
+    }
+
+    pub fn of(kind: claudesktop_core::SessionKind) -> Self {
+        match kind {
+            claudesktop_core::SessionKind::Code => Self::Code,
+            claudesktop_core::SessionKind::Chat => Self::Chat,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Code => "代码",
+            Self::Chat => "聊天",
+        }
+    }
+}
+
+/// 聊天空间（见「设计说明-聊天与Code分离.md」第五章）。
+///
+/// 三项都只影响**之后新建**的聊天会话——说明例外：它每轮重读，改了下一轮就生效。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatSettings {
+    /// 聊天用的模型（同一服务商）；空 = 跟随档案里的默认模型
+    pub model: String,
+    /// 新建的聊天默认开着「联网」（输入框里可以随时关）
+    pub web: bool,
+    /// 聊天说明文件的路径（每轮读一次，进系统提示词的 `# User instructions`）
+    pub instructions: String,
+}
+
+impl Default for ChatSettings {
+    /// `web` 默认开（`bool::default()` 是 false，不能只靠派生）
+    fn default() -> Self {
+        Self { model: String::new(), web: true, instructions: String::new() }
+    }
+}
+
+impl ChatSettings {
+    /// 聊天说明文件的路径；空 = 没有。
+    pub fn instructions_path(&self) -> Option<PathBuf> {
+        let p = self.instructions.trim();
+        (!p.is_empty()).then(|| PathBuf::from(p))
+    }
 }
 
 /// `bool` 字段的默认值为 true（`bool::default()` 是 false，不能只靠派生）。
@@ -513,6 +584,8 @@ impl Default for Settings {
             suggest_model: String::new(),
             memory_suggest: false,
             auto_mode: AutoModeSettings::default(),
+            space: Space::default(),
+            chat: ChatSettings::default(),
         }
     }
 }
@@ -862,6 +935,20 @@ impl Settings {
         self.kernel.is_none() && !self.builtin.is_configured() && self.acp.first().is_none()
     }
 
+    /// 能不能开聊天会话：聊天直接连模型（ACP agent 都是写代码的，不能聊天），
+    /// 所以自研内核的端点 / 模型填好了才行。只配了 agent 时聊天空间换成配置引导（见 `overview.rs`）。
+    pub fn chat_available(&self) -> bool {
+        self.builtin.is_configured()
+    }
+
+    /// 某个空间新会话用哪套内核：聊天空间只能是自研内核（ACP 都跑不了聊天）；代码空间照旧跟着设置。
+    pub fn kernel_for_space(&self, space: Space) -> KernelChoice {
+        match space {
+            Space::Chat => KernelChoice::Builtin,
+            Space::Code => self.kernel(),
+        }
+    }
+
     pub fn builtin_config(&self, cwd: PathBuf) -> anyhow::Result<BuiltinConfig> {
         let p = self.builtin.current();
         if p.base_url.trim().is_empty() {
@@ -881,6 +968,10 @@ impl Settings {
         config.memory_suggest = self.memory_suggest;
         // 「自动」模式没配好时不出现（设置页保存时会拦住，这里再兜一次）
         config.auto_mode = self.auto_mode.to_config(p);
+        // 聊天空间：模型（空 = 跟档案）、默认联网、聊天说明文件
+        config.chat_model = Some(self.chat.model.trim().to_string()).filter(|m| !m.is_empty());
+        config.chat_web = self.chat.web;
+        config.chat_instructions = self.chat.instructions_path();
         Ok(config)
     }
 
@@ -1112,6 +1203,43 @@ mod tests {
         assert_eq!(Settings::load(Some(&path)).0.max_steps, claudesktop_builtin::MIN_MAX_STEPS);
         std::fs::write(&path, r#"{"max_steps":999999}"#).unwrap();
         assert_eq!(Settings::load(Some(&path)).0.max_steps, claudesktop_builtin::MAX_MAX_STEPS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 聊天空间：老设置文件里没有这两项 → 代码空间 + 联网默认开；三项都进自研内核配置。
+    #[core::prelude::v1::test]
+    fn chat_space_defaults_and_config() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.space, Space::Code);
+        assert!(s.chat.web);
+        assert!(s.chat.model.is_empty());
+        assert!(s.chat.instructions_path().is_none());
+
+        let mut s = Settings::default();
+        s.builtin.current_mut().base_url = "http://x/v1".into();
+        s.builtin.current_mut().model = "m".into();
+        s.chat.model = "cheap".into();
+        s.chat.web = false;
+        s.chat.instructions = "  C:\\notes.md  ".into();
+        let cfg = s.builtin_config(PathBuf::from(".")).unwrap();
+        assert_eq!(cfg.chat_model.as_deref(), Some("cheap"));
+        assert!(!cfg.chat_web);
+        assert_eq!(cfg.chat_instructions, Some(PathBuf::from("C:\\notes.md")));
+
+        // 聊天只能用自研内核；代码空间跟着「默认内核」
+        s.space = Space::Chat;
+        assert_eq!(s.kernel_for_space(Space::Chat), KernelChoice::Builtin);
+        s.space = Space::Code;
+        assert_eq!(s.kernel_for_space(Space::Code), KernelChoice::Builtin);
+        // 写盘回读
+        let dir = std::env::temp_dir().join(format!("claudesktop-space-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        s.space = Space::Chat;
+        s.save(&path).unwrap();
+        let back = Settings::load(Some(&path)).0;
+        assert_eq!(back.space, Space::Chat);
+        assert!(!back.chat.web);
+        assert_eq!(back.chat.model, "cheap");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

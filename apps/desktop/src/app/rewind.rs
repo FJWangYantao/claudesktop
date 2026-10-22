@@ -45,6 +45,8 @@ pub(crate) struct RewindPreview {
     commands: usize,
     /// 内核能回退对话
     conversation: bool,
+    /// 聊天会话（没有工作目录，也就没有文件可还原）
+    chat: bool,
     /// 回退不了的原因（没有保存记录、对话和记录对不上）
     error: Option<&'static str>,
 }
@@ -100,6 +102,7 @@ impl ChatApp {
             files: Vec::new(),
             commands: 0,
             conversation,
+            chat: s.is_chat(),
             error: None,
         };
         let Some(records) = self.effective_records(active) else {
@@ -302,14 +305,18 @@ fn rewind_panel(
         "这个内核不支持回退对话（上下文在 agent 进程里），只能还原文件".into()
     }));
     let all: Vec<&FileRestore> = p.files.iter().map(|(r, _)| r).collect();
-    panel = panel.child(line(if all.is_empty() {
-        "agent 在这之后没有改过文件".into()
-    } else {
-        format!("还原 {} 个文件：{}", all.len(), names(&all))
-    }));
-    if p.commands > 0 {
-        panel =
-            panel.child(warn(format!("这几轮跑过 {} 条命令，命令改动的文件不会还原", p.commands)));
+    // 聊天会话没有工作目录，也就不可能有文件改动：只列对话那一项
+    let chat = p.chat;
+    if !chat {
+        panel = panel.child(line(if all.is_empty() {
+            "agent 在这之后没有改过文件".into()
+        } else {
+            format!("还原 {} 个文件：{}", all.len(), names(&all))
+        }));
+        if p.commands > 0 {
+            panel = panel
+                .child(warn(format!("这几轮跑过 {} 条命令，命令改动的文件不会还原", p.commands)));
+        }
     }
     let conflicts: Vec<&FileRestore> = p.conflicts().collect();
     if !conflicts.is_empty() {
@@ -338,7 +345,7 @@ fn rewind_panel(
     }
 
     // 按钮：能做的才出现；主按钮是最完整的那种
-    let files = p.restorable(overwrite) > 0;
+    let files = !chat && p.restorable(overwrite) > 0;
     let mut choices: Vec<(&'static str, bool, bool)> = Vec::new();
     if p.conversation && files {
         choices.push(("回退对话和文件", true, true));

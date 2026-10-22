@@ -505,6 +505,119 @@ pub fn specs(writable: bool) -> Vec<Value> {
     tools
 }
 
+/// 聊天会话的工具定义：只有联网（`web` 开着时）和记忆（只全局）。
+/// 不给工作目录那套：聊天改不了文件、跑不了命令。
+pub fn chat_specs(web: bool) -> Vec<Value> {
+    let f = |name: &str, description: String, parameters: Value| {
+        json!({
+            "type": "function",
+            "function": { "name": name, "description": description, "parameters": parameters },
+        })
+    };
+    let mut tools = Vec::new();
+    if web {
+        tools.push(f(
+            WEB_FETCH,
+            format!(
+                "Fetch a web page (http/https) and return its text: HTML is converted to plain text with \
+                 headings, lists, code blocks and [text](absolute-url) links; JSON and other text are returned as is. \
+                 Scripts are not run. Returns at most {} characters; use offset to read further.",
+                crate::fetch::FETCH_PAGE_CHARS
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Full URL, e.g. https://docs.rs/serde" },
+                    "offset": { "type": "integer", "description": "Character offset into the converted text (for long pages)" }
+                },
+                "required": ["url"]
+            }),
+        ));
+        tools.push(f(
+            WEB_SEARCH,
+            format!(
+                "Search the web and return at most {} results (title, URL, snippet). \
+                 Use it to find current information, then web_fetch the most promising URL for details.",
+                crate::websearch::SEARCH_MAX_RESULTS
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" }
+                },
+                "required": ["query"]
+            }),
+        ));
+    }
+    tools.push(f(
+        MEMORY_SEARCH,
+        "Search the notes saved for later sessions (user preferences, decisions, pitfalls) and \
+         return the matching ones. Only the notes that fit the budget are in the system prompt; \
+         use this to look up the rest. Plain words, not a regex; case-insensitive. Read-only."
+            .to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Words to look for" }
+            },
+            "required": ["query"]
+        }),
+    ));
+    // 聊天会话没有工作目录：记忆一律记到全局，所以不带 `scope` 参数
+    tools.push(f(
+        MEMORY_WRITE,
+        format!(
+            "Save one short note for later sessions: a user preference, a decision with its reason, \
+             or a pitfall you hit. `text` is one sentence (at most {MAX_TEXT_CHARS} characters), not \
+             a transcript and not \"the user asked me to …\". Do not record secrets (tokens, \
+             passwords, keys) or one-off task details. If the user asks you to remember something, \
+             save it here instead of repeating the conversation."
+        ),
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "One sentence, with the why when it matters" },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "A few short categories, e.g. 偏好 / 习惯"
+                },
+                "pinned": { "type": "boolean", "description": "Keep it in context and never evict it" }
+            },
+            "required": ["text"]
+        }),
+    ));
+    tools.push(f(
+        MEMORY_FORGET,
+        "Delete a note saved earlier. Use it when a note is wrong, outdated, or the user says to \
+         forget it. You can only delete notes this same session saved (the user can delete any of \
+         them in the settings); if the note came from an earlier session, tell the user where to \
+         delete it instead of guessing."
+            .to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Words from the note (or its text), enough to pick it out"
+                }
+            },
+            "required": ["query"]
+        }),
+    ));
+    tools
+}
+
+/// 这个工具名在聊天会话里能不能用（只靠「不给定义」不够：有的端点不校验工具名，
+/// 模型也可能照着续接前的 `[tool] …` 文字瞎编）。
+pub fn chat_allows(web: bool, name: &str) -> bool {
+    match name {
+        WEB_FETCH | WEB_SEARCH => web,
+        MEMORY_WRITE | MEMORY_SEARCH | MEMORY_FORGET => true,
+        _ => false,
+    }
+}
+
 #[derive(Deserialize)]
 struct FetchArgs {
     url: String,

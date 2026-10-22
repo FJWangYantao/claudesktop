@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use claudesktop_core::{
-    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent, UserPrompt,
+    AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, RoutedEvent, SessionKind,
+    SessionSpec, UserPrompt,
 };
 
 fn mock_command() -> String {
@@ -151,7 +152,7 @@ fn mock_agent_full_event_chain() {
 /// 等连接就绪 → 创建一个会话 → 返回它的 sessionId。
 fn start_session(kernel: &AcpKernel, events: &Arc<Mutex<Vec<KernelEvent>>>) -> String {
     wait_for(events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
-    kernel.new_session(1, None).expect("new session");
+    kernel.new_session(1, SessionSpec::default()).expect("new session");
     wait_for(events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
 
     events
@@ -197,8 +198,8 @@ fn two_sessions_are_isolated() {
     };
 
     poll("connected", &|evs| evs.iter().any(|r| matches!(r.event, KernelEvent::Connected { .. })));
-    kernel.new_session(11, None).expect("new session 1");
-    kernel.new_session(22, None).expect("new session 2");
+    kernel.new_session(11, SessionSpec::default()).expect("new session 1");
+    kernel.new_session(22, SessionSpec::default()).expect("new session 2");
     poll("two sessions", &|evs| {
         evs.iter().filter(|r| matches!(r.event, KernelEvent::Started { .. })).count() == 2
     });
@@ -376,7 +377,9 @@ fn run_resume(mock_flag: &str) -> (String, bool, String) {
     .expect("spawn kernel");
 
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
-    kernel.resume_session(5, "old-session-42", None, &[]).expect("resume session");
+    kernel
+        .resume_session(5, "old-session-42", SessionSpec::default(), &[])
+        .expect("resume session");
     wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Started { .. }));
     let (sid, resumed) = events
         .lock()
@@ -418,6 +421,34 @@ fn resume_falls_back_to_new_session() {
     let (sid, resumed, _) = run_resume("");
     assert_ne!(sid, "old-session-42");
     assert!(!resumed);
+}
+
+/// ACP agent 都是写代码的：聊天会话直接回 `SessionFailed`（界面不会这么发，这是兜底）。
+#[test]
+fn chat_session_is_refused() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
+    };
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: mock_command(),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+            env: Vec::new(),
+        },
+        sink,
+    )
+    .unwrap();
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
+    kernel.new_session(7, SessionSpec { cwd: None, kind: SessionKind::Chat }).unwrap();
+    wait_for(
+        &events,
+        10_000,
+        |e| matches!(e, KernelEvent::SessionFailed { token: 7, message } if message.contains("纯聊天")),
+    );
 }
 
 /// 检查点：agent 经客户端 `fs/write_text_file` 写的文件，前后内容作为 `FileChanged` 上报。

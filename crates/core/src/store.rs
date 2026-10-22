@@ -19,6 +19,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 合并中的文本超过这个长度就先落盘（降低崩溃时的丢失量）。
 const COALESCE_LIMIT: usize = 4096;
 
+/// 会话类型（见「设计说明-聊天与Code分离.md」）。
+///
+/// 建好就定，和 [`crate::Kernel`] 一样：空会话可以换，发过第一条消息就固定。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    /// 写代码：有工作目录、全套工具和权限（加这一项之前的会话都是它）
+    #[default]
+    Code,
+    /// 纯聊天：没有工作目录，只有联网和全局记忆
+    Chat,
+}
+
+impl SessionKind {
+    /// 是不是 Code 会话（序列化时省略这个默认值）。
+    pub fn is_code(&self) -> bool {
+        *self == Self::Code
+    }
+}
+
 /// 会话元信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -47,6 +67,9 @@ pub struct SessionMeta {
     /// 会话跑在自己的 git worktree 里（`cwd` 就是 worktree 目录），见 [`WorktreeMeta`]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeMeta>,
+    /// 会话类型；老元信息没有这一项，读成 [`SessionKind::Code`]
+    #[serde(default, skip_serializing_if = "SessionKind::is_code")]
+    pub kind: SessionKind,
 }
 
 /// 会话的 git worktree：[`SessionMeta::cwd`] 是检出目录，这里记它从哪个仓库、哪个分支分出来。
@@ -240,6 +263,7 @@ impl SessionStore {
             archived: false,
             task: false,
             worktree: None,
+            kind: SessionKind::Code,
         };
         self.save_meta(&meta)?;
         let log = self.append_log(&meta.id)?;
@@ -456,6 +480,21 @@ mod tests {
 
     fn chunk(text: &str) -> Record {
         Record::Event { event: KernelEvent::AgentMessageChunk { text: text.into() } }
+    }
+
+    #[test]
+    fn kind_round_trips_and_old_metas_read_as_code() {
+        // 老元信息没有 kind：读成 Code
+        let old = r#"{"id":"s","title":"t","cwd":".","agent":"a","created_ms":1,"updated_ms":2}"#;
+        let meta: SessionMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(meta.kind, SessionKind::Code);
+        // Code 会话不写这一项（旧版本读新文件也不受影响），聊天写 "chat"
+        assert!(!serde_json::to_string(&meta).unwrap().contains("kind"));
+        let mut chat = meta.clone();
+        chat.kind = SessionKind::Chat;
+        let text = serde_json::to_string(&chat).unwrap();
+        assert!(text.contains("\"kind\":\"chat\""), "{text}");
+        assert_eq!(serde_json::from_str::<SessionMeta>(&text).unwrap(), chat);
     }
 
     #[test]

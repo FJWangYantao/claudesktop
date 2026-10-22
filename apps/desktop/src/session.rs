@@ -4,7 +4,9 @@ use crate::demo::*;
 use crate::model::*;
 use crate::settings::KernelChoice;
 use crate::usage::Streamed;
-use claudesktop_core::{DiffView, Kernel, KernelEvent, Record, SessionLog, SessionMeta};
+use claudesktop_core::{
+    DiffView, Kernel, KernelEvent, Record, SessionKind, SessionLog, SessionMeta,
+};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -49,6 +51,12 @@ pub struct Session {
     pub autoprompt: Option<claudesktop_core::UserPrompt>,
     /// 会话工作目录（侧栏按它分组；session/new 用它）
     pub cwd: PathBuf,
+    /// 会话类型：聊天（没有工作目录那套）还是 Code。建好就定，发过第一条消息后不再改
+    pub kind: SessionKind,
+    /// 聊天会话的「联网」开关（会话级，下一轮开头生效）
+    pub web: bool,
+    /// 内核重连 / 会话还没 Started 时先记着，`Started` 时补交（和 `pending_thinking` 一个套路）
+    pub pending_web: Option<bool>,
     /// 任务：建立时没为它选过文件夹（跑在默认目录里）。侧栏归到「任务」区，
     /// 在输入框上方的目录菜单里选个文件夹就成了项目会话
     pub task: bool,
@@ -310,8 +318,14 @@ fn new_list_state() -> ListState {
 }
 
 impl Session {
-    /// 新会话；演示回放不需要内核会话，直接可用。
+    /// 新会话（Code）；演示回放不需要内核会话，直接可用。
     pub fn new(token: u64, kernel: KernelChoice, cwd: PathBuf) -> Self {
+        Self::of_kind(token, kernel, cwd, SessionKind::Code)
+    }
+
+    /// 新会话，按类型：[`SessionKind::Chat`] 的会话没有工作目录那套（`task` 恒为 false），
+    /// `cwd` 是数据目录下的 `chat/` 占位（见「设计说明-聊天与Code分离.md」第三章）。
+    pub fn of_kind(token: u64, kernel: KernelChoice, cwd: PathBuf, kind: SessionKind) -> Self {
         let kernel_key = kernel.key();
         let is_demo = kernel == KernelChoice::Demo;
         Self {
@@ -329,12 +343,20 @@ impl Session {
             list: new_list_state(),
             measured: Vec::new(),
             measured_busy: false,
-            modes: default_modes(),
+            modes: if kind == SessionKind::Chat {
+                // 聊天没有工具要批，也就没有权限模式（Started 报的也是空表）
+                Vec::new()
+            } else {
+                default_modes()
+            },
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
             model_label: if is_demo { "GLM-5.3" } else { UNKNOWN_MODEL }.into(),
             autoprompt: None,
             cwd,
+            kind,
+            web: true,
+            pending_web: None,
             task: false,
             worktree: None,
             worktree_busy: None,
@@ -396,6 +418,7 @@ impl Session {
         s.pending_mode = None;
         // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
         s.task = meta.task;
+        s.kind = meta.kind;
         // 跑在 git worktree 里的会话：侧栏仍归到主项目，分支 chip 用它
         s.worktree = meta.worktree.clone();
         s.title = meta.title.clone().into();
@@ -788,9 +811,14 @@ impl Session {
     }
 
     /// 侧栏分组按哪个目录算：worktree 会话归到**主仓库**那一组（`cwd` 是数据目录里的 worktree，
-    /// 不该单独占一组），其余就是工作目录。
+    /// 不该单独占一组），其余就是工作目录。聊天会话没有工作目录（`cwd` 是占位目录），不按它分组。
     pub fn group_dir(&self) -> &std::path::Path {
         self.worktree.as_ref().map_or(self.cwd.as_path(), |w| w.repo.as_path())
+    }
+
+    /// 是不是聊天会话（没有工作目录：没有目录 chip、权限模式、`@` 文件补全那套）。
+    pub fn is_chat(&self) -> bool {
+        self.kind == SessionKind::Chat
     }
 
     /// 新会话默认的权限模式（设置里开着「自动」时是「自动」）：先把这一项补进模式表并选中
@@ -1165,6 +1193,10 @@ impl Session {
         // 会话级思考档位同理：新内核会话里是「默认」，选过的要重新交回去
         if self.thinking.is_some() {
             self.pending_thinking = Some(self.thinking);
+        }
+        // 联网开关也是会话级的：新内核会话默认按设置来，用户在输入框里改过的要重新交回去
+        if self.kind == SessionKind::Chat {
+            self.pending_web = Some(self.web);
         }
     }
 
@@ -1739,6 +1771,7 @@ mod tests {
             archived: false,
             task: false,
             worktree: None,
+            kind: SessionKind::Code,
         }
     }
 

@@ -36,8 +36,8 @@ pub use diff::{
 pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
 pub use store::{
-    Record, SessionLog, SessionMeta, SessionStore, WorktreeMeta, default_data_dir, effective,
-    read_log,
+    Record, SessionKind, SessionLog, SessionMeta, SessionStore, WorktreeMeta, default_data_dir,
+    effective, read_log,
 };
 
 pub use plugin::Plugin;
@@ -527,10 +527,10 @@ pub type EventSink = Arc<dyn Fn(RoutedEvent) + Send + Sync + 'static>;
 #[derive(Debug, Clone)]
 pub enum KernelCommand {
     /// 创建会话；`cwd` 为空用内核的默认工作目录
-    NewSession { token: u64, cwd: Option<PathBuf> },
+    NewSession { token: u64, cwd: Option<PathBuf>, kind: SessionKind },
     /// 续接一个已有会话（ACP `session/resume`，其次 `session/load`）；
     /// 都不支持或失败时退回新建，结果经 `Started { resumed }` 报告
-    ResumeSession { token: u64, session_id: String, cwd: Option<PathBuf> },
+    ResumeSession { token: u64, session_id: String, cwd: Option<PathBuf>, kind: SessionKind },
     /// 向某会话发送一轮用户消息
     Prompt { session: String, prompt: UserPrompt },
     /// 请求取消某会话的当前轮
@@ -539,6 +539,22 @@ pub enum KernelCommand {
     SetMode { session: String, mode_id: String },
     /// 关闭内核（断开连接、终止子进程）
     Shutdown,
+}
+
+/// 开会话时交给内核的东西（以后再加会话级选项只往这里添字段）。
+#[derive(Debug, Clone, Default)]
+pub struct SessionSpec {
+    /// None = 内核的默认目录（聊天会话也传 `<数据目录>/chat`，见 [`SessionKind`]）
+    pub cwd: Option<PathBuf>,
+    /// 会话类型：聊天会话只给联网和全局记忆，不带工作目录相关的东西
+    pub kind: SessionKind,
+}
+
+impl SessionSpec {
+    /// Code 会话（有工作目录那套）。
+    pub fn code(cwd: Option<PathBuf>) -> Self {
+        Self { cwd, kind: SessionKind::Code }
+    }
 }
 
 /// 可更换内核的统一抽象。
@@ -552,7 +568,7 @@ pub trait Kernel: Send + Sync {
     fn label(&self) -> String;
     /// 创建一个会话；结果经 `Started` / `SessionFailed` 事件异步回报，
     /// 事件里带回同一个 `token`。
-    fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()>;
+    fn new_session(&self, token: u64, spec: SessionSpec) -> anyhow::Result<()>;
     /// 续接之前的会话（`session_id` 为内核侧 ID）；结果经 `Started` 回报，
     /// 其 `resumed` 表示上下文是否得以延续。`history` 是该会话的本地日志：
     /// 自己保有上下文的内核（ACP agent）忽略它，进程内内核用它重建上下文。
@@ -561,11 +577,15 @@ pub trait Kernel: Send + Sync {
         &self,
         token: u64,
         session_id: &str,
-        cwd: Option<PathBuf>,
+        spec: SessionSpec,
         history: &[Record],
     ) -> anyhow::Result<()> {
         let _ = (session_id, history);
-        self.new_session(token, cwd)
+        self.new_session(token, spec)
+    }
+    /// 能不能开聊天会话（[`SessionKind::Chat`]）。ACP agent 都是写代码的，不能 —— 默认不能。
+    fn supports_chat(&self) -> bool {
+        false
     }
     /// 向某会话发送一轮用户消息（文本 + 可选图片）；返回仅代表「已投递」。
     fn send_prompt(&self, session: &str, prompt: UserPrompt) -> anyhow::Result<()>;
@@ -598,6 +618,11 @@ pub trait Kernel: Send + Sync {
     fn set_thinking(&self, session: &str, level: Option<&str>) -> anyhow::Result<()> {
         let _ = (session, level);
         anyhow::bail!("当前内核不支持切换思考强度")
+    }
+    /// 聊天会话的「联网」开关（会话级，下一轮开头生效）；默认不支持。
+    fn set_web(&self, session: &str, web: bool) -> anyhow::Result<()> {
+        let _ = (session, web);
+        anyhow::bail!("当前内核不支持关联网")
     }
     /// 更新各模型的上下文窗口（模型 ID → token；界面取到模型列表后推过来，自动压缩用）。默认忽略。
     fn set_context_windows(&self, windows: std::collections::HashMap<String, u64>) {

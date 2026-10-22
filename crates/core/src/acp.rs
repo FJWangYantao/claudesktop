@@ -40,7 +40,7 @@ use futures::channel::oneshot;
 
 use crate::{
     DiffView, EventSink, Kernel, KernelCommand, KernelEvent, ModeView, PermissionOptionView,
-    PlanEntryView, RoutedEvent,
+    PlanEntryView, RoutedEvent, SessionKind,
 };
 
 /// 发出一个事件；`session` 为空表示连接级事件。
@@ -164,8 +164,8 @@ impl Kernel for AcpKernel {
         "ACP agent".into()
     }
 
-    fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()> {
-        self.send_command(KernelCommand::NewSession { token, cwd })
+    fn new_session(&self, token: u64, spec: crate::SessionSpec) -> anyhow::Result<()> {
+        self.send_command(KernelCommand::NewSession { token, cwd: spec.cwd, kind: spec.kind })
     }
 
     fn set_plugins(&self, plugins: Vec<crate::plugin::Plugin>) {
@@ -199,14 +199,15 @@ impl Kernel for AcpKernel {
         &self,
         token: u64,
         session_id: &str,
-        cwd: Option<PathBuf>,
+        spec: crate::SessionSpec,
         _history: &[crate::Record],
     ) -> anyhow::Result<()> {
         // agent 自己保有上下文（session/resume 或 session/load），本地日志用不上
         self.send_command(KernelCommand::ResumeSession {
             token,
             session_id: session_id.to_string(),
-            cwd,
+            cwd: spec.cwd,
+            kind: spec.kind,
         })
     }
 
@@ -477,13 +478,36 @@ fn run_kernel(
                 // ---- 指令循环 --------------------------------------------
                 while let Some(command) = cmd_rx.next().await {
                     match command {
-                        KernelCommand::NewSession { token, cwd } => {
+                        KernelCommand::NewSession { token, cwd, kind } => {
+                            // ACP agent 都是写代码的：聊天会话直接回绝（界面本来就不会这么发，这是兜底）
+                            if kind == SessionKind::Chat {
+                                emit(
+                                    &sink,
+                                    None,
+                                    KernelEvent::SessionFailed {
+                                        token,
+                                        message: "这个 agent 不支持纯聊天".into(),
+                                    },
+                                );
+                                continue;
+                            }
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
                             let servers = supported(plugin_servers.lock().unwrap().clone());
                             let opened = open_new_session(&connection, cwd, servers).await;
                             report_started(&sink, &agent_name, token, opened, false);
                         }
-                        KernelCommand::ResumeSession { token, session_id, cwd } => {
+                        KernelCommand::ResumeSession { token, session_id, cwd, kind } => {
+                            if kind == SessionKind::Chat {
+                                emit(
+                                    &sink,
+                                    None,
+                                    KernelEvent::SessionFailed {
+                                        token,
+                                        message: "这个 agent 不支持纯聊天".into(),
+                                    },
+                                );
+                                continue;
+                            }
                             let cwd = cwd.unwrap_or_else(|| default_cwd.clone());
                             // 先拷出来再放锁：锁不能跨 await 拿着（界面线程 set_plugins 会被卡住）
                             let servers = supported(plugin_servers.lock().unwrap().clone());

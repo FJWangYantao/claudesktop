@@ -78,7 +78,7 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
 use claudesktop_core::plugin::{self, AgentDef, HookEvent, HookOutcome, Plugin, Skill};
 use claudesktop_core::{
     EventSink, Kernel, KernelEvent, ModeView, PartialGrant, PermissionHunks, PermissionOptionView,
-    PlanEntryView, Record, RoutedEvent, checkpoint,
+    PlanEntryView, Record, RoutedEvent, SessionKind, SessionSpec, checkpoint,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -152,6 +152,12 @@ pub struct BuiltinConfig {
     pub memory_suggest: bool,
     /// 「自动」模式（分类器代替用户审批）；None = 没配置，这个模式不出现
     pub auto_mode: Option<AutoModeConfig>,
+    /// 聊天会话用的模型；None = 跟随全局默认模型
+    pub chat_model: Option<String>,
+    /// 新建的聊天会话默认开不开联网（输入框里随时能改）
+    pub chat_web: bool,
+    /// 用户的「聊天说明」文件（每轮重读）：每次聊天都带上的话
+    pub chat_instructions: Option<PathBuf>,
 }
 
 impl BuiltinConfig {
@@ -170,6 +176,9 @@ impl BuiltinConfig {
             memory_path: default_memory_path(),
             memory_suggest: false,
             auto_mode: None,
+            chat_model: None,
+            chat_web: true,
+            chat_instructions: None,
         }
     }
 
@@ -234,6 +243,10 @@ fn modes(auto_available: bool) -> Vec<ModeView> {
 
 struct SessionState {
     cwd: PathBuf,
+    /// 会话类型（聊天会话不带工作目录那套，见「设计说明-聊天与Code分离.md」）
+    kind: SessionKind,
+    /// 聊天会话的「联网」开关（会话级，`Kernel::set_web` 改；Code 会话恒为 false 不用）
+    web: bool,
     /// 本会话使用的模型
     model: String,
     /// 本会话临时覆盖的思考档位（会话级 chip 选的）；None = 用档案里的
@@ -305,6 +318,15 @@ impl SessionState {
     }
 
     fn system_prompt(&self) -> String {
+        if self.kind == SessionKind::Chat {
+            return chat_system_prompt(
+                self.web,
+                self.restored,
+                self.summary.as_deref(),
+                &self.instructions,
+                &self.memory_global,
+            );
+        }
         let ctx = Context {
             instructions: &self.instructions,
             skills: &self.skills,
@@ -361,6 +383,12 @@ struct Inner {
     memory_suggest: bool,
     /// 「自动」模式的配置和分类器 provider（None = 没开这个模式）
     auto_mode: Option<AutoMode>,
+    /// 聊天会话用的模型（None = 跟随全局默认）
+    chat_model: Option<String>,
+    /// 新建聊天会话默认的联网开关
+    chat_web: bool,
+    /// 用户的「聊天说明」文件（每轮重读）
+    chat_instructions: Option<PathBuf>,
 }
 
 /// 「自动」模式的运行时：配置 + 每个会话的拒绝计数。
@@ -498,6 +526,19 @@ impl Inner {
             .is_none_or(|agent| subagent::allows(agent, tool))
     }
 
+    /// 这个会话是聊天会话时返回它的联网开关（`Some`），Code 会话返回 `None`。
+    /// 界面不知道会话类型，内核按 `SessionState::kind` 判断。
+    fn chat_web_of(&self, session: &str) -> Option<bool> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session).filter(|s| s.kind == SessionKind::Chat).map(|s| s.web)
+    }
+
+    /// 这个会话是不是聊天会话。
+    fn is_chat(&self, session: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session).is_some_and(|s| s.kind == SessionKind::Chat)
+    }
+
     /// 这是会话的第一轮吗（给标题起名用）；子会话 / 不存在的会话返回 false。
     fn is_first_turn(&self, session: &str) -> bool {
         let sessions = self.sessions.lock().unwrap();
@@ -577,6 +618,10 @@ impl Inner {
         tool: Option<&str>,
         mut input: Value,
     ) -> (Vec<String>, Option<String>) {
+        // 聊天会话不跑钩子：钩子是插件配的 shell 命令，按工作目录跑，聊天没有工作目录
+        if self.is_chat(session) {
+            return (Vec::new(), None);
+        }
         let hooks: Vec<plugin::Hook> = self
             .plugins
             .lock()
@@ -993,6 +1038,16 @@ impl Inner {
         call: &ToolCall,
         stopped: &dyn Fn() -> bool,
     ) -> ToolOutput {
+        // 聊天会话：不在名单里的工具一律回错误结果（模型照着续接前的文字瞎编、
+        // 或者别家模型幻觉都会走到这里），不进 authorize
+        if let Some(web) = self.chat_web_of(session)
+            && !tools::chat_allows(web, &call.function.name)
+        {
+            return ToolOutput::fail(
+                "This tool is not available in a chat conversation.",
+                "聊天里没有这个工具",
+            );
+        }
         // 待办清单不碰文件、不用授权，也不占一行工具：直接换掉界面上的计划（子会话没有这个工具）
         if call.function.name == tools::TODO_WRITE && self.tool_allowed(session, tools::TODO_WRITE)
         {
@@ -1050,6 +1105,8 @@ impl Inner {
             Ok(parsed) => parsed,
             Err(message) => return ToolOutput::fail(message, "参数无效"),
         };
+        // 聊天会话没有工作目录：一律记到全局，不会往 `<数据目录>/chat/.claudesktop/` 里写
+        let scope = if self.is_chat(session) { memory::Scope::Global } else { scope };
         let (path, scope_name) = match scope {
             memory::Scope::Global => (self.memory_path.clone(), "global"),
             memory::Scope::Project => (Some(memory::project_file_or(cwd)), "project"),
@@ -1519,6 +1576,10 @@ impl Inner {
                 let flag = parent.turn.clone()?;
                 let state = SessionState {
                     cwd: parent.cwd.clone(),
+                    // 子会话的 ID 是 `主会话/调用 ID`，`chat_web_of` 只看主会话，所以这两个
+                    // 字段对子会话没有实际作用；跟着主会话走，免得以后加判断时漏掉
+                    kind: parent.kind,
+                    web: parent.web,
                     model: agent.model.clone().unwrap_or_else(|| parent.model.clone()),
                     // 子任务跟主会话的档位走（用户中途换档也跟上）
                     thinking: parent.thinking,
@@ -1602,6 +1663,18 @@ impl Inner {
         }
     }
 
+    /// 有没有一条已保存的「总是拒绝」规则命中这个动作（聊天会话联网免问之前先看它）。
+    fn denied_rule_hits(&self, cwd: &Path, action: &Action) -> bool {
+        let Some(rule) = action.rule(cwd) else {
+            return false;
+        };
+        let command = match action {
+            Action::Shell { command, .. } => Some(command.as_str()),
+            _ => None,
+        };
+        self.rules.lock().unwrap().denies(cwd, &rule, command)
+    }
+
     /// 读工具直接放行；其余按模式 → 已保存规则 → 询问用户。
     /// 抓网页是只读的，Plan 模式下也能用（照样要问）。
     fn authorize(
@@ -1615,6 +1688,14 @@ impl Inner {
     ) -> Verdict {
         let access = action.access();
         if access == Access::Read {
+            return Verdict::Allow;
+        }
+        // 聊天会话：联网开着就是用户同意了（关着时这两个工具根本不在定义里）。
+        // 已保存的「总是拒绝」规则照样生效，所以放在规则判断之前
+        if access == Access::Fetch
+            && self.chat_web_of(session) == Some(true)
+            && !self.denied_rule_hits(cwd, action)
+        {
             return Verdict::Allow;
         }
         let mode = self.mode(session);
@@ -2045,6 +2126,9 @@ impl BuiltinKernel {
                 denials: Mutex::default(),
                 provider: Mutex::default(),
             }),
+            chat_model: config.chat_model,
+            chat_web: config.chat_web,
+            chat_instructions: config.chat_instructions,
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
@@ -2067,13 +2151,17 @@ impl BuiltinKernel {
     }
 
     /// 新建会话（`history` 有内容 = 续接），报告 `Started`。
-    fn open_session(&self, token: u64, cwd: Option<PathBuf>, history: history::Rebuilt) {
+    fn open_session(&self, token: u64, spec: SessionSpec, history: history::Rebuilt) {
         let n = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
         let session_id = format!("builtin-{}-{n}", std::process::id());
-        let cwd = cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
+        let kind = spec.kind;
+        let cwd = spec.cwd.unwrap_or_else(|| self.inner.default_cwd.clone());
         let resumed = !history.messages.is_empty() || history.summary.is_some();
+        // 聊天会话：不读项目配置（模型、权限规则、MCP、插件范围都不读），
+        // 说明换成用户的「聊天说明」，不放技能
+        let chat = kind == SessionKind::Chat;
         // 项目级配置（`.claudesktop/settings.json`）：模型、说明文件、停用的 MCP、权限规则
-        let project = claudesktop_core::project::load(&cwd);
+        let project = if chat { None } else { claudesktop_core::project::load(&cwd) };
         for warning in project.as_ref().map(|p| p.warnings.iter()).into_iter().flatten() {
             self.inner.emit(Some(&session_id), KernelEvent::Notice(warning.clone()));
         }
@@ -2112,18 +2200,36 @@ impl BuiltinKernel {
                 }
             }
         }
-        let instructions =
-            session_instructions(&cwd, self.inner.user_instructions.as_deref(), project.as_ref());
-        let skills = self.inner.skills(project.as_ref().and_then(|p| p.plugins_enabled.as_deref()));
-        // 项目指定的默认模型优先（全局默认其次）
-        let model = project
-            .as_ref()
-            .and_then(|p| p.model.clone())
-            .unwrap_or_else(|| self.inner.default_model.lock().unwrap().clone());
+        let instructions = if chat {
+            // 聊天不带项目说明，换成设置里写的「聊天说明」；每轮重读
+            instructions::chat_instructions(self.inner.chat_instructions.as_deref())
+        } else {
+            session_instructions(&cwd, self.inner.user_instructions.as_deref(), project.as_ref())
+        };
+        // 技能要 read_file 读文件，聊天没有
+        let skills = if chat {
+            Vec::new()
+        } else {
+            self.inner.skills(project.as_ref().and_then(|p| p.plugins_enabled.as_deref()))
+        };
+        // 项目指定的默认模型优先（全局默认其次）；聊天用设置里的聊天模型（空 = 全局默认）
+        let model = if chat {
+            self.inner
+                .chat_model
+                .clone()
+                .unwrap_or_else(|| self.inner.default_model.lock().unwrap().clone())
+        } else {
+            project
+                .as_ref()
+                .and_then(|p| p.model.clone())
+                .unwrap_or_else(|| self.inner.default_model.lock().unwrap().clone())
+        };
         let mcp_disabled = project.as_ref().map(|p| p.mcp_disabled.clone()).unwrap_or_default();
         let plugins_enabled = project.as_ref().and_then(|p| p.plugins_enabled.clone());
         let mut state = SessionState {
             cwd,
+            kind,
+            web: !chat || self.inner.chat_web,
             model: model.clone(),
             // 会话级档位默认跟随档案，用户在下拉里选了才覆盖
             thinking: None,
@@ -2162,8 +2268,9 @@ impl BuiltinKernel {
                 agent_name: self.inner.agent_name.clone(),
                 session_id: session_id.clone(),
                 model: Some(model),
-                modes: modes(self.inner.auto_mode.is_some()),
-                current_mode: Some(MODE_DEFAULT.into()),
+                // 聊天没有权限模式：模式表为空，界面据此不画模式 chip
+                modes: if chat { Vec::new() } else { modes(self.inner.auto_mode.is_some()) },
+                current_mode: (!chat).then(|| MODE_DEFAULT.to_string()),
                 resumed,
             },
         );
@@ -2278,6 +2385,75 @@ fn system_prompt(
         );
     }
     prompt
+}
+
+/// 聊天会话的系统提示词：通用助手 + 用户的「聊天说明」+ 全局记忆。
+/// 没有工作目录、平台、`BACKGROUND`、待办清单、技能、计划 / 自动模式那几段。
+/// 日期按天写（一天之内提示词不变，不废提示缓存）。
+fn chat_system_prompt(
+    web: bool,
+    restored: bool,
+    summary: Option<&str>,
+    instructions: &[instructions::Instruction],
+    memory_global: &[claudesktop_core::memory::Entry],
+) -> String {
+    let web = if web {
+        "You can search the web with web_search and read pages with web_fetch. Use them for recent \
+         events, facts you are unsure of, and URLs the user gives; cite the pages you used."
+    } else {
+        "You have no internet access; say so when a question needs current information."
+    };
+    let mut prompt = format!(
+        "You are a helpful assistant inside claudesktop, a desktop app. Today is {}.\n\
+         Answer in the user's language. Use Markdown for structure and code. Be direct; skip filler.\n\
+         Write math in LaTeX: $...$ inline and $$...$$ on its own lines for display. \
+         Do not use \\( \\) or \\[ \\].\n\
+         {web}",
+        today_local()
+    );
+    if restored {
+        prompt.push_str(
+            "\n\nThis conversation was restored from a saved log; the earlier turns above are \
+             its full text.",
+        );
+    }
+    if let Some(section) = instructions::chat_prompt_section(instructions) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
+    if let Some(section) = claudesktop_core::memory::prompt_section(&[], memory_global) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
+    }
+    if let Some(summary) = summary {
+        prompt.push_str("\n\n");
+        prompt.push_str(&compact::prompt_section(summary));
+    }
+    prompt
+}
+
+/// 本地日期（`2026-10-22`）：按天写进聊天提示词，一天之内不变。
+fn today_local() -> String {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    civil_from_days(since.div_euclid(86_400))
+}
+
+/// Unix 天数 → `YYYY-MM-DD`（按 UTC；差一天不影响「今天是哪天」这句话）。
+fn civil_from_days(days: i64) -> String {
+    // Howard Hinnant 的算法（公历换算）
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{}-{m:02}-{d:02}", if m <= 2 { y + 1 } else { y })
 }
 
 /// provider 的 finish_reason → ACP 风格的 stop_reason。
@@ -2455,7 +2631,6 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         {
             last.append_text(&reminder);
         }
-        let mut specs = tools::specs(mode != MODE_PLAN);
         let (disabled, plugin_scope) = {
             let sessions = inner.sessions.lock().unwrap();
             sessions
@@ -2463,12 +2638,19 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                 .map(|s| (s.mcp_disabled.clone(), s.plugins_enabled.clone()))
                 .unwrap_or_default()
         };
-        specs.extend(inner.mcp.specs(mode != MODE_PLAN, &disabled));
-        match &agent {
-            // 主会话能派子任务；子会话按角色的工具清单筛（不嵌套）
-            None => specs.push(subagent::spec(&inner.agents(plugin_scope.as_deref()))),
-            Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
-        }
+        // 聊天会话：只有联网（开着时）和记忆，不带 MCP 工具、不带子任务
+        let specs = if let Some(web) = inner.chat_web_of(session) {
+            tools::chat_specs(web)
+        } else {
+            let mut specs = tools::specs(mode != MODE_PLAN);
+            specs.extend(inner.mcp.specs(mode != MODE_PLAN, &disabled));
+            match &agent {
+                // 主会话能派子任务；子会话按角色的工具清单筛（不嵌套）
+                None => specs.push(subagent::spec(&inner.agents(plugin_scope.as_deref()))),
+                Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
+            }
+            specs
+        };
         let mut text = String::new();
         // 会话级档位覆盖档案里的那份；没覆盖时直接用构造好的 provider
         let provider: &dyn ChatProvider = match thinking {
@@ -2636,8 +2818,8 @@ impl Kernel for BuiltinKernel {
         self.inner.agent_name.clone()
     }
 
-    fn new_session(&self, token: u64, cwd: Option<PathBuf>) -> anyhow::Result<()> {
-        self.open_session(token, cwd, history::Rebuilt::default());
+    fn new_session(&self, token: u64, spec: SessionSpec) -> anyhow::Result<()> {
+        self.open_session(token, spec, history::Rebuilt::default());
         Ok(())
     }
 
@@ -2646,10 +2828,26 @@ impl Kernel for BuiltinKernel {
         &self,
         token: u64,
         _session_id: &str,
-        cwd: Option<PathBuf>,
+        spec: SessionSpec,
         history: &[Record],
     ) -> anyhow::Result<()> {
-        self.open_session(token, cwd, history::rebuild(history));
+        self.open_session(token, spec, history::rebuild(history));
+        Ok(())
+    }
+
+    fn supports_chat(&self) -> bool {
+        true
+    }
+
+    fn set_web(&self, session: &str, web: bool) -> anyhow::Result<()> {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        let state =
+            sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+        if state.kind != SessionKind::Chat {
+            anyhow::bail!("只有聊天会话能关联网");
+        }
+        // 下一轮开头生效（进行中的一轮工具定义中途变了，有的端点会报错）
+        state.web = web;
         Ok(())
     }
 
@@ -2666,13 +2864,19 @@ impl Kernel for BuiltinKernel {
                 anyhow::bail!("上一轮还没结束");
             }
             // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
-            let project = claudesktop_core::project::load(&state.cwd);
-            state.instructions = session_instructions(
-                &state.cwd,
-                self.inner.user_instructions.as_deref(),
-                project.as_ref(),
-            );
-            state.skills = self.inner.skills(state.plugins_enabled.as_deref());
+            if state.kind == SessionKind::Chat {
+                // 聊天说明每轮重读（改了下一轮就生效）；聊天没有技能
+                state.instructions =
+                    instructions::chat_instructions(self.inner.chat_instructions.as_deref());
+            } else {
+                let project = claudesktop_core::project::load(&state.cwd);
+                state.instructions = session_instructions(
+                    &state.cwd,
+                    self.inner.user_instructions.as_deref(),
+                    project.as_ref(),
+                );
+                state.skills = self.inner.skills(state.plugins_enabled.as_deref());
+            }
             // 记忆文件同理：界面删掉一条，下一轮就不在提示词里了
             let warnings = state.reload_memory_for_turn(self.inner.memory_path.as_deref());
             // 自动模式的分类器靠这些判断「用户授权了什么」：只记用户说的话

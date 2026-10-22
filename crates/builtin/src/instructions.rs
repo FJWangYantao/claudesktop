@@ -82,6 +82,23 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
+/// 读某个说明文件（聊天说明用：只有一份，没有项目里的那些）。
+pub fn load_file(path: &Path) -> Vec<Instruction> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let text = clip(text.trim(), FILE_MAX_CHARS);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![Instruction { path: path.to_path_buf(), text }]
+}
+
+/// 聊天会话的说明：只有设置里写的「聊天说明」一份（没有项目说明、没有用户级 CLAUDE.md）。
+pub fn chat_instructions(file: Option<&Path>) -> Vec<Instruction> {
+    file.map(load_file).unwrap_or_default()
+}
+
 /// 拼成系统提示词里的一节；没有说明返回 None。
 pub fn prompt_section(found: &[Instruction]) -> Option<String> {
     if found.is_empty() {
@@ -95,6 +112,23 @@ pub fn prompt_section(found: &[Instruction]) -> Option<String> {
     );
     for f in found {
         out.push_str(&format!("\n\n## {}\n\n{}", f.path.display(), f.text));
+    }
+    Some(out)
+}
+
+/// 聊天会话那一节（用户的「聊天说明」）：只有一份，没有项目、没有文件路径。
+pub fn chat_prompt_section(found: &[Instruction]) -> Option<String> {
+    if found.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "# User instructions\n\
+         The user wrote these for every chat. Follow them; they take precedence over the \
+         general guidance above.",
+    );
+    for f in found {
+        out.push_str("\n\n");
+        out.push_str(&f.text);
     }
     Some(out)
 }

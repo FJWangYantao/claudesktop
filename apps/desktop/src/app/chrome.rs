@@ -96,8 +96,11 @@ impl ChatApp {
         let crumb = if self.settings_open {
             crumb
         } else {
-            // 任务会话没有项目：面包屑里写「任务」，不拿默认目录的名字冒充项目
-            let (icon, project) = if s.task {
+            // 任务会话没有项目：面包屑里写「任务」，不拿默认目录的名字冒充项目；
+            // 聊天会话没有工作目录，写「聊天」
+            let (icon, project) = if s.is_chat() {
+                (IconAll::MessageSquare, "聊天".to_string())
+            } else if s.task {
                 (IconAll::ListTodo, "任务".to_string())
             } else {
                 let label = s
