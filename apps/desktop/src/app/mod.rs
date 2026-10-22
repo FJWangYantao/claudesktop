@@ -251,6 +251,19 @@ impl Drop for ChatApp {
     }
 }
 
+/// 从聊天复制到 Code 会话时只抄这些记录：对话本身。
+/// 文件改动 / 检查点 / 回退不抄（新会话的目录里没有那些文件，抄过去回退会乱）。
+fn copyable(record: &Record) -> bool {
+    matches!(
+        record,
+        Record::User { .. }
+            | Record::Event { .. }
+            | Record::PermissionResolved { .. }
+            | Record::Turn { .. }
+            | Record::Thought { .. }
+    )
+}
+
 impl ChatApp {
     /// 按槽的 key 找（只读）。
     pub(crate) fn slot(&self, key: &str) -> Option<&KernelSlot> {
@@ -745,6 +758,75 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 「在项目里继续…」（见设计说明第八章）：把当前聊天**复制**成一个 Code 会话。
+    ///
+    /// 新会话拿一份新的日志（新 ID、`kind: Code`、选的那个目录），内容原样抄过来；
+    /// 自研内核续接时按日志重建上下文，所以它「记得」前面聊过什么，而且现在有了工具。
+    /// 原来的聊天不动（转换会让原聊天消失，复制干净）。
+    pub(crate) fn continue_in_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let src = self.active;
+        let Some(store) = self.store.as_ref() else {
+            self.toast(Notification::warning("数据目录不可用，没法把这段聊天接到项目里"), cx);
+            return;
+        };
+        let records = match &self.sessions[src].meta {
+            Some(meta) => store.load(&meta.id).unwrap_or_default(),
+            // 还没落过盘（一个字都没发）：没有可复制的东西
+            None => Vec::new(),
+        };
+        // 只抄对话本身：文件改动 / 检查点 / 回退不抄（新目录里没有那些文件，抄过去回退会乱）
+        let records: Vec<Record> = records
+            .into_iter()
+            .filter(copyable)
+            .map(|r| match r {
+                // 图片附件的路径指向前一个会话的资产目录：还在的保留，不在的去掉
+                Record::User { text, images, sent } => Record::User {
+                    text,
+                    images: images.into_iter().filter(|p| Path::new(p).is_file()).collect(),
+                    sent,
+                },
+                other => other,
+            })
+            .collect();
+        let title = format!("{}（接着聊）", self.sessions[src].title);
+        let kind = self.settings.kernel_for_space(Space::Code);
+        let agent_cmd = self.slot(&kind.key()).map(|s| s.agent_cmd.clone()).unwrap_or_default();
+        let created =
+            store.create(&title, dir.clone(), &agent_cmd).and_then(|(mut meta, mut log)| {
+                meta.kind = SessionKind::Code;
+                meta.task = false;
+                store.save_meta(&meta)?;
+                for record in records {
+                    log.append(record)?;
+                }
+                Ok(meta)
+            });
+        let meta = match created {
+            Ok(meta) => meta,
+            Err(err) => {
+                self.toast(Notification::error(format!("没能接到项目里：{err}")), cx);
+                return;
+            }
+        };
+        // 在代码空间里开出来并切过去（新会话要先续接内核、重建上下文）
+        self.remember_space(self.space());
+        self.settings.space = Space::Code;
+        self.update_settings(|s| s.space = Space::Code);
+        let idx = self.open_session_of(kind, dir.clone(), SessionKind::Code);
+        self.sessions[idx].meta = Some(meta);
+        self.sessions[idx].title = title.into();
+        self.sessions[idx].restored = true;
+        self.sessions[idx].renamed = true;
+        self.sessions[idx].note(format!(
+            "从聊天接过来的（目录：{}）。前面聊过的内容都在上下文里，现在可以动文件、跑命令了",
+            dir.display()
+        ));
+        self.active = idx;
+        self.remember_space(Space::Code);
+        self.suggestion.clear();
+        cx.notify();
+    }
+
     /// 在某个空间里开一个新会话（用该空间的默认内核和目录），并切过去。
     fn open_in_space(&mut self, space: Space, cx: &mut Context<Self>) {
         let (kind, cwd) = self.space_defaults(space);
@@ -931,6 +1013,24 @@ impl ChatApp {
             meta.task = s.task;
             let _ = store.save_meta(meta);
         }
+    }
+
+    /// 「在项目里继续…」（顶栏的按钮）：选一个目录，把当前聊天接到那个目录的 Code 会话里。
+    pub(crate) fn continue_in_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选一个项目目录，把这段聊天接过去".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(dir) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |app, _, cx| app.continue_in_dir(dir, cx));
+            }
+        })
+        .detach();
     }
 
     /// 目录菜单里的「选择文件夹…」：系统对话框选一个目录切过去。
@@ -2503,4 +2603,33 @@ fn load_prompt_image(path: &std::path::Path) -> Option<PromptImage> {
         media_type: mime_of(path).to_string(),
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
     })
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    /// 复制到 Code 会话的只有对话本身：文件改动 / 检查点 / 回退不抄。
+    #[core::prelude::v1::test]
+    fn only_the_conversation_is_copied() {
+        assert!(copyable(&Record::user("你好")));
+        assert!(copyable(&Record::Event {
+            event: KernelEvent::AgentMessageChunk { text: "在".into() }
+        }));
+        assert!(copyable(&Record::PermissionResolved { id: 1, label: "Yes".into() }));
+        assert!(copyable(&Record::Thought { elapsed_ms: 1200 }));
+        // 文件改动、检查点、回退不抄
+        assert!(!copyable(&Record::FileChanged {
+            path: "a.rs".into(),
+            before: None,
+            after: None,
+            reverted: None,
+        }));
+        assert!(!copyable(&Record::Rewind {
+            turn: 0,
+            conversation: true,
+            files: 0,
+            prompt: "x".into(),
+        }));
+    }
 }

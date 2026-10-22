@@ -202,6 +202,22 @@ impl ChatApp {
                     view_menu_items,
                 )))
             })
+            // 聊天会话：接到某个项目里继续（复制日志成 Code 会话，见设计说明第八章）
+            .when(self.session().is_chat() && can_export, |d| {
+                d.child(
+                    Self::quiet_button(
+                        "continue-in-project",
+                        IconAll::FolderOpen,
+                        Surface::Paper,
+                        cx,
+                    )
+                    .mr_1()
+                    .tooltip("在项目里继续…（把这段聊天接到一个项目的 Code 会话里）")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.continue_in_project(window, cx)),
+                    ),
+                )
+            })
             .when(can_export, |d| {
                 d.child(
                     Self::quiet_button("share-session", IconAll::Share, Surface::Paper, cx)
