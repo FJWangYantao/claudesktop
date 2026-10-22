@@ -624,7 +624,7 @@ impl ChatApp {
             self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
         let usage_open =
             self.settings_open && self.settings_form.tab == super::usage_view::USAGE_TAB;
-        // 品牌：桌面日出标志（同 exe 图标、首页问候语）+ 名字。不是按钮，摆在拖拽区里
+        // 品牌：小陶（同 exe 图标、首页问候语）+ 名字。不是按钮，摆在拖拽区里
         let brand =
             div().h_flex().items_center().gap_2().pl_1().child(brand_mark(rems(1.25))).child(
                 div()
