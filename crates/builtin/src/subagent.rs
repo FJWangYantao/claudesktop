@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 pub const TASK: &str = "task";
 pub const GENERAL: &str = "general-purpose";
 pub const EXPLORE: &str = "explore";
-/// 只读调研角色能用的工具：只看不改，所以它的调用在默认模式下也不用逐个审批
+/// 只读调研角色能用的工具：只看不改，读文件、搜代码不用审批（联网照常按模式问）
 const EXPLORE_TOOLS: [&str; 7] =
     ["read_file", "list_dir", "glob", "grep", "web_fetch", "web_search", "memory_search"];
 
