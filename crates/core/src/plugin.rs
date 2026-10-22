@@ -245,7 +245,7 @@ fn load_marketplace(dir: &Path, value: &Value) -> Vec<Plugin> {
                     name,
                     root: dir.to_path_buf(),
                     problems: vec![
-                        "这个插件在别的仓库里，暂不支持从市场跟着装，请单独用它的地址安装".into(),
+                        "这个插件在别的仓库里：在「推荐」里按它的仓库地址单独装（或者填 git 地址装），不跟着这个市场一起装".into(),
                     ],
                     ..Plugin::default()
                 },

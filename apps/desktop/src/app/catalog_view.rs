@@ -108,12 +108,14 @@ pub(super) fn shelf_bar(
 /// 推荐列表里的一行：标题、名字（等宽）、要准备什么，下面一句说明；右边是按钮或状态。
 pub(super) fn pick_row(
     first: bool,
-    title: &'static str,
-    name: &'static str,
-    needs: &'static str,
-    description: &'static str,
+    title: &str,
+    name: &str,
+    needs: &str,
+    description: &str,
     action: impl IntoElement,
 ) -> Div {
+    let (title, name, needs, description) =
+        (title.to_string(), name.to_string(), needs.to_string(), description.to_string());
     div()
         .h_flex()
         .items_center()

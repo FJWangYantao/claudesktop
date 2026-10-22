@@ -30,7 +30,9 @@ mod store;
 
 pub use acp::{AcpKernel, AcpKernelConfig};
 pub use agents::{AgentPreset, DetectState, Detected};
-pub use diff::{DiffLineView, DiffView};
+pub use diff::{
+    DiffHunk, DiffLineView, DiffView, HunkRange, hunk_ranges, hunks_with_context, splice_ranges,
+};
 pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
 pub use store::{
@@ -73,6 +75,34 @@ pub struct PermissionOptionView {
     pub name: String,
     /// 种类：allow_once / allow_always / reject_once / reject_always
     pub kind: String,
+}
+
+/// 按块部分同意：这次只放行这些块，其余块不写盘（等用户先看）。
+///
+/// 只对自研内核的写文件 / 改文件工具开放（其它内核的工具结果不归我们写，做不到）。
+/// 写 / 改文件一次只动一个文件，块编号就是那个文件的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialGrant {
+    /// 放行的块编号（[`PermissionHunks`] 里的 `index`）
+    pub hunks: Vec<u32>,
+}
+
+/// 权限请求里「可以按块同意」的那部分：这次要写哪些文件、每个文件的块。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionHunks {
+    /// 一个文件一项（写 / 改都只有一个文件，留成列表是为了以后的多文件工具）
+    pub files: Vec<HunkFile>,
+}
+
+/// 按块同意里的一个文件。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HunkFile {
+    /// 显示用路径（和 [`DiffView::path`] 一致，界面上对得上）
+    pub path: String,
+    /// 这次改动在整个文件里的块（带上下文行，够画出来）
+    pub hunks: Vec<crate::DiffHunk>,
+    /// 这次要写的内容是不是覆盖整个文件（新建 / 整份重写）；False = 只替换了几处
+    pub whole_file: bool,
 }
 
 /// 内核 → UI 的事件流。
@@ -176,6 +206,10 @@ pub enum KernelEvent {
         /// 触发请求的工具调用 ID（应答后界面把结果并进那一行）；旧日志没有
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
+        /// 这次改动可以按块部分同意：等这行的块（编号同 [`DiffView`](crate::DiffView) 的
+        /// `'~'` 分隔段，和逐块审查共用一份划分）。None = 不支持按块（ACP、命令类工具、旧日志）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hunks: Option<PermissionHunks>,
     },
     /// 客户端代执行的 fs 读请求结果
     FsRead { path: String, ok: bool },
@@ -540,6 +574,18 @@ pub trait Kernel: Send + Sync {
     /// 应答一个 [`KernelEvent::PermissionRequest`]：`Some(选项 ID)` 选择，
     /// `None` 表示取消（等同拒绝且不再追问）。
     fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()>;
+
+    /// 同 [`resolve_permission`](Self::resolve_permission)，另外带上「只写这些块」。
+    /// 只有自研内核的写文件 / 改文件认它；别的内核忽略 `grant`，按整个动作放行。
+    fn resolve_permission_with(
+        &self,
+        request_id: u64,
+        option_id: Option<String>,
+        grant: Option<PartialGrant>,
+    ) -> anyhow::Result<()> {
+        let _ = grant;
+        self.resolve_permission(request_id, option_id)
+    }
     /// 切换权限模式；结果经 `Status` 事件回报，不支持的 agent 会被忽略。
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()>;
     /// 切换某会话之后各轮使用的模型；默认不支持。

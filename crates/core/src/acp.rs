@@ -317,7 +317,13 @@ fn run_kernel(
                         emit(
                             &sink_permission,
                             Some(session),
-                            KernelEvent::PermissionRequest { id, title, options, tool },
+                            KernelEvent::PermissionRequest {
+                                id,
+                                title,
+                                options,
+                                tool,
+                                hunks: None,
+                            },
                         );
                         return connection.spawn(async move {
                             let outcome = match rx.await.ok().flatten() {

@@ -117,6 +117,9 @@ pub struct Session {
     pub unread: bool,
     /// 这一轮跑着时用户又发的消息（先进先出）：这一轮正常结束就发出第一条，见 `ChatApp::dispatch_queued`。只在内存里
     pub queued: Vec<QueuedPrompt>,
+    /// 这一轮跑着时点了 `/compact`：排在这轮后面，轮子正常结束后、发排队的消息之前压（见
+    /// `ChatApp::queued_compaction`）。用户停下 / 这一轮出错时撤掉并说明。只在内存里
+    pub compact_queued: bool,
     /// 用户按了停止、内核还没回这一轮的结束：这期间发的消息先排队，等结束到了再发
     /// （不然迟到的「已取消」会落在新的一轮头上，把它提前收掉）
     pub stopping: bool,
@@ -363,6 +366,7 @@ impl Session {
             retry: None,
             unread: false,
             queued: Vec::new(),
+            compact_queued: false,
             reveal: None,
             wheel: None,
             stopping: false,
@@ -1004,6 +1008,7 @@ impl Session {
     }
 
     /// 应答某条权限请求：`Some((选项 ID, 展示名))` 选择，`None` 取消。
+    /// 选的是「允许一次」而且卡片上取消勾选了一部分块时，把剩下的块作为按块同意交给内核。
     pub fn resolve_permission(
         &mut self,
         idx: usize,
@@ -1013,20 +1018,32 @@ impl Session {
         let Some(kernel) = kernel else {
             return;
         };
-        if let Some(ChatItem::Permission { id, resolved, .. }) = self.transcript.get_mut(idx) {
-            if resolved.is_some() {
-                return;
-            }
-            let label: SharedString = match &choice {
-                Some((_, name)) => name.clone().into(),
-                None => "已取消".into(),
-            };
-            *resolved = Some(match kernel.resolve_permission(*id, choice.map(|(i, _)| i)) {
-                Ok(()) => label,
-                Err(err) => format!("应答失败：{err}").into(),
-            });
-            self.merge_permission(idx);
+        let Some(ChatItem::Permission { id, resolved, keep, .. }) = self.transcript.get_mut(idx)
+        else {
+            return;
+        };
+        if resolved.is_some() {
+            return;
         }
+        let id = *id;
+        let label: SharedString = match &choice {
+            Some((_, name)) => name.clone().into(),
+            None => "已取消".into(),
+        };
+        // 只有「允许一次」才按块写：选「总是允许」是存规则，之后整个动作都放行
+        let allow_once = choice.as_ref().is_some_and(|(id, _)| id == "allow_once");
+        let (grant, label) = match (allow_once, keep.take()) {
+            (true, Some(hunks)) => {
+                let text: SharedString = format!("{label}（只写 {} 块）", hunks.len()).into();
+                (Some(claudesktop_core::PartialGrant { hunks }), text)
+            }
+            _ => (None, label),
+        };
+        *resolved = Some(match kernel.resolve_permission_with(id, choice.map(|(i, _)| i), grant) {
+            Ok(()) => label,
+            Err(err) => format!("应答失败：{err}").into(),
+        });
+        self.merge_permission(idx);
     }
 
     /// 应答过的权限请求并进它的工具行（工具行末尾出「已允许」之类的短标签），这一行不再画。
@@ -1042,10 +1059,12 @@ impl Session {
         else {
             return;
         };
-        let grant = if label.as_ref() == "已取消" {
+        // 按块同意的标签带着「（只写 N 块）」：匹配选项时去掉它
+        let base = partial_base(label);
+        let grant = if base.as_ref() == "已取消" {
             Grant::from_choice(None, label.clone())
         } else {
-            match options.iter().find(|o| o.name == label.as_ref()) {
+            match options.iter().find(|o| o.name == base.as_ref()) {
                 Some(option) => Grant::from_choice(Some(&option.kind), label.clone()),
                 None => return,
             }
@@ -1114,10 +1133,19 @@ impl Session {
         }
     }
 
+    /// 排着的「压缩上下文」（[`Self::compact_queued`]）不做了：撤掉并在对话里说一句（`why` 是开头的原因）。
+    pub fn drop_queued_compaction(&mut self, why: &str) {
+        if std::mem::take(&mut self.compact_queued) {
+            self.note(format!("{why}：排着的「压缩上下文」也撤掉了，需要的话再发一次"));
+        }
+    }
+
     /// 内核要换了：收尾进行中的一轮，断开与旧内核会话的关联。
     /// 有对话的会话变成「历史会话」，下次发消息时在新内核上续接。
     pub fn detach_kernel(&mut self, kernel: Option<&Arc<dyn Kernel>>) {
         self.cancel_pending_permissions(kernel);
+        // 排着的压缩是给旧内核会话的：撤掉，免得新会话接上时和第一轮撞在一起
+        self.drop_queued_compaction("内核已切换");
         self.cancel_token += 1;
         if self.busy {
             self.busy = false;
@@ -1147,6 +1175,7 @@ impl Session {
         self.ready = false;
         self.cancel_pending_permissions(kernel);
         self.note(format!("内核错误：{message}"));
+        self.drop_queued_compaction("内核出错");
     }
 
     /// 内核事件 → 本会话的界面内容（ACP `session/update` 的 UI 投影）。
@@ -1370,7 +1399,7 @@ impl Session {
                     }),
                 }
             }
-            KernelEvent::PermissionRequest { id, title, options, tool } => {
+            KernelEvent::PermissionRequest { id, title, options, tool, hunks } => {
                 self.finish_thinking();
                 self.transcript.push(ChatItem::Permission {
                     id,
@@ -1379,6 +1408,9 @@ impl Session {
                     resolved: None,
                     tool,
                     merged: false,
+                    hunks,
+                    // 默认全部放行：「允许一次」就是不勾也行
+                    keep: None,
                 });
             }
             KernelEvent::Compacting => {
@@ -1564,6 +1596,17 @@ impl Session {
     }
 }
 
+/// 权限应答的展示名去掉按块写的后缀（「允许一次（只写 2 块）」→「允许一次」），
+/// 用来对回内核给的选项名。只认这一种后缀：agent 自己的选项名里也可能带括号（「允许（本次会话）」）。
+fn partial_base(label: &SharedString) -> SharedString {
+    let base = label.strip_suffix(" 块）").and_then(|rest| {
+        let at = rest.rfind("（只写 ")?;
+        let n = &rest[at + "（只写 ".len()..];
+        (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| &rest[..at])
+    });
+    base.map_or_else(|| label.clone(), SharedString::from)
+}
+
 /// 一段（Markdown）文字的第一行有内容的话，去掉标题 / 列表 / 引用记号，截到通知里放得下。
 fn preview_line(text: &str) -> Option<String> {
     const MAX_CHARS: usize = 80;
@@ -1714,6 +1757,7 @@ mod tests {
             }],
             // 旧日志：不知道是哪个工具调用的，应答后照旧单独一行
             tool: None,
+            hunks: None,
         })
     }
 
@@ -2112,6 +2156,39 @@ mod tests {
             row,
             Some(ChatItem::Compaction { state: CompactState::Failed(t), .. }) if t.as_ref() == "已取消"
         ));
+    }
+
+    /// 按块同意的后缀只去掉自己加的那种，agent 选项名里本来的括号不动。
+    #[core::prelude::v1::test]
+    fn partial_base_strips_only_the_hunk_suffix() {
+        let base = |s: &str| partial_base(&SharedString::from(s.to_string())).to_string();
+        assert_eq!(base("允许一次（只写 2 块）"), "允许一次");
+        assert_eq!(base("允许（本次会话）"), "允许（本次会话）");
+        assert_eq!(base("允许（本次会话）（只写 12 块）"), "允许（本次会话）");
+        assert_eq!(base("允许一次（只写 几 块）"), "允许一次（只写 几 块）");
+    }
+
+    /// 排着的压缩是给旧内核会话的：换内核、内核出错都撤掉并说一句，不留到新会话里和第一轮撞上。
+    #[core::prelude::v1::test]
+    fn queued_compaction_is_dropped_on_detach_and_fatal() {
+        let notes = |s: &Session| {
+            s.transcript
+                .iter()
+                .filter(|i| matches!(i, ChatItem::Note(t) if t.contains("压缩上下文")))
+                .count()
+        };
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        s.compact_queued = true;
+        s.detach_kernel(None);
+        assert!(!s.compact_queued);
+        assert_eq!(notes(&s), 1);
+        // 没排着就什么都不说
+        s.detach_kernel(None);
+        assert_eq!(notes(&s), 1);
+        s.compact_queued = true;
+        s.on_fatal("断了", None);
+        assert!(!s.compact_queued);
+        assert_eq!(notes(&s), 2);
     }
 
     #[core::prelude::v1::test]
@@ -2526,6 +2603,7 @@ mod tests {
                     })
                     .collect(),
                 tool: Some(tool.into()),
+                hunks: None,
             })
         };
         let records = vec![

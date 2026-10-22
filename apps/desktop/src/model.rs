@@ -1,6 +1,6 @@
 //! 对话记录的数据模型、模式表与工具行辅助函数（UI 无关逻辑）。
 
-use claudesktop_core::{DiffView, PermissionOptionView, PromptImage, UserPrompt};
+use claudesktop_core::{DiffView, PermissionHunks, PermissionOptionView, PromptImage, UserPrompt};
 use gpui_kit::SharedString;
 use gpui_kit::assets::IconName as IconAll;
 use std::time::Instant;
@@ -390,6 +390,10 @@ pub enum ChatItem {
         tool: Option<String>,
         /// 应答结果已并进那个工具行：这一行不再画（见 `Session::merge_permission`）
         merged: bool,
+        /// 这次改动可以按块部分同意（自研内核的写 / 改文件）：卡片上列出这些块，可以取消勾选
+        hunks: Option<PermissionHunks>,
+        /// 用户在卡片上取消勾选之后放行的块（`None` = 没动过，全放行）
+        keep: Option<Vec<u32>>,
     },
     Plan(Vec<PlanRow>),
     Agent(String),
@@ -562,10 +566,19 @@ impl ChatItem {
                 c.grant.as_ref().map(|g| g.kind),
             )
                 .hash(&mut h),
-            Self::Permission { title, options, resolved, merged, .. } => {
-                (4u8, title.len(), options.len(), resolved.as_ref().map(|r| r.len()), merged)
-                    .hash(&mut h)
-            }
+            // 按块同意：块数 / 行数决定卡片多高，勾掉几块会换标题文字（可能多折一行）
+            Self::Permission { title, options, resolved, merged, hunks, keep, .. } => (
+                4u8,
+                title.len(),
+                options.len(),
+                resolved.as_ref().map(|r| r.len()),
+                merged,
+                hunks.as_ref().map(|h| {
+                    h.files.iter().flat_map(|f| &f.hunks).map(|x| x.lines.len() + 1).sum::<usize>()
+                }),
+                keep.as_ref().map(Vec::len),
+            )
+                .hash(&mut h),
             Self::Plan(rows) => {
                 5u8.hash(&mut h);
                 for r in rows {

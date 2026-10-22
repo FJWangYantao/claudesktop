@@ -446,18 +446,21 @@ impl ChatApp {
 
     /// 输入框正上方的排队消息（`Session::queued`）：一条一行，可以退回输入框改、删掉；
     /// 上一轮没有正常结束（停了 / 出错）时队列不自己走，每行多一个「现在发送」。
+    /// 排着的「压缩上下文」（`Session::compact_queued`）也占一行，最先发出（压完再发消息）。
     fn render_queue(&self, cx: &mut Context<Self>) -> Option<Div> {
         let s = self.session();
-        if s.queued.is_empty() {
+        let compact = s.compact_queued;
+        if s.queued.is_empty() && !compact {
             return None;
         }
+        let count = s.queued.len() + usize::from(compact);
         let busy = s.busy;
         let hint = if busy {
-            format!("排队 {} 条 · 这一轮结束后依次发出", s.queued.len())
+            format!("排队 {count} 条 · 这一轮结束后依次发出")
         } else if s.stopping {
-            format!("排队 {} 条 · 停稳后发出", s.queued.len())
+            format!("排队 {count} 条 · 停稳后发出")
         } else {
-            format!("排队 {} 条 · 上一轮没有正常结束，先不自动发", s.queued.len())
+            format!("排队 {count} 条 · 上一轮没有正常结束，先不自动发")
         };
         let mut card = div()
             .v_flex()
@@ -470,6 +473,39 @@ impl ChatApp {
             .text_size(TEXT_SMALL)
             .text_color(rgb(INK_SOFT))
             .child(div().py_0p5().font_features(tabular_nums()).child(hint));
+        if compact {
+            let label = if s.queued.is_empty() {
+                "压缩上下文 · 这一轮结束后开始"
+            } else {
+                "压缩上下文 · 先压再发下面的消息"
+            };
+            card = card.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Icon::new(IconAll::ListCollapse).size_3p5().flex_shrink_0())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(rgb(INK))
+                            .child(label),
+                    )
+                    .child(
+                        Self::quiet_button("queue-compact-remove", IconAll::X, Surface::Sand, cx)
+                            .xsmall()
+                            .tooltip("不压了")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sessions[this.active].compact_queued = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
         for (i, item) in s.queued.iter().enumerate() {
             let text: SharedString = item.summary().into();
             card = card.child(

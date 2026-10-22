@@ -249,7 +249,7 @@ impl ChatApp {
     }
 
     /// 「一轮结束后猜下一句」这次要不要猜：开关开着、自研内核配好了、不在设置页、
-    /// 输入框空着，而且这一轮结束后没有接着开下一轮（排队的消息已经发出去了）。
+    /// 输入框空着，而且这一轮结束后没有接着开下一轮（排队的消息 / 压缩已经接上了）。
     fn next_suggestion_enabled(&self, cx: &App) -> bool {
         self.settings.next_suggestion
             && !self.settings_open
@@ -258,6 +258,7 @@ impl ChatApp {
             && self.session().acp_id.is_some()
             && !self.session().busy
             && self.session().queued.is_empty()
+            && !self.session().compact_queued
             && self.input.read(cx).value().is_empty()
     }
 

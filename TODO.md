@@ -8,26 +8,32 @@
 
 ## 零、已知 bug（要修）
 
-- [ ] **一轮跑着的时候 `/compact` 被吃掉**（小）：`ChatApp::compact_session` 开头 `if s.busy { return }`
+- [x] **一轮跑着的时候 `/compact` 被吃掉**（小）：`ChatApp::compact_session` 开头 `if s.busy { return }`
   一声不响就退出，而命令面板 / 补全选中时已经把输入框里的 `/compact` 换掉了，所以看起来是「发了、什么也没发生」。
-  该跟发消息一样排队：`Session` 上记一个「这一轮结束后压缩」，`clean_end` 时在 `dispatch_queued` **之前**压
-  （压缩自成一轮，见 `begin_turn` + `compact_turn`），输入框上方那行队列文字里标出来；
-  用户停下 / 这一轮出错时撤掉并说明一句（和排队消息一样，不自动往下走）。
+  现在和发消息一样排队：`Session::compact_queued`，`clean_end` 时由 `queued_compaction` 在 `dispatch_queued`
+  **之前**压（压缩自成一轮），输入框上方那行队列文字也标出来、可以「不压了」；
+  用户停下 / 这一轮出错时撤掉并在对话里说明一句。
 
 ## 一、单个子系统（一天上下）
 
-1. [ ] **插件市场补齐**（小～中，约一天）：推荐项里指向别的仓库的条目不支持（现在只列出来并注明）、按版本号装 / 回退。
-     见「设计说明-插件.md」末尾「还没做」。两件事都不动内核，只补 `catalog.rs` 与 `plugin_git.rs`。
+1. [x] **插件市场补齐**（小～中，约一天）：推荐项里指向别的仓库的条目（`EXTERNAL_PLUGIN_PICKS`，按市场清单里的
+     `ref` 钉版本）、按版本号装 / 换版本（`plugin_git::install_at` / `versions` / `checkout`，插件卡片上的版本 chip）。
+     见「设计说明-插件.md」。
 
 ## 二、跨层改动（内核 + 界面一起动）
 
-2. [ ] **逐块审查第 2 期**（约 1.5 天）：自研内核授权时按块部分同意——权限卡上的 diff 按块勾选，
-     工具结果写明只写了哪几块。见「设计说明-逐块审查改动.md」第十节。要同时改权限请求的结构、工具的写盘逻辑和卡片渲染。
+2. [x] **逐块审查第 2 期**（约 1.5 天）：自研内核授权时按块部分同意——权限卡上的 diff 按块勾选，
+     工具结果写明只写了哪几块。块的划分和逐块审查共用 `diff::hunks_with_context`（`review::hunks` 就是它），
+     按块拼内容用 `diff::splice_ranges`。见「设计说明-逐块审查改动.md」第十节。
 3. [ ] **桌面之外：远程连接 / 定时任务 / Linux TUI**（较难，约 9～12 天）：三件事共用一层「无头会话层」
    （把 `apps/desktop/session.rs` 的状态机 + `ChatItem` 搬进 `crates/core`，去掉 `SharedString` / `ListState`），
    然后在它上面加三个壳：`claudesktop-cli run` + 系统计划任务、`claudesktop-cli serve`（默认只监听回环，远程靠 SSH 隧道）、
    `ratatui` 的 `claudesktop-tui`。方案、成本和要拍板的六件事见「想法-桌面之外.md」。
    排期：地基 2～3 天 → 定时任务 1.5～2 天 → serve 1 天 → TUI 3～4 天 → TUI 接 serve + token 2 天。
+
+## 已完成（2026-11 这一批）
+
+`/compact` 排进队列；插件市场补齐（别的仓库的条目、按版本装 / 换版本）；逐块审查第 2 期（授权时按块同意）。
 
 ## 三、大改（多天）
 
