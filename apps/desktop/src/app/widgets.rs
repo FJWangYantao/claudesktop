@@ -87,6 +87,83 @@ impl ChatApp {
     }
 }
 
+/// 品牌图形「桌面日出」：赤陶半日带光芒，落在墨色桌沿上（同 exe 图标，几何照 `tools/make-icon.py`），
+/// `canvas` 矢量画。`w` 是图形的宽；`rays = false` 是小尺寸版（不画光芒，日和桌沿加粗，同图标 32px 以下那档）。
+/// 颜色走色板，换配色 / 深色时跟着变。
+pub(super) fn brand_glyph(w: Rems, rays: bool) -> Div {
+    let (vw, vh) = if rays { (180., 132.) } else { (176., 116.) };
+    let (sun, ink) = (rgb(CORAL), rgb(INK));
+    div().w(w).h(rems(w.0 * vh / vw)).flex_shrink_0().child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                // SVG 坐标（宽 vw）换成像素
+                let at = |x: f32, y: f32| {
+                    bounds.origin
+                        + point(bounds.size.width * (x / vw), bounds.size.width * (y / vw))
+                };
+                let len = |l: f32| bounds.size.width * (l / vw);
+                // 圆头线段：描边是平头，两端补半个线宽的圆点
+                let bar = |from: Point<Pixels>,
+                           to: Point<Pixels>,
+                           width: f32,
+                           color: Rgba,
+                           window: &mut Window| {
+                    let mut line = PathBuilder::stroke(len(width));
+                    line.move_to(from);
+                    line.line_to(to);
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, color);
+                    }
+                    super::motion::paint_dot(from, len(width / 2.), color, window);
+                    super::motion::paint_dot(to, len(width / 2.), color, window);
+                };
+                // (日心 x, y, 半径), (桌沿两端圆心 x, 中线 y, 粗细)
+                let ((cx, cy, r), (x0, x1, desk_y, desk_w)) = if rays {
+                    ((90., 104., 54.), (14., 166., 124., 16.))
+                } else {
+                    ((88., 68., 68.), (14., 162., 102., 28.))
+                };
+                let mut half = PathBuilder::fill();
+                half.move_to(at(cx - r, cy));
+                half.arc_to(point(len(r), len(r)), px(0.), false, true, at(cx + r, cy));
+                half.close();
+                if let Ok(path) = half.build() {
+                    window.paint_path(path, sun);
+                }
+                if rays {
+                    for (x1, y1, x2, y2) in [
+                        (90., 6., 90., 24.),
+                        (30., 30., 42., 42.),
+                        (150., 30., 138., 42.),
+                        (6., 78., 22., 78.),
+                        (158., 78., 174., 78.),
+                    ] {
+                        bar(at(x1, y1), at(x2, y2), 12., sun, window);
+                    }
+                }
+                bar(at(x0, desk_y), at(x1, desk_y), desk_w, ink, window);
+            },
+        )
+        .size_full(),
+    )
+}
+
+/// 品牌标志：纸色圆角方块里的 [`brand_glyph`]（同 exe 图标），`size` 是方块边长。
+pub(super) fn brand_mark(size: Rems) -> Div {
+    div()
+        .size(size)
+        .flex_shrink_0()
+        .rounded_md()
+        .bg(rgb(PAPER))
+        .border_1()
+        .border_color(rgb(LINE_STRONG))
+        .flex()
+        .justify_center()
+        .items_center()
+        .child(brand_glyph(rems(size.0 * 0.6875), false))
+}
+
 /// 滚动区内容的定宽。gpui 滚一格就重画整个 view，滚动区里的内容宽度不定时，
 /// taffy 每帧要按不同约束把整页来回排好几遍（实测设置页每帧 25ms → 定宽后 10ms）。
 /// 做法：用 [`probe`](Self::probe) 量出滚动区这一帧的宽度，下一帧拿 [`get`](Self::get) 给内容当定宽；
