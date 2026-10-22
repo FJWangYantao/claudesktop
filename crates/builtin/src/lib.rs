@@ -2881,7 +2881,14 @@ impl Kernel for BuiltinKernel {
             let warnings = state.reload_memory_for_turn(self.inner.memory_path.as_deref());
             // 自动模式的分类器靠这些判断「用户授权了什么」：只记用户说的话
             let text = prompt.text.clone();
-            let mut parts = vec![ContentPart::Text(prompt.text)];
+            // 聊天附件的内容界面已经拼进 `text`（见 `attach::compose`）；这里再兜一次，
+            // 别的调用方（测试、命令行）直接带 `attachments` 时也能发出去
+            let full = if prompt.attachments.is_empty() {
+                text.clone()
+            } else {
+                claudesktop_core::attach::compose(&text, &prompt.attachments)
+            };
+            let mut parts = vec![ContentPart::Text(full)];
             for image in prompt.images {
                 parts.push(ContentPart::Image { media_type: image.media_type, data: image.data });
             }

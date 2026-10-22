@@ -2019,6 +2019,7 @@ fn image_prompt_reaches_wire() {
             media_type: "image/png".into(),
             data: "QUJD".into(),
         }],
+        attachments: Vec::new(),
     };
     h.kernel.send_prompt(&sid, prompt).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
@@ -2073,6 +2074,7 @@ fn anthropic_image_prompt_reaches_wire() {
             media_type: "image/png".into(),
             data: "QUJD".into(),
         }],
+        attachments: Vec::new(),
     };
     h.kernel.send_prompt(&sid, prompt).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
@@ -2332,6 +2334,34 @@ fn chat_session_gets_only_web_and_memory_tools() {
     wait_second_body(&bodies, 2);
     let second = tool_names(&serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap());
     assert_eq!(second, ["memory_search", "memory_write", "memory_forget"]);
+}
+
+/// 聊天会话：带的文本附件内容内联进这一轮的用户消息（聊天没有 `read_file`）。
+#[test]
+fn chat_session_inlines_text_attachments() {
+    let (base, bodies) = serve(vec![happy_stream("看完了")]);
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+    let kernel = chat_kernel(base, Arc::clone(&events), None, false);
+    kernel.new_session(1, SessionSpec { cwd: None, kind: SessionKind::Chat }).unwrap();
+    let sid = session_id(&events);
+    let prompt = UserPrompt {
+        text: "这段怎么改".into(),
+        images: Vec::new(),
+        attachments: vec![claudesktop_core::attach::TextAttachment {
+            name: "notes.md".into(),
+            path: std::path::PathBuf::from("notes.md"),
+            text: "# 标题\n正文".into(),
+        }],
+    };
+    kernel.send_prompt(&sid, prompt).unwrap();
+    wait_turn_end(&events);
+    let user = first_body(&bodies)["messages"][1]["content"].as_str().unwrap().to_string();
+    assert!(user.contains("<attachment name=\"notes.md\">"), "{user}");
+    assert!(user.contains("正文"), "{user}");
+    assert!(user.trim_end().ends_with("这段怎么改"), "{user}");
+    // 附件内容不该变成一条单独的消息
+    let count = first_body(&bodies)["messages"].as_array().unwrap().len();
+    assert_eq!(count, 2, "{}", first_body(&bodies)["messages"]);
 }
 
 /// 聊天会话：模型硬调工作目录那套工具时回错误结果，不发权限请求、不执行。

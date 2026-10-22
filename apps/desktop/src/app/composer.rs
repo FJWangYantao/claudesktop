@@ -44,13 +44,23 @@ impl ChatApp {
         .detach();
     }
 
-    /// 加号按钮：选文件，把路径插进输入框（提示词里引用，交给 agent 读）。
+    /// 加号按钮：选文件加进待发送附件。
+    /// 聊天会话把文本内容内联进消息（聊天没有 `read_file`）；代码会话还是把路径插进输入框，
+    /// 等 agent 自己读。
     pub(crate) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chat = self.session().is_chat();
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: !chat,
             multiple: true,
-            prompt: Some("选择要交给 agent 的文件".into()),
+            prompt: Some(
+                if chat {
+                    "选择要一起发过去的文件"
+                } else {
+                    "选择要交给 agent 的文件"
+                }
+                .into(),
+            ),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
@@ -58,6 +68,11 @@ impl ChatApp {
                     return;
                 }
                 let _ = this.update_in(cx, |app, window, cx| {
+                    if chat {
+                        app.add_pending_files(&paths, cx);
+                        app.focus_input(window, cx);
+                        return;
+                    }
                     let add = paths
                         .iter()
                         .map(|p| format!("\"{}\"", p.display()))
@@ -245,6 +260,72 @@ impl ChatApp {
             )
     }
 
+    /// 输入框上方的一枚待发送文本文件 chip（文件名 + 大小，右侧 × 撤掉）。
+    /// 聊天才用：内容会内联进消息，所以提示里说清带上的是内容。
+    fn pending_file_chip(&self, i: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let file = &self.pending_files[i];
+        let name: SharedString = file.name.clone().into();
+        let size: SharedString = file.size_label().into();
+        let path: SharedString = file.path.display().to_string().into();
+        div()
+            .id(("pending-file", i))
+            .h_flex()
+            .items_center()
+            .gap_1p5()
+            .pl_2()
+            .pr_1()
+            .h(px(56.))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(SAND))
+            .tooltip({
+                let path = path.clone();
+                move |window, cx| {
+                    Tooltip::new(format!("{path}\n内容会一起发给模型")).build(window, cx)
+                }
+            })
+            .child(Icon::new(IconAll::FileText).size_4().text_color(rgb(INK_SOFT)))
+            .child(
+                div()
+                    .v_flex()
+                    .gap_0p5()
+                    .max_w(rems(12.))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(TEXT_META)
+                            .text_color(rgb(INK_SOFT))
+                            .font_features(tabular_nums())
+                            .child(size),
+                    ),
+            )
+            .child(
+                div()
+                    .id(("pending-file-x", i))
+                    .size(px(16.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_pending_file(i, cx);
+                    }))
+                    .child(Icon::new(IconAll::X).size_3().text_color(rgb(INK_SOFT))),
+            )
+    }
+
     /// 只重画输入区：通知输入框的 view，它的祖先 `ChatApp` 跟着重画，内容区的缓存不动（见 content.rs）。
     /// 打字、补全、聚焦这类只影响输入区的变化用它；用 `cx.notify()` 会连对话一起重画。
     pub(super) fn refresh_composer(&self, cx: &mut App) {
@@ -277,7 +358,9 @@ impl ChatApp {
             window.is_window_active() && self.input.read(cx).focus_handle(cx).is_focused(window);
 
         // 发送按钮三态：空（淡、不可点）/ 可发送（赤陶）/ 忙（深色停止方块，同 Esc）
-        let can_send = !self.input.read(cx).value().trim().is_empty() || !self.pending.is_empty();
+        let can_send = !self.input.read(cx).value().trim().is_empty()
+            || !self.pending.is_empty()
+            || !self.pending_files.is_empty();
         let send_bg = match (busy, can_send) {
             (true, _) => INK,
             (false, true) => CORAL,
@@ -388,12 +471,15 @@ impl ChatApp {
                 .px_2()
                 .pt_1p5()
                 .pb_2()
-                // 待发送图片缩略图（点右上角 × 撤掉），左边和输入文字对齐
-                .when(!self.pending.is_empty(), |d| {
+                // 待发送附件：图片缩略图 + 文本文件 chip（点右上角 × 撤掉），左边和输入文字对齐
+                .when(!self.pending.is_empty() || !self.pending_files.is_empty(), |d| {
                     d.child(
-                        div().h_flex().flex_wrap().gap_1p5().px_2().pt_1().pb_1().children(
-                            (0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)),
-                        ),
+                        div().h_flex().flex_wrap().gap_1p5().px_2().pt_1().pb_1()
+                            .children((0..self.pending.len()).map(|i| self.pending_image_thumb(i, cx)))
+                            .children(
+                                (0..self.pending_files.len())
+                                    .map(|i| self.pending_file_chip(i, cx)),
+                            ),
                     )
                 })
                 .child(
@@ -643,7 +729,7 @@ impl ChatApp {
         .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
             this.drop_paths(paths.paths(), window, cx)
         }))
-        .when(self.file_drag, |d| d.child(Self::render_drop_hint()))
+        .when(self.file_drag, |d| d.child(Self::render_drop_hint(chat)))
     }
 
     pub(crate) fn drop_paths(
@@ -654,11 +740,17 @@ impl ChatApp {
     ) {
         self.file_drag = false;
         let cwd = self.session().cwd.clone();
+        let chat = self.session().is_chat();
         let mut images = Vec::new();
         let mut mentions = Vec::new();
         for path in paths {
             match PendingImage::from_path(path) {
                 Some(image) => images.push(image),
+                // 聊天没有 read_file，@ 引用没用：文本直接内联进来
+                None if chat => {
+                    let one = [path.clone()];
+                    self.add_pending_files(&one, cx);
+                }
                 None => mentions.push(crate::complete::mention_for(path, &cwd)),
             }
         }
@@ -684,7 +776,7 @@ impl ChatApp {
     }
 
     /// 拖拽中盖在会话区上的提示（不挡事件：松开落在下面的会话区上）。
-    fn render_drop_hint() -> Div {
+    fn render_drop_hint(chat: bool) -> Div {
         let mut scrim = rgb(PAPER);
         scrim.a = 0.94;
         div().absolute().inset_0().p_4().bg(scrim).child(
@@ -704,7 +796,11 @@ impl ChatApp {
                     div()
                         .text_size(TEXT_SMALL)
                         .text_color(rgb(INK_SOFT))
-                        .child("图片作为附件，其他文件和文件夹插入 @ 引用"),
+                        .child(if chat {
+                            "图片作为附件，文本文件的内容一起发过去"
+                        } else {
+                            "图片作为附件，其他文件和文件夹插入 @ 引用"
+                        }),
                 ),
         )
     }

@@ -135,6 +135,12 @@ pub struct SettingsForm {
     suggest_model: Entity<InputState>,
     /// 一轮结束后提炼候选记忆开着没有（保存才生效，会重启自研内核）
     memory_suggest: bool,
+    /// 聊天用的模型；空 = 跟档案的默认模型
+    chat_model: Entity<InputState>,
+    /// 新建的聊天默认开着「联网」
+    chat_web: bool,
+    /// 「聊天说明」文件（每轮重读，改了下一轮就生效）
+    chat_instructions: Entity<InputState>,
     /// Brave Search API key（`web_search` 用）
     brave_key: Entity<InputState>,
     /// `web_search` 的后端选择（存在内核那边的数据目录 `search.json`，所以不在 `Settings` 里）
@@ -170,6 +176,11 @@ impl SettingsForm {
         let suggest_model = cx.new(|cx| {
             InputState::new(window, cx).placeholder("留空用会话的模型，如 deepseek-chat")
         });
+        let chat_model = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("留空用上面默认模型，如 deepseek-chat")
+        });
+        let chat_instructions =
+            cx.new(|cx| InputState::new(window, cx).placeholder("说明文件的路径"));
         let brave_key =
             cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
         let deepseek_search_key = cx.new(|cx| {
@@ -198,6 +209,9 @@ impl SettingsForm {
             next_suggestion: false,
             suggest_model,
             memory_suggest: false,
+            chat_model,
+            chat_web: true,
+            chat_instructions,
             brave_key,
             search: Default::default(),
             deepseek_search_key,
@@ -290,6 +304,14 @@ impl ChatApp {
         self.settings_form
             .suggest_model
             .update(cx, |state, cx| state.set_value(s.suggest_model.clone(), window, cx));
+        // 聊天空间的一组（模型 / 默认联网 / 聊天说明文件）
+        self.settings_form.chat_web = s.chat.web;
+        self.settings_form
+            .chat_model
+            .update(cx, |state, cx| state.set_value(s.chat.model.clone(), window, cx));
+        self.settings_form.chat_instructions.update(cx, |state, cx| {
+            state.set_value(s.chat.instructions.clone(), window, cx)
+        });
         // web_search 的 Brave key（环境变量优先；文件里没有时输入框留空）
         let brave = std::env::var(claudesktop_builtin::websearch::BRAVE_KEY_ENV)
             .ok()
@@ -680,6 +702,10 @@ impl ChatApp {
         s.next_suggestion = f.next_suggestion;
         s.memory_suggest = f.memory_suggest;
         s.suggest_model = value(&f.suggest_model, cx);
+        // 聊天空间：模型（空 = 跟档案）、默认联网、聊天说明文件
+        s.chat.model = value(&f.chat_model, cx);
+        s.chat.web = f.chat_web;
+        s.chat.instructions = value(&f.chat_instructions, cx);
         s.usage_gateway = f.usage_gateway;
         s.gateway_bodies = f.gateway_bodies;
         // 单价表写错了留着原来的（`save_settings` 先报错，不会走到这里）；和内置的一样就不存
@@ -804,6 +830,8 @@ impl ChatApp {
             || new.usage_gateway != self.settings.usage_gateway
             // 一轮结束的候选记忆开关变了：内核要重装才知道
             || new.memory_suggest != self.settings.memory_suggest
+            // 聊天空间的一组（模型 / 默认联网 / 说明文件）也要重装才知道
+            || new.chat != self.settings.chat
             // 自动模式的开关 / 分类器模型变了：模式列表和分类器都要重装
             || new.auto_mode != self.settings.auto_mode;
         // 只重启启动命令 / 环境变量变了的档案：改一家的网关开关不该把另一家跑着的一轮杀掉
@@ -1623,6 +1651,7 @@ impl ChatApp {
                 .child(self.render_auto_mode(window, cx))
                 .child(self.render_suggest(cx))
                 .child(self.render_memory_options(cx))
+                .child(self.render_chat(cx))
                 .child(section(
                     "运行",
                     "",
@@ -1697,6 +1726,85 @@ impl ChatApp {
             "由分类器代替你逐项审批；它看不到助手的解释和工具结果，只按动作本身判，拦下时把理由交给 agent",
             None,
             body,
+        )
+    }
+
+    /// 聊天空间的一组：用哪个模型、新建的聊天默认开不开联网、带一份「聊天说明」文件。
+    /// 只影响之后新建的聊天（说明例外：每轮重读，改了下一轮就生效）。
+    fn render_chat(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let path = f.chat_instructions.read(cx).value().trim().to_string();
+        let pick = Self::quiet_button(
+            "chat-instructions-pick",
+            IconAll::FolderOpen,
+            Surface::Paper,
+            cx,
+        )
+            .small()
+            .tooltip("选择一个说明文件")
+            .on_click(cx.listener(|_, _, window, cx| {
+                let rx = cx.prompt_for_paths(PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some("选择聊天说明文件".into()),
+                });
+                cx.spawn_in(window, async move |this, cx| {
+                    if let Ok(Ok(Some(paths))) = rx.await
+                        && let Some(path) = paths.into_iter().next()
+                    {
+                        let _ = this.update_in(cx, |app, window, cx| {
+                            let text = path.to_string_lossy().into_owned();
+                            app.settings_form.chat_instructions.update(cx, |state, cx| {
+                                state.set_value(text, window, cx)
+                            });
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }));
+        // 填了路径但文件不在：说在前面（不然聊天提示词里悄悄少一截）
+        let missing = !path.is_empty() && !std::path::Path::new(&path).is_file();
+        section(
+            "聊天",
+            "聊天空间直接连模型：没有工作目录、不跑命令、只带联网和记忆；这里的三项只影响之后新建的聊天",
+            None,
+            div()
+                .v_flex()
+                .gap_3()
+                .child(setting_group([
+                    setting_row(
+                        "聊天用的模型",
+                        "同一端点的模型名，留空跟档案里的默认模型；聊天可以用便宜些的模型",
+                        div().w(rems(20.)).child(Input::new(&f.chat_model).cleanable(true)),
+                    ),
+                    setting_row(
+                        "默认联网",
+                        "新建的聊天默认能搜索网页、读网页；输入框里可以随时关",
+                        Switch::new("chat-web")
+                            .checked(f.chat_web)
+                            .color(rgb(CORAL))
+                            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                this.settings_form.chat_web = *checked;
+                                cx.notify();
+                            })),
+                    ),
+                    setting_row(
+                        "聊天说明",
+                        "每次聊天都带上的话（一份文件，每轮重读）；比如「回答尽量简短」「我是前端工程师」",
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .w(rems(24.))
+                            .child(div().flex_1().min_w_0().child(Input::new(&f.chat_instructions)))
+                            .child(pick),
+                    ),
+                ]))
+                .when(missing, |d| {
+                    d.child(note(IconAll::Info, "这个文件不存在，聊天不会带上它"))
+                }),
         )
     }
 

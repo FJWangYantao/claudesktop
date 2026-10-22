@@ -468,6 +468,8 @@ impl PendingImage {
 pub struct QueuedPrompt {
     pub text: String,
     pub images: Vec<PendingImage>,
+    /// 聊天会话的文本附件（内容发送时才拼进去，退回输入框时还是原样）
+    pub files: Vec<claudesktop_core::attach::TextAttachment>,
 }
 
 impl QueuedPrompt {
@@ -477,17 +479,21 @@ impl QueuedPrompt {
             .into_iter()
             .map(|p| PromptImage { media_type: p.media_type, data: p.data })
             .collect();
-        UserPrompt { text: self.text, images }
+        UserPrompt { text: self.text, images, attachments: self.files }
     }
 
-    /// 队列里一行显示的文字：换行压成空格；只有图片时写「N 张图片」。
+    /// 队列里一行显示的文字：换行压成空格；只有图片时写「N 张图片」，带文件时在后面补一句。
     pub fn summary(&self) -> String {
         let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        match (text.is_empty(), self.images.len()) {
+        let mut out = match (text.is_empty(), self.images.len()) {
             (true, n) => format!("{n} 张图片"),
             (false, 0) => text,
             (false, n) => format!("{text}（附 {n} 张图片）"),
+        };
+        if !self.files.is_empty() {
+            out.push_str(&format!("（附 {} 个文件）", self.files.len()));
         }
+        out
     }
 }
 
@@ -948,7 +954,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn queued_summary_is_one_line() {
-        let q = QueuedPrompt { text: "先别改\n  测试\n".into(), images: Vec::new() };
+        let q = QueuedPrompt { text: "先别改\n  测试\n".into(), images: Vec::new(), files: Vec::new() };
         assert_eq!(q.summary(), "先别改 测试");
         assert_eq!(q.into_prompt(), UserPrompt::text("先别改\n  测试\n"));
     }

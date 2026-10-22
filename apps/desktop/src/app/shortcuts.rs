@@ -24,7 +24,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
         &[
             ("命令面板", &[PALETTE_KEY]),
             ("快捷键速查", &[SHORTCUTS_KEY]),
-            ("新会话", &[NEW_SESSION_KEY]),
+            ("在当前空间新建对话", &[NEW_SESSION_KEY]),
             ("显示 / 隐藏侧栏", &[TOGGLE_SIDEBAR_KEY]),
             ("下一个会话", &[NEXT_SESSION_KEY]),
             ("上一个会话", &[PREV_SESSION_KEY]),
@@ -45,12 +45,15 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
         "输入框",
         &[
             ("发送（这一轮还在跑时排队）", &["enter"]),
+            ("直接发送（不认补全，也不管列表）", &["secondary-enter"]),
             ("换行", &["shift-enter"]),
             ("指令 / 引用文件", &["/", "@"]),
             ("填入建议的提示词 / 接上补全的灰字", &["tab"]),
             ("选补全列表的上一项 / 下一项", &INPUT_HISTORY_KEYS),
             ("光标在开头时回上一条输入 / 在末尾时取下一条", &INPUT_HISTORY_KEYS),
             ("光标在第一行 / 最后一行：移到开头 / 移到末尾", &INPUT_HISTORY_KEYS),
+            ("收起补全列表（不填入）", &[COLLAPSE_COMPLETION_KEY]),
+            ("重新展开补全列表", &[EXPAND_COMPLETION_KEY]),
         ],
     ),
 ];

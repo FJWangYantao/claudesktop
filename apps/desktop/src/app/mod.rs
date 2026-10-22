@@ -72,6 +72,8 @@ pub struct ChatApp {
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
+    /// 聊天会话待发送的文本附件（内容内联进消息，代码会话不用这个；见 `crates/core/src/attach.rs`）
+    pub(crate) pending_files: Vec<claudesktop_core::attach::TextAttachment>,
     /// 正从系统往会话区拖文件（盖一层「松开添加」的提示，见 `composer.rs` 的 `render_drop_hint`）
     file_drag: bool,
     /// 内核会话（可多个）；至少有一个，`active` 始终有效
@@ -414,6 +416,7 @@ impl ChatApp {
         let mut app = Self {
             input,
             pending: Vec::new(),
+            pending_files: Vec::new(),
             file_drag: false,
             sessions: Vec::new(),
             active: 0,
@@ -750,6 +753,15 @@ impl ChatApp {
         self.refresh_composer(cx);
     }
 
+    /// 命令面板的「新建聊天 / 新建代码会话」：先切到那个空间，再按那个空间的规矩新建
+    ///（已经有空会话就切过去，见 `add_session`）。
+    pub(crate) fn new_in_space(&mut self, space: Space, cx: &mut Context<Self>) {
+        if space != self.space() {
+            self.switch_space(space, cx);
+        }
+        self.add_session(cx);
+    }
+
     /// 新建一个会话并切过去（在当前空间里：聊天空间建聊天，代码空间按设置的默认内核）。
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
         let space = self.space();
@@ -995,7 +1007,15 @@ impl ChatApp {
         if self.sessions[idx].busy {
             return;
         }
-        self.submit_to(idx, UserPrompt { text: "继续".into(), images: Vec::new() }, cx);
+        self.submit_to(
+            idx,
+            UserPrompt {
+                text: "继续".into(),
+                images: Vec::new(),
+                attachments: Vec::new(),
+            },
+            cx,
+        );
     }
 
     /// 失败卡片上的「重试」：把第 `failed_idx` 行所在这一轮的用户消息原样再发一遍。
@@ -1011,8 +1031,10 @@ impl ChatApp {
             return;
         };
         let prompt = UserPrompt {
-            text: text.to_string(),
+            // 气泡里带着附件名那一行：重发时只要回复用户打的字（附件已经不在手里）
+            text: claudesktop_core::attach::strip_display(text).to_string(),
             images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
+            attachments: Vec::new(),
         };
         self.submit_to(idx, prompt, cx);
     }
@@ -1025,8 +1047,9 @@ impl ChatApp {
             return;
         };
         let prompt = UserPrompt {
-            text: text.to_string(),
+            text: claudesktop_core::attach::strip_display(text).to_string(),
             images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
+            attachments: Vec::new(),
         };
         let from = self.sessions[src].title.clone();
         let cwd = self.sessions[src].cwd.clone();
@@ -1357,7 +1380,7 @@ impl ChatApp {
     /// 发出输入框里的内容；这一轮还在跑时先排队（输入框上方的队列），这一轮正常结束后自动发出。
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
-        if text.trim().is_empty() && self.pending.is_empty() {
+        if text.trim().is_empty() && self.pending.is_empty() && self.pending_files.is_empty() {
             return;
         }
         let active = self.active;
@@ -1369,13 +1392,18 @@ impl ChatApp {
             );
             return;
         }
-        let queued = QueuedPrompt { text, images: self.pending.clone() };
+        let queued = QueuedPrompt {
+            text,
+            images: self.pending.clone(),
+            files: self.pending_files.clone(),
+        };
         // 发出去了：光标后面那句灰字、以及轮结束时猜的下一句都作废
         self.suggestion.clear();
         self.next_suggestion.clear();
         if self.sessions[active].busy || self.sessions[active].stopping {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.pending_files.clear();
             self.history.push(&queued.text);
             self.sessions[active].queued.push(queued);
             cx.notify();
@@ -1385,6 +1413,7 @@ impl ChatApp {
         if self.sessions[active].worktree_busy.is_some() {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.pending_files.clear();
             self.history.push(&queued.text);
             self.sessions[active].queued.push(queued);
             cx.notify();
@@ -1395,6 +1424,7 @@ impl ChatApp {
         if self.submit_to(active, queued.into_prompt(), cx) {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.pending_files.clear();
             // 真发出去了才进输入历史（排队的两处上面已经记过）；发失败的不记，
             // 免得 ↑ 翻出来一条从没发出去的消息
             self.history.push(&sent_text);
@@ -1437,6 +1467,11 @@ impl ChatApp {
                 parts.push(item.text);
             }
             self.pending.extend(item.images);
+            for file in item.files {
+                if !self.pending_files.iter().any(|f| f.path == file.path) {
+                    self.pending_files.push(file);
+                }
+            }
         }
         let draft = self.input.read(cx).value().to_string();
         if !draft.trim().is_empty() {
@@ -1495,14 +1530,66 @@ impl ChatApp {
             );
         }
         self.pending.extend(images.into_iter().take(room));
-        cx.notify();
+        self.refresh_composer(cx);
     }
 
     /// 撤掉第 `i` 张待发送图片。
     pub(crate) fn remove_pending_image(&mut self, i: usize, cx: &mut Context<Self>) {
         if i < self.pending.len() {
             self.pending.remove(i);
-            cx.notify();
+            self.refresh_composer(cx);
+        }
+    }
+
+    // ---------- 文本附件（只有聊天会话用：内容内联进消息） ----------
+
+    /// 把这些路径当聊天附件收下（文本内联，图片走图片附件，其余 toast 说明）。
+    /// 代码会话不走这里：那边还是把路径贴进输入框，等 agent 自己读。
+    pub(crate) fn add_pending_files(
+        &mut self,
+        paths: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        use claudesktop_core::attach;
+        let mut images = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for path in paths {
+            // 图片还是图片附件（发送前按图片那样处理，见设计说明第七章）
+            if let Some(image) = PendingImage::from_path(path) {
+                images.push(image);
+                continue;
+            }
+            // 已经带上了就不再读一遍
+            if self.pending_files.iter().any(|f| &f.path == path) {
+                continue;
+            }
+            match attach::read_text(path) {
+                Ok(file) => {
+                    if attach::fits_total(&self.pending_files, &file) {
+                        self.pending_files.push(file);
+                    } else {
+                        let bytes = file.bytes();
+                        refused.push(
+                            attach::AttachError::TotalTooLarge { name: file.name, bytes }.message(),
+                        );
+                    }
+                }
+                // 读不了 / 不是文本：一句说明，不打断其余文件
+                Err(err) => refused.push(err.message()),
+            }
+        }
+        self.add_pending_images(images, cx);
+        for why in refused {
+            self.toast(Notification::warning(why), cx);
+        }
+        self.refresh_composer(cx);
+    }
+
+    /// 撤掉第 `i` 个待发送文本附件。
+    pub(crate) fn remove_pending_file(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i < self.pending_files.len() {
+            self.pending_files.remove(i);
+            self.refresh_composer(cx);
         }
     }
 
@@ -1540,7 +1627,7 @@ impl ChatApp {
     pub(crate) fn submit_to(
         &mut self,
         idx: usize,
-        prompt: UserPrompt,
+        mut prompt: UserPrompt,
         cx: &mut Context<Self>,
     ) -> bool {
         let kind = self.sessions[idx].kernel.clone();
@@ -1584,8 +1671,19 @@ impl ChatApp {
                 return false;
             }
             s.steering = false;
+            // 聊天会话的文本附件：内容拼在发给内核的全文里；气泡和日志里只写文件名
+            let attachments = std::mem::take(&mut prompt.attachments);
+            let has_attachments = !attachments.is_empty();
+            let shown = claudesktop_core::attach::display_text(&prompt.text, &attachments);
+            let full = claudesktop_core::attach::compose(&prompt.text, &attachments);
             if !s.has_user_message() && !s.renamed {
-                s.title = crate::model::title_from_prompt(&prompt.text).into();
+                // 只有附件时用第一个文件名当标题
+                let basis = if prompt.text.trim().is_empty() {
+                    attachments.first().map(|a| a.name.as_str()).unwrap_or("").to_string()
+                } else {
+                    prompt.text.clone()
+                };
+                s.title = crate::model::title_from_prompt(&basis).into();
             }
             // 图片附件先落盘（需要会话元信息），路径进记录与气泡
             let stored = self.store_images(idx, &prompt.images);
@@ -1594,29 +1692,35 @@ impl ChatApp {
             }
             let image_paths = stored.iter().map(PathBuf::from).collect::<Vec<_>>();
             self.sessions[idx].transcript.push(ChatItem::User {
-                text: SharedString::from(prompt.text.clone()),
+                text: SharedString::from(shown.clone()),
                 images: image_paths,
             });
             // 插件的斜杠命令：对话里显示原样的「/命令 参数」，发给内核的是展开后的模板
             let enabled = self.enabled_plugins();
-            let sent = claudesktop_core::plugin::find_command(&enabled, &prompt.text).map(
+            let expanded = claudesktop_core::plugin::find_command(&enabled, &prompt.text).map(
                 |(_, command, args)| claudesktop_core::plugin::expand_command(&command.body, &args),
             );
-            // 上一轮在审查页里撤回过块：发给内核的文字前面附上说明，气泡里照常只显示用户写的
-            let sent = match self.take_review_note(idx) {
-                Some(note) => {
-                    Some(format!("{note}\n\n{}", sent.as_deref().unwrap_or(&prompt.text)))
-                }
-                None => sent,
+            // 聊天附件的内容跟在（展开后的）文字后面一起发出去
+            let mut sent = match &expanded {
+                Some(text) => text.clone(),
+                None => full,
             };
+            // 上一轮在审查页里撤回过块：发给内核的文字前面附上说明，气泡里照常只显示用户写的
+            let reviewed = match self.take_review_note(idx) {
+                Some(note) => {
+                    sent = format!("{note}\n\n{sent}");
+                    true
+                }
+                None => false,
+            };
+            // 和用户写的一样就不必另存一份（`sent` 只在不一样时进日志）
+            let sent = (reviewed || expanded.is_some() || has_attachments).then_some(sent);
             if kernel.is_some() {
-                self.persist(
-                    idx,
-                    Record::User { text: prompt.text.clone(), images: stored, sent: sent.clone() },
-                );
+                self.persist(idx, Record::User { text: shown.clone(), images: stored, sent });
             }
             let prompt = match sent {
-                Some(text) => UserPrompt { text, ..prompt },
+                // 附件内容已经在 `sent` 里了，内核不必再拼一遍
+                Some(text) => UserPrompt { text, images: prompt.images, attachments: Vec::new() },
                 None => prompt,
             };
             let s = &mut self.sessions[idx];
@@ -1630,6 +1734,7 @@ impl ChatApp {
                             s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. }));
                         claudesktop_builtin::gateway::note_turn(&id, turn.count() as u64);
                     }
+                    // 附件内容已经在 `sent` 里：内核只看文字，不必再拼一遍
                     if let Err(err) = kernel.send_prompt(&id, prompt) {
                         s.busy = false;
                         s.fail(format!("发送失败：{err}"));

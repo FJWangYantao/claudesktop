@@ -14,6 +14,7 @@
 
 mod acp;
 pub mod agents;
+pub mod attach;
 pub mod catalog;
 pub mod checkpoint;
 mod diff;
@@ -502,21 +503,23 @@ pub struct PromptImage {
     pub data: String,
 }
 
-/// 一条用户提示词：文本 + 可选图片附件。
+/// 一条用户提示词：文本 + 可选图片附件 + 聊天的文本附件（内容内联进 `text`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserPrompt {
     pub text: String,
     pub images: Vec<PromptImage>,
+    /// 聊天会话带的文本文件（内容拼进 `text`，见 [`attach::compose`]）；代码会话恒为空
+    pub attachments: Vec<attach::TextAttachment>,
 }
 
 impl UserPrompt {
     /// 纯文本提示词。
     pub fn text(text: impl Into<String>) -> Self {
-        Self { text: text.into(), images: Vec::new() }
+        Self { text: text.into(), images: Vec::new(), attachments: Vec::new() }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty() && self.images.is_empty()
+        self.text.trim().is_empty() && self.images.is_empty() && self.attachments.is_empty()
     }
 }
 
