@@ -1,8 +1,8 @@
-//! 动效：限帧的转圈 / 呼吸圆点 / 扫光、展开收起（弹簧 + 高度裁切）、悬停淡入、新内容入场、平滑回到底部。
+//! 动效：限帧的转圈 / 小陶 / 扫光、展开收起（弹簧 + 高度裁切）、悬停淡入、新内容入场、平滑回到底部。
 //!
-//! 「进行中」只有两种样子：通用的圆弧转圈（[`spinner`]）和运行状态行专用的呼吸圆点（[`breathing_dot`]），
-//! 都用 `canvas` + `PathBuilder` 矢量画，不靠旋转图标或换字形（小尺寸下旋转的位图发虚、
-//! 符号字体里各个字形粗细不一）。
+//! 「进行中」只有两种样子：通用的圆弧转圈（[`spinner`]，`canvas` + `PathBuilder` 矢量画，不靠旋转图标或换字形：
+//! 小尺寸下旋转的位图发虚、符号字体里各个字形粗细不一）和运行状态行专用的小陶（[`mascot`]，
+//! 按状态换表情、几帧轮着放，见 mascot.rs）。
 //!
 //! gpui 的动画每一帧都要重画它所在的整个 view（`request_animation_frame` 通知当前 view，
 //! 祖先一并变脏），所以常驻的循环动画（转圈、扫光）不用 `with_animation`：相位按全局时钟算，
@@ -17,6 +17,7 @@
 //! 系统设置或设置页的「动画」关掉后直接落到终态（见 [`ChatApp::apply_motion_pref`]）。
 
 use super::ChatApp;
+use super::mascot::Mood;
 use crate::settings::MotionPref;
 use crate::theme::rgb;
 use crate::theme::*;
@@ -35,13 +36,11 @@ use std::time::{Duration, Instant};
 const LOOP_INTERVAL: Duration = Duration::from_millis(33);
 /// 帧到来的时刻有抖动：差这么一点也算到了（60Hz 下正好每两帧一拍）
 const TICK_SLACK: Duration = Duration::from_millis(4);
-// 循环动画的节奏：转圈 1 秒一圈，圆弧伸缩和扫光 2 秒一拍，状态行圆点 1.6 秒一呼一吸
+// 循环动画的节奏：转圈 1 秒一圈，圆弧伸缩和扫光 2 秒一拍（小陶每帧停多久见 `Mood::script`）
 /// 转圈匀速转一圈的时长
 const SPIN_PERIOD: Duration = Duration::from_millis(1000);
 /// 圆弧一伸一缩的周期
 const PULSE_PERIOD: Duration = Duration::from_millis(2000);
-/// 状态行圆点变大变亮再回落的周期
-const BREATH_PERIOD: Duration = Duration::from_millis(1600);
 /// 扫光扫一遍的时长
 const SHIMMER_PERIOD: Duration = Duration::from_millis(2000);
 
@@ -64,7 +63,7 @@ struct LoopSpot {
 
 enum LoopKind {
     Spinner,
-    Dot,
+    Mascot(Mood),
     /// 扫光文字：字体字号取占位那份透明文字的样式
     Shimmer {
         text: SharedString,
@@ -112,7 +111,7 @@ impl Render for LoopOverlay {
 
 fn paint_loop_spots(window: &mut Window, cx: &mut App) {
     let spin = (loop_phase(SPIN_PERIOD), 0.2 + 0.45 * pulse(loop_phase(PULSE_PERIOD)));
-    let breath = pulse(loop_phase(BREATH_PERIOD));
+    let clock = loop_clock();
     let shimmer = loop_phase(SHIMMER_PERIOD);
     let color = rgb(CORAL);
     LOOP_SPOTS.with_borrow(|spots| {
@@ -120,7 +119,7 @@ fn paint_loop_spots(window: &mut Window, cx: &mut App) {
             let mask = ContentMask { bounds: spot.clip };
             window.with_content_mask(Some(mask), |window| match &spot.kind {
                 LoopKind::Spinner => paint_spinner(spot.bounds, spin.0, spin.1, color, window),
-                LoopKind::Dot => paint_breath(spot.bounds, breath, color, window),
+                LoopKind::Mascot(mood) => paint_mascot(*mood, spot.bounds, clock, window, cx),
                 LoopKind::Shimmer { text, style, base, highlight } => {
                     paint_shimmer(text, style, spot.bounds, shimmer, *base, *highlight, window, cx)
                 }
@@ -131,9 +130,14 @@ fn paint_loop_spots(window: &mut Window, cx: &mut App) {
 
 /// 循环动画在这一刻的相位（0..1），所有转圈 / 扫光共用一个时钟，彼此同步。
 fn loop_phase(period: Duration) -> f32 {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    let t = EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64();
+    let t = loop_clock().as_secs_f64();
     (t % period.as_secs_f64() / period.as_secs_f64()) as f32
+}
+
+/// 循环动画共用的时钟：从第一次用到现在过了多久
+fn loop_clock() -> Duration {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed()
 }
 
 /// 约 33ms 后让当前 view 重画一次（prepaint 里调）。各个 view 共用一拍：同一拍里
@@ -278,31 +282,36 @@ fn paint_spinner(bounds: Bounds<Pixels>, start: f32, sweep: f32, color: Rgba, wi
     paint_dot(to, stroke / 2., color, window);
 }
 
-/// 运行状态行的等待动效（14px 格子）：一个赤陶色圆点缓慢变大变亮再回落，约 30 帧（节拍器重画）。
-/// 早先试过换字形的 ✻ 和矢量星芒，小尺寸下都显得怪，最后选了最克制的圆点（对比稿见设计指南第 13 条）。
-/// 减少动态效果时停在中间大小、不透明。
-pub(super) fn breathing_dot() -> Div {
-    let div = div().size_3p5().flex_shrink_0();
+/// 运行状态行的小陶（20px 格子）：按 [`Mood`] 换表情、几帧轮着放，由 [`LoopOverlay`] 画、节拍器重画。
+/// 早先这里是一个呼吸的赤陶圆点（14px 下任何品牌形状都太小，见设计指南第 13 条）；
+/// 换成小陶后格子放大到 20px，每个状态单独画了帧，道具（泡、问号、汗珠）按 20px 加粗。
+/// 减少动态效果时停在最能说明状态的那一帧（[`Mood::rest_frame`]）。
+pub(super) fn mascot(mood: Mood) -> Div {
+    let div = div().size_5().flex_shrink_0();
     if REDUCED.load(Ordering::Relaxed) {
-        // 停在中间大小、不透明
-        return div.child(
-            canvas(
-                |_, _, _| {},
-                |bounds, _, window, _| {
-                    let r = bounds.size.width.min(bounds.size.height) / 2. * 0.92;
-                    paint_dot(bounds.center(), r * 0.45, rgb(CORAL), window);
-                },
-            )
-            .size_full(),
-        );
+        return div.child(img(mood.frames()[mood.rest_frame()].clone()).size_full());
     }
-    div.child(loop_spot(LoopKind::Dot).size_full())
+    div.child(loop_spot(LoopKind::Mascot(mood)).size_full())
 }
 
-/// 呼吸圆点的一帧：`k` 是 0..1 的起伏。
-fn paint_breath(bounds: Bounds<Pixels>, k: f32, color: Rgba, window: &mut Window) {
-    let r = bounds.size.width.min(bounds.size.height) / 2. * 0.92;
-    paint_dot(bounds.center(), r * (0.38 + 0.14 * k), Rgba { a: 0.55 + 0.45 * k, ..color }, window);
+/// 小陶的一帧。图是异步解码的：每次都把这个表情的各帧要一遍（解码好前不画、好了覆盖层收到通知），
+/// 该放的那帧还没好就先画已经好的。
+fn paint_mascot(
+    mood: Mood,
+    bounds: Bounds<Pixels>,
+    clock: Duration,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let frames: Vec<_> =
+        mood.frames().iter().map(|f| f.clone().use_render_image(window, cx)).collect();
+    let Some(data) =
+        frames[mood.frame_at(clock)].clone().or_else(|| frames.iter().flatten().next().cloned())
+    else {
+        return;
+    };
+    // 图集分配失败之类的偶发错误：这一拍不画，下一拍再来
+    let _ = window.paint_image(bounds, bounds, Corners::default(), data, 0, false);
 }
 
 /// 扫光文字（「思考中…」）：`base` 色的字上一道 `highlight` 色的柔和高光从左扫到右，约 30 帧。

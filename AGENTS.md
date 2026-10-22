@@ -94,8 +94,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   不在 `ChatApp` 键上下文下，派发的动作收不到。
 - **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
 - **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
-  - 「进行中」只有两种样子：运行状态行用呼吸圆点 `motion::breathing_dot()`，其余（工具行、侧栏、压缩）一律圆弧转圈
-    `motion::spinner()`，都是 `canvas` + `PathBuilder` 矢量画；思考中的扫光用 `shimmer_text()`（按像素分档着色）。
+  - 「进行中」只有两种样子：运行状态行用会动的小陶 `motion::mascot(Mood)`（按状态换表情、几帧轮播，见 `app/mascot.rs`；
+    新状态要配表情就在 `tools/xiaotao.mjs` 的 `MOODS` 加帧、跑 `node tools/make-icon.mjs`，再在 `Mood` 加一项），
+    其余（工具行、侧栏、压缩）一律圆弧转圈 `motion::spinner()`（`canvas` + `PathBuilder` 矢量画）；思考中的扫光用 `shimmer_text()`（按像素分档着色）。
     内容区里这三个只是占位格（prepaint 记位置），由叠在内容区上的 `motion::LoopOverlay` 画，节拍器只重画它、不重画整页对话；
     内容区以外自己就是小覆盖层的 view（侧栏转圈）用 `spinner_in_place`。
     转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：

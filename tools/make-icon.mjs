@@ -1,7 +1,8 @@
 // 生成应用图标和界面里的品牌标志「小陶」（形象定义在 xiaotao.mjs）：
 //   apps/desktop/resources/claudesktop.ico   exe 图标，16~256 每档按自己的细节级别单独栅格化
 //   apps/desktop/resources/claudesktop.svg   图标原稿（256，纸底）
-//   apps/desktop/assets/brand/xiaotao*.svg  界面里用的（无底；widgets.rs 的 brand_mark 内嵌）
+//   apps/desktop/assets/brand/xiaotao*.svg  界面里用的（无底；mascot.rs 的 brand_mark 内嵌）
+//   apps/desktop/assets/brand/moods/*.svg    运行状态行会动的表情，每个状态几帧（mascot.rs 的 Mood）
 // 用法：node tools/make-icon.mjs
 // 需要 resvg 命令行：cargo install resvg --version 0.46.0 --locked（和 gpui 栅格化 SVG 的是同一版，图标和界面里看到的一致）
 import { execFileSync } from 'node:child_process';
@@ -9,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { xiaotao } from './xiaotao.mjs';
+import { MOODS, STATUS_LAYOUT, xiaotao } from './xiaotao.mjs';
 
 // 当前选定的组合，可选值见 xiaotao.mjs 的 SHAPES / FACES / GLAZES
 const LOOK = { shape: 'round', face: 'capsuleBlush', glaze: 'dip' };
@@ -22,6 +23,14 @@ mkdirSync(join(desktop, 'assets', 'brand'), { recursive: true });
 writeFileSync(join(desktop, 'assets', 'brand', 'xiaotao-small.svg'), xiaotao({ ...LOOK, bg: 'none', detail: 'small', size: 20 }));
 writeFileSync(join(desktop, 'assets', 'brand', 'xiaotao.svg'), xiaotao({ ...LOOK, bg: 'none', detail: 'mid', size: 40 }));
 writeFileSync(join(desktop, 'resources', 'claudesktop.svg'), xiaotao({ ...LOOK, bg: 'paper' }));
+// 运行状态行：20px 的格子，身子缩小挪到左下，给头顶的道具让位置
+mkdirSync(join(desktop, 'assets', 'brand', 'moods'), { recursive: true });
+for (const [mood, { frames }] of Object.entries(MOODS)) {
+  for (let frame = 0; frame < frames; frame++) {
+    const svg = xiaotao({ ...LOOK, bg: 'none', detail: 'small', expr: mood, frame, size: 20, ...STATUS_LAYOUT });
+    writeFileSync(join(desktop, 'assets', 'brand', 'moods', `${mood}-${frame}.svg`), svg);
+  }
+}
 
 const tmp = mkdtempSync(join(tmpdir(), 'xiaotao-'));
 try {

@@ -50,9 +50,9 @@ export const SHAPES = {
   jar: { label: '小罐', p: { a: 76, b: 62, cy: 142, n: 2.4, nTop: 2.6, nBot: 3.4 }, jar: true },
 };
 
-function shapeOf(kind, scale) {
+function shapeOf(kind, scale, [ox, oy] = [0, 0]) {
   const s = SHAPES[kind];
-  const p = { ...s.p, a: s.p.a * scale, b: s.p.b * scale, cy: 128 + ((s.p.cy ?? 130) - 128) * scale };
+  const p = { ...s.p, a: s.p.a * scale, b: s.p.b * scale, cx: 128 + ox, cy: 128 + ((s.p.cy ?? 130) - 128) * scale + oy };
   const pts = superPts(p);
   const xs = pts.map((q) => q[0]);
   const ys = pts.map((q) => q[1]);
@@ -157,9 +157,22 @@ ${blur('b1', 0.05 * W)}${blur('b2', 0.016 * W)}${blur('b3', 0.004 * W + 0.3)}`;
 export const FACES = {
   capsule: '竖眼', dots: '豆眼', dotsBlush: '豆眼 + 腮红', capsuleBlush: '竖眼 + 腮红', capsuleSmile: '竖眼 + 腮红 + 小嘴', happy: '笑眼',
 };
-export const EXPRS = { idle: '待命', think: '思考', focus: '专注', done: '完成', oops: '出错', sleep: '休息' };
+export const EXPRS = { idle: '待命', think: '思考', focus: '专注', done: '完成', oops: '出错', sleep: '休息', surprised: '吃惊' };
 
-function face(sh, kind, g, detail, expr) {
+// 运行状态行用的会动的表情：每个有几帧（frame 0..n-1），轮着放的顺序和节奏在界面那边（mascot.rs）。
+// 画在 20px 上：道具（泡、问号、汗珠）按绝对尺寸画粗，身子缩小挪到左下给道具让位置（见 STATUS_LAYOUT）
+export const MOODS = {
+  think: { label: '琢磨中', frames: 4 }, // 往右上看，头顶的泡一个个冒出来
+  talk: { label: '正在回复', frames: 3 }, // 嘴一张一合
+  ask: { label: '等待你授权', frames: 2 }, // 睁大眼，问号上下跳
+  sweat: { label: '自动重试', frames: 3 }, // 汗珠往下滑
+  squish: { label: '压缩上下文', frames: 2 }, // 闭眼使劲，压扁再回弹
+  wake: { label: '续接会话', frames: 3 }, // 眼睛慢慢睁开
+  scan: { label: '准备 worktree', frames: 2 }, // 左右张望
+};
+export const STATUS_LAYOUT = { scale: 1.08, offset: [-14, 16] };
+
+function face(sh, kind, g, detail, expr, frame = 0) {
   const B = sh.box;
   const W = B.w;
   const H = B.h;
@@ -197,10 +210,6 @@ function face(sh, kind, g, detail, expr) {
   if (expr === 'idle') {
     if (kind === 'happy') s = blush() + both((x) => arc(x, ey));
     else s = (blushed ? blush() : '') + both((x) => eye(x)) + (kind === 'capsuleSmile' ? smile() : '');
-  } else if (expr === 'think') {
-    // 眼睛往右上看，头顶冒三个泡
-    s = both((x) => eye(x + 0.03 * W, ey - 0.05 * H, ew, eh * 0.85));
-    s += [0, 1, 2].map((i) => `<circle cx="${f(B.x1 - 0.02 * W + i * 0.07 * W)}" cy="${f(B.y0 + 0.06 * H - i * 0.07 * H)}" r="${f(0.022 * W + i * 0.012 * W)}" fill="#C9BFAE"/>`).join('');
   } else if (expr === 'focus') {
     // 眯成两道横着的短条
     s = both((x) => pill(x, ey + 0.03 * H, ew * 1.7, ew * 0.9));
@@ -215,6 +224,39 @@ function face(sh, kind, g, detail, expr) {
     // 两个 z 用折线画，不依赖字体
     const z = (x, y, w) => `<path d="M${f(x)} ${f(y)}h${f(w)}l${f(-w)} ${f(w)}h${f(w)}" fill="none" stroke="#B5AD9E" stroke-width="${f(w * 0.22)}" stroke-linecap="round" stroke-linejoin="round"/>`;
     s += z(B.x1 - 0.04 * W, B.y0 + 0.02 * H, 13) + z(B.x1 + 0.08 * W, B.y0 - 0.1 * H, 9);
+  } else if (expr === 'surprised') {
+    s = both((x) => dot(x, ey - 0.02 * H, 0.06 * W * k[0])) + `<ellipse cx="${f(cx)}" cy="${f(ey + 0.12 * H)}" rx="${f(0.035 * W)}" ry="${f(0.045 * H)}" fill="${ink}"/>`;
+  } else if (expr === 'think') {
+    s = both((x) => eye(x + 0.04 * W, ey - 0.06 * H, ew, eh * 0.85));
+    s += [[B.x1 - 4, B.y0 - 4, 12], [B.x1 + 20, B.y0 - 30, 16], [B.x1 + 46, B.y0 - 58, 19]]
+      .slice(0, frame)
+      .map(([x, y, r]) => `<circle cx="${f(x)}" cy="${f(y)}" r="${r}" fill="#ADA596"/>`)
+      .join('');
+  } else if (expr === 'talk') {
+    s = both((x) => eye(x, ey - 0.03 * H));
+    const my = ey + 0.17 * H;
+    if (frame === 2) s += stroke(`M${f(cx - 0.07 * W)} ${f(my - 0.02 * H)}Q${f(cx)} ${f(my + 0.05 * H)} ${f(cx + 0.07 * W)} ${f(my - 0.02 * H)}`, 0.045 * W);
+    else s += `<ellipse cx="${f(cx)}" cy="${f(my)}" rx="${f((frame ? 0.06 : 0.08) * W)}" ry="${f((frame ? 0.045 : 0.085) * H)}" fill="${ink}"/>`;
+  } else if (expr === 'ask') {
+    s = both((x) => dot(x, ey - 0.02 * H, 0.062 * W * k[0]));
+    // 问号：一道弯钩 + 一个点，赤红色（和“等待你授权”的红字同一个意思）
+    const qx = B.x1 + 26;
+    const qy = B.y0 - 30 - (frame ? 10 : 0);
+    s += `<path d="M${qx - 18} ${qy - 10}q0-22 20-22q20 0 20 18q0 14-18 20v12" fill="none" stroke="#C0504D" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"/>`;
+    s += `<circle cx="${qx + 2}" cy="${qy + 42}" r="10" fill="#C0504D"/>`;
+  } else if (expr === 'sweat') {
+    s = both((x) => dot(x - 0.02 * W, ey + 0.03 * H));
+    const y = B.y0 + 6 + frame * 18;
+    const x = B.x1 + 8;
+    s += `<path d="M${x} ${y}q22 30 0 44q-22-14 0-44z" fill="#A9CBDD" stroke="#5E8FA8" stroke-width="5" stroke-linejoin="round"/>`;
+  } else if (expr === 'squish') {
+    const chev = (x, dir) => stroke(`M${f(x - dir * 0.05 * W)} ${f(ey - 0.07 * H)}L${f(x + dir * 0.04 * W)} ${f(ey)}L${f(x - dir * 0.05 * W)} ${f(ey + 0.07 * H)}`, 0.05 * W);
+    s = chev(cx - dx, 1) + chev(cx + dx, -1);
+  } else if (expr === 'wake') {
+    if (frame === 0) s = both((x) => arc(x, ey + 0.02 * H, false));
+    else s = both((x) => pill(x, ey + (frame === 1 ? 0.04 * H : 0), ew, frame === 1 ? ew : eh));
+  } else if (expr === 'scan') {
+    s = both((x) => pill(x + (frame ? 0.05 : -0.05) * W, ey, ew * 1.15, eh * 0.75));
   }
   return { defs, s };
 }
@@ -258,13 +300,16 @@ function shadow(sh, bg, detail) {
  * 生成一张小陶。size 给了就写进 width / height（gpui 按这个固有尺寸的 2 倍栅格化，界面里要和显示尺寸相当）。
  * @param {{shape?: string, face?: string, glaze?: string, bg?: string, detail?: 'full'|'mid'|'small', expr?: string, size?: number}} o
  */
-export function xiaotao({ shape = 'round', face: fk = 'capsuleBlush', glaze = 'dip', bg = 'paper', detail = 'full', expr = 'idle', size } = {}) {
+export function xiaotao({ shape = 'round', face: fk = 'capsuleBlush', glaze = 'dip', bg = 'paper', detail = 'full', expr = 'idle', frame = 0, size, scale, offset = [0, 0] } = {}) {
   // 没有底时画满一些；小尺寸再放大一档
-  const scale = detail === 'small' ? (bg === 'none' ? 1.34 : 1.24) : bg === 'none' ? 1.24 : 1.08;
-  const sh = shapeOf(shape, scale);
+  scale ??= detail === 'small' ? (bg === 'none' ? 1.34 : 1.24) : bg === 'none' ? 1.24 : 1.08;
+  const sh = shapeOf(shape, scale, offset);
   const t = tile(bg);
   const b = body(sh, glaze, detail);
-  const fc = face(sh, fk, glaze, detail, expr);
+  const fc = face(sh, fk, glaze, detail, expr, frame);
   const dim = size ? ` width="${size}" height="${size}"` : '';
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"${dim}><defs>${t.defs}${b.defs}${fc.defs}</defs>${t.back}${shadow(sh, bg, detail)}${b.L}${fc.s}${t.front}</svg>\n`;
+  // 压扁：以底边中点为基准横向撑开、纵向压低（影子不跟着变）
+  const B = sh.box;
+  const squash = expr === 'squish' && frame === 1 ? ` transform="translate(${f(B.cx)} ${f(B.y1)}) scale(1.16 .8) translate(${f(-B.cx)} ${f(-B.y1)})"` : '';
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"${dim}><defs>${t.defs}${b.defs}${fc.defs}</defs>${t.back}${shadow(sh, bg, detail)}<g${squash}>${b.L}${fc.s}</g>${t.front}</svg>\n`;
 }

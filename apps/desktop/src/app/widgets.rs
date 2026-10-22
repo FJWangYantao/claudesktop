@@ -11,7 +11,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock};
 
 /// 按钮所在的底，决定透明按钮的悬停色：纸底 / 卡片上用 `HOVER`，
 /// 沙色底（侧栏、代码块、chip）上用 `SELECTED`。
@@ -86,22 +85,6 @@ impl ChatApp {
     pub(super) fn key_text(key: &str) -> String {
         Kbd::format(&Keystroke::parse(key).expect("keys.rs 里的按键串应能解析"))
     }
-}
-
-/// 品牌形象「小陶」：上了釉的赤陶小石子（同 exe 图标），`size` 是边长。SVG 在 `assets/brand/`，
-/// 由 `tools/make-icon.mjs` 生成：1.5rem 以内用简化版（去掉釉线和高光细节、眼睛放大），大的用细节版。
-/// gpui 按 SVG 固有尺寸的 2 倍栅格化，两份的固有尺寸就是各自常用的显示尺寸（20 / 40），缩放少、边缘不糊。
-pub(super) fn brand_mark(size: Rems) -> Img {
-    static SMALL: LazyLock<Arc<Image>> = LazyLock::new(|| {
-        let svg = include_bytes!("../../assets/brand/xiaotao-small.svg");
-        Arc::new(Image::from_bytes(ImageFormat::Svg, svg.to_vec()))
-    });
-    static LARGE: LazyLock<Arc<Image>> = LazyLock::new(|| {
-        let svg = include_bytes!("../../assets/brand/xiaotao.svg");
-        Arc::new(Image::from_bytes(ImageFormat::Svg, svg.to_vec()))
-    });
-    let image = if size.0 <= 1.5 { &SMALL } else { &LARGE };
-    img(Arc::clone(image)).size(size).flex_shrink_0()
 }
 
 /// 滚动区内容的定宽。gpui 滚一格就重画整个 view，滚动区里的内容宽度不定时，

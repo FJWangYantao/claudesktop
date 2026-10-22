@@ -1,5 +1,5 @@
 //! 对话流末尾的运行状态行：本轮在干什么、跑了多久、正在下发多少 token、怎么停
-//! （对照官方「✳ 5s · ↓ 3.5k tokens · esc to interrupt」）。只在当前会话忙时出现；
+//! （对照官方「✳ 5s · ↓ 3.5k tokens · esc to interrupt」；我们的 ✳ 是一只按状态换表情的小陶）。只在当前会话忙时出现；
 //! 数据来自 `Session::activity` / `turn_usage` / `turn_started` / `live_output_tokens`
 //! （后者是本轮输出量：端点报过的 + 还在流式、靠字数估的，见 `usage::Streamed`）。
 //! 数出来的和估出来的得分得出来：端点报过用量是实色的 `↓ 1.2k token`，
@@ -7,6 +7,8 @@
 //! 一轮结束后用时和用量挂到回复末尾（[`turn_meta`]）。
 
 use super::ChatApp;
+use super::mascot::Mood;
+use super::motion::mascot;
 use crate::session::{Activity, TurnSummary, TurnUsage};
 use crate::theme::rgb;
 use crate::theme::*;
@@ -30,16 +32,7 @@ impl ChatApp {
                         .gap_1p5()
                         .text_size(TEXT_SMALL)
                         .text_color(rgb(INK_SOFT))
-                        .child(
-                            div()
-                                .size(px(16.))
-                                .flex_shrink_0()
-                                .flex()
-                                .justify_center()
-                                .items_center()
-                                .mr_0p5()
-                                .child(super::motion::breathing_dot()),
-                        )
+                        .child(mascot(Mood::Scan))
                         .child("正在准备 worktree（现在发的话会等它建好再发）…"),
                 );
             }
@@ -51,45 +44,30 @@ impl ChatApp {
                     .gap_1p5()
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
-                    .child(
-                        div()
-                            .size(px(16.))
-                            .flex_shrink_0()
-                            .flex()
-                            .justify_center()
-                            .items_center()
-                            .mr_0p5()
-                            .child(super::motion::breathing_dot()),
-                    )
+                    .child(mascot(Mood::Wake))
                     .child("正在续接会话…")
             });
         }
         let activity = s.activity();
-        // 等授权要用户处理：静止红点、红字；其余是呼吸的赤陶色圆点（减少动态效果时静止）。
-        // 只分三档：具体在跑哪一步看上面的过程组，这里不跟着每个工具来回切
-        let (indicator, label) = match activity {
-            Activity::WaitingPermission => (
-                div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element(),
-                div().text_color(rgb(RED)).child("等待你授权"),
-            ),
+        // 左边一只小陶，按状态换表情（mascot.rs 的 Mood）；等授权要用户处理，文字是红的。
+        // 只分这几档：具体在跑哪一步看上面的过程组，这里不跟着每个工具来回切
+        let (mood, label) = match activity {
+            Activity::WaitingPermission => {
+                (Mood::Ask, div().text_color(rgb(RED)).child("等待你授权"))
+            }
             // 限流 / 5xx：内核自己会重发，告诉用户在等什么、还要等多久（不然看着像卡死）
             Activity::Retrying => (
-                super::motion::breathing_dot().into_any_element(),
+                Mood::Sweat,
                 div().child(s.retry.as_ref().map_or_else(String::new, |r| {
                     retry_label(r.status, r.attempt, r.at.saturating_duration_since(Instant::now()))
                 })),
             ),
-            Activity::Compacting => {
-                (super::motion::breathing_dot().into_any_element(), div().child("正在压缩上下文"))
-            }
-            Activity::Replying => {
-                (super::motion::breathing_dot().into_any_element(), div().child("正在回复"))
-            }
+            Activity::Compacting => (Mood::Squish, div().child("正在压缩上下文")),
+            Activity::Replying => (Mood::Talk, div().child("正在回复")),
             // 一轮里固定一个动词，下一轮换（按会话和本轮开始的时刻取）
-            Activity::Working => (
-                super::motion::breathing_dot().into_any_element(),
-                div().child(working_verb((s.token, s.turn_started))),
-            ),
+            Activity::Working => {
+                (Mood::Think, div().child(working_verb((s.token, s.turn_started))))
+            }
         };
         let mut meta: Vec<(String, Color)> =
             s.turn_started.map(|t| (elapsed_label(t.elapsed()), INK_SOFT)).into_iter().collect();
@@ -110,16 +88,7 @@ impl ChatApp {
             .text_color(rgb(INK_SOFT))
             // 用时每秒在变、token 流式在涨：等宽数字，后面的「Esc 停止」不跟着抖
             .font_features(tabular_nums())
-            .child(
-                div()
-                    .size(px(16.))
-                    .flex_shrink_0()
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .mr_0p5()
-                    .child(indicator),
-            )
+            .child(mascot(mood))
             .child(label);
         for (text, color) in meta {
             row = row

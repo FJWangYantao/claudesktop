@@ -9,6 +9,7 @@ mod composer;
 mod content;
 mod gauge;
 pub(crate) mod keys;
+mod mascot;
 mod mcp_view;
 mod memory_view;
 mod menu;

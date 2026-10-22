@@ -2,7 +2,8 @@
 //! 输入框下方一排建议入口、空输入框里的建议提示词（Tab 填入，见 `complete_view.rs`）。
 
 use super::ChatApp;
-use super::widgets::{Surface, brand_mark};
+use super::mascot::brand_mark;
+use super::widgets::Surface;
 use crate::model::*;
 use crate::settings::KernelChoice;
 use crate::theme::rgb;

@@ -16,9 +16,10 @@
 //! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
+use super::mascot::brand_mark;
 use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
-use super::widgets::{Surface, brand_mark};
+use super::widgets::Surface;
 use super::{ChatApp, project_label};
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
