@@ -16,10 +16,11 @@ use super::ChatApp;
 use super::catalog_view::{
     Shelf, ShelfState, list_card, matches, no_match, pick_done, pick_row, shelf_bar,
 };
+use super::plugin_versions::{short_rev, version_label};
 use super::settings_kit::{how_to, note, section};
 use crate::theme::rgb;
 use crate::theme::*;
-use claudesktop_core::catalog::{OFFICIAL_PLUGINS, PLUGIN_PICKS, PluginPick};
+use claudesktop_core::catalog::{PluginPick, all_plugin_picks};
 use claudesktop_core::plugin::{self, Plugin};
 use claudesktop_core::plugin_git;
 use gpui_kit::assets::IconName as IconAll;
@@ -77,6 +78,16 @@ impl PluginsForm {
 }
 
 impl ChatApp {
+    /// 插件页有没有 git 操作在跑（安装 / 更新 / 换版本）。
+    pub(super) fn plugins_busy(&self) -> bool {
+        self.plugins_form.busy.is_some()
+    }
+
+    /// 改「正在跑什么」那行字（None = 没有在跑）。
+    pub(super) fn set_plugins_busy(&mut self, text: Option<SharedString>) {
+        self.plugins_form.busy = text;
+    }
+
     /// 启用了的插件（按名字记，插件目录里找不到的名字忽略）。
     pub(crate) fn enabled_plugins(&self) -> Vec<Plugin> {
         self.plugins
@@ -162,7 +173,7 @@ impl ChatApp {
         .detach();
     }
 
-    /// 装一个推荐插件：只克隆官方市场里它那个目录，装好直接启用。
+    /// 装一个推荐插件：只克隆它那个目录，装好直接启用。指向别的仓库的条目按钉住的版本装。
     fn install_pick(&mut self, pick: &'static PluginPick, cx: &mut Context<Self>) {
         if self.plugins_form.busy.is_some() {
             return;
@@ -180,7 +191,14 @@ impl ChatApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    plugin_git::install_subdir(&dir, OFFICIAL_PLUGINS, pick.path, pick.name)
+                    // 市场里的一层目录、钉了版本的按版本检出：同一个入口
+                    plugin_git::install_at(
+                        &dir,
+                        pick.repo_url(),
+                        pick.rev,
+                        Some(pick.path),
+                        pick.name,
+                    )
                 })
                 .await;
             let _ = this.update(cx, |app, cx| {
@@ -296,7 +314,7 @@ impl ChatApp {
             "plugins-shelf",
             shelf,
             self.plugins.len(),
-            PLUGIN_PICKS.len(),
+            all_plugin_picks().count(),
             |this| &mut this.plugins_form.shelf,
             cx,
         );
@@ -349,17 +367,18 @@ impl ChatApp {
         )
     }
 
-    /// 「推荐」栏：官方市场里的常用插件，装过的写「已启用」或给「启用」按钮。
+    /// 「推荐」栏：官方市场里的常用插件 + 别的仓库里的几个，装过的写「已启用」或给「启用」按钮。
     fn plugin_picks(&self, query: &str, cx: &mut Context<Self>) -> Div {
         let busy = self.plugins_form.busy.is_some();
         let mut card = list_card();
         let mut shown = 0;
-        for (i, pick) in PLUGIN_PICKS.iter().enumerate() {
-            if !matches(query, &[pick.name, pick.title, pick.description]) {
+        for (i, pick) in all_plugin_picks().enumerate() {
+            let (title, name, description) = (pick.title, pick.name, pick.description);
+            if !matches(query, &[name, title, description]) {
                 continue;
             }
-            let installed = self.plugins.iter().any(|p| p.name == pick.name);
-            let enabled = self.settings.plugins_enabled.iter().any(|n| n == pick.name);
+            let installed = self.plugins.iter().any(|p| p.name == name);
+            let enabled = self.settings.plugins_enabled.iter().any(|n| n == name);
             let action = if installed && enabled {
                 pick_done("已启用").into_any_element()
             } else if installed {
@@ -367,10 +386,10 @@ impl ChatApp {
                     .small()
                     .with_variant(ButtonVariant::Secondary)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_plugin_enabled(pick.name.to_string(), true, cx)
+                        this.set_plugin_enabled(name.to_string(), true, cx)
                     }))
                     .into_any_element()
-            } else if self.plugins_form.installing == Some(pick.name) {
+            } else if self.plugins_form.installing == Some(name) {
                 div()
                     .h_flex()
                     .items_center()
@@ -388,14 +407,19 @@ impl ChatApp {
                     .on_click(cx.listener(move |this, _, _, cx| this.install_pick(pick, cx)))
                     .into_any_element()
             };
-            card = card.child(pick_row(
-                shown == 0,
-                pick.title,
-                pick.name,
-                "",
-                pick.description,
-                action,
-            ));
+            // 指向别的仓库的条目：标出仓库和钉住的版本（和官方市场里的一眼区分开）
+            let source = pick.repo.map_or_else(
+                || "".to_string(),
+                |repo| {
+                    let short = repo.rsplit('/').next().unwrap_or(repo);
+                    if pick.rev.is_empty() {
+                        short.to_string()
+                    } else {
+                        format!("{short}@{}", short_rev(pick.rev))
+                    }
+                },
+            );
+            card = card.child(pick_row(shown == 0, title, name, &source, description, action));
             shown += 1;
         }
         if shown == 0 { no_match(query) } else { card }
@@ -530,14 +554,21 @@ impl ChatApp {
                                 .flex_shrink_0()
                                 .text_size(TEXT_SMALL)
                                 .text_color(rgb(INK_SOFT))
-                                .child(format!("v{v}")),
+                                .child(version_label(&v)),
                         )
                     })
                     .child(div().flex_1())
-                    // 从 git 装的：更新 / 卸载（卡片自带边框，按钮不描边）
+                    // 从 git 装的：换版本（按 tag）、更新、卸载（卡片自带边框，按钮不描边）
                     .when_some(p.repo.clone(), |d, repo| {
                         let update = repo.clone();
-                        d.child(
+                        d.child(super::plugin_versions::version_chip(
+                            i,
+                            p,
+                            cx.entity(),
+                            self.menu_focus.clone(),
+                            cx,
+                        ))
+                        .child(
                             Self::text_button(("plugin-update", i), "更新", false)
                                 .small()
                                 .with_variant(ButtonVariant::Secondary)

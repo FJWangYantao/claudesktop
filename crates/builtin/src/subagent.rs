@@ -142,12 +142,13 @@ pub fn forward(call: &str, event: KernelEvent) -> Option<KernelEvent> {
         KernelEvent::AgentThoughtChunk { text } => {
             KernelEvent::SubagentChunk { task: call.to_string(), text, thought: true }
         }
-        KernelEvent::PermissionRequest { id: req, title, options, tool } => {
+        KernelEvent::PermissionRequest { id: req, title, options, tool, hunks } => {
             KernelEvent::PermissionRequest {
                 id: req,
                 title: format!("子任务 · {title}"),
                 options,
                 tool: tool.map(id),
+                hunks,
             }
         }
         e @ (KernelEvent::FileChanged { .. }
