@@ -278,6 +278,7 @@ impl ChatApp {
                         .child(
                             TextView::markdown("task-prompt", reading_markdown(&run.prompt, false))
                                 .style(markdown_style())
+                                .markdown_extensions(crate::app::math::extensions())
                                 .text_size(TEXT_BODY)
                                 .text_color(rgb(INK))
                                 .line_height(LEADING),
@@ -304,6 +305,7 @@ impl ChatApp {
                     div().child(
                         TextView::markdown(("task-text", k), reading_markdown(text, streaming))
                             .style(markdown_style())
+                            .markdown_extensions(crate::app::math::extensions())
                             .text_size(TEXT_BODY)
                             .text_color(rgb(INK))
                             .line_height(LEADING),

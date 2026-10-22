@@ -21,6 +21,7 @@ mod diff;
 pub mod git;
 pub mod history_search;
 mod json_error;
+pub mod math;
 pub mod memory;
 pub mod plugin;
 pub mod plugin_git;

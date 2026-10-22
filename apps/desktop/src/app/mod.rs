@@ -11,6 +11,7 @@ mod gauge;
 mod history;
 pub(crate) mod keys;
 mod mascot;
+pub mod math;
 mod mcp_view;
 mod memory_view;
 mod menu;
@@ -1009,11 +1010,7 @@ impl ChatApp {
         }
         self.submit_to(
             idx,
-            UserPrompt {
-                text: "继续".into(),
-                images: Vec::new(),
-                attachments: Vec::new(),
-            },
+            UserPrompt { text: "继续".into(), images: Vec::new(), attachments: Vec::new() },
             cx,
         );
     }
@@ -1392,11 +1389,8 @@ impl ChatApp {
             );
             return;
         }
-        let queued = QueuedPrompt {
-            text,
-            images: self.pending.clone(),
-            files: self.pending_files.clone(),
-        };
+        let queued =
+            QueuedPrompt { text, images: self.pending.clone(), files: self.pending_files.clone() };
         // 发出去了：光标后面那句灰字、以及轮结束时猜的下一句都作废
         self.suggestion.clear();
         self.next_suggestion.clear();
@@ -1545,11 +1539,7 @@ impl ChatApp {
 
     /// 把这些路径当聊天附件收下（文本内联，图片走图片附件，其余 toast 说明）。
     /// 代码会话不走这里：那边还是把路径贴进输入框，等 agent 自己读。
-    pub(crate) fn add_pending_files(
-        &mut self,
-        paths: &[PathBuf],
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn add_pending_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
         use claudesktop_core::attach;
         let mut images = Vec::new();
         let mut refused: Vec<String> = Vec::new();
@@ -1716,7 +1706,10 @@ impl ChatApp {
             // 和用户写的一样就不必另存一份（`sent` 只在不一样时进日志）
             let sent = (reviewed || expanded.is_some() || has_attachments).then_some(sent);
             if kernel.is_some() {
-                self.persist(idx, Record::User { text: shown.clone(), images: stored, sent });
+                self.persist(
+                    idx,
+                    Record::User { text: shown.clone(), images: stored, sent: sent.clone() },
+                );
             }
             let prompt = match sent {
                 // 附件内容已经在 `sent` 里了，内核不必再拼一遍
