@@ -1,5 +1,15 @@
 # claudesktop 开发约定
 
+## 工作方式
+
+1. **第一性原理**：先确认真实目标、约束和成功标准，再动手；不要套用惯例（惯例只是默认值，不是理由）。
+2. **按复杂度选回答形式**：简单问题直接回答；复杂的方案 / 对比 / 梳理用 `answer-me-with-html` 出一份带样式的 HTML。
+3. **坑写进 `HANDOFF.md`**：踩过的坑、绕过的弯路记进项目根的 `HANDOFF.md`；接新任务前先读一遍，避免重踩。
+4. **浏览器默认用 Chrome**（含 Codex 的浏览器自动化）；要动 Vivaldi（用户自己的浏览器）之前先问。
+5. **上线 / 部署 / 生产环境的任务**：把性能开销（CPU、内存、请求数、启动时间）写进设计取舍和验收标准。
+6. **UI 不堆二级标题和说明**：能不写的标签、副标题、解释句就不写，让排版本身说明结构（同「设计指南-Claude风格UI.md」的反模式一节）。
+   *Avoid unnecessary secondary labels and descriptions. Let the layout do the explaining.*
+
 ## UI：优先用 gpui-kit 自带组件，不要手写
 
 本项目依赖 `gpui-kit 0.7`，其组件实体在 `gpui-component` crate 里（本地源码：
@@ -16,6 +26,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `MenuChip`）。open 状态由 Popover 自己持有（点外 / Esc 关闭，选中后
   `PopoverState::dismiss`），**不要**在 `ChatApp` 根 struct 里加 `*_open` bool、
   手摆 `absolute()` 坐标或手写互斥——那是 2026-10 之前的老写法，已清除。
+  chip 里放长度不由我们定的文字（项目名 / 模型名 / 分支名）时加 `.shrink()`：它给 chip 和
+  Popover 的 trigger 容器一起设 `flex_shrink` + `min_w`，文字打省略号；不加就会在窄窗口 /
+  大字号下把同一行的发送键顶到卡片外面（见 HANDOFF.md）。
 - **菜单条目**：两行式（图标 + 名称 + 灰色说明 + 当前项对勾）用 `menu.rs` 的 `menu_item()`，
   「选的是观感」的条目（如字体）用 `font_menu_item()`（上面灰字名称，下面用该字体本身排一行预览）；
   装进 `MenuList::pick(row, action)`（点了执行并收起，前 9 个自动标键帽、按数字直接选；动作要 `Window` 时用 `pick_in`）；
@@ -166,6 +179,11 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `MoveUp` / `Enter` / `IndentInline` / `Escape` 动作，动作先于原始按键事件分发，所以 `on_key_down`
   截不到；要在输入框的祖先上 `capture_action`（capture 阶段从根到焦点），处理了 `cx.stop_propagation()`，
   没处理就什么都不做（放行）。见 `app/complete_view.rs`。
+  细节（`设计说明-输入框方向键.md`）：↑↓ **只有两项以上才截**（一项时放行移光标）；←→ 一律放行，
+  在 capture 里 `cx.defer_in` 一次 `sync_completion`——`InputEvent` 没有光标事件，只能键放行后
+  自己再对一次触发词（移出 `/` `@` 范围就收列表）；Ctrl+回车不用另绑，输入框的
+  `secondary-enter` 已经是 `Enter { secondary: true }` 且照常发 `PressEnter`；Alt+← / → 展开 / 收起列表
+  （macOS 上那对键被输入框占了按词移动，走 Ctrl+Alt+← / →）。
 - **输入框的 Tab 补全**（`app/suggest.rs` + `crates/builtin/src/suggest.rs`）：停顿一下就让模型
   猜一句下文，灰字画在光标后面，Tab 接上（`complete_view.rs` 里 `IndentInline` 的第二个分支，
   排在 `/` `@` 列表和首页 ghost prompt 之后）。灰字不能自己算位置——光标在第几行、横向滚了多远
