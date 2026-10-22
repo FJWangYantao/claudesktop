@@ -8,6 +8,7 @@ mod complete_view;
 mod composer;
 mod content;
 mod gauge;
+mod history;
 pub(crate) mod keys;
 mod mascot;
 mod mcp_view;
@@ -99,6 +100,8 @@ pub struct ChatApp {
     rename_focused: bool,
     /// 输入框的 `/指令`、`@文件` 补全（见 `complete_view.rs`）
     completion: complete_view::CompletionState,
+    /// 输入历史（发出去的消息，输入框里上下键回溯，见 `history.rs`）
+    history: history::InputHistory,
     /// 侧栏里等待确认删除的会话（令牌）
     confirm_delete: Option<u64>,
     /// 内核槽，按 [`KernelChoice::key`] 找：用到时才启动，可以同时在线，会话各自绑定一个
@@ -288,6 +291,8 @@ impl ChatApp {
                     InputEvent::PressEnter { .. } => {}
                     // 打字时刷新 `/`、`@` 补全。只重画输入区，不碰对话（见 content.rs）
                     InputEvent::Change => {
+                        // 用户改了内容：退出历史回溯，别让下一条历史把新写的字冲掉
+                        this.history.touch();
                         this.update_completion(cx);
                         // 停顿一下就猜一句下文（见 suggest.rs）
                         this.schedule_suggestion(cx);
@@ -423,6 +428,7 @@ impl ChatApp {
             rename_input,
             rename_focused: false,
             completion: Default::default(),
+            history: Default::default(),
             confirm_delete: None,
             kernels: Default::default(),
             ev_tx,
@@ -1257,6 +1263,7 @@ impl ChatApp {
         if self.sessions[active].busy || self.sessions[active].stopping {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.history.push(&queued.text);
             self.sessions[active].queued.push(queued);
             cx.notify();
             return;
@@ -1265,14 +1272,19 @@ impl ChatApp {
         if self.sessions[active].worktree_busy.is_some() {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.history.push(&queued.text);
             self.sessions[active].queued.push(queued);
             cx.notify();
             return;
         }
         // 发不出去（内核不可用、会话还没就绪）就别清空，免得写好的内容丢了
+        let sent_text = queued.text.clone();
         if self.submit_to(active, queued.into_prompt(), cx) {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            // 真发出去了才进输入历史（排队的两处上面已经记过）；发失败的不记，
+            // 免得 ↑ 翻出来一条从没发出去的消息
+            self.history.push(&sent_text);
             self.refresh_composer(cx);
         }
     }

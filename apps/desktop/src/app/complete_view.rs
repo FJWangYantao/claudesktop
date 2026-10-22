@@ -299,65 +299,149 @@ impl ChatApp {
         card: Stateful<Div>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        card.capture_action(cx.listener(|this, _: &MoveUp, _, cx| this.step_completion(-1, cx)))
-            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| this.step_completion(1, cx)))
-            .capture_action(cx.listener(|this, action: &Enter, window, cx| {
-                // Shift+回车照常换行
-                if action.shift {
-                    return;
-                }
-                this.accept_selected(window, cx);
-            }))
-            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                // 首页空输入框里的建议提示词：Tab 填入（见 overview.rs）
-                if this.completion.open.is_none()
-                    && this.input.read(cx).value().is_empty()
-                    && let Some(prompt) = this.ghost_prompt()
-                {
-                    cx.stop_propagation();
-                    this.fill_prompt(prompt, window, cx);
-                    return;
-                }
-                // 一轮结束后猜的那句（淡色画在空输入框里）：Tab 填入（见 suggest.rs）
-                if this.completion.open.is_none() && this.next_suggestion_text(cx).is_some() {
-                    cx.stop_propagation();
-                    this.accept_next_suggestion(window, cx);
-                    return;
-                }
-                // 候选列表没开、光标后面有一句灰字：Tab 接上（见 suggest.rs）
-                if this.completion.open.is_none() && this.suggested_tail(cx).is_some() {
-                    cx.stop_propagation();
-                    this.accept_suggestion(window, cx);
-                    return;
-                }
-                this.accept_selected(window, cx)
-            }))
-            .capture_action(cx.listener(|this, _: &Escape, _, cx| {
-                if this.completion.open.take().is_some() {
-                    this.completion.dismissed = Some(this.input.read(cx).value().to_string());
-                    cx.stop_propagation();
-                    this.refresh_composer(cx);
-                } else if this.next_suggestion_text(cx).is_some() {
-                    // 空输入框里那句猜的下一句：Esc 先撤掉它（不打断打字，也不动光标）
-                    this.next_suggestion.clear();
-                    cx.stop_propagation();
-                    this.refresh_composer(cx);
-                } else if this.suggested_tail(cx).is_some() {
-                    // 光标后面有灰字：Esc 先撤掉它（不打断打字，也不动光标）
-                    this.suggestion.clear();
-                    cx.stop_propagation();
-                    this.refresh_composer(cx);
-                }
-            }))
+        card.capture_action(
+            cx.listener(|this, _: &MoveUp, window, cx| this.step_completion(-1, window, cx)),
+        )
+        .capture_action(
+            cx.listener(|this, _: &MoveDown, window, cx| this.step_completion(1, window, cx)),
+        )
+        .capture_action(cx.listener(|this, action: &Enter, window, cx| {
+            // Shift+回车照常换行
+            if action.shift {
+                return;
+            }
+            this.accept_selected(window, cx);
+        }))
+        .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+            // 首页空输入框里的建议提示词：Tab 填入（见 overview.rs）
+            if this.completion.open.is_none()
+                && this.input.read(cx).value().is_empty()
+                && let Some(prompt) = this.ghost_prompt()
+            {
+                cx.stop_propagation();
+                this.fill_prompt(prompt, window, cx);
+                return;
+            }
+            // 一轮结束后猜的那句（淡色画在空输入框里）：Tab 填入（见 suggest.rs）
+            if this.completion.open.is_none() && this.next_suggestion_text(cx).is_some() {
+                cx.stop_propagation();
+                this.accept_next_suggestion(window, cx);
+                return;
+            }
+            // 候选列表没开、光标后面有一句灰字：Tab 接上（见 suggest.rs）
+            if this.completion.open.is_none() && this.suggested_tail(cx).is_some() {
+                cx.stop_propagation();
+                this.accept_suggestion(window, cx);
+                return;
+            }
+            this.accept_selected(window, cx)
+        }))
+        .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+            if this.completion.open.take().is_some() {
+                this.completion.dismissed = Some(this.input.read(cx).value().to_string());
+                cx.stop_propagation();
+                this.refresh_composer(cx);
+            } else if this.next_suggestion_text(cx).is_some() {
+                // 空输入框里那句猜的下一句：Esc 先撤掉它（不打断打字，也不动光标）
+                this.next_suggestion.clear();
+                cx.stop_propagation();
+                this.refresh_composer(cx);
+            } else if this.suggested_tail(cx).is_some() {
+                // 光标后面有灰字：Esc 先撤掉它（不打断打字，也不动光标）
+                this.suggestion.clear();
+                cx.stop_propagation();
+                this.refresh_composer(cx);
+            }
+        }))
     }
 
-    fn step_completion(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(c) = self.completion.open.as_mut() else {
+    /// 上下键的统一入口，按下面的顺序判定，第一条命中就停（见「设计说明-输入框方向键.md」）：
+    ///
+    /// 1. 补全列表开着且有 **两项以上** → 选上 / 下一项。只有一项时不截键：
+    ///    截了却没有可选项会变成「按了没反应」。
+    /// 2. 光标在第一行开头按 ↑ / 末尾按 ↓（且正翻着历史）→ 回溯输入历史（见 `history.rs`）；
+    ///    没有上一条 / 下一条时**什么都不做**。
+    /// 3. 单行输入：↑ 到开头、↓ 到末尾（光标在中间就只走这一步）。
+    /// 4. 其余（多行的行内移动）→ 放行，由输入框自己上下移光标。
+    ///    走到第一行开头 / 最后一行末尾之后**再按一次**才换历史。
+    fn step_completion(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        // 1. 补全列表：两项以上才接管
+        if let Some(c) = self.completion.open.as_mut()
+            && c.items.len() >= 2
+        {
+            let n = c.items.len() as isize;
+            c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
+            cx.stop_propagation();
+            self.refresh_composer(cx);
             return;
+        }
+        let (text, cursor) = {
+            let input = self.input.read(cx);
+            (input.value().to_string(), input.cursor())
         };
-        let n = c.items.len() as isize;
-        c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
-        cx.stop_propagation();
+        let (line, _column) = cursor_line_column(&text, cursor);
+        let last_line = text.matches('\n').count();
+        let single_line = last_line == 0;
+        let at_start = cursor == 0;
+        let at_end = cursor == text.len();
+
+        // 2. 句首：回溯历史；已经是第一行开头但没有上一条 → 什么都不做
+        //    （多行时只有走到第一行开头才换历史，行内移动留给下面的放行分支）
+        if at_start && delta < 0 && (single_line || line == 0) {
+            if let Some(prev) = self.history.prev(&text).map(str::to_string) {
+                self.fill_history(&prev, false, window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        // 2b. 句末且正翻着历史：下一条（走到最新一条之后再按就拿回草稿）
+        if at_end && delta > 0 && self.history.browsing() {
+            if let Some(next) = self.history.next(&text) {
+                self.fill_history(&next, true, window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        // 3. 单行输入：↑ 到开头、↓ 到末尾（光标在中间就只走这一步）
+        if single_line && delta < 0 && !at_start {
+            self.move_caret(0, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if single_line && delta > 0 && !at_end {
+            self.move_caret(text.len(), window, cx);
+            cx.stop_propagation();
+        }
+
+        // 4. 其余放行：多行编辑的行内移动不丢（走到第一行开头 / 最后一行末尾后再按才换历史）
+    }
+
+    /// 把光标挪到 `offset`（字节）；多行按行列换算。
+    fn move_caret(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |state, cx| {
+            let text = state.value().to_string();
+            let offset = offset.min(text.len());
+            let (line, column) = cursor_line_column(&text, offset);
+            state.set_cursor_position(Position::new(line, column), window, cx);
+        });
+        self.refresh_composer(cx);
+    }
+
+    /// 把历史里的一条填进输入框（`to_end` 决定光标放开头还是末尾）。
+    ///
+    /// `set_value` 不发 `InputEvent::Change`（见 gpui-base 的注释），所以这里要自己
+    /// 收掉补全列表、重画输入区；不能让 `update_completion` 跑，否则会拿旧草稿重新开列表。
+    fn fill_history(
+        &mut self,
+        text: &str,
+        to_end: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.update(cx, |state, cx| state.set_value(text, window, cx));
+        self.completion.open = None;
+        self.move_caret(if to_end { text.len() } else { 0 }, window, cx);
         self.refresh_composer(cx);
     }
 
@@ -442,5 +526,40 @@ impl ChatApp {
             );
         }
         Some(list)
+    }
+}
+
+/// 把字节偏移换算成输入框用的行列（0 起）：行按 `\n` 数，列按字符数（不是字节）。
+/// 偏移落在多字节字符中间时向前取整（`cursor` 理论上总在边界上，这里兜个底）。
+fn cursor_line_column(text: &str, offset: usize) -> (u32, u32) {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &text[..offset];
+    let line = before.matches('\n').count() as u32;
+    let column = before.rsplit('\n').next().unwrap_or(before).chars().count() as u32;
+    (line, column)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn line_column_is_zero_based_and_counts_chars() {
+        // 列按字符数：`"ab\ncd"` 里 `c` 的字节偏移是 3，列 0；`d` 是 4，列 1
+        assert_eq!(cursor_line_column("", 0), (0, 0));
+        assert_eq!(cursor_line_column("abc", 0), (0, 0));
+        assert_eq!(cursor_line_column("abc", 3), (0, 3));
+        assert_eq!(cursor_line_column("ab\ncd", 0), (0, 0));
+        assert_eq!(cursor_line_column("ab\ncd", 3), (1, 0));
+        assert_eq!(cursor_line_column("ab\ncd", 4), (1, 1));
+        // 多字节：按字符数，不按字节（"中文" 各 3 字节，`\n` 在偏移 6，`好` 在 7..10）
+        assert_eq!(cursor_line_column("中文\n好", 6), (0, 2));
+        assert_eq!(cursor_line_column("中文\n好", 7), (1, 0));
+        assert_eq!(cursor_line_column("中文\n好", "中文\n好".len()), (1, 1));
+        // 偏移落在多字节字符中间：向前取整，不 panic
+        assert_eq!(cursor_line_column("中文\n好", 1), (0, 0));
     }
 }

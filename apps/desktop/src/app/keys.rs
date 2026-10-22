@@ -68,6 +68,10 @@ pub(super) const ZOOM_OUT_KEY: &str = "secondary--";
 pub(super) const ZOOM_RESET_KEY: &str = "secondary-0";
 /// 权限卡上的第 n 个按钮。带 Alt：焦点总在输入框里，裸数字键会和打字（排队消息）抢
 pub(super) const PERMISSION_KEYS: [&str; 4] = ["alt-1", "alt-2", "alt-3", "alt-4"];
+/// 输入框里的上下键（历史回溯 / 跳到句首句末）。这两个键由输入框自己绑动作
+/// （`MoveUp` / `MoveDown`），在 `complete_view.rs` 的 `capture_action` 里接管，
+/// 所以这里只是速查表用的文案常量，**不进 `bind()`**。
+pub(super) const INPUT_HISTORY_KEYS: [&str; 2] = ["up", "down"];
 
 /// 注册按键（应用启动时调用一次）。`secondary` 在 macOS 上是 Cmd，其余平台是 Ctrl。
 pub(crate) fn bind(cx: &mut App) {
