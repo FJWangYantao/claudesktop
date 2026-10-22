@@ -310,22 +310,31 @@ pub fn vision_from_modalities(entry: &serde_json::Value) -> Option<bool> {
 }
 
 /// 端点回的 400 是不是「这个模型看不了图片」（第七章 7.3 的识别与翻译）。
+///
+/// 判错了会把模型永久记成「看不了图」（之后附图直接拦下），所以宁可漏判：
+/// 明确说「这个模型不收图」的短语直接算；`multimodal` 这类泛的词要同时提到图片 / 视觉，
+/// 而且不是在说格式、尺寸（那是这张图的问题，换张图就好，不是模型看不了）。
 pub fn image_rejection(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    const HINTS: &[&str] = &[
+    const STRONG: &[&str] = &[
         "image_url is not supported",
         "does not support image",
         "does not support images",
         "image input is not supported",
         "not support vision",
-        "no vision",
-        "multimodal",
-        "invalid content type",
         "image not supported",
-        "unsupported image",
         "不支持图片",
     ];
-    HINTS.iter().any(|h| m.contains(h))
+    if STRONG.iter().any(|h| m.contains(h)) {
+        return true;
+    }
+    const WEAK: &[&str] = &["multimodal", "invalid content type", "unsupported image"];
+    const ABOUT_IMAGES: &[&str] = &["image", "vision", "图片", "图像"];
+    const ABOUT_THIS_IMAGE: &[&str] =
+        &["format", "size", "too large", "dimension", "resolution", "格式", "尺寸", "太大"];
+    WEAK.iter().any(|h| m.contains(h))
+        && ABOUT_IMAGES.iter().any(|h| m.contains(h))
+        && !ABOUT_THIS_IMAGE.iter().any(|h| m.contains(h))
 }
 
 #[cfg(test)]
@@ -469,5 +478,11 @@ mod tests {
         assert!(image_rejection("image_url is not supported for this model"));
         assert!(image_rejection("This model does not support image inputs."));
         assert!(!image_rejection("rate limit exceeded"));
+        // 泛的词要同时提到图片，且不是在说这张图的格式 / 尺寸
+        assert!(image_rejection("Multimodal input (image) is not available for this model"));
+        assert!(!image_rejection("multimodal tool schemas are not supported"));
+        assert!(!image_rejection("Invalid content type: expected text or tool_result"));
+        assert!(!image_rejection("Unsupported image format: image/heic"));
+        assert!(!image_rejection("unsupported image: size exceeds 5 MB"));
     }
 }

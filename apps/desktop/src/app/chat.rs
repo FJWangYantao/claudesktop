@@ -1873,7 +1873,7 @@ impl ChatApp {
     ) -> Div {
         let verbose = self.settings.view_mode == ViewMode::Verbose;
         match item {
-            ChatItem::User { text, images } => self.render_user(idx, text, images, window, cx),
+            ChatItem::User { text, images, .. } => self.render_user(idx, text, images, window, cx),
             ChatItem::Thinking { text, streaming, open, elapsed_ms, .. } => Self::render_thinking(
                 idx,
                 text,

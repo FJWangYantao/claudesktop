@@ -359,6 +359,9 @@ pub enum ChatItem {
         text: SharedString,
         /// 图片附件的绝对路径（气泡里渲染缩略图；发给内核时读回 base64）
         images: Vec<std::path::PathBuf>,
+        /// 聊天的文本附件（重试 / 换内核重跑时原样再带上）。只在这次运行里有：
+        /// 从日志恢复的会话为空（内容只在日志的 `sent` 里，已经拼进上下文了）
+        files: std::sync::Arc<Vec<claudesktop_core::attach::TextAttachment>>,
     },
     Thinking {
         text: String,
@@ -423,6 +426,8 @@ pub enum CompactState {
 /// 输入框里待发送的一张图片附件（已编好 base64，预览用 gpui Image）。
 #[derive(Clone)]
 pub struct PendingImage {
+    /// 这次运行里唯一的编号：后台处理完按它对回（下标会因删除而挪，名字会重复，如「剪贴板图片」）
+    pub id: u64,
     /// 原始文件名（悬停提示用）
     pub name: SharedString,
     /// 如 `image/png`
@@ -441,7 +446,9 @@ impl PendingImage {
     /// 从图片字节构造（格式已知，如剪贴板里的 gpui Image）。
     pub fn from_bytes(name: SharedString, bytes: Vec<u8>, format: gpui_kit::ImageFormat) -> Self {
         use base64::Engine as _;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             name,
             media_type: format.mime_type().to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -451,8 +458,9 @@ impl PendingImage {
         }
     }
 
-    /// 已经处理好的那张（发送前转正 / 缩小 / 重编码的结果，见 `image_prep`）。
+    /// 已经处理好的那张（发送前转正 / 缩小 / 重编码的结果，见 `image_prep`）；`id` 沿用原来那张的。
     pub fn from_prepared(
+        id: u64,
         name: SharedString,
         prepared: &claudesktop_core::image_prep::Prepared,
     ) -> Self {
@@ -464,6 +472,7 @@ impl PendingImage {
             _ => gpui_kit::ImageFormat::Jpeg,
         };
         Self {
+            id,
             name,
             media_type: prepared.media_type.clone(),
             data: base64::engine::general_purpose::STANDARD.encode(&prepared.bytes),
@@ -599,7 +608,7 @@ impl ChatItem {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match self {
-            Self::User { text, images } => (0u8, text.len(), images.len()).hash(&mut h),
+            Self::User { text, images, .. } => (0u8, text.len(), images.len()).hash(&mut h),
             Self::Thinking { text, streaming, open, elapsed_ms, .. } => {
                 (1u8, text.len(), streaming, open, elapsed_ms.is_some()).hash(&mut h)
             }

@@ -1122,31 +1122,53 @@ impl ChatApp {
         if s.busy {
             return;
         }
-        let Some(ChatItem::User { text, images }) =
-            s.turn_prompt(failed_idx).and_then(|u| s.transcript.get(u))
-        else {
+        let Some(user) = s.turn_prompt(failed_idx) else {
             return;
         };
-        let prompt = UserPrompt {
-            // 气泡里带着附件名那一行：重发时只要回复用户打的字（附件已经不在手里）
-            text: claudesktop_core::attach::strip_display(text).to_string(),
-            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
-            attachments: Vec::new(),
+        let Some(prompt) = self.resend_prompt(idx, user, cx) else {
+            return;
         };
         self.submit_to(idx, prompt, cx);
+    }
+
+    /// 把对话里的一条用户消息还原成能再发一遍的提示词（重试 / 换内核重跑）。
+    ///
+    /// 气泡里那行附件名不是用户打的字，去掉；文本附件这次运行里还在就原样带上。
+    /// 从日志恢复的会话里附件内容已经不在手里：照发用户的话，并提示一句。
+    fn resend_prompt(
+        &mut self,
+        idx: usize,
+        item_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<UserPrompt> {
+        let Some(ChatItem::User { text, images, files }) =
+            self.sessions[idx].transcript.get(item_idx)
+        else {
+            return None;
+        };
+        let typed = claudesktop_core::attach::strip_display(text);
+        let lost = files.is_empty() && typed.len() != text.len();
+        let prompt = UserPrompt {
+            text: typed.to_string(),
+            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
+            attachments: files.as_ref().clone(),
+        };
+        if lost {
+            self.toast(
+                Notification::warning(
+                    "这条消息的文本附件已经不在了，只重发了文字和图片；需要的话请重新添加文件",
+                ),
+                cx,
+            );
+        }
+        Some(prompt)
     }
 
     /// 同一任务换个内核跑：拿当前会话里第 `item_idx` 条用户消息，在 `kind` 上新开会话发出去。
     pub(crate) fn rerun_on(&mut self, item_idx: usize, kind: KernelChoice, cx: &mut Context<Self>) {
         let src = self.active;
-        let Some(ChatItem::User { text, images }) = self.sessions[src].transcript.get(item_idx)
-        else {
+        let Some(prompt) = self.resend_prompt(src, item_idx, cx) else {
             return;
-        };
-        let prompt = UserPrompt {
-            text: claudesktop_core::attach::strip_display(text).to_string(),
-            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
-            attachments: Vec::new(),
         };
         let from = self.sessions[src].title.clone();
         let cwd = self.sessions[src].cwd.clone();
@@ -1173,6 +1195,7 @@ impl ChatApp {
                 0 => ChatItem::User {
                     text: format!("第 {i} 条：帮我看看这段代码为什么慢").into(),
                     images: Vec::new(),
+                    files: Default::default(),
                 },
                 1 => ChatItem::Agent(format!(
                     "**第 {i} 条回复。** 先看热点：\n\n- 每帧重建整棵树\n- 列表没有虚拟化\n\n```rust\nfn hot(i: usize) -> usize {{ i * {i} }}\n```\n\n改完再测一次。"
@@ -1647,17 +1670,16 @@ impl ChatApp {
         if !self.pending.iter().any(|p| p.preparing) {
             return;
         }
-        // 只处理还没处理过的那些，按下标找回（后台跑的时候列表可能被删过）
-        let jobs: Vec<(usize, SharedString, Vec<u8>)> = self
+        // 只处理还没处理过的那些，按编号找回（后台跑的时候列表可能被删过、挪过）
+        let jobs: Vec<(u64, SharedString, Vec<u8>)> = self
             .pending
             .iter()
-            .enumerate()
-            .filter(|(_, p)| p.preparing)
-            .filter_map(|(i, p)| {
+            .filter(|p| p.preparing)
+            .filter_map(|p| {
                 use base64::Engine as _;
                 let raw =
                     base64::engine::general_purpose::STANDARD.decode(p.data.as_bytes()).ok()?;
-                Some((i, p.name.clone(), raw))
+                Some((p.id, p.name.clone(), raw))
             })
             .collect();
         if jobs.is_empty() {
@@ -1669,23 +1691,23 @@ impl ChatApp {
                 .background_executor()
                 .spawn(async move {
                     jobs.into_iter()
-                        .map(|(i, name, raw)| {
+                        .map(|(id, name, raw)| {
                             let out = claudesktop_core::image_prep::prepare(&name, &raw, quality);
-                            (i, name, out)
+                            (id, name, out)
                         })
                         .collect::<Vec<_>>()
                 })
                 .await;
             this.update(cx, |app, cx| {
                 let mut failed: Vec<String> = Vec::new();
-                for (i, name, out) in results {
-                    let Some(slot) = app.pending.get_mut(i) else { continue };
-                    // 处理期间那一格被别人删了：跳过（下标可能已经变了，用名字再对一次）
-                    if slot.name != name {
+                for (id, name, out) in results {
+                    // 处理期间被删了（或另一批已经处理好了）：跳过
+                    let Some(slot) = app.pending.iter_mut().find(|p| p.id == id && p.preparing)
+                    else {
                         continue;
-                    }
+                    };
                     match out {
-                        Ok(prepared) => *slot = PendingImage::from_prepared(name, &prepared),
+                        Ok(prepared) => *slot = PendingImage::from_prepared(id, name, &prepared),
                         Err(err) => {
                             failed.push(err.message());
                             slot.preparing = false;
@@ -1878,6 +1900,7 @@ impl ChatApp {
             self.sessions[idx].transcript.push(ChatItem::User {
                 text: SharedString::from(shown.clone()),
                 images: image_paths,
+                files: std::sync::Arc::new(attachments.clone()),
             });
             // 插件的斜杠命令：对话里显示原样的「/命令 参数」，发给内核的是展开后的模板
             let enabled = self.enabled_plugins();
