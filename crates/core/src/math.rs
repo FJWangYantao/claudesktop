@@ -183,9 +183,10 @@ pub fn normalize_markup(text: &str) -> std::borrow::Cow<'_, str> {
                     out.push_str(&text[i..end]);
                     i = end;
                 }
+                // 落单的 `$`（多半是价格）：只抄它自己，后面的 `\(` 照常转换
                 None => {
-                    out.push_str(rest);
-                    i = limit;
+                    out.push_str(delim);
+                    i = body_start;
                 }
             }
             continue;
@@ -458,6 +459,12 @@ mod tests {
     fn unclosed_backslash_paren_survives_streaming() {
         // 流式中途只写了一半：原样留着，等收尾
         assert_eq!(normalize_markup("结果是 \\(x + 1"), "结果是 \\(x + 1");
+    }
+
+    #[test]
+    fn a_lone_dollar_does_not_stop_normalizing() {
+        assert_eq!(normalize_markup("costs $5. Formula: \\(x^2\\)"), "costs $5. Formula: $x^2$");
+        assert_eq!(normalize_markup("$$ open \\(a\\)"), "$$ open $a$");
     }
 
     #[test]

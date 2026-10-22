@@ -264,6 +264,14 @@ fn copyable(record: &Record) -> bool {
     )
 }
 
+/// 把一张图片附件拷进会话 `id` 的资产目录，返回新路径；原文件已经不在了返回 None。
+fn copy_image(store: &SessionStore, id: &str, path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let copied = store.save_image(id, ext, &bytes).ok()?;
+    Some(copied.to_string_lossy().into_owned())
+}
+
 impl ChatApp {
     /// 按槽的 key 找（只读）。
     pub(crate) fn slot(&self, key: &str) -> Option<&KernelSlot> {
@@ -774,20 +782,10 @@ impl ChatApp {
             // 还没落过盘（一个字都没发）：没有可复制的东西
             None => Vec::new(),
         };
-        // 只抄对话本身：文件改动 / 检查点 / 回退不抄（新目录里没有那些文件，抄过去回退会乱）
-        let records: Vec<Record> = records
-            .into_iter()
-            .filter(copyable)
-            .map(|r| match r {
-                // 图片附件的路径指向前一个会话的资产目录：还在的保留，不在的去掉
-                Record::User { text, images, sent } => Record::User {
-                    text,
-                    images: images.into_iter().filter(|p| Path::new(p).is_file()).collect(),
-                    sent,
-                },
-                other => other,
-            })
-            .collect();
+        // 先折算回退（回退掉的轮次不能在新会话里复活），再只抄对话本身：
+        // 文件改动 / 检查点 / 回退不抄（新目录里没有那些文件，抄过去回退会乱）
+        let records: Vec<Record> =
+            claudesktop_core::effective(&records).into_iter().filter(copyable).collect();
         let title = format!("{}（接着聊）", self.sessions[src].title);
         let kind = self.settings.kernel_for_space(Space::Code);
         let agent_cmd = self.slot(&kind.key()).map(|s| s.agent_cmd.clone()).unwrap_or_default();
@@ -797,6 +795,19 @@ impl ChatApp {
                 meta.task = false;
                 store.save_meta(&meta)?;
                 for record in records {
+                    let record = match record {
+                        // 图片附件拷进新会话自己的资产目录：删掉原聊天时会连资产一起删。
+                        // 已经不在的去掉
+                        Record::User { text, images, sent } => Record::User {
+                            text,
+                            images: images
+                                .iter()
+                                .filter_map(|p| copy_image(store, &meta.id, Path::new(p)))
+                                .collect(),
+                            sent,
+                        },
+                        other => other,
+                    };
                     log.append(record)?;
                 }
                 Ok(meta)
@@ -2330,6 +2341,7 @@ impl ChatApp {
                 meta.task = s.task;
                 meta.worktree = s.worktree.clone();
                 meta.kind = s.kind;
+                meta.web = (s.kind == SessionKind::Chat).then_some(s.web);
                 let _ = store.save_meta(&meta);
                 s.meta = Some(meta);
                 log
@@ -2457,6 +2469,7 @@ impl ChatApp {
             meta.task = s.task;
             meta.worktree = s.worktree.clone();
             meta.kind = s.kind;
+            meta.web = (s.kind == SessionKind::Chat).then_some(s.web);
             meta.updated_ms = now_ms();
             let _ = store.save_meta(meta);
         }

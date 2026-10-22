@@ -547,6 +547,7 @@ mod tests {
             task: false,
             worktree: None,
             kind: claudesktop_core::SessionKind::Code,
+            web: None,
         }
     }
 
