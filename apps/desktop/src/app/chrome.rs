@@ -168,7 +168,9 @@ impl ChatApp {
                     .child(self.sidebar_toggle("header-sidebar-toggle", cx))
             })
             .child(drag_area().pl_4().pr_2().child(crumb))
-            // 跑在 git worktree 里：面包屑后面一个分支 chip（点开是打开目录 / 合并 / 删除）
+            // 跑在 git worktree 里：面包屑后面一个分支 chip（点开是打开目录 / 合并 / 删除）。
+            // 分支名很长，chip 自己可缩（`worktree_chip`）；外层不设 min_w_0，让它的最小宽度
+            // 正好等于 chip 的最小宽度，缩到头就停，别让 chip 画到旁边的按钮上
             .when_some(
                 super::worktree::render_worktree_chip(self, &cx.entity(), &self.menu_focus),
                 |d, chip| d.child(div().mr_1().child(chip)),

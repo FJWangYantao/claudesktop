@@ -19,6 +19,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::rc::Rc;
 
+/// 可收缩的 chip 最多压到多宽（rem）：图标 + 一两个字，够看出它是哪一类；点开菜单能看到全名
+const CHIP_MIN_W: Rems = rems(3.5);
+
 /// 下拉 trigger chip：图标 + 文字 + 展开箭头，或只有文字，弹层打开时高亮。
 /// 实现 [`Selectable`] 以便作为 `Popover::trigger` 使用。
 #[derive(IntoElement)]
@@ -29,23 +32,51 @@ pub(super) struct MenuChip {
     plain: bool,
     /// 沙色实底（筛选条这类放在纸底上、要一眼看出能点的 chip）
     filled: bool,
+    /// 一行放不下时允许把这个 chip 压窄、文字末尾打省略号（项目名 / 模型名这类外来的长文字）
+    shrink: bool,
     open: bool,
 }
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self { icon: Some(icon), label: label.into(), plain: false, filled: false, open: false }
+        Self {
+            icon: Some(icon),
+            label: label.into(),
+            plain: false,
+            filled: false,
+            shrink: false,
+            open: false,
+        }
     }
 
     /// 只有文字，不带展开箭头（输入框工具栏里的模型）。
     pub(super) fn plain(label: impl Into<SharedString>) -> Self {
-        Self { icon: None, label: label.into(), plain: true, filled: false, open: false }
+        Self {
+            icon: None,
+            label: label.into(),
+            plain: true,
+            filled: false,
+            shrink: false,
+            open: false,
+        }
     }
 
     /// 沙色实底（筛选条、「添加」这类放在纸底上的 chip）。
     pub(super) fn filled(mut self) -> Self {
         self.filled = true;
         self
+    }
+
+    /// 行里放不下时可以压窄（文字末尾打省略号）。给项目名、模型名这种长度不由我们定的 chip 用：
+    /// 不让它缩，整行就只能往右溢出（输入框工具栏的发送 / 停止按钮会被顶到卡片外面）。
+    pub(super) fn shrink(mut self) -> Self {
+        self.shrink = true;
+        self
+    }
+
+    /// 这个 chip 会不会被压窄（[`menu_popover`] 要据此决定 trigger 容器让不让缩）。
+    pub(super) fn shrinkable(&self) -> bool {
+        self.shrink
     }
 }
 
@@ -67,16 +98,28 @@ impl RenderOnce for MenuChip {
             .gap_1p5()
             .py_1()
             .rounded_md()
+            // 可缩的 chip 要能让出宽度：min_w_0 是 flex 子项真正能缩下去的前提，
+            // 文字那格再 min_w_0 + 省略号（否则最小宽度就是整串文字的宽度）；
+            // 但也不能缩成一条线——留到图标 + 一两个字，还认得出是哪一类
+            .when(self.shrink, |d| d.flex_shrink_1().min_w(CHIP_MIN_W))
             .map(|d| if self.filled { d.px_2p5().bg(rgb(SAND)) } else { d.px_2() });
         if let Some(icon) = self.icon {
-            chip = chip.child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)));
+            chip = chip.child(Icon::new(icon).size_3p5().flex_shrink_0().text_color(rgb(INK_SOFT)));
         }
         chip = chip.child(
             // chip 一律次要字号
-            div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(self.label),
+            div()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .when(self.shrink, |d| {
+                    d.min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap()
+                })
+                .child(self.label),
         );
         if !self.plain {
-            chip = chip.child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
+            chip = chip.child(
+                Icon::new(IconAll::ChevronDown).size_3().flex_shrink_0().text_color(rgb(INK_SOFT)),
+            );
         }
         // 沙色底上的悬停 / 打开用 SELECTED，纸底上用 HOVER
         let active = if self.filled { SELECTED } else { HOVER };
@@ -337,12 +380,20 @@ pub(super) fn menu_popover(
 ) -> Popover {
     let handle = handle.clone();
     let list_focus = focus.clone();
-    menu_panel(Popover::new(id), focus).anchor(anchor).w(width).trigger(chip).content(
-        move |_, _, cx| {
+    // 可缩的 chip：trigger 容器（参与工具栏排版的那一格）也得能让出宽度。
+    // 它默认按内容撑到 min-content，只把 chip 自己设成能缩是不够的——外层不给窄宽度，里面就缩不了
+    let shrink = chip.shrinkable();
+    menu_panel(Popover::new(id), focus)
+        .anchor(anchor)
+        .w(width)
+        .when(shrink, |p| {
+            p.trigger_style(StyleRefinement::default().flex_shrink_1().min_w(CHIP_MIN_W))
+        })
+        .trigger(chip)
+        .content(move |_, _, cx| {
             let popover = cx.entity();
             items(handle.read(cx), &handle, &popover).finish(&list_focus)
-        },
-    )
+        })
 }
 
 /// 菜单面板的外观和焦点（trigger 不是 [`MenuChip`] 的菜单自己组 Popover 时也用它）。
