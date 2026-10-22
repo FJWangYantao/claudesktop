@@ -62,21 +62,32 @@ impl Selectable for MenuChip {
 
 impl RenderOnce for MenuChip {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        // 工具栏挤不下时 chip 可以收窄，文字截成省略号（长模型名别把发送键挤出卡片）
         let mut chip = div()
             .h_flex()
+            .min_w_0()
             .gap_1p5()
             .py_1()
             .rounded_md()
             .map(|d| if self.filled { d.px_2p5().bg(rgb(SAND)) } else { d.px_2() });
         if let Some(icon) = self.icon {
-            chip = chip.child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)));
+            chip = chip.child(Icon::new(icon).size_3p5().flex_shrink_0().text_color(rgb(INK_SOFT)));
         }
         chip = chip.child(
             // chip 一律次要字号
-            div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(self.label),
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(self.label),
         );
         if !self.plain {
-            chip = chip.child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT)));
+            chip = chip.child(
+                Icon::new(IconAll::ChevronDown).size_3().flex_shrink_0().text_color(rgb(INK_SOFT)),
+            );
         }
         // 沙色底上的悬停 / 打开用 SELECTED，纸底上用 HOVER
         let active = if self.filled { SELECTED } else { HOVER };

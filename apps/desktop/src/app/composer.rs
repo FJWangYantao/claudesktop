@@ -450,14 +450,19 @@ impl ChatApp {
             ))
             .children(self.render_context_gauge())
             .children(render_thinking_chip(self, &app))
-            .child(model_menu_popover(
-                &app,
-                &self.menu_focus,
-                "model-menu",
-                Anchor::BottomRight,
-                MenuChip::plain(self.session().model_label.clone()),
-            ))
-            .child(div().pl_1().child(send));
+            // 模型名可能很长（`global:deepseek-v4.1-flash`）：只有它可以收窄、截成省略号，
+            // 其余按内容宽度排；不然整排撑出卡片，发送键被挤到外面
+            .child(
+                model_menu_popover(
+                    &app,
+                    &self.menu_focus,
+                    "model-menu",
+                    Anchor::BottomRight,
+                    MenuChip::plain(self.session().model_label.clone()),
+                )
+                .trigger_style(StyleRefinement::default().min_w_0()),
+            )
+            .child(div().flex_shrink_0().pl_1().child(send));
 
         // 一张卡片：附件缩略图、随内容长高的多行输入（至少两行），底边是工具栏。
         // 三档：静止细边 + 淡阴影；悬停边框加深一档（提示整块都能点）；聚焦再深一档、阴影加重。
