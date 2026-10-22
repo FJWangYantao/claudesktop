@@ -651,9 +651,9 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// 顶栏的分支 chip（Popover trigger）。
+/// 顶栏的分支 chip（Popover trigger）。分支名很长，允许压窄（顶栏还有视图模式 / 导出 / 窗口按钮）。
 pub(super) fn worktree_chip(label: SharedString) -> MenuChip {
-    MenuChip::new(IconAll::GitBranch, label)
+    MenuChip::new(IconAll::GitBranch, label).shrink()
 }
 
 /// 顶栏上的分支 chip：只有 worktree 会话才画（见 `chrome.rs` 的 `render_header`）。

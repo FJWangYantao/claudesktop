@@ -381,7 +381,7 @@ impl ChatApp {
                     rems(18.),
                     &cx.entity(),
                     &self.menu_focus,
-                    MenuChip::new(IconAll::Cpu, model_label).filled(),
+                    MenuChip::new(IconAll::Cpu, model_label).filled().shrink(),
                     move |app, handle, popover| {
                         let current = app.requests_view.model.clone();
                         let mut menu = MenuList::new("req-model-list", handle, popover).pick(
@@ -426,7 +426,7 @@ impl ChatApp {
                     rems(20.),
                     &cx.entity(),
                     &self.menu_focus,
-                    MenuChip::new(IconAll::MessageSquare, session_label).filled(),
+                    MenuChip::new(IconAll::MessageSquare, session_label).filled().shrink(),
                     move |app, handle, popover| {
                         let current = app.requests_view.session;
                         let mut menu = MenuList::new("req-session-list", handle, popover).pick(

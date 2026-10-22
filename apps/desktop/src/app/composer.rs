@@ -345,15 +345,16 @@ impl ChatApp {
             .map(|m| m.name.clone())
             .unwrap_or_else(|| "—".into());
         let project = project_label(&self.session().cwd);
-        // 任务（建立时没选过文件夹的对话）：chip 上直说，点开可以挂到某个文件夹上
+        // 任务（建立时没选过文件夹的对话）：chip 上直说，点开可以挂到某个文件夹上。
+        // 项目名 / 模型名长度不由我们定，都允许压窄（否则一行排不下时会把右边的发送键挤出卡片）
         let task = self.session().task;
         let project_chip = if task {
             MenuChip::new(IconAll::ListTodo, "任务")
         } else if let Some(branch) = self.session().worktree.as_ref().map(|w| w.repo_name()) {
             // worktree 会话：chip 写仓库名（目录是数据目录里的 worktree，显出来没意义）
-            MenuChip::new(IconAll::GitBranch, format!("{branch} · worktree"))
+            MenuChip::new(IconAll::GitBranch, format!("{branch} · worktree")).shrink()
         } else {
-            MenuChip::new(IconAll::Folder, project)
+            MenuChip::new(IconAll::Folder, project).shrink()
         };
         // 焦点几乎总在输入框上（丢了由 restore_focus 找回），所以窗口不在前台时按没聚焦画：
         // 切去别的程序后输入框回到静止样子，鼠标移上来是悬停态，点回来才是聚焦态
@@ -451,19 +452,16 @@ impl ChatApp {
             ))
             .children(self.render_context_gauge())
             .children(render_thinking_chip(self, &app))
-            // 模型名可能很长（`global:deepseek-v4.1-flash`）：只有它可以收窄、截成省略号，
-            // 其余按内容宽度排；不然整排撑出卡片，发送键被挤到外面
-            .child(
-                model_menu_popover(
-                    &app,
-                    &self.menu_focus,
-                    "model-menu",
-                    Anchor::BottomRight,
-                    MenuChip::plain(self.session().model_label.clone()),
-                )
-                .trigger_style(StyleRefinement::default().min_w_0()),
-            )
-            .child(div().flex_shrink_0().pl_1().child(send));
+            .child(model_menu_popover(
+                &app,
+                &self.menu_focus,
+                "model-menu",
+                Anchor::BottomRight,
+                // 模型名（尤其带端点标签的）比别的 chip 长得多：允许压窄、末尾打省略号
+                MenuChip::plain(self.session().model_label.clone()).shrink(),
+            ))
+            // 发送键不参与收缩：一行排不下时先让 chip 让路，它永远在最右边
+            .child(div().pl_1().flex_shrink_0().child(send));
 
         // 一张卡片：附件缩略图、随内容长高的多行输入（至少两行），底边是工具栏。
         // 静止：细边 + 一层贴地的阴影；悬停边框加深一档（提示整块都能点）；
@@ -479,6 +477,10 @@ impl ChatApp {
             .border_color(rgb(if focused { LINE_STRONG } else { LINE }))
             .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
             .rounded_2xl()
+            // 兜底：外面的 chip / 按钮都允许压窄，正常排不下时先缩它们；万一还有排不下的
+            // （极端窄 + 超大字号），按卡片边界裁掉，别让按钮飘到卡片外面。
+            // 弹层是 deferred 画的（不套这里的 content mask），菜单照常露出卡片
+            .overflow_hidden()
             .shadow(if focused { focus_ring(INK_FAINT) } else { raised_shadow() })
             // 发送键离右边和底边都是 8px
             .px_2()
