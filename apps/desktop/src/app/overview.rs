@@ -2,6 +2,7 @@
 //! 输入框下方一排建议入口、空输入框里的建议提示词（Tab 填入，见 `complete_view.rs`）。
 
 use super::ChatApp;
+use super::mascot::brand_mark;
 use super::widgets::Surface;
 use crate::model::*;
 use crate::settings::KernelChoice;
@@ -342,18 +343,13 @@ impl ChatApp {
             .gap_6()
             .child(
                 // 问候语
-                div()
-                    .h_flex()
-                    .gap_2p5()
-                    .items_center()
-                    .child(Icon::new(IconAll::Sparkles).size_6().text_color(rgb(CORAL)))
-                    .child(
-                        div()
-                            .text_size(TEXT_TITLE)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(INK))
-                            .child(greeting()),
-                    ),
+                div().h_flex().gap_2p5().items_center().child(brand_mark(rems(2.5))).child(
+                    div()
+                        .text_size(TEXT_TITLE)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(INK))
+                        .child(greeting()),
+                ),
             )
             .children(setup)
             .children((!needs_setup).then(|| self.render_recent(cx)).flatten())

@@ -191,7 +191,7 @@ tools          # 调试与接入工具（截图脚本、mock agent、mock MCP �
 | [tools/shot.ps1](./tools/shot.ps1) | 抓窗口截图，改完 UI 后自检渲染（默认 PrintWindow，不抢焦点、不动光标） |
 | [tools/mock-acp-agent.mjs](./tools/mock-acp-agent.mjs) | mock ACP agent，跑内核事件链测试 |
 | [tools/mock-mcp-server.mjs](./tools/mock-mcp-server.mjs) | mock MCP 服务器（`--http` / `--sse` 起远程模式） |
-| [tools/make-icon.py](./tools/make-icon.py) | 生成 `resources/claudesktop.ico` |
+| [tools/make-icon.mjs](./tools/make-icon.mjs) | 生成 exe 图标和界面里的品牌形象「小陶」（形象定义在 [tools/xiaotao.mjs](./tools/xiaotao.mjs)，需要 `resvg` 命令行） |
 
 内嵌字体（Inter / Newsreader / JetBrains Mono）均为 SIL OFL，来源见
 [apps/desktop/assets/fonts/README.md](./apps/desktop/assets/fonts/README.md)。

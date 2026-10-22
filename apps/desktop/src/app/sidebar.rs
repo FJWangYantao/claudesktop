@@ -16,6 +16,7 @@
 //! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
+use super::mascot::brand_mark;
 use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
@@ -624,24 +625,9 @@ impl ChatApp {
             self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
         let usage_open =
             self.settings_open && self.settings_form.tab == super::usage_view::USAGE_TAB;
-        // 品牌：赤陶底方块里一枚星芒（同首页问候语的图标）+ 名字。不是按钮，摆在拖拽区里
-        let brand = div()
-            .h_flex()
-            .items_center()
-            .gap_2()
-            .pl_1()
-            .child(
-                div()
-                    .size_5()
-                    .flex_shrink_0()
-                    .rounded_md()
-                    .bg(rgb(CORAL))
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .child(Icon::new(IconAll::Sparkles).size_3().text_color(rgb(ON_ACCENT))),
-            )
-            .child(
+        // 品牌：小陶（同 exe 图标、首页问候语）+ 名字。不是按钮，摆在拖拽区里
+        let brand =
+            div().h_flex().items_center().gap_2().pl_1().child(brand_mark(rems(1.25))).child(
                 div()
                     .text_size(TEXT_BODY)
                     .font_weight(FontWeight::SEMIBOLD)
