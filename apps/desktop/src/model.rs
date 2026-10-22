@@ -1,6 +1,6 @@
 //! 对话记录的数据模型、模式表与工具行辅助函数（UI 无关逻辑）。
 
-use claudesktop_core::{DiffView, PermissionOptionView, PromptImage, UserPrompt};
+use claudesktop_core::{DiffView, PermissionHunks, PermissionOptionView, PromptImage, UserPrompt};
 use gpui_kit::SharedString;
 use gpui_kit::assets::IconName as IconAll;
 use std::time::Instant;
@@ -390,6 +390,10 @@ pub enum ChatItem {
         tool: Option<String>,
         /// 应答结果已并进那个工具行：这一行不再画（见 `Session::merge_permission`）
         merged: bool,
+        /// 这次改动可以按块部分同意（自研内核的写 / 改文件）：卡片上列出这些块，可以取消勾选
+        hunks: Option<PermissionHunks>,
+        /// 用户在卡片上取消勾选之后放行的块（`None` = 没动过，全放行）
+        keep: Option<Vec<u32>>,
     },
     Plan(Vec<PlanRow>),
     Agent(String),

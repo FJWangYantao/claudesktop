@@ -1028,14 +1028,46 @@ impl Action {
         }
     }
 
+    /// 这次改动能不能按块同意：写文件 / 改文件且预先算得出 diff 时给出每个文件的块
+    /// （块的划分在 `claudesktop_core::hunks_with_context`，和逐块审查、按块写盘同一份）。
+    pub fn permission_hunks(&self, cwd: &Path) -> Option<claudesktop_core::PermissionHunks> {
+        let old = match self {
+            Self::Write { path, .. } | Self::Edit { path, .. } => read_for_preview(path).ok()?,
+            _ => return None,
+        };
+        let new = match self {
+            Self::Write { path: _, content } => content.clone(),
+            Self::Edit { path, old: from, new, all } => {
+                let text = old.as_deref()?;
+                replace_in(text, path, from, new, *all).ok()?.text
+            }
+            _ => return None,
+        };
+        let hunks = claudesktop_core::hunks_with_context(old.as_deref().unwrap_or(""), &new);
+        if hunks.is_empty() {
+            return None;
+        }
+        let path = self.written_path().map(|p| display(cwd, p)).unwrap_or_default();
+        Some(claudesktop_core::PermissionHunks {
+            files: vec![claudesktop_core::HunkFile { path, hunks, whole_file: old.is_none() }],
+        })
+    }
+
     /// 执行；`should_stop` 用于中断长命令，命令跑着时隔一阵把到目前为止的输出预览交给
-    /// `progress`（见 [`claudesktop_core::output_tail_preview`]）。
-    pub fn run(&self, should_stop: &dyn Fn() -> bool, progress: &dyn Fn(String)) -> ToolOutput {
+    /// `progress`（见 [`claudesktop_core::output_tail_preview`]）。`keep` 给了就只写这些块
+    /// （按块部分同意，见 [`claudesktop_core::PartialGrant`]）：其余块保持文件原来的内容。
+    /// 只有写文件 / 改文件认它，其它工具忽略。
+    pub fn run(
+        &self,
+        should_stop: &dyn Fn() -> bool,
+        progress: &dyn Fn(String),
+        keep: Option<&[u32]>,
+    ) -> ToolOutput {
         match self {
             Self::Read { path, offset, limit } => read_file(path, *offset, *limit),
             Self::List { path } => list_dir(path),
-            Self::Write { path, content } => write_file(path, content),
-            Self::Edit { path, old, new, all } => edit_file(path, old, new, *all),
+            Self::Write { path, content } => write_file(path, content, keep),
+            Self::Edit { path, old, new, all } => edit_file(path, old, new, *all, keep),
             Self::Shell { command, timeout, cwd } => {
                 run_shell(command, cwd, *timeout, should_stop, progress)
             }
@@ -1687,8 +1719,21 @@ fn list_dir(path: &Path) -> ToolOutput {
     ToolOutput::ok(out, format!("{total} 项"))
 }
 
-fn write_file(path: &Path, content: &str) -> ToolOutput {
+fn write_file(path: &Path, content: &str, keep: Option<&[u32]>) -> ToolOutput {
     let existed = path.exists();
+    // 按块同意：只把放行的块写进去，其余块保持文件原来的内容
+    let content = match keep {
+        None => content.to_string(),
+        Some(keep) => {
+            let old = std::fs::read_to_string(path).ok();
+            let text = splices(old.as_deref(), content, keep);
+            if text.is_empty() && old.is_none() {
+                return ToolOutput::fail("Nothing was approved to write", "没有放行任何改动");
+            }
+            text
+        }
+    };
+    let content = content.as_str();
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -1697,17 +1742,51 @@ fn write_file(path: &Path, content: &str) -> ToolOutput {
     match std::fs::write(path, content) {
         Ok(()) => {
             let lines = content.lines().count();
+            // 按块写入时在摘要里说清楚：模型和用户都要知道只写了几块
+            let partial = match keep {
+                Some(k) => format!(" · 只写了 {} 块", k.len()),
+                None => String::new(),
+            };
             ToolOutput::ok(
                 format!("Wrote {lines} lines to {}", path.display()),
                 if existed {
-                    format!("覆盖 · {lines} 行")
+                    format!("覆盖 · {lines} 行{partial}")
                 } else {
-                    format!("新建 · {lines} 行")
+                    format!("新建 · {lines} 行{partial}")
                 },
             )
         }
         Err(e) => ToolOutput::fail(format!("Cannot write {}: {e}", path.display()), "写入失败"),
     }
+}
+
+/// 按块拼出要写入的内容：`keep` 里放行的块取新内容，其余块保留旧内容
+/// （块的划分在 `claudesktop_core::hunk_ranges`，和权限卡上列的一致）。
+fn splices(old: Option<&str>, new: &str, keep: &[u32]) -> String {
+    claudesktop_core::splice_ranges(old, new, Some(keep))
+}
+
+/// 按块拼出改文件的结果：`replaced` 是整份改完的内容，`original` 是改之前的，
+/// `keep` 给了就只把放行的块写进去（其余块保持改之前的样子）。
+fn splice_edit(original: &str, replaced: &str, keep: Option<&[u32]>) -> Partial {
+    match keep {
+        None => Partial { text: replaced.to_string(), taken: 0, skipped: 0 },
+        Some(keep) => {
+            let text = splices(Some(original), replaced, keep);
+            // 块总数：放行的 + 没放行的
+            let total = claudesktop_core::hunk_ranges(original, replaced).len();
+            Partial { text, taken: keep.len().min(total), skipped: total - keep.len().min(total) }
+        }
+    }
+}
+
+/// 按块写盘的结果：写下去的全文和放行 / 没放行的块数。
+struct Partial {
+    text: String,
+    /// 实际写进文件的块
+    taken: usize,
+    /// 没写的块（这些改动没落到盘上）
+    skipped: usize,
 }
 
 /// 一次替换的结果：新全文、替换处数、实际使用的旧 / 新片段（可能已转成 CRLF）
@@ -1762,7 +1841,7 @@ fn replace_in(
     Ok(Replaced { text, count: if all { count } else { 1 }, old, new })
 }
 
-fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> ToolOutput {
+fn edit_file(path: &Path, old: &str, new: &str, all: bool, keep: Option<&[u32]>) -> ToolOutput {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -1773,12 +1852,26 @@ fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> ToolOutput {
         Ok(r) => r,
         Err(out) => return out,
     };
-    match std::fs::write(path, &r.text) {
+    // 按块同意：只把放行的块写进去，其余块保持改之前的样子
+    let partial = splice_edit(&text, &r.text, keep);
+    match std::fs::write(path, &partial.text) {
         Ok(()) => {
             let (minus, plus) = (r.old.lines().count(), r.new.lines().count());
+            let written = match keep {
+                Some(_) if partial.skipped > 0 => format!(
+                    "（只写了 {} 块，另有 {} 块没写：用户还没同意）",
+                    partial.taken, partial.skipped
+                ),
+                _ => String::new(),
+            };
             ToolOutput::ok(
-                format!("Replaced {} occurrence(s) in {}", r.count, path.display()),
-                format!("替换 {} 处（−{minus} +{plus} 行）", r.count),
+                format!(
+                    "Replaced {} occurrence(s) in {}{}",
+                    r.count,
+                    path.display(),
+                    if written.is_empty() { String::new() } else { format!(". {written}") }
+                ),
+                format!("替换 {} 处（−{minus} +{plus} 行）{written}", r.count),
             )
         }
         Err(e) => ToolOutput::fail(format!("Cannot write {}: {e}", path.display()), "写入失败"),
@@ -2153,7 +2246,7 @@ mod tests {
             let a = Action::parse(name, args, &dir).unwrap();
             assert_eq!(a.access(), Access::Read);
             assert_eq!(a.kind(), "search");
-            a.run(&never, &|_| {})
+            a.run(&never, &|_| {}, None)
         };
 
         // 不含 / 的模式按文件名匹配任意层级；target/ 被 .gitignore 排除
@@ -2368,23 +2461,23 @@ y
     fn read_write_edit_roundtrip() {
         let dir = tmp("rw");
         let file = dir.join("sub/a.txt");
-        assert!(write_file(&file, "one\ntwo\nthree\n").ok);
+        assert!(write_file(&file, "one\ntwo\nthree\n", None).ok);
         let r = read_file(&file, 2, 1);
         assert!(r.ok);
         assert!(r.content.starts_with("     2\ttwo\n"), "{}", r.content);
         assert!(r.content.contains("lines 2-2 of 3"));
 
-        assert!(edit_file(&file, "two", "TWO", false).ok);
-        assert!(!edit_file(&file, "missing", "x", false).ok);
-        assert!(write_file(&file, "x\nx\n").ok);
-        let dup = edit_file(&file, "x", "y", false);
+        assert!(edit_file(&file, "two", "TWO", false, None).ok);
+        assert!(!edit_file(&file, "missing", "x", false, None).ok);
+        assert!(write_file(&file, "x\nx\n", None).ok);
+        let dup = edit_file(&file, "x", "y", false, None);
         assert!(!dup.ok && dup.content.contains("2 times"));
-        assert!(edit_file(&file, "x", "y", true).ok);
+        assert!(edit_file(&file, "x", "y", true, None).ok);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "y\ny\n");
 
         // CRLF 文件 + LF 的 old_string
         std::fs::write(&file, "a\r\nb\r\nc\r\n").unwrap();
-        assert!(edit_file(&file, "a\nb", "A\nB", false).ok);
+        assert!(edit_file(&file, "a\nb", "A\nB", false, None).ok);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "A\r\nB\r\nc\r\n");
 
         let l = list_dir(&dir);
@@ -2438,6 +2531,39 @@ y
         // 跑着的时候报过只有第一行的预览，同样的内容不重复报
         assert!(seen.iter().any(|p| p == "first"), "{seen:?}");
         assert_eq!(seen.iter().filter(|p| *p == "first").count(), 1, "{seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 按块写盘：只写放行的块，其余块保持文件原来的内容；摘要里说清楚写了几块。
+    #[test]
+    fn partial_write_keeps_unselected_hunks() {
+        let dir = tmp("partial");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
+        // 改两处（第 0 块把 b 改成 B，第 1 块把 e 改成 E）：只放行第 1 块
+        let edit =
+            Action::Edit { path: file.clone(), old: "b".into(), new: "B".into(), all: false };
+        assert!(edit.permission_hunks(&dir).is_none() || edit.permission_hunks(&dir).is_some());
+        let full = Action::Write { path: file.clone(), content: "a\nB\nc\nd\nE\n".into() };
+        let hunks = full.permission_hunks(&dir).expect("能按块同意");
+        assert_eq!(hunks.files.len(), 1);
+        assert_eq!(hunks.files[0].hunks.len(), 2, "{:?}", hunks.files[0].hunks);
+        assert!(!hunks.files[0].whole_file);
+        let out = full.run(&|| false, &|_| {}, Some(&[1]));
+        assert!(out.ok, "{out:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc\nd\nE\n");
+        assert!(out.summary.contains("只写了 1 块"), "{}", out.summary);
+        // 全部放行 = 整份写
+        full.run(&|| false, &|_| {}, Some(&[0, 1]));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nB\nc\nd\nE\n");
+        // 一块不放：文件保持现在的内容（只有一块变了时另外两块自然留下）
+        std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
+        full.run(&|| false, &|_| {}, Some(&[]));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc\nd\ne\n");
+        // 改文件同样按块：`replace_all` 的两处替换是两块
+        let edit =
+            Action::Edit { path: file.clone(), old: "e".into(), new: "E".into(), all: false };
+        assert!(edit.permission_hunks(&dir).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

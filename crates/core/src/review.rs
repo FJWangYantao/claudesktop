@@ -9,111 +9,20 @@
 //!
 //! 设计见仓库根目录「设计说明-逐块审查改动.md」。
 
+use crate::Record;
 use crate::checkpoint::user_index;
-use crate::diff::clip;
-use crate::{DiffLineView, Record};
-use serde::{Deserialize, Serialize};
-use similar::{DiffTag, TextDiff};
+pub use crate::diff::{DiffHunk, HunkRange};
+use crate::diff::{Run, hunks_with_context, runs};
+use similar::TextDiff;
 use std::path::Path;
 
-/// 每块前后带几行上下文（只用于显示）
-const CONTEXT: usize = 3;
-
-/// 一块在 `diff(base, head)` 里的位置：旧文件 / 新文件的起始行（从 0 数）和行数。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HunkRange {
-    pub old_start: u32,
-    pub old_len: u32,
-    pub new_start: u32,
-    pub new_len: u32,
-}
-
 /// 一块改动，带显示用的行（前后各带几行上下文，和相邻块不重复）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Hunk {
-    pub range: HunkRange,
-    pub lines: Vec<DiffLineView>,
-}
+pub type Hunk = DiffHunk;
 
-impl Hunk {
-    pub fn added(&self) -> u32 {
-        self.range.new_len
-    }
-
-    pub fn removed(&self) -> u32 {
-        self.range.old_len
-    }
-}
-
-/// diff 的一段：相同的部分，或者一块改动。
-enum Run {
-    Equal { new_start: usize, len: usize },
-    Change(HunkRange),
-}
-
-/// 按行比较，连续的增删合成一块。
-fn runs(diff: &TextDiff<'_, '_, '_, str>) -> Vec<Run> {
-    let mut out: Vec<Run> = Vec::new();
-    for op in diff.ops() {
-        let (tag, old, new) = op.as_tag_tuple();
-        if tag == DiffTag::Equal {
-            out.push(Run::Equal { new_start: new.start, len: new.len() });
-            continue;
-        }
-        match out.last_mut() {
-            Some(Run::Change(h)) => {
-                h.old_len += old.len() as u32;
-                h.new_len += new.len() as u32;
-            }
-            _ => out.push(Run::Change(HunkRange {
-                old_start: old.start as u32,
-                old_len: old.len() as u32,
-                new_start: new.start as u32,
-                new_len: new.len() as u32,
-            })),
-        }
-    }
-    out
-}
-
-fn line_view(tag: char, no: usize, text: &str) -> DiffLineView {
-    DiffLineView { tag, no: no as u32 + 1, text: clip(text.trim_end_matches(['\n', '\r'])) }
-}
-
-/// `base` → `head` 的全部块，按位置排好。
+/// `base` → `head` 的全部块，按位置排好（块的划分在 `diff::hunks_with_context`，和内核按块写盘同一份）。
 pub fn hunks(base: &str, head: &str) -> Vec<Hunk> {
-    let diff = TextDiff::from_lines(base, head);
-    let (old, new) = (diff.old_slices(), diff.new_slices());
-    let ranges: Vec<HunkRange> = runs(&diff)
-        .into_iter()
-        .filter_map(|r| match r {
-            Run::Change(h) => Some(h),
-            Run::Equal { .. } => None,
-        })
-        .collect();
-    // 上下文：块后面最多 CONTEXT 行，前面的上下文从上一块后面剩下的行里取，不重复
-    let mut out = Vec::with_capacity(ranges.len());
-    let mut shown_to = 0; // 新文件里已经画到第几行
-    for (i, h) in ranges.iter().enumerate() {
-        let start = h.new_start as usize;
-        let end = start + h.new_len as usize;
-        let next = ranges.get(i + 1).map_or(new.len(), |n| n.new_start as usize);
-        let mut lines = Vec::new();
-        let ctx = |no: usize| line_view(' ', no, new[no]);
-        lines.extend((start.saturating_sub(CONTEXT).max(shown_to)..start).map(ctx));
-        let old_start = h.old_start as usize;
-        lines.extend(
-            (old_start..old_start + h.old_len as usize).map(|no| line_view('-', no, old[no])),
-        );
-        lines.extend((start..end).map(|no| line_view('+', no, new[no])));
-        let after = (end + CONTEXT).min(next);
-        lines.extend((end..after).map(ctx));
-        shown_to = after;
-        out.push(Hunk { range: *h, lines });
-    }
-    out
+    hunks_with_context(base, head)
 }
-
 /// 按块拼出撤回后的内容：`reverted` 里的块取 base 的行，其余取 head 的行；
 /// 同时返回每个撤回的块在结果里从第几行起（从 1 数）。拼的是原始行，换行符原样保留。
 pub fn splice_with_positions(base: &str, head: &str, reverted: &[HunkRange]) -> (String, Vec<u32>) {

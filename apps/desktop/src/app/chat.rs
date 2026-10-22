@@ -13,7 +13,7 @@ use crate::session::{RowLayout, Session, StepGroup, WheelScroll};
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
-use claudesktop_core::{DiffView, PermissionOptionView};
+use claudesktop_core::{DiffView, PermissionHunks, PermissionOptionView};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::motion::{Presence, Transition};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -876,11 +876,17 @@ impl ChatApp {
 
     /// 权限卡：内核给的选项按钮之后是「拒绝并说明」。`keyed` = 这是最早一条待定的请求，
     /// 按钮上带 Alt+数字提示（见 keys.rs 的 `answer_key`）。
+    ///
+    /// 这次改动能按块同意时（`hunks`），先按文件列出每个块，块头可以点掉——放行的块才会写盘，
+    /// 剩下的留着不动。默认全部放行（「允许一次」不勾也行）。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_permission(
         idx: usize,
         title: &SharedString,
         options: &[PermissionOptionView],
         resolved: &Option<SharedString>,
+        hunks: Option<&PermissionHunks>,
+        keep: Option<&Vec<u32>>,
         keyed: bool,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -989,7 +995,118 @@ impl ChatApp {
                             .child(plain_title(title)),
                     ),
             )
+            .when_some(hunks.filter(|_| resolved.is_none()), |d, hunks| {
+                d.child(div().pl(STEP_INDENT).child(Self::render_hunk_picker(idx, hunks, keep, cx)))
+            })
             .child(div().pl(STEP_INDENT).child(buttons))
+    }
+
+    /// 权限卡上的按块选择：每个文件一段，块头点一下切换「这块写不写」。
+    /// 已经放行的块正常画，没放行的淡下去并划一道线；上面写清还剩几块。
+    fn render_hunk_picker(
+        idx: usize,
+        hunks: &PermissionHunks,
+        keep: Option<&Vec<u32>>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let all: Vec<u32> =
+            hunks.files.iter().flat_map(|f| f.hunks.iter().map(|h| h.index)).collect();
+        let total = all.len();
+        let kept: Vec<u32> = match keep {
+            Some(k) => all.iter().copied().filter(|i| k.contains(i)).collect(),
+            None => all.clone(),
+        };
+        let mut body = div().v_flex().gap_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(
+            if kept.len() == total {
+                format!("这次改 {total} 处：整段允许，或者点掉不想写的几块")
+            } else {
+                format!(
+                    "只写勾着的 {} 处（其余 {} 处不动），点一下切换",
+                    kept.len(),
+                    total - kept.len()
+                )
+            },
+        );
+        for file in &hunks.files {
+            let name = file.path.clone();
+            body =
+                body.child(
+                    div().text_size(TEXT_SMALL).font_family(MONO).text_color(rgb(INK)).child(
+                        format!("{}{}", name, if file.whole_file { "（新文件）" } else { "" }),
+                    ),
+                );
+            for hunk in &file.hunks {
+                let on = kept.contains(&hunk.index);
+                let current = kept.clone();
+                let index = hunk.index;
+                let toggle = cx.listener(move |this: &mut ChatApp, _, _, cx| {
+                    let mut next = current.clone();
+                    if let Some(at) = next.iter().position(|i| *i == index) {
+                        next.remove(at);
+                    } else {
+                        next.push(index);
+                        next.sort_unstable();
+                    }
+                    if let Some(ChatItem::Permission { keep, .. }) =
+                        this.sessions[this.active].transcript.get_mut(idx)
+                    {
+                        *keep = Some(next);
+                    }
+                    cx.notify();
+                });
+                let head = div().text_color(if on { rgb(INK_SOFT) } else { rgb(INK_FAINT) }).child(
+                    format!(
+                        "第 {} 行 · +{} −{}",
+                        hunk.range.new_start + 1,
+                        hunk.added(),
+                        hunk.removed()
+                    ),
+                );
+                body = body.child(
+                    div()
+                        .v_flex()
+                        .gap_0p5()
+                        .rounded_md()
+                        .when(on, |d| d)
+                        .when(!on, |d| d.opacity(0.55))
+                        .child(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("perm-hunk-{idx}-{}", hunk.index).into(),
+                                ))
+                                .h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded_md()
+                                .hover(|d| d.bg(rgb(HOVER)))
+                                .on_click(toggle)
+                                .child(
+                                    Icon::new(if on { IconAll::Check } else { IconAll::Square })
+                                        .size_3()
+                                        .text_color(rgb(if on { CORAL } else { INK_FAINT })),
+                                )
+                                .child(head),
+                        )
+                        .child(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("perm-hunk-diff-{idx}-{}", hunk.index).into(),
+                                ))
+                                .v_flex()
+                                .rounded_sm()
+                                .overflow_hidden()
+                                .font_family(MONO)
+                                .line_height(LEADING)
+                                .max_h(rems(11.))
+                                .overflow_y_scroll()
+                                .children(hunk.lines.iter().map(diff_line)),
+                        ),
+                );
+            }
+        }
+        body
     }
 
     /// 回复末尾的改动卡片（对照 Codex）：表头「改动了 N 个文件 +a −b」，最新一轮带「撤回」和「审查」；
@@ -1772,9 +1889,18 @@ impl ChatApp {
             ChatItem::AutoApproved { title, chosen } => {
                 Self::render_auto_approved(idx, title, chosen)
             }
-            ChatItem::Permission { title, options, resolved, .. } => {
+            ChatItem::Permission { title, options, resolved, hunks, keep, .. } => {
                 let keyed = self.session().pending_permission() == Some(idx);
-                Self::render_permission(idx, title, options, resolved, keyed, cx)
+                Self::render_permission(
+                    idx,
+                    title,
+                    options,
+                    resolved,
+                    hunks.as_ref(),
+                    keep.as_ref(),
+                    keyed,
+                    cx,
+                )
             }
             ChatItem::Plan(rows) => Self::render_plan(rows, layout.compact),
             ChatItem::Agent(text) => {

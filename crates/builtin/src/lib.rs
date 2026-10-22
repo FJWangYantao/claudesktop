@@ -77,8 +77,8 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
 
 use claudesktop_core::plugin::{self, AgentDef, HookEvent, HookOutcome, Plugin, Skill};
 use claudesktop_core::{
-    EventSink, Kernel, KernelEvent, ModeView, PermissionOptionView, PlanEntryView, Record,
-    RoutedEvent, checkpoint,
+    EventSink, Kernel, KernelEvent, ModeView, PartialGrant, PermissionHunks, PermissionOptionView,
+    PlanEntryView, Record, RoutedEvent, checkpoint,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -350,8 +350,8 @@ struct Inner {
     mcp: Arc<mcp::McpHub>,
     /// 启用的插件（技能、钩子；它们的 MCP 服务在 `mcp` 里）
     plugins: Mutex<Arc<Vec<Plugin>>>,
-    /// 等待 UI 应答的权限请求：请求 ID → 应答通道
-    pending: Mutex<HashMap<u64, mpsc::Sender<Option<String>>>>,
+    /// 等待 UI 应答的权限请求：请求 ID → 应答通道（选项 ID + 按块同意放行的块）
+    pending: Mutex<HashMap<u64, mpsc::Sender<Option<Answer>>>>,
     next_request: AtomicU64,
     /// 这个内核的编号（后台命令表按它分组：同一进程里几个内核各收自己的）
     kernel_id: u64,
@@ -436,8 +436,17 @@ enum Steps {
 /// 权限判定结果
 enum Verdict {
     Allow,
+    /// 只放行这些块（写文件 / 改文件按块同意），其余块不写盘
+    Partial(Vec<u32>),
     /// 拒绝；内容回给模型
     Deny(String),
+}
+
+/// 用户在权限卡上选了什么：选项 ID，加上（选了按块同意时）放行哪些块。
+#[derive(Debug, Clone)]
+struct Answer {
+    option: String,
+    hunks: Option<Vec<u32>>,
 }
 
 impl Inner {
@@ -1336,15 +1345,20 @@ impl Inner {
         call_id: &str,
         action: &Action,
         stopped: &dyn Fn() -> bool,
+        keep: Option<&[u32]>,
     ) -> ToolOutput {
         let target = action.written_path().map(Path::to_path_buf);
         let before = target.as_deref().and_then(checkpoint::read_snapshot);
         // 后台任务记在这个会话名下（事件里按会话分组）
         bgtasks::set_current(self.kernel_id, session);
-        let output = action.run(stopped, &|output| {
-            let id = call_id.to_string();
-            self.emit(Some(session), KernelEvent::ToolCallProgress { id, output });
-        });
+        let output = action.run(
+            stopped,
+            &|output| {
+                let id = call_id.to_string();
+                self.emit(Some(session), KernelEvent::ToolCallProgress { id, output });
+            },
+            keep,
+        );
         if let (Some(path), Some(before)) = (target, before)
             && let Some(after) = checkpoint::read_snapshot(&path)
             && before != after
@@ -1405,33 +1419,47 @@ impl Inner {
                 format!("Blocked by a plugin hook: {}", blocked.unwrap_or_default()),
                 "插件钩子拦下",
             ),
-            Ok(action) => match self.authorize(session, cwd, &action, title, &call.id, stopped) {
-                Verdict::Allow => {
-                    if stopped() {
-                        return ToolOutput::fail("cancelled", "已中断");
-                    }
-                    self.emit(
-                        Some(session),
-                        KernelEvent::ToolCallUpdated {
-                            id: call.id.clone(),
-                            title: None,
-                            status: Some("in_progress".into()),
-                            raw_output: None,
-                            output: None,
-                        },
-                    );
-                    match &action {
-                        Action::Mcp { server, tool, arguments, .. } => {
-                            self.mcp.call(server, tool, arguments.clone(), stopped)
+            Ok(action) => {
+                let verdict = self.authorize(session, cwd, &action, title, &call.id, stopped);
+                match verdict {
+                    Verdict::Allow | Verdict::Partial(_) => {
+                        if stopped() {
+                            return ToolOutput::fail("cancelled", "已中断");
                         }
-                        Action::Task { prompt, agent, .. } => {
-                            self.run_task(session, cwd, &call.id, prompt, agent.as_deref())
+                        self.emit(
+                            Some(session),
+                            KernelEvent::ToolCallUpdated {
+                                id: call.id.clone(),
+                                title: None,
+                                status: Some("in_progress".into()),
+                                raw_output: None,
+                                output: None,
+                            },
+                        );
+                        // 按块同意：只写这几块（其余块留着旧内容）
+                        let keep = match verdict {
+                            Verdict::Partial(keep) => Some(keep),
+                            _ => None,
+                        };
+                        match &action {
+                            Action::Mcp { server, tool, arguments, .. } => {
+                                self.mcp.call(server, tool, arguments.clone(), stopped)
+                            }
+                            Action::Task { prompt, agent, .. } => {
+                                self.run_task(session, cwd, &call.id, prompt, agent.as_deref())
+                            }
+                            _ => self.run_checkpointed(
+                                session,
+                                &call.id,
+                                &action,
+                                stopped,
+                                keep.as_deref(),
+                            ),
                         }
-                        _ => self.run_checkpointed(session, &call.id, &action, stopped),
                     }
+                    Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),
                 }
-                Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),
-            },
+            }
         };
         // 「执行工具后」钩子：退出码 2 的原因追加到结果里给模型看
         if output.ok && !stopped() {
@@ -1666,8 +1694,16 @@ impl Inner {
             options.push(option("reject_always", always_name(rule, true)));
         }
 
-        match self.ask(session, title, tool, options, stopped).as_deref() {
-            Some("allow_once") => Verdict::Allow,
+        // 写 / 改文件：把这次的块一并交给权限卡，用户可以在上面逐块勾选
+        let hunks = action.permission_hunks(cwd);
+        let answer = self.ask(session, title, tool, options, hunks, stopped);
+        let choice = answer.as_ref().map(|a| a.option.as_str());
+        match choice {
+            Some("allow_once") => match answer.and_then(|a| a.hunks) {
+                // 只勾了一部分：只写这几块
+                Some(keep) => Verdict::Partial(keep),
+                None => Verdict::Allow,
+            },
             Some("allow_always") => {
                 if let Some(rule) = rule
                     && let Err(e) = self.rules.lock().unwrap().add(cwd, rule)
@@ -1755,6 +1791,8 @@ impl Inner {
         // 拒绝的理由连同「别换个马甲重试」的说明一起回给模型：它自己决定换路子还是问用户
         match verdict {
             Verdict::Allow => Verdict::Allow,
+            // 分类器不按块同意（它只给放行 / 拒绝），按块只有用户在卡片上勾选这一条路
+            Verdict::Partial(keep) => Verdict::Partial(keep),
             Verdict::Deny(reason) => Verdict::Deny(auto::denial_text(&reason)),
         }
     }
@@ -1779,7 +1817,7 @@ impl Inner {
         let mut counters = auto.denials.lock().unwrap();
         let d = counters.entry(session.to_string()).or_default();
         match verdict {
-            Verdict::Allow => {
+            Verdict::Allow | Verdict::Partial(_) => {
                 d.streak = 0;
                 self.emit(
                     Some(session),
@@ -1892,15 +1930,17 @@ impl Inner {
         self.sessions.lock().unwrap().get(session).map(|s| s.model.clone())
     }
 
-    /// 发出权限请求并阻塞等待应答；被取消时返回 None。
+    /// 发出权限请求并阻塞等待应答；被取消时返回 None。`hunks` 给了就表示这次改动可以
+    /// 按块部分同意（界面据此在卡片里列块、允许勾选）。
     fn ask(
         &self,
         session: &str,
         title: &str,
         tool: &str,
         options: Vec<PermissionOptionView>,
+        hunks: Option<PermissionHunks>,
         stopped: &dyn Fn() -> bool,
-    ) -> Option<String> {
+    ) -> Option<Answer> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -1911,6 +1951,7 @@ impl Inner {
                 title: title.to_string(),
                 options,
                 tool: Some(tool.to_string()),
+                hunks,
             },
         );
         loop {
@@ -2682,10 +2723,22 @@ impl Kernel for BuiltinKernel {
     }
 
     fn resolve_permission(&self, request_id: u64, option_id: Option<String>) -> anyhow::Result<()> {
+        self.resolve_permission_with(request_id, option_id, None)
+    }
+
+    /// 同 `resolve_permission`，另外带上「只写这些块」（自研内核的写文件 / 改文件认它）。
+    fn resolve_permission_with(
+        &self,
+        request_id: u64,
+        option_id: Option<String>,
+        grant: Option<PartialGrant>,
+    ) -> anyhow::Result<()> {
         let tx = self.inner.pending.lock().unwrap().remove(&request_id);
         match tx {
             Some(tx) => {
-                let _ = tx.send(option_id);
+                let answer =
+                    option_id.map(|option| Answer { option, hunks: grant.map(|g| g.hunks) });
+                let _ = tx.send(answer);
                 Ok(())
             }
             None => anyhow::bail!("权限请求 {request_id} 已失效"),

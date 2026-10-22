@@ -244,11 +244,27 @@ impl ChatApp {
 
         // 子任务里的调用在等授权：权限卡直接摆在这里（按钮、Alt+数字照常管用），不用先回对话
         if let Some(ix) = s.pending_permission()
-            && let Some(ChatItem::Permission { title, options, resolved, tool: Some(tool), .. }) =
-                s.transcript.get(ix)
+            && let Some(ChatItem::Permission {
+                title,
+                options,
+                resolved,
+                tool: Some(tool),
+                hunks,
+                keep,
+                ..
+            }) = s.transcript.get(ix)
             && tool.starts_with(&format!("{task}/"))
         {
-            page = page.child(Self::render_permission(ix, title, options, resolved, true, cx));
+            page = page.child(Self::render_permission(
+                ix,
+                title,
+                options,
+                resolved,
+                hunks.as_ref(),
+                keep.as_ref(),
+                true,
+                cx,
+            ));
         }
 
         if !run.prompt.is_empty() {

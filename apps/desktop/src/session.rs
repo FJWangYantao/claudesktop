@@ -117,6 +117,9 @@ pub struct Session {
     pub unread: bool,
     /// 这一轮跑着时用户又发的消息（先进先出）：这一轮正常结束就发出第一条，见 `ChatApp::dispatch_queued`。只在内存里
     pub queued: Vec<QueuedPrompt>,
+    /// 这一轮跑着时点了 `/compact`：排在这轮后面，轮子正常结束后、发排队的消息之前压（见
+    /// `ChatApp::queued_compaction`）。用户停下 / 这一轮出错时撤掉并说明。只在内存里
+    pub compact_queued: bool,
     /// 用户按了停止、内核还没回这一轮的结束：这期间发的消息先排队，等结束到了再发
     /// （不然迟到的「已取消」会落在新的一轮头上，把它提前收掉）
     pub stopping: bool,
@@ -363,6 +366,7 @@ impl Session {
             retry: None,
             unread: false,
             queued: Vec::new(),
+            compact_queued: false,
             reveal: None,
             wheel: None,
             stopping: false,
@@ -1004,6 +1008,7 @@ impl Session {
     }
 
     /// 应答某条权限请求：`Some((选项 ID, 展示名))` 选择，`None` 取消。
+    /// 选的是「允许一次」而且卡片上取消勾选了一部分块时，把剩下的块作为按块同意交给内核。
     pub fn resolve_permission(
         &mut self,
         idx: usize,
@@ -1013,20 +1018,32 @@ impl Session {
         let Some(kernel) = kernel else {
             return;
         };
-        if let Some(ChatItem::Permission { id, resolved, .. }) = self.transcript.get_mut(idx) {
-            if resolved.is_some() {
-                return;
-            }
-            let label: SharedString = match &choice {
-                Some((_, name)) => name.clone().into(),
-                None => "已取消".into(),
-            };
-            *resolved = Some(match kernel.resolve_permission(*id, choice.map(|(i, _)| i)) {
-                Ok(()) => label,
-                Err(err) => format!("应答失败：{err}").into(),
-            });
-            self.merge_permission(idx);
+        let Some(ChatItem::Permission { id, resolved, keep, .. }) = self.transcript.get_mut(idx)
+        else {
+            return;
+        };
+        if resolved.is_some() {
+            return;
         }
+        let id = *id;
+        let label: SharedString = match &choice {
+            Some((_, name)) => name.clone().into(),
+            None => "已取消".into(),
+        };
+        // 只有「允许一次」才按块写：选「总是允许」是存规则，之后整个动作都放行
+        let allow_once = choice.as_ref().is_some_and(|(id, _)| id == "allow_once");
+        let (grant, label) = match (allow_once, keep.take()) {
+            (true, Some(hunks)) => {
+                let text: SharedString = format!("{label}（只写 {} 块）", hunks.len()).into();
+                (Some(claudesktop_core::PartialGrant { hunks, paths: Vec::new() }), text)
+            }
+            _ => (None, label),
+        };
+        *resolved = Some(match kernel.resolve_permission_with(id, choice.map(|(i, _)| i), grant) {
+            Ok(()) => label,
+            Err(err) => format!("应答失败：{err}").into(),
+        });
+        self.merge_permission(idx);
     }
 
     /// 应答过的权限请求并进它的工具行（工具行末尾出「已允许」之类的短标签），这一行不再画。
@@ -1042,10 +1059,12 @@ impl Session {
         else {
             return;
         };
-        let grant = if label.as_ref() == "已取消" {
+        // 按块同意的标签带着「（只写 N 块）」：匹配选项时去掉它
+        let base = partial_base(label);
+        let grant = if base.as_ref() == "已取消" {
             Grant::from_choice(None, label.clone())
         } else {
-            match options.iter().find(|o| o.name == label.as_ref()) {
+            match options.iter().find(|o| o.name == base.as_ref()) {
                 Some(option) => Grant::from_choice(Some(&option.kind), label.clone()),
                 None => return,
             }
@@ -1370,7 +1389,7 @@ impl Session {
                     }),
                 }
             }
-            KernelEvent::PermissionRequest { id, title, options, tool } => {
+            KernelEvent::PermissionRequest { id, title, options, tool, hunks } => {
                 self.finish_thinking();
                 self.transcript.push(ChatItem::Permission {
                     id,
@@ -1379,6 +1398,9 @@ impl Session {
                     resolved: None,
                     tool,
                     merged: false,
+                    hunks,
+                    // 默认全部放行：「允许一次」就是不勾也行
+                    keep: None,
                 });
             }
             KernelEvent::Compacting => {
@@ -1564,6 +1586,15 @@ impl Session {
     }
 }
 
+/// 权限应答的展示名去掉按块写的后缀（「允许一次（只写 2 块）」→「允许一次」），
+/// 用来对回内核给的选项名。
+fn partial_base(label: &SharedString) -> SharedString {
+    match label.rfind('（') {
+        Some(at) if label[at..].ends_with('）') => label[..at].into(),
+        _ => label.clone(),
+    }
+}
+
 /// 一段（Markdown）文字的第一行有内容的话，去掉标题 / 列表 / 引用记号，截到通知里放得下。
 fn preview_line(text: &str) -> Option<String> {
     const MAX_CHARS: usize = 80;
@@ -1714,6 +1745,7 @@ mod tests {
             }],
             // 旧日志：不知道是哪个工具调用的，应答后照旧单独一行
             tool: None,
+            hunks: None,
         })
     }
 
@@ -2526,6 +2558,7 @@ mod tests {
                     })
                     .collect(),
                 tool: Some(tool.into()),
+                hunks: None,
             })
         };
         let records = vec![

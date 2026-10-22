@@ -777,6 +777,65 @@ fn consecutive_reads_run_together_and_results_keep_call_order() {
 }
 
 #[test]
+fn partial_permission_writes_only_the_selected_hunks() {
+    let dir = workdir("partial-perm");
+    std::fs::write(dir.join("a.txt"), "a\nb\nc\nd\ne\n").unwrap();
+    let (base, _bodies) = serve(vec![
+        tool_call(
+            "w1",
+            "write_file",
+            serde_json::json!({ "path": "a.txt", "content": "a\nB\nc\nd\nE\n" }),
+        ),
+        happy_stream("写好了"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("改 b 和 e")).unwrap();
+    // 权限请求里带着这次改动的块（两处）
+    h.wait("permission", |e| matches!(e, KernelEvent::PermissionRequest { .. }));
+    let (req, files) = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|r| match &r.event {
+            KernelEvent::PermissionRequest { id, hunks: Some(hunks), .. } => {
+                Some((*id, hunks.files.iter().map(|f| f.hunks.len()).collect::<Vec<_>>()))
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(files, vec![2]);
+    assert!(!std::fs::read_to_string(dir.join("a.txt")).unwrap().contains('B'));
+    // 只放行第 1 块（把 e 改成 E）
+    h.kernel
+        .resolve_permission_with(
+            req,
+            Some("allow_once".into()),
+            Some(claudesktop_core::PartialGrant { hunks: vec![1], paths: Vec::new() }),
+        )
+        .unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a\nb\nc\nd\nE\n");
+    // 工具结果里说清楚了只写几块
+    let summary = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|r| match &r.event {
+            KernelEvent::ToolCallUpdated { id, raw_output: Some(o), .. } if id == "w1" => {
+                Some(o.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(summary.contains("1 块"), "{summary:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn write_asks_permission_and_allow_always_is_remembered() {
     let dir = workdir("write");
     let (base, bodies) = serve(vec![

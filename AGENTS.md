@@ -240,6 +240,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 逐块审查（`crates/core/src/review.rs` + `app/review.rs`）：只审最新一轮、跑完了才行；撤回 / 恢复写盘后追加带 `reverted` 的 `Record::FileChanged`（回退照常算），
   下一条消息的 `sent` 前面附 `<user-review>` 说明（`Session::review_pending` 只是提示，说明从日志现算）。磁盘现状对不上就只读，不合并。
   入口在回复末尾的改动卡片（`render_changes_card`）：整轮「撤回」/「恢复」也走这套（`undo_turn`），撤回状态记在 `Session::undo`（进行指纹）。
+  块的划分只有一份：`diff::hunks_with_context`（`review::hunks` 就是它），「授权时按块同意」也用它——
+  权限卡勾掉一部分块后 `resolve_permission_with(.., PartialGrant)` 交给内核，`Action::run(.., keep)` 用
+  `diff::splice_ranges` 只写放行的块。只有「允许一次」按块写（「总是允许」是存规则）。ACP 的 `hunks` 恒为 None。
 - 记忆（`crates/core/src/memory.rs` + `crates/builtin/src/remember.rs` + `app/memory_view.rs`）：两份 JSON（数据目录 / 项目根 `.claudesktop/`），
   文件是唯一真相、每轮重读。**系统提示词那一节只放预算内的**（`pick_missed` 按 `pinned` → 最近用过 / 改过排），这一轮相关的另附 `<memory-context>` 在用户消息尾
   （`Inner::attach_memory`，system 变了会废掉提示缓存）；超预算的条数写在提示词里让模型用 `memory_search` 找。
