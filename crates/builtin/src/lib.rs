@@ -1416,6 +1416,13 @@ impl Inner {
         } else {
             Action::parse(name, &call.function.arguments, cwd)
         };
+        // 聊天会话里抓网页不问用户（见 `authorize`），所以只许访问公网
+        let action = action.map(|mut a| {
+            if let Action::Fetch { public_only, .. } = &mut a {
+                *public_only = self.is_chat(session);
+            }
+            a
+        });
         let (title, kind) = match &action {
             Ok(a) => (a.title(cwd), a.kind()),
             Err(_) => (call.function.name.clone(), "other"),
@@ -1618,8 +1625,8 @@ impl Inner {
                 let flag = parent.turn.clone()?;
                 let state = SessionState {
                     cwd: parent.cwd.clone(),
-                    // 子会话的 ID 是 `主会话/调用 ID`，`chat_web_of` 只看主会话，所以这两个
-                    // 字段对子会话没有实际作用；跟着主会话走，免得以后加判断时漏掉
+                    // 跟着主会话走：`chat_web_of` / `is_chat` 按子会话自己的 ID 查这两项
+                    // （聊天里没有 task 工具，目前开不出聊天的子会话，免得以后漏掉）
                     kind: parent.kind,
                     web: parent.web,
                     model: agent.model.clone().unwrap_or_else(|| parent.model.clone()),
@@ -2465,26 +2472,7 @@ fn chat_system_prompt(
 
 /// 本地日期（`2026-10-22`）：按天写进聊天提示词，一天之内不变。
 fn today_local() -> String {
-    let since = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    civil_from_days(since.div_euclid(86_400))
-}
-
-/// Unix 天数 → `YYYY-MM-DD`（按 UTC；差一天不影响「今天是哪天」这句话）。
-fn civil_from_days(days: i64) -> String {
-    // Howard Hinnant 的算法（公历换算）
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{}-{m:02}-{d:02}", if m <= 2 { y + 1 } else { y })
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 /// provider 的 finish_reason → ACP 风格的 stop_reason。

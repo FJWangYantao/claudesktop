@@ -147,6 +147,8 @@ pub enum Action {
     Fetch {
         url: String,
         offset: usize,
+        /// 只许访问公网（聊天会话联网免问，不能让网页里的注入指使模型去碰本机 / 局域网）
+        public_only: bool,
     },
     /// 搜网页（Brave 有 key 走 Brave，否则 DuckDuckGo 兜底，见 `websearch` 模块）
     Search {
@@ -991,6 +993,7 @@ impl Action {
                 Self::Fetch {
                     url: crate::fetch::normalize_url(&a.url)?,
                     offset: a.offset.unwrap_or(0),
+                    public_only: false,
                 }
             }
             WEB_SEARCH => {
@@ -1214,7 +1217,9 @@ impl Action {
                 cwd,
                 should_stop,
             ),
-            Self::Fetch { url, offset } => crate::fetch::fetch(url, *offset, should_stop),
+            Self::Fetch { url, offset, public_only } => {
+                crate::fetch::fetch(url, *offset, *public_only, should_stop)
+            }
             Self::Search { query } => crate::websearch::search(query, should_stop),
             Self::Mcp { .. } => {
                 ToolOutput::fail("MCP tool was not routed to its server", "内部错误")

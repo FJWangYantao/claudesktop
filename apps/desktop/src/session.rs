@@ -420,6 +420,12 @@ impl Session {
         // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
         s.task = meta.task;
         s.kind = meta.kind;
+        // 聊天的联网开关跟着元信息走，并且总是交给新的内核会话（内核默认按设置来，
+        // 不交的话界面上显示的和模型实际拿到的工具可能对不上）；老元信息没记就当开着
+        if s.kind == SessionKind::Chat {
+            s.web = meta.web.unwrap_or(true);
+            s.pending_web = Some(s.web);
+        }
         // 跑在 git worktree 里的会话：侧栏仍归到主项目，分支 chip 用它
         s.worktree = meta.worktree.clone();
         s.title = meta.title.clone().into();
@@ -1513,8 +1519,13 @@ impl Session {
                 context_tokens,
                 cache_read_tokens,
             } => {
-                // 端点不报缓存时是 0，和「一点没命中」分不开，所以 0 也当不知道
-                self.cache_hit = crate::usage::cache_hit_percent(cache_read_tokens, input_tokens);
+                // 端点不报缓存时是 0，和「一点没命中」分不开，所以 0 也当不知道。
+                // 只看主会话自己的请求（带上下文大小的那种）：压缩、子会话的请求是另一份上下文，
+                // 它们的命中率不该顶掉主会话的
+                if context_tokens > 0 {
+                    self.cache_hit =
+                        crate::usage::cache_hit_percent(cache_read_tokens, input_tokens);
+                }
                 // 到这里的输出已经被端点数过，估算的那部分清掉（之后新收到的再重新估）
                 self.turn_streamed.clear();
                 self.turn_usage.reported = true;
@@ -1779,6 +1790,7 @@ mod tests {
             task: false,
             worktree: None,
             kind: SessionKind::Code,
+            web: None,
         }
     }
 
@@ -2382,9 +2394,23 @@ mod tests {
         assert_eq!(s.cache_hit, Some(80));
         // 上下文用量取最近一次报告的，不累加
         assert_eq!(s.context_tokens, 130);
+        // 压缩 / 子会话的用量（不带上下文大小）只并进累计，不顶掉主会话的命中率和上下文大小
+        s.apply_event(
+            KernelEvent::UsageUpdated {
+                input_tokens: 50,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+                context_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            None,
+        );
+        assert_eq!(s.cache_hit, Some(80));
+        assert_eq!(s.context_tokens, 130);
+        assert_eq!(s.turn_usage.input, 250);
         // 一轮结束：用量和用时记到这一轮名下，回复那行能查到
         let summary = s.close_turn();
-        assert_eq!(summary.usage.input, 200);
+        assert_eq!(summary.usage.input, 250);
         assert!(summary.elapsed_ms.is_some() && s.turn_started.is_none());
         assert_eq!(s.turn_usage, TurnUsage::default());
         let reply = s.transcript.len() - 2;
@@ -2531,6 +2557,26 @@ mod tests {
         assert!(s.task);
         let s = Session::from_records(2, meta(), vec![Record::user("问")], &Default::default());
         assert!(!s.task);
+    }
+
+    #[core::prelude::v1::test]
+    fn restored_chats_hand_their_web_switch_to_the_kernel() {
+        // 内核开会话时按设置的默认值；不把界面上的开关交回去，两边就可能对不上
+        let mut chat = meta();
+        chat.kind = SessionKind::Chat;
+        chat.web = Some(false);
+        let s =
+            Session::from_records(1, chat.clone(), vec![Record::user("问")], &Default::default());
+        assert!(!s.web);
+        assert_eq!(s.pending_web, Some(false));
+        // 老元信息没记：当开着，同样交给内核
+        chat.web = None;
+        let s = Session::from_records(2, chat, vec![Record::user("问")], &Default::default());
+        assert!(s.web);
+        assert_eq!(s.pending_web, Some(true));
+        // Code 会话没有这个开关
+        let s = Session::from_records(3, meta(), vec![Record::user("问")], &Default::default());
+        assert_eq!(s.pending_web, None);
     }
 
     #[core::prelude::v1::test]

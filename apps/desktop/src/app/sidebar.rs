@@ -1417,6 +1417,7 @@ mod tests {
             task: false,
             worktree: s.worktree.clone(),
             kind: claudesktop_core::SessionKind::Code,
+            web: None,
         };
         let restored =
             crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());

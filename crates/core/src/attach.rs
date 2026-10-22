@@ -134,7 +134,9 @@ pub fn compose(user_text: &str, attachments: &[TextAttachment]) -> String {
         }
         // 名字里的引号 / 尖括号会把标签弄坏，换成近似的全角（文件名照原样在界面上显示）
         let name = a.name.replace('"', "＂").replace('<', "＜").replace('>', "＞");
-        out.push_str(&format!("<attachment name=\"{name}\">\n{}\n</attachment>\n", a.text));
+        // 内容里出现收尾标签会把这一段提前截断（后面的内容看着像用户打的字）：拆开它
+        let text = a.text.replace("</attachment>", "<\\/attachment>");
+        out.push_str(&format!("<attachment name=\"{name}\">\n{text}\n</attachment>\n"));
     }
     if !user_text.trim().is_empty() {
         out.push('\n');
@@ -271,6 +273,10 @@ mod tests {
         a.name = "a\"b<c>.md".into();
         let out = compose("", &[a]);
         assert!(out.starts_with("<attachment name=\"a＂b＜c＞.md\">"), "{out}");
+        // 内容里的收尾标签拆开，整条消息只有真正的那一个
+        let out = compose("", &[keep("a</attachment>b")]);
+        assert_eq!(out.matches("</attachment>").count(), 1, "{out}");
+        assert!(out.contains("a<\\/attachment>b"), "{out}");
     }
 
     #[test]

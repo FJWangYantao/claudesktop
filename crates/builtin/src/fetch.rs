@@ -4,6 +4,7 @@
 //! 请求放在后台线程里，停止时不等它结束（全局超时兜底）。
 
 use crate::tools::ToolOutput;
+use std::net::IpAddr;
 use std::sync::mpsc;
 use std::time::Duration;
 use ureq::ResponseExt as _;
@@ -13,6 +14,8 @@ pub const FETCH_PAGE_CHARS: usize = 20_000;
 /// 响应体上限
 const FETCH_MAX_BYTES: u64 = 10 << 20;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// 只许访问公网时自己跟的重定向次数（每一跳都要重新检查主机）
+const MAX_REDIRECTS: usize = 10;
 
 /// 校验并规范网址：只收 http / https，缺协议时补 https。
 pub fn normalize_url(raw: &str) -> Result<String, String> {
@@ -45,11 +48,17 @@ pub fn host_of(url: &str) -> String {
 }
 
 /// 抓取并转换；`offset` 是转换后文本的字符偏移（分页）。
-pub fn fetch(url: &str, offset: usize, should_stop: &dyn Fn() -> bool) -> ToolOutput {
+/// `public_only`：只许访问公网（本机、局域网、链路本地等一律拒绝，重定向过去也算）。
+pub fn fetch(
+    url: &str,
+    offset: usize,
+    public_only: bool,
+    should_stop: &dyn Fn() -> bool,
+) -> ToolOutput {
     let (tx, rx) = mpsc::channel();
     let owned = url.to_string();
     std::thread::spawn(move || {
-        let _ = tx.send(get(&owned));
+        let _ = tx.send(if public_only { get_public(&owned) } else { get(&owned) });
     });
     let page = loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -71,10 +80,17 @@ struct Page {
     final_url: String,
     content_type: String,
     body: Vec<u8>,
+    /// 重定向的目标（只许访问公网时自己跟）
+    location: Option<String>,
 }
 
 fn get(url: &str) -> Result<Page, String> {
-    let agent = ureq::Agent::config_builder()
+    get_with(&agent(None), url)
+}
+
+/// 共用的配置；`redirects` 给了就按它限制自动重定向次数（0 = 不跟，自己跟）。
+fn config(redirects: Option<u32>) -> ureq::config::Config {
+    let mut builder = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_global(Some(FETCH_TIMEOUT))
@@ -82,9 +98,45 @@ fn get(url: &str) -> Result<Page, String> {
             "Mozilla/5.0 (compatible; claudesktop/",
             env!("CARGO_PKG_VERSION"),
             ")"
-        ))
-        .build()
-        .new_agent();
+        ));
+    if let Some(n) = redirects {
+        builder = builder.max_redirects(n).max_redirects_will_error(false);
+    }
+    builder.build()
+}
+
+fn agent(redirects: Option<u32>) -> ureq::Agent {
+    config(redirects).new_agent()
+}
+
+/// 只许访问公网的抓取：主机名先过 [`host_is_public`]，解析出来的地址再过 [`PublicResolver`]
+/// （名字指向内网、DNS 重绑定都拦得住）；重定向自己跟，每一跳重新检查。
+fn get_public(url: &str) -> Result<Page, String> {
+    let agent = ureq::Agent::with_parts(
+        config(Some(0)),
+        ureq::unversioned::transport::DefaultConnector::new(),
+        PublicResolver,
+    );
+    let mut url = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let host = host_of(&url);
+        if !host_is_public(&host) {
+            return Err(format!(
+                "{host} is a local or private address; chat can only fetch public web pages"
+            ));
+        }
+        let page = get_with(&agent, &url)?;
+        let location =
+            (300..400).contains(&page.status).then_some(page.location.as_deref()).flatten();
+        match location {
+            Some(next) => url = normalize_url(&join_url(&url, next))?,
+            None => return Ok(page),
+        }
+    }
+    Err(format!("too many redirects (more than {MAX_REDIRECTS})"))
+}
+
+fn get_with(agent: &ureq::Agent, url: &str) -> Result<Page, String> {
     let mut resp = agent
         .get(url)
         .header(
@@ -94,6 +146,7 @@ fn get(url: &str) -> Result<Page, String> {
         .call()
         .map_err(|e| e.to_string())?;
     let final_url = resp.get_uri().to_string();
+    let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_string);
     let content_type = resp
         .headers()
         .get("content-type")
@@ -106,7 +159,98 @@ fn get(url: &str) -> Result<Page, String> {
         .limit(FETCH_MAX_BYTES)
         .read_to_vec()
         .map_err(|e| e.to_string())?;
-    Ok(Page { status: resp.status().as_u16(), final_url, content_type, body })
+    Ok(Page { status: resp.status().as_u16(), final_url, content_type, body, location })
+}
+
+/// 重定向的 `Location`（可能是相对的）按当前网址补全。
+fn join_url(base: &str, location: &str) -> String {
+    let location = location.trim();
+    if location.contains("://") {
+        return location.to_string();
+    }
+    let (scheme, rest) = base.split_once("://").unwrap_or(("https", base));
+    if let Some(net) = location.strip_prefix("//") {
+        return format!("{scheme}://{net}");
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if location.starts_with('/') {
+        return format!("{scheme}://{authority}{location}");
+    }
+    // 相对路径：接在当前路径的最后一个 `/` 后面
+    let path = rest[authority.len()..].split(['?', '#']).next().unwrap_or("");
+    let dir = path.rfind('/').map_or("/", |i| &path[..=i]);
+    format!("{scheme}://{authority}{dir}{location}")
+}
+
+/// 主机名本身看得出是不是公网：IP 字面量按 [`ip_is_public`]，
+/// `localhost` / `*.localhost` / `*.local` / `*.internal` / 不带点的内网短名都不算。
+/// 走代理时目标主机由代理解析，所以名字这一关在这里先拦一次。
+pub fn host_is_public(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip_is_public(ip);
+    }
+    !(host.is_empty()
+        || !host.contains('.')
+        || host == "localhost"
+        || [".localhost", ".local", ".internal", ".lan", ".home.arpa"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix)))
+}
+
+/// 是不是公网地址（回环、私有网段、链路本地、CGNAT、组播、文档保留段等都不算）。
+pub fn ip_is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || a == 0
+                || (a == 100 && (64..128).contains(&b)) // CGNAT 100.64/10
+                || a >= 240)
+            // 198.18/15 不拦：Clash 等代理的 fake-ip 模式把所有域名都解析到这一段
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_public(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00 // 唯一本地 fc00::/7
+                || (first & 0xffc0) == 0xfe80) // 链路本地 fe80::/10
+        }
+    }
+}
+
+/// 解析出的地址只要有一个不是公网就整个拒绝（代理本身的地址除外：本机代理很常见）。
+#[derive(Debug)]
+struct PublicResolver;
+
+impl ureq::unversioned::resolver::Resolver for PublicResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let addrs = ureq::unversioned::resolver::DefaultResolver::default()
+            .resolve(uri, config, timeout)?;
+        let is_proxy = config.proxy().is_some_and(|p| p.uri().authority() == uri.authority());
+        if !is_proxy && addrs.iter().any(|a| !ip_is_public(a.ip())) {
+            return Err(ureq::Error::Other(
+                format!("{} resolves to a local or private address", uri.host().unwrap_or("host"))
+                    .into(),
+            ));
+        }
+        Ok(addrs)
+    }
 }
 
 /// 响应 → 工具结果：HTML 转文本，其他文本原样，二进制拒绝。
@@ -654,6 +798,7 @@ mod tests {
             final_url: "https://x.org/a".into(),
             content_type: ct.into(),
             body: body.as_bytes().to_vec(),
+            location: None,
         };
         let out = render("https://x.org/a", page("application/json", "{\"a\":1}"), 0);
         assert!(out.ok && out.content.ends_with("{\"a\":1}"), "{}", out.content);
@@ -676,6 +821,47 @@ mod tests {
         assert!(!out.ok && out.summary == "HTTP 404" && out.content.contains("gone"));
     }
 
+    #[test]
+    fn public_only_rejects_local_and_private_hosts() {
+        for host in [
+            "localhost",
+            "app.localhost",
+            "printer.local",
+            "nas",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!host_is_public(host), "{host}");
+        }
+        for host in ["docs.rs", "example.com.", "8.8.8.8", "2606:4700::1111", "198.18.0.5"] {
+            assert!(host_is_public(host), "{host}");
+        }
+        // 直接给内网地址：还没发请求就拒绝
+        let out = fetch("http://127.0.0.1:1/", 0, true, &|| false);
+        assert!(!out.ok && out.content.contains("local or private"), "{}", out.content);
+        // 代码会话（不限公网）照常去连（这里连不上，但不是因为被拦）
+        let out = fetch("http://127.0.0.1:1/", 0, false, &|| false);
+        assert!(!out.ok && !out.content.contains("local or private"), "{}", out.content);
+    }
+
+    #[test]
+    fn redirect_locations_are_joined() {
+        assert_eq!(join_url("https://a.org/x/y?q", "/z"), "https://a.org/z");
+        assert_eq!(join_url("https://a.org/x/y", "z"), "https://a.org/x/z");
+        assert_eq!(join_url("https://a.org", "z"), "https://a.org/z");
+        assert_eq!(join_url("https://a.org/x", "//b.org/p"), "https://b.org/p");
+        assert_eq!(join_url("https://a.org/x", "http://127.0.0.1/"), "http://127.0.0.1/");
+    }
+
     /// 联网抓真实网页看转换效果：
     /// `CLAUDESKTOP_FETCH_URL=https://… cargo test -p claudesktop-builtin live_fetch -- --ignored --nocapture`
     #[test]
@@ -683,7 +869,7 @@ mod tests {
     fn live_fetch() {
         let url = std::env::var("CLAUDESKTOP_FETCH_URL")
             .unwrap_or_else(|_| "https://www.rust-lang.org/".into());
-        let out = fetch(&normalize_url(&url).unwrap(), 0, &|| false);
+        let out = fetch(&normalize_url(&url).unwrap(), 0, false, &|| false);
         println!("[{}] {}\n{}", out.ok, out.summary, out.content);
         assert!(out.ok);
     }

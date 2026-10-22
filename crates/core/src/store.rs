@@ -70,6 +70,9 @@ pub struct SessionMeta {
     /// 会话类型；老元信息没有这一项，读成 [`SessionKind::Code`]
     #[serde(default, skip_serializing_if = "SessionKind::is_code")]
     pub kind: SessionKind,
+    /// 聊天会话的「联网」开关（会话级，重开应用后还是用户选的那样）；Code 会话 / 老元信息为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<bool>,
 }
 
 /// 会话的 git worktree：[`SessionMeta::cwd`] 是检出目录，这里记它从哪个仓库、哪个分支分出来。
@@ -264,6 +267,7 @@ impl SessionStore {
             task: false,
             worktree: None,
             kind: SessionKind::Code,
+            web: None,
         };
         self.save_meta(&meta)?;
         let log = self.append_log(&meta.id)?;

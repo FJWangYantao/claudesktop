@@ -163,6 +163,11 @@ impl ChatApp {
             return;
         }
         s.web = on;
+        // 记进元信息：重开应用后还是这样（还没落过盘的等建档时一起写）
+        if let (Some(store), Some(meta)) = (self.store.as_ref(), s.meta.as_mut()) {
+            meta.web = Some(on);
+            let _ = store.save_meta(meta);
+        }
         match (kernel, s.acp_id.clone()) {
             (Some(kernel), Some(id)) if kernel.supports_chat() => {
                 if let Err(err) = kernel.set_web(&id, on) {
