@@ -5,9 +5,7 @@
 //! 所以不用并进 `Session::row_key`。详情页占内容区（输入框照常在下面），Esc 或「返回」回到对话。
 
 use super::ChatApp;
-use super::chat::{
-    STEP_INDENT, close_dangling_markup, ellipsis, icon_cell, markdown_style, step_line,
-};
+use super::chat::{STEP_INDENT, ellipsis, icon_cell, markdown_style, reading_markdown, step_line};
 use super::motion::{self, Reveal};
 use super::widgets::Surface;
 use crate::model::*;
@@ -278,7 +276,7 @@ impl ChatApp {
                         .border_color(rgb(LINE))
                         .bg(rgb(CARD))
                         .child(
-                            TextView::markdown("task-prompt", run.prompt.clone())
+                            TextView::markdown("task-prompt", reading_markdown(&run.prompt, false))
                                 .style(markdown_style())
                                 .text_size(TEXT_BODY)
                                 .text_color(rgb(INK))
@@ -303,9 +301,8 @@ impl ChatApp {
                 ChatItem::Tool(c) => Self::render_task_tool(task, k, c, &s.cwd, window, cx),
                 ChatItem::Agent(text) => {
                     let streaming = running && k + 1 == run.items.len();
-                    let text = if streaming { close_dangling_markup(text) } else { text.into() };
                     div().child(
-                        TextView::markdown(("task-text", k), SharedString::from(text.into_owned()))
+                        TextView::markdown(("task-text", k), reading_markdown(text, streaming))
                             .style(markdown_style())
                             .text_size(TEXT_BODY)
                             .text_color(rgb(INK))
@@ -337,7 +334,7 @@ impl ChatApp {
         {
             page = page.child(
                 div().v_flex().gap_2().child(section_label("交回的报告")).child(
-                    TextView::markdown("task-report", SharedString::from(text.clone()))
+                    TextView::markdown("task-report", reading_markdown(text, false))
                         .style(markdown_style())
                         .text_size(TEXT_LARGE)
                         .text_color(rgb(INK))
