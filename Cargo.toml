@@ -5,7 +5,7 @@ members = ["apps/desktop", "crates/core", "crates/builtin"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 license = "Apache-2.0"
 
