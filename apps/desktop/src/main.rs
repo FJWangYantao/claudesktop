@@ -10,6 +10,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod assets;
 mod complete;
 mod demo;
 mod fonts;
@@ -67,7 +68,7 @@ fn main() {
     }
     let t_job = t0.elapsed();
 
-    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+    gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
         let t_gpui_run = t0.elapsed();
         gpui_kit::init(cx);
         // 系统通知要有应用身份（Windows AppUserModelID，通知上显示的应用名）

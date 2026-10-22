@@ -409,6 +409,7 @@ impl ChatApp {
             let body = div().pt_1().pl(STEP_INDENT).child(
                 TextView::markdown(("think-md", idx), text)
                     .style(markdown_style().paragraph_gap(rems(0.5)))
+                    .markdown_extensions(crate::app::math::extensions())
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
                     .line_height(LEADING),
@@ -749,6 +750,7 @@ impl ChatApp {
                             reading_markdown(summary, false),
                         )
                         .style(markdown_style())
+                        .markdown_extensions(crate::app::math::extensions())
                         .text_size(TEXT_BODY)
                         .text_color(rgb(INK))
                         .line_height(LEADING),
@@ -1871,7 +1873,7 @@ impl ChatApp {
     ) -> Div {
         let verbose = self.settings.view_mode == ViewMode::Verbose;
         match item {
-            ChatItem::User { text, images } => self.render_user(idx, text, images, window, cx),
+            ChatItem::User { text, images, .. } => self.render_user(idx, text, images, window, cx),
             ChatItem::Thinking { text, streaming, open, elapsed_ms, .. } => Self::render_thinking(
                 idx,
                 text,
@@ -1921,6 +1923,7 @@ impl ChatApp {
                 let body = div().min_w_0().text_size(TEXT_LARGE).line_height(LEADING).child(
                     TextView::markdown(("agent", idx), text)
                         .style(markdown_style())
+                        .markdown_extensions(crate::app::math::extensions())
                         .stream_fade(true)
                         .code_block_actions(move |block, window, cx| {
                             let start = block.span.map(|span| span.start).unwrap_or(0);
@@ -2082,9 +2085,11 @@ fn distance_to_end(list: &ListState) -> Pixels {
     (list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y).max(px(0.))
 }
 
-/// 回复 / 思考 / 摘要交给 `TextView` 前的整理：流式中补齐半截标记，再收掉全角标点旁的空格。
+/// 回复 / 思考 / 摘要交给 `TextView` 前的整理：流式中补齐半截标记，把 `\( … \)` / `\[ … \]` 这类
+/// 写法统一成 `$…$`（代码里不动，见 `math::normalize_markup`），再收掉全角标点旁的空格。
 pub(super) fn reading_markdown(text: &str, streaming: bool) -> SharedString {
     let text = if streaming { close_dangling_markup(text) } else { Cow::Borrowed(text) };
+    let text = claudesktop_core::math::normalize_markup(&text);
     SharedString::from(tidy_cjk_spacing(&text).into_owned())
 }
 

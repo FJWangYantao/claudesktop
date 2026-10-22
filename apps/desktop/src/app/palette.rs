@@ -9,7 +9,7 @@ use super::ChatApp;
 use super::keys::{NEW_SESSION_KEY, SHORTCUTS_KEY, TOGGLE_SIDEBAR_KEY};
 use super::project_label;
 use crate::model::ViewMode;
-use crate::settings::{KernelChoice, ThemeChoice};
+use crate::settings::{KernelChoice, Space, ThemeChoice};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
@@ -27,6 +27,12 @@ const PALETTE_W: Rems = rems(36.);
 #[derive(Clone, Debug, PartialEq)]
 enum PaletteCmd {
     NewSession,
+    /// 在聊天空间新建一个聊天（当前空间不是聊天时先切过去）
+    NewChat,
+    /// 在代码空间新建一个会话
+    NewCode,
+    /// 切到某个空间（聊天的会话本来就在当前空间时不新建）
+    SwitchSpace(Space),
     ToggleSidebar,
     PickWorkspace,
     /// 在当前目录的 git 仓库里建一个 worktree，新对话在那里开始
@@ -156,7 +162,12 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
     let s = app.session();
     let mut actions = vec![
         Entry::new(IconAll::MessageSquarePlus, "新会话", PaletteCmd::NewSession)
-            .key(NEW_SESSION_KEY),
+            .key(NEW_SESSION_KEY)
+            .desc("在当前空间里新建"),
+        Entry::new(IconAll::MessageSquare, "新建聊天", PaletteCmd::NewChat)
+            .desc("聊天直接连模型：没有工作目录，只带联网和记忆"),
+        Entry::new(IconAll::SquareTerminal, "新建代码会话", PaletteCmd::NewCode)
+            .desc("有工作目录、全套工具和权限"),
         Entry::new(
             IconAll::PanelLeft,
             if app.sidebar_open { "收起侧栏" } else { "展开侧栏" },
@@ -179,6 +190,27 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
                 .desc("把较早的对话换成摘要"),
         );
     }
+
+    // 切空间：两个都列出来，当前那个打勾（点了只回去，不新建）
+    let space_now = app.space();
+    let mut spaces: Vec<Entry> = [Space::Chat, Space::Code]
+        .into_iter()
+        .map(|space| {
+            Entry::new(
+                if space == Space::Chat { IconAll::MessageSquare } else { IconAll::SquareTerminal },
+                format!("切到{}", space.label()),
+                PaletteCmd::SwitchSpace(space),
+            )
+            .desc(if space == Space::Chat {
+                "侧栏顶部「聊天 | 代码」的聊天那一格"
+            } else {
+                "侧栏顶部「聊天 | 代码」的代码那一格"
+            })
+            .checked(space == space_now)
+        })
+        .collect();
+    // 会话命令在前，切空间接在后面（同一个「操作」组）
+    actions.append(&mut spaces);
 
     // 会话按侧栏的显示顺序
     let sessions = app
@@ -347,6 +379,18 @@ impl ChatApp {
             PaletteCmd::NewSession => {
                 self.settings_open = false;
                 self.add_session(cx);
+            }
+            PaletteCmd::NewChat => {
+                self.settings_open = false;
+                self.new_in_space(Space::Chat, cx);
+            }
+            PaletteCmd::NewCode => {
+                self.settings_open = false;
+                self.new_in_space(Space::Code, cx);
+            }
+            PaletteCmd::SwitchSpace(space) => {
+                self.settings_open = false;
+                self.switch_space(space, cx);
             }
             PaletteCmd::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             PaletteCmd::PickWorkspace => self.pick_workspace(cx),

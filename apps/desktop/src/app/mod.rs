@@ -11,6 +11,7 @@ mod gauge;
 mod history;
 pub(crate) mod keys;
 mod mascot;
+pub mod math;
 mod mcp_view;
 mod memory_view;
 mod menu;
@@ -72,6 +73,8 @@ pub struct ChatApp {
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
+    /// 聊天会话待发送的文本附件（内容内联进消息，代码会话不用这个；见 `crates/core/src/attach.rs`）
+    pub(crate) pending_files: Vec<claudesktop_core::attach::TextAttachment>,
     /// 正从系统往会话区拖文件（盖一层「松开添加」的提示，见 `composer.rs` 的 `render_drop_hint`）
     file_drag: bool,
     /// 内核会话（可多个）；至少有一个，`active` 始终有效
@@ -248,6 +251,19 @@ impl Drop for ChatApp {
     }
 }
 
+/// 从聊天复制到 Code 会话时只抄这些记录：对话本身。
+/// 文件改动 / 检查点 / 回退不抄（新会话的目录里没有那些文件，抄过去回退会乱）。
+fn copyable(record: &Record) -> bool {
+    matches!(
+        record,
+        Record::User { .. }
+            | Record::Event { .. }
+            | Record::PermissionResolved { .. }
+            | Record::Turn { .. }
+            | Record::Thought { .. }
+    )
+}
+
 impl ChatApp {
     /// 按槽的 key 找（只读）。
     pub(crate) fn slot(&self, key: &str) -> Option<&KernelSlot> {
@@ -414,6 +430,7 @@ impl ChatApp {
         let mut app = Self {
             input,
             pending: Vec::new(),
+            pending_files: Vec::new(),
             file_drag: false,
             sessions: Vec::new(),
             active: 0,
@@ -741,6 +758,75 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 「在项目里继续…」（见设计说明第八章）：把当前聊天**复制**成一个 Code 会话。
+    ///
+    /// 新会话拿一份新的日志（新 ID、`kind: Code`、选的那个目录），内容原样抄过来；
+    /// 自研内核续接时按日志重建上下文，所以它「记得」前面聊过什么，而且现在有了工具。
+    /// 原来的聊天不动（转换会让原聊天消失，复制干净）。
+    pub(crate) fn continue_in_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let src = self.active;
+        let Some(store) = self.store.as_ref() else {
+            self.toast(Notification::warning("数据目录不可用，没法把这段聊天接到项目里"), cx);
+            return;
+        };
+        let records = match &self.sessions[src].meta {
+            Some(meta) => store.load(&meta.id).unwrap_or_default(),
+            // 还没落过盘（一个字都没发）：没有可复制的东西
+            None => Vec::new(),
+        };
+        // 只抄对话本身：文件改动 / 检查点 / 回退不抄（新目录里没有那些文件，抄过去回退会乱）
+        let records: Vec<Record> = records
+            .into_iter()
+            .filter(copyable)
+            .map(|r| match r {
+                // 图片附件的路径指向前一个会话的资产目录：还在的保留，不在的去掉
+                Record::User { text, images, sent } => Record::User {
+                    text,
+                    images: images.into_iter().filter(|p| Path::new(p).is_file()).collect(),
+                    sent,
+                },
+                other => other,
+            })
+            .collect();
+        let title = format!("{}（接着聊）", self.sessions[src].title);
+        let kind = self.settings.kernel_for_space(Space::Code);
+        let agent_cmd = self.slot(&kind.key()).map(|s| s.agent_cmd.clone()).unwrap_or_default();
+        let created =
+            store.create(&title, dir.clone(), &agent_cmd).and_then(|(mut meta, mut log)| {
+                meta.kind = SessionKind::Code;
+                meta.task = false;
+                store.save_meta(&meta)?;
+                for record in records {
+                    log.append(record)?;
+                }
+                Ok(meta)
+            });
+        let meta = match created {
+            Ok(meta) => meta,
+            Err(err) => {
+                self.toast(Notification::error(format!("没能接到项目里：{err}")), cx);
+                return;
+            }
+        };
+        // 在代码空间里开出来并切过去（新会话要先续接内核、重建上下文）
+        self.remember_space(self.space());
+        self.settings.space = Space::Code;
+        self.update_settings(|s| s.space = Space::Code);
+        let idx = self.open_session_of(kind, dir.clone(), SessionKind::Code);
+        self.sessions[idx].meta = Some(meta);
+        self.sessions[idx].title = title.into();
+        self.sessions[idx].restored = true;
+        self.sessions[idx].renamed = true;
+        self.sessions[idx].note(format!(
+            "从聊天接过来的（目录：{}）。前面聊过的内容都在上下文里，现在可以动文件、跑命令了",
+            dir.display()
+        ));
+        self.active = idx;
+        self.remember_space(Space::Code);
+        self.suggestion.clear();
+        cx.notify();
+    }
+
     /// 在某个空间里开一个新会话（用该空间的默认内核和目录），并切过去。
     fn open_in_space(&mut self, space: Space, cx: &mut Context<Self>) {
         let (kind, cwd) = self.space_defaults(space);
@@ -748,6 +834,15 @@ impl ChatApp {
         self.active = idx;
         self.remember_space(space);
         self.refresh_composer(cx);
+    }
+
+    /// 命令面板的「新建聊天 / 新建代码会话」：先切到那个空间，再按那个空间的规矩新建
+    ///（已经有空会话就切过去，见 `add_session`）。
+    pub(crate) fn new_in_space(&mut self, space: Space, cx: &mut Context<Self>) {
+        if space != self.space() {
+            self.switch_space(space, cx);
+        }
+        self.add_session(cx);
     }
 
     /// 新建一个会话并切过去（在当前空间里：聊天空间建聊天，代码空间按设置的默认内核）。
@@ -920,6 +1015,24 @@ impl ChatApp {
         }
     }
 
+    /// 「在项目里继续…」（顶栏的按钮）：选一个目录，把当前聊天接到那个目录的 Code 会话里。
+    pub(crate) fn continue_in_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选一个项目目录，把这段聊天接过去".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(dir) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |app, _, cx| app.continue_in_dir(dir, cx));
+            }
+        })
+        .detach();
+    }
+
     /// 目录菜单里的「选择文件夹…」：系统对话框选一个目录切过去。
     pub(crate) fn pick_workspace(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
@@ -995,7 +1108,11 @@ impl ChatApp {
         if self.sessions[idx].busy {
             return;
         }
-        self.submit_to(idx, UserPrompt { text: "继续".into(), images: Vec::new() }, cx);
+        self.submit_to(
+            idx,
+            UserPrompt { text: "继续".into(), images: Vec::new(), attachments: Vec::new() },
+            cx,
+        );
     }
 
     /// 失败卡片上的「重试」：把第 `failed_idx` 行所在这一轮的用户消息原样再发一遍。
@@ -1005,28 +1122,53 @@ impl ChatApp {
         if s.busy {
             return;
         }
-        let Some(ChatItem::User { text, images }) =
-            s.turn_prompt(failed_idx).and_then(|u| s.transcript.get(u))
-        else {
+        let Some(user) = s.turn_prompt(failed_idx) else {
             return;
         };
-        let prompt = UserPrompt {
-            text: text.to_string(),
-            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
+        let Some(prompt) = self.resend_prompt(idx, user, cx) else {
+            return;
         };
         self.submit_to(idx, prompt, cx);
+    }
+
+    /// 把对话里的一条用户消息还原成能再发一遍的提示词（重试 / 换内核重跑）。
+    ///
+    /// 气泡里那行附件名不是用户打的字，去掉；文本附件这次运行里还在就原样带上。
+    /// 从日志恢复的会话里附件内容已经不在手里：照发用户的话，并提示一句。
+    fn resend_prompt(
+        &mut self,
+        idx: usize,
+        item_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<UserPrompt> {
+        let Some(ChatItem::User { text, images, files }) =
+            self.sessions[idx].transcript.get(item_idx)
+        else {
+            return None;
+        };
+        let typed = claudesktop_core::attach::strip_display(text);
+        let lost = files.is_empty() && typed.len() != text.len();
+        let prompt = UserPrompt {
+            text: typed.to_string(),
+            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
+            attachments: files.as_ref().clone(),
+        };
+        if lost {
+            self.toast(
+                Notification::warning(
+                    "这条消息的文本附件已经不在了，只重发了文字和图片；需要的话请重新添加文件",
+                ),
+                cx,
+            );
+        }
+        Some(prompt)
     }
 
     /// 同一任务换个内核跑：拿当前会话里第 `item_idx` 条用户消息，在 `kind` 上新开会话发出去。
     pub(crate) fn rerun_on(&mut self, item_idx: usize, kind: KernelChoice, cx: &mut Context<Self>) {
         let src = self.active;
-        let Some(ChatItem::User { text, images }) = self.sessions[src].transcript.get(item_idx)
-        else {
+        let Some(prompt) = self.resend_prompt(src, item_idx, cx) else {
             return;
-        };
-        let prompt = UserPrompt {
-            text: text.to_string(),
-            images: images.iter().filter_map(|p| load_prompt_image(p)).collect(),
         };
         let from = self.sessions[src].title.clone();
         let cwd = self.sessions[src].cwd.clone();
@@ -1053,6 +1195,7 @@ impl ChatApp {
                 0 => ChatItem::User {
                     text: format!("第 {i} 条：帮我看看这段代码为什么慢").into(),
                     images: Vec::new(),
+                    files: Default::default(),
                 },
                 1 => ChatItem::Agent(format!(
                     "**第 {i} 条回复。** 先看热点：\n\n- 每帧重建整棵树\n- 列表没有虚拟化\n\n```rust\nfn hot(i: usize) -> usize {{ i * {i} }}\n```\n\n改完再测一次。"
@@ -1357,7 +1500,17 @@ impl ChatApp {
     /// 发出输入框里的内容；这一轮还在跑时先排队（输入框上方的队列），这一轮正常结束后自动发出。
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
-        if text.trim().is_empty() && self.pending.is_empty() {
+        if text.trim().is_empty() && self.pending.is_empty() && self.pending_files.is_empty() {
+            return;
+        }
+        // 还有图在后台转正 / 缩小：等处理完再发（缩略图上半透明占位，发送键也置灰）
+        if self.pending.iter().any(|p| p.preparing) {
+            self.toast(Notification::warning("图片还在处理，稍等一下再发"), cx);
+            return;
+        }
+        // 这个模型明确看不了图：不发，图留在输入框里（换模型后再发）
+        if let Some(why) = self.pending_images_unviewable() {
+            self.toast(Notification::warning(why), cx);
             return;
         }
         let active = self.active;
@@ -1369,13 +1522,15 @@ impl ChatApp {
             );
             return;
         }
-        let queued = QueuedPrompt { text, images: self.pending.clone() };
+        let queued =
+            QueuedPrompt { text, images: self.pending.clone(), files: self.pending_files.clone() };
         // 发出去了：光标后面那句灰字、以及轮结束时猜的下一句都作废
         self.suggestion.clear();
         self.next_suggestion.clear();
         if self.sessions[active].busy || self.sessions[active].stopping {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.pending_files.clear();
             self.history.push(&queued.text);
             self.sessions[active].queued.push(queued);
             cx.notify();
@@ -1385,6 +1540,7 @@ impl ChatApp {
         if self.sessions[active].worktree_busy.is_some() {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.pending_files.clear();
             self.history.push(&queued.text);
             self.sessions[active].queued.push(queued);
             cx.notify();
@@ -1395,6 +1551,7 @@ impl ChatApp {
         if self.submit_to(active, queued.into_prompt(), cx) {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
+            self.pending_files.clear();
             // 真发出去了才进输入历史（排队的两处上面已经记过）；发失败的不记，
             // 免得 ↑ 翻出来一条从没发出去的消息
             self.history.push(&sent_text);
@@ -1437,6 +1594,11 @@ impl ChatApp {
                 parts.push(item.text);
             }
             self.pending.extend(item.images);
+            for file in item.files {
+                if !self.pending_files.iter().any(|f| f.path == file.path) {
+                    self.pending_files.push(file);
+                }
+            }
         }
         let draft = self.input.read(cx).value().to_string();
         if !draft.trim().is_empty() {
@@ -1495,14 +1657,145 @@ impl ChatApp {
             );
         }
         self.pending.extend(images.into_iter().take(room));
-        cx.notify();
+        self.refresh_composer(cx);
+        // 新来的图片在后台转正 / 缩小（粘贴、拖放、选文件都走这里）
+        self.prepare_pending_images(cx);
+    }
+
+    /// 把刚收下的图片放到后台去转正 / 缩小 / 重编码（一张 1200 万像素的照片要一两百毫秒）。
+    ///
+    /// 处理期间缩略图先按原图半透明显示（不放转圈：输入区画在 `ChatApp` 里，循环动画会
+    /// 带着内容区一起重画，见 AGENTS.md「动效」）；还有图没处理完时发送键置灰。
+    pub(crate) fn prepare_pending_images(&mut self, cx: &mut Context<Self>) {
+        if !self.pending.iter().any(|p| p.preparing) {
+            return;
+        }
+        // 只处理还没处理过的那些，按编号找回（后台跑的时候列表可能被删过、挪过）
+        let jobs: Vec<(u64, SharedString, Vec<u8>)> = self
+            .pending
+            .iter()
+            .filter(|p| p.preparing)
+            .filter_map(|p| {
+                use base64::Engine as _;
+                let raw =
+                    base64::engine::general_purpose::STANDARD.decode(p.data.as_bytes()).ok()?;
+                Some((p.id, p.name.clone(), raw))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let quality = claudesktop_core::image_prep::Quality::Standard;
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    jobs.into_iter()
+                        .map(|(id, name, raw)| {
+                            let out = claudesktop_core::image_prep::prepare(&name, &raw, quality);
+                            (id, name, out)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                let mut failed: Vec<String> = Vec::new();
+                for (id, name, out) in results {
+                    // 处理期间被删了（或另一批已经处理好了）：跳过
+                    let Some(slot) = app.pending.iter_mut().find(|p| p.id == id && p.preparing)
+                    else {
+                        continue;
+                    };
+                    match out {
+                        Ok(prepared) => *slot = PendingImage::from_prepared(id, name, &prepared),
+                        Err(err) => {
+                            failed.push(err.message());
+                            slot.preparing = false;
+                        }
+                    }
+                }
+                for why in failed {
+                    app.toast(Notification::warning(why), cx);
+                }
+                // 处理失败的也留着（用户可以自己删），只是不再挂着「处理中」
+                app.refresh_composer(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 撤掉第 `i` 张待发送图片。
     pub(crate) fn remove_pending_image(&mut self, i: usize, cx: &mut Context<Self>) {
         if i < self.pending.len() {
             self.pending.remove(i);
-            cx.notify();
+            self.refresh_composer(cx);
+        }
+    }
+
+    // ---------- 文本附件（只有聊天会话用：内容内联进消息） ----------
+
+    /// 在当前会话的模型上，这些待发送图片有没有「看不了」的问题；返回提示里要说的那句话。
+    ///
+    /// 两种来源：能力表知道这个模型只吃文字（`vision_support == Some(false)`），或者用户
+    /// 之前被端点回过 400、已经记进 `no_vision_models`（见设置）。
+    pub(crate) fn pending_images_unviewable(&self) -> Option<String> {
+        if self.pending.is_empty() || self.sessions[self.active].kernel != KernelChoice::Builtin {
+            return None;
+        }
+        let model = &self.sessions[self.active].model_label;
+        let protocol = self.settings.builtin.current().protocol;
+        let known_bad =
+            self.settings.no_vision_models.iter().any(|m| m.eq_ignore_ascii_case(model.as_ref()));
+        let support = claudesktop_core::image_prep::vision_support(
+            &serde_json::to_string(&protocol).unwrap_or_default(),
+            model,
+        );
+        (known_bad || support == Some(false))
+            .then(|| format!("当前模型 {model} 看不了图片，换一个能看图的模型再发"))
+    }
+
+    pub(crate) fn add_pending_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        use claudesktop_core::attach;
+        let mut images = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for path in paths {
+            // 图片还是图片附件（发送前按图片那样处理，见设计说明第七章）
+            if let Some(image) = PendingImage::from_path(path) {
+                images.push(image);
+                continue;
+            }
+            // 已经带上了就不再读一遍
+            if self.pending_files.iter().any(|f| &f.path == path) {
+                continue;
+            }
+            match attach::read_text(path) {
+                Ok(file) => {
+                    if attach::fits_total(&self.pending_files, &file) {
+                        self.pending_files.push(file);
+                    } else {
+                        let bytes = file.bytes();
+                        refused.push(
+                            attach::AttachError::TotalTooLarge { name: file.name, bytes }.message(),
+                        );
+                    }
+                }
+                // 读不了 / 不是文本：一句说明，不打断其余文件
+                Err(err) => refused.push(err.message()),
+            }
+        }
+        self.add_pending_images(images, cx);
+        for why in refused {
+            self.toast(Notification::warning(why), cx);
+        }
+        self.refresh_composer(cx);
+    }
+
+    /// 撤掉第 `i` 个待发送文本附件。
+    pub(crate) fn remove_pending_file(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i < self.pending_files.len() {
+            self.pending_files.remove(i);
+            self.refresh_composer(cx);
         }
     }
 
@@ -1540,7 +1833,7 @@ impl ChatApp {
     pub(crate) fn submit_to(
         &mut self,
         idx: usize,
-        prompt: UserPrompt,
+        mut prompt: UserPrompt,
         cx: &mut Context<Self>,
     ) -> bool {
         let kind = self.sessions[idx].kernel.clone();
@@ -1584,8 +1877,19 @@ impl ChatApp {
                 return false;
             }
             s.steering = false;
+            // 聊天会话的文本附件：内容拼在发给内核的全文里；气泡和日志里只写文件名
+            let attachments = std::mem::take(&mut prompt.attachments);
+            let has_attachments = !attachments.is_empty();
+            let shown = claudesktop_core::attach::display_text(&prompt.text, &attachments);
+            let full = claudesktop_core::attach::compose(&prompt.text, &attachments);
             if !s.has_user_message() && !s.renamed {
-                s.title = crate::model::title_from_prompt(&prompt.text).into();
+                // 只有附件时用第一个文件名当标题
+                let basis = if prompt.text.trim().is_empty() {
+                    attachments.first().map(|a| a.name.as_str()).unwrap_or("").to_string()
+                } else {
+                    prompt.text.clone()
+                };
+                s.title = crate::model::title_from_prompt(&basis).into();
             }
             // 图片附件先落盘（需要会话元信息），路径进记录与气泡
             let stored = self.store_images(idx, &prompt.images);
@@ -1594,29 +1898,39 @@ impl ChatApp {
             }
             let image_paths = stored.iter().map(PathBuf::from).collect::<Vec<_>>();
             self.sessions[idx].transcript.push(ChatItem::User {
-                text: SharedString::from(prompt.text.clone()),
+                text: SharedString::from(shown.clone()),
                 images: image_paths,
+                files: std::sync::Arc::new(attachments.clone()),
             });
             // 插件的斜杠命令：对话里显示原样的「/命令 参数」，发给内核的是展开后的模板
             let enabled = self.enabled_plugins();
-            let sent = claudesktop_core::plugin::find_command(&enabled, &prompt.text).map(
+            let expanded = claudesktop_core::plugin::find_command(&enabled, &prompt.text).map(
                 |(_, command, args)| claudesktop_core::plugin::expand_command(&command.body, &args),
             );
-            // 上一轮在审查页里撤回过块：发给内核的文字前面附上说明，气泡里照常只显示用户写的
-            let sent = match self.take_review_note(idx) {
-                Some(note) => {
-                    Some(format!("{note}\n\n{}", sent.as_deref().unwrap_or(&prompt.text)))
-                }
-                None => sent,
+            // 聊天附件的内容跟在（展开后的）文字后面一起发出去
+            let mut sent = match &expanded {
+                Some(text) => text.clone(),
+                None => full,
             };
+            // 上一轮在审查页里撤回过块：发给内核的文字前面附上说明，气泡里照常只显示用户写的
+            let reviewed = match self.take_review_note(idx) {
+                Some(note) => {
+                    sent = format!("{note}\n\n{sent}");
+                    true
+                }
+                None => false,
+            };
+            // 和用户写的一样就不必另存一份（`sent` 只在不一样时进日志）
+            let sent = (reviewed || expanded.is_some() || has_attachments).then_some(sent);
             if kernel.is_some() {
                 self.persist(
                     idx,
-                    Record::User { text: prompt.text.clone(), images: stored, sent: sent.clone() },
+                    Record::User { text: shown.clone(), images: stored, sent: sent.clone() },
                 );
             }
             let prompt = match sent {
-                Some(text) => UserPrompt { text, ..prompt },
+                // 附件内容已经在 `sent` 里了，内核不必再拼一遍
+                Some(text) => UserPrompt { text, images: prompt.images, attachments: Vec::new() },
                 None => prompt,
             };
             let s = &mut self.sessions[idx];
@@ -1630,6 +1944,7 @@ impl ChatApp {
                             s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. }));
                         claudesktop_builtin::gateway::note_turn(&id, turn.count() as u64);
                     }
+                    // 附件内容已经在 `sent` 里：内核只看文字，不必再拼一遍
                     if let Err(err) = kernel.send_prompt(&id, prompt) {
                         s.busy = false;
                         s.fail(format!("发送失败：{err}"));
@@ -1917,8 +2232,30 @@ impl ChatApp {
                         }
                     }
                     let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
-                    // 网关又记了请求：用量页的费用、请求跟着刷新（不用等这一轮跑完再手动重读）
-                    if turn_over || matches!(event, KernelEvent::UsageUpdated { .. }) {
+                    // 端点回了「这个模型看不了图片」：把这轮用过的模型记进设置，
+                    // 下次附上图时直接按「看不了」提醒（设置页里能清掉）
+                    if let KernelEvent::PromptFailed { message } = &event
+                        && claudesktop_core::image_prep::image_rejection(message)
+                    {
+                        let model = self.sessions[idx].model_label.to_string();
+                        if !model.is_empty()
+                            && !self
+                                .settings
+                                .no_vision_models
+                                .iter()
+                                .any(|m| m.eq_ignore_ascii_case(&model))
+                        {
+                            let record = model.clone();
+                            self.save_ui_pref(move |s| s.no_vision_models.push(record.clone()), cx);
+                            self.push_no_vision_models();
+                        }
+                    }
+                    // 网关又记了请求：用量页的费用、请求跟着刷新（不用等这一轮跑完再手动重读）。
+                    // 工具循环每一步都会报用量，只在请求日志真看得见时才读（它自己攒 2 秒）
+                    if turn_over
+                        || (self.requests_shown()
+                            && matches!(event, KernelEvent::UsageUpdated { .. }))
+                    {
                         self.refresh_requests_soon(cx);
                     }
                     // 模型起了标题：元信息也跟着更新（TurnEnded 时写的还是旧标题）
@@ -2298,4 +2635,33 @@ fn load_prompt_image(path: &std::path::Path) -> Option<PromptImage> {
         media_type: mime_of(path).to_string(),
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
     })
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    /// 复制到 Code 会话的只有对话本身：文件改动 / 检查点 / 回退不抄。
+    #[core::prelude::v1::test]
+    fn only_the_conversation_is_copied() {
+        assert!(copyable(&Record::user("你好")));
+        assert!(copyable(&Record::Event {
+            event: KernelEvent::AgentMessageChunk { text: "在".into() }
+        }));
+        assert!(copyable(&Record::PermissionResolved { id: 1, label: "Yes".into() }));
+        assert!(copyable(&Record::Thought { elapsed_ms: 1200 }));
+        // 文件改动、检查点、回退不抄
+        assert!(!copyable(&Record::FileChanged {
+            path: "a.rs".into(),
+            before: None,
+            after: None,
+            reverted: None,
+        }));
+        assert!(!copyable(&Record::Rewind {
+            turn: 0,
+            conversation: true,
+            files: 0,
+            prompt: "x".into(),
+        }));
+    }
 }

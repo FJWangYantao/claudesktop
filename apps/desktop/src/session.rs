@@ -113,7 +113,8 @@ pub struct Session {
     pub turn_summaries: HashMap<usize, TurnSummary>,
     /// 输入框上方的计划收成一行
     pub plan_folded: bool,
-    /// 上下文里的 token（最近一轮结束时内核报告的；0 = 不知道，输入框旁不显示用量）
+    /// 上下文里的 token（最近一次请求结束时内核报告的；0 = 不知道，输入框旁不显示用量）。
+    /// 自研内核每走完一步工具循环就更新一次，跑着的时候也跟着涨
     pub context_tokens: u64,
     /// 正在从日志重放：新的思考块不计时（用时从日志里的 `Record::Thought` 取）
     replaying: bool,
@@ -435,6 +436,7 @@ impl Session {
                     s.transcript.push(ChatItem::User {
                         text: text.into(),
                         images: images.iter().map(PathBuf::from).collect(),
+                        files: Default::default(),
                     })
                 }
                 Record::Event { event } => {
@@ -463,7 +465,7 @@ impl Session {
                         };
                         s.turn_summaries.insert(user, TurnSummary { elapsed_ms, usage });
                     }
-                    if let Some(n) = context_tokens {
+                    if let Some(n) = context_tokens.filter(|n| *n > 0) {
                         s.context_tokens = n;
                     }
                 }
@@ -956,7 +958,7 @@ impl Session {
         );
         for item in &self.transcript {
             match item {
-                ChatItem::User { text, images } => {
+                ChatItem::User { text, images, .. } => {
                     out += &format!("## 我\n\n{text}\n\n");
                     if !images.is_empty() {
                         out += &format!("（{} 张图片附件）\n\n", images.len());
@@ -1141,7 +1143,7 @@ impl Session {
         self.turn_summaries.retain(|&i, _| i < idx);
         self.open_groups.retain(|&i| i < idx);
         self.plan_folded = false;
-        // 上下文变短了，用量等下一轮结束时内核再报
+        // 上下文变短了，用量等下一轮第一步请求完内核再报
         self.context_tokens = 0;
         self.cache_hit = None;
     }
@@ -1675,7 +1677,8 @@ mod tests {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("C:/proj"));
         s.title = "测试会话".into();
         s.note("一条备注");
-        let user = ChatItem::User { text: "你好".into(), images: Vec::new() };
+        let user =
+            ChatItem::User { text: "你好".into(), images: Vec::new(), files: Default::default() };
         let agent = ChatItem::Agent("**回复**".into());
         let card = ToolCard {
             id: None,
@@ -1711,7 +1714,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn failure_resume_needs_progress_and_latest_turn() {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("C:/proj"));
-        let user = |t: &str| ChatItem::User { text: t.into(), images: Vec::new() };
+        let user = |t: &str| ChatItem::User {
+            text: t.into(),
+            images: Vec::new(),
+            files: Default::default(),
+        };
         let tool = || {
             ChatItem::Tool(ToolCard {
                 id: None,
@@ -1946,7 +1953,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn list_tracks_new_and_changed_rows() {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "hi".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.transcript.push(ChatItem::Agent("a".into()));
         s.sync_list(ViewMode::Normal);
         // 记录 2 行 + 末尾状态行
@@ -1977,7 +1988,8 @@ mod tests {
     #[core::prelude::v1::test]
     fn turn_end_and_turn_text() {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("."));
-        let user = || ChatItem::User { text: "q".into(), images: Vec::new() };
+        let user =
+            || ChatItem::User { text: "q".into(), images: Vec::new(), files: Default::default() };
         s.transcript = vec![
             user(),
             ChatItem::Agent("a".into()),
@@ -2044,7 +2056,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn subagent_events_go_to_their_own_task() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "查".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "查".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.begin_turn();
         let started = |id: &str, parent: Option<&str>| KernelEvent::ToolCallStarted {
             id: id.into(),
@@ -2113,7 +2129,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn retry_shows_until_the_next_real_event() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "hi".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.begin_turn();
         let retrying = KernelEvent::Retrying {
             status: 429,
@@ -2135,7 +2155,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn cancelled_turn_settles_tools_and_stopping() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "跑一下".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "跑一下".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.begin_turn();
         s.transcript.push(ChatItem::Tool(ToolCard {
             id: None,
@@ -2163,7 +2187,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn compaction_row_tracks_progress_and_drops_the_gauge() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "hi".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.transcript.push(ChatItem::Agent("好".into()));
         s.context_tokens = 900;
         // 空闲时手动压缩：自成一轮
@@ -2246,7 +2274,11 @@ mod tests {
 
         s.acp_id = Some("k2".into());
         s.ready = true;
-        s.transcript.push(ChatItem::User { text: "hi".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "hi".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.apply_event(
             KernelEvent::ToolCallStarted {
                 id: "t".into(),
@@ -2273,7 +2305,11 @@ mod tests {
     fn activity_follows_turn_and_usage_accumulates() {
         let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
         // 上一轮遗留的执行中工具不算进本轮
-        s.transcript.push(ChatItem::User { text: "上一轮".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "上一轮".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.apply_event(
             KernelEvent::ToolCallStarted {
                 id: "old".into(),
@@ -2284,7 +2320,11 @@ mod tests {
             },
             None,
         );
-        s.transcript.push(ChatItem::User { text: "这一轮".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "这一轮".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.begin_turn();
         assert!(s.busy && s.turn_started.is_some());
         assert_eq!(s.activity(), Activity::Working);
@@ -2357,7 +2397,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn live_output_tokens_adds_reported_and_streamed() {
         let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.begin_turn();
         assert_eq!(s.live_output_tokens(), 0);
 
@@ -2388,7 +2432,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn live_thinking_is_timed_once() {
         let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.apply_event(thought("想"), None);
         s.apply_event(thought("再想"), None);
         assert!(matches!(&s.transcript[1], ChatItem::Thinking { started: Some(_), .. }));
@@ -2533,7 +2581,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn steps_group_and_fold() {
         let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.begin_turn();
         // 只有一步：照常一行，没有组头
         s.apply_event(read("a"), None);
@@ -2580,7 +2632,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn diff_tools_and_permissions_split_groups() {
         let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.apply_event(read("a"), None);
         s.apply_event(read("b"), None);
         s.apply_event(
@@ -2694,7 +2750,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn plan_pins_while_turn_runs() {
         let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.begin_turn();
         let plan = |statuses: &[&str]| KernelEvent::PlanReplaced {
             entries: statuses
@@ -2856,7 +2916,11 @@ mod tests {
     #[core::prelude::v1::test]
     fn attention_picks_events_worth_a_notification() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
-        s.transcript.push(ChatItem::User { text: "q".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         s.transcript.push(ChatItem::Agent(
             "## 结论\n\n**改好了**，测试 `cargo test` 全过。\n第二行".into(),
         ));
@@ -2873,7 +2937,11 @@ mod tests {
         s.compact_turn = true;
         assert_eq!(s.attention(&ended("end_turn")), None);
         s.compact_turn = false;
-        s.transcript.push(ChatItem::User { text: "q2".into(), images: Vec::new() });
+        s.transcript.push(ChatItem::User {
+            text: "q2".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
         assert_eq!(s.attention(&ended("end_turn")).as_deref(), Some("回复完了"));
         // 长回复截断
         let long = "很长".repeat(100);

@@ -359,6 +359,9 @@ pub enum ChatItem {
         text: SharedString,
         /// 图片附件的绝对路径（气泡里渲染缩略图；发给内核时读回 base64）
         images: Vec<std::path::PathBuf>,
+        /// 聊天的文本附件（重试 / 换内核重跑时原样再带上）。只在这次运行里有：
+        /// 从日志恢复的会话为空（内容只在日志的 `sent` 里，已经拼进上下文了）
+        files: std::sync::Arc<Vec<claudesktop_core::attach::TextAttachment>>,
     },
     Thinking {
         text: String,
@@ -423,6 +426,8 @@ pub enum CompactState {
 /// 输入框里待发送的一张图片附件（已编好 base64，预览用 gpui Image）。
 #[derive(Clone)]
 pub struct PendingImage {
+    /// 这次运行里唯一的编号：后台处理完按它对回（下标会因删除而挪，名字会重复，如「剪贴板图片」）
+    pub id: u64,
     /// 原始文件名（悬停提示用）
     pub name: SharedString,
     /// 如 `image/png`
@@ -431,17 +436,66 @@ pub struct PendingImage {
     pub data: String,
     /// 输入框上方的预览
     pub preview: gpui_kit::Image,
+    /// 处理后的宽高（悬停提示「1568×1176 · 约 2.5k token」）；还没处理完是 None
+    pub size: Option<(u32, u32)>,
+    /// 还在后台转正 / 缩小（缩略图先半透明占位）
+    pub preparing: bool,
 }
 
 impl PendingImage {
     /// 从图片字节构造（格式已知，如剪贴板里的 gpui Image）。
     pub fn from_bytes(name: SharedString, bytes: Vec<u8>, format: gpui_kit::ImageFormat) -> Self {
         use base64::Engine as _;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             name,
             media_type: format.mime_type().to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&bytes),
             preview: gpui_kit::Image::from_bytes(format, bytes),
+            size: None,
+            preparing: true,
+        }
+    }
+
+    /// 已经处理好的那张（发送前转正 / 缩小 / 重编码的结果，见 `image_prep`）；`id` 沿用原来那张的。
+    pub fn from_prepared(
+        id: u64,
+        name: SharedString,
+        prepared: &claudesktop_core::image_prep::Prepared,
+    ) -> Self {
+        use base64::Engine as _;
+        // 小动图原样保留（`image/gif`），其余重编码成 PNG / JPEG
+        let format = match prepared.media_type.as_str() {
+            "image/png" => gpui_kit::ImageFormat::Png,
+            "image/gif" => gpui_kit::ImageFormat::Gif,
+            _ => gpui_kit::ImageFormat::Jpeg,
+        };
+        Self {
+            id,
+            name,
+            media_type: prepared.media_type.clone(),
+            data: base64::engine::general_purpose::STANDARD.encode(&prepared.bytes),
+            preview: gpui_kit::Image::from_bytes(format, prepared.bytes.clone()),
+            size: Some((prepared.width, prepared.height)),
+            preparing: false,
+        }
+    }
+
+    /// 悬停提示：文件名 + 尺寸 + 大约多少 token。
+    pub fn tip(&self) -> String {
+        match self.size {
+            Some((w, h)) => {
+                let tokens = claudesktop_core::image_prep::Prepared {
+                    media_type: self.media_type.clone(),
+                    bytes: Vec::new(),
+                    width: w,
+                    height: h,
+                }
+                .approx_tokens();
+                format!("{} · {w}×{h} · 约 {:.1}k token", self.name, tokens as f64 / 1000.)
+            }
+            None => self.name.to_string(),
         }
     }
 
@@ -468,6 +522,8 @@ impl PendingImage {
 pub struct QueuedPrompt {
     pub text: String,
     pub images: Vec<PendingImage>,
+    /// 聊天会话的文本附件（内容发送时才拼进去，退回输入框时还是原样）
+    pub files: Vec<claudesktop_core::attach::TextAttachment>,
 }
 
 impl QueuedPrompt {
@@ -477,17 +533,21 @@ impl QueuedPrompt {
             .into_iter()
             .map(|p| PromptImage { media_type: p.media_type, data: p.data })
             .collect();
-        UserPrompt { text: self.text, images }
+        UserPrompt { text: self.text, images, attachments: self.files }
     }
 
-    /// 队列里一行显示的文字：换行压成空格；只有图片时写「N 张图片」。
+    /// 队列里一行显示的文字：换行压成空格；只有图片时写「N 张图片」，带文件时在后面补一句。
     pub fn summary(&self) -> String {
         let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        match (text.is_empty(), self.images.len()) {
+        let mut out = match (text.is_empty(), self.images.len()) {
             (true, n) => format!("{n} 张图片"),
             (false, 0) => text,
             (false, n) => format!("{text}（附 {n} 张图片）"),
+        };
+        if !self.files.is_empty() {
+            out.push_str(&format!("（附 {} 个文件）", self.files.len()));
         }
+        out
     }
 }
 
@@ -548,7 +608,7 @@ impl ChatItem {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match self {
-            Self::User { text, images } => (0u8, text.len(), images.len()).hash(&mut h),
+            Self::User { text, images, .. } => (0u8, text.len(), images.len()).hash(&mut h),
             Self::Thinking { text, streaming, open, elapsed_ms, .. } => {
                 (1u8, text.len(), streaming, open, elapsed_ms.is_some()).hash(&mut h)
             }
@@ -757,6 +817,8 @@ pub enum FailureKind {
     Server,
     /// 404 且说的是模型：模型名写错了，或者这个 Key 用不了它
     Model,
+    /// 端点回了 400，说的是「这个模型不支持图片」（第七章 7.3：翻译成中文并记住这个模型）
+    NoVision,
     /// 其余的 404：多半是端点地址不对（少了 `/v1` 这类）
     Endpoint,
     /// 请求没发出去：连不上、超时、证书
@@ -770,6 +832,11 @@ pub enum FailureKind {
 
 impl FailureKind {
     pub fn of(message: &str) -> Self {
+        // 「这个模型看不了图片」：先把这一条认出来——它的文案里常有 multimodal 之类的词，
+        // 别的判断（如「请求本身太长」）容易被带偏
+        if claudesktop_core::image_prep::image_rejection(message) {
+            return Self::NoVision;
+        }
         // 先看状态码：5xx / 429 的响应体里也可能捎带 "context length" 字样，
         // 那会儿真正该修的是服务端或额度，不是「新开会话」
         if let Some(status) = http_status(message) {
@@ -817,6 +884,7 @@ impl FailureKind {
             Self::RateLimit => "请求太频繁或额度用完了",
             Self::Server => "模型服务出错了",
             Self::Model => "找不到这个模型",
+            Self::NoVision => "这个模型看不了图片",
             Self::Endpoint => "找不到模型服务的接口",
             Self::Network => "连不上模型服务",
             Self::Interrupted => "回复中途断开了",
@@ -840,6 +908,9 @@ impl FailureKind {
             Self::Server => "是服务端的问题，不是这个会话的错。稍后再试通常就好。",
             Self::Model => {
                 "模型名写错了，或者这个 Key 用不了它。点输入框右下角的模型名换一个，再点重试。"
+            }
+            Self::NoVision => {
+                "点输入框右下角的模型名换一个能看图的模型重发；这个模型已经记进设置，下次直接按「看不了图片」处理。"
             }
             Self::Endpoint => {
                 "端点地址多半不对（很多服务的地址以 /v1 结尾）。到设置里检查服务商的端点地址。"
@@ -948,7 +1019,10 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn queued_summary_is_one_line() {
-        let q = QueuedPrompt { text: "先别改\n  测试\n".into(), images: Vec::new() };
+        let q =
+            QueuedPrompt {
+                text: "先别改\n  测试\n".into(), images: Vec::new(), files: Vec::new()
+            };
         assert_eq!(q.summary(), "先别改 测试");
         assert_eq!(q.into_prompt(), UserPrompt::text("先别改\n  测试\n"));
     }

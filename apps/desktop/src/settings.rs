@@ -468,6 +468,9 @@ pub struct Settings {
     /// 当前空间（侧栏顶部「聊天 | 代码」）；切换即写回，下次启动回到上次那个。
     /// 默认 Code：升级后打开还是熟悉的样子
     pub space: Space,
+    /// 被端点回过 400、确认看不了图片的模型（下次直接按「看不了」处理）。
+    /// 自动记的，设置页模型那一行能看到、能清掉（万一是误判）
+    pub no_vision_models: Vec<String>,
     /// 聊天空间的一组设置（见 [`ChatSettings`]）
     pub chat: ChatSettings,
 }
@@ -585,6 +588,7 @@ impl Default for Settings {
             memory_suggest: false,
             auto_mode: AutoModeSettings::default(),
             space: Space::default(),
+            no_vision_models: Vec::new(),
             chat: ChatSettings::default(),
         }
     }
@@ -960,6 +964,8 @@ impl Settings {
         let mut config = BuiltinConfig::new(p.provider_config(), cwd);
         // 自动压缩要知道窗口多大
         config.context_windows = p.context_windows.clone().into_iter().collect();
+        // 端点回过 400 的看不了图的模型：历史里的图片换成占位，不让整个会话卡住
+        config.no_vision_models = self.no_vision_models.clone();
         config.max_steps = self.max_steps;
         config.provider.gateway = self.gateway();
         // `web_search` 的 DeepSeek 后端复用哪把 key（见 `deepseek_search_key`）

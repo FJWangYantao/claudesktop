@@ -243,6 +243,7 @@ impl Harness {
                 rules_path: None,
                 user_instructions: None,
                 context_windows,
+                no_vision_models: Vec::new(),
                 mcp_config,
                 plugins: Vec::new(),
                 max_steps,
@@ -369,7 +370,8 @@ fn streams_reasoning_text_usage_and_ends_turn() {
                 cache_read_tokens: 0
             }
         )),
-        1
+        1,
+        "一次请求报一次（以前是整轮结束时补报）"
     );
     assert_eq!(
         h.count(
@@ -568,6 +570,7 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> Reply {
             delta("content", "我先看看。"),
             format!("data: {call}"),
             finish("tool_calls"),
+            r#"data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":8}}"#.into(),
             "data: [DONE]".into(),
         ],
         gap_ms: 5,
@@ -1965,18 +1968,33 @@ fn anthropic_protocol_streams_and_runs_tools() {
 
     assert_eq!(h.text(true), "想想");
     assert_eq!(h.text(false), "文件里是 77。");
-    assert_eq!(
-        h.count(|e| matches!(
-            e,
+    // 每一步请求的用量当场报（两步各报一次），最后一次就是此刻的上下文大小
+    let usage: Vec<_> = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| match &r.event {
             KernelEvent::UsageUpdated {
-                input_tokens: 39,
-                output_tokens: 17,
-                reasoning_tokens: 0,
-                context_tokens: 35,
-                cache_read_tokens: 0
-            }
-        )),
-        1
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                context_tokens,
+                cache_read_tokens,
+            } => Some((
+                *input_tokens,
+                *output_tokens,
+                *reasoning_tokens,
+                *context_tokens,
+                *cache_read_tokens,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage,
+        [(9, 12, 0, 21, 0), (30, 5, 0, 35, 0)],
+        "每走一步报一次，最后一步的输入 + 输出就是上下文大小"
     );
     assert_eq!(
         h.count(
@@ -2019,6 +2037,7 @@ fn image_prompt_reaches_wire() {
             media_type: "image/png".into(),
             data: "QUJD".into(),
         }],
+        attachments: Vec::new(),
     };
     h.kernel.send_prompt(&sid, prompt).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
@@ -2028,6 +2047,75 @@ fn image_prompt_reaches_wire() {
     assert_eq!(content[0]["text"], "看图");
     assert_eq!(content[1]["type"], "image_url");
     assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+}
+
+/// 当前模型看不了图（能力表说的是文本型号）时，历史里的图片换成占位文字，不让整轮报错。
+#[test]
+fn images_are_omitted_for_text_only_models() {
+    let (base, bodies) = serve(vec![happy_stream("好的")]);
+    // 能力表里 deepseek-chat 是「只看文字」
+    let h = Harness::with_config(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "deepseek-chat".into(),
+            ..Default::default()
+        },
+        workdir("text-only-model"),
+    );
+    let sid = h.start();
+    let prompt = claudesktop_core::UserPrompt {
+        text: "看图".into(),
+        images: vec![claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        }],
+        attachments: Vec::new(),
+    };
+    h.kernel.send_prompt(&sid, prompt).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = body(&bodies, 0);
+    let content = &first["messages"][1]["content"];
+    // 只有文字：图片换成了占位说明，用户打的字还在
+    let text = match content {
+        serde_json::Value::String(s) => s.clone(),
+        other => other[0]["text"].as_str().unwrap_or_default().to_string(),
+    };
+    assert!(text.contains("[image omitted"), "{text}");
+    assert!(text.contains("看图"), "{text}");
+    assert!(!first.to_string().contains("image_url"), "{first}");
+}
+
+/// 能力表认不出、但端点回过 400 被界面记进名单的模型：历史里的图片同样换成占位，
+/// 不然带过图的会话之后每一轮都 400。
+#[test]
+fn images_are_omitted_for_models_marked_no_vision() {
+    let (base, bodies) = serve(vec![happy_stream("好的")]);
+    let h = Harness::with_config(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "acme-text-1".into(),
+            ..Default::default()
+        },
+        workdir("marked-no-vision"),
+    );
+    // 名单按大小写不敏感比较
+    h.kernel.set_no_vision_models(vec!["ACME-TEXT-1".into()]);
+    let sid = h.start();
+    let prompt = claudesktop_core::UserPrompt {
+        text: "看图".into(),
+        images: vec![claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        }],
+        attachments: Vec::new(),
+    };
+    h.kernel.send_prompt(&sid, prompt).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = body(&bodies, 0);
+    assert!(first.to_string().contains("[image omitted"), "{first}");
+    assert!(!first.to_string().contains("image_url"), "{first}");
 }
 
 /// Anthropic 原生协议下，图片走 `image` / `source.base64` 分段。
@@ -2073,6 +2161,7 @@ fn anthropic_image_prompt_reaches_wire() {
             media_type: "image/png".into(),
             data: "QUJD".into(),
         }],
+        attachments: Vec::new(),
     };
     h.kernel.send_prompt(&sid, prompt).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
@@ -2334,6 +2423,34 @@ fn chat_session_gets_only_web_and_memory_tools() {
     assert_eq!(second, ["memory_search", "memory_write", "memory_forget"]);
 }
 
+/// 聊天会话：带的文本附件内容内联进这一轮的用户消息（聊天没有 `read_file`）。
+#[test]
+fn chat_session_inlines_text_attachments() {
+    let (base, bodies) = serve(vec![happy_stream("看完了")]);
+    let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+    let kernel = chat_kernel(base, Arc::clone(&events), None, false);
+    kernel.new_session(1, SessionSpec { cwd: None, kind: SessionKind::Chat }).unwrap();
+    let sid = session_id(&events);
+    let prompt = UserPrompt {
+        text: "这段怎么改".into(),
+        images: Vec::new(),
+        attachments: vec![claudesktop_core::attach::TextAttachment {
+            name: "notes.md".into(),
+            path: std::path::PathBuf::from("notes.md"),
+            text: "# 标题\n正文".into(),
+        }],
+    };
+    kernel.send_prompt(&sid, prompt).unwrap();
+    wait_turn_end(&events);
+    let user = first_body(&bodies)["messages"][1]["content"].as_str().unwrap().to_string();
+    assert!(user.contains("<attachment name=\"notes.md\">"), "{user}");
+    assert!(user.contains("正文"), "{user}");
+    assert!(user.trim_end().ends_with("这段怎么改"), "{user}");
+    // 附件内容不该变成一条单独的消息
+    let count = first_body(&bodies)["messages"].as_array().unwrap().len();
+    assert_eq!(count, 2, "{}", first_body(&bodies)["messages"]);
+}
+
 /// 聊天会话：模型硬调工作目录那套工具时回错误结果，不发权限请求、不执行。
 #[test]
 fn chat_session_rejects_code_tools() {
@@ -2398,6 +2515,7 @@ fn chat_kernel(
             rules_path: None,
             user_instructions: None,
             context_windows: HashMap::new(),
+            no_vision_models: Vec::new(),
             mcp_config: None,
             plugins: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
@@ -2498,8 +2616,13 @@ fn task_runs_a_subagent_and_returns_its_report() {
     assert_eq!(h.tool_status("t1/c1").as_deref(), Some("completed"));
     assert_eq!(h.tool_status("t1").as_deref(), Some("completed"));
     assert_eq!(h.text(false), "我先看看。子任务说秘密是 42。");
-    // 子会话的用量另报一次（不带上下文大小），主会话结束时再报自己的
-    assert_eq!(h.count(|e| matches!(e, KernelEvent::UsageUpdated { context_tokens: 0, .. })), 1);
+    // 子会话每步的用量都并进主会话这一轮，但不带上下文大小（那个是主会话自己的）；
+    // 子会话走了两步（读文件、交报告），所以有两条
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::UsageUpdated { context_tokens: 0, .. })),
+        2,
+        "子会话两步的用量，不带上下文大小"
+    );
 
     // 子会话的请求：角色的系统提示词、只有清单里的工具、上下文里只有任务本身
     let child = body(&bodies, 1);
@@ -3004,6 +3127,7 @@ fn session_title_comes_from_a_second_request() {
             rules_path: None,
             user_instructions: None,
             context_windows: HashMap::new(),
+            no_vision_models: Vec::new(),
             mcp_config: None,
             plugins: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,

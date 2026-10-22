@@ -24,7 +24,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
         &[
             ("命令面板", &[PALETTE_KEY]),
             ("快捷键速查", &[SHORTCUTS_KEY]),
-            ("新会话", &[NEW_SESSION_KEY]),
+            ("在当前空间新建对话", &[NEW_SESSION_KEY]),
             ("显示 / 隐藏侧栏", &[TOGGLE_SIDEBAR_KEY]),
             ("下一个会话", &[NEXT_SESSION_KEY]),
             ("上一个会话", &[PREV_SESSION_KEY]),

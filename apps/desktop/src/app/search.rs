@@ -328,7 +328,7 @@ mod tests {
     }
 
     fn user(text: &str) -> ChatItem {
-        ChatItem::User { text: text.into(), images: Vec::new() }
+        ChatItem::User { text: text.into(), images: Vec::new(), files: Default::default() }
     }
 
     #[core::prelude::v1::test]

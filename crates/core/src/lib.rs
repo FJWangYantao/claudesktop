@@ -14,12 +14,15 @@
 
 mod acp;
 pub mod agents;
+pub mod attach;
 pub mod catalog;
 pub mod checkpoint;
 mod diff;
 pub mod git;
 pub mod history_search;
+pub mod image_prep;
 mod json_error;
+pub mod math;
 pub mod memory;
 pub mod plugin;
 pub mod plugin_git;
@@ -217,14 +220,15 @@ pub enum KernelEvent {
     FsWrite { path: String, ok: bool },
     /// 一轮对话结束（`session/prompt` 响应到达）
     TurnEnded { stop_reason: String },
-    /// 本轮 token 用量（provider 报告时才有）
+    /// 本轮 token 用量（provider 报告时才有）。自研内核每走完一步工具循环就报一次，
+    /// 跑着的时候就能看到用量和上下文在涨；ACP agent 通常只在轮末报
     UsageUpdated {
         input_tokens: u64,
         output_tokens: u64,
         /// 其中思考消耗的 token（不报告为 0）
         reasoning_tokens: u64,
-        /// 本轮最后一次请求结束时上下文里的 token（输入 + 输出），即下一轮大约要带上的量；
-        /// 0 = 不知道
+        /// 最近一次请求结束时上下文里的 token（输入 + 输出），即下一次请求大约要带上的量；
+        /// 0 = 这次不更新（压缩、子会话的用量只并进累计）
         #[serde(default)]
         context_tokens: u64,
         /// 本轮输入里命中提示缓存的部分（包含在 `input_tokens` 里；不报告为 0）
@@ -502,21 +506,23 @@ pub struct PromptImage {
     pub data: String,
 }
 
-/// 一条用户提示词：文本 + 可选图片附件。
+/// 一条用户提示词：文本 + 可选图片附件 + 聊天的文本附件（内容内联进 `text`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserPrompt {
     pub text: String,
     pub images: Vec<PromptImage>,
+    /// 聊天会话带的文本文件（内容拼进 `text`，见 [`attach::compose`]）；代码会话恒为空
+    pub attachments: Vec<attach::TextAttachment>,
 }
 
 impl UserPrompt {
     /// 纯文本提示词。
     pub fn text(text: impl Into<String>) -> Self {
-        Self { text: text.into(), images: Vec::new() }
+        Self { text: text.into(), images: Vec::new(), attachments: Vec::new() }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty() && self.images.is_empty()
+        self.text.trim().is_empty() && self.images.is_empty() && self.attachments.is_empty()
     }
 }
 
@@ -627,6 +633,11 @@ pub trait Kernel: Send + Sync {
     /// 更新各模型的上下文窗口（模型 ID → token；界面取到模型列表后推过来，自动压缩用）。默认忽略。
     fn set_context_windows(&self, windows: std::collections::HashMap<String, u64>) {
         let _ = windows;
+    }
+    /// 更新「看不了图片」的模型名单（端点回过 400 的，界面记在设置里推过来）：
+    /// 这些模型的请求里历史图片换成文字占位。默认忽略。
+    fn set_no_vision_models(&self, models: Vec<String>) {
+        let _ = models;
     }
     /// 把某会话较早的对话压缩成摘要（手动压缩，会话空闲时）：经 `Compacting` →
     /// `Compacted` / `CompactFailed` → `TurnEnded` 回报。默认不支持。
