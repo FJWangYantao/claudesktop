@@ -2636,6 +2636,8 @@ fn task_runs_a_subagent_and_returns_its_report() {
     // ——工作目录落在某个仓库里时就会读到它
     let harness = system.split("# User and project instructions").next().unwrap();
     assert!(!harness.contains("todo_write"), "{harness}");
+    // 派子任务的指引只给主会话（子会话没有 task 工具）
+    assert!(!harness.contains("Delegate with the task tool"), "{harness}");
     assert_eq!(msgs.len(), 2);
     assert!(msgs[1]["content"].to_string().contains("Find the secret"));
     assert_eq!(tool_names(&child), ["read_file", "grep"]);
@@ -2643,7 +2645,13 @@ fn task_runs_a_subagent_and_returns_its_report() {
     let main = body(&bodies, 0);
     let task = main["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "task");
     let task_doc = task.unwrap()["function"]["description"].as_str().unwrap();
-    assert!(task_doc.contains("- scout: finds things") && task_doc.contains("- general-purpose:"));
+    assert!(
+        task_doc.contains("- scout: finds things")
+            && task_doc.contains("- general-purpose:")
+            && task_doc.contains("- explore:")
+    );
+    let main_system = main["messages"][0]["content"].as_str().unwrap();
+    assert!(main_system.contains("Delegate with the task tool"), "{main_system}");
     // 报告作为 task 的结果回给主模型
     let last = body(&bodies, 3);
     let result = last["messages"].as_array().unwrap().last().unwrap();
