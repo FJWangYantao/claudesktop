@@ -23,14 +23,12 @@ fn registry() -> &'static Mutex<HashMap<String, &'static [u8]>> {
 ///
 /// 内存只留一份：同一段公式在整段会话里只占一次（排版缓存命中时哈希也一样）。
 pub fn register_math(svg: &str) {
-    let name = math_name(svg);
+    // 表里按去掉 `math/` 前缀的名字存（`load` 也是去掉前缀再查）
+    let name = crate::app::math::hash_of(svg);
     let mut map = registry().lock().unwrap();
-    if !map.contains_key(&name) {
-        // 一次性泄漏一小块静态缓冲：资源源要求 'static，生命周期跟着进程走
-        //（和 gpui-kit 内嵌的图标一个路子）
-        let bytes: &'static [u8] = Box::leak(svg.as_bytes().to_vec().into_boxed_slice());
-        map.insert(name, bytes);
-    }
+    // 一次性泄漏一小块静态缓冲：资源源要求 'static，生命周期跟着进程走
+    //（和 gpui-kit 内嵌的图标一个路子）
+    map.entry(name).or_insert_with(|| Box::leak(svg.as_bytes().to_vec().into_boxed_slice()));
 }
 
 /// 一份公式 SVG 的资源名。

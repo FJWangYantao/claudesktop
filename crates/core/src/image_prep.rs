@@ -187,7 +187,7 @@ fn shrink(image: image::DynamicImage, quality: Quality) -> image::DynamicImage {
             ((f64::from(w) * scale) as u32, (f64::from(h) * scale) as u32)
         }
         Quality::Original => {
-            let scale = 8_000. as f64 / f64::from(w.max(h));
+            let scale = 8_000_f64 / f64::from(w.max(h));
             ((f64::from(w) * scale) as u32, (f64::from(h) * scale) as u32)
         }
     };

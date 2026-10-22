@@ -417,6 +417,14 @@ impl ChatApp {
         }
     }
 
+    /// 把「看不了图片」的模型名单交给已经起来的内核（没起来的启动时从设置带上）。
+    pub(crate) fn push_no_vision_models(&self) {
+        let models = self.settings.no_vision_models.clone();
+        for kernel in self.kernels.iter().filter_map(|(_, k)| k.kernel.as_ref()) {
+            kernel.set_no_vision_models(models.clone());
+        }
+    }
+
     /// 按设置（或系统外观）切浅色 / 深色：我们自己的色板和 gpui-kit 组件（输入框、提示、滚动条）一起切。
     pub(crate) fn apply_appearance(&mut self, window: &Window, cx: &mut Context<Self>) {
         let dark = match self.settings.appearance {
@@ -1839,6 +1847,7 @@ impl ChatApp {
                                     move |s| s.no_vision_models.retain(|m| *m != gone),
                                     cx,
                                 );
+                                this.push_no_vision_models();
                                 cx.notify();
                             })),
                     ),

@@ -964,6 +964,8 @@ impl Settings {
         let mut config = BuiltinConfig::new(p.provider_config(), cwd);
         // 自动压缩要知道窗口多大
         config.context_windows = p.context_windows.clone().into_iter().collect();
+        // 端点回过 400 的看不了图的模型：历史里的图片换成占位，不让整个会话卡住
+        config.no_vision_models = self.no_vision_models.clone();
         config.max_steps = self.max_steps;
         config.provider.gateway = self.gateway();
         // `web_search` 的 DeepSeek 后端复用哪把 key（见 `deepseek_search_key`）

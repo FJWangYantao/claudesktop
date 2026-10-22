@@ -457,10 +457,11 @@ impl PendingImage {
         prepared: &claudesktop_core::image_prep::Prepared,
     ) -> Self {
         use base64::Engine as _;
-        let format = if prepared.media_type == "image/png" {
-            gpui_kit::ImageFormat::Png
-        } else {
-            gpui_kit::ImageFormat::Jpeg
+        // 小动图原样保留（`image/gif`），其余重编码成 PNG / JPEG
+        let format = match prepared.media_type.as_str() {
+            "image/png" => gpui_kit::ImageFormat::Png,
+            "image/gif" => gpui_kit::ImageFormat::Gif,
+            _ => gpui_kit::ImageFormat::Jpeg,
         };
         Self {
             name,

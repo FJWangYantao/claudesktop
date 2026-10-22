@@ -86,16 +86,20 @@ pub fn typeset(latex: &str, display: bool) -> Result<Typeset, MathError> {
     out
 }
 
-fn cache() -> &'static Mutex<HashMap<(String, bool), Result<Typeset, MathError>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, bool), Result<Typeset, MathError>>>> =
-        OnceLock::new();
+/// 排版缓存：（源码, 是不是块公式）→ 结果
+type Cache = Mutex<HashMap<(String, bool), Result<Typeset, MathError>>>;
+
+fn cache() -> &'static Cache {
+    static CACHE: OnceLock<Cache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn typeset_uncached(latex: &str, display: bool) -> Result<Typeset, MathError> {
     let ast = parse_latex(latex).map_err(|e| MathError::new(e.message))?;
-    let mut options = LayoutOptions::default();
-    options.style = if display { MathStyle::Display } else { MathStyle::Text };
+    let options = LayoutOptions {
+        style: if display { MathStyle::Display } else { MathStyle::Text },
+        ..LayoutOptions::default()
+    };
     let root = layout(&ast, &options);
     // 几百行的矩阵这种：超了就不画，交回源码
     validate_layout(&root).map_err(MathError::new)?;
@@ -187,11 +191,11 @@ pub fn normalize_markup(text: &str) -> std::borrow::Cow<'_, str> {
             continue;
         }
         // \( … \) → $…$
-        if rest.starts_with("\\(") {
-            match rest[2..].find("\\)") {
+        if let Some(inner) = rest.strip_prefix("\\(") {
+            match inner.find("\\)") {
                 Some(at) => {
                     out.push('$');
-                    out.push_str(&rest[2..2 + at]);
+                    out.push_str(&inner[..at]);
                     out.push('$');
                     i += 2 + at + 2;
                 }
@@ -203,10 +207,10 @@ pub fn normalize_markup(text: &str) -> std::borrow::Cow<'_, str> {
             continue;
         }
         // \[ … \] → $$ … $$（前后补空行，保证是块）
-        if rest.starts_with("\\[") {
-            match rest[2..].find("\\]") {
+        if let Some(inner) = rest.strip_prefix("\\[") {
+            match inner.find("\\]") {
                 Some(at) => {
-                    let body = rest[2..2 + at].trim();
+                    let body = inner[..at].trim();
                     push_block(&mut out, body);
                     i += 2 + at + 2;
                 }
@@ -218,17 +222,16 @@ pub fn normalize_markup(text: &str) -> std::borrow::Cow<'_, str> {
             continue;
         }
         // 裸的显示环境：包进 $$
-        if rest.starts_with("\\begin{") {
-            if let Some((env, after)) = begin_env(&text[i..limit], 0) {
-                if DISPLAY_ENVS.contains(&env.as_str()) {
-                    let end_tag = format!("\\end{{{env}}}");
-                    if let Some(at) = text[after..limit].find(&end_tag) {
-                        let body = &text[i..after + at + end_tag.len()];
-                        push_block(&mut out, body);
-                        i = after + at + end_tag.len();
-                        continue;
-                    }
-                }
+        if rest.starts_with("\\begin{")
+            && let Some((env, after)) = begin_env(&text[..limit], i)
+            && DISPLAY_ENVS.contains(&env.as_str())
+        {
+            let end_tag = format!("\\end{{{env}}}");
+            if let Some(at) = text[after..limit].find(&end_tag) {
+                let body = &text[i..after + at + end_tag.len()];
+                push_block(&mut out, body);
+                i = after + at + end_tag.len();
+                continue;
             }
         }
         out.push(next);
@@ -438,6 +441,10 @@ mod tests {
         // 行内的 aligned（不是显示环境）不包
         let inline = normalize_markup("$\\begin{aligned}a&=b\\end{aligned}$");
         assert_eq!(inline, "$\\begin{aligned}a&=b\\end{aligned}$");
+        // 环境前面有正文时同样整段包进去（不能从环境中间截断）
+        let after_text = normalize_markup("推导如下：\n\\begin{align}\na &= b\n\\end{align}\n完");
+        assert!(after_text.contains("$$\n\\begin{align}"), "{after_text}");
+        assert!(after_text.contains("\\end{align}\n$$"), "{after_text}");
     }
 
     #[test]

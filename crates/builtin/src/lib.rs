@@ -136,6 +136,8 @@ pub struct BuiltinConfig {
     /// 端点报告的上下文窗口（模型 ID → token）：用量快到窗口时自动压缩；
     /// 查不到窗口的模型只在端点报「超出上下文」后压缩
     pub context_windows: HashMap<String, u64>,
+    /// 端点回过 400、确认看不了图片的模型（之后经 `set_no_vision_models` 更新）
+    pub no_vision_models: Vec<String>,
     /// MCP 服务器配置文件（默认数据目录的 `mcp.json`）；None = 不接 MCP
     pub mcp_config: Option<PathBuf>,
     /// 启用的插件（之后经 `Kernel::set_plugins` 更新）
@@ -169,6 +171,7 @@ impl BuiltinConfig {
             rules_path: default_rules_path(),
             user_instructions: instructions::default_user_file(),
             context_windows: HashMap::new(),
+            no_vision_models: Vec::new(),
             mcp_config: default_mcp_config(),
             plugins: Vec::new(),
             max_steps: DEFAULT_MAX_STEPS,
@@ -365,6 +368,8 @@ struct Inner {
     session_titles: bool,
     /// 见 [`BuiltinConfig::context_windows`]；界面取到模型列表后经 `set_context_windows` 更新
     context_windows: Mutex<HashMap<String, u64>>,
+    /// 见 [`BuiltinConfig::no_vision_models`]
+    no_vision_models: Mutex<Vec<String>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     next_session: AtomicU64,
     rules: Mutex<PermissionRules>,
@@ -539,9 +544,12 @@ impl Inner {
         sessions.get(session).is_some_and(|s| s.kind == SessionKind::Chat)
     }
 
-    /// 这个模型能不能看图片（能力表 + 端点报过的 `input_modalities`）。
-    /// `Some(false)` 时请求里的图片换成占位文字（见设计说明 7.3）。
+    /// 这个模型看不了图片吗（能力表说只吃文字，或端点回过 400、界面记进了名单）。
+    /// 是的话请求里的图片换成占位文字（见设计说明 7.3）。
     fn model_blind_to_images(&self, model: &str) -> bool {
+        if self.no_vision_models.lock().unwrap().iter().any(|m| m.eq_ignore_ascii_case(model)) {
+            return true;
+        }
         // 能力表（`image_prep::vision_support`，和思考档位一个写法）：认得出才算数
         claudesktop_core::image_prep::vision_support(
             match self.provider_config.protocol {
@@ -2125,6 +2133,7 @@ impl BuiltinKernel {
             max_steps,
             session_titles: config.session_titles,
             context_windows: Mutex::new(config.context_windows),
+            no_vision_models: Mutex::new(config.no_vision_models),
             sessions: Mutex::default(),
             next_session: AtomicU64::new(1),
             rules: Mutex::new(PermissionRules::load(config.rules_path)),
@@ -3004,6 +3013,10 @@ impl Kernel for BuiltinKernel {
 
     fn set_context_windows(&self, windows: HashMap<String, u64>) {
         *self.inner.context_windows.lock().unwrap() = windows;
+    }
+
+    fn set_no_vision_models(&self, models: Vec<String>) {
+        *self.inner.no_vision_models.lock().unwrap() = models;
     }
 
     /// 会话级思考档位：存进会话状态，之后每轮请求现取（见 `run_steps`）。

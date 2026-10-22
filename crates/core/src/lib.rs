@@ -633,6 +633,11 @@ pub trait Kernel: Send + Sync {
     fn set_context_windows(&self, windows: std::collections::HashMap<String, u64>) {
         let _ = windows;
     }
+    /// 更新「看不了图片」的模型名单（端点回过 400 的，界面记在设置里推过来）：
+    /// 这些模型的请求里历史图片换成文字占位。默认忽略。
+    fn set_no_vision_models(&self, models: Vec<String>) {
+        let _ = models;
+    }
     /// 把某会话较早的对话压缩成摘要（手动压缩，会话空闲时）：经 `Compacting` →
     /// `Compacted` / `CompactFailed` → `TurnEnded` 回报。默认不支持。
     fn compact(&self, session: &str) -> anyhow::Result<()> {

@@ -243,6 +243,7 @@ impl Harness {
                 rules_path: None,
                 user_instructions: None,
                 context_windows,
+                no_vision_models: Vec::new(),
                 mcp_config,
                 plugins: Vec::new(),
                 max_steps,
@@ -2068,6 +2069,38 @@ fn images_are_omitted_for_text_only_models() {
     assert!(!first.to_string().contains("image_url"), "{first}");
 }
 
+/// 能力表认不出、但端点回过 400 被界面记进名单的模型：历史里的图片同样换成占位，
+/// 不然带过图的会话之后每一轮都 400。
+#[test]
+fn images_are_omitted_for_models_marked_no_vision() {
+    let (base, bodies) = serve(vec![happy_stream("好的")]);
+    let h = Harness::with_config(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "acme-text-1".into(),
+            ..Default::default()
+        },
+        workdir("marked-no-vision"),
+    );
+    // 名单按大小写不敏感比较
+    h.kernel.set_no_vision_models(vec!["ACME-TEXT-1".into()]);
+    let sid = h.start();
+    let prompt = claudesktop_core::UserPrompt {
+        text: "看图".into(),
+        images: vec![claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        }],
+        attachments: Vec::new(),
+    };
+    h.kernel.send_prompt(&sid, prompt).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let first = body(&bodies, 0);
+    assert!(first.to_string().contains("[image omitted"), "{first}");
+    assert!(!first.to_string().contains("image_url"), "{first}");
+}
+
 /// Anthropic 原生协议下，图片走 `image` / `source.base64` 分段。
 #[test]
 fn anthropic_image_prompt_reaches_wire() {
@@ -2465,6 +2498,7 @@ fn chat_kernel(
             rules_path: None,
             user_instructions: None,
             context_windows: HashMap::new(),
+            no_vision_models: Vec::new(),
             mcp_config: None,
             plugins: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
@@ -3071,6 +3105,7 @@ fn session_title_comes_from_a_second_request() {
             rules_path: None,
             user_instructions: None,
             context_windows: HashMap::new(),
+            no_vision_models: Vec::new(),
             mcp_config: None,
             plugins: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,

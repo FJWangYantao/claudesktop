@@ -2216,10 +2216,15 @@ impl ChatApp {
                     {
                         let model = self.sessions[idx].model_label.to_string();
                         if !model.is_empty()
-                            && !self.settings.no_vision_models.iter().any(|m| *m == model)
+                            && !self
+                                .settings
+                                .no_vision_models
+                                .iter()
+                                .any(|m| m.eq_ignore_ascii_case(&model))
                         {
                             let record = model.clone();
                             self.save_ui_pref(move |s| s.no_vision_models.push(record.clone()), cx);
+                            self.push_no_vision_models();
                         }
                     }
                     // 网关又记了请求：用量页的费用、请求跟着刷新（不用等这一轮跑完再手动重读）

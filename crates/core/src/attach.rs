@@ -133,11 +133,7 @@ pub fn compose(user_text: &str, attachments: &[TextAttachment]) -> String {
             out.push('\n');
         }
         // 名字里的引号 / 尖括号会把标签弄坏，换成近似的全角（文件名照原样在界面上显示）
-        let name = a
-            .name
-            .replace('"', "＂")
-            .replace('<', "＜")
-            .replace('>', "＞");
+        let name = a.name.replace('"', "＂").replace('<', "＜").replace('>', "＞");
         out.push_str(&format!("<attachment name=\"{name}\">\n{}\n</attachment>\n", a.text));
     }
     if !user_text.trim().is_empty() {
@@ -156,7 +152,8 @@ pub fn display_text(user_text: &str, attachments: &[TextAttachment]) -> String {
     let names = attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
     let text = user_text.trim();
     match text.is_empty() {
-        true => names.join("、"),
+        // 只有附件时也带 📎：`strip_display` 靠它认出这一行不是用户打的字
+        true => format!("📎 {}", names.join("、")),
         false => format!("{text}\n\n📎 {}", names.join("、")),
     }
 }
@@ -166,6 +163,8 @@ pub fn display_text(user_text: &str, attachments: &[TextAttachment]) -> String {
 pub fn strip_display(shown: &str) -> &str {
     match shown.rfind("\n\n📎 ") {
         Some(at) => &shown[..at],
+        // 只有附件、没打字
+        None if shown.starts_with("📎 ") => "",
         None => shown,
     }
 }
@@ -278,7 +277,7 @@ mod tests {
     fn display_text_lists_names_after_the_text() {
         let a = keep("x");
         assert_eq!(display_text("看这个", std::slice::from_ref(&a)), "看这个\n\n📎 notes.md");
-        assert_eq!(display_text("  ", std::slice::from_ref(&a)), "notes.md");
+        assert_eq!(display_text("  ", std::slice::from_ref(&a)), "📎 notes.md");
         // 没有附件时原样（不 trim）
         assert_eq!(display_text("看这个\n", &[]), "看这个\n");
         let mut b = keep("y");
