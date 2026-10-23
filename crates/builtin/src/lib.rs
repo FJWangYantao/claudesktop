@@ -636,7 +636,7 @@ impl Inner {
         let mut user = String::new();
         let mut reply = String::new();
         for message in state.history.iter().rev() {
-            if message.role == "user" {
+            if message.is_user_turn() {
                 user = message_text(message);
                 break;
             }
@@ -1500,8 +1500,16 @@ impl Inner {
                 .count()
                 .min(PARALLEL_TOOLS);
             if n < 2 {
-                outputs.push(self.run_tool(session, cwd, &rest[0], stopped));
+                let output = self.run_tool(session, cwd, &rest[0], stopped);
+                let halt = output.stop_turn;
+                outputs.push(output);
                 rest = &rest[1..];
+                // 用户在提问卡片上选了「自己说」/ 取消：同一步后面的调用不再执行，
+                // 只补上结果（tool_calls 后面必须跟着对应的 tool 消息）
+                if halt {
+                    outputs.extend(rest.iter().map(|call| self.skip_tool(session, call)));
+                    break;
+                }
             } else {
                 let (group, tail) = rest.split_at(n);
                 // 先按顺序报出全部工具行，界面上的顺序和模型的调用顺序一致
@@ -1531,6 +1539,32 @@ impl Inner {
             }
         }
         Some(outputs)
+    }
+
+    /// 用户叫停后没执行的调用：报一行失败的工具（续接时历史里也有它的结果），回给模型说明原因。
+    fn skip_tool(&self, session: &str, call: &ToolCall) -> ToolOutput {
+        let content = "Not executed: the user stopped this turn at your question.";
+        self.emit(
+            Some(session),
+            KernelEvent::ToolCallStarted {
+                id: call.id.clone(),
+                title: call.function.name.clone(),
+                status: "failed".into(),
+                kind: "other".into(),
+                parent: None,
+            },
+        );
+        self.emit(
+            Some(session),
+            KernelEvent::ToolCallUpdated {
+                id: call.id.clone(),
+                title: None,
+                status: Some("failed".into()),
+                raw_output: Some("用户停在了提问，未执行".into()),
+                output: Some(claudesktop_core::output_preview(content)),
+            },
+        );
+        ToolOutput::fail(content, "用户停在了提问，未执行")
     }
 
     /// 解析调用并报出工具行（改动类先带上 diff 预览）。
@@ -1913,7 +1947,7 @@ impl Inner {
                 if access == Access::Edit && action.inside(cwd) {
                     return Verdict::Allow;
                 }
-                // 明显只读的命令（`ls`、`git status`、`cargo test` 这类白名单，见
+                // 明显只读的命令（`ls`、`git status`、`rg` 这类白名单，见
                 // `tools::reads_only`）直接放行：不调分类器、不计入拒绝计数，
                 // 和 `Action::Read` 的待遇一样只是走的是命令那条路
                 if let Action::Shell { command, .. } | Action::ShellBackground { command, .. } =
@@ -2574,8 +2608,8 @@ fn prompt_sections(
     let mut sections: Vec<(&'static str, String)> = Vec::new();
     // 子会话没有待办清单（计划是主会话的），也不能再派子任务
     let todo = if agent.is_none() {
-        "For tasks with several steps, track progress with todo_write and keep it current: \
-         mark each item completed as soon as it is done. "
+        "For tasks with several steps, track progress with todo_write (find it with tool_search \
+         first) and keep it current: mark each item completed as soon as it is done. "
     } else {
         ""
     };
@@ -2650,8 +2684,9 @@ fn prompt_sections(
             .to_string();
         if agent.is_none() {
             text.push_str(
-                " When helpful, consult `explore` subagents to map parts of the codebase you have \
-                 not seen yet, and build the plan on their findings.",
+                " When helpful, consult `explore` subagents (the task tool, found with tool_search) \
+                 to map parts of the codebase you have not seen yet, and build the plan on their \
+                 findings.",
             );
         }
         sections.push(("plan", text));
@@ -3182,7 +3217,9 @@ fn images_as_user_message(
         "Image(s) returned by the tool calls above ({model} can read images):"
     ))];
     parts.extend(images);
-    vec![ChatMessage::with_parts("user", parts)]
+    let mut message = ChatMessage::with_parts("user", parts);
+    message.tool_images = true;
+    vec![message]
 }
 
 /// 一条消息里的文字部分（给钩子看用户说了什么）。
@@ -3441,6 +3478,8 @@ impl Kernel for BuiltinKernel {
         state.user_messages = recent_user_messages(rebuilt.user_messages);
         // 清单回到回退点那时的样子
         state.todos = rebuilt.todos;
+        // 回退掉的轮次里 `tool_search` 加载的工具也撤掉，和重启后续接看到的一致
+        state.loaded_tools = rebuilt.loaded_tools;
         state.steps_since_todo = 0;
         state.restored = true;
         state.measured = None;

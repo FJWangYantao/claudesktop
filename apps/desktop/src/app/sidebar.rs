@@ -319,9 +319,7 @@ impl ChatApp {
             .now
             .iter()
             .filter(|spot| {
-                self.sessions
-                    .iter()
-                    .any(|s| s.token == spot.token && s.busy && !s.waiting_user())
+                self.sessions.iter().any(|s| s.token == spot.token && s.busy && !s.waiting_user())
             })
             .map(|spot| {
                 let (b, clip) = (spot.bounds, spot.clip);

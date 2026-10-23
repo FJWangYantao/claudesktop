@@ -81,8 +81,8 @@ pub struct Rebuilt {
     pub user_messages: Vec<String>,
     /// 最后一次的待办清单（回退掉的不算；压缩前写的也算）
     pub todos: Vec<PlanEntryView>,
-    /// 内核通过 `tool_search` 额外声明给模型的工具（见 `Record::ToolLoadout`）。
-    /// 骨架阶段恒为空；阶段 2 填上之后，续接的会话才不会丢掉加载过的工具。
+    /// 内核通过 `tool_search` 额外声明给模型的工具（见 `Record::ToolLoadout`；回退掉的不算）。
+    /// 续接和回退都拿它恢复，加载过的工具才不会丢、回退掉的才不会留着。
     pub loaded_tools: Vec<String>,
 }
 
@@ -192,9 +192,12 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
                     None => "问了一下".to_string(),
                 };
                 if let Some((_, status, output)) = assistant.tool(&key) {
+                    // 和实时一致（`Inner::ask_user`）：选了 / 让模型定算成功，自己说 / 取消算失败
                     *status = match answer {
-                        QuestionAnswer::Choices { .. } => "completed".into(),
-                        _ => "failed".into(),
+                        QuestionAnswer::Choices { .. } | QuestionAnswer::ModelDecides => {
+                            "completed".into()
+                        }
+                        QuestionAnswer::SelfAnswer | QuestionAnswer::Cancelled => "failed".into(),
                     };
                     *output = summary;
                 }
@@ -314,6 +317,40 @@ mod tests {
                 "user:算了",
             ]
         );
+    }
+
+    /// 提问的结果续接后和实时一致：「你来定」算成功（模型照常往下做），「自己说」算失败
+    #[test]
+    fn question_answers_rebuild_with_the_live_status() {
+        let asked = |id: u64| {
+            ev(KernelEvent::UserQuestion {
+                id,
+                tool: None,
+                questions: vec![QuestionView {
+                    question: "走哪条？".into(),
+                    header: None,
+                    options: vec![claudesktop_core::QuestionOptionView {
+                        label: "重写".into(),
+                        description: None,
+                    }],
+                }],
+            })
+        };
+        let records = vec![
+            Record::user("改一下"),
+            asked(1),
+            Record::QuestionAnswered { id: 1, answer: QuestionAnswer::ModelDecides },
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+            Record::user("再改"),
+            asked(2),
+            Record::QuestionAnswered { id: 2, answer: QuestionAnswer::SelfAnswer },
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+        ];
+        let msgs = rebuild(&records).messages;
+        let assistant: Vec<_> =
+            msgs.iter().filter(|m| m.role == "assistant").map(|m| m.text().unwrap()).collect();
+        assert!(assistant[0].starts_with("[tool] ask_user → completed"), "{assistant:?}");
+        assert!(assistant[1].starts_with("[tool] ask_user → failed"), "{assistant:?}");
     }
 
     #[test]

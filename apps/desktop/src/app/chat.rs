@@ -107,9 +107,7 @@ pub(super) fn save_image(image: ImageView, window: &mut Window, cx: &mut App) {
             }
             Err(err) => (None, format!("读不了这张图：{err}")),
         },
-        ImageView::Memory { bytes, ext, .. } => {
-            (Some(bytes.to_vec()), format!("tool-image.{ext}"))
-        }
+        ImageView::Memory { bytes, ext, .. } => (Some(bytes.to_vec()), format!("tool-image.{ext}")),
         ImageView::Remote(url) => {
             // 扩展名按取回的实际格式（登记名 `remote/<哈希>.jpg` 的尾巴），别一律写 .png
             let ext = super::remote_image::registered_name(url)

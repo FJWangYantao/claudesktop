@@ -901,6 +901,9 @@ pub struct ChatMessage {
     /// 开了思考预算时，工具循环里回传的 assistant 消息必须以它们开头。只有原生 Anthropic
     /// 协议发回去，别的协议序列化时忽略；不进日志（续接后没有，也不需要）。
     pub thinking: Vec<Value>,
+    /// 代工具发图片的 user 消息（OpenAI 兼容协议的 `role: tool` 带不了图，见
+    /// `images_as_user_message`）：不是用户说的话，找「这一轮从哪开始」时要跳过它
+    pub tool_images: bool,
 }
 
 impl ChatMessage {
@@ -915,7 +918,13 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             thinking: Vec::new(),
+            tool_images: false,
         }
+    }
+
+    /// 用户说的话（一轮的开头）：role 是 user，且不是代工具发图片的那种
+    pub fn is_user_turn(&self) -> bool {
+        self.role == "user" && !self.tool_images
     }
 
     /// 带工具调用的 assistant 消息（`text` 为同一步里模型说的话，可为空）

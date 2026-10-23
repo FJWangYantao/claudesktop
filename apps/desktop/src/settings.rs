@@ -1216,9 +1216,11 @@ mod tests {
         assert_eq!(ThemeChoice::parse("pure"), Some(ThemeChoice::Pure));
         assert_eq!(ThemeChoice::parse("nope"), None);
         // 新加的配色也走一遍 key 往返（顺序和 `theme::PALETTES` 对齐）
-        for (t, key) in
-            [(ThemeChoice::Github, "github"), (ThemeChoice::Pure, "pure"), (ThemeChoice::Lavender, "lavender")]
-        {
+        for (t, key) in [
+            (ThemeChoice::Github, "github"),
+            (ThemeChoice::Pure, "pure"),
+            (ThemeChoice::Lavender, "lavender"),
+        ] {
             assert_eq!(ThemeChoice::parse(key), Some(t));
             let s = Settings { theme: t, ..Default::default() };
             s.save(&path).unwrap();

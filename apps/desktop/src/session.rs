@@ -506,9 +506,13 @@ impl Session {
                             &mut s.transcript[at]
                     {
                         *picks = match &answer {
-                            claudesktop_core::QuestionAnswer::Choices { choices } => choices
+                            // 第 i 项是第 i 题选的选项下标：按那题的选项数校验
+                            claudesktop_core::QuestionAnswer::Choices { choices } => questions
                                 .iter()
-                                .map(|n| (*n < questions.len()).then_some(*n))
+                                .enumerate()
+                                .map(|(i, q)| {
+                                    choices.get(i).copied().filter(|n| *n < q.options.len())
+                                })
                                 .collect(),
                             _ => vec![None; questions.len()],
                         };
@@ -1614,7 +1618,7 @@ impl Session {
                 if let Some(card) = self.tool_card(&id) {
                     card.images = images
                         .iter()
-                        .filter_map(|image| thumb_from_prompt_image(image))
+                        .filter_map(thumb_from_prompt_image)
                         .collect();
                 }
             }
@@ -1671,11 +1675,11 @@ impl Session {
                     keep: None,
                 });
             }
-            KernelEvent::UserQuestion { id, tool, questions } => {
+            // 事件里的 `tool`（触发它的调用 ID）界面不用：提问不占工具行
+            KernelEvent::UserQuestion { id, questions, .. } => {
                 self.finish_thinking();
                 self.transcript.push(ChatItem::Question {
                     id,
-                    tool,
                     picks: vec![None; questions.len()],
                     questions,
                     answer: None,
@@ -1950,6 +1954,7 @@ mod tests {
             expanded: false,
             task: false,
             grant: None,
+            images: Vec::new(),
         };
         let tool = ChatItem::Tool(card);
         let row = PlanRow { status: PlanStatus::Pending, text: "第一步".into() };
@@ -1990,6 +1995,7 @@ mod tests {
                 expanded: false,
                 task: false,
                 grant: None,
+                images: Vec::new(),
             })
         };
         s.transcript = vec![
@@ -2432,6 +2438,7 @@ mod tests {
             expanded: false,
             task: false,
             grant: None,
+            images: Vec::new(),
         }));
         // 用户停下：等内核回结束，期间工具行不该一直转圈
         s.busy = false;

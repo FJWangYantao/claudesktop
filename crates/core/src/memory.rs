@@ -499,8 +499,8 @@ pub fn prompt_section(project: &[Entry], global: &[Entry]) -> Option<String> {
     if missed > 0 {
         // 预算装不下的那些不是没了：告诉模型还能找回来（不然它会以为只记着上面几条）
         out.push_str(&format!(
-            "\n{missed} more notes did not fit here; use `memory_search` to look them up when the \
-             topic comes up."
+            "\n{missed} more notes did not fit here; use `memory_search` (find it with \
+             `tool_search` if it is not among your tools) to look them up when the topic comes up."
         ));
     }
     Some(out.trim_end().to_string())

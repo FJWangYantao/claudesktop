@@ -486,6 +486,7 @@ mod tests {
             expanded: false,
             task: true,
             grant: None,
+            images: Vec::new(),
         }
     }
 

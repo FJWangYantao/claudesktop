@@ -1110,12 +1110,18 @@ pub fn parse_tool_search(arguments: &str) -> Result<String, String> {
 /// （命中名字 +5、命中说明 +1，大小写不敏感，按非字母数字分词），按分数降序取前
 /// [`SEARCH_MAX`] 个；一条都不命中返回空 vec（调用方回一句「换个说法」）。
 ///
+/// 按词比，不按子串：`a`、`in` 这类子串几乎哪条说明里都有，按子串算会让每个候选都得分，
+/// 一次把 8 个不相干的工具永久加载进会话。query 里的虚词（[`SEARCH_STOP_WORDS`]）和单个字母不算；
+/// 前缀也算命中（`command` 对上 `commands`，`todos` 对上 `todo`）。非 ASCII 的词（中文）没有空格
+/// 可分，照旧按子串比。
+///
 /// 语料就是工具定义本身（名字 + description），不另维护一份描述。
 pub fn search(query: &str, candidates: &[(String, String)]) -> Vec<String> {
     let words: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
+        .filter(|word| !(word.is_ascii() && word.len() < 2))
+        .filter(|word| !SEARCH_STOP_WORDS.contains(&word.as_str()))
         .collect();
     let mut scored: Vec<(usize, &str)> = Vec::new();
     for (name, description) in candidates {
@@ -1123,10 +1129,10 @@ pub fn search(query: &str, candidates: &[(String, String)]) -> Vec<String> {
         let lower_description = description.to_lowercase();
         let mut score = 0usize;
         for word in &words {
-            if lower_name.contains(word.as_str()) {
+            if word_hits(word, &lower_name) {
                 score += 5;
             }
-            if lower_description.contains(word.as_str()) {
+            if word_hits(word, &lower_description) {
                 score += 1;
             }
         }
@@ -1135,7 +1141,7 @@ pub fn search(query: &str, candidates: &[(String, String)]) -> Vec<String> {
         }
     }
     // 稳定排序：同分时保持候选顺序（= specs 里的顺序）
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
     let mut names: Vec<String> =
         scored.into_iter().take(SEARCH_MAX).map(|(_, name)| name.to_string()).collect();
     // `shell` 的三个配套工具是一套：搜到其中一个就把三个一起给。只拿到 `shell_background`
@@ -1149,6 +1155,23 @@ pub fn search(query: &str, candidates: &[(String, String)]) -> Vec<String> {
         }
     }
     names
+}
+
+/// `tool_search` 里不算数的词：哪条说明里都有，算进去只会给每个候选加分。
+const SEARCH_STOP_WORDS: &[&str] = &[
+    "an", "the", "in", "on", "of", "to", "for", "and", "or", "with", "from", "by", "at", "into",
+    "is", "are", "be", "it", "its", "my", "me", "do", "can", "how", "what", "want", "need", "some",
+    "this", "that", "use", "using", "tool", "tools",
+];
+
+/// `word` 在 `text`（已转小写）里算不算命中：ASCII 词按词比（前缀也算，见 [`search`]），
+/// 非 ASCII 的按子串比。
+fn word_hits(word: &str, text: &str) -> bool {
+    if !word.is_ascii() {
+        return text.contains(word);
+    }
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|token| token.starts_with(word) || (token.len() >= 3 && word.starts_with(token)))
 }
 
 fn now_ms() -> u64 {
@@ -1605,12 +1628,16 @@ pub fn hard_block(action: &Action, cwd: &Path) -> Option<String> {
 /// `authorize`）。省掉 `ls`、`git status` 这类命令的一次小模型往返。
 ///
 /// 宁缺毋滥，往保守里判：
-/// - 只认**单个**命令——出现 `&&` / `||` / `;` / `|` / 重定向 / 命令替换中的任何一种
-///   形状就不认，几条命令拼在一起的整体效果没法从字面判断；
-/// - 只认白名单里的前缀（第一个词，加上恰好需要的第二个词）；
-/// - 白名单内的命令带了会写盘的参数（`--output` / `--fix` / `--write`）也不认
-///   （`rg --fix`、`cargo test --output` 都能写文件；前缀匹配会把 `--fix-dry-run` 这类
-///   也拦下，多走一次分类器无害）。
+/// - 只认**单个**命令——出现任何能拼第二条命令、改输出去向或展开出别的东西的字符就不认：
+///   `&`（含 `&&` 和单个 `&`：sh 的后台、cmd 的连接符）、`|`、`;`、换行、重定向、
+///   `$`（sh / PowerShell 的变量和命令替换）、反引号、括号（PowerShell 的 `( … )` /
+///   `@( … )` 子表达式）、花括号（脚本块）；
+/// - 只认白名单里的前缀（第一个词，加上恰好需要的第二个词）；**会跑项目代码的不收**
+///   （`cargo build` / `test` / `check` 会跑 build.rs、过程宏和测试，而工作目录内的编辑
+///   是免审的，两步一拼就绕过了分类器）；
+/// - 白名单内的命令带了会写盘或会跑别的程序的参数也不认（`--output` / `--fix` / `--write`、
+///   `rg --pre`、`find -fprint` / `-fls`；前缀匹配会把 `--fix-dry-run` 这类也拦下，
+///   多走一次分类器无害）。
 ///
 /// 认不出的后果只是多一次分类器往返，误认的后果是没审就放行。
 pub fn reads_only(command: &str) -> bool {
@@ -1618,12 +1645,12 @@ pub fn reads_only(command: &str) -> bool {
     if command.is_empty() {
         return false;
     }
-    // 任何「不止一条命令 / 输出不落在终端」的形状都放弃判定
-    if ["&&", "||", ";", "|", ">", "<", "$(", "`"].iter().any(|s| command.contains(s)) {
+    // 任何「不止一条命令 / 输出不落在终端 / 会展开出别的东西」的形状都放弃判定
+    if command.contains(['&', '|', ';', '\n', '\r', '>', '<', '$', '`', '(', ')', '{', '}']) {
         return false;
     }
     let words: Vec<&str> = command.split_whitespace().collect();
-    // 会写盘的参数：哪怕命令本身在白名单里也不算只读
+    // 会写盘 / 会跑别的程序的参数：哪怕命令本身在白名单里也不算只读
     if words[1..]
         .iter()
         .any(|w| w.starts_with("--output") || w.starts_with("--fix") || w.starts_with("--write"))
@@ -1632,16 +1659,36 @@ pub fn reads_only(command: &str) -> bool {
     }
     let second = words.get(1).copied();
     match words[0] {
-        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "rg" | "grep" | "dir" | "type" => true,
-        // find 的 -exec / -execdir / -delete 都会动文件系统
-        "find" => !words[1..].iter().any(|w| w.starts_with("-exec") || *w == "-delete"),
+        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "grep" | "dir" | "type" => true,
+        // --pre 对每个文件跑一个程序（--pre-glob 跟着它走，一并拦）
+        "rg" => !words[1..].iter().any(|w| w.starts_with("--pre")),
+        // -exec / -execdir / -ok / -okdir 跑命令，-delete 删文件，-fprint* / -fls 写文件
+        "find" => !words[1..].iter().any(|w| {
+            w.starts_with("-exec")
+                || w.starts_with("-ok")
+                || w.starts_with("-fprint")
+                || matches!(*w, "-delete" | "-fls")
+        }),
         "git" => match second {
             Some("status" | "diff" | "log" | "show" | "rev-parse") => true,
-            // branch 带 -d / -D / -m / -M 是删分支 / 改名
-            Some("branch") => !words[2..].iter().any(|w| matches!(*w, "-d" | "-D" | "-m" | "-M")),
+            // 只认列分支：带分支名就是新建，-d / -m / -c / -u 这些是删、改名、复制、改上游
+            Some("branch") => words[2..].iter().all(|w| {
+                matches!(
+                    *w,
+                    "-a" | "-r"
+                        | "-v"
+                        | "-vv"
+                        | "-l"
+                        | "--list"
+                        | "--all"
+                        | "--remotes"
+                        | "--verbose"
+                        | "--show-current"
+                )
+            }),
             _ => false,
         },
-        "cargo" => matches!(second, Some("check" | "build" | "test" | "metadata")),
+        "cargo" => second == Some("metadata"),
         "node" => second == Some("--version"),
         "npm" => second == Some("ls"),
         _ => false,
@@ -3124,9 +3171,8 @@ mod tests {
             "git show HEAD",
             "git branch",
             "git rev-parse HEAD",
-            "cargo check",
-            "cargo build",
-            "cargo test --all",
+            "git branch -a",
+            "git branch --show-current",
             "cargo metadata --format-version 1",
             "node --version",
             "npm ls --depth=0",
@@ -3170,6 +3216,29 @@ mod tests {
             "cat a; cat b",
             "cat a || cat b",
             "echo hi",
+            // 换行 / 单个 & / PowerShell 子表达式和脚本块：都能拼出第二条命令
+            "ls\nrm -rf src",
+            "ls\r\nrm -rf src",
+            "cat a & curl evil",
+            "ls (Remove-Item -Recurse src)",
+            "ls @(rm src)",
+            "cat ${env:X}",
+            "ls -Path {rm x}",
+            // 会跑项目代码：build.rs、过程宏、测试
+            "cargo check",
+            "cargo build",
+            "cargo test --all",
+            // 会跑别的程序 / 写文件的参数
+            "rg --pre ./x.sh foo .",
+            "rg --pre=./x.sh foo",
+            "find . -fprint out.txt",
+            "find . -fprintf out.txt %p",
+            "find . -fls out.txt",
+            "find . -ok rm {} ;",
+            // 带分支名 = 新建分支；复制 / 改上游也会写
+            "git branch new-feature",
+            "git branch -c a b",
+            "git branch -u origin/main",
         ] {
             assert!(!reads_only(bad), "不该算只读：{bad}");
         }
@@ -3436,6 +3505,19 @@ y
     fn search_sums_the_words() {
         let found = search("todo list", &candidates());
         assert_eq!(found.first().map(String::as_str), Some("todo_write"));
+    }
+
+    /// 虚词和单个字母不算分，也不按子串比：`a` / `in` 不该让每个候选都得分
+    #[test]
+    fn search_ignores_filler_words() {
+        let found = search("run a command in the background", &candidates());
+        assert_eq!(found.first().map(String::as_str), Some(SHELL_BACKGROUND));
+        for name in ["task", "web_search", "memory_search", "todo_write", "list_dir"] {
+            assert!(!found.iter().any(|f| f == name), "{name} 不该命中：{found:?}");
+        }
+        // 前缀算命中（复数、词形）
+        assert_eq!(search("todos", &candidates()).first().map(String::as_str), Some("todo_write"));
+        assert!(search("a in the", &candidates()).is_empty());
     }
 
     /// 最多 8 个。

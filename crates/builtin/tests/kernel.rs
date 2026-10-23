@@ -4000,3 +4000,70 @@ fn read_image_degrades_to_text_for_a_model_without_vision() {
     assert!(second.contains("cannot read images"), "{second}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 提问卡片上选了「自己说」：同一步里排在 `ask_user` 后面的调用不再执行
+/// （不弹权限、不写文件），只补一条失败结果，这一轮当场结束、不再请求模型
+#[test]
+fn self_answer_skips_the_rest_of_the_step() {
+    let dir = workdir("ask-user-halt");
+    let question = serde_json::json!({ "questions": [{
+        "question": "覆盖配置吗？",
+        "options": [{ "label": "覆盖" }, { "label": "保留" }]
+    }] });
+    let (base, bodies) = serve(vec![tool_calls(&[
+        ("q", "ask_user", question),
+        ("w", "write_file", serde_json::json!({ "path": "config.txt", "content": "new" })),
+    ])]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("改配置")).unwrap();
+    h.wait("question", |e| matches!(e, KernelEvent::UserQuestion { .. }));
+    let id = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|r| match &r.event {
+            KernelEvent::UserQuestion { id, .. } => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    h.kernel.resolve_question(id, claudesktop_core::QuestionAnswer::SelfAnswer).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    assert!(!dir.join("config.txt").exists());
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
+    assert_eq!(h.tool_status("w").as_deref(), Some("failed"));
+    // 只有最初那一次请求
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 回退掉的轮次里 `tool_search` 加载的工具跟着撤掉：和重启后从日志续接看到的工具清单一致
+#[test]
+fn rewind_drops_tools_loaded_in_rewound_turns() {
+    let (base, bodies) = serve(vec![
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "todo" })),
+        happy_stream("找到了"),
+        happy_stream("重来答"),
+    ]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
+    h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert!(tool_names(&body(&bodies, 1)).contains(&"todo_write".to_string()));
+
+    let ev = |event| Record::Event { event };
+    let log = vec![
+        Record::user("第一问"),
+        Record::ToolLoadout { names: vec!["todo_write".into()] },
+        ev(KernelEvent::AgentMessageChunk { text: "找到了".into() }),
+        ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+        Record::Rewind { turn: 0, conversation: true, files: 0, prompt: "第一问".into() },
+    ];
+    h.kernel.rewind(&sid, &log).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("重来问")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let tools = tool_names(&body(&bodies, 2));
+    assert!(!tools.contains(&"todo_write".to_string()), "{tools:?}");
+}

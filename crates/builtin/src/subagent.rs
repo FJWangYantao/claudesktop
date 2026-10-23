@@ -29,7 +29,7 @@ const EXPLORE_TOOLS: [&str; 7] =
 /// 没有它模型几乎只自己搜，中间过程全堆在主上下文里；但把它排得太前模型又什么都往外推。
 pub const DELEGATION: &str = "Do the searching yourself when you already know the file, or a glob / \
     grep or two will answer it, or you need the exact contents in front of you to edit them. \
-    Delegate with the task tool only for open-ended investigation that takes several rounds of \
+    Delegate with the task tool (find it with tool_search first) only for open-ended investigation that takes several rounds of \
     searching and reading and where you mostly need the location rather than the contents \
     (finding where something is implemented across the codebase, tracing how a feature works, \
     surveying usages before a refactor): an `explore` subagent keeps that searching out of your \
@@ -138,6 +138,8 @@ pub fn allows(agent: &AgentDef, tool: &str) -> bool {
         // 子会话记下的东西没有归属（算谁的会话、哪一轮都不明确），不给它
         && tool != crate::tools::MEMORY_WRITE
         && tool != crate::tools::MEMORY_FORGET
+        // 子会话不分层（按角色清单全声明），没有藏起来的工具可搜，调了也只会报错
+        && tool != crate::tools::TOOL_SEARCH
         && agent.tools.as_ref().is_none_or(|t| plugin::tool_listed(t, tool))
 }
 

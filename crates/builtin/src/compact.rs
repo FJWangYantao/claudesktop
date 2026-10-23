@@ -85,7 +85,7 @@ pub fn split(history: &[ChatMessage], keep_budget: u64, idle: bool) -> Option<Sp
         return (!history.is_empty())
             .then_some(Split { tail_from: history.len(), keep_user: None });
     }
-    let turn = history.iter().rposition(|m| m.role == "user")?;
+    let turn = history.iter().rposition(ChatMessage::is_user_turn)?;
     if turn > 0 && estimate_tokens(&history[turn..]) <= keep_budget {
         return Some(Split { tail_from: turn, keep_user: None });
     }
@@ -254,6 +254,28 @@ mod tests {
         // 最近一步都放不下：也只留最近一步
         let s = split(&h[..5], 100, false).unwrap();
         assert_eq!(s, Split { tail_from: 3, keep_user: Some(0) });
+    }
+
+    /// 代工具发图片的 user 消息（OpenAI 兼容协议）不是这一轮的开头：切点和保留的用户消息
+    /// 都要落在真正的用户消息上
+    #[test]
+    fn tool_image_messages_do_not_start_a_turn() {
+        let big = "x".repeat(4_000);
+        let mut images = user("Image(s) returned by the tool calls above:");
+        images.tool_images = true;
+        let h = vec![
+            user("看看截图"),
+            call("c1", "{}"),
+            result("c1", &big),
+            images,
+            call("c2", "{}"),
+            result("c2", &big),
+            call("c3", "{}"),
+            result("c3", "短"),
+        ];
+        let s = split(&h, 500, false).unwrap();
+        assert_eq!(s, Split { tail_from: 6, keep_user: Some(0) });
+        assert_eq!(s.apply(&h)[0].text().unwrap(), "看看截图");
     }
 
     #[test]

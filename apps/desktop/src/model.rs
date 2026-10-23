@@ -437,8 +437,6 @@ pub enum ChatItem {
     /// 模型向你提问（`ask_user`）：选项卡片。`answer` 有值后不能再改
     Question {
         id: u64,
-        /// 触发它的工具调用 ID（应答后结果并进那一行；现在没有工具行，留着给以后）
-        tool: Option<String>,
         questions: Vec<QuestionView>,
         /// 每题当前点着的选项（提交前可改；`None` = 这题还没点）
         picks: Vec<Option<usize>>,
@@ -1149,6 +1147,7 @@ mod tests {
                 expanded: false,
                 task: false,
                 grant: None,
+                images: Vec::new(),
             })
         };
         let thinking = thought("t", None);
@@ -1178,6 +1177,7 @@ mod tests {
             expanded: false,
             task: false,
             grant: None,
+            images: Vec::new(),
         })
     }
 
