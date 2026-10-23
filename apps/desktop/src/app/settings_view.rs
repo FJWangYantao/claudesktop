@@ -648,7 +648,7 @@ impl ChatApp {
         setting_row("界面字号", tip, slider)
     }
 
-    /// 配色下拉：六套色板，每项下面一行色块预览。换配色即时生效。
+    /// 配色下拉：八套色板，每项下面一行色块预览。换配色即时生效。
     fn theme_row(&self, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
         setting_row(
@@ -2744,7 +2744,8 @@ fn theme_menu_items(
     popover: &Entity<PopoverState>,
 ) -> MenuList {
     let current = app.settings.theme;
-    let mut menu = MenuList::new("theme-list", handle, popover);
+    // 八套色板 × 三行（名称 / 说明 / 色块）比原来高，限高滚动，矮窗口里不至于顶出屏幕
+    let mut menu = MenuList::new("theme-list", handle, popover).scroll(rems(26.));
     for t in ThemeChoice::ALL {
         menu = menu.pick(
             theme_menu_item(

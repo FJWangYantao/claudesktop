@@ -693,11 +693,21 @@ pub enum ThemeChoice {
     Everforest,
     Nord,
     Catppuccin,
+    Github,
+    Pure,
 }
 
 impl ThemeChoice {
-    pub const ALL: [ThemeChoice; 6] =
-        [Self::Warm, Self::Flexoki, Self::RosePine, Self::Everforest, Self::Nord, Self::Catppuccin];
+    pub const ALL: [ThemeChoice; 8] = [
+        Self::Warm,
+        Self::Flexoki,
+        Self::RosePine,
+        Self::Everforest,
+        Self::Nord,
+        Self::Catppuccin,
+        Self::Github,
+        Self::Pure,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -711,6 +721,8 @@ impl ThemeChoice {
             Self::Everforest => "常青",
             Self::Nord => "北境",
             Self::Catppuccin => "拿铁 / 摩卡",
+            Self::Github => "GitHub",
+            Self::Pure => "纯白",
         }
     }
 
@@ -722,6 +734,8 @@ impl ThemeChoice {
             Self::Everforest => "Everforest · 米黄底配灰绿，护眼",
             Self::Nord => "Nord · 雪白和冰蓝，冷色",
             Self::Catppuccin => "Catppuccin · 粉彩紫",
+            Self::Github => "GitHub · 纯白底配浅灰和链接蓝",
+            Self::Pure => "纯白 · 只有灰阶，没有彩色强调",
         }
     }
 
@@ -733,6 +747,8 @@ impl ThemeChoice {
             "everforest" => Self::Everforest,
             "nord" => Self::Nord,
             "catppuccin" => Self::Catppuccin,
+            "github" => Self::Github,
+            "pure" | "pure_white" | "purewhite" => Self::Pure,
             _ => return None,
         })
     }
@@ -1191,7 +1207,18 @@ mod tests {
 
         assert_eq!(ThemeChoice::parse("Nord"), Some(ThemeChoice::Nord));
         assert_eq!(ThemeChoice::parse("rosepine"), Some(ThemeChoice::RosePine));
+        assert_eq!(ThemeChoice::parse("GitHub"), Some(ThemeChoice::Github));
+        assert_eq!(ThemeChoice::parse("pure"), Some(ThemeChoice::Pure));
         assert_eq!(ThemeChoice::parse("nope"), None);
+        // 新加的配色也走一遍 key 往返（顺序和 `theme::PALETTES` 对齐）
+        for (t, key) in [(ThemeChoice::Github, "github"), (ThemeChoice::Pure, "pure")] {
+            assert_eq!(ThemeChoice::parse(key), Some(t));
+            let s = Settings { theme: t, ..Default::default() };
+            s.save(&path).unwrap();
+            assert!(std::fs::read_to_string(&path).unwrap().contains(&format!("\"{key}\"")));
+            assert_eq!(Settings::load(Some(&path)).0.theme, t);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 步数上限：旧设置文件缺这项时用默认 200；手改成越界的值读取时夹住；

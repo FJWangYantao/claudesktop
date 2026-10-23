@@ -68,7 +68,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   带边框的容器（卡片、权限卡、输入框）里的按钮不再描边（单层边框）：次级用 `SAND` 实底
   （悬停 `SELECTED`），拒绝 / 危险项只留 `RED` 字、悬停出底色（红字在 `SAND` 上只有 4.0:1）。
 - **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
-  - `Color` 是语义 token，取值查当前色板（六套配色，设置页「外观 · 配色」切换）；新颜色在 `Palette` 加一项、
+  - `Color` 是语义 token，取值查当前色板（八套配色，设置页「外观 · 配色」切换）；新颜色在 `Palette` 加一项、
     `WARM` 给值，别的色板不写就继承，写了要过 `palette_contrast` 测试。
   - 每个常量是浅色 / 深色一对（`Shade`），界面里写 `rgb(INK)`；这个 `rgb` 是 `theme::rgb`（按当前色板 + 外观取值），
     文件里要 `use crate::theme::rgb;`，否则和 `gpui_kit::*` 里的同名函数冲突。新颜色两种外观都要给值并校对对比度。

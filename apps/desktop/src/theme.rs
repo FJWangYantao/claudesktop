@@ -293,8 +293,75 @@ const CATPPUCCIN: Palette = Palette {
     ..WARM
 };
 
+/// GitHub（Primer 浅色 / 深色：白底、浅灰凹面、蓝链接）
+///
+/// 唯一一套「强调色是蓝」的配色（见「设计指南-Claude风格UI.md」：暖纸刻意避开蓝）。
+/// 浅色纸底和卡片底都是纯白，凹面靠 `sand`（`#f6f8fa`）拉开；强调色取 GitHub 的链接蓝，
+/// 深色版悬停压到 `#1760cf`——原版 `#388bfd` 上白字只有 3.3:1。
+const GITHUB: Palette = Palette {
+    paper: s(0xFFFFFF, 0x0D1117),
+    sand: s(0xF6F8FA, 0x010409),
+    sand_active: s(0xEAEEF2, 0x161B22),
+    card: s(0xFFFFFF, 0x161B22),
+    coral: s(0x0969DA, 0x1F6FEB),
+    coral_deep: s(0x0969DA, 0x1F6FEB),
+    coral_deep_hover: s(0x0550AE, 0x1760CF),
+    on_accent: s(0xFFFFFF, 0xFFFFFF),
+    ink: s(0x1F2328, 0xE6EDF3),
+    ink_soft: s(0x59636E, 0x9198A1),
+    ink_faint: s(0x818B98, 0x6E7681),
+    line: s(0xD1D9E0, 0x3D444D),
+    line_strong: s(0xB7BEC8, 0x515B65),
+    code_bg: s(0xF6F8FA, 0x161B22),
+    hover: s(0xF6F8FA, 0x1C2128),
+    hover_strong: s(0xE7ECF0, 0x2D333B),
+    selection: s(0xDDF4FF, 0x0C2D6B),
+    heat1: s(0x9BE9A8, 0x0E4429),
+    heat2: s(0x40C463, 0x006D32),
+    heat3: s(0x30A14E, 0x26A641),
+    heat4: s(0x216E39, 0x39D353),
+    green: s(0x1A7F37, 0x3FB950),
+    red: s(0xCF222E, 0xFF7B72),
+    danger: s(0xCF222E, 0xDA3633),
+    white: s(0xFFFFFF, 0xFFFFFF),
+    diff_add_bg: s(0xE6FFEC, 0x12261E),
+    diff_add_fg: s(0x1A7F37, 0x3FB950),
+    diff_del_bg: s(0xFFEBE9, 0x25171C),
+    diff_del_fg: s(0xCF222E, 0xFF7B72),
+};
+
+/// 纯白（只用灰阶：纸底和卡片是纯白，强调色就是墨色本身）
+///
+/// 没有彩色强调：主按钮是近黑实底、浅灰悬停，选中 / 聚焦全用灰阶。
+/// 深色版是纯黑纸底 + 近白按钮底（`ON_ACCENT` 反过来用黑字）。
+const PURE: Palette = Palette {
+    paper: s(0xFFFFFF, 0x000000),
+    sand: s(0xF2F2F2, 0x0A0A0A),
+    sand_active: s(0xE6E6E6, 0x141414),
+    card: s(0xFFFFFF, 0x0A0A0A),
+    coral: s(0x1F2328, 0xE6EDF3),
+    coral_deep: s(0x1F2328, 0xF0F6FC),
+    coral_deep_hover: s(0x32383F, 0xFFFFFF),
+    on_accent: s(0xFFFFFF, 0x000000),
+    ink: s(0x1F2328, 0xEDEDED),
+    ink_soft: s(0x575757, 0xA0A0A0),
+    ink_faint: s(0x8A8A8A, 0x6E6E6E),
+    line: s(0xE5E5E5, 0x262626),
+    line_strong: s(0xC8C8C8, 0x3D3D3D),
+    code_bg: s(0xF6F6F6, 0x0A0A0A),
+    hover: s(0xF2F2F2, 0x141414),
+    hover_strong: s(0xE2E2E2, 0x212121),
+    selection: s(0xE2E2E2, 0x1F1F1F),
+    heat1: s(0xEDEDED, 0x1F1F1F),
+    heat2: s(0xD4D4D4, 0x3A3A3A),
+    heat3: s(0xA8A8A8, 0x5C5C5C),
+    heat4: s(0x575757, 0xA8A8A8),
+    ..WARM
+};
+
 /// 顺序和 `settings::ThemeChoice::ALL` 一致（`ThemeChoice::index` 取下标）。
-pub static PALETTES: [Palette; 6] = [WARM, FLEXOKI, ROSE_PINE, EVERFOREST, NORD, CATPPUCCIN];
+pub static PALETTES: [Palette; 8] =
+    [WARM, FLEXOKI, ROSE_PINE, EVERFOREST, NORD, CATPPUCCIN, GITHUB, PURE];
 
 static PALETTE: AtomicUsize = AtomicUsize::new(0);
 
