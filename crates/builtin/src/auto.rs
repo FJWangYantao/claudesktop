@@ -200,16 +200,15 @@ pub fn parse(reply: &str) -> Option<Decision> {
 /// 判不出来时的拒绝理由（用户看到的是「自动模式没能判定」，模型看到的是该怎么收场）。
 pub const FAILED: &str = "[Auto mode] The safety classifier could not judge this action (the \
                          endpoint did not answer, or its reply could not be read). It was not run. \
-                         Do not retry it as is: explain what you were trying to do and ask the user.";
+                         Do not retry it as is: use ask_user to have the user decide.";
 
-/// 拒绝的理由连同「别换个马甲重试」一起回给模型：它自己决定换路子还是问用户。
+/// 拒绝的理由连同「别换个马甲重试」一起回给模型：它自己决定换路子还是用 `ask_user` 问用户。
 pub fn denial_text(reason: &str) -> String {
     format!(
         "Automatic mode blocked this tool call. It was not run.\n\
          Reason: {reason}\n\
          Do not retry the same thing in a disguised form. Either find a safer approach that \
-         stays inside what the user asked for, or tell the user what you wanted to do and why, \
-         and wait for their answer."
+         stays inside what the user asked for, or use ask_user to have the user decide."
     )
 }
 

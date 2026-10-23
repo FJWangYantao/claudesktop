@@ -265,6 +265,7 @@ fn copyable(record: &Record) -> bool {
         Record::User { .. }
             | Record::Event { .. }
             | Record::PermissionResolved { .. }
+            | Record::QuestionAnswered { .. }
             | Record::Turn { .. }
             | Record::Thought { .. }
     )
@@ -2017,6 +2018,46 @@ impl ChatApp {
             self.persist(active, record);
         }
         cx.notify();
+    }
+
+    /// 点选提问卡片上的一个选项。
+    pub(crate) fn pick_question(
+        &mut self,
+        item_idx: usize,
+        q: usize,
+        option: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active;
+        self.sessions[active].pick_question(item_idx, q, option);
+        cx.notify();
+    }
+
+    /// 把提问的答案交给内核，并记进日志（重放时卡片上还看得见答了什么）。
+    pub(crate) fn answer_question(
+        &mut self,
+        item_idx: usize,
+        answer: claudesktop_core::QuestionAnswer,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.active;
+        let kernel = self.session_kernel(active);
+        self.sessions[active].resolve_question(item_idx, answer, kernel.as_ref());
+        if let Some(ChatItem::Question { id, answer: Some(answer), .. }) =
+            self.sessions[active].transcript.get(item_idx)
+        {
+            let record = Record::QuestionAnswered { id: *id, answer: answer.clone() };
+            self.persist(active, record);
+        }
+        cx.notify();
+    }
+
+    /// 「就这样」：所有题都选好了才提交。
+    pub(crate) fn submit_question(&mut self, item_idx: usize, cx: &mut Context<Self>) {
+        let Some(choices) = self.sessions[self.active].question_choices(item_idx) else {
+            return;
+        };
+        self.answer_question(item_idx, claudesktop_core::QuestionAnswer::Choices { choices }, cx);
     }
 
     /// 权限卡上的「拒绝并说明」：按拒绝应答，停下这一轮，请用户在输入框里说要怎么改

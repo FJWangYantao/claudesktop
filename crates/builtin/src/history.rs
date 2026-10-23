@@ -10,7 +10,7 @@
 
 use crate::ChatMessage;
 use crate::provider::ContentPart;
-use claudesktop_core::{KernelEvent, PlanEntryView, Record};
+use claudesktop_core::{KernelEvent, PlanEntryView, QuestionAnswer, QuestionView, Record};
 
 /// 重建历史的总字符上限：超出时从最早的轮次开始丢
 const HISTORY_MAX_CHARS: usize = 200_000;
@@ -91,6 +91,8 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
     let mut summary = None;
     let mut user_messages = Vec::new();
     let mut todos = Vec::new();
+    // 提问的 id → 问了什么（`QuestionAnswered` 只记选了几号，摘要要回到这里拿）
+    let mut questions: std::collections::HashMap<u64, Vec<QuestionView>> = Default::default();
     let mut assistant = Assistant::default();
     // 有进行中的一轮（最后一条用户消息之后还没结束）
     let mut in_turn = false;
@@ -165,9 +167,34 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
                         messages.clear();
                     }
                 }
+                // 提问写成一行工具摘要（和待办一样：它没有 ToolCallStarted），
+                // 没答完的那一轮续接后是 `interrupted`，模型知道当时停在那里
+                KernelEvent::UserQuestion { id, questions: asked, .. } => {
+                    questions.insert(*id, asked.clone());
+                    assistant.segments.push(Segment::Tool {
+                        id: format!("ask_user/{id}"),
+                        title: crate::tools::ASK_USER.into(),
+                        status: "pending".into(),
+                        output: String::new(),
+                    });
+                }
                 // 思考、权限请求不进上下文
                 _ => {}
             },
+            Record::QuestionAnswered { id, answer } => {
+                let key = format!("ask_user/{id}");
+                let summary = match questions.get(id) {
+                    Some(asked) => crate::tools::question_result(asked, answer).1,
+                    None => "问了一下".to_string(),
+                };
+                if let Some((_, status, output)) = assistant.tool(&key) {
+                    *status = match answer {
+                        QuestionAnswer::Choices { .. } => "completed".into(),
+                        _ => "failed".into(),
+                    };
+                    *output = summary;
+                }
+            }
             Record::PermissionResolved { .. }
             | Record::Turn { .. }
             | Record::Thought { .. }

@@ -1096,6 +1096,158 @@ impl ChatApp {
             .child(div().pl(STEP_INDENT).child(buttons))
     }
 
+    /// 提问卡片（`ask_user`）：每题一组选项，选完点「就这样」交给模型。
+    /// 答完收成一行（和权限卡一样），点开能看到当时问了什么。
+    pub(super) fn render_question(
+        idx: usize,
+        questions: &[claudesktop_core::QuestionView],
+        picks: &[Option<usize>],
+        answer: &Option<claudesktop_core::QuestionAnswer>,
+        keyed: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        if let Some(answer) = answer {
+            let first = questions.first().map(|q| q.question.clone()).unwrap_or_default();
+            let picked = match answer {
+                claudesktop_core::QuestionAnswer::Choices { choices } => {
+                    let parts: Vec<String> = questions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, q)| {
+                            let option = choices.get(i).and_then(|n| q.options.get(*n))?;
+                            Some(option.label.clone())
+                        })
+                        .collect();
+                    parts.join("；")
+                }
+                other => other.label().to_string(),
+            };
+            return step_line(
+                Icon::new(IconAll::MessageSquare).size_3p5().text_color(rgb(INK_SOFT)),
+            )
+            .child(div().flex_shrink_0().child("问了一下"))
+            .child(ellipsis(("question-title", idx), first.into()))
+            .child(div().flex_shrink_0().child(format!("· {picked}")));
+        }
+
+        let key_hint = |n: usize| {
+            super::keys::PERMISSION_KEYS.get(n).filter(|_| keyed).map(|key| {
+                div().text_size(TEXT_META).opacity(0.7).child(Self::kbd(key).appearance(false))
+            })
+        };
+        let key_name = |n: usize| {
+            super::keys::PERMISSION_KEYS.get(n).filter(|_| keyed).map(|key| Self::key_text(key))
+        };
+
+        let mut body = div().v_flex().gap_3().pl(STEP_INDENT);
+        for (q, question) in questions.iter().enumerate() {
+            let mut block = div().v_flex().gap_1p5().child(
+                div().text_size(TEXT_BODY).text_color(rgb(INK)).child(question.question.clone()),
+            );
+            let mut options = div().v_flex().gap_1();
+            for (o, option) in question.options.iter().enumerate() {
+                let selected = picks.get(q).copied().flatten() == Some(o);
+                options = options.child(
+                    div()
+                        .id(("question-opt", idx * 16 + q * 4 + o))
+                        .v_flex()
+                        .gap_0p5()
+                        .px_3()
+                        .py_1p5()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .text_size(TEXT_BODY)
+                        .when(selected, |d| {
+                            d.bg(rgb(SELECTED)).border_1().border_color(state_line(CORAL))
+                        })
+                        .when(!selected, |d| d.bg(rgb(SAND)).hover(|d| d.bg(rgb(SELECTED))))
+                        .when_some(key_name(o), |d, key| d.aria_keyshortcuts(key))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_question(idx, q, o, cx);
+                        }))
+                        .child(
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div().flex_shrink_0().child(
+                                        Icon::new(if selected {
+                                            IconAll::CircleCheck
+                                        } else {
+                                            IconAll::Circle
+                                        })
+                                        .size_3p5()
+                                        .text_color(
+                                            if selected { rgb(CORAL) } else { rgb(INK_FAINT) },
+                                        ),
+                                    ),
+                                )
+                                .child(div().min_w_0().child(option.label.clone()))
+                                .children(key_hint(o)),
+                        )
+                        .children(option.description.clone().map(|d| {
+                            div().pl_5().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(d)
+                        })),
+                );
+            }
+            block = block.child(options);
+            body = body.child(block);
+        }
+
+        let ready = picks.iter().all(Option::is_some);
+        let mut actions = div().h_flex().flex_wrap().items_center().gap_2().child(
+            Self::text_button(("question-submit", idx), "就这样", true)
+                .with_variant(ButtonVariant::Primary)
+                .disabled(!ready)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.submit_question(idx, cx);
+                })),
+        );
+        // 「自己说」：这一轮停在这里，用户下一条消息就是答案
+        actions = actions.child(
+            Self::text_button(("question-self", idx), "自己说", false)
+                .with_variant(ButtonVariant::Secondary)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.answer_question(idx, claudesktop_core::QuestionAnswer::SelfAnswer, cx);
+                })),
+        );
+        // 「你来定」：让模型自己假设一个继续（免得它反复问）
+        actions = actions.child(
+            Self::text_button(("question-model", idx), "你来定", false)
+                .with_variant(ButtonVariant::Secondary)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.answer_question(idx, claudesktop_core::QuestionAnswer::ModelDecides, cx);
+                })),
+        );
+
+        div()
+            .v_flex()
+            .gap_3()
+            .p_4()
+            .rounded_xl()
+            .border_1()
+            .border_color(state_line(CORAL))
+            .bg(rgb(CARD))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon_cell(
+                        Icon::new(IconAll::MessageSquare).size_4().text_color(rgb(CORAL)),
+                    ))
+                    .child(
+                        div()
+                            .text_size(TEXT_BODY)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("需要你定一下"),
+                    ),
+            )
+            .child(body)
+            .child(div().pl(STEP_INDENT).child(actions))
+    }
+
     /// 权限卡上的按块选择：每个文件一段，块头点一下切换「这块写不写」。
     /// 已经放行的块正常画，没放行的淡下去并划一道线；上面写清还剩几块。
     fn render_hunk_picker(
@@ -1997,6 +2149,10 @@ impl ChatApp {
                     keyed,
                     cx,
                 )
+            }
+            ChatItem::Question { questions, picks, answer, .. } => {
+                let keyed = self.session().pending_question() == Some(idx);
+                Self::render_question(idx, questions, picks, answer, keyed, cx)
             }
             ChatItem::Plan(rows) => Self::render_plan(rows, layout.compact),
             ChatItem::Agent(text) => {

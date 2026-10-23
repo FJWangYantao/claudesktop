@@ -78,7 +78,7 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
 use claudesktop_core::plugin::{self, AgentDef, HookEvent, HookOutcome, Plugin, Skill};
 use claudesktop_core::{
     EventSink, Kernel, KernelEvent, ModeView, PartialGrant, PermissionHunks, PermissionOptionView,
-    PlanEntryView, Record, RoutedEvent, SessionKind, SessionSpec, checkpoint,
+    PlanEntryView, QuestionAnswer, Record, RoutedEvent, SessionKind, SessionSpec, checkpoint,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -380,8 +380,8 @@ struct Inner {
     mcp: Arc<mcp::McpHub>,
     /// 启用的插件（技能、钩子；它们的 MCP 服务在 `mcp` 里）
     plugins: Mutex<Arc<Vec<Plugin>>>,
-    /// 等待 UI 应答的权限请求：请求 ID → 应答通道（选项 ID + 按块同意放行的块）
-    pending: Mutex<HashMap<u64, mpsc::Sender<Option<Answer>>>>,
+    /// 等待 UI 应答的请求：请求 ID → 应答通道（权限选项 / 提问答案）
+    pending: Mutex<HashMap<u64, mpsc::Sender<Reply>>>,
     next_request: AtomicU64,
     /// 这个内核的编号（后台命令表按它分组：同一进程里几个内核各收自己的）
     kernel_id: u64,
@@ -485,6 +485,12 @@ enum Verdict {
 struct Answer {
     option: String,
     hunks: Option<Vec<u32>>,
+}
+
+/// 内核等 UI 应答的两种请求共用一个通道（见 `Inner::pending`）。
+enum Reply {
+    Permission(Option<Answer>),
+    Question(QuestionAnswer),
 }
 
 impl Inner {
@@ -1111,6 +1117,11 @@ impl Inner {
                 }
                 Err(message) => ToolOutput::fail(message, "参数无效"),
             };
+        }
+        // 向用户提问：不碰文件、不用授权，也不占一行工具（卡片自己就是那一行）。
+        // 子会话没有这个工具（没人看得到它的问题），`tool_allowed` 会拦住
+        if call.function.name == tools::ASK_USER && self.tool_allowed(session, tools::ASK_USER) {
+            return self.ask_user(session, &call.function.arguments, stopped);
         }
         // 记忆不出网、不用授权：直接写 memory.json（见 memory 模块）。但它是写文件，
         // Plan 模式（只读）不给（工具列表里也没有，这里挡住模型硬调的）
@@ -2086,12 +2097,52 @@ impl Inner {
         );
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(choice) => return choice,
+                Ok(Reply::Permission(choice)) => return choice,
+                // 通道串了（不可能）：当成取消，别把提问的答案当成权限选项
+                Ok(Reply::Question(_)) => return None,
                 Err(mpsc::RecvTimeoutError::Timeout) if !stopped() => {}
                 Err(_) => {
                     self.pending.lock().unwrap().remove(&id);
                     return None;
                 }
+            }
+        }
+    }
+
+    /// `ask_user`：把问题发给界面并阻塞等待回答。用户停下这一轮时返回「已取消」。
+    /// 和权限请求一样没有超时：窗口切走 / 最小化都不影响。
+    fn ask_user(&self, session: &str, arguments: &str, stopped: &dyn Fn() -> bool) -> ToolOutput {
+        let questions = match tools::parse_questions(arguments) {
+            Ok(questions) => questions,
+            Err(message) => return ToolOutput::fail(message, "参数无效"),
+        };
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        self.emit(
+            Some(session),
+            KernelEvent::UserQuestion { id, tool: None, questions: questions.clone() },
+        );
+        let answer = loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Reply::Question(answer)) => break answer,
+                // 串了（不可能）：当取消
+                Ok(Reply::Permission(_)) => break QuestionAnswer::Cancelled,
+                Err(mpsc::RecvTimeoutError::Timeout) if !stopped() => {}
+                Err(_) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    break QuestionAnswer::Cancelled;
+                }
+            }
+        };
+        let (content, summary) = tools::question_result(&questions, &answer);
+        match answer {
+            QuestionAnswer::Choices { .. } => ToolOutput::ok(content, summary),
+            // 「你来定」：模型自己挑一个继续，结果照常回给它
+            QuestionAnswer::ModelDecides => ToolOutput::ok(content, summary),
+            // 「自己说」/ 取消：这一轮停在这里，等用户下一条消息
+            QuestionAnswer::SelfAnswer | QuestionAnswer::Cancelled => {
+                ToolOutput::fail_stop(content, summary)
             }
         }
     }
@@ -2375,7 +2426,11 @@ fn system_prompt(
          prefer edit_file for small changes, read URLs the user gives with web_fetch, and verify your work (e.g. build or run tests) \
          when it makes sense. {todo}\
          Tool calls that change things may need the user's approval; \
-         if one is denied, do not retry it and ask the user instead.\n\
+         if one is denied, do not retry it.\n\
+         When a decision is really the user's (which of two approaches, whether to overwrite \
+         something they own, anything irreversible), call `ask_user` with 2-4 concrete options \
+         instead of guessing or picking one yourself. Do not use it for anything a tool can find \
+         out, and do not ask the same question twice.\n\
          {delegation}\
          {BACKGROUND}\n\
          Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
@@ -2442,7 +2497,7 @@ fn system_prompt(
              user asked for and anything irreversible, and it does not see your explanations or the \
              contents of tool results, so it judges each action on its own. When it blocks a call, \
              the reason comes back in the tool result: do not retry the same thing in another form. \
-             Either take a clearly safer route, or tell the user what you wanted to do and ask.",
+             Either take a clearly safer route, or use `ask_user` to have the user decide.",
         );
     }
     prompt
@@ -2469,6 +2524,8 @@ fn chat_system_prompt(
          Answer in the user's language. Use Markdown for structure and code. Be direct; skip filler.\n\
          Write math in LaTeX: $...$ inline and $$...$$ on its own lines for display. \
          Do not use \\( \\) or \\[ \\].\n\
+         When the answer depends on a choice only the user can make, call `ask_user` with 2-4 \
+         concrete options instead of guessing. Do not use it for anything you can find out yourself.\n\
          {web}",
         today_local()
     );
@@ -2779,6 +2836,12 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         let Some(outputs) = inner.run_tools(session, &cwd, &outcome.tool_calls, &stopped) else {
             return Steps::Stopped;
         };
+        // 用户在提问卡片上选了「自己说」/ 取消：结果写进历史后这一轮就结束
+        let halt = outcome
+            .tool_calls
+            .iter()
+            .zip(&outputs)
+            .any(|(c, o)| c.function.name == tools::ASK_USER && o.stop_turn);
         let results: Vec<_> = outcome
             .tool_calls
             .iter()
@@ -2809,6 +2872,10 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         // 工具结果还没被端点数过
         inner.measure(session, step_tokens, unmeasured);
         inner.count_step(session, wrote_todo);
+        if halt {
+            stop = "end_turn".into();
+            break;
+        }
     }
     Steps::Done { stop, reply }
 }
@@ -2974,6 +3041,18 @@ impl Kernel for BuiltinKernel {
         self.resolve_permission_with(request_id, option_id, None)
     }
 
+    /// 应答一次提问（`ask_user`）：`Reply::Question` 交给阻塞在 `Inner::ask_user` 里的那一轮。
+    fn resolve_question(&self, request_id: u64, answer: QuestionAnswer) -> anyhow::Result<()> {
+        let tx = self.inner.pending.lock().unwrap().remove(&request_id);
+        match tx {
+            Some(tx) => {
+                let _ = tx.send(Reply::Question(answer));
+                Ok(())
+            }
+            None => anyhow::bail!("提问 {request_id} 已失效"),
+        }
+    }
+
     /// 同 `resolve_permission`，另外带上「只写这些块」（自研内核的写文件 / 改文件认它）。
     fn resolve_permission_with(
         &self,
@@ -2986,7 +3065,7 @@ impl Kernel for BuiltinKernel {
             Some(tx) => {
                 let answer =
                     option_id.map(|option| Answer { option, hunks: grant.map(|g| g.hunks) });
-                let _ = tx.send(answer);
+                let _ = tx.send(Reply::Permission(answer));
                 Ok(())
             }
             None => anyhow::bail!("权限请求 {request_id} 已失效"),

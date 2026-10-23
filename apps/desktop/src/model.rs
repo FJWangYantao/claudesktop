@@ -1,6 +1,9 @@
 //! 对话记录的数据模型、模式表与工具行辅助函数（UI 无关逻辑）。
 
-use claudesktop_core::{DiffView, PermissionHunks, PermissionOptionView, PromptImage, UserPrompt};
+use claudesktop_core::{
+    DiffView, PermissionHunks, PermissionOptionView, PromptImage, QuestionAnswer, QuestionView,
+    UserPrompt,
+};
 use gpui_kit::SharedString;
 use gpui_kit::assets::IconName as IconAll;
 use std::time::Instant;
@@ -398,6 +401,17 @@ pub enum ChatItem {
         /// 用户在卡片上取消勾选之后放行的块（`None` = 没动过，全放行）
         keep: Option<Vec<u32>>,
     },
+    /// 模型向你提问（`ask_user`）：选项卡片。`answer` 有值后不能再改
+    Question {
+        id: u64,
+        /// 触发它的工具调用 ID（应答后结果并进那一行；现在没有工具行，留着给以后）
+        tool: Option<String>,
+        questions: Vec<QuestionView>,
+        /// 每题当前点着的选项（提交前可改；`None` = 这题还没点）
+        picks: Vec<Option<usize>>,
+        /// 提交后的结果；`None` = 还在等你答
+        answer: Option<QuestionAnswer>,
+    },
     Plan(Vec<PlanRow>),
     Agent(String),
     Note(SharedString),
@@ -637,6 +651,19 @@ impl ChatItem {
                     h.files.iter().flat_map(|f| &f.hunks).map(|x| x.lines.len() + 1).sum::<usize>()
                 }),
                 keep.as_ref().map(Vec::len),
+            )
+                .hash(&mut h),
+            Self::Question { questions, picks, answer, .. } => (
+                11u8,
+                questions.len(),
+                questions
+                    .iter()
+                    .map(|q| {
+                        q.question.len() + q.options.iter().map(|o| o.label.len()).sum::<usize>()
+                    })
+                    .sum::<usize>(),
+                picks.iter().filter(|p| p.is_some()).count(),
+                answer.is_some(),
             )
                 .hash(&mut h),
             Self::Plan(rows) => {

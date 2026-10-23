@@ -295,7 +295,7 @@ impl ChatApp {
             (
                 &s.title,
                 s.busy,
-                s.busy && s.waiting_permission(),
+                s.busy && s.waiting_user(),
                 s.unread,
                 age,
                 archived,
@@ -321,7 +321,7 @@ impl ChatApp {
             .filter(|spot| {
                 self.sessions
                     .iter()
-                    .any(|s| s.token == spot.token && s.busy && !s.waiting_permission())
+                    .any(|s| s.token == spot.token && s.busy && !s.waiting_user())
             })
             .map(|spot| {
                 let (b, clip) = (spot.bounds, spot.clip);
@@ -783,7 +783,7 @@ impl ChatApp {
                 .iter()
                 .filter(|s| Space::of(s.kind) == space)
                 .fold((false, false, false), |(b, w, u), s| {
-                    (b || s.busy, w || (s.busy && s.waiting_permission()), u || s.unread)
+                    (b || s.busy, w || (s.busy && s.waiting_user()), u || s.unread)
                 });
             if waiting {
                 Some(RED)
@@ -851,7 +851,7 @@ impl ChatApp {
         match filter {
             SidebarFilter::All => true,
             SidebarFilter::Running => s.busy,
-            SidebarFilter::Unread => s.unread || (s.busy && s.waiting_permission()),
+            SidebarFilter::Unread => s.unread || (s.busy && s.waiting_user()),
         }
     }
 
@@ -1073,7 +1073,7 @@ impl ChatApp {
         }
 
         // 状态标记：等授权红点、运行中转圈、待查看赤陶实心点，其余空心圈（与官方一样，每行都有个标记位）
-        let marker = if s.busy && s.waiting_permission() {
+        let marker = if s.busy && s.waiting_user() {
             div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
         } else if s.busy {
             // 转圈由 ChatApp 叠在这里画（见文件头）：这里只记位置，挪了位置就要下一帧让它跟上

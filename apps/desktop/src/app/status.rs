@@ -55,6 +55,9 @@ impl ChatApp {
             Activity::WaitingPermission => {
                 (Mood::Ask, div().text_color(rgb(RED)).child("等待你授权"))
             }
+            Activity::WaitingQuestion => {
+                (Mood::Ask, div().text_color(rgb(CORAL_DEEP)).child("等你的回答"))
+            }
             // 限流 / 5xx：内核自己会重发，告诉用户在等什么、还要等多久（不然看着像卡死）
             Activity::Retrying => (
                 Mood::Sweat,

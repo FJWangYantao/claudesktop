@@ -132,6 +132,8 @@ pub fn spec(agents: &[AgentDef]) -> Value {
 pub fn allows(agent: &AgentDef, tool: &str) -> bool {
     tool != TASK
         && tool != crate::tools::TODO_WRITE
+        // 用户看不见子会话，问了没人答（提示词里让它自己假设并说明）
+        && tool != crate::tools::ASK_USER
         // 子会话记下的东西没有归属（算谁的会话、哪一轮都不明确），不给它
         && tool != crate::tools::MEMORY_WRITE
         && tool != crate::tools::MEMORY_FORGET
@@ -259,6 +261,7 @@ mod tests {
         assert!(allows(&agent, "shell"));
         assert!(!allows(&agent, TASK));
         assert!(!allows(&agent, crate::tools::TODO_WRITE));
+        assert!(!allows(&agent, crate::tools::ASK_USER));
         agent.tools = Some(vec!["Read".into(), "Grep".into(), "mcp__db__query".into()]);
         assert!(allows(&agent, "read_file"));
         assert!(allows(&agent, "mcp__db__query"));

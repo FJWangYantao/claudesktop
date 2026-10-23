@@ -123,6 +123,8 @@ pub enum Record {
     Event { event: KernelEvent },
     /// 用户对某条权限请求的应答（展示名，如「Yes」「已取消」）
     PermissionResolved { id: u64, label: String },
+    /// 用户对某次提问（`ask_user`）的应答；没答上（取消 / 自己说 / 让模型定）也记
+    QuestionAnswered { id: u64, answer: crate::QuestionAnswer },
     /// 一轮结束时的统计：时间、模型、token 用量、这一轮用了多久
     /// （首页用量概览用；重放时挂到这一轮的回复下面）。
     /// 内核没报告模型 / 用量时对应字段为空 / 0；旧日志没有用时
@@ -188,6 +190,7 @@ impl Record {
                 | KernelEvent::PlanReplaced { .. }
                 | KernelEvent::PermissionAuto { .. }
                 | KernelEvent::PermissionRequest { .. }
+                | KernelEvent::UserQuestion { .. }
                 | KernelEvent::PromptFailed { .. }
                 | KernelEvent::Compacting
                 | KernelEvent::Compacted { .. }

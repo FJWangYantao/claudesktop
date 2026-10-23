@@ -44,6 +44,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   会话还没连上内核时先把这一项补进模式表（`model::auto_mode_entry`）并选中，`Started` 时走
   `Session::pending_mode` 交给内核（内核不认就退回它报的那个）；用户在下拉里改了就以此为准，
   内核重连（`detach_kernel`）时把当前模式重新挂上 `pending_mode`。
+- **向用户提问（`ask_user`）**：在 `Inner::run_tool` 开头拦截，不走 `start_tool` / `authorize`——「自动」模式的分类器
+  不能替用户答，也不发 `ToolCallStarted`（提问不占工具行）。事件是 `KernelEvent::UserQuestion`，应答走
+  `Kernel::resolve_question`；`Inner::pending` 按 `Reply` 分权限 / 提问两种。界面是 `ChatItem::Question`
+  （摘要模式也显示，`is_step` 为假），答完收成一行；`Record::QuestionAnswered` 记答案，`history::rebuild`
+  折成 `[tool] ask_user → …` 一行。选项「自己说」/ 取消用 `ToolOutput::fail_stop` 让这一轮当场结束。
+  子会话没有这个工具；聊天会话有。
 - **Markdown（`TextView`）**：字号、颜色、行高要直接设在 `TextView` 上（它实现了 `Styled`），
   设在外层 div 上不生效。
 - **回复里的远程图片**（`app/remote_image.rs` + `src/http.rs`）：`![](https://…)` 由

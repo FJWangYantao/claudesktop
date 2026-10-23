@@ -90,6 +90,59 @@ pub struct PartialGrant {
     pub hunks: Vec<u32>,
 }
 
+/// 向用户提问时的一个选项（`ask_user`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOptionView {
+    /// 按钮上的字（一句话）
+    pub label: String,
+    /// 按钮下面的灰字：说清后果
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// 向用户提的一个问题（一次工具调用里可以有 1～3 个）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionView {
+    /// 一句话，界面当标题
+    pub question: String,
+    /// 12 字以内，给侧栏 / 摘要用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// 2～4 个选项
+    pub options: Vec<QuestionOptionView>,
+}
+
+/// 用户对一次 [`KernelEvent::UserQuestion`] 的应答。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuestionAnswer {
+    /// 每题选中的选项下标（和 `questions` 一一对应）
+    Choices { choices: Vec<usize> },
+    /// 「自己说」：这一轮停在这里，下一条用户消息就是答案
+    SelfAnswer,
+    /// 「你来定」：让模型自己合理假设并继续
+    ModelDecides,
+    /// 取消这一轮
+    Cancelled,
+}
+
+impl QuestionAnswer {
+    /// 是不是真的选了（重放时据此决定卡片还点不点得动）
+    pub fn is_choices(&self) -> bool {
+        matches!(self, Self::Choices { .. })
+    }
+
+    /// 卡片答完那一行的中文说明（`None` = 还没答）
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Choices { .. } => "已选",
+            Self::SelfAnswer => "自己说",
+            Self::ModelDecides => "让模型自己定",
+            Self::Cancelled => "已取消",
+        }
+    }
+}
+
 /// 权限请求里「可以按块同意」的那部分：这次要写哪些文件、每个文件的块。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionHunks {
@@ -213,6 +266,16 @@ pub enum KernelEvent {
         /// `'~'` 分隔段，和逐块审查共用一份划分）。None = 不支持按块（ACP、命令类工具、旧日志）
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hunks: Option<PermissionHunks>,
+    },
+    /// 模型向你提问（`ask_user`）：等你经 [`Kernel::resolve_question`] 应答，这一轮阻塞在这里。
+    /// 和权限请求分开：它不进「自动」模式的分类器，也不能存成规则
+    UserQuestion {
+        /// 请求 ID（应答时回传）
+        id: u64,
+        /// 触发它的工具调用 ID（应答后结果并进那一行）；旧日志没有
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        questions: Vec<QuestionView>,
     },
     /// 客户端代执行的 fs 读请求结果
     FsRead { path: String, ok: bool },
@@ -373,6 +436,7 @@ impl KernelEvent {
             Self::PlanReplaced { .. } => "plan_replaced",
             Self::PermissionAuto { .. } => "permission_auto",
             Self::PermissionRequest { .. } => "permission_request",
+            Self::UserQuestion { .. } => "user_question",
             Self::FsRead { .. } => "fs_read",
             Self::FsWrite { .. } => "fs_write",
             Self::TurnEnded { .. } => "turn_ended",
@@ -611,6 +675,12 @@ pub trait Kernel: Send + Sync {
     ) -> anyhow::Result<()> {
         let _ = grant;
         self.resolve_permission(request_id, option_id)
+    }
+    /// 应答一个 [`KernelEvent::UserQuestion`]（自研内核的 `ask_user` 工具）。
+    /// 默认不支持：ACP 内核没有对应的提问通道。
+    fn resolve_question(&self, request_id: u64, answer: QuestionAnswer) -> anyhow::Result<()> {
+        let _ = (request_id, answer);
+        anyhow::bail!("这个内核不支持向用户提问")
     }
     /// 切换权限模式；结果经 `Status` 事件回报，不支持的 agent 会被忽略。
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()>;

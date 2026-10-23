@@ -300,6 +300,8 @@ pub struct TurnUsage {
 pub enum Activity {
     /// 有权限请求等用户应答
     WaitingPermission,
+    /// 模型问了问题，等用户选
+    WaitingQuestion,
     /// 思考、调工具，或刚发出还没回音
     Working,
     /// 正在输出正文
@@ -495,6 +497,24 @@ impl Session {
                         s.merge_permission(at);
                     }
                 }
+                Record::QuestionAnswered { id, answer } => {
+                    let at = s.transcript.iter().rposition(
+                        |i| matches!(i, ChatItem::Question { id: qid, answer: None, .. } if *qid == id),
+                    );
+                    if let Some(at) = at
+                        && let ChatItem::Question { picks, answer: slot, questions, .. } =
+                            &mut s.transcript[at]
+                    {
+                        *picks = match &answer {
+                            claudesktop_core::QuestionAnswer::Choices { choices } => choices
+                                .iter()
+                                .map(|n| (*n < questions.len()).then_some(*n))
+                                .collect(),
+                            _ => vec![None; questions.len()],
+                        };
+                        *slot = Some(answer);
+                    }
+                }
                 Record::Rewind { conversation, files, prompt, .. } => {
                     s.note(rewind_note(conversation, files, &prompt))
                 }
@@ -520,6 +540,11 @@ impl Session {
             match item {
                 ChatItem::Permission { resolved: r @ None, .. } => {
                     *r = Some("已取消".into());
+                    unfinished = true;
+                }
+                // 上次退出时还挂着的提问：内核那边早就没了这个请求，按取消收尾
+                ChatItem::Question { answer: a @ None, .. } => {
+                    *a = Some(claudesktop_core::QuestionAnswer::Cancelled);
                     unfinished = true;
                 }
                 ChatItem::Tool(card) if card.phase == ToolPhase::Running => {
@@ -748,6 +773,10 @@ impl Session {
     pub fn attention(&self, event: &KernelEvent) -> Option<String> {
         match event {
             KernelEvent::PermissionRequest { title, .. } => Some(format!("等你授权：{title}")),
+            KernelEvent::UserQuestion { questions, .. } => {
+                let first = questions.first().map(|q| q.question.as_str()).unwrap_or("");
+                Some(format!("等你回答：{first}"))
+            }
             KernelEvent::PromptFailed { message } => {
                 Some(format!("出错了：{}", preview_line(message).unwrap_or_default()))
             }
@@ -811,7 +840,13 @@ impl Session {
             return false;
         }
         match self.transcript[ix + 1..].iter().find(|i| {
-            !matches!(i, ChatItem::Note(_) | ChatItem::Failed { .. } | ChatItem::Compaction { .. })
+            !matches!(
+                i,
+                ChatItem::Note(_)
+                    | ChatItem::Failed { .. }
+                    | ChatItem::Compaction { .. }
+                    | ChatItem::Question { .. }
+            )
         }) {
             Some(ChatItem::User { .. }) => true,
             Some(_) => false,
@@ -921,6 +956,21 @@ impl Session {
             .position(|i| matches!(i, ChatItem::Permission { resolved: None, .. }))
     }
 
+    /// 在等用户处理：授权或回答问题（侧栏红点、通知都看这个）
+    pub fn waiting_user(&self) -> bool {
+        self.waiting_permission() || self.waiting_question()
+    }
+
+    /// 有还没回答的提问
+    pub fn waiting_question(&self) -> bool {
+        self.pending_question().is_some()
+    }
+
+    /// 最早一条还没回答的提问（数字键 / 回车应答的就是它）
+    pub fn pending_question(&self) -> Option<usize> {
+        self.transcript.iter().position(|i| matches!(i, ChatItem::Question { answer: None, .. }))
+    }
+
     /// 第 `idx` 条是刚发出去、这一轮还在跑的用户消息：返回发出的时刻（入场动画用）。
     pub fn fresh_user(&self, idx: usize) -> Option<Instant> {
         (self.busy && self.last_user() == Some(idx)).then_some(self.turn_started).flatten()
@@ -940,6 +990,9 @@ impl Session {
     pub fn activity(&self) -> Activity {
         if self.waiting_permission() {
             return Activity::WaitingPermission;
+        }
+        if self.waiting_question() {
+            return Activity::WaitingQuestion;
         }
         if self.retry.is_some() {
             return Activity::Retrying;
@@ -1055,6 +1108,21 @@ impl Session {
                     let state = resolved.as_deref().unwrap_or("待处理");
                     out += &format!("> 权限请求 `{title}`（{state}）\n\n");
                 }
+                ChatItem::Question { questions, answer, .. } => {
+                    out += "> **提问**\n";
+                    for (n, q) in questions.iter().enumerate() {
+                        let picked = match answer {
+                            Some(claudesktop_core::QuestionAnswer::Choices { choices }) => choices
+                                .get(n)
+                                .and_then(|i| q.options.get(*i))
+                                .map(|o| format!(" → {}", o.label)),
+                            Some(a) => format!("（{}）", a.label()),
+                            None => "（待回答）".to_string(),
+                        };
+                        out += &format!("> - {}{}\n", q.question, picked);
+                    }
+                    out += "\n";
+                }
                 ChatItem::Plan(rows) => {
                     out += "**计划**\n\n";
                     for row in rows.iter() {
@@ -1141,6 +1209,73 @@ impl Session {
         self.merge_permission(idx);
     }
 
+    /// 回答一次提问：把答案交给内核，卡片收成一行。
+    /// 内核那边已经不在了（重放出来的、或这一轮刚被停掉）时按取消收尾并说明一句。
+    pub fn resolve_question(
+        &mut self,
+        idx: usize,
+        answer: claudesktop_core::QuestionAnswer,
+        kernel: Option<&Arc<dyn Kernel>>,
+    ) {
+        let Some(ChatItem::Question { id, answer: slot, .. }) = self.transcript.get_mut(idx) else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let id = *id;
+        let Some(kernel) = kernel else {
+            return;
+        };
+        let (answer, err) = match kernel.resolve_question(id, answer.clone()) {
+            Ok(()) => (answer, None),
+            Err(err) => (claudesktop_core::QuestionAnswer::Cancelled, Some(err)),
+        };
+        if let Some(ChatItem::Question { answer: slot, .. }) = self.transcript.get_mut(idx) {
+            *slot = Some(answer);
+        }
+        if let Some(err) = err {
+            self.note(format!("这个提问已经不在内核那边了：{err}"));
+        }
+    }
+
+    /// 点选提问里第 `q` 题的第 `option` 个选项（还没提交时才动）。
+    pub fn pick_question(&mut self, idx: usize, q: usize, option: usize) {
+        let Some(ChatItem::Question { questions, picks, answer: None, .. }) =
+            self.transcript.get_mut(idx)
+        else {
+            return;
+        };
+        if questions.get(q).is_some_and(|item| option < item.options.len())
+            && let Some(slot) = picks.get_mut(q)
+        {
+            *slot = Some(option);
+        }
+    }
+
+    /// 数字键选选项：选第一道还没选的题，都选过了就改最后一题。
+    pub fn pick_question_key(&mut self, idx: usize, option: usize) {
+        let Some(ChatItem::Question { questions, picks, answer: None, .. }) =
+            self.transcript.get_mut(idx)
+        else {
+            return;
+        };
+        let q = picks.iter().position(|p| p.is_none()).unwrap_or(questions.len().saturating_sub(1));
+        if questions.get(q).is_some_and(|item| option < item.options.len())
+            && let Some(slot) = picks.get_mut(q)
+        {
+            *slot = Some(option);
+        }
+    }
+
+    /// 每题都选好了才能提交：返回每题选中的下标。
+    pub fn question_choices(&self, idx: usize) -> Option<Vec<usize>> {
+        let ChatItem::Question { picks, answer: None, .. } = self.transcript.get(idx)? else {
+            return None;
+        };
+        picks.iter().copied().collect()
+    }
+
     /// 应答过的权限请求并进它的工具行（工具行末尾出「已允许」之类的短标签），这一行不再画。
     /// 找不到工具行（旧日志没有工具 ID）、认不出选的是什么或应答失败时，照旧单独一行。
     fn merge_permission(&mut self, idx: usize) {
@@ -1200,6 +1335,16 @@ impl Session {
             }
         }
         self.merge_permissions();
+    }
+
+    /// 本轮结束 / 停止 / 内核出错时，还没回答的提问一律按「取消」收尾
+    /// （内核那边的阻塞已经解开了，再点也送不进去）。
+    pub fn cancel_pending_questions(&mut self) {
+        for item in &mut self.transcript {
+            if let ChatItem::Question { answer: a @ None, .. } = item {
+                *a = Some(claudesktop_core::QuestionAnswer::Cancelled);
+            }
+        }
     }
 
     /// 回退对话：对话截到第 `idx` 行之前（那条用户消息起都不要了），挂在这些行上的状态一并清掉。
@@ -1512,6 +1657,16 @@ impl Session {
                     keep: None,
                 });
             }
+            KernelEvent::UserQuestion { id, tool, questions } => {
+                self.finish_thinking();
+                self.transcript.push(ChatItem::Question {
+                    id,
+                    tool,
+                    picks: vec![None; questions.len()],
+                    questions,
+                    answer: None,
+                });
+            }
             KernelEvent::Compacting => {
                 self.finish_thinking();
                 self.transcript
@@ -1532,6 +1687,7 @@ impl Session {
                 self.busy = false;
                 self.stopping = false;
                 self.cancel_pending_permissions(kernel);
+                self.cancel_pending_questions();
                 self.interrupt_running_tools();
                 self.fail(message);
             }
@@ -1544,6 +1700,7 @@ impl Session {
                 // 用户停下的：「已请求停止」已经说过了，不再补一行「本轮结束：cancelled」
                 let stopped = std::mem::take(&mut self.stopping) && stop_reason == "cancelled";
                 self.cancel_pending_permissions(kernel);
+                self.cancel_pending_questions();
                 self.interrupt_running_tools();
                 if stop_reason != "end_turn" && !stopped {
                     self.note(format!("本轮结束：{stop_reason}"));
@@ -2898,6 +3055,66 @@ mod tests {
         s.busy = false;
         assert_eq!(s.pinned_plan(), None);
         assert!(!s.compute_layout(ViewMode::Normal)[1].compact);
+    }
+
+    #[core::prelude::v1::test]
+    fn replay_shows_questions_and_their_answers() {
+        let asked = |id: u64| {
+            ev(KernelEvent::UserQuestion {
+                id,
+                tool: None,
+                questions: vec![claudesktop_core::QuestionView {
+                    question: "走哪条？".into(),
+                    header: None,
+                    options: vec![
+                        claudesktop_core::QuestionOptionView {
+                            label: "重写".into(),
+                            description: None,
+                        },
+                        claudesktop_core::QuestionOptionView {
+                            label: "保留".into(),
+                            description: Some("还有引用".into()),
+                        },
+                    ],
+                }],
+            })
+        };
+        // 答过的：卡片留着，显示选中的项，不能再点
+        let s = Session::from_records(
+            7,
+            meta(),
+            vec![
+                Record::user("改一下"),
+                asked(3),
+                Record::QuestionAnswered {
+                    id: 3,
+                    answer: claudesktop_core::QuestionAnswer::Choices { choices: vec![1] },
+                },
+                ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+            ],
+            &Default::default(),
+        );
+        let item = s.transcript.iter().find_map(|i| match i {
+            ChatItem::Question { picks, answer, .. } => Some((picks.clone(), answer.clone())),
+            _ => None,
+        });
+        let (picks, answer) = item.expect("提问卡片应该在");
+        assert_eq!(picks, vec![Some(1)]);
+        assert_eq!(answer, Some(claudesktop_core::QuestionAnswer::Choices { choices: vec![1] }));
+        assert_eq!(s.pending_question(), None);
+
+        // 上次退出时还没答的：按取消收尾，并给一张「未完成」卡片
+        let s = Session::from_records(
+            7,
+            meta(),
+            vec![Record::user("改一下"), asked(4)],
+            &Default::default(),
+        );
+        assert_eq!(s.pending_question(), None);
+        assert!(s.transcript.iter().any(|i| matches!(
+            i,
+            ChatItem::Question { answer: Some(claudesktop_core::QuestionAnswer::Cancelled), .. }
+        )));
     }
 
     #[core::prelude::v1::test]

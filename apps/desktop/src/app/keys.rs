@@ -173,6 +173,15 @@ impl ChatApp {
     /// Alt+数字：按下权限卡上的第 `n` 个按钮（最早一条待定的请求；按钮顺序见 `chat.rs` 的
     /// `render_permission`，内核给的选项之后是「拒绝并说明」）。没有可按的就放行。
     fn answer_key(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 有提问先答提问（同一屏里两者不会同时挂着：内核是串行阻塞的）
+        if !self.settings_open
+            && let Some(idx) = self.session().pending_question()
+        {
+            let active = self.active;
+            self.sessions[active].pick_question_key(idx, n);
+            cx.notify();
+            return;
+        }
         let s = self.session();
         let target =
             s.pending_permission().filter(|_| !self.settings_open).and_then(|idx| {

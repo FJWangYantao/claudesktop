@@ -4,7 +4,9 @@
 //! 给模型看的说明与结果用英文（与系统提示词一致），给 UI 的摘要用中文。
 
 use claudesktop_core::memory::MAX_TEXT_CHARS;
-use claudesktop_core::{DiffHunk, DiffView, PermissionHunks, PlanEntryView};
+use claudesktop_core::{
+    DiffHunk, DiffView, PermissionHunks, PlanEntryView, QuestionAnswer, QuestionView,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -27,6 +29,7 @@ const GREP: &str = "grep";
 const WEB_FETCH: &str = "web_fetch";
 const WEB_SEARCH: &str = "web_search";
 pub const TODO_WRITE: &str = "todo_write";
+pub const ASK_USER: &str = "ask_user";
 pub const MEMORY_WRITE: &str = "memory_write";
 pub const MEMORY_SEARCH: &str = "memory_search";
 pub const MEMORY_FORGET: &str = "memory_forget";
@@ -187,15 +190,34 @@ pub struct ToolOutput {
     pub content: String,
     pub summary: String,
     pub images: Vec<OutputImage>,
+    /// 这一轮到此为止：工具结果已经写好，不要再请求模型（用户选了「自己说」/ 取消提问）
+    pub stop_turn: bool,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self { ok: true, content: content.into(), summary: summary.into(), images: Vec::new() }
+        Self {
+            ok: true,
+            content: content.into(),
+            summary: summary.into(),
+            images: Vec::new(),
+            stop_turn: false,
+        }
     }
 
     pub fn fail(content: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self { ok: false, content: content.into(), summary: summary.into(), images: Vec::new() }
+        Self {
+            ok: false,
+            content: content.into(),
+            summary: summary.into(),
+            images: Vec::new(),
+            stop_turn: false,
+        }
+    }
+
+    /// 同 [`ToolOutput::fail`]，并让这一轮停在这里（用户不再等模型继续说）。
+    pub fn fail_stop(content: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self { stop_turn: true, ..Self::fail(content, summary) }
     }
 }
 
@@ -276,6 +298,11 @@ pub fn specs(writable: bool) -> Vec<Value> {
                 },
                 "required": ["todos"]
             }),
+        ),
+        f(
+            ASK_USER,
+            ASK_USER_DESCRIPTION.into(),
+            ask_user_params(),
         ),
         f(
             GREP,
@@ -516,7 +543,7 @@ pub fn chat_specs(web: bool) -> Vec<Value> {
             "function": { "name": name, "description": description, "parameters": parameters },
         })
     };
-    let mut tools = Vec::new();
+    let mut tools = vec![f(ASK_USER, ASK_USER_DESCRIPTION.into(), ask_user_params())];
     if web {
         tools.push(f(
             WEB_FETCH,
@@ -615,7 +642,7 @@ pub fn chat_specs(web: bool) -> Vec<Value> {
 pub fn chat_allows(web: bool, name: &str) -> bool {
     match name {
         WEB_FETCH | WEB_SEARCH => web,
-        MEMORY_WRITE | MEMORY_SEARCH | MEMORY_FORGET => true,
+        MEMORY_WRITE | MEMORY_SEARCH | MEMORY_FORGET | ASK_USER => true,
         _ => false,
     }
 }
@@ -637,6 +664,154 @@ struct ShellOutputArgs {
     id: String,
     #[serde(default)]
     wait_secs: Option<u64>,
+}
+
+/// `ask_user` 的说明（Code / 聊天会话共用）。
+const ASK_USER_DESCRIPTION: &str = "Ask the user to choose between options when you need a decision you should not make \
+     yourself (which approach, which file, whether to run something risky). Blocks this turn until they answer. \
+     Do not use it to confirm a plan or to ask something you can find out yourself with a tool.";
+
+/// `ask_user` 的参数定义（Code / 聊天会话共用）。
+fn ask_user_params() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array", "minItems": 1, "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string", "description": "One sentence, shown as the card title" },
+                        "header": { "type": "string", "description": "At most 12 characters, for the summary line" },
+                        "options": {
+                            "type": "array", "minItems": 2, "maxItems": 4,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string", "description": "One line, the button text" },
+                                    "description": { "type": "string", "description": "Grey line under the button: what this choice means" }
+                                },
+                                "required": ["label"]
+                            }
+                        }
+                    },
+                    "required": ["question", "options"]
+                }
+            }
+        },
+        "required": ["questions"]
+    })
+}
+
+/// 一次最多问几题（再多不如分两次问，卡片也一屏放不下）。
+pub const ASK_USER_MAX_QUESTIONS: usize = 3;
+/// 每题最多几个选项（和权限卡的数字键位数对齐）。
+pub const ASK_USER_MAX_OPTIONS: usize = 4;
+
+#[derive(Deserialize)]
+struct AskUserArgs {
+    questions: Vec<AskUserQuestion>,
+}
+
+#[derive(Deserialize)]
+struct AskUserQuestion {
+    question: String,
+    #[serde(default)]
+    header: Option<String>,
+    options: Vec<AskUserOption>,
+}
+
+#[derive(Deserialize)]
+struct AskUserOption {
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// 解析 `ask_user` 的参数；错误信息指明哪个字段（直接回给模型）。
+pub fn parse_questions(arguments: &str) -> Result<Vec<QuestionView>, String> {
+    let args: AskUserArgs = serde_json::from_str(arguments)
+        .map_err(|e| format!("Invalid arguments for {ASK_USER}: {e}"))?;
+    if args.questions.is_empty() {
+        return Err(format!("{ASK_USER}: at least one question is required"));
+    }
+    if args.questions.len() > ASK_USER_MAX_QUESTIONS {
+        return Err(format!("{ASK_USER}: at most {ASK_USER_MAX_QUESTIONS} questions per call"));
+    }
+    let mut out = Vec::with_capacity(args.questions.len());
+    for (i, q) in args.questions.into_iter().enumerate() {
+        let n = i + 1;
+        if q.question.trim().is_empty() {
+            return Err(format!("{ASK_USER}: question {n} has no text"));
+        }
+        if q.options.len() < 2 {
+            return Err(format!("{ASK_USER}: question {n} needs at least 2 options"));
+        }
+        if q.options.len() > ASK_USER_MAX_OPTIONS {
+            return Err(format!(
+                "{ASK_USER}: question {n} has more than {ASK_USER_MAX_OPTIONS} options"
+            ));
+        }
+        let mut options = Vec::with_capacity(q.options.len());
+        for opt in q.options {
+            if opt.label.trim().is_empty() {
+                return Err(format!("{ASK_USER}: question {n} has an option with no label"));
+            }
+            options.push(claudesktop_core::QuestionOptionView {
+                label: opt.label.trim().to_string(),
+                description: opt
+                    .description
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty()),
+            });
+        }
+        out.push(QuestionView {
+            question: q.question.trim().to_string(),
+            header: q.header.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()),
+            options,
+        });
+    }
+    Ok(out)
+}
+
+/// 用户答完回给模型的内容和卡片摘要（中文）。
+pub fn question_result(questions: &[QuestionView], answer: &QuestionAnswer) -> (String, String) {
+    match answer {
+        QuestionAnswer::Choices { choices } => {
+            let mut lines = vec!["The user answered:".to_string()];
+            let mut picked = Vec::new();
+            for (i, q) in questions.iter().enumerate() {
+                let Some(label) = choices.get(i).and_then(|n| q.options.get(*n)) else {
+                    continue;
+                };
+                lines.push(format!("- {} → {}", q.question, label.label));
+                picked.push(format!("{} → {}", q.question, label.label));
+            }
+            if picked.is_empty() {
+                return (
+                    "The user did not pick an option. Ask again only if it really matters, otherwise \
+                     make a reasonable assumption and say so."
+                        .into(),
+                    "问了一下（没选）".into(),
+                );
+            }
+            (lines.join("\n"), format!("问了一下：{}", picked.join("；")))
+        }
+        QuestionAnswer::SelfAnswer => (
+            "The user will answer in their next message. Stop here and ask nothing else.".into(),
+            "问了一下（等用户回答）".into(),
+        ),
+        QuestionAnswer::ModelDecides => (
+            "The user let you decide. Pick the option you think is best, say which one and why in one \
+             line, and continue."
+                .into(),
+            "问了一下（让模型自己定）".into(),
+        ),
+        QuestionAnswer::Cancelled => (
+            "Cancelled by the user. Do not retry; wait for their next message.".into(),
+            "问了一下（未回答）".into(),
+        ),
+    }
 }
 
 /// 清单里还有没做完的项。
@@ -2487,6 +2662,62 @@ mod tests {
         assert!(parse_todos(r#"{"items":[]}"#).unwrap_err().contains("todo_write"));
         // Plan 模式也能用
         assert!(specs(false).iter().any(|t| t["function"]["name"] == TODO_WRITE));
+    }
+
+    #[test]
+    fn ask_user_parses_and_validates() {
+        let ok = parse_questions(
+            r#"{"questions":[{"question":"走哪条？","options":[{"label":"重写"},{"label":"保留","description":"还有引用"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].options.len(), 2);
+        assert_eq!(ok[0].options[1].description.as_deref(), Some("还有引用"));
+
+        let err = |json: &str| parse_questions(json).unwrap_err();
+        // 没题 / 题太多
+        assert!(err(r#"{"questions":[]}"#).contains("at least one"));
+        assert!(err(
+            r#"{"questions":[{"question":"a","options":[{"label":"x"},{"label":"y"}]},{"question":"b","options":[{"label":"x"},{"label":"y"}]},{"question":"c","options":[{"label":"x"},{"label":"y"}]},{"question":"d","options":[{"label":"x"},{"label":"y"}]}]}"#
+        )
+        .contains("at most 3"));
+        // 选项太少 / 太多
+        assert!(
+            err(r#"{"questions":[{"question":"a","options":[{"label":"x"}]}]}"#)
+                .contains("at least 2")
+        );
+        assert!(err(
+            r#"{"questions":[{"question":"a","options":[{"label":"1"},{"label":"2"},{"label":"3"},{"label":"4"},{"label":"5"}]}]}"#
+        )
+        .contains("more than 4"));
+        // 空 label / 空问题
+        assert!(
+            err(r#"{"questions":[{"question":"a","options":[{"label":" "},{"label":"y"}]}]}"#)
+                .contains("no label")
+        );
+        assert!(
+            err(r#"{"questions":[{"question":"  ","options":[{"label":"x"},{"label":"y"}]}]}"#)
+                .contains("no text")
+        );
+        // Plan 模式、聊天会话都给
+        assert!(specs(false).iter().any(|t| t["function"]["name"] == ASK_USER));
+        assert!(chat_specs(false).iter().any(|t| t["function"]["name"] == ASK_USER));
+    }
+
+    #[test]
+    fn question_result_lists_the_picked_labels() {
+        let questions = parse_questions(
+            r#"{"questions":[{"question":"走哪条？","options":[{"label":"重写"},{"label":"保留"}]},{"question":"删掉吗？","options":[{"label":"删"},{"label":"留"}]}]}"#,
+        )
+        .unwrap();
+        let (content, summary) =
+            question_result(&questions, &QuestionAnswer::Choices { choices: vec![0, 1] });
+        assert!(content.contains("走哪条？ → 重写"));
+        assert!(content.contains("删掉吗？ → 留"));
+        assert_eq!(summary, "问了一下：走哪条？ → 重写；删掉吗？ → 留");
+        let (content, summary) = question_result(&questions, &QuestionAnswer::Cancelled);
+        assert!(content.contains("Cancelled by the user"));
+        assert!(summary.contains("未回答"));
     }
 
     #[test]
