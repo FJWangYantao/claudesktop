@@ -219,7 +219,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   它们按 **rem** 取值，`0.5` 档是 8px 而非 4px——算间距时注意基准不是 16px 的整数倍。
   不要再把"搜不到定义"当成渲染塌陷的证据：早先正是据此误判顶栏渲染坏了，
   实际是探针里的 `top_bar()` 从未被 `render()` 调用（死代码）。
-- **gpui-pre 是打过补丁的本地拷贝**（`vendor/gpui-pre`，经 `[patch.crates-io]`；现在只改了中文避头尾）。
+- **gpui-pre / gpui-pre-windows 是打过补丁的本地拷贝**（`vendor/`，经 `[patch.crates-io]`；改了中文避头尾、Windows 上文字纵向位置不算字体 lineGap）。
   改 gpui 本身的行为照此办理：改动标 `claudesktop patch`，记进 `vendor/README.md`，升级时按标记重打。
 - **gpui 没有 CSS**，抄网页上的写法前先看这张表（对照结论见「调研报告-Claude前端CSS手法对照.md」）：
   - **做不到**：`mask-image`（只有矩形 `ContentMask`，渐隐只能拿背景色渐变覆盖层近似）、

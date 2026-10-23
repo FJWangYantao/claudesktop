@@ -18,6 +18,7 @@ serde_json = "1"
 futures = "0.3"
 smol = "2"
 
-# 中文避头尾：换行逻辑在 gpui-pre 里，拷一份改（改了什么、怎么升级见 vendor/README.md）
+# 打过补丁的 gpui：中文避头尾（gpui-pre）、文字纵向位置不算 lineGap（gpui-pre-windows）。改了什么、怎么升级见 vendor/README.md
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
