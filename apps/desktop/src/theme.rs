@@ -698,10 +698,17 @@ pub fn raised_shadow() -> Vec<BoxShadow> {
 ///
 /// 描边宽度不跟字号走，所以这里是少数**该用 `px`** 的地方。
 /// `accent` 传 `INK_FAINT`（输入框这种中性的）/ `CORAL`（按钮、链接）/ `RED`（危险操作）。
+/// ① 的间隙色默认是 `CARD`（输入框、卡片、弹层都是卡片底）；放在纸底上的元素用
+/// [`focus_ring_on`] 传 `PAPER`，否则会看到一道比周围更浅的缝。
 pub fn focus_ring(accent: Color) -> Vec<BoxShadow> {
+    focus_ring_on(accent, CARD)
+}
+
+/// 同 [`focus_ring`]，间隙色自己给（见那里的说明）。
+pub fn focus_ring_on(accent: Color, gap: Color) -> Vec<BoxShadow> {
     let line = hsla_of(accent);
     vec![
-        BoxShadow::new(px(0.), px(0.), hsla_of(PAPER)).spread_radius(px(1.)).inset(),
+        BoxShadow::new(px(0.), px(0.), hsla_of(gap)).spread_radius(px(1.)).inset(),
         BoxShadow::new(px(0.), px(0.), line).spread_radius(px(1.)),
         BoxShadow::new(px(0.), px(0.), line.alpha(line.a * 0.4))
             .blur_radius(px(3.))
@@ -890,10 +897,11 @@ mod tests {
         set_dark(false);
         let ring = focus_ring(CORAL);
         assert_eq!(ring.len(), 3);
-        // ① 内挖：1px spread、无模糊
+        // ① 内挖：1px spread、无模糊、底色取卡片底（输入框的底）
         assert!(ring[0].inset);
         assert_eq!(ring[0].spread_radius, px(1.));
         assert_eq!(ring[0].blur_radius, px(0.));
+        assert_eq!(ring[0].color, hsla_of(CARD));
         // ② 实边：1px、无模糊、不 inset
         assert!(!ring[1].inset);
         assert_eq!(ring[1].spread_radius, px(1.));
@@ -901,5 +909,7 @@ mod tests {
         // ③ 光晕：CSS 的 6px 减半成 σ 3px，40% 透明度
         assert_eq!(ring[2].blur_radius, px(3.));
         assert!((ring[2].color.a - 0.4).abs() < 1e-4);
+        // 放在纸底上的元素换间隙色
+        assert_eq!(focus_ring_on(CORAL, PAPER)[0].color, hsla_of(PAPER));
     }
 }
