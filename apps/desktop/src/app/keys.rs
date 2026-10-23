@@ -46,6 +46,10 @@ actions!(
         AnswerPermission2,
         AnswerPermission3,
         AnswerPermission4,
+        /// 输入框：在光标处重新展开 `/` `@` 补全（Alt+←）
+        ExpandCompletion,
+        /// 输入框：收起 `/` `@` 补全，不填入（Alt+→）
+        CollapseCompletion,
     ]
 );
 
@@ -72,6 +76,17 @@ pub(super) const PERMISSION_KEYS: [&str; 4] = ["alt-1", "alt-2", "alt-3", "alt-4
 /// （`MoveUp` / `MoveDown`），在 `complete_view.rs` 的 `capture_action` 里接管，
 /// 所以这里只是速查表用的文案常量，**不进 `bind()`**。
 pub(super) const INPUT_HISTORY_KEYS: [&str; 2] = ["up", "down"];
+/// 输入框里展开 / 收起 `/` `@` 补全（在输入框卡片上处理，见 `complete_view.rs`）。
+/// 不用裸 ← / →（那是移光标），也不用 Ctrl+← / →（输入框自己绑了按词移动）；
+/// macOS 上 Alt+← / → 被输入框占了按词移动，退到 Ctrl+Alt+← / →
+#[cfg(target_os = "macos")]
+pub(super) const EXPAND_COMPLETION_KEY: &str = "ctrl-alt-left";
+#[cfg(target_os = "macos")]
+pub(super) const COLLAPSE_COMPLETION_KEY: &str = "ctrl-alt-right";
+#[cfg(not(target_os = "macos"))]
+pub(super) const EXPAND_COMPLETION_KEY: &str = "alt-left";
+#[cfg(not(target_os = "macos"))]
+pub(super) const COLLAPSE_COMPLETION_KEY: &str = "alt-right";
 
 /// 注册按键（应用启动时调用一次）。`secondary` 在 macOS 上是 Cmd，其余平台是 Ctrl。
 pub(crate) fn bind(cx: &mut App) {
@@ -94,6 +109,9 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(PERMISSION_KEYS[1], AnswerPermission2, Some(CONTEXT)),
         KeyBinding::new(PERMISSION_KEYS[2], AnswerPermission3, Some(CONTEXT)),
         KeyBinding::new(PERMISSION_KEYS[3], AnswerPermission4, Some(CONTEXT)),
+        // 补全列表的展开 / 收起：只在输入框卡片上处理（`complete_view.rs` 的 capture）
+        KeyBinding::new(EXPAND_COMPLETION_KEY, ExpandCompletion, Some(CONTEXT)),
+        KeyBinding::new(COLLAPSE_COMPLETION_KEY, CollapseCompletion, Some(CONTEXT)),
     ]);
 }
 

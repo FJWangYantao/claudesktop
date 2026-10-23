@@ -53,6 +53,53 @@ pub fn trigger_at(text: &str, cursor: usize) -> Option<Trigger> {
     Some(Trigger { kind: TriggerKind::Mention, range: start..end, query: word[1..].to_string() })
 }
 
+/// 光标所在（或正好停在开头 / 末尾）的那个 `/` `@` 触发词的字节范围 `(start, end)`。
+///
+/// 和 [`trigger_at`] 的区别：这里只认「空白分隔的一个词」，不看光标前有没有内容，
+/// 所以光标停在词首（`text[..cursor]` 里还没有 `@`）时也能认出整词——左右键的「按词移动」要用它。
+pub fn token_bounds(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = text[..cursor]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let end = cursor + text[cursor..].find(char::is_whitespace).unwrap_or(text.len() - cursor);
+    if !text[start..end].starts_with(['/', '@']) {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// 从 `at` 往前跳到上一个词的**词尾**（越过光标前的空白，落在上一个词最后一个字后面）。
+/// 已经在最前面时原地不动。
+pub fn prev_word_end(text: &str, at: usize) -> usize {
+    let at = at.min(text.len());
+    text[..at]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8())
+}
+
+/// 从 `at` 往后跳到下一个词的**词首**（越过光标后的空白，落在下一个词第一个字前面）。
+/// 已经在最后时原尾不动。
+pub fn next_word_start(text: &str, at: usize) -> usize {
+    let at = at.min(text.len());
+    at + text[at..].find(|c: char| !c.is_whitespace()).unwrap_or(text.len() - at)
+}
+
+/// 上下键该选第几项：列表里两项以上才动（`None` = 不截这个键，交给输入框移光标）。
+pub fn step_index(len: usize, selected: usize, delta: isize) -> Option<usize> {
+    if len < 2 {
+        return None;
+    }
+    Some((selected as isize + delta).rem_euclid(len as isize) as usize)
+}
+
 /// 列工作区里的文件（相对路径、正斜杠），跳过隐藏目录和常见的构建 / 依赖目录，最多 `limit` 个。
 pub fn list_files(root: &Path, limit: usize) -> Vec<String> {
     const SKIP: [&str; 8] =
@@ -161,6 +208,52 @@ mod tests {
         assert_eq!((t.range, t.query.as_str()), (0..4, "a"));
         assert_eq!(trigger_at("a@b", 3), None);
         assert_eq!(trigger_at("@a b", 4), None);
+    }
+
+    #[test]
+    fn token_bounds_cover_the_whole_word() {
+        // 光标在词中间、词首、词尾都认得出同一个词
+        assert_eq!(token_bounds("/mod", 2), Some((0, 4)));
+        assert_eq!(token_bounds("/mod", 0), Some((0, 4)));
+        assert_eq!(token_bounds("/mod", 4), Some((0, 4)));
+        assert_eq!(token_bounds("@src/main.rs", 5), Some((0, 12)));
+        // 多字节：`中文 /设置` 的 `/设置` 是 12..18
+        let text = "中文 /设置";
+        assert_eq!(token_bounds(text, text.len()), Some((7, text.len())));
+        // 中间那个词
+        assert_eq!(token_bounds("a /x b", 4), Some((2, 4)));
+        // 光标不在触发词的范围里（在别的词上）
+        assert_eq!(token_bounds("a /x b", 1), None);
+        assert_eq!(token_bounds("@a b", 3), None);
+        // 连着几个触发符也算一个词
+        assert_eq!(token_bounds("@@@", 1), Some((0, 3)));
+        // 光标落在多字节字符中间
+        assert_eq!(token_bounds("@设置", 2), None);
+    }
+
+    #[test]
+    fn word_jumps_skip_whitespace() {
+        let text = "看 @src/ma 里的";
+        // 从词尾往前走：越过空格落到上一个词最后一个字后面
+        let tail = text.find(" 里").unwrap();
+        assert_eq!(prev_word_end(text, tail), tail);
+        assert_eq!(prev_word_end(text, text.find('里').unwrap()), tail);
+        assert_eq!(prev_word_end(text, 0), 0);
+        // 往后：越过空格落到下一个词第一个字前面
+        assert_eq!(next_word_start(text, tail), text.find('里').unwrap());
+        assert_eq!(next_word_start(text, text.len()), text.len());
+        // 多行：换行也算空白
+        assert_eq!(prev_word_end("a\nb", 3), 3);
+        assert_eq!(next_word_start("a\nb", 1), 2);
+    }
+
+    #[test]
+    fn step_needs_two_items() {
+        assert_eq!(step_index(1, 0, 1), None);
+        assert_eq!(step_index(0, 0, 1), None);
+        assert_eq!(step_index(2, 0, 1), Some(1));
+        assert_eq!(step_index(2, 0, -1), Some(1));
+        assert_eq!(step_index(3, 2, 1), Some(0));
     }
 
     #[test]

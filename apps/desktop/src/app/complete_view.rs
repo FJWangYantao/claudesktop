@@ -4,15 +4,28 @@
 //! 键盘接管：输入框把上下键 / 回车 / Tab / Esc 绑成了自己的动作（`MoveUp` / `Enter` …），
 //! 列表开着时在输入框卡片上用 `capture_action` 先截下来（动作分发先走 capture 阶段，
 //! 从根到焦点），处理了就 `stop_propagation`，输入框收不到；列表没开时放行。
+//!
+//! 键位与谁管：
+//! - ↑ / ↓：列表里两项以上才截走（选上 / 下一项）；只有一项时放行给输入框移光标，列表不动。
+//!   其余情况按「设计说明-输入框方向键.md」的顺序判定（历史回溯 → 按显示行移动）。
+//! - ← / →：一律放行（光标照常移），但 capture 里登记一次 `defer_in`，光标挪完再对一次触发词——
+//!   移出 `/` `@` 的范围就收起列表，移回来再弹（`sync_completion`）。输入框不广播光标事件，
+//!   所以只能这样补。
+//! - Ctrl+回车：跳过「接受补全」，直接发送（输入框把 `secondary-enter` 绑成了 `Enter{secondary}`，
+//!   我们别截它就是发送）。
+//! - Alt+← / Alt+→：在光标处重新展开 / 收起列表（绑定在 `keys.rs`，处理在这里，只在输入框卡片上生效）。
 
 use super::ChatApp;
+use super::keys::{CollapseCompletion, ExpandCompletion};
 use crate::complete::{self, Trigger, TriggerKind};
 use crate::model::ViewMode;
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
-use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Position};
+use gpui_kit::component::input::{
+    Enter, Escape, IndentInline, MoveDown, MoveLeft, MoveRight, MoveUp, Position,
+};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -291,11 +304,23 @@ impl ChatApp {
             let text = state.value().to_string();
             let (start, end) = (range.start.min(text.len()), range.end.min(text.len()));
             let next = format!("{}{with}{}", &text[..start], &text[end..]);
-            let before = &next[..start + with.len()];
-            let line = before.matches('\n').count() as u32;
-            let column = before.rsplit('\n').next().unwrap_or(before).chars().count() as u32;
+            let position = position_of(&next, start + with.len());
             state.set_value(next, window, cx);
-            state.set_cursor_position(Position::new(line, column), window, cx);
+            state.set_cursor_position(position, window, cx);
+        });
+    }
+
+    /// 光标挪到字节偏移 `offset`（换行 / 多字节都算对）。`text` 是输入框当前内容。
+    fn set_input_cursor(
+        &mut self,
+        text: &str,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = position_of(text, offset);
+        self.input.update(cx, |state, cx| {
+            state.set_cursor_position(position, window, cx);
         });
     }
 
@@ -311,9 +336,26 @@ impl ChatApp {
         .capture_action(
             cx.listener(|this, _: &MoveDown, window, cx| this.step_completion(1, window, cx)),
         )
+        .capture_action(cx.listener(|this, _: &MoveLeft, window, cx| this.on_arrow(-1, window, cx)))
+        .capture_action(cx.listener(|this, _: &MoveRight, window, cx| this.on_arrow(1, window, cx)))
+        // Alt+← / Alt+→：在光标处重新展开 / 收起列表（键位绑在 keys.rs）
+        .capture_action(cx.listener(|this, _: &ExpandCompletion, _, cx| this.expand_completion(cx)))
+        .capture_action(
+            cx.listener(|this, _: &CollapseCompletion, _, cx| this.collapse_completion(cx)),
+        )
         .capture_action(cx.listener(|this, action: &Enter, window, cx| {
             // Shift+回车照常换行
             if action.shift {
+                return;
+            }
+            // Ctrl+回车：不认补全，直接发送。输入框把 `secondary-enter` 绑成了
+            // `Enter { secondary: true }`，它照常发 `PressEnter`（见 mod.rs 的事件订阅），
+            // 所以这里只是不截它；开着的列表顺手收起，别留一张悬空的列表
+            if action.secondary {
+                if this.completion.open.take().is_some() {
+                    this.completion.dismissed = Some(this.input.read(cx).value().to_string());
+                    this.refresh_composer(cx);
+                }
                 return;
             }
             this.accept_selected(window, cx);
@@ -371,12 +413,16 @@ impl ChatApp {
     ///    移完光标没动（已经在第一 / 最后一个显示行）就补一步：↑ 到开头、↓ 到末尾。
     ///    走到开头 / 末尾之后**再按一次**才换历史。
     fn step_completion(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        // 1. 补全列表：两项以上才接管
-        if let Some(c) = self.completion.open.as_mut()
-            && c.items.len() >= 2
-        {
-            let n = c.items.len() as isize;
-            c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
+        // 1. 补全列表：两项以上才接管（只有一项时放行给输入框移光标，列表保持不动）
+        let next = self
+            .completion
+            .open
+            .as_ref()
+            .and_then(|c| complete::step_index(c.items.len(), c.selected, delta));
+        if let Some(next) = next {
+            if let Some(c) = self.completion.open.as_mut() {
+                c.selected = next;
+            }
             cx.stop_propagation();
             self.refresh_composer(cx);
             return;
@@ -432,9 +478,7 @@ impl ChatApp {
     fn move_caret(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |state, cx| {
             let text = state.value().to_string();
-            let offset = offset.min(text.len());
-            let (line, column) = cursor_line_column(&text, offset);
-            state.set_cursor_position(Position::new(line, column), window, cx);
+            state.set_cursor_position(position_of(&text, offset), window, cx);
         });
         self.refresh_composer(cx);
     }
@@ -453,6 +497,102 @@ impl ChatApp {
         self.input.update(cx, |state, cx| state.set_value(text, window, cx));
         self.completion.open = None;
         self.move_caret(if to_end { text.len() } else { 0 }, window, cx);
+        self.refresh_composer(cx);
+    }
+
+    /// ← / →：光标在触发词的开头（←）/ 末尾（→）时按词跳，其余照常放行给输入框移一格。
+    /// 无论哪种，光标挪完都要再对一次触发词（移出 `/` `@` 的范围就把列表收起，移回来再弹）。
+    fn on_arrow(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.jump_by_word(delta, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        // 输入框不广播光标事件（`InputEvent` 只有 Change / PressEnter / Focus / Blur）：
+        // 键放行给输入框，光标挪完再比对一次。按键是人手打发，一次内容拷贝不心疼
+        cx.defer_in(window, |this, _, cx| this.sync_completion(cx));
+    }
+
+    /// 光标正好在触发词的开头（`delta < 0`）/ 末尾（`delta > 0`）时跳到上 / 下一个词，
+    /// 返回是否跳了。跳出去之后列表就跟着收起（`sync_completion`）。
+    fn jump_by_word(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let (text, cursor, selection) = {
+            let input = self.input.read(cx);
+            (input.value().to_string(), input.cursor(), input.selected_range())
+        };
+        if !selection.is_empty() {
+            return false;
+        }
+        let Some((start, end)) = complete::token_bounds(&text, cursor) else {
+            return false;
+        };
+        let target = if delta < 0 {
+            if cursor != start {
+                return false;
+            }
+            complete::prev_word_end(&text, start)
+        } else {
+            if cursor != end {
+                return false;
+            }
+            complete::next_word_start(&text, end)
+        };
+        if target == cursor {
+            return false;
+        }
+        self.set_input_cursor(&text, target, window, cx);
+        self.sync_completion(cx);
+        true
+    }
+
+    /// 光标挪过之后对一次触发词：触发词没变（种类、范围、查询都一样）就什么都不做，
+    /// 换了 / 没了就重算。别的地方（打字）走 `update_completion`，这里只补「只动了光标」这一类
+    /// （Esc / Alt+→ 收起过的那份内容由 `update_completion` 开头的 `dismissed` 判断挡住，不会自己弹回来）。
+    fn sync_completion(&mut self, cx: &mut Context<Self>) {
+        let (text, cursor) = {
+            let input = self.input.read(cx);
+            (input.value().to_string(), input.cursor())
+        };
+        let open = self.completion.open.as_ref().map(|c| c.trigger.clone());
+        let same = match (&open, complete::trigger_at(&text, cursor)) {
+            (Some(open), Some(now)) => {
+                now.kind == open.kind && now.range == open.range && now.query == open.query
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.update_completion(cx);
+        }
+    }
+
+    /// Alt+←：光标处有触发词时重新展开列表（按 Esc / Alt+→ 收起过的那份内容也照弹）。
+    fn expand_completion(&mut self, cx: &mut Context<Self>) {
+        let (text, cursor) = {
+            let input = self.input.read(cx);
+            (input.value().to_string(), input.cursor())
+        };
+        if complete::trigger_at(&text, cursor).is_none() {
+            cx.propagate();
+            return;
+        }
+        cx.stop_propagation();
+        // 已经开着就不用再建一遍（免得选中项被重置）
+        if self.completion.open.is_some() {
+            return;
+        }
+        // 明确要它弹出来：先把 Esc 收起时的快照清掉，不然 update_completion 会当场返回
+        self.completion.dismissed = None;
+        self.update_completion(cx);
+    }
+
+    /// Alt+→：收起列表（只收起，不填入）。和 Esc 一样留下快照，光标来回挪不会再弹回来。
+    fn collapse_completion(&mut self, cx: &mut Context<Self>) {
+        if self.completion.open.take().is_none() {
+            cx.propagate();
+            return;
+        }
+        cx.stop_propagation();
+        self.completion.dismissed = Some(self.input.read(cx).value().to_string());
         self.refresh_composer(cx);
     }
 
@@ -490,7 +630,11 @@ impl ChatApp {
                     .text_size(TEXT_META)
                     .text_color(rgb(INK_SOFT))
                     .child(heading)
-                    .child("↑↓ 选择 · 回车 / Tab 确认 · Esc 关闭"),
+                    .child(if c.items.len() >= 2 {
+                        "↑↓ 选择 · 回车 / Tab 确认 · Esc 关闭"
+                    } else {
+                        "Tab 填入 · Esc 关闭"
+                    }),
             );
         for (i, item) in c.items.iter().enumerate() {
             let selected = i == c.selected;
@@ -553,6 +697,12 @@ fn cursor_line_column(text: &str, offset: usize) -> (u32, u32) {
     (line, column)
 }
 
+/// 字节偏移 → 输入框的光标位置（第几行、第几个字）。
+fn position_of(text: &str, offset: usize) -> Position {
+    let (line, column) = cursor_line_column(text, offset);
+    Position::new(line, column)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +722,14 @@ mod tests {
         assert_eq!(cursor_line_column("中文\n好", "中文\n好".len()), (1, 1));
         // 偏移落在多字节字符中间：向前取整，不 panic
         assert_eq!(cursor_line_column("中文\n好", 1), (0, 0));
+    }
+
+    /// 光标位置：换行算行、多字节按字算列，超出末尾夹到末尾
+    #[core::prelude::v1::test]
+    fn position_counts_lines_and_chars() {
+        assert_eq!(position_of("/mode", 0), Position::new(0, 0));
+        assert_eq!(position_of("a\nbc", 4), Position::new(1, 2));
+        assert_eq!(position_of("@设置", 4), Position::new(0, 2));
+        assert_eq!(position_of("ab", 99), Position::new(0, 2));
     }
 }
