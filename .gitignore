@@ -15,3 +15,6 @@ tools/ascii-shot.ps1
 
 # 本机状态（记忆、日志等），不进仓库
 /.claudesktop/
+
+# 一次性调研：Claude Code 前端构建产物的静态分析原文（270 KB，无引用）
+/调研报告-Claude-Code前端.md
