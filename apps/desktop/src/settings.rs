@@ -695,10 +695,11 @@ pub enum ThemeChoice {
     Catppuccin,
     Github,
     Pure,
+    Lavender,
 }
 
 impl ThemeChoice {
-    pub const ALL: [ThemeChoice; 8] = [
+    pub const ALL: [ThemeChoice; 9] = [
         Self::Warm,
         Self::Flexoki,
         Self::RosePine,
@@ -707,6 +708,7 @@ impl ThemeChoice {
         Self::Catppuccin,
         Self::Github,
         Self::Pure,
+        Self::Lavender,
     ];
 
     pub fn index(self) -> usize {
@@ -723,6 +725,7 @@ impl ThemeChoice {
             Self::Catppuccin => "拿铁 / 摩卡",
             Self::Github => "GitHub",
             Self::Pure => "纯白",
+            Self::Lavender => "薰衣草",
         }
     }
 
@@ -736,6 +739,7 @@ impl ThemeChoice {
             Self::Catppuccin => "Catppuccin · 粉彩紫",
             Self::Github => "GitHub · 纯白底配浅灰和链接蓝",
             Self::Pure => "纯白 · 只有灰阶，没有彩色强调",
+            Self::Lavender => "薰衣草 · 淡紫玻璃，偏冷",
         }
     }
 
@@ -749,6 +753,7 @@ impl ThemeChoice {
             "catppuccin" => Self::Catppuccin,
             "github" => Self::Github,
             "pure" | "pure_white" | "purewhite" => Self::Pure,
+            "lavender" | "purple" => Self::Lavender,
             _ => return None,
         })
     }
@@ -1211,7 +1216,9 @@ mod tests {
         assert_eq!(ThemeChoice::parse("pure"), Some(ThemeChoice::Pure));
         assert_eq!(ThemeChoice::parse("nope"), None);
         // 新加的配色也走一遍 key 往返（顺序和 `theme::PALETTES` 对齐）
-        for (t, key) in [(ThemeChoice::Github, "github"), (ThemeChoice::Pure, "pure")] {
+        for (t, key) in
+            [(ThemeChoice::Github, "github"), (ThemeChoice::Pure, "pure"), (ThemeChoice::Lavender, "lavender")]
+        {
             assert_eq!(ThemeChoice::parse(key), Some(t));
             let s = Settings { theme: t, ..Default::default() };
             s.save(&path).unwrap();

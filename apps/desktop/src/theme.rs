@@ -359,9 +359,49 @@ const PURE: Palette = Palette {
     ..WARM
 };
 
+/// 薰衣草（淡紫玻璃观感：偏紫的纸底、浅紫凹面、紫强调色）
+///
+/// 取自 Kero 主窗口那层「淡紫 + 半透明白」的观感。注意那层紫有大半是玻璃染色叠出来的
+/// （`mygo/plugins/glass` 按背景亮度染色，配合 `Vibrancy` 和背景壁纸），Kero 也没有
+/// 暴露可改的 UI 配色，所以**没有一份可提取的固定色值**——这套是照着观感自建的。
+/// 本仓库没有半透明窗口，只能给不透明近似：底和凹面往紫里压、卡片保持近白，靠这三档拉层次。
+/// 强调色参照 Kero 的紫标签色 `#8257e6`（浅）/ `#b493ff`（深）——`#8257e6` 上白字只有
+/// 4.1:1，所以带文字的按钮底再压一档到 `#6f43d9`。
+const LAVENDER: Palette = Palette {
+    paper: s(0xF7F3FC, 0x1A1722),
+    sand: s(0xEFE7F8, 0x140F1B),
+    sand_active: s(0xE6DBF4, 0x2E2740),
+    card: s(0xFDFBFF, 0x241F30),
+    coral: s(0x8257E6, 0xB493FF),
+    coral_deep: s(0x6F43D9, 0x9B78F0),
+    coral_deep_hover: s(0x5E35C7, 0xAF94F5),
+    on_accent: s(0xFFFFFF, 0x1A1722),
+    ink: s(0x2A2340, 0xEDE8F7),
+    ink_soft: s(0x635A78, 0xBCB2D0),
+    ink_faint: s(0xA79DBB, 0x7A7192),
+    line: s(0xE3D9F0, 0x37304A),
+    line_strong: s(0xCDC0E0, 0x4A4162),
+    code_bg: s(0xF0EAF8, 0x140F1B),
+    hover: s(0xEFE7F8, 0x2A2438),
+    hover_strong: s(0xE0D4F2, 0x3A3250),
+    selection: s(0xDCCDF6, 0x3B2F5C),
+    heat1: s(0xDCCDF6, 0x332850),
+    heat2: s(0xB99BF0, 0x4F3D80),
+    heat3: s(0x8B63E0, 0x7657B8),
+    heat4: s(0x6340BE, 0xB493FF),
+    green: s(0x2E7D4F, 0x7BC79B),
+    red: s(0xC0392B, 0xF08578),
+    danger: s(0xC0392B, 0xB33A2E),
+    diff_add_bg: s(0xE3F5E9, 0x1E2A24),
+    diff_add_fg: s(0x2E7D4F, 0x7BC79B),
+    diff_del_bg: s(0xFBE4E1, 0x332022),
+    diff_del_fg: s(0xA33A2E, 0xF08578),
+    ..WARM
+};
+
 /// 顺序和 `settings::ThemeChoice::ALL` 一致（`ThemeChoice::index` 取下标）。
-pub static PALETTES: [Palette; 8] =
-    [WARM, FLEXOKI, ROSE_PINE, EVERFOREST, NORD, CATPPUCCIN, GITHUB, PURE];
+pub static PALETTES: [Palette; 9] =
+    [WARM, FLEXOKI, ROSE_PINE, EVERFOREST, NORD, CATPPUCCIN, GITHUB, PURE, LAVENDER];
 
 static PALETTE: AtomicUsize = AtomicUsize::new(0);
 
