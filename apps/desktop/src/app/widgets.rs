@@ -132,3 +132,34 @@ impl MeasuredWidth {
         .inset_0()
     }
 }
+
+/// 元素上沿在窗口里的位置（顶栏以下还能放多高）。用法同 [`MeasuredWidth`]：
+/// 探针量这一帧，下一帧按量到的值排。
+///
+/// 典型用途是浮在输入框上方的补全面板：面板高度不能超过「输入框上沿 → 顶栏下沿」
+/// 这段，否则放大字号 / 窗口矮时整个面板顶出窗口，最上面几项看不见也点不到。
+#[derive(Clone, Default)]
+pub(super) struct MeasuredTop(Rc<Cell<Option<Pixels>>>);
+
+impl MeasuredTop {
+    /// 上一帧量到的上沿（还没量过是 None）。
+    pub(super) fn get(&self) -> Option<Pixels> {
+        self.0.get()
+    }
+
+    /// 量上沿的空 canvas：挂在要量的容器里（那个容器要 `.relative()`），不挡事件。
+    pub(super) fn probe(&self) -> impl IntoElement + use<> {
+        let cell = self.0.clone();
+        canvas(
+            move |bounds, window, _| {
+                if cell.get() != Some(bounds.origin.y) {
+                    cell.set(Some(bounds.origin.y));
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+    }
+}

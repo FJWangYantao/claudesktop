@@ -16,6 +16,7 @@
 //! - Alt+← / Alt+→：在光标处重新展开 / 收起列表（绑定在 `keys.rs`，处理在这里，只在输入框卡片上生效）。
 
 use super::ChatApp;
+use super::chrome::CHROME_H;
 use super::keys::{COLLAPSE_COMPLETION_KEY, CollapseCompletion, ExpandCompletion};
 use crate::complete::{self, Trigger, TriggerKind};
 use crate::model::ViewMode;
@@ -41,6 +42,8 @@ pub(super) struct Completion {
     trigger: Trigger,
     items: Vec<CompletionItem>,
     selected: usize,
+    /// 条目滚动的位置：面板限高后条目多了要能滚，上下键选中项要滚回可见
+    scroll: ScrollHandle,
 }
 
 #[derive(Clone)]
@@ -156,7 +159,12 @@ impl ChatApp {
                 Some(c) if c.trigger.kind == trigger.kind => c.selected.min(items.len() - 1),
                 _ => 0,
             };
-            Completion { trigger, items, selected }
+            // 同一类时接着用原来的滚动位置：每敲一个字都换一份的话，选中的那一项会跳回顶
+            let scroll = match &self.completion.open {
+                Some(c) if c.trigger.kind == trigger.kind => c.scroll.clone(),
+                _ => ScrollHandle::new(),
+            };
+            Completion { trigger, items, selected, scroll }
         });
         self.refresh_composer(cx);
     }
@@ -422,6 +430,8 @@ impl ChatApp {
         if let Some(next) = next {
             if let Some(c) = self.completion.open.as_mut() {
                 c.selected = next;
+                // 面板限高了，选中项可能在可视区外：滚回可见（差多少滚多少）
+                c.scroll.scroll_to_item(next);
             }
             cx.stop_propagation();
             self.refresh_composer(cx);
@@ -605,44 +615,57 @@ impl ChatApp {
     }
 
     /// 输入框正上方的候选列表（浮在对话上面，不挤布局）；没开时为 None。
-    pub(super) fn render_completion(&self, cx: &mut Context<Self>) -> Option<Div> {
+    ///
+    /// `window` 用来量「面板最多能有多高」：面板锚在输入框上沿往上长，窗口矮 / 字号大时
+    /// 不限高就会顶出窗口，最上面几项既看不见也点不到。高度按 `composer_top`（输入框卡片
+    /// 上沿在窗口里的位置）减去顶栏留一点边距算，超出的部分在面板里滚动。
+    pub(super) fn render_completion(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let c = self.completion.open.as_ref()?;
         let heading = match c.trigger.kind {
             TriggerKind::Slash => "指令",
             TriggerKind::Mention => "引用文件",
         };
-        let mut list = div()
-            .v_flex()
-            .gap_0p5()
-            .p_1()
-            .rounded_xl()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(CARD))
-            .shadow_md()
-            .child(
-                div()
-                    .h_flex()
-                    .justify_between()
-                    .px_2p5()
-                    .pt_1()
-                    .pb_0p5()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .child(heading)
-                    .child(format!(
-                        "{} · Esc / {} 收起",
-                        if c.items.len() >= 2 {
-                            "↑↓ 选择 · 回车 / Tab 确认"
-                        } else {
-                            "Tab 填入"
-                        },
-                        Self::key_text(COLLAPSE_COMPLETION_KEY),
-                    )),
-            );
+        let rem = window.rem_size();
+        // 输入框上沿还没量过（第一帧）就不限高，下一帧补上
+        let max_h = self.composer_top.get().map(|top| {
+            let gap = rems(1.).to_pixels(rem); // 和顶栏之间留一点
+            let chrome = CHROME_H.to_pixels(rem);
+            // 面板自己离输入框还有 mb_1p5
+            let above = rems(0.375).to_pixels(rem);
+            (top - chrome - gap - above).max(rems(6.).to_pixels(rem))
+        });
+        // 标题行和面板内边距占掉的部分（`rows` 的限高从这里扣）
+        let chrome_h = rems(2.75).to_pixels(rem);
+        let header = div()
+            .h_flex()
+            .flex_shrink_0()
+            .justify_between()
+            .px_2p5()
+            .pt_1()
+            .pb_0p5()
+            .text_size(TEXT_META)
+            .text_color(rgb(INK_SOFT))
+            .child(heading)
+            .child(format!(
+                "{} · Esc / {} 收起",
+                if c.items.len() >= 2 {
+                    "↑↓ 选择 · 回车 / Tab 确认"
+                } else {
+                    "Tab 填入"
+                },
+                Self::key_text(COLLAPSE_COMPLETION_KEY),
+            ));
+        let mut rows = div().id("completion-rows").v_flex().gap_0p5().min_h_0();
+        // 条目多了（文件很多、插件命令很多）要能滚：只在限高时才开滚动区
+        if let Some(h) = max_h {
+            rows = rows
+                .max_h((h - chrome_h).max(rems(3.).to_pixels(rem)))
+                .overflow_y_scroll()
+                .track_scroll(&c.scroll);
+        }
         for (i, item) in c.items.iter().enumerate() {
             let selected = i == c.selected;
-            list = list.child(
+            rows = rows.child(
                 div()
                     .id(("completion", i))
                     .h_flex()
@@ -684,7 +707,20 @@ impl ChatApp {
                     }),
             );
         }
-        Some(list)
+        Some(
+            div()
+                .v_flex()
+                .min_h_0()
+                .gap_0p5()
+                .p_1()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(CARD))
+                .shadow_md()
+                .child(header)
+                .child(rows),
+        )
     }
 }
 

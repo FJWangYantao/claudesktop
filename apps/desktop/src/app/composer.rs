@@ -555,12 +555,23 @@ impl ChatApp {
                     .gap_1()
                     .children(self.render_context_warning(cx))
                     .children(self.render_queue(cx))
-                    // `/`、`@` 补全列表浮在卡片正上方，盖住对话而不是把输入框往下挤
-                    .child(div().relative().child(self.with_completion_keys(card, cx)).children(
-                        self.render_completion(cx).map(|list| {
-                            div().absolute().left_0().right_0().bottom_full().mb_1p5().child(list)
-                        }),
-                    )),
+                    // `/`、`@` 补全列表浮在卡片正上方，盖住对话而不是把输入框往下挤。
+                    // 量一次卡片上沿（`composer_top`），补全面板按它限高，不会顶出窗口
+                    .child(
+                        div()
+                            .relative()
+                            .child(self.with_completion_keys(card, cx))
+                            .child(self.composer_top.probe())
+                            .children(self.render_completion(window, cx).map(|list| {
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .bottom_full()
+                                    .mb_1p5()
+                                    .child(list)
+                            })),
+                    ),
             )
             // 首页：输入框下方一排建议入口（见 overview.rs）
             .when(!self.session().has_user_message() && !self.settings.needs_setup(), |d| {
