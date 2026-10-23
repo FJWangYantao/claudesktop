@@ -18,7 +18,8 @@ use crate::theme::{INK_SOFT, LINE, RED, SAND, TEXT_SMALL, rgb};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::MarkdownExtensions;
 use gpui_kit::base::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown_ast};
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::Icon;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::collections::HashMap;
@@ -222,7 +223,7 @@ fn loaded(name: &str, url: &str) -> AnyElement {
                 .object_fit(ObjectFit::Contain)
                 .cursor_pointer()
                 .on_click(move |_, window, cx| {
-                    super::chat::ChatApp::open_image(
+                    super::chat::open_image(
                         super::chat::ImageView::Remote(url.clone()),
                         window,
                         cx,
