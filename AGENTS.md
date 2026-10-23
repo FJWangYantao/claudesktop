@@ -9,6 +9,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 
 视觉与交互的取舍依据（色彩 / 圆角 / 层级 / 文案 / 反模式）见
 [设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md)，第七章是对照本项目的落地清单。
+哪些网页上的 CSS 手法能搬进 gpui、怎么换算、哪些根本做不到，见
+[调研报告-Claude前端CSS手法对照.md](./调研报告-Claude前端CSS手法对照.md)。
 
 ### 已沉淀的封装与惯例
 
@@ -194,6 +196,20 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   实际是探针里的 `top_bar()` 从未被 `render()` 调用（死代码）。
 - **gpui-pre 是打过补丁的本地拷贝**（`vendor/gpui-pre`，经 `[patch.crates-io]`；现在只改了中文避头尾）。
   改 gpui 本身的行为照此办理：改动标 `claudesktop patch`，记进 `vendor/README.md`，升级时按标记重打。
+- **gpui 没有 CSS**，抄网页上的写法前先看这张表（对照结论见「调研报告-Claude前端CSS手法对照.md」）：
+  - **做不到**：`mask-image`（只有矩形 `ContentMask`，渐隐只能拿背景色渐变覆盖层近似）、
+    `letter-spacing`、`font-variation-settings`（`TextStyle` 没有这两项）、`text-wrap`、
+    元素级 `backdrop-filter`（只有整窗的 `WindowBackgroundAppearance`）、
+    `:has()` / `@container` / `view-transition`、按语言切 CJK fallback（`FontFallbacks` 是平铺列表）。
+  - **hairline 也做不到**：`round_stroke_to_device_pixel` 把任何非零描边夹到 ≥1 物理像素
+    （`gpui-pre/src/util.rs`）。要更淡就降颜色的对比度，别想细线。
+  - **`box-shadow` 的 blur 要减半**：gpui 的 `BoxShadow::blur_radius` 是高斯 σ，CSS 是 2σ。
+    `.shadow_xs/sm/md/lg` 是宏生成的、直接用了 Tailwind 数值（**没减半**，比原版宽一倍）；
+    要贴原版观感就自己写 `BoxShadow`，参照 `gpui-component` 的 `popover_shadow` / `raised_shadow`。
+  - **`linear_gradient` 只有两个色标**（`Background.colors: [LinearColorStop; 2]`），
+    多段渐变要么叠条、要么用 `.color_space(ColorSpace::Oklab)` 让两色过渡更均匀。
+  - **`aria-*` 是有的**（`role()` / `aria_selected` / `aria_expanded` / `aria_keyshortcuts` …），
+    别照网上「gpui 没有无障碍属性」的说法。状态用 ARIA 表达，样式和行为就不会脱节。
 
 ## 其他
 

@@ -178,6 +178,7 @@ tools          # 调试与接入工具（截图脚本、mock agent、mock MCP �
 |---|---|
 | [AGENTS.md](./AGENTS.md) | 开发约定：UI 组件惯例、配色与字号规范、动效、快捷键、内核侧注意事项 |
 | [设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md) | Claude 系产品的设计理念与视觉系统，第七章是本项目的落地清单 |
+| [调研报告-Claude前端CSS手法对照.md](./调研报告-Claude前端CSS手法对照.md) | 从 Claude 桌面端构建产物里拆出的 CSS 手法，哪些能搬进 gpui、怎么换算、哪些做不到 |
 | [调研报告-GPUI-Claude风格桌面Harness.md](./调研报告-GPUI-Claude风格桌面Harness.md) | 立项时的技术调研 |
 | [设计说明-检查点与回退.md](./设计说明-检查点与回退.md) | 回退的粒度、文件被别人改过怎么办 |
 | [设计说明-插件.md](./设计说明-插件.md) | 插件目录格式、钩子、与 Claude Code 的兼容范围 |

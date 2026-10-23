@@ -14,6 +14,41 @@
   **之前**压（压缩自成一轮），输入框上方那行队列文字也标出来、可以「不压了」；
   用户停下 / 这一轮出错时撤掉并在对话里说明一句。
 
+## 界面打磨（对照 Claude 前端 CSS，见「调研报告-Claude前端CSS手法对照.md」）
+
+只列**核对过 gpui 能力**、确定能做的。色彩 / 动效 / 组件契约已经对齐，别重抄。
+每条的 gpui 实现要点、换算和「为什么不能照抄 CSS」都在报告里。
+
+1. [ ] **焦点环升级成三层**（小）：`composer.rs:464-473` 现在是「边框换色 + 阴影」两层，
+   原版是 `inset 1px 底色间隙 + 1px 实边 + 6px 光晕`。gpui 的 `BoxShadow` 有 `inset()` 和
+   `spread_radius`，绘制顺序（`gpui-pre/src/style.rs:711` 先 drop、`:740` 背景后 inset）也支持三层。
+   **`blur_radius` 要取 CSS 值的一半**（gpui 是高斯 σ）。顺带把 `:focus` / `:focus-visible`
+   分开（`.focus_visible(..)`，`div.rs:1295`）。
+2. [ ] **块间距改成跟字号缩放**（小）：`chat.rs:31-38` 的 `STEP_GAP` / `BLOCK_GAP` / `STEP_INDENT`
+   是 `Pixels`，字号调到 140% 时正文长了 40%、间距不变，整页节奏塌。先只换单位、数值不动。
+   `ICON_COL` 是固定图标格，可以留 px。
+3. [ ] **侧栏 / 设置页导航 / 顶栏宽度改 rem**（小）：`SIDEBAR_W` / `SETTINGS_NAV_W` / `CHROME_H`
+   固定 px，放大字号后侧栏标题和相对时间互相挤、顶栏塞不下。阅读列 `READING_W`、设置页 `FORM_W`、
+   概览 `OVERVIEW_W` 是 measure，**保持 px**。
+4. [ ] **滚动渐隐跟手**（小）：`content.rs:195` 现在上下两条渐变是常驻的。原版滚到顶 / 底时
+   对应的那条收到 0。滚动期间内容区本来就每帧重画（`step_wheel`），所以是零额外成本。
+   分三档（贴顶 / 中间 / 贴底），**不要并进 `row_key`**（那是布局指纹，会触发整表重测）；
+   侧栏那条要并进 `sync_sidebar` 的指纹。
+5. [ ] **菜单面板改用 `popover_style`**（小）：`menu.rs:349` 手写了 `bg + border_1(LINE)`，
+   和 gpui-kit 自己的弹层（无边框 + 10% hairline ring + 两层阴影）是两套描边语言。
+   换成 `popover_style(cx)` 打底，只保留 `p_1` 和焦点。
+6. [ ] **补 `role` / `aria-*`**（小）：gpui 有 `role()`、`aria_selected` / `aria_expanded` /
+   `aria_keyshortcuts` / `aria_label`（`div.rs:1310` 起），本仓库一个都没用。
+   侧栏会话行、折叠组头、视图菜单项、权限卡按钮、队列的「现在发送」各加一个。
+   「状态只有一份，样式和行为永不脱节」——这是原版 `data-cds` 契约真正值钱的地方。
+7. [ ] **渐隐条换 Oklab 插值**（小）：`linear_gradient` 只有两个色标，原版的 4 段 / 16 段搬不过来；
+   先试 `.color_space(ColorSpace::Oklab)`（sRGB 线性插值在低 alpha 段发灰）。
+   不够再叠条（24px 切 8 条固定 alpha）。
+
+**留后（不急）**：60ms 悬停专用令牌（`MotionTokens.duration_fast` 是 120ms，悬停偏肉）；
+密度轴（只改间距不改字号，现在字号缩放把两者绑在一起）；输入框单独一档圆角（原版 20px，现在 16px）；
+权限请求音效（`notify_attention` 里加一声，默认关）。
+
 ## 一、单个子系统（一天上下）
 
 1. [x] **插件市场补齐**（小～中，约一天）：推荐项里指向别的仓库的条目（`EXTERNAL_PLUGIN_PICKS`，按市场清单里的

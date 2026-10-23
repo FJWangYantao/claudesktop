@@ -10,3 +10,8 @@ tools/*.png
 tools/scan.ps1
 tools/shot_one.ps1
 tools/ascii-shot.ps1
+# 一次性脚本：从 Claude 桌面端构建产物里抠 CSS / 生成事实表，硬编码本机路径
+/_*.mjs
+
+# 本机状态（记忆、日志等），不进仓库
+/.claudesktop/
