@@ -584,10 +584,6 @@ impl ChatApp {
                             })),
                     ),
             )
-            // 首页：输入框下方一排建议入口（见 overview.rs）
-            .when(!self.session().has_user_message() && !self.settings.needs_setup(), |d| {
-                d.child(self.render_suggestions(cx))
-            })
     }
 
     /// 输入框正上方的提问面板（`ask_user`）：一次只问一题，点一个选项就走到下一题，
