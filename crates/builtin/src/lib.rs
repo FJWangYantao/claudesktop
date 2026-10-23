@@ -562,6 +562,12 @@ impl Inner {
         sessions.get(session).is_some_and(|s| s.kind == SessionKind::Chat)
     }
 
+    /// 这个会话是不是子会话（`task` 开的）。
+    fn is_subagent(&self, session: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session).is_some_and(|s| s.agent.is_some())
+    }
+
     /// 本会话已经通过 `tool_search` 加载的工具（交给 `tools::for_model` 决定哪些要声明）。
     fn loaded_tools(&self, session: &str) -> Vec<String> {
         let sessions = self.sessions.lock().unwrap();
@@ -1134,6 +1140,20 @@ impl Inner {
         if call.function.name == tools::ASK_USER && self.tool_allowed(session, tools::ASK_USER) {
             return self.ask_user(session, &call.function.arguments, stopped);
         }
+        // 找工具：不碰文件、不用授权，也不占一行工具行（它只换下一轮声明给模型的清单）。
+        // 子会话不参与工具分层（工具按角色白名单给），直接回一句
+        if call.function.name == tools::TOOL_SEARCH
+            && self.tool_allowed(session, tools::TOOL_SEARCH)
+        {
+            if self.is_subagent(session) {
+                return ToolOutput::fail(
+                    "A subagent has no tool_search: its tools are fixed by the role it was \
+                     started with. Work with what you have.",
+                    "子任务里没有这个工具",
+                );
+            }
+            return self.search_tools(session, &call.function.arguments);
+        }
         // 记忆不出网、不用授权：直接写 memory.json（见 memory 模块）。但它是写文件，
         // Plan 模式（只读）不给（工具列表里也没有，这里挡住模型硬调的）
         if call.function.name == tools::MEMORY_WRITE
@@ -1166,6 +1186,88 @@ impl Inner {
         }
         let (action, title) = self.start_tool(session, cwd, call);
         self.finish_tool(session, cwd, call, action, &title, stopped)
+    }
+
+    /// `tool_search`：把没直接声明的工具找出来，并加载进本会话（下一次请求起生效）。
+    ///
+    /// 返回里必须说清楚「这一步已经发完了，下一轮才能调」：模型拿到工具结果时这一步的
+    /// 请求已经发出去了，它在同一步里再调刚搜到的工具只会报「不在名单里」。
+    fn search_tools(&self, session: &str, arguments: &str) -> ToolOutput {
+        let query = match tools::parse_tool_search(arguments) {
+            Ok(query) => query,
+            Err(message) => return ToolOutput::fail(message, "参数无效"),
+        };
+        let candidates = self.tool_candidates(session);
+        let found = tools::search(&query, &candidates);
+        if found.is_empty() {
+            return ToolOutput::ok(
+                format!(
+                    "No tool matches \"{query}\". Try different words (a tool name or what you want \
+                     to do), or do it with the tools you already have. Tools already loaded in this \
+                     session are not listed again."
+                ),
+                format!("没找到「{query}」"),
+            );
+        }
+        // 并进本会话的名单（去重），再把完整名单落进日志：续接 / 回退时内核从这里把名单还回去
+        let names = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let Some(state) = sessions.get_mut(session) else {
+                return ToolOutput::fail("This session is gone.", "会话已结束");
+            };
+            for name in &found {
+                if !state.loaded_tools.contains(name) {
+                    state.loaded_tools.push(name.clone());
+                }
+            }
+            state.loaded_tools.clone()
+        };
+        self.emit(Some(session), KernelEvent::ToolsLoaded { names });
+        let lines: Vec<String> = found
+            .iter()
+            .map(|name| match candidates.iter().find(|(candidate, _)| candidate == name) {
+                Some((_, description)) => format!("- {name}: {description}"),
+                None => format!("- {name}"),
+            })
+            .collect();
+        ToolOutput::ok(
+            format!(
+                "Found {} tool(s):\n{}\n\nThey are available from your NEXT request onwards. This \
+                 request is already sent, so do not call them in this same step — say what you are \
+                 going to do with them, and call them in the next round.",
+                found.len(),
+                lines.join("\n")
+            ),
+            format!("找到 {} 个工具：{}", found.len(), found.join("、")),
+        )
+    }
+
+    /// `tool_search` 的候选语料：这个会话「能拿但还没声明」的工具（名字, 说明）。
+    ///
+    /// 语料就是工具定义本身（和 `run_steps` 里那份一致），不另维护一份描述；已加载的不再给。
+    fn tool_candidates(&self, session: &str) -> Vec<(String, String)> {
+        let (disabled, plugin_scope) = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .get(session)
+                .map(|s| (s.mcp_disabled.clone(), s.plugins_enabled.clone()))
+                .unwrap_or_default()
+        };
+        let writable = self.mode(session) != MODE_PLAN;
+        let mut specs = tools::specs(writable);
+        specs.extend(self.mcp.specs(writable, &disabled));
+        specs.push(subagent::spec(&self.agents(plugin_scope.as_deref())));
+        let loaded = self.loaded_tools(session);
+        specs
+            .into_iter()
+            .filter(|spec| tools::exposure(subagent::spec_name(spec)) == tools::Exposure::Deferred)
+            .filter(|spec| !loaded.iter().any(|name| name == subagent::spec_name(spec)))
+            .map(|spec| {
+                let name = subagent::spec_name(&spec).to_string();
+                let description = spec["function"]["description"].as_str().unwrap_or_default();
+                (name, description.to_string())
+            })
+            .collect()
     }
 
     /// `memory_write`：写进全局或项目的 `memory.json`，报 `MemoryChanged`。
@@ -2792,10 +2894,13 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                 None => specs.push(subagent::spec(&inner.agents(plugin_scope.as_deref()))),
                 Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
             }
+            // 工具分层（见 `tools::exposure`）只作用于主会话：子会话按角色白名单本来就窄，
+            // 而且它看不到界面，不该再让它多走一步去搜工具
+            if agent.is_none() {
+                specs = tools::for_model(specs, &inner.loaded_tools(session));
+            }
             specs
         };
-        // 工具分层（见 `tools::exposure`）：骨架阶段 `exposure` 全是 `Direct`，原样返回
-        let specs = tools::for_model(specs, &inner.loaded_tools(session));
         let mut text = String::new();
         // 会话级档位覆盖档案里的那份；没覆盖时直接用构造好的 provider
         let provider: &dyn ChatProvider = match thinking {
