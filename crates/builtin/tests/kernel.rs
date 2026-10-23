@@ -659,7 +659,8 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
     assert_eq!(h.tool_status("call_1").as_deref(), Some("completed"));
     assert_eq!(h.text(false), "我先看看。秘密是 42。");
 
-    // 第一步带工具定义；第二步历史里是 assistant(tool_calls) + tool 结果
+    // 第一步带工具定义；第二步历史里是 assistant(tool_calls) + tool 结果。
+    // 只有常驻的几个：其余工具要先 `tool_search` 找出来（见 `tool_search_loads_...`）
     let first = body(&bodies, 0);
     let names: Vec<_> = first["tools"]
         .as_array()
@@ -671,23 +672,13 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
         names,
         [
             "read_file",
-            "list_dir",
             "glob",
-            "todo_write",
             "ask_user",
             "grep",
-            "web_fetch",
-            "web_search",
-            "memory_search",
-            "memory_write",
-            "memory_forget",
             "write_file",
             "edit_file",
             "shell",
-            "shell_background",
-            "shell_output",
-            "shell_stop",
-            "task"
+            "tool_search"
         ]
     );
     let second = body(&bodies, 1);
@@ -699,6 +690,62 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
     assert_eq!(msgs[n - 1]["role"], "tool");
     assert_eq!(msgs[n - 1]["tool_call_id"], "call_1");
     assert!(msgs[n - 1]["content"].as_str().unwrap().contains("2\t秘密是 42"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 工具分层：`todo_write` 第一次请求里没有，`tool_search` 找出来之后下一次请求就在了。
+/// 加载动作要落进日志（`KernelEvent::ToolsLoaded`，界面转成 `Record::ToolLoadout`），
+/// 否则续接 / 回退后模型手里的工具和界面显示的对不上。
+#[test]
+fn tool_search_loads_a_deferred_tool_for_the_next_request() {
+    let dir = workdir("tool-search");
+    let (base, bodies) = serve(vec![
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "todo" })),
+        tool_call(
+            "t1",
+            "todo_write",
+            serde_json::json!({ "todos": [{ "content": "读文件", "status": "pending" }] }),
+        ),
+        happy_stream("先列个清单"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("改一下")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 第一次请求里没有 todo_write
+    let first = tool_names(&body(&bodies, 0));
+    assert!(!first.contains(&"todo_write".to_string()), "{first:?}");
+    assert!(first.contains(&"tool_search".to_string()), "{first:?}");
+
+    // tool_search 的结果里有 todo_write，并说清楚下一轮才能调（这一步已经发完了）
+    let second = body(&bodies, 1);
+    let result = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(result.contains("todo_write"), "{result}");
+    assert!(result.contains("NEXT request"), "{result}");
+
+    // 下一次请求的 tools 里出现 todo_write，而且它真能调（清单换上了）
+    assert!(tool_names(&second).contains(&"todo_write".to_string()));
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::PlanReplaced { entries } if !entries.is_empty())),
+        1
+    );
+
+    // 加载记进了日志
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::ToolsLoaded { names } if names.iter().any(|n| n == "todo_write"))),
+        1
+    );
+    // 工具行不占位（和 todo_write 一样：它只改下一轮的工具清单）
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { id, .. } if id == "s1")), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1059,6 +1106,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
     assert_eq!(h.tool_status("p1").as_deref(), Some("failed"));
     assert!(!dir.join("x.txt").exists());
+    // Plan 模式：常驻的只有只读的那几个（写文件的整段不给）
     let first = body(&bodies, 0);
     let names: Vec<_> = first["tools"]
         .as_array()
@@ -1066,21 +1114,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(
-        names,
-        [
-            "read_file",
-            "list_dir",
-            "glob",
-            "todo_write",
-            "ask_user",
-            "grep",
-            "web_fetch",
-            "web_search",
-            "memory_search",
-            "task"
-        ]
-    );
+    assert_eq!(names, ["read_file", "glob", "ask_user", "grep", "tool_search"]);
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2216,6 +2250,8 @@ fn mcp_tools_are_offered_asked_and_called() {
     let dir = workdir("mcp");
     let config = mock_mcp_config(&dir);
     let (base, bodies) = serve(vec![
+        // MCP 工具也是 deferred 的：先搜一次（按服务器名搜），下一轮就能调
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "mock" })),
         tool_call("m1", "mcp__mock__echo", serde_json::json!({ "text": "你好" })),
         happy_stream("它说你好"),
         tool_call("m2", "mcp__mock__boom", serde_json::json!({})),
@@ -2239,10 +2275,12 @@ fn mcp_tools_are_offered_asked_and_called() {
     assert_eq!(h.tool_status("m1").as_deref(), Some("completed"));
     let echo_row = |e: &KernelEvent| matches!(e, KernelEvent::ToolCallStarted { title, .. } if title.starts_with("mock:echo "));
     assert_eq!(h.count(echo_row), 1);
-    // 工具定义里有 MCP 工具；结果回给了模型
-    let names = body(&bodies, 0)["tools"].to_string();
+    // 工具定义里有 MCP 工具（搜过之后才声明）；结果回给了模型
+    let first = body(&bodies, 0)["tools"].to_string();
+    assert!(!first.contains("mcp__mock__echo"), "MCP 工具不常驻：{first}");
+    let names = body(&bodies, 1)["tools"].to_string();
     assert!(names.contains("mcp__mock__echo"), "{names}");
-    assert!(body(&bodies, 1).to_string().contains("echo: 你好"));
+    assert!(body(&bodies, 2).to_string().contains("echo: 你好"));
 
     // isError 的结果算失败
     h.kernel.send_prompt(&sid, UserPrompt::text("调 boom")).unwrap();
@@ -2250,7 +2288,7 @@ fn mcp_tools_are_offered_asked_and_called() {
     h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
     h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.tool_status("m2").as_deref(), Some("failed"));
-    assert!(body(&bodies, 3).to_string().contains("boom failed"));
+    assert!(body(&bodies, 4).to_string().contains("boom failed"));
     h.kernel.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2260,6 +2298,7 @@ fn mcp_read_only_tools_survive_plan_mode_and_list_changes() {
     let dir = workdir("mcp-plan");
     let config = mock_mcp_config(&dir);
     let (base, bodies) = serve(vec![
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "echo" })),
         tool_call("p1", "mcp__mock__echo", serde_json::json!({ "text": "relist" })),
         happy_stream("好"),
     ]);
@@ -2272,8 +2311,8 @@ fn mcp_read_only_tools_survive_plan_mode_and_list_changes() {
     h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
     h.wait("turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     assert_eq!(h.tool_status("p1").as_deref(), Some("completed"));
-    // Plan 模式只给只读的 MCP 工具
-    let names = body(&bodies, 0)["tools"].to_string();
+    // Plan 模式只给只读的 MCP 工具（能当候选的也只有只读的，所以搜也搜不到 boom）
+    let names = body(&bodies, 1)["tools"].to_string();
     assert!(names.contains("mcp__mock__echo") && !names.contains("mcp__mock__boom"), "{names}");
     // 服务器说工具变了：重新列，多出 extra
     h.wait("relist", |e| {
@@ -2578,6 +2617,8 @@ fn task_runs_a_subagent_and_returns_its_report() {
     let dir = workdir("subagent");
     std::fs::write(dir.join("notes.txt"), "secret = 42").unwrap();
     let (base, bodies) = serve(vec![
+        // `task` 是 deferred 的：主会话得先搜一次，下一轮才能派子任务
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "subagent" })),
         tool_call(
             "t1",
             "task",
@@ -2621,7 +2662,8 @@ fn task_runs_a_subagent_and_returns_its_report() {
     );
     assert_eq!(h.tool_status("t1/c1").as_deref(), Some("completed"));
     assert_eq!(h.tool_status("t1").as_deref(), Some("completed"));
-    assert_eq!(h.text(false), "我先看看。子任务说秘密是 42。");
+    // 两步工具调用各带一句「我先看看。」（tool_search 那步也算一步）
+    assert_eq!(h.text(false), "我先看看。我先看看。子任务说秘密是 42。");
     // 子会话每步的用量都并进主会话这一轮，但不带上下文大小（那个是主会话自己的）；
     // 子会话走了两步（读文件、交报告），所以有两条
     assert_eq!(
@@ -2631,7 +2673,7 @@ fn task_runs_a_subagent_and_returns_its_report() {
     );
 
     // 子会话的请求：角色的系统提示词、只有清单里的工具、上下文里只有任务本身
-    let child = body(&bodies, 1);
+    let child = body(&bodies, 2);
     let msgs = child["messages"].as_array().unwrap();
     let system = msgs[0]["content"].as_str().unwrap();
     assert!(
@@ -2647,8 +2689,9 @@ fn task_runs_a_subagent_and_returns_its_report() {
     assert_eq!(msgs.len(), 2);
     assert!(msgs[1]["content"].to_string().contains("Find the secret"));
     assert_eq!(tool_names(&child), ["read_file", "grep"]);
-    // 主会话的任务工具说明里列着角色
-    let main = body(&bodies, 0);
+    // 主会话的任务工具说明里列着角色（第一次请求里还没有 `task`，搜过之后才有）
+    assert!(!tool_names(&body(&bodies, 0)).contains(&"task".to_string()));
+    let main = body(&bodies, 1);
     let task = main["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "task");
     let task_doc = task.unwrap()["function"]["description"].as_str().unwrap();
     assert!(
@@ -2659,7 +2702,7 @@ fn task_runs_a_subagent_and_returns_its_report() {
     let main_system = main["messages"][0]["content"].as_str().unwrap();
     assert!(main_system.contains("Delegate with the task tool"), "{main_system}");
     // 报告作为 task 的结果回给主模型
-    let last = body(&bodies, 3);
+    let last = body(&bodies, 4);
     let result = last["messages"].as_array().unwrap().last().unwrap();
     assert_eq!(result["role"], "tool");
     assert_eq!(result["content"], "秘密是 42");

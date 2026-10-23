@@ -33,6 +33,7 @@ pub const ASK_USER: &str = "ask_user";
 pub const MEMORY_WRITE: &str = "memory_write";
 pub const MEMORY_SEARCH: &str = "memory_search";
 pub const MEMORY_FORGET: &str = "memory_forget";
+pub const TOOL_SEARCH: &str = "tool_search";
 /// `memory_search` 最多返回几条
 pub const MEMORY_SEARCH_MAX: usize = 12;
 /// 待办清单最多几项
@@ -224,8 +225,8 @@ impl ToolOutput {
 
 /// 工具对模型的暴露档位（「方案-内核提速.md」阶段 2）。
 ///
-/// `Direct` 每次请求都声明；`Deferred` 不声明，模型得先用 `tool_search` 把它找出来。
-/// **骨架阶段全部 `Direct`，行为不变**；阶段 2 再填表，`for_model` 是唯一的开关点。
+/// `Direct` 每次请求都声明；`Deferred` 不声明，模型得先用 `tool_search` 把它找出来，
+/// 找出来之后这一次会话往后的请求都带上它。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Exposure {
     Direct,
@@ -233,17 +234,37 @@ pub enum Exposure {
 }
 
 /// 哪些工具默认不声明给模型，要先用 `tool_search` 找出来（「方案-内核提速.md」阶段 2）。
-/// **骨架阶段是空的**（全部 `Direct`，行为不变）；阶段 2 往这里添名字就行。
-const DEFERRED: &[&str] = &[];
+///
+/// 常驻的是每次都要用的那几个（读写文件、改文件、shell、搜代码、提问、搜工具）；
+/// 这里是不常用、但真要用时必须能找回来的。`task` 来自 `subagent`，名字直接写字符串。
+const DEFERRED: &[&str] = &[
+    LIST_DIR,
+    TODO_WRITE,
+    WEB_FETCH,
+    WEB_SEARCH,
+    MEMORY_SEARCH,
+    MEMORY_WRITE,
+    MEMORY_FORGET,
+    // `shell` 的三个配套工具：搜到其中一个，`search` 会把三个一起给
+    SHELL_BACKGROUND,
+    SHELL_OUTPUT,
+    SHELL_STOP,
+    "task",
+];
 
-/// 工具名 → 暴露档位。阶段 2 把不常用的工具改成 `Deferred` 就改 [`DEFERRED`]，
-/// 别在调用处散着写。
+/// 工具名 → 暴露档位。改暴露档位就改 [`DEFERRED`]，别在调用处散着写。
+/// MCP 工具一律 `Deferred`（名字带 `mcp__` 前缀，见 [`crate::mcp::is_mcp_tool`]）：
+/// 一个服务器挂几个工具事先不知道，全常驻比内置工具还贵。
 pub fn exposure(name: &str) -> Exposure {
-    if DEFERRED.contains(&name) { Exposure::Deferred } else { Exposure::Direct }
+    if DEFERRED.contains(&name) || crate::mcp::is_mcp_tool(name) {
+        Exposure::Deferred
+    } else {
+        Exposure::Direct
+    }
 }
 
 /// 按 exposure 筛掉这次请求不该声明的工具定义。`loaded` 是本会话已经通过 `tool_search`
-/// 加载的名字（`SessionState::loaded_tools`）。骨架阶段 `exposure` 全是 `Direct`，原样返回。
+/// 加载的名字（`SessionState::loaded_tools`）。
 pub fn for_model(specs: Vec<Value>, loaded: &[String]) -> Vec<Value> {
     if specs.iter().all(|spec| exposure(spec_name(spec)) == Exposure::Direct) {
         return specs;
@@ -573,6 +594,26 @@ pub fn specs(writable: bool) -> Vec<Value> {
             }),
         ));
     }
+    // `tool_search` 在两种模式下都给（它不碰文件）：Plan 模式也得能把 `todo_write` / `web_fetch` 找回来
+    tools.push(f(
+        TOOL_SEARCH,
+        "Some of your tools are not listed here (memory, todo list, subagents, background \
+         commands, web access, MCP servers, and so on). Describe in one sentence what you want to do \
+         and this finds them by name and description; they become callable from your NEXT request \
+         onwards, not in this one. So: search first, finish this request, and call the tool you found \
+         in the next round."
+            .to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What you want to do, e.g. `todo list` or `run a command in the background`"
+                }
+            },
+            "required": ["query"]
+        }),
+    ));
     tools
 }
 
@@ -1029,6 +1070,72 @@ pub fn parse_memory_query(tool: &str, arguments: &str) -> Result<(String, Memory
         })?),
     };
     Ok((query, where_))
+}
+
+/// `tool_search` 一次最多给几个（再多不如换个说法）。
+pub const SEARCH_MAX: usize = 8;
+
+/// `tool_search` 的参数 → 查询串；空 / 缺参数报错（错误信息直接回给模型）。
+pub fn parse_tool_search(arguments: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Args {
+        #[serde(default)]
+        query: String,
+    }
+    let args: Args = serde_json::from_str(arguments)
+        .map_err(|e| format!("Invalid arguments for {TOOL_SEARCH}: {e}"))?;
+    let query = args.query.trim().to_string();
+    if query.is_empty() {
+        return Err(format!(
+            "{TOOL_SEARCH}: `query` is empty — describe in one sentence what you want to do"
+        ));
+    }
+    Ok(query)
+}
+
+/// `tool_search` 的排序：`candidates` 是 (名字, 说明)，按 query 分词后在名字和说明里打分
+/// （命中名字 +5、命中说明 +1，大小写不敏感，按非字母数字分词），按分数降序取前
+/// [`SEARCH_MAX`] 个；一条都不命中返回空 vec（调用方回一句「换个说法」）。
+///
+/// 语料就是工具定义本身（名字 + description），不另维护一份描述。
+pub fn search(query: &str, candidates: &[(String, String)]) -> Vec<String> {
+    let words: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let mut scored: Vec<(usize, &str)> = Vec::new();
+    for (name, description) in candidates {
+        let lower_name = name.to_lowercase();
+        let lower_description = description.to_lowercase();
+        let mut score = 0usize;
+        for word in &words {
+            if lower_name.contains(word.as_str()) {
+                score += 5;
+            }
+            if lower_description.contains(word.as_str()) {
+                score += 1;
+            }
+        }
+        if score > 0 {
+            scored.push((score, name.as_str()));
+        }
+    }
+    // 稳定排序：同分时保持候选顺序（= specs 里的顺序）
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut names: Vec<String> =
+        scored.into_iter().take(SEARCH_MAX).map(|(_, name)| name.to_string()).collect();
+    // `shell` 的三个配套工具是一套：搜到其中一个就把三个一起给。只拿到 `shell_background`
+    // 的模型不知道怎么读输出，等于没给。它们同属一套，所以不占 [`SEARCH_MAX`] 的名额。
+    const SHELL_FAMILY: [&str; 3] = [SHELL_BACKGROUND, SHELL_OUTPUT, SHELL_STOP];
+    if names.iter().any(|name| SHELL_FAMILY.contains(&name.as_str())) {
+        for name in SHELL_FAMILY {
+            if !names.iter().any(|found| found == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
 }
 
 fn now_ms() -> u64 {
@@ -3073,5 +3180,117 @@ y
         // 标签超上限：报错让模型自己挑（不悄悄截掉，截掉的可能正是要紧的那个）
         let args = serde_json::json!({"text": "x", "tags": many}).to_string();
         assert!(parse_memory(&args).is_err());
+    }
+
+    /// `tool_search` 的候选：(名字, 说明)。
+    fn candidates() -> Vec<(String, String)> {
+        [
+            ("todo_write", "Create or update the task list"),
+            ("memory_search", "Search the notes saved for later sessions"),
+            ("web_fetch", "Fetch a web page"),
+            ("web_search", "Search the web"),
+            ("list_dir", "List the entries of a directory"),
+            ("shell_background", "Start a command in the background"),
+            ("shell_output", "Read the new output of a background command"),
+            ("shell_stop", "Stop a background command"),
+            ("task", "Launch a subagent"),
+        ]
+        .iter()
+        .map(|(name, description)| (name.to_string(), description.to_string()))
+        .collect()
+    }
+
+    /// 命中名字（+5）排在只命中说明（+1）的前面。
+    #[test]
+    fn search_ranks_name_hits_above_description_hits() {
+        let cands = vec![
+            ("alpha".to_string(), "does beta things".to_string()),
+            ("beta_tool".to_string(), "nothing in common".to_string()),
+        ];
+        assert_eq!(search("beta", &cands), ["beta_tool", "alpha"]);
+        // 大小写不敏感
+        assert_eq!(search("BETA", &cands), ["beta_tool", "alpha"]);
+    }
+
+    /// 多个词累加：两个词都命中的排在只命中一个的前面。
+    #[test]
+    fn search_sums_the_words() {
+        let found = search("todo list", &candidates());
+        assert_eq!(found.first().map(String::as_str), Some("todo_write"));
+    }
+
+    /// 最多 8 个。
+    #[test]
+    fn search_returns_at_most_eight() {
+        let cands: Vec<(String, String)> =
+            (0..12).map(|i| (format!("widget_{i}"), format!("tool number {i}"))).collect();
+        assert_eq!(search("widget", &cands).len(), SEARCH_MAX);
+    }
+
+    /// 一条都不命中：空 vec（调用方回「换个说法」）。
+    #[test]
+    fn search_returns_nothing_when_no_word_matches() {
+        assert!(search("zzzz", &candidates()).is_empty());
+        assert!(search("", &candidates()).is_empty());
+    }
+
+    /// 搜到 `shell` 的配套工具就把三个一起给（只给一个等于没给）。
+    #[test]
+    fn search_brings_the_shell_family_together() {
+        let found = search("background", &candidates());
+        for name in [SHELL_BACKGROUND, SHELL_OUTPUT, SHELL_STOP] {
+            assert!(found.iter().any(|f| f == name), "{name} 没一起给：{found:?}");
+        }
+        // `task` 不影响别的
+        assert_eq!(search("subagent", &candidates()), ["task"]);
+    }
+
+    /// 参数：`query` 空的 / 缺参数的报错。
+    #[test]
+    fn tool_search_args() {
+        assert_eq!(parse_tool_search(r#"{"query":"  todo "}"#).unwrap(), "todo");
+        assert!(parse_tool_search(r#"{"query":"  "}"#).is_err());
+        assert!(parse_tool_search("{}").is_err());
+        assert!(parse_tool_search("nope").is_err());
+    }
+
+    /// `for_model`：`Direct` 恒在，`Deferred` 只在 `loaded` 里时出现，`loaded` 里不存在
+    /// 的名字不影响结果。
+    #[test]
+    fn for_model_keeps_direct_and_loaded_only() {
+        let names = |list: Vec<Value>| -> Vec<String> {
+            list.iter().map(|spec| spec_name(spec).to_string()).collect()
+        };
+        let direct = names(for_model(specs(true), &[]));
+        for name in [READ_FILE, WRITE_FILE, EDIT_FILE, SHELL, GREP, GLOB, ASK_USER, TOOL_SEARCH] {
+            assert!(direct.contains(&name.to_string()), "{name} 应该常驻：{direct:?}");
+        }
+        for name in [LIST_DIR, TODO_WRITE, MEMORY_SEARCH, SHELL_OUTPUT, "task"] {
+            assert!(!direct.contains(&name.to_string()), "{name} 应该先搜：{direct:?}");
+        }
+        // 加载过的出现；不存在的名字不报错也不多给
+        let loaded = vec![TODO_WRITE.to_string(), "no_such_tool".to_string()];
+        let with_todo = names(for_model(specs(true), &loaded));
+        assert!(with_todo.contains(&TODO_WRITE.to_string()), "{with_todo:?}");
+        assert!(!with_todo.contains(&MEMORY_SEARCH.to_string()), "{with_todo:?}");
+        assert_eq!(with_todo.len(), direct.len() + 1);
+    }
+
+    /// MCP 工具也是 `Deferred`：一个服务器挂几个工具事先不知道，全常驻太贵。
+    #[test]
+    fn mcp_tools_are_deferred_too() {
+        let mcp = json!({
+            "type": "function",
+            "function": { "name": "mcp__github__search_issues", "description": "d", "parameters": {} }
+        });
+        let mut all = specs(true);
+        all.push(mcp);
+        let has = |loaded: &[String]| -> bool {
+            for_model(all.clone(), loaded)
+                .iter()
+                .any(|s| spec_name(s) == "mcp__github__search_issues")
+        };
+        assert!(!has(&[]));
+        assert!(has(&["mcp__github__search_issues".to_string()]));
     }
 }
