@@ -1,5 +1,4 @@
-//! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs；卡片、格子、模型行点了进用量页，见 usage_view.rs），
-//! 输入框下方一排建议入口、空输入框里的建议提示词（Tab 填入，见 `complete_view.rs`）。
+//! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs；卡片、格子、模型行点了进用量页，见 usage_view.rs）。
 
 use super::ChatApp;
 use super::mascot::brand_mark;
@@ -16,26 +15,6 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// 代码空间首页的建议：(图标, 入口上的短名, 填进输入框的提示词)
-const CODE_SUGGESTIONS: [(IconAll, &str, &str); 4] = [
-    (IconAll::FolderTree, "梳理项目结构", "梳理这个项目的结构：主要模块、入口和它们之间的关系"),
-    (IconAll::Bug, "排查潜在问题", "通读最近改动的代码，找出可能的 bug 和没处理的边界情况"),
-    (IconAll::FlaskConical, "补单元测试", "给核心逻辑补上单元测试，先列出要覆盖的情况再写"),
-    (
-        IconAll::GitCommitHorizontal,
-        "总结最近改动",
-        "看看 git log 和还没提交的改动，总结最近做了什么",
-    ),
-];
-
-/// 聊天空间首页的建议：(图标, 入口上的短名, 填进输入框的提示词)
-const CHAT_SUGGESTIONS: [(IconAll, &str, &str); 4] = [
-    (IconAll::MessageSquare, "帮我改写", "把下面这段话改得更清楚、更简洁，保留原意："),
-    (IconAll::Globe, "翻译", "把下面这段翻译成英文，语气自然："),
-    (IconAll::Lightbulb, "解释一个概念", "用通俗的话解释一下：（概念），再举一个例子"),
-    (IconAll::ListChecks, "列个计划", "帮我列一个计划：（目标），按先后排好，写清每一步要多久"),
-];
 
 /// 输入框平时的占位文字（代码空间）
 const PLACEHOLDER: &str = "描述要做的事，回车发送，Shift+回车换行";
@@ -633,30 +612,7 @@ impl ChatApp {
         )
     }
 
-    /// 当前会话是首页（还没发过消息）。
-    pub(super) fn on_home(&self) -> bool {
-        !self.settings_open && !self.session().has_user_message()
-    }
-
-    /// 首页空输入框里建议的提示词：每个会话固定一条（按会话令牌轮换）。
-    pub(super) fn ghost_prompt(&self) -> Option<&'static str> {
-        let ready = match self.space() {
-            // 聊天要有能用的自研内核端点
-            Space::Chat => self.settings.chat_available(),
-            Space::Code => !self.settings.needs_setup(),
-        };
-        (self.on_home() && ready).then(|| self.suggestions()[self.session().token as usize % 4].2)
-    }
-
-    /// 当前空间的首页建议。
-    pub(super) fn suggestions(&self) -> &'static [(IconAll, &'static str, &'static str); 4] {
-        match self.space() {
-            Space::Chat => &CHAT_SUGGESTIONS,
-            Space::Code => &CODE_SUGGESTIONS,
-        }
-    }
-
-    /// 输入框的占位文字：首页是建议的提示词，跑着时说明回车会排队，刚拒绝了权限时请用户说要怎么改，
+    /// 输入框的占位文字：跑着时说明回车会排队，刚拒绝了权限时请用户说要怎么改，
     /// 其余是操作提示。变了才写进输入框（每帧调一次）。
     ///
     /// 「猜的下一句」画在输入框里时占位文字让开（留空）：两句淡色字叠在同一行没法读。
@@ -665,15 +621,11 @@ impl ChatApp {
         let text: SharedString = if self.next_suggestion_text(cx).is_some() {
             SharedString::default()
         } else {
-            match self.ghost_prompt() {
+            match self.space() {
                 _ if s.steering => "说说要它怎么改，回车发送".into(),
                 _ if s.busy || s.stopping => "回车排队，这一轮结束后自动发出".into(),
-                Some(prompt) => format!("试试：{prompt}（Tab 填入）").into(),
-                None => match self.space() {
-                    Space::Chat => CHAT_PLACEHOLDER,
-                    Space::Code => PLACEHOLDER,
-                }
-                .into(),
+                Space::Chat => CHAT_PLACEHOLDER.into(),
+                Space::Code => PLACEHOLDER.into(),
             }
         };
         if text != self.placeholder {
@@ -698,33 +650,6 @@ impl ChatApp {
             state.focus(window, cx);
         });
         self.refresh_composer(cx);
-    }
-
-    /// 首页输入框下方的一排建议入口，点了把提示词填进输入框。
-    pub(super) fn render_suggestions(&self, cx: &mut Context<Self>) -> Div {
-        div().h_flex().flex_wrap().justify_center().gap_2().pt_1().children(
-            self.suggestions().iter().enumerate().map(|(i, &(icon, label, prompt))| {
-                div()
-                    .id(("suggestion", i))
-                    .h_flex()
-                    .items_center()
-                    .gap_1p5()
-                    .px_2p5()
-                    .py_1()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)).border_color(rgb(LINE_STRONG)))
-                    .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
-                    .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(label))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.fill_prompt(prompt, window, cx)
-                        }),
-                    )
-            }),
-        )
     }
 }
 
