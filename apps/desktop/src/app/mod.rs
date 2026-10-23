@@ -2025,7 +2025,8 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 点选提问卡片上的一个选项。
+    /// 点选提问面板上的一个选项。还有题没答就停在下一题，最后一题选完直接交给模型
+    /// （面板上没有「就这样」这一排按钮）。
     pub(crate) fn pick_question(
         &mut self,
         item_idx: usize,
@@ -2035,6 +2036,16 @@ impl ChatApp {
     ) {
         let active = self.active;
         self.sessions[active].pick_question(item_idx, q, option);
+        if self.sessions[active].question_choices(item_idx).is_some() {
+            self.submit_question(item_idx, cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    /// 提问面板上的「上一题」：退回到最近选过的那一题重选。
+    pub(crate) fn back_question(&mut self, item_idx: usize, cx: &mut Context<Self>) {
+        self.sessions[self.active].back_question(item_idx);
         cx.notify();
     }
 
@@ -2057,7 +2068,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 「就这样」：所有题都选好了才提交。
+    /// 所有题都选好了才提交（每题选中的下标交给内核），由 [`Self::pick_question`] 自动调。
     pub(crate) fn submit_question(&mut self, item_idx: usize, cx: &mut Context<Self>) {
         let Some(choices) = self.sessions[self.active].question_choices(item_idx) else {
             return;

@@ -1,5 +1,6 @@
 //! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
 
+use super::chrome::CHROME_H;
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::settings_view::active_thinking;
 use super::widgets::Surface;
@@ -562,6 +563,16 @@ impl ChatApp {
                             .relative()
                             .child(self.with_completion_keys(card, cx))
                             .child(self.composer_top.probe())
+                            // 提问面板（`ask_user`）贴着输入框上沿：一次问一题，选完自动交给模型
+                            .children(self.render_question_panel(window, cx).map(|panel| {
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .bottom_full()
+                                    .mb_1p5()
+                                    .child(panel)
+                            }))
                             .children(self.render_completion(window, cx).map(|list| {
                                 div()
                                     .absolute()
@@ -577,6 +588,188 @@ impl ChatApp {
             .when(!self.session().has_user_message() && !self.settings.needs_setup(), |d| {
                 d.child(self.render_suggestions(cx))
             })
+    }
+
+    /// 输入框正上方的提问面板（`ask_user`）：一次只问一题，点一个选项就走到下一题，
+    /// 最后一题选完直接交给模型——所以没有「就这样」那一排按钮。
+    /// 和补全面板一样按输入框上沿量到的位置限高，窗口矮 / 字号大时在面板里滚。
+    fn render_question_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        let item_idx = self.session().pending_question()?;
+        let crate::model::ChatItem::Question { questions, .. } =
+            &self.session().transcript[item_idx]
+        else {
+            return None;
+        };
+        let cursor = self.session().question_cursor(item_idx)?;
+        let question = questions.get(cursor)?;
+        let total = questions.len();
+        let last = cursor + 1 >= total;
+        let rem = window.rem_size();
+        let max_h = self.composer_top.get().map(|top| {
+            let gap = rems(1.).to_pixels(rem);
+            let chrome = CHROME_H.to_pixels(rem);
+            let above = rems(0.375).to_pixels(rem);
+            (top - chrome - gap - above).max(rems(6.).to_pixels(rem))
+        });
+
+        let header = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .px_2p5()
+            .pt_1()
+            .pb_0p5()
+            .child(Icon::new(IconAll::MessageSquare).size_4().text_color(rgb(CORAL)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child(question.header.clone().unwrap_or_else(|| "需要你定一下".to_string())),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .font_features(tabular_nums())
+                    .child(format!("第 {}/{} 题", cursor + 1, total)),
+            )
+            .when(cursor > 0, |d| {
+                d.child(
+                    div()
+                        .id("question-back")
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                        .child("上一题")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.back_question(item_idx, cx);
+                        })),
+                )
+            });
+
+        let prompt = div()
+            .px_2p5()
+            .pb_1()
+            .text_size(TEXT_BODY)
+            .text_color(rgb(INK))
+            .child(question.question.clone());
+
+        let mut rows = div().id("question-rows").v_flex().gap_0p5().min_h_0().px_1();
+        // 条目多了才开滚动区（限高是从输入框上沿倒推的）
+        if let Some(h) = max_h {
+            rows = rows.max_h(h).overflow_y_scroll();
+        }
+        for (o, option) in question.options.iter().enumerate() {
+            let key = super::keys::PERMISSION_KEYS.get(o).copied();
+            rows =
+                rows.child(
+                    div()
+                        .id(("question-option", o))
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(HOVER)))
+                        .when_some(key.map(Self::key_text), |d, key| d.aria_keyshortcuts(key))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_question(item_idx, cursor, o, cx);
+                        }))
+                        .child(
+                            Icon::new(IconAll::Circle)
+                                .size_3p5()
+                                .flex_shrink_0()
+                                .text_color(rgb(INK_FAINT)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .v_flex()
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_size(TEXT_BODY)
+                                        .text_color(rgb(INK))
+                                        .child(option.label.clone()),
+                                )
+                                .children(option.description.clone().map(|d| {
+                                    div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(d)
+                                })),
+                        )
+                        .children(key.map(|key| {
+                            div().flex_shrink_0().child(Self::kbd(key).appearance(false))
+                        })),
+                );
+        }
+
+        // 底边一句提示 + 两个退路（不再是一排按钮）
+        let link = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .rounded_md()
+                .px_1()
+                .cursor_pointer()
+                .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                .child(label)
+        };
+        let footer = div()
+            .h_flex()
+            .items_center()
+            .gap_3()
+            .px_2p5()
+            .pt_1()
+            .pb_1p5()
+            .text_size(TEXT_META)
+            .text_color(rgb(INK_SOFT))
+            .child(div().flex_1().min_w_0().child(if last {
+                "选一个就交给模型"
+            } else {
+                "选一个继续下一题"
+            }))
+            .child(link("question-self", "自己说").on_click(cx.listener(move |this, _, _, cx| {
+                this.answer_question(item_idx, claudesktop_core::QuestionAnswer::SelfAnswer, cx);
+            })))
+            .child(link("question-model", "你来定").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.answer_question(
+                        item_idx,
+                        claudesktop_core::QuestionAnswer::ModelDecides,
+                        cx,
+                    );
+                },
+            )));
+
+        Some(
+            div()
+                .v_flex()
+                .min_h_0()
+                .gap_0p5()
+                .pt_0p5()
+                .rounded_xl()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(CARD))
+                .shadow(float_shadow())
+                .child(header)
+                .child(prompt)
+                .child(rows)
+                .child(footer),
+        )
     }
 }
 

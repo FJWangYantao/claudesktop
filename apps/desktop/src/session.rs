@@ -1283,6 +1283,26 @@ impl Session {
         picks.iter().copied().collect()
     }
 
+    /// 提问面板当前停在哪一题：第一道还没选的；都选过了就停在最后一题。
+    pub fn question_cursor(&self, idx: usize) -> Option<usize> {
+        let ChatItem::Question { questions, picks, answer: None, .. } = self.transcript.get(idx)?
+        else {
+            return None;
+        };
+        Some(picks.iter().position(|p| p.is_none()).unwrap_or(questions.len().saturating_sub(1)))
+    }
+
+    /// 面板上的「上一题」：把最近选过的一题退回去重选，再选就顺着往下走。
+    pub fn back_question(&mut self, idx: usize) {
+        let Some(ChatItem::Question { picks, answer: None, .. }) = self.transcript.get_mut(idx)
+        else {
+            return;
+        };
+        if let Some(slot) = picks.iter_mut().rev().find(|p| p.is_some()) {
+            *slot = None;
+        }
+    }
+
     /// 应答过的权限请求并进它的工具行（工具行末尾出「已允许」之类的短标签），这一行不再画。
     /// 找不到工具行（旧日志没有工具 ID）、认不出选的是什么或应答失败时，照旧单独一行。
     fn merge_permission(&mut self, idx: usize) {
@@ -3139,6 +3159,38 @@ mod tests {
             i,
             ChatItem::Question { answer: Some(claudesktop_core::QuestionAnswer::Cancelled), .. }
         )));
+    }
+
+    #[core::prelude::v1::test]
+    fn question_panel_walks_questions_one_at_a_time() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        let q = |text: &str| claudesktop_core::QuestionView {
+            question: text.into(),
+            header: None,
+            options: vec![
+                claudesktop_core::QuestionOptionView { label: "甲".into(), description: None },
+                claudesktop_core::QuestionOptionView { label: "乙".into(), description: None },
+            ],
+        };
+        s.apply_event(
+            KernelEvent::UserQuestion {
+                id: 9, tool: None, questions: vec![q("先问"), q("再问")]
+            },
+            None,
+        );
+        let idx = s.pending_question().expect("挂着提问");
+        assert_eq!(s.question_cursor(idx), Some(0));
+        // 选完第一题就停在第二题
+        s.pick_question(idx, 0, 1);
+        assert_eq!(s.question_cursor(idx), Some(1));
+        assert_eq!(s.question_choices(idx), None);
+        // 「上一题」把那题退回去重选
+        s.back_question(idx);
+        assert_eq!(s.question_cursor(idx), Some(0));
+        s.pick_question_key(idx, 1);
+        s.pick_question_key(idx, 0);
+        assert_eq!(s.question_choices(idx), Some(vec![1, 0]));
+        assert_eq!(s.question_cursor(idx), Some(1), "都选过了停在最后一题");
     }
 
     #[core::prelude::v1::test]

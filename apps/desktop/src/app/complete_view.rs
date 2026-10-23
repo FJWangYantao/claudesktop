@@ -83,6 +83,13 @@ pub(super) struct CompletionState {
 impl ChatApp {
     /// 输入内容变了：重新判断光标处是不是触发词、刷新候选。
     pub(super) fn update_completion(&mut self, cx: &mut Context<Self>) {
+        // 提问面板挂在输入框上沿时不同时开补全（两叠一起会互相盖住）
+        if self.session().waiting_question() {
+            if self.completion.open.take().is_some() {
+                self.refresh_composer(cx);
+            }
+            return;
+        }
         let (text, cursor) = {
             let input = self.input.read(cx);
             (input.value().to_string(), input.cursor())
