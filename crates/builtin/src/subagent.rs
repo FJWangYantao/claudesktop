@@ -25,14 +25,15 @@ pub const EXPLORE: &str = "explore";
 const EXPLORE_TOOLS: [&str; 7] =
     ["read_file", "list_dir", "glob", "grep", "web_fetch", "web_search", "memory_search"];
 
-/// 主会话系统提示词里的一段：什么时候该派子任务。不写的话模型几乎只自己搜，
-/// 中间过程全堆在主上下文里。
-pub const DELEGATION: &str = "Delegate with the task tool to keep your own context focused: \
-    use an `explore` subagent for open-ended investigation that will take several rounds of \
-    searching and reading (finding where something is implemented across the codebase, tracing how a \
-    feature works, surveying usages before a refactor), and launch several in one step when the \
-    questions are independent. Do it yourself when you already know the file or a single glob / grep \
-    will answer it, and when you need the exact file contents in front of you to edit them.";
+/// 主会话系统提示词里的一段：什么时候该派子任务。先说自己做（默认），再说什么时候才值得派：
+/// 没有它模型几乎只自己搜，中间过程全堆在主上下文里；但把它排得太前模型又什么都往外推。
+pub const DELEGATION: &str = "Do the searching yourself when you already know the file, or a glob / \
+    grep or two will answer it, or you need the exact contents in front of you to edit them. \
+    Delegate with the task tool only for open-ended investigation that takes several rounds of \
+    searching and reading and where you mostly need the location rather than the contents \
+    (finding where something is implemented across the codebase, tracing how a feature works, \
+    surveying usages before a refactor): an `explore` subagent keeps that searching out of your \
+    context. Launch several in one step when the questions are independent.";
 /// 工具行摘要最多几个字
 const SUMMARY_CHARS: usize = 80;
 

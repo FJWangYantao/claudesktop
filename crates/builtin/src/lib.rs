@@ -1782,13 +1782,22 @@ impl Inner {
             MODE_ACCEPT_EDITS if access == Access::Edit && action.inside(cwd) => {
                 return Verdict::Allow;
             }
-            // 自动：硬熔断 → 已保存的规则 → 分类器。工作目录内的编辑在下面按
-            // 「和 acceptEdits 一样直接放行」处理，省掉一次分类器往返
+            // 自动：硬熔断 → 明显只读的命令 → 工作目录内的编辑（都免分类器）→ 已保存的规则
+            // → 分类器。前三个都是省掉一次分类器往返的快路
             MODE_AUTO => {
                 if let Some(reason) = tools::hard_block(action, cwd) {
                     return Verdict::Deny(reason);
                 }
                 if access == Access::Edit && action.inside(cwd) {
+                    return Verdict::Allow;
+                }
+                // 明显只读的命令（`ls`、`git status`、`cargo test` 这类白名单，见
+                // `tools::reads_only`）直接放行：不调分类器、不计入拒绝计数，
+                // 和 `Action::Read` 的待遇一样只是走的是命令那条路
+                if let Action::Shell { command, .. } | Action::ShellBackground { command, .. } =
+                    action
+                    && tools::reads_only(command)
+                {
                     return Verdict::Allow;
                 }
                 return self.auto_verdict(session, cwd, action, title, stopped);
@@ -2457,11 +2466,8 @@ fn prompt_sections(
              working on the user's machine.\n\
              Working directory: {}\n\
              Platform: {}\n\n\
-             Use the tools to inspect and change the project: find files with glob and search code with grep \
-             (rather than shell commands), read files before editing them, \
-             request independent reads and searches together in one step (they run in parallel), \
-             prefer edit_file for small changes, read URLs the user gives with web_fetch, and verify your work (e.g. build or run tests) \
-             when it makes sense. {todo}\
+             Verify a change only when you judge it risky or the user asks for it — one check, \
+             not a build after every step. {todo}\
              Tool calls that change things may need the user's approval; \
              if one is denied, do not retry it.\n\
              When a decision is really the user's (which of two approaches, whether to overwrite \
@@ -2470,7 +2476,10 @@ fn prompt_sections(
              out, and do not ask the same question twice.\n\
              {delegation}\
              {BACKGROUND}\n\
-             Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
+             Keep replies concise. Answer in the user's language. Use Markdown for structure and code.\n\
+             Act on the task directly: don't restate a plan or narrate what you are about to do \
+             before a tool call, and don't re-confirm facts you already have from the conversation \
+             or from tool results. A short reply is better than a thorough-looking one.",
             cwd.display(),
             std::env::consts::OS,
         ),
@@ -2519,9 +2528,8 @@ fn prompt_sections(
             .to_string();
         if agent.is_none() {
             text.push_str(
-                " When the change touches parts of the codebase you have not seen yet, map them \
-                 first with `explore` subagents (in parallel when they are independent) and build \
-                 the plan on their findings.",
+                " When helpful, consult `explore` subagents to map parts of the codebase you have \
+                 not seen yet, and build the plan on their findings.",
             );
         }
         sections.push(("plan", text));

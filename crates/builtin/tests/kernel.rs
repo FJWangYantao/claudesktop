@@ -1320,6 +1320,76 @@ fn auto_mode_lets_in_repo_edits_through_without_the_classifier() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 明显只读的命令（tools::reads_only 白名单）不进分类器，直接放行：省一次小模型往返，
+/// 也不计入拒绝计数
+#[test]
+fn auto_mode_runs_read_only_shell_commands_without_the_classifier() {
+    let dir = workdir("auto-readonly");
+    let (base, bodies) = serve(vec![
+        tool_call("s1", "shell", serde_json::json!({ "command": "ls" })),
+        happy_stream("看过了"),
+    ]);
+    let h = Harness::build_full(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "mock-model".into(),
+            ..Default::default()
+        },
+        dir.clone(),
+        HashMap::new(),
+        None,
+        claudesktop_builtin::DEFAULT_MAX_STEPS,
+        None,
+        Some(auto_config()),
+    );
+    let sid = h.start();
+    h.kernel.set_mode(&sid, "auto").unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看目录里有什么")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 命令真的跑了，没有权限卡，也没有「分类器放行」的记录（根本没调它）
+    assert_eq!(h.tool_status("s1").as_deref(), Some("completed"));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionAuto { .. })), 0);
+    // 两次请求都是主模型，没有分类器调用
+    assert_eq!(bodies.lock().unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 白名单的边界：白名单里的命令带了写盘参数（rg --fix）就不算只读，照田过分类器
+#[test]
+fn auto_mode_still_classifies_read_only_tools_with_writing_flags() {
+    let dir = workdir("auto-readonly-flag");
+    let (base, bodies) = serve(vec![
+        tool_call("s1", "shell", serde_json::json!({ "command": "rg --fix pattern" })),
+        classifier_says(r#"{"decision":"deny","reason":"[Write] rg --fix rewrites files"}"#),
+        happy_stream("那我不改了"),
+    ]);
+    let h = Harness::build_full(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "mock-model".into(),
+            ..Default::default()
+        },
+        dir.clone(),
+        HashMap::new(),
+        None,
+        claudesktop_builtin::DEFAULT_MAX_STEPS,
+        None,
+        Some(auto_config()),
+    );
+    let sid = h.start();
+    h.kernel.set_mode(&sid, "auto").unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("顺手格式化一下")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    // 第二次请求是分类器：带写盘参数的命令没有免检
+    assert_eq!(bodies.lock().unwrap().len(), 3);
+    assert!(body(&bodies, 1)["messages"].to_string().contains("You are the safety classifier"));
+    assert_eq!(h.tool_status("s1").as_deref(), Some("failed"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 本地网页服务器：每个请求都回同一页 HTML；返回网址前缀
 fn serve_page(html: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
