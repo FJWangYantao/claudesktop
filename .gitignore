@@ -6,6 +6,8 @@
 
 # Debug screenshots captured while probing layout (not source)
 tools/*.png
+# memwatch 的运行输出（逐秒内存打点），数据不进仓库；脚本本身保留
+tools/memwatch.csv
 # One-off probes for those shots (kept out of the repo: hard-coded local paths)
 tools/scan.ps1
 tools/shot_one.ps1
