@@ -1481,6 +1481,53 @@ pub fn hard_block(action: &Action, cwd: &Path) -> Option<String> {
     }
 }
 
+/// 明显只读的命令白名单：「自动」模式里命中就直接放行、不调分类器（见 `lib.rs` 的
+/// `authorize`）。省掉 `ls`、`git status` 这类命令的一次小模型往返。
+///
+/// 宁缺毋滥，往保守里判：
+/// - 只认**单个**命令——出现 `&&` / `||` / `;` / `|` / 重定向 / 命令替换中的任何一种
+///   形状就不认，几条命令拼在一起的整体效果没法从字面判断；
+/// - 只认白名单里的前缀（第一个词，加上恰好需要的第二个词）；
+/// - 白名单内的命令带了会写盘的参数（`--output` / `--fix` / `--write`）也不认
+///   （`rg --fix`、`cargo test --output` 都能写文件；前缀匹配会把 `--fix-dry-run` 这类
+///   也拦下，多走一次分类器无害）。
+///
+/// 认不出的后果只是多一次分类器往返，误认的后果是没审就放行。
+pub fn reads_only(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    // 任何「不止一条命令 / 输出不落在终端」的形状都放弃判定
+    if ["&&", "||", ";", "|", ">", "<", "$(", "`"].iter().any(|s| command.contains(s)) {
+        return false;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    // 会写盘的参数：哪怕命令本身在白名单里也不算只读
+    if words[1..]
+        .iter()
+        .any(|w| w.starts_with("--output") || w.starts_with("--fix") || w.starts_with("--write"))
+    {
+        return false;
+    }
+    let second = words.get(1).copied();
+    match words[0] {
+        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "rg" | "grep" | "dir" | "type" => true,
+        // find 的 -exec / -execdir / -delete 都会动文件系统
+        "find" => !words[1..].iter().any(|w| w.starts_with("-exec") || *w == "-delete"),
+        "git" => match second {
+            Some("status" | "diff" | "log" | "show" | "rev-parse") => true,
+            // branch 带 -d / -D / -m / -M 是删分支 / 改名
+            Some("branch") => !words[2..].iter().any(|w| matches!(*w, "-d" | "-D" | "-m" | "-M")),
+            _ => false,
+        },
+        "cargo" => matches!(second, Some("check" | "build" | "test" | "metadata")),
+        "node" => second == Some("--version"),
+        "npm" => second == Some("ls"),
+        _ => false,
+    }
+}
+
 /// 受保护的文件名（写这些一律不放行）：密钥、shell 启动脚本、包管理器 / 钩子配置、
 /// 以及本程序自己的 MCP 配置和设置。
 const PROTECTED_FILES: [&str; 24] = [
@@ -2847,6 +2894,77 @@ mod tests {
         assert!(protected_path(&upper.join("mcp.json"), Some(&data)));
         assert!(!protected_path(&cwd.join("mcp.json"), Some(&data)));
         assert!(!protected_path(&cwd.join("src/main.rs"), None));
+    }
+
+    /// 白名单里的命令和形状安全的组合才算只读
+    #[test]
+    fn reads_only_accepts_clearly_read_only_commands() {
+        for ok in [
+            "ls",
+            "ls -la",
+            "pwd",
+            "cat README.md",
+            "head -n 20 log",
+            "tail -n 50 log",
+            "wc -l src/main.rs",
+            "rg pattern src",
+            "grep -n foo bar.txt",
+            "find . -name '*.rs' -type f",
+            "git status",
+            "git diff --stat",
+            "git log -3 --oneline",
+            "git show HEAD",
+            "git branch",
+            "git rev-parse HEAD",
+            "cargo check",
+            "cargo build",
+            "cargo test --all",
+            "cargo metadata --format-version 1",
+            "node --version",
+            "npm ls --depth=0",
+            "dir",
+            "type notes.txt",
+        ] {
+            assert!(reads_only(ok), "应算只读：{ok}");
+        }
+    }
+
+    /// 白名单外、带写盘参数、或拼了管道 / 重定向 / 连接符的一律不算只读（宁缺毋滥）
+    #[test]
+    fn reads_only_rejects_everything_composed_or_writing() {
+        for bad in [
+            "rm -rf x",
+            "ls > out.txt",
+            "git branch -D x",
+            "git branch -m old new",
+            "echo a && rm b",
+            "find . -delete",
+            "find . -exec rm {} +",
+            "cat a | sh",
+            // 写盘的参数：即使命令本身在白名单里
+            "rg --fix pattern",
+            "cargo test --output results.txt",
+            "cargo fmt --write",
+            // 不在白名单里的子命令 / 第二个词不对
+            "git push origin main",
+            "cargo clean",
+            "node -e print(1)",
+            "npm install",
+            "cargo",
+            "git",
+            "",
+            "   ",
+            // 重定向 / 命令替换 / 反引号：形状不安全
+            "cargo test 2>&1",
+            "grep pat < input",
+            "cat `which python`",
+            "cat $(which python)",
+            "cat a; cat b",
+            "cat a || cat b",
+            "echo hi",
+        ] {
+            assert!(!reads_only(bad), "不该算只读：{bad}");
+        }
     }
 
     #[test]
