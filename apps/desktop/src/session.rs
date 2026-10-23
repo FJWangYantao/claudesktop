@@ -523,6 +523,8 @@ impl Session {
                     s.review_pending |= reverted.is_some();
                     reverted_now.insert(path, reverted.is_some_and(|r| !r.is_empty()));
                 }
+                // 工具加载状态是内核给模型的工具定义，界面上不显示（续接时内核从日志还回去）
+                Record::ToolLoadout { .. } => {}
             }
         }
         // 撤回了多少要对着 diff 才数得清，这里只知道「撤回过」：先按撤回了一部分显示，
@@ -1115,7 +1117,8 @@ impl Session {
                             Some(claudesktop_core::QuestionAnswer::Choices { choices }) => choices
                                 .get(n)
                                 .and_then(|i| q.options.get(*i))
-                                .map(|o| format!(" → {}", o.label)),
+                                .map(|o| format!(" → {}", o.label))
+                                .unwrap_or_default(),
                             Some(a) => format!("（{}）", a.label()),
                             None => "（待回答）".to_string(),
                         };

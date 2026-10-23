@@ -161,6 +161,13 @@ pub enum Record {
     /// 从那条消息起的记录作废（见 [`effective`]）；`files` 是还原了几个文件，`prompt` 是那条消息
     /// （重放时显示成一行备注）
     Rewind { turn: usize, conversation: bool, files: usize, prompt: String },
+    /// 内核把 `tool_search` 加载的工具额外声明给了模型（见「方案-内核提速.md」阶段 2）。
+    /// `names` 是加载后额外声明的工具名；续接时内核照着它把这份名单还回去，
+    /// 免得模型手里的工具和日志里记的对不上。不产生消息，也不进上下文。
+    ToolLoadout {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        names: Vec<String>,
+    },
 }
 
 impl Record {
