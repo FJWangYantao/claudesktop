@@ -329,6 +329,10 @@ pub enum KernelEvent {
     /// 内核改了一个文件：改之前 / 之后的完整内容（None = 文件不存在）。
     /// 给 UI 存检查点用（见 [`checkpoint`]）；内容可能很大，不原样进日志，由 UI 转成 `Record::FileChanged`
     FileChanged { path: String, before: Option<String>, after: Option<String> },
+    /// 内核给这一轮的工具清单动了：`names` 是通过 `tool_search` 额外声明给模型的工具
+    /// （见「方案-内核提速.md」阶段 2）。不进对话流，由 UI 转成 `Record::ToolLoadout`，
+    /// 续接时内核照着它把名单还回去。
+    ToolsLoaded { names: Vec<String> },
     /// MCP 服务器的连接状态（连接级事件，配置变了 / 某个服务器状态变了就整份重发）
     McpStatus { servers: Vec<McpServerView> },
     /// 内核用模型给会话起了个新标题（第一轮结束后）；界面更新侧栏，失败不发
@@ -449,6 +453,7 @@ impl KernelEvent {
             Self::CompactFailed { .. } => "compact_failed",
             Self::Fatal(_) => "fatal",
             Self::FileChanged { .. } => "file_changed",
+            Self::ToolsLoaded { .. } => "tools_loaded",
             Self::McpStatus { .. } => "mcp_status",
             Self::TitleGenerated { .. } => "title_generated",
             Self::BackgroundTasks { .. } => "background_tasks",

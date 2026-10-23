@@ -164,6 +164,8 @@ pub struct ChatApp {
     loop_overlay: Entity<motion::LoopOverlay>,
     /// 首页滚动区内容的定宽（见 `MeasuredWidth`）
     home_w: widgets::MeasuredWidth,
+    /// 输入框卡片上沿在窗口里的位置（补全面板按它限高，见 `MeasuredTop`）
+    composer_top: widgets::MeasuredTop,
     /// 首页整页的滚动位置（「请求」页签据此只排视口附近的几轮）
     home_scroll: ScrollHandle,
     /// 子任务详情页的滚动位置（每次打开从顶上看起）
@@ -498,6 +500,7 @@ impl ChatApp {
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             loop_overlay: cx.new(|_| motion::LoopOverlay),
             home_w: Default::default(),
+            composer_top: Default::default(),
             home_scroll: ScrollHandle::new(),
             task_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
@@ -2266,6 +2269,11 @@ impl ChatApp {
                     let event = match event {
                         KernelEvent::FileChanged { path, before, after } => {
                             self.record_file_change(idx, path, before, after);
+                            return;
+                        }
+                        // 工具加载：模型手里多出来的工具定义，续接时要还给模型
+                        KernelEvent::ToolsLoaded { names } => {
+                            self.persist(idx, Record::ToolLoadout { names });
                             return;
                         }
                         event => event,

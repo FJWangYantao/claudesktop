@@ -1720,6 +1720,8 @@ impl Session {
             | KernelEvent::FsRead { .. }
             | KernelEvent::FsWrite { .. }
             | KernelEvent::FileChanged { .. }
+            // 工具加载只影响内核发给模型的工具定义（内核从日志的 `Record::ToolLoadout` 拿回来）
+            | KernelEvent::ToolsLoaded { .. }
             | KernelEvent::McpStatus { .. }
             | KernelEvent::BackgroundTasks { .. }
             | KernelEvent::MemoryChanged { .. }
