@@ -299,16 +299,8 @@ fn truncated_edit_file_does_not_touch_other_lines() {
 fn two_truncated_replies_in_a_row_stop_the_turn() {
     let dir = workdir("twice");
     let (base, bodies) = serve(vec![
-        truncated_call(
-            "w1",
-            "write_file",
-            serde_json::json!({ "path": "a.txt", "content": "一" }),
-        ),
-        truncated_call(
-            "w2",
-            "write_file",
-            serde_json::json!({ "path": "a.txt", "content": "二" }),
-        ),
+        truncated_call("w1", "write_file", serde_json::json!({ "path": "a.txt", "content": "一" })),
+        truncated_call("w2", "write_file", serde_json::json!({ "path": "a.txt", "content": "二" })),
         // 剧本只给两条：真要是还请求第三次，测试会因为没回复而失败
     ]);
     let h = Harness::new(base, dir.clone());

@@ -39,7 +39,7 @@ mod sse;
 mod subagent;
 pub mod suggest;
 mod tools;
-pub use tools::{ToolOutput, TODO_REMIND_STEPS, run_command};
+pub use tools::{TODO_REMIND_STEPS, ToolOutput, run_command};
 pub mod websearch;
 
 pub use anthropic::AnthropicProvider;
@@ -2990,15 +2990,16 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                     "连续 {truncated_steps} 次回复被输出上限截断（finish_reason = length），已停止。"
                 ));
             }
-            let contents: Vec<String> =
-                outcome.tool_calls.iter().map(|c| truncated_tool_message(&c.function.name)).collect();
+            let contents: Vec<String> = outcome
+                .tool_calls
+                .iter()
+                .map(|c| truncated_tool_message(&c.function.name))
+                .collect();
             let results: Vec<_> = outcome
                 .tool_calls
                 .iter()
                 .zip(&contents)
-                .map(|(call, content)| {
-                    ChatMessage::tool_result(call.id.clone(), content.clone())
-                })
+                .map(|(call, content)| ChatMessage::tool_result(call.id.clone(), content.clone()))
                 .collect();
             // 界面：每个调用都报一行工具，状态直接是 failed。不走 `start_tool`：截断的参数不该被
             // 解析（`Action::parse` 可能成功），也不该发 diff 预览
@@ -3463,12 +3464,8 @@ mod tests {
     #[test]
     fn prompt_sections_join_back_into_the_prompt() {
         let cwd = Path::new("/tmp/proj");
-        let empty = || Context {
-            instructions: &[],
-            skills: &[],
-            memory_project: &[],
-            memory_global: &[],
-        };
+        let empty =
+            || Context { instructions: &[], skills: &[], memory_project: &[], memory_global: &[] };
         let sections = prompt_sections(cwd, MODE_DEFAULT, false, None, None, empty());
         assert_eq!(sections.len(), 1, "没有背景材料时只有 preamble");
         assert_eq!(sections[0].0, "preamble");
