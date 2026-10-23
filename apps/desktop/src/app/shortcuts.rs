@@ -51,6 +51,8 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
             ("选补全列表的上一项 / 下一项", &INPUT_HISTORY_KEYS),
             ("光标在开头时回上一条输入 / 在末尾时取下一条", &INPUT_HISTORY_KEYS),
             ("光标在第一行 / 最后一行：移到开头 / 移到末尾", &INPUT_HISTORY_KEYS),
+            ("在光标处展开 / 收起补全列表", &[EXPAND_COMPLETION_KEY, COLLAPSE_COMPLETION_KEY]),
+            ("补全列表开着时不填入、直接发送", &["secondary-enter"]),
         ],
     ),
 ];

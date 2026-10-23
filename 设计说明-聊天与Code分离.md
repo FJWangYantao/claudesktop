@@ -12,7 +12,7 @@
 > `main.rs`（`AssetSource` 包一层）、`app/chat.rs`（`TextView` 挂插件）；
 > 图片（两种会话共用）：`crates/core/src/image_prep.rs`（新增：转正 / 缩小 / 重编码）、`crates/builtin/src/provider.rs`（`ModelInfo::vision`、能力表）、
 > `model.rs`（`PendingImage` 异步处理）、`app/composer.rs`（附件按钮、看不了图的提示）、`app/chat.rs`（回复里的图片）；
-> 远程图片（第 8 步）：`src/http.rs`（新增：gpui 的 `HttpClient`，走 `ureq`）、`app/remote_image.rs`（新增：占位卡 + 加载状态 + `MarkdownPlugin`）、
+> 远程图片（第 8 步）：`src/http.rs`（新增：`get_bytes` 取字节，走 `ureq`）、`app/remote_image.rs`（新增：占位卡 + 加载状态 + `MarkdownPlugin`）、
 > `assets.rs`（`register_image` / `cached`，按内容哈希登记字节）、`app/chat.rs`（`ImageView` + 图片浮层的「另存为…」）。
 
 ## 一、要解决什么
@@ -429,8 +429,9 @@ Code 会话的提示词不加（不改现有缓存命中），靠 6.4 的归一�
 
 - 点回复里的图片同样打开 `open_image` 浮层，浮层里加「另存为…」（`cx.prompt_for_new_path`，
   本地图读文件、远程图写已经取回的那份字节）。
-- **远程图片**（`https://…`）：给 gpui 配一个 HTTP 客户端（`src/http.rs` 的 `UreqHttpClient`，
-  实现 `gpui` 的 `HttpClient`，底下复用 `ureq`，代理按 `ureq` 的默认规则读环境变量）。
+- **远程图片**（`https://…`）：`src/http.rs` 的 `get_bytes` 取字节，底下复用 `ureq`，代理按 `ureq` 的默认规则读环境变量。
+  **不给 gpui 配 `HttpClient`**（保持 `NullHttpClient`）：插件认领不到的远程图（回复里原始 HTML 的 `<img src="https://…">`）
+  否则会被 `img()` 不问用户就请求；现在它们取不回来，「先问用户」没有旁路。
   但**默认不自动加载**：远程图片会把用户的 IP 和「正在看这条回复」告诉图片所在的服务器，模型给的链接也可能是编的。
   默认显示一张占位卡「图片 · example.com」+「加载」，设置「外观」里一个开关「自动加载回复里的网络图片」（默认关）。
   落地时多做了一步：**真图不走 `img("https://…")` 的隐式加载**——`app/remote_image.rs` 的 `MarkdownPlugin`
@@ -549,7 +550,7 @@ Code 会话的提示词不加（不改现有缓存命中），靠 6.4 的归一�
 | 5 | **公式**：`math.rs`（RaTeX 排版 + 写法归一 + 货币规则 + 缓存）、`MarkdownPlugin`（行内 / 块）、`AssetSource` 包一层、出错与流式、复制 LaTeX、测试与压测 | 2 天 |
 | 6 | **图片**：`image_prep.rs`、后台处理与占位、附件按钮收图、`ModelInfo::vision` + 能力表 + 400 识别与记忆、历史图片占位、待发送缩略图可点开、回复里的图片另存为 | 2 天 |
 | 7 | 聊天转 Code（复制日志续接） | 半天 |
-| 8 | 回复里的网络图片：gpui `HttpClient`（`http.rs`）、占位卡与「加载」（`remote_image.rs`）、`assets` 登记、浮层「另存为…」、设置开关 | 1 天 |
+| 8 | 回复里的网络图片：取字节（`http.rs`）、占位卡与「加载」（`remote_image.rs`）、`assets` 登记、浮层「另存为…」、设置开关 | 1 天 |
 
 聊天分离本身（第 1～4 步）约 4 天；加上公式、图片和聊天转 Code 约 8.5 天，带上第 8 步约 9.5 天。
 

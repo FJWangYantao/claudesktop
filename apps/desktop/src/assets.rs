@@ -30,11 +30,12 @@ fn registry() -> &'static Mutex<HashMap<String, &'static [u8]>> {
 /// 所以同一张图重复登记是同一个名字、只占一份内存。
 pub fn register_image(bytes: &[u8]) -> Option<String> {
     let ext = image_extension(image::guess_format(bytes).ok()?)?;
-    let name = format!("{IMAGE_PREFIX}{}.{ext}", crate::app::remote_image::hash_bytes(bytes));
+    // 表里按去掉 `remote/` 前缀的名字存（`load` 也是去掉前缀再查），和公式一样
+    let key = format!("{}.{ext}", crate::app::remote_image::hash_bytes(bytes));
     let mut map = registry().lock().unwrap();
     // 和公式一样泄漏一小块静态缓冲：资源源要求 'static，生命周期跟着进程走
-    map.entry(name.clone()).or_insert_with(|| Box::leak(bytes.to_vec().into_boxed_slice()));
-    Some(name)
+    map.entry(key.clone()).or_insert_with(|| Box::leak(bytes.to_vec().into_boxed_slice()));
+    Some(format!("{IMAGE_PREFIX}{key}"))
 }
 
 /// 只收 gpui 画得出来的格式（别的给个 `None`，让界面说「读不出来」而不是崩）。
@@ -108,7 +109,8 @@ impl AssetSource for Assets {
 /// 「另存为…」写盘要原始字节；画图用 [`crate::app::remote_image::registered_name`]。
 pub fn cached(url: &str) -> Option<Vec<u8>> {
     let name = crate::app::remote_image::registered_name(url)?;
-    registry().lock().unwrap().get(&name).map(|bytes| bytes.to_vec())
+    let key = name.strip_prefix(IMAGE_PREFIX)?;
+    registry().lock().unwrap().get(key).map(|bytes| bytes.to_vec())
 }
 
 #[cfg(test)]
@@ -142,6 +144,8 @@ mod tests {
         let name = register_image(png).expect("PNG 认得出来");
         assert!(name.starts_with(IMAGE_PREFIX), "{name}");
         assert_eq!(&*Assets.load(&name).unwrap().unwrap(), png);
+        // 列目录给的也是能直接 load 的名字（不重复前缀）
+        assert!(Assets.list(IMAGE_PREFIX).unwrap().iter().any(|n| n.as_ref() == name));
         // 同一份字节登记两次是同一个名字（只占一份）
         assert_eq!(register_image(png).as_deref(), Some(name.as_str()));
         // 不是图片的字节给 None，界面据此说「读不出来」

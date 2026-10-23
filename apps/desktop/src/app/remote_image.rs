@@ -16,10 +16,9 @@
 
 use crate::theme::{INK_SOFT, LINE, RED, SAND, TEXT_SMALL, rgb};
 use gpui_kit::assets::IconName as IconAll;
-use gpui_kit::base::MarkdownExtensions;
 use gpui_kit::base::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown_ast};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::Icon;
+use gpui_kit::component::button::Button;
+use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::collections::HashMap;
@@ -117,11 +116,6 @@ impl MarkdownPlugin for RemoteImagePlugin {
             state => div().py_1().child(card(image, &state)).into_any_element(),
         }
     }
-}
-
-/// 给所有画回复的 `TextView` 挂上的扩展（和公式那一份并在一起，见 `math::extensions`）。
-pub fn extension() -> MarkdownExtensions {
-    MarkdownExtensions::default().plugin(RemoteImagePlugin)
 }
 
 // ---------------------------------------------------------------- 状态与加载
@@ -223,11 +217,7 @@ fn loaded(name: &str, url: &str) -> AnyElement {
                 .object_fit(ObjectFit::Contain)
                 .cursor_pointer()
                 .on_click(move |_, window, cx| {
-                    super::chat::open_image(
-                        super::chat::ImageView::Remote(url.clone()),
-                        window,
-                        cx,
-                    )
+                    super::chat::open_image(super::chat::ImageView::Remote(url.clone()), window, cx)
                 }),
         )
         .into_any_element()
@@ -329,8 +319,11 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn label_falls_back_to_the_host() {
-        let mut image =
-            RemoteImage { url: "https://example.com/a.png".into(), host: "example.com".into(), alt: String::new() };
+        let mut image = RemoteImage {
+            url: "https://example.com/a.png".into(),
+            host: "example.com".into(),
+            alt: String::new(),
+        };
         assert_eq!(image.label(), "图片 · example.com");
         image.alt = "一张截图".into();
         assert_eq!(image.label(), "一张截图");

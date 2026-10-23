@@ -60,7 +60,7 @@ pub(super) fn open_image(image: ImageView, window: &mut Window, cx: &mut App) {
     let width = (viewport.width * 0.8).min(px(1200.));
     let height = viewport.height * 0.72;
     let dialog_image = image.clone();
-    window.open_dialog(cx, move |dialog, _window, cx| {
+    window.open_dialog(cx, move |dialog, _window, _cx| {
         let light: AnyElement = match &dialog_image {
             ImageView::Path(path) => {
                 img(path.clone()).size_full().object_fit(ObjectFit::ScaleDown).into_any_element()
@@ -81,9 +81,7 @@ pub(super) fn open_image(image: ImageView, window: &mut Window, cx: &mut App) {
                 .v_flex()
                 .gap_3()
                 .w_full()
-                .child(
-                    div().w_full().h(height).flex().justify_center().items_center().child(light),
-                )
+                .child(div().w_full().h(height).flex().justify_center().items_center().child(light))
                 .child(div().h_flex().justify_end().child(save_button)),
         )
     });
@@ -103,7 +101,11 @@ pub(super) fn save_image(image: ImageView, window: &mut Window, cx: &mut App) {
             Err(err) => (None, format!("读不了这张图：{err}")),
         },
         ImageView::Remote(url) => {
-            let name = format!("{}.png", super::remote_image::RemoteImage::host_of(url));
+            // 扩展名按取回的实际格式（登记名 `remote/<哈希>.jpg` 的尾巴），别一律写 .png
+            let ext = super::remote_image::registered_name(url)
+                .and_then(|n| n.rsplit_once('.').map(|(_, ext)| ext.to_string()))
+                .unwrap_or_else(|| "png".into());
+            let name = format!("{}.{ext}", super::remote_image::RemoteImage::host_of(url));
             (crate::assets::cached(url), name)
         }
     };

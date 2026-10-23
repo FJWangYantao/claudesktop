@@ -86,7 +86,7 @@ pub fn prev_word_end(text: &str, at: usize) -> usize {
 }
 
 /// 从 `at` 往后跳到下一个词的**词首**（越过光标后的空白，落在下一个词第一个字前面）。
-/// 已经在最后时原尾不动。
+/// 已经在最后时原地不动。
 pub fn next_word_start(text: &str, at: usize) -> usize {
     let at = at.min(text.len());
     at + text[at..].find(|c: char| !c.is_whitespace()).unwrap_or(text.len() - at)
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(token_bounds("/mod", 0), Some((0, 4)));
         assert_eq!(token_bounds("/mod", 4), Some((0, 4)));
         assert_eq!(token_bounds("@src/main.rs", 5), Some((0, 12)));
-        // 多字节：`中文 /设置` 的 `/设置` 是 12..18
+        // 多字节：`中文 /设置` 的 `/设置` 从第 7 个字节开始（`中文` 6 字节 + 空格）
         let text = "中文 /设置";
         assert_eq!(token_bounds(text, text.len()), Some((7, text.len())));
         // 中间那个词

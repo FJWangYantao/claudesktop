@@ -16,7 +16,7 @@
 //! - Alt+← / Alt+→：在光标处重新展开 / 收起列表（绑定在 `keys.rs`，处理在这里，只在输入框卡片上生效）。
 
 use super::ChatApp;
-use super::keys::{CollapseCompletion, ExpandCompletion};
+use super::keys::{COLLAPSE_COMPLETION_KEY, CollapseCompletion, ExpandCompletion};
 use crate::complete::{self, Trigger, TriggerKind};
 use crate::model::ViewMode;
 use crate::settings::KernelChoice;
@@ -630,11 +630,15 @@ impl ChatApp {
                     .text_size(TEXT_META)
                     .text_color(rgb(INK_SOFT))
                     .child(heading)
-                    .child(if c.items.len() >= 2 {
-                        "↑↓ 选择 · 回车 / Tab 确认 · Esc 关闭"
-                    } else {
-                        "Tab 填入 · Esc 关闭"
-                    }),
+                    .child(format!(
+                        "{} · Esc / {} 收起",
+                        if c.items.len() >= 2 {
+                            "↑↓ 选择 · 回车 / Tab 确认"
+                        } else {
+                            "Tab 填入"
+                        },
+                        Self::key_text(COLLAPSE_COMPLETION_KEY),
+                    )),
             );
         for (i, item) in c.items.iter().enumerate() {
             let selected = i == c.selected;

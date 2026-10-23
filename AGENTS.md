@@ -50,7 +50,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `MarkdownPlugin` 认领成占位卡「图片 · 域名」+「加载」，**默认不自动请求**（设置「外观」的
   `auto_load_images` 默认关）。真图**不走 `img("https://…")`**：点了才用 `http::get_bytes` 取字节，
   按内容哈希登记进 `assets::register_image` 再交给 `img()`——所以「先问用户」是结构上的保证，
-  失败也能在卡片上写清原因。新加网络图片来源时走 `http::get_bytes`，别再开第二条请求路径。
+  失败也能在卡片上写清原因。新加网络图片来源时走 `http::get_bytes`，别再开第二条请求路径；也别给 gpui 配 `with_http_client`（回复里 HTML `<img>` 这类插件认领不到的会被不问用户就请求）。
 - **条目点击回调**：Popover 的 `content` 闭包里拿到的是 `Context<PopoverState>`，
   动作经 `Entity<ChatApp>.update(cx, |this, cx| ...)` 回根视图（`MenuList::pick` 已包好）；参照
   `composer.rs` 里 `mode_menu_items` 的写法。菜单打开时焦点在 `ChatApp::menu_focus`（数字键靠它），
