@@ -78,7 +78,8 @@ fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
 use claudesktop_core::plugin::{self, AgentDef, HookEvent, HookOutcome, Plugin, Skill};
 use claudesktop_core::{
     EventSink, Kernel, KernelEvent, ModeView, PartialGrant, PermissionHunks, PermissionOptionView,
-    PlanEntryView, QuestionAnswer, Record, RoutedEvent, SessionKind, SessionSpec, checkpoint,
+    PlanEntryView, PromptImage, QuestionAnswer, Record, RoutedEvent, SessionKind, SessionSpec,
+    checkpoint,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -1722,6 +1723,23 @@ impl Inner {
                     output: Some(claudesktop_core::output_preview(&output.content)),
                 },
             );
+            // 工具带回来的图片：界面上在工具行里画缩略图。不进日志（base64 太大）。
+            // 发的是**未处理**的那份：要不要真的发给模型由 `run_steps` 按模型 / 协议决定，
+            // 界面上总能看到（模型看不了图也能看）
+            if !output.images.is_empty() {
+                let images = output
+                    .images
+                    .iter()
+                    .map(|image| PromptImage {
+                        media_type: image.media_type.clone(),
+                        data: image.data.clone(),
+                    })
+                    .collect();
+                self.emit(
+                    Some(session),
+                    KernelEvent::ToolCallImages { id: call.id.clone(), images },
+                );
+            }
         }
         output
     }
@@ -3080,14 +3098,27 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
                 }
             })
             .collect();
+        // 工具带回来的图片（`read_file` 读到的图、MCP 的多模态结果）能不能真跟在这一步里发出去，
+        // 看模型和协议：
+        // - 模型看不了图：换成文字说明（图已经在前面的 `ToolCallImages` 里给界面看过了）；
+        // - OpenAI 兼容协议：`role: tool` 的 content 只能是字符串，图片另起一条 user 消息；
+        // - Anthropic / Responses：本来就能带，留在工具结果里（Responses 会自己拆成 input_image）。
+        let mut results = results;
+        let mut image_message = images_as_user_message(
+            &mut results,
+            inner.provider_config.protocol,
+            &model,
+            inner.model_blind_to_images(&model),
+        );
         let wrote_todo = outcome.tool_calls.iter().any(|c| c.function.name == tools::TODO_WRITE);
-        let mut step = Vec::with_capacity(results.len() + 1);
+        let mut step = Vec::with_capacity(results.len() + 2);
         let unmeasured = results.len();
         let mut call = ChatMessage::assistant_tool_calls(text, outcome.tool_calls);
         // 思考块跟着工具调用回传（Anthropic 开了思考时缺了它，下一步请求会被拒）
         call.thinking = outcome.thinking;
         step.push(call);
         step.extend(results);
+        step.append(&mut image_message);
         if !inner.commit(session, flag, step) {
             return Steps::Stopped;
         }
@@ -3108,6 +3139,50 @@ fn truncated_tool_message(name: &str) -> String {
         "Tool call `{name}` was not executed: the reply hit the output token limit, so its \
          arguments may be truncated. Re-issue the call with complete arguments."
     )
+}
+
+/// 工具结果里的图片怎么送：模型 / 协议带不了就降级，能把图挪到一条 user 消息里就挪。
+///
+/// 返回要接在工具结果后面的 user 消息（0 或 1 条，不想要图就是空的）。
+/// - 模型看不了图：图省掉，正文里补一句说明（界面已经靠 `ToolCallImages` 看过了）；
+/// - OpenAI 兼容协议：`role: tool` 的 content 只能是字符串，图改挂一条 user 消息
+///   （它是完全合法的多模态 user 消息，也不打乱 tool_calls 后面紧跟 tool 消息的顺序）；
+/// - Anthropic / Responses：原生支持，原样留着（Responses 自己会拆成 input_image）。
+fn images_as_user_message(
+    results: &mut [ChatMessage],
+    protocol: Protocol,
+    model: &str,
+    blind: bool,
+) -> Vec<ChatMessage> {
+    if !results.iter().any(|message| message.has_image_any()) {
+        return Vec::new();
+    }
+    let mut images: Vec<ContentPart> = Vec::new();
+    for message in results.iter_mut() {
+        if !message.has_image_any() {
+            continue;
+        }
+        if blind {
+            message.replace_images_with_placeholder();
+            message.append_text(
+                "\n\n(The image was not sent: this model cannot read images. Say so if it matters, \
+                 and ask the user to describe it.)",
+            );
+        } else if protocol == Protocol::OpenAiCompat {
+            images.extend(message.take_images());
+            message.append_text(
+                "\n\n(The image itself follows in the next message so you can look at it.)",
+            );
+        }
+    }
+    if images.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = vec![ContentPart::Text(format!(
+        "Image(s) returned by the tool calls above ({model} can read images):"
+    ))];
+    parts.extend(images);
+    vec![ChatMessage::with_parts("user", parts)]
 }
 
 /// 一条消息里的文字部分（给钩子看用户说了什么）。

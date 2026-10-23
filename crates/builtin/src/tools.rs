@@ -221,6 +221,16 @@ impl ToolOutput {
     pub fn fail_stop(content: impl Into<String>, summary: impl Into<String>) -> Self {
         Self { stop_turn: true, ..Self::fail(content, summary) }
     }
+
+    /// 带图片的成功结果（`read_file` 读到图片、MCP 的多模态结果）。
+    /// 图片跟着工具结果一起进下一次请求；模型 / 协议带不了时由内核降级成文字说明。
+    pub fn ok_with_images(
+        content: impl Into<String>,
+        summary: impl Into<String>,
+        images: Vec<OutputImage>,
+    ) -> Self {
+        Self { images, ..Self::ok(content, summary) }
+    }
 }
 
 /// 工具对模型的暴露档位（「方案-内核提速.md」阶段 2）。
@@ -295,8 +305,11 @@ pub fn specs(writable: bool) -> Vec<Value> {
         f(
             READ_FILE,
             format!(
-                "Read a text file. Returns lines prefixed with their 1-based line number and a tab. \
-                 Reads up to {READ_LIMIT} lines by default; use offset/limit for large files. \
+                "Read a file. Text files: returns lines prefixed with their 1-based line number and a tab, \
+                 up to {READ_LIMIT} lines by default (use offset/limit for large files). \
+                 Images (png / jpeg / gif / webp / bmp): the image is attached to the conversation so you \
+                 can look at it, with a one-line note giving its size; offset/limit do not apply. \
+                 Use this to look at screenshots, mockups and diagrams. \
                  Relative paths resolve against the working directory."
             ),
             json!({
@@ -2148,6 +2161,10 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
             return ToolOutput::fail(format!("Cannot read {}: {e}", path.display()), "读取失败");
         }
     };
+    // 图片：不按文本读，交给模型看（见 `read_image`）。放在二进制判断之前——PNG 里就有 NUL
+    if let Some(media_type) = image_media_type(&bytes) {
+        return read_image(path, &bytes, media_type);
+    }
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return ToolOutput::fail(
             format!("{} looks like a binary file", path.display()),
@@ -2180,6 +2197,71 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> ToolOutput {
         );
     }
     ToolOutput::ok(clip_output(out), format!("{} 行", end - start))
+}
+
+/// 按文件开头的 magic bytes 认图片类型（扩展名不可靠，内容说了算）。
+/// 只认两家接口都收的那几种；认不出就是 `None`（按文本 / 二进制处理）。
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
+/// 图片文件：不按文本返回，而是当成附件交给模型（和 pi 的 `read` 一样）。
+///
+/// 重编码过一遍再发（`image_prep::prepare`）：限长边、去 EXIF/GPS、BMP 转 PNG。
+/// 处理不了就只回文字说明——读到一个文件总比报错强，模型至少知道那是个图片、多大。
+fn read_image(path: &Path, bytes: &[u8], media_type: &str) -> ToolOutput {
+    use base64::Engine as _;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let prepared = match claudesktop_core::image_prep::prepare(
+        name,
+        bytes,
+        claudesktop_core::image_prep::Quality::Standard,
+    ) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            return ToolOutput::ok(
+                format!(
+                    "{} is an image ({media_type}, {}) but it could not be prepared for the model: \
+                     {e}. Read something else, or ask the user about it.",
+                    path.display(),
+                    claudesktop_core::image_prep::human_size(bytes.len())
+                ),
+                "图片读不了",
+            );
+        }
+    };
+    let summary = format!(
+        "{}×{} · {}",
+        prepared.width,
+        prepared.height,
+        claudesktop_core::image_prep::human_size(prepared.bytes.len())
+    );
+    let data = base64::engine::general_purpose::STANDARD.encode(&prepared.bytes);
+    let note = format!(
+        "Read image file [{}] {}×{}, about {} tokens of context. The image itself is attached \
+         above/below: describe and reason about what you see rather than guessing from the filename.",
+        prepared.media_type,
+        prepared.width,
+        prepared.height,
+        (prepared.approx_tokens() + 500) / 1000
+    );
+    ToolOutput::ok_with_images(
+        note,
+        summary,
+        vec![OutputImage { media_type: prepared.media_type, data }],
+    )
 }
 
 fn list_dir(path: &Path) -> ToolOutput {
@@ -2696,6 +2778,25 @@ fn run_shell_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 按 magic bytes 认图片：扩展名不可靠，内容说了算；认不出的按文本 / 二进制走。
+    #[test]
+    fn image_media_type_goes_by_magic_bytes() {
+        assert_eq!(
+            image_media_type(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0]),
+            Some("image/png")
+        );
+        assert_eq!(image_media_type(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(image_media_type(b"GIF89a....."), Some("image/gif"));
+        assert_eq!(image_media_type(b"GIF87a....."), Some("image/gif"));
+        assert_eq!(image_media_type(b"RIFF$   WEBPVP8 "), Some("image/webp"));
+        assert_eq!(image_media_type(b"BM6   "), Some("image/bmp"));
+        // 不是图片：文本、空文件、只认一半的魔数
+        assert_eq!(image_media_type(b"fn main() {}"), None);
+        assert_eq!(image_media_type(b""), None);
+        assert_eq!(image_media_type(b"RIFF$   WAVE"), None);
+        assert_eq!(image_media_type(&[0x89, b'P', b'N']), None);
+    }
 
     /// 输出比管道缓冲大也不卡；超时连同后台的子孙一起结束（不等子孙退出才返回）。
     #[cfg(unix)]

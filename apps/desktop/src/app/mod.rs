@@ -1238,6 +1238,7 @@ impl ChatApp {
                     expanded: false,
                     task: false,
                     grant: None,
+                    images: Vec::new(),
                 }),
                 _ => ChatItem::Note(format!("备注 {i}").into()),
             });
@@ -1265,6 +1266,7 @@ impl ChatApp {
                 expanded: false,
                 task: false,
                 grant: None,
+                images: Vec::new(),
             }));
             s.begin_turn();
         }

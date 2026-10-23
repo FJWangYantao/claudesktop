@@ -26,6 +26,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 同组相邻两步之间的行距
@@ -49,6 +50,8 @@ pub(super) enum ImageView {
     Path(PathBuf),
     /// 远程图片的地址
     Remote(String),
+    /// 工具结果里带回来的图（`read_file` 读到的、MCP 返回的）：字节只在内存里
+    Memory { image: Arc<gpui_kit::Image>, bytes: Arc<Vec<u8>>, ext: &'static str },
 }
 
 /// 图片大图：gpui-kit 的对话框，宽约窗口八成，图按原比例缩进去（小图不放大），
@@ -70,6 +73,9 @@ pub(super) fn open_image(image: ImageView, window: &mut Window, cx: &mut App) {
                 || div().text_color(rgb(INK_SOFT)).child("这张图还没加载").into_any_element(),
                 |name| img(name).size_full().object_fit(ObjectFit::ScaleDown).into_any_element(),
             ),
+            ImageView::Memory { image, .. } => {
+                img(image.clone()).size_full().object_fit(ObjectFit::ScaleDown).into_any_element()
+            }
         };
         let save = dialog_image.clone();
         let save_button = Button::new("save-image")
@@ -101,6 +107,9 @@ pub(super) fn save_image(image: ImageView, window: &mut Window, cx: &mut App) {
             }
             Err(err) => (None, format!("读不了这张图：{err}")),
         },
+        ImageView::Memory { bytes, ext, .. } => {
+            (Some(bytes.to_vec()), format!("tool-image.{ext}"))
+        }
         ImageView::Remote(url) => {
             // 扩展名按取回的实际格式（登记名 `remote/<哈希>.jpg` 的尾巴），别一律写 .png
             let ext = super::remote_image::registered_name(url)
@@ -696,6 +705,31 @@ impl ChatApp {
                     })
             });
         let has_command = command.is_some();
+        // 工具带回来的图片（`read_file` 读到的图、MCP 的多模态结果）：点开看大图
+        let thumbs = (!card.images.is_empty()).then(|| {
+            div().h_flex().gap_1p5().flex_wrap().children(
+                card.images.iter().cloned().enumerate().map(|(n, thumb)| {
+                    let big = ImageView::Memory {
+                        image: thumb.image.clone(),
+                        bytes: thumb.bytes.clone(),
+                        ext: thumb.ext,
+                    };
+                    div()
+                        .id(("tool-image", n))
+                        .cursor_pointer()
+                        .rounded_md()
+                        .hover(|d| d.opacity(0.85))
+                        .on_click(move |_, window, cx| open_image(big.clone(), window, cx))
+                        .child(
+                            img(thumb.image.clone())
+                                .h_20()
+                                .max_w_48()
+                                .rounded_md()
+                                .object_fit(ObjectFit::Cover),
+                        )
+                }),
+            )
+        });
         div().pt_1().pl(STEP_INDENT).child(
             div()
                 .v_flex()
@@ -711,6 +745,7 @@ impl ChatApp {
                 .line_height(LEADING)
                 .text_color(rgb(INK_SOFT))
                 .children(command)
+                .children(thumbs)
                 .when(!output.is_empty(), |d| {
                     d.child(div().v_flex().children(output.lines().map(line)))
                 })

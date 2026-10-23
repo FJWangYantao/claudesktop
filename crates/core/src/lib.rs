@@ -333,6 +333,9 @@ pub enum KernelEvent {
     /// （见「方案-内核提速.md」阶段 2）。不进对话流，由 UI 转成 `Record::ToolLoadout`，
     /// 续接时内核照着它把名单还回去。
     ToolsLoaded { names: Vec<String> },
+    /// 工具把图片带回来了（`read_file` 读到的图、MCP 的多模态结果）：界面在工具行里画缩略图。
+    /// 内容是 base64，可能很大，**不进日志**（续接后缩略图不再有，图还在磁盘上）。
+    ToolCallImages { id: String, images: Vec<PromptImage> },
     /// MCP 服务器的连接状态（连接级事件，配置变了 / 某个服务器状态变了就整份重发）
     McpStatus { servers: Vec<McpServerView> },
     /// 内核用模型给会话起了个新标题（第一轮结束后）；界面更新侧栏，失败不发
@@ -454,6 +457,7 @@ impl KernelEvent {
             Self::Fatal(_) => "fatal",
             Self::FileChanged { .. } => "file_changed",
             Self::ToolsLoaded { .. } => "tools_loaded",
+            Self::ToolCallImages { .. } => "tool_call_images",
             Self::McpStatus { .. } => "mcp_status",
             Self::TitleGenerated { .. } => "title_generated",
             Self::BackgroundTasks { .. } => "background_tasks",

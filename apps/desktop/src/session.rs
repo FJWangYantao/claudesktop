@@ -1570,6 +1570,7 @@ impl Session {
                     expanded: false,
                     task: false,
                     grant: None,
+                    images: Vec::new(),
                 };
                 // 子 agent 的调用归到它那个子任务里，不进对话记录
                 match parent {
@@ -1605,6 +1606,16 @@ impl Session {
             KernelEvent::ToolCallDiff { id, diff } => {
                 if let Some(card) = self.tool_card(&id) {
                     card.set_diff(diff);
+                }
+            }
+            // 工具带回来的图片（`read_file` 读到的图、MCP 的多模态结果）：工具行里画缩略图。
+            // 图片太大不进日志，续接后这一行没有缩略图（图片文件还在磁盘上）
+            KernelEvent::ToolCallImages { id, images } => {
+                if let Some(card) = self.tool_card(&id) {
+                    card.images = images
+                        .iter()
+                        .filter_map(|image| thumb_from_prompt_image(image))
+                        .collect();
                 }
             }
             KernelEvent::PlanReplaced { entries } => {
@@ -1809,6 +1820,7 @@ impl Session {
                     expanded: false,
                     task: false,
                     grant: None,
+                    images: Vec::new(),
                 }));
             }
             MockAction::ToolDone(result) => {

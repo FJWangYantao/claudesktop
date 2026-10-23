@@ -89,6 +89,9 @@ pub struct ToolCard {
     pub task: bool,
     /// 这次调用的授权结果（权限请求应答后并进这一行，不再单独占一行）
     pub grant: Option<Grant>,
+    /// 工具带回来的图片（`read_file` 读到的图、MCP 的多模态结果）：工具行里画缩略图。
+    /// 不进日志，续接后不再有（图片文件还在磁盘上）。
+    pub images: Vec<ToolImage>,
 }
 
 /// 工具行上的授权结果：种类决定短标签，`label` 是选的那个选项的全名（悬停看）。
@@ -146,9 +149,9 @@ impl ToolCard {
         self.kind == "execute" && !self.arg.trim().is_empty()
     }
 
-    /// 工具行能不能点开：有输出可看，或者是命令（跑着、还没输出时也能点开看完整命令）。
+    /// 工具行能不能点开：有输出可看、有图片可看，或者是命令（跑着、还没输出时也能点开看完整命令）。
     pub fn can_open(&self) -> bool {
-        self.shows_command() || !self.output.trim().is_empty()
+        self.shows_command() || !self.output.trim().is_empty() || !self.images.is_empty()
     }
 
     /// 记录一份 diff：同一路径替换（执行前的预览会被之后的结果覆盖）。
@@ -177,6 +180,36 @@ impl ToolCard {
             _ => "other",
         }
     }
+}
+
+/// 工具结果里带回来的图片（`read_file` 读到的图、MCP 的多模态结果）：
+/// 缩略图 + 原始字节（点开看大图、另存为都要用原字节）。
+#[derive(Clone)]
+pub struct ToolImage {
+    pub image: std::sync::Arc<gpui_kit::Image>,
+    /// 内核给的字节（已经重编码过；另存为写这份）
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    /// 另存为时用的扩展名
+    pub ext: &'static str,
+}
+
+/// 内核发来的图片 → 工具行缩略图。内核给的已经是重编码过的（PNG / JPEG / GIF），
+/// 解不开就跳过——宁可没图，也不要界面上留一个空框。
+pub fn thumb_from_prompt_image(image: &PromptImage) -> Option<ToolImage> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(image.data.as_bytes()).ok()?;
+    let (format, ext) = match image.media_type.as_str() {
+        "image/png" => (gpui_kit::ImageFormat::Png, "png"),
+        "image/gif" => (gpui_kit::ImageFormat::Gif, "gif"),
+        "image/webp" => (gpui_kit::ImageFormat::Webp, "webp"),
+        "image/bmp" => (gpui_kit::ImageFormat::Bmp, "bmp"),
+        _ => (gpui_kit::ImageFormat::Jpeg, "jpg"),
+    };
+    Some(ToolImage {
+        image: std::sync::Arc::new(gpui_kit::Image::from_bytes(format, bytes.clone())),
+        bytes: std::sync::Arc::new(bytes),
+        ext,
+    })
 }
 
 /// 工具行左侧的种类图标。

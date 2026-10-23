@@ -180,6 +180,7 @@ impl ChatApp {
                             expanded: phase == ToolPhase::Failed,
                             task: false,
                             grant: None,
+                            images: Vec::new(),
                         }));
                     }
                 }
@@ -196,6 +197,7 @@ impl ChatApp {
                         expanded: !run.ok,
                         task: false,
                         grant: None,
+                        images: Vec::new(),
                     }));
                     if !run.ok {
                         app.toast(

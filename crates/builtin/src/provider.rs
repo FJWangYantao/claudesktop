@@ -976,6 +976,25 @@ impl ChatMessage {
         self.parts.iter().any(|p| matches!(p, ContentPart::Image { .. }))
     }
 
+    /// 同样的判断，给 `lib.rs` 用（`has_image` 私有，不想为它开一个 pub）
+    pub fn has_image_any(&self) -> bool {
+        self.has_image()
+    }
+
+    /// 取走全部图片段，留下文字（图片改装进一条 user 消息时用，见 `images_as_user_message`）。
+    pub fn take_images(&mut self) -> Vec<ContentPart> {
+        let mut taken = Vec::new();
+        self.parts.retain(|part| {
+            if matches!(part, ContentPart::Image { .. }) {
+                taken.push(part.clone());
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
+
     /// 把图片段换成文字占位（当前模型看不了图时，见设计说明 7.3）。
     /// 只影响这一份请求里的副本，历史不动。
     pub fn replace_images_with_placeholder(&mut self) {

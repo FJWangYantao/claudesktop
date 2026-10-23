@@ -3852,3 +3852,151 @@ fn auto_mode_classifier_sees_resumed_messages_but_not_rewound_ones() {
     assert!(!sent.contains("撤回的那句话"), "{sent}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------- 读图片（`read_file` 把图片当附件交给模型） ----------
+
+/// 1×1 的 PNG（够 `image_prep` 解码就行，测试不关心画面）。
+const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+
+/// 在工作目录里放一张 png，返回文件名。
+fn write_png(dir: &std::path::Path) -> String {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(TINY_PNG).unwrap();
+    std::fs::write(dir.join("shot.png"), bytes).unwrap();
+    "shot.png".to_string()
+}
+
+/// OpenAI 兼容协议：`role: tool` 的 content 只能是字符串，所以图片另起一条 user 消息。
+#[test]
+fn read_image_moves_to_a_user_message_on_openai_compat() {
+    let (base, bodies) = serve(vec![
+        tool_call("c1", "read_file", serde_json::json!({ "path": "shot.png" })),
+        happy_stream("看到了，是一张白图。"),
+    ]);
+    let dir = workdir("read-image-openai");
+    write_png(&dir);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看这张图")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 界面拿到过一次图片（工具行缩略图）
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallImages { .. })), 1);
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { .. })), 1, "工具行还在");
+
+    let second = body(&bodies, 1);
+    let msgs = second["messages"].as_array().unwrap();
+    let at = msgs
+        .iter()
+        .position(|m| m["role"] == "tool" && m["tool_call_id"] == "c1")
+        .expect("工具结果");
+    let tool = &msgs[at];
+    // 工具结果本身还是纯文本：说了那是个图片，图在下一句里
+    let content = tool["content"].as_str().expect("tool content 必须是字符串");
+    // 格式按处理后的那份（`image_prep` 会把不透明的截图重编码成 PNG、其余存 JPEG）
+    assert!(content.contains("Read image file [image/"), "{content}");
+    assert!(content.contains("next message"), "{content}");
+    let next = &msgs[at + 1];
+    assert_eq!(next["role"], "user", "图要跟在工具结果后面当一条 user 消息");
+    let parts = next["content"].as_array().expect("user 消息是多段");
+    assert!(parts.iter().any(|p| p["type"] == "image_url"
+        && p["image_url"]["url"].as_str().is_some_and(|u| u.starts_with("data:image/"))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Anthropic 原生协议：图片留在 tool_result 里（本来就是合法的形状）。
+#[test]
+fn read_image_stays_in_the_tool_result_on_anthropic() {
+    fn acme(payload: &str) -> String {
+        format!("data: {payload}")
+    }
+    // 第一轮：tool_use(read_file shot.png)；第二轮：正文
+    let first = Reply::Sse {
+        lines: vec![
+            acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#),
+            acme(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"shot"}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":".png\"}"}}"#,
+            ),
+            acme(
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}"#,
+            ),
+            acme(r#"{"type":"message_stop"}"#),
+        ],
+        gap_ms: 5,
+    };
+    let second = Reply::Sse {
+        lines: vec![
+            acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":30}}}"#),
+            acme(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"看到图了。"}}"#,
+            ),
+            acme(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+            ),
+            acme(r#"{"type":"message_stop"}"#),
+        ],
+        gap_ms: 5,
+    };
+    let (base, bodies) = serve(vec![first, second]);
+    let dir = workdir("read-image-anthropic");
+    write_png(&dir);
+    let h = Harness::with_config(
+        ProviderConfig {
+            protocol: Protocol::Anthropic,
+            base_url: format!("{base}/v1"),
+            api_key: Some("test-key".into()),
+            model: "claude-mock".into(),
+            ..Default::default()
+        },
+        dir.clone(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看这张图")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    let second = body(&bodies, 1);
+    let text = second["messages"].to_string();
+    assert!(text.contains("\"type\":\"tool_result\""), "{text}");
+    assert!(text.contains("\"tool_use_id\":\"toolu_1\""), "{text}");
+    assert!(text.contains("\"media_type\":\"image/"), "图片要在 tool_result 里：{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 模型看不了图（能力表说只吃文字）：不发图，改成一句文字说明。
+#[test]
+fn read_image_degrades_to_text_for_a_model_without_vision() {
+    let (base, bodies) = serve(vec![
+        tool_call("c1", "read_file", serde_json::json!({ "path": "shot.png" })),
+        happy_stream("我看不到图，说说里面是什么？"),
+    ]);
+    let dir = workdir("read-image-blind");
+    write_png(&dir);
+    let h = Harness::with_config(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "deepseek-chat".into(),
+            ..Default::default()
+        },
+        dir.clone(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看这张图")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 界面照样能看到缩略图（内核先发 ToolCallImages，再按模型降级）
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallImages { .. })), 1);
+    let second = body(&bodies, 1).to_string();
+    assert!(!second.contains("base64,"), "看不了图的模型不该收到图片：{second}");
+    assert!(second.contains("cannot read images"), "{second}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
