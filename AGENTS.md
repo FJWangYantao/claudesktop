@@ -80,6 +80,16 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     组件颜色不对时先补映射，别在调用处逐个覆盖。派生的 `button_*` 色要和基色一起写。
 - **圆角 / 宽度**：圆角只用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
   不写 `rounded(px(..))`；阅读列 / 设置页 / 概览 / 侧栏宽度用 `READING_W` / `FORM_W` / `OVERVIEW_W` / `SIDEBAR_W`。
+  `READING_W` / `FORM_W` / `OVERVIEW_W` 是 measure，**保持 px**；`SIDEBAR_W` / `SETTINGS_NAV_W` / `CHROME_H`
+  是「框」，是 `Rems`，拿它算加减时要 `.to_pixels(window.rem_size())`（设置页整页宽度用 `theme::settings_page_w()`）。
+- **阴影**：`raised_shadow()`（贴地一档）/ `float_shadow()`（悬浮两层）在 `theme.rs`，σ 已按 CSS 减半；
+  `.shadow_xs/sm/md/lg` 是 Tailwind 原值（没减半），别当设计值用。
+- **焦点环**：`theme::focus_ring(accent)` 是三层（内挖 1px 底色 + 1px 实边 + σ3px 光晕）。
+  输入框这种「点了就是在这里打字」的用 `focus`；按钮类要「键盘 Tab 才出环」用 `.focus_visible(..)`，
+  gpui-kit `Button` 自带（`focus_ring_style`），别在调用处覆盖。
+- **状态色描边**取浅档：`theme::state_line(color)`（前景色 40%），不要拿 `RED` / `GREEN` 实色描边。
+- **滚动渐隐**：`session::ScrollEdge` + `scroll_handle_edge` 给三档高度（贴顶 / 贴底时对应那条收成 0），
+  `widgets::edge_fade` 画（已用 `ColorSpace::Oklab`）。侧栏那条的档位要并进 `sync_sidebar` 的指纹。
 - **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯。**它们是 `Rems` 不是 `Pixels`**——
   字号、间距、圆角、图标全按窗口 rem 换算，而 `gpui-component` 的 Root 每帧把
   `Theme::font_size` 写进 `window.set_rem_size()`，所以设置页改一个字号的缩放，
@@ -158,6 +168,11 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - trigger 要作为 `Popover::trigger` 使用需实现 `gpui_kit::base::Selectable`（平凡
   builder trait，见 `MenuChip`）。
 - `Popover` 的 `Styled` 样式落在弹层面板上（bg / border / p / w 都能直接链）。
+  **弹层外观（底色 / hairline ring / 两层阴影 / 圆角）由 `appearance`（默认开）在渲染时套
+  `popover_style`**，`refine_style` 在它之后合并，所以 `menu_panel` 只写 `p_1` 就能盖掉默认的 `p_3`；
+  不要在调用处写 `bg(rgb(CARD))` / `border_color(rgb(LINE))`，配色不对去 `theme::apply_colors` 补映射。
+- **`role()` 要挂在带 id 的 stateful div 上**（`Div` 本身没有这个方法）；`ElementId` 只认
+  `&'static str` / `usize` 这类，`("前缀", SharedString)` 拼不出来，用 `ElementId::Name(..)`。
 - 组件路径：`gpui_kit::component::popover::Popover`、`gpui_kit::base::{Selectable, PopoverState}`
   （`component::*` 的 glob 不含子模块里的类型）。
 - **不用 gpui-kit `TitleBar`**：窗口框架自绘（`app/chrome.rs`），侧栏顶到窗口顶，

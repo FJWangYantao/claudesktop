@@ -29,13 +29,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 同组相邻两步之间的行距
-const STEP_GAP: Pixels = px(6.);
+const STEP_GAP: Rems = rems(0.375);
 /// 块与块之间的行距
-pub(super) const BLOCK_GAP: Pixels = px(16.);
-/// 步骤行左侧的图标格宽度；组内细线对着它的中线
+pub(super) const BLOCK_GAP: Rems = rems(1.);
+/// 步骤行左侧的图标格宽度；组内细线对着它的中线。
+/// 固定图标格，**不**跟着字号缩放（图标本身也是固定档，见 AGENTS.md 的例外）
 const ICON_COL: Pixels = px(16.);
 /// 图标格 + 间距：步骤的展开内容（思考正文等）缩进到文字起点
-pub(super) const STEP_INDENT: Pixels = px(24.);
+pub(super) const STEP_INDENT: Rems = rems(1.5);
 /// 输入框上方的计划最多露出几条
 const PINNED_PLAN_ROWS: usize = 5;
 
@@ -381,14 +382,14 @@ impl ChatApp {
         }
         // 正在收起、自己已不显示的步骤不留块间距（组头那行会留）
         let gap = Self::row_gap(layout);
-        col.when(gap > px(0.), |d| d.pb(gap))
+        col.when(gap != Rems::ZERO, |d| d.pb(gap))
     }
 
     /// 这一行底下留多高的块间距：`content.rs` 里给高亮描边留位置也要用同一个值，
     /// 所以判断只放在这里（别再抄一份条件过去）。
-    pub(super) fn row_gap(layout: RowLayout) -> Pixels {
+    pub(super) fn row_gap(layout: RowLayout) -> Rems {
         // 正在收起、自己已不显示的步骤不留块间距（组头那行会留）
-        if !layout.tight && (layout.body || layout.head.is_some()) { BLOCK_GAP } else { px(0.) }
+        if !layout.tight && (layout.body || layout.head.is_some()) { BLOCK_GAP } else { Rems::ZERO }
     }
 
     /// 过程组的组头：一行摘要（读了几个文件、跑了几条命令…），点开 / 收起；详细视图总是展开、不给开关。
@@ -404,6 +405,7 @@ impl ChatApp {
         let toggle = self.settings.view_mode != ViewMode::Verbose;
         div()
             .id(("step-group", ix))
+            .when(toggle, |d| d.role(Role::Button).aria_expanded(group.open))
             .h_flex()
             .items_center()
             .gap_2()
@@ -463,6 +465,7 @@ impl ChatApp {
         let open = (open || verbose) && has_text;
         let header = step_line(Icon::new(IconAll::Brain).size_3p5().text_color(rgb(INK_SOFT)))
             .id(("think-toggle", idx))
+            .when(toggle, |d| d.role(Role::Button).aria_expanded(open))
             .when(toggle, |d| {
                 d.cursor_pointer().hover(|d| d.text_color(rgb(INK))).on_click(cx.listener(
                     move |this, _, _, cx| {
@@ -888,7 +891,8 @@ impl ChatApp {
             .py_3()
             .rounded_xl()
             .border_1()
-            .border_color(rgb(LINE))
+            // 出错卡片：状态色描边取浅档（40%），实色描边会和里面的红字抢
+            .border_color(state_line(RED))
             .bg(rgb(CARD))
             .child(
                 div()
@@ -1013,6 +1017,13 @@ impl ChatApp {
                         d.bg(rgb(SAND)).hover(|d| d.bg(rgb(SELECTED))).text_color(rgb(INK))
                     })
                     .when(!allow, |d| d.hover(|d| d.bg(rgb(HOVER))).text_color(rgb(RED)))
+                    .aria_keyshortcuts(
+                        super::keys::PERMISSION_KEYS
+                            .get(n)
+                            .filter(|_| keyed)
+                            .map(|k| Self::key_text(k))
+                            .unwrap_or_default(),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.resolve_permission(idx, Some((id.clone(), name.clone())), cx);
                     }))
@@ -1034,6 +1045,13 @@ impl ChatApp {
                 .text_size(TEXT_BODY)
                 .text_color(rgb(INK_SOFT))
                 .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                .aria_keyshortcuts(
+                    super::keys::PERMISSION_KEYS
+                        .get(options.len())
+                        .filter(|_| keyed)
+                        .map(|k| Self::key_text(k))
+                        .unwrap_or_default(),
+                )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.reject_and_steer(idx, window, cx);
                 }))
@@ -1047,7 +1065,8 @@ impl ChatApp {
             .p_4()
             .rounded_xl()
             .border_1()
-            .border_color(rgb(CORAL))
+            // 状态描边取浅档：拿赤陶实色描边太抢，40% 就够指出「这行需要你」
+            .border_color(with_alpha(rgb(CORAL), 0.4))
             .bg(rgb(CARD))
             .child(
                 div()
@@ -1618,7 +1637,8 @@ impl ChatApp {
             .bg(rgb(CARD))
             .border_1()
             .border_color(rgb(LINE))
-            .shadow_sm()
+            // 浮在对话上的圆按钮：两层阴影（近距接触 + 远距悬浮）
+            .shadow(float_shadow())
             .flex()
             .justify_center()
             .items_center()

@@ -17,7 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 顶部一行的高度：侧栏头部与会话区顶栏对齐
-pub(super) const CHROME_H: Pixels = px(44.);
+pub(super) const CHROME_H: Rems = rems(2.75);
 
 /// macOS 红绿灯占位（窗口按钮由系统画在左上角）
 const TRAFFIC_LIGHT_W: Pixels = px(72.);
@@ -112,7 +112,8 @@ impl ChatApp {
             };
             // 顶栏窄到放不下「项目 / 标题」时只留标题（项目名在侧栏分组里也有）：
             // 带省略号的文字缩不到零，留着项目名会把标题挤没
-            let sidebar = if self.sidebar_open { SIDEBAR_W } else { px(0.) };
+            let sidebar =
+                if self.sidebar_open { SIDEBAR_W.to_pixels(window.rem_size()) } else { px(0.) };
             let compact =
                 window.viewport_size().width - sidebar < rems(25.).to_pixels(window.rem_size());
             crumb

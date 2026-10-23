@@ -170,6 +170,8 @@ pub struct ChatApp {
     task_scroll: ScrollHandle,
     /// 设置页右侧内容（和用量页）的滚动位置（用量页的请求明细同样只排视口附近的几轮）
     settings_scroll: ScrollHandle,
+    /// 侧栏会话列表的滚动位置（底部渐隐跟手，见 `ScrollEdge`）
+    sidebar_scroll: ScrollHandle,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
     /// 侧栏只列哪些会话（全部 / 进行中 / 待查看）
@@ -495,6 +497,7 @@ impl ChatApp {
             home_scroll: ScrollHandle::new(),
             task_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
+            sidebar_scroll: ScrollHandle::new(),
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),

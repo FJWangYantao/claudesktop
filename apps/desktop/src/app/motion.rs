@@ -180,6 +180,9 @@ const SHIMMER_LEVELS: usize = 10;
 /// 新内容入场：淡入的同时从下方这么远的地方升上来
 const ENTER_RISE: Pixels = px(8.);
 
+/// 悬停反馈的时长（原版 `--cds-dur-fast`）：比一次性过渡快得多，鼠标划过就该出来
+const HOVER_DURATION: Duration = Duration::from_millis(60);
+
 /// 平滑回到底部：剩下的距离每过这么久衰减到 1/e（约 4 倍时长基本到底）
 pub(super) const JUMP_TAU: f32 = 0.06;
 /// 平滑回到底部最多滑这么久，之后直接交给自动跟随（流式输出时底部一直在长）
@@ -416,14 +419,18 @@ pub(super) fn reveal_progress(
     spring((id.into(), "reveal"), if open { 1f32 } else { 0. }, policy, window, cx)
 }
 
-/// 悬停才出现的操作的透明度：120ms 淡入 / 淡出（不挤布局，只改透明度）。
+/// 悬停才出现的操作的透明度：60ms 淡入 / 淡出（不挤布局，只改透明度）。
+///
+/// 悬停反馈要比一次性过渡快得多：原版 `--cds-dur-fast` 就是 60ms，而
+/// `motion_tokens().duration_fast` 是 120ms，用在这里显得「肉」——鼠标划过去，
+/// 按钮慢半拍才出来。所以这里单开一个常量，不跟主题令牌走。
 pub(super) fn hover_opacity(
     id: impl Into<ElementId>,
     hovered: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> f32 {
-    let policy = Transition::new(cx.theme().motion_tokens().duration_fast);
+    let policy = Transition::new(HOVER_DURATION);
     transition((id.into(), "hover"), if hovered { 1f32 } else { 0. }, policy, window, cx)
 }
 

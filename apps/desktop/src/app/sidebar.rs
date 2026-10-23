@@ -21,6 +21,7 @@ use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
 use super::{ChatApp, project_label};
+use crate::session::scroll_handle_edge;
 use crate::settings::{KernelChoice, Space};
 use crate::theme::rgb;
 use crate::theme::*;
@@ -202,7 +203,8 @@ impl ChatApp {
             let motion = cx.theme().motion_tokens();
             (motion.duration_normal, motion.easing_move.clone())
         };
-        let target = if self.sidebar_open { SIDEBAR_W } else { px(0.) };
+        let target =
+            if self.sidebar_open { SIDEBAR_W.to_pixels(window.rem_size()) } else { px(0.) };
         let width = transition(
             "sidebar-width",
             target,
@@ -217,11 +219,15 @@ impl ChatApp {
         // 侧栏按全宽画、整块从左边滑进滑出（外层裁切），开合过程中它自己的尺寸不变
         (width > px(0.)).then(|| {
             div().w(width).h_full().flex_shrink_0().overflow_hidden().child(
-                div().relative().left(width - SIDEBAR_W).h_full().child(
-                    self.sidebar_view
-                        .clone()
-                        .cached(StyleRefinement::default().w(SIDEBAR_W).h_full()),
-                ),
+                div()
+                    .relative()
+                    .left(width - SIDEBAR_W.to_pixels(window.rem_size()))
+                    .h_full()
+                    .child(
+                        self.sidebar_view
+                            .clone()
+                            .cached(StyleRefinement::default().w(SIDEBAR_W).h_full()),
+                    ),
             )
         })
     }
@@ -272,6 +278,9 @@ impl ChatApp {
             &self.cwd,
         )
             .hash(&mut h);
+        // 列表底部渐隐跟手：档位变了侧栏要重画（缓存 view 不重画就不会跟着变）。
+        // 单独 hash：上面那个元组已经 12 项了，`Hash` 只给到 12 元组
+        scroll_handle_edge(&self.sidebar_scroll).hash(&mut h);
         // 空间切换（分段高亮、小点）和会话类型
         self.settings.space.hash(&mut h);
         for s in &self.sessions {
@@ -438,6 +447,8 @@ impl ChatApp {
                         .text_color(rgb(INK_SOFT));
                 // 箭头放在组名左边的留白里（绝对定位），不占组名的宽度：第一组右侧还排着几个按钮
                 title
+                    .role(Role::Button)
+                    .aria_expanded(!folded)
                     .cursor_pointer()
                     .child(
                         div()
@@ -662,7 +673,7 @@ impl ChatApp {
                 // 头部：侧栏开关 + 品牌，其余是拖拽区（与会话区顶栏同高）
                 div()
                     .h_flex()
-                    .h(CHROME_H - px(8.))
+                    .h(CHROME_H.to_pixels(window.rem_size()) - px(8.))
                     .flex_shrink_0()
                     .items_center()
                     .pl_2()
@@ -688,7 +699,8 @@ impl ChatApp {
             )
             .child(
                 // 列表滚到底部「设置」上面时渐隐，不是一刀切（同对话区的下边缘）；
-                // 列表底下留出渐隐的高度，滚到头时最后一行不被盖住
+                // 列表底下留出渐隐的高度，滚到头时最后一行不被盖住。滚到底了渐隐收成 0
+                // （档位并进 `sync_sidebar` 的指纹，否则缓存 view 不会跟着变）
                 div()
                     .relative()
                     .flex_1()
@@ -700,15 +712,21 @@ impl ChatApp {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
+                            .track_scroll(&self.sidebar_scroll)
                             .child(div().pb_4().child(body)),
                     )
-                    .child(div().absolute().left_0().right_0().bottom_0().h(px(16.)).bg(
-                        linear_gradient(
-                            180.,
-                            linear_color_stop(Rgba { a: 0., ..rgb(SAND) }, 0.),
-                            linear_color_stop(rgb(SAND), 1.),
-                        ),
-                    )),
+                    .child({
+                        let h = scroll_handle_edge(&self.sidebar_scroll).heights().1;
+                        let rem = window.rem_size();
+                        div().absolute().left_0().right_0().bottom_0().h(h.to_pixels(rem)).bg(
+                            linear_gradient(
+                                180.,
+                                linear_color_stop(Rgba { a: 0., ..rgb(SAND) }, 0.),
+                                linear_color_stop(rgb(SAND), 1.),
+                            )
+                            .color_space(ColorSpace::Oklab),
+                        )
+                    }),
             )
             .child(
                 // 底部：设置 + 内核状态
@@ -986,6 +1004,9 @@ impl ChatApp {
         let active = self.active == i && !self.settings_open;
         let row = div()
             .id(("session", i))
+            .role(Role::ListItem)
+            .aria_selected(active)
+            .aria_label(s.title.clone())
             .relative()
             .h_flex()
             .items_center()

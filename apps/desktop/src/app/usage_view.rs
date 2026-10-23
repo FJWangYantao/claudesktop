@@ -161,7 +161,7 @@ impl ChatApp {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .max_w(SETTINGS_NAV_W + FORM_W)
+                    .max_w(settings_page_w())
                     .mx_auto()
                     .child(
                         div()

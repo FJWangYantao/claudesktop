@@ -592,7 +592,64 @@ impl Session {
             self.list.scroll_by(-px(24.));
         }
     }
+}
 
+/// 滚动区内容滚到了哪一档：上边缘 / 下边缘的渐隐条按它收放（贴顶时顶上那条收成 0）。
+///
+/// 只用来决定覆盖层的高度，**不要**并进 `Session::row_key`——那是布局指纹，变了会整表重测；
+/// 滚动时内容区本来就在重画，这里零额外成本。侧栏是缓存 view，档位要并进 `sync_sidebar` 的指纹。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ScrollEdge {
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// 顶上那条渐隐的高度（约一行的上边距）
+pub const FADE_TOP: Rems = rems(1.);
+/// 底下那条渐隐的高度（状态行下边距）
+pub const FADE_BOTTOM: Rems = rems(1.5);
+
+impl ScrollEdge {
+    /// `top` = 离顶部多远，`remaining` = 离底部还有多远（都按像素）。
+    /// 差 1px 以内就算到头（浮点累加的滚动位置不会正好是 0）。
+    pub fn of(top: Pixels, remaining: Pixels) -> Self {
+        if top <= px(1.) {
+            Self::Top
+        } else if remaining <= px(1.) {
+            Self::Bottom
+        } else {
+            Self::Middle
+        }
+    }
+
+    /// 上下两条渐隐的高度。
+    pub fn heights(self) -> (Rems, Rems) {
+        match self {
+            Self::Top => (Rems::ZERO, FADE_BOTTOM),
+            Self::Middle => (FADE_TOP, FADE_BOTTOM),
+            Self::Bottom => (FADE_TOP, Rems::ZERO),
+        }
+    }
+}
+
+impl Session {
+    /// 对话列表滚到哪一档（见 [`ScrollEdge`]）。
+    pub fn scroll_edge(&self) -> ScrollEdge {
+        let offset = self.list.scroll_px_offset_for_scrollbar().y;
+        let max = self.list.max_offset_for_scrollbar().y.max(px(0.));
+        ScrollEdge::of(-offset, max + offset)
+    }
+}
+
+/// 某个 `ScrollHandle` 滚到哪一档（首页、侧栏这类普通滚动区用它）。
+pub fn scroll_handle_edge(handle: &ScrollHandle) -> ScrollEdge {
+    let offset = handle.offset().y;
+    let max = handle.max_offset().y.max(px(0.));
+    ScrollEdge::of(-offset, max + offset)
+}
+
+impl Session {
     /// 一行的测量指纹：内容指纹 + 视图模式 + 会不会跟着状态改行高（回合末尾的回复下面多一行
     /// 操作、失败卡片的按钮组会多出「继续」）+ 分组结果（组头、折叠、行距）。
     fn row_key(&self, i: usize, view: ViewMode) -> u64 {

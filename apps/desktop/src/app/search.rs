@@ -272,7 +272,7 @@ impl ChatApp {
         &self,
         row: Div,
         ix: usize,
-        card: Option<Pixels>,
+        card: Option<Rems>,
         window: &mut Window,
         cx: &App,
     ) -> Div {

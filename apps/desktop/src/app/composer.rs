@@ -465,17 +465,20 @@ impl ChatApp {
             .child(div().flex_shrink_0().pl_1().child(send));
 
         // 一张卡片：附件缩略图、随内容长高的多行输入（至少两行），底边是工具栏。
-        // 三档：静止细边 + 淡阴影；悬停边框加深一档（提示整块都能点）；聚焦再深一档、阴影加重。
+        // 静止：细边 + 一层贴地的阴影；悬停边框加深一档（提示整块都能点）；
+        // 聚焦：边框保持 `LINE_STRONG`，换成三层焦点环（内挖底色 + 实边 + 光晕）。
+        // 鼠标点进来也出环：输入框是这张卡片的主体，点了它就是「正在这里打字」，
+        // 和按钮那种「键盘 Tab 才出环」的语义不同（见 `focus_visible`）。
         let card = div()
             .id("composer")
             .v_flex()
             .w_full()
             .bg(rgb(CARD))
             .border_1()
-            .border_color(rgb(if focused { INK_FAINT } else { LINE }))
+            .border_color(rgb(if focused { LINE_STRONG } else { LINE }))
             .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
             .rounded_2xl()
-            .map(|d| if focused { d.shadow_md() } else { d.shadow_sm() })
+            .shadow(if focused { focus_ring(INK_FAINT) } else { raised_shadow() })
             // 发送键离右边和底边都是 8px
             .px_2()
             .pt_1p5()
@@ -797,9 +800,17 @@ impl ChatApp {
     }
 
     /// 拖拽中盖在会话区上的提示（不挡事件：松开落在下面的会话区上）。
+    /// 框用原版 `--cds-shadow-drop-ring` + `--cds-shadow-drop-glow` 的两层：
+    /// 2px 赤陶实圈（`inset`）+ 12px（σ，CSS 24px 减半）赤陶 20% 柔光，比一圈虚线更像「这里能放」。
     fn render_drop_hint(chat: bool) -> Div {
         let mut scrim = rgb(PAPER);
         scrim.a = 0.94;
+        let accent = rgb(CORAL);
+        let ring = BoxShadow::new(px(0.), px(0.), accent.into()).spread_radius(px(2.)).inset();
+        let glow = BoxShadow::new(px(0.), px(0.), with_alpha(accent, 0.2).into())
+            .blur_radius(px(12.))
+            .spread_radius(px(-2.))
+            .inset();
         div().absolute().inset_0().p_4().bg(scrim).child(
             div()
                 .size_full()
@@ -807,10 +818,8 @@ impl ChatApp {
                 .items_center()
                 .justify_center()
                 .gap_1p5()
-                .border_2()
-                .border_dashed()
-                .border_color(rgb(CORAL))
                 .rounded_2xl()
+                .shadow(vec![ring, glow])
                 .child(Icon::new(IconAll::Plus).size_6().text_color(rgb(CORAL)))
                 .child(div().text_size(TEXT_LEAD).font_medium().child("松开即可添加"))
                 .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(if chat {

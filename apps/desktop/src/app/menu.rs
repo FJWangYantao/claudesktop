@@ -62,8 +62,15 @@ impl Selectable for MenuChip {
 
 impl RenderOnce for MenuChip {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        // 工具栏挤不下时 chip 可以收窄，文字截成省略号（长模型名别把发送键挤出卡片）
+        // 工具栏挤不下时 chip 可以收窄，文字截成省略号（长模型名别把发送键挤出卡片）。
+        // 无障碍：这是一个按钮，展开状态就是弹层开没开（和样式读同一个 `open`，
+        // 状态只有一份——原版 `data-cds` 契约真正值钱的地方）。`role` 要挂在带 id 的
+        // stateful div 上，所以先给个 id
         let mut chip = div()
+            .id(ElementId::Name(format!("menu-chip-{}", self.label).into()))
+            .role(Role::Button)
+            .aria_expanded(self.open)
+            .aria_label(self.label.clone())
             .h_flex()
             .min_w_0()
             .gap_1p5()
@@ -209,6 +216,8 @@ pub(super) fn menu_item(
     let desc: SharedString = desc.into();
     div()
         .id(id)
+        .role(Role::MenuItem)
+        .aria_selected(active)
         .h_flex()
         .items_center()
         .gap_2p5()
@@ -251,6 +260,8 @@ pub(super) fn font_menu_item(
     let family: SharedString = family.into();
     div()
         .id(id)
+        .role(Role::MenuItem)
+        .aria_selected(active)
         .h_flex()
         .items_center()
         .gap_2p5()
@@ -303,6 +314,8 @@ pub(super) fn theme_menu_item(
 ) -> Stateful<Div> {
     div()
         .id(id)
+        .role(Role::MenuItem)
+        .aria_selected(active)
         .h_flex()
         .items_center()
         .gap_2p5()
@@ -357,6 +370,12 @@ pub(super) fn menu_popover(
 }
 
 /// 菜单面板的外观和焦点（trigger 不是 [`MenuChip`] 的菜单自己组 Popover 时也用它）。
+///
+/// 外观交给 Popover 自己：`appearance`（默认开）在渲染时套 gpui-kit 的 `popover_style`
+/// ——无边框 + 10% 前景 hairline ring + 两层阴影，和命令面板、通知、对话框是同一套弹层
+/// 描边语言。这里只把内边距收成 `p_1`（`refine_style` 在 `popover_style` 之后合并，
+/// 所以能盖掉它默认的 `p_3`）。底色、圆角都从组件主题取，**不要**在调用处写
+/// `bg(rgb(CARD))` / `border_color(rgb(LINE))`——配色不对就去 `theme::apply_colors` 补映射。
 pub(super) fn menu_panel(popover: Popover, focus: &FocusHandle) -> Popover {
-    popover.track_focus(focus).bg(rgb(CARD)).border_1().border_color(rgb(LINE)).rounded_lg().p_1()
+    popover.track_focus(focus).p_1()
 }

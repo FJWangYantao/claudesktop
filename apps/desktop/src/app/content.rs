@@ -8,8 +8,10 @@
 //! 内容区里的动画（展开、悬停淡入、平滑滚动）通知的是当前 view，也就是内容区自己；
 //! 常驻的循环动画（转圈、呼吸点、扫光）例外，由叠在上面的 `motion::LoopOverlay` 画（见 motion.rs 文件头）。
 
+use super::widgets::edge_fade;
 use super::{ChatApp, motion};
 use crate::model::ChatItem;
+use crate::session::scroll_handle_edge;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::component::*;
@@ -94,8 +96,16 @@ impl ChatApp {
                         ),
                 )
                 .child(self.home_w.probe())
-                .child(edge_fade(px(16.), paper, clear).top_0())
-                .child(edge_fade(px(24.), clear, paper).bottom_0())
+                .child({
+                    // 上下渐隐跟手：贴顶时顶上那条收成 0，贴底时底下那条收成 0
+                    let (top, bottom) = scroll_handle_edge(&self.home_scroll).heights();
+                    let rem = window.rem_size();
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(edge_fade(top.to_pixels(rem), paper, clear).top_0())
+                        .child(edge_fade(bottom.to_pixels(rem), clear, paper).bottom_0())
+                })
                 .into_any_element();
         }
 
@@ -147,10 +157,13 @@ impl ChatApp {
         .flex_1()
         .min_h_0();
 
-        // 上下边缘渐隐：内容滚到顶栏 / 输入区下面时淡出，不是一刀切。高度不超过首行上边距和
-        // 状态行下边距，滚到头时不遮内容；覆盖层不挂事件，不挡点击和滚轮
+        // 上下边缘渐隐：内容滚到顶栏 / 输入区下面时淡出，不是一刀切。高度按滚到哪一档给
+        // （贴顶 / 贴底时对应那条收成 0），不超过首行上边距和状态行下边距，滚到头时不遮内容；
+        // 覆盖层不挂事件，不挡点击和滚轮
         let paper = rgb(PAPER);
         let clear = Rgba { a: 0., ..paper };
+        let (fade_top, fade_bottom) = self.sessions[active].scroll_edge().heights();
+        let rem = window.rem_size();
         // 滚轮平滑：capture 阶段截住滚轮记成目标（见 `ChatApp::wheel_by`），列表自己在 bubble 阶段
         // 一格硬跳 60px 的处理就不跑了。只有横向（Shift+滚轮）时放行。
         // 命中区不挡悬停；弹层、对话框盖在上面时 `should_handle_scroll` 为 false，不抢它们的滚轮
@@ -184,18 +197,9 @@ impl ChatApp {
             .v_flex()
             .child(scroll)
             .child(wheel)
-            .child(edge_fade(px(16.), paper, clear).top_0())
-            .child(edge_fade(px(24.), clear, paper).bottom_0())
+            .child(edge_fade(fade_top.to_pixels(rem), paper, clear).top_0())
+            .child(edge_fade(fade_bottom.to_pixels(rem), clear, paper).bottom_0())
             .children(self.render_jump_to_bottom(window, cx))
             .into_any_element()
     }
-}
-
-/// 滚动区上下边缘的渐隐条（从 `from` 渐变到 `to`），不挂事件，不挡点击和滚轮。
-fn edge_fade(h: Pixels, from: Rgba, to: Rgba) -> Div {
-    div().absolute().left_0().right_0().h(h).bg(linear_gradient(
-        180.,
-        linear_color_stop(from, 0.),
-        linear_color_stop(to, 1.),
-    ))
 }

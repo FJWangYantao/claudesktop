@@ -1,8 +1,8 @@
 //! 色板、字体与字号阶梯（Claude 品牌基准：暖纸底 + 赤陶橙）。
 
 use gpui_kit::{
-    App, DefiniteLength, FontFallbacks, FontFeatures, Pixels, Rems, Rgba, SharedString, px,
-    relative, rems,
+    App, BoxShadow, DefiniteLength, FontFallbacks, FontFeatures, Hsla, Pixels, Rems, Rgba,
+    SharedString, hsla, px, relative, rems,
 };
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -333,6 +333,16 @@ pub fn rgb(color: Color) -> Rgba {
     gpui_kit::rgb(pick(palette(), color, is_dark()))
 }
 
+/// 同一个颜色加一层透明度（0..1）：只用在「状态色描边」「光晕」这类不该抢前景的地方。
+pub fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: color.a * alpha, ..color }
+}
+
+/// 语义色的 `Hsla` 版本（`BoxShadow` 要这个）。
+fn hsla_of(color: Color) -> Hsla {
+    rgb(color).into()
+}
+
 /// 配色菜单的色块：画别的色板（不是当前这套）在当前明暗下的颜色。
 pub fn swatch(index: usize, color: Color) -> Rgba {
     gpui_kit::rgb(pick(&PALETTES[index.min(PALETTES.len() - 1)], color, is_dark()))
@@ -657,20 +667,76 @@ fn set_font_family_raw(family: Option<SharedString>) {
 // rounded_xl  12px 卡片、弹层、权限卡、侧栏面板
 // rounded_2xl 16px 输入框、用户气泡
 
+// ---------- 阴影 ----------
+// gpui 的 `BoxShadow::blur_radius` 是高斯 σ，CSS 的 blur 是 2σ，所以照网页配方写时要**减半**。
+// `.shadow_xs/sm/md/lg` 是宏生成的 Tailwind 原值（没减半），比网页宽一倍，别再拿来当设计值用；
+// 这里的两个函数按「减半后」的 σ 给。
+//
+// 两层的思路（原版 `--cds-shadow-lg`）：近距一层小锐利做接触感，远距一层大扩散做悬浮感。
+// 只有一层会像贴纸。墨水用固定的 8% 黑：阴影不是语义色，深色下也一样读得出来。
+
+/// 悬浮面（输入框、卡片悬停、回到底部这类浮在纸上的东西）的两层阴影。
+/// 对应原版 `0 4px 8px` + `0 12px 28px -2px`，σ 减半。
+pub fn float_shadow() -> Vec<BoxShadow> {
+    let ink = hsla(0., 0., 0., 0.08);
+    vec![
+        BoxShadow::new(px(0.), px(2.), ink).blur_radius(px(4.)),
+        BoxShadow::new(px(0.), px(6.), ink).blur_radius(px(14.)).spread_radius(px(-1.)),
+    ]
+}
+
+/// 贴着容器浮起一档的东西（输入框静止态）：比 [`float_shadow`] 收一档，不抢注意力。
+pub fn raised_shadow() -> Vec<BoxShadow> {
+    let ink = hsla(0., 0., 0., 0.05);
+    vec![BoxShadow::new(px(0.), px(1.), ink).blur_radius(px(3.))]
+}
+
+/// 三层焦点环（原版 `--cds-focus-shadow`）：
+/// ① 内挖 1px 底色，让实边和元素自己的底之间留一道缝；
+/// ② 1px 实边，真正的边界；
+/// ③ 6px 光晕（σ 3px，CSS 值减半），40% 透明度。
+///
+/// 描边宽度不跟字号走，所以这里是少数**该用 `px`** 的地方。
+/// `accent` 传 `INK_FAINT`（输入框这种中性的）/ `CORAL`（按钮、链接）/ `RED`（危险操作）。
+pub fn focus_ring(accent: Color) -> Vec<BoxShadow> {
+    let line = hsla_of(accent);
+    vec![
+        BoxShadow::new(px(0.), px(0.), hsla_of(PAPER)).spread_radius(px(1.)).inset(),
+        BoxShadow::new(px(0.), px(0.), line).spread_radius(px(1.)),
+        BoxShadow::new(px(0.), px(0.), line.alpha(line.a * 0.4))
+            .blur_radius(px(3.))
+            .spread_radius(px(1.)),
+    ]
+}
+
+/// 状态色（红 / 绿）的描边：前景色 40%，直接拿前景色描边会喧宾夺主（原版状态描边一律取浅档）。
+pub fn state_line(color: Color) -> Rgba {
+    with_alpha(rgb(color), 0.4)
+}
+
 // ---------- 布局宽度 ----------
+// 阅读列 / 设置页内容 / 概览面板是「measure」（按一行放多少字定），**保持 px**：
+// 字号放大时列宽不该跟着放大，否则一行字数跟着变。
+// 侧栏、分类导航、顶栏高度是界面的「框」，跟字号缩放（放大后标题和相对时间才不会互挤）。
 
 /// 对话列与输入框的最大宽度（阅读列）
 pub const READING_W: Pixels = px(760.);
 /// 设置页内容最大宽度
 pub const FORM_W: Pixels = px(720.);
 /// 设置页左侧分类导航宽度
-pub const SETTINGS_NAV_W: Pixels = px(200.);
+pub const SETTINGS_NAV_W: Rems = rems(12.5);
 /// 首页用量概览面板宽度
 pub const OVERVIEW_W: Pixels = px(724.);
 /// 侧栏宽度（含外圈留白）
-pub const SIDEBAR_W: Pixels = px(256.);
+pub const SIDEBAR_W: Rems = rems(16.);
 /// 设置页里填数字的小输入框（步数上限这类）
 pub const NUMBER_INPUT_W: Pixels = px(120.);
+
+/// 设置页（含用量页）整页的最大宽度：左侧分类导航 + 右侧内容。
+/// 导航按 rem 缩放，内容按 measure 固定，所以这里要换算一次；拿不到 `window` 的地方用它。
+pub fn settings_page_w() -> Pixels {
+    SETTINGS_NAV_W.to_pixels(root_font_size()) + FORM_W
+}
 
 #[cfg(test)]
 mod tests {
@@ -793,5 +859,47 @@ mod tests {
         assert_eq!(sans(), "Microsoft YaHei");
         set_font_family_raw(None);
         assert_eq!(sans(), DEFAULT_SANS);
+    }
+
+    /// 侧栏 / 分类导航 / 顶栏是「框」，必须跟着字号缩放；阅读列这类 measure 保持 px。
+    ///
+    /// 用一个只收 `Rems` 的函数卡类型：有人把它们改回 `Pixels` 就编译不过，
+    /// 不用等到肉眼发现「放大字号后侧栏标题和相对时间互挤」。
+    #[core::prelude::v1::test]
+    fn layout_boxes_scale_with_font() {
+        const fn as_rems(v: Rems) -> Rems {
+            v
+        }
+        let scale = 1.4;
+        set_font_scale(scale);
+        let rem = root_font_size();
+        // 放大后侧栏、导航、顶栏跟着变宽变高
+        assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(256. * scale));
+        assert_eq!(as_rems(SETTINGS_NAV_W).to_pixels(rem), px(200. * scale));
+        // 阅读列是 measure：不跟字号走（一行字数的量纲不变）
+        assert_eq!(READING_W, px(760.));
+        assert_eq!(FORM_W, px(720.));
+        set_font_scale(FONT_SCALE_DEFAULT);
+        assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(256.));
+    }
+
+    /// 焦点环必须是三层（内挖底色 + 实边 + 光晕），光晕的 σ 是 CSS 值的一半。
+    #[core::prelude::v1::test]
+    fn focus_ring_has_three_layers() {
+        set_palette(0);
+        set_dark(false);
+        let ring = focus_ring(CORAL);
+        assert_eq!(ring.len(), 3);
+        // ① 内挖：1px spread、无模糊
+        assert!(ring[0].inset);
+        assert_eq!(ring[0].spread_radius, px(1.));
+        assert_eq!(ring[0].blur_radius, px(0.));
+        // ② 实边：1px、无模糊、不 inset
+        assert!(!ring[1].inset);
+        assert_eq!(ring[1].spread_radius, px(1.));
+        assert_eq!(ring[1].blur_radius, px(0.));
+        // ③ 光晕：CSS 的 6px 减半成 σ 3px，40% 透明度
+        assert_eq!(ring[2].blur_radius, px(3.));
+        assert!((ring[2].color.a - 0.4).abs() < 1e-4);
     }
 }

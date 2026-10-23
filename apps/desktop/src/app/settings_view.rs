@@ -2491,7 +2491,7 @@ impl ChatApp {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .max_w(SETTINGS_NAV_W + FORM_W)
+                    .max_w(settings_page_w())
                     .mx_auto()
                     // 标题行：「设置」与导航项文字左对齐，关闭按钮在右
                     .child(
