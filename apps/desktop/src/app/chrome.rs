@@ -34,6 +34,15 @@ pub(super) fn drag_area() -> Div {
         })
 }
 
+/// macOS 红绿灯摆在哪（窗口左上角为原点）。gpui-kit `TitleBar::title_bar_options` 给的 (9, 9)
+/// 是按默认字号（根字号 16px）下 44px 高的顶栏摆的；`CHROME_H` 跟字号缩放，顶栏变高后
+/// 红绿灯往下挪半个增量，留在顶栏中线上（系统画的按钮本身不缩放）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn traffic_light_origin(rem: Pixels) -> Point<Pixels> {
+    let grow = CHROME_H.to_pixels(rem) - CHROME_H.to_pixels(px(16.));
+    point(px(9.), px(9.) + grow * 0.5)
+}
+
 /// 左上角给系统红绿灯留的位置（只有 macOS 需要）
 pub(super) fn traffic_light_gap() -> Option<Div> {
     cfg!(target_os = "macos").then(|| div().w(TRAFFIC_LIGHT_W).flex_shrink_0())
@@ -259,4 +268,17 @@ fn view_menu_items(
             .child(ChatApp::kbd(CYCLE_VIEW_KEY))
             .child("循环切换"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 默认字号下保持 gpui-kit 原来的位置；放大后跟着顶栏中线往下挪。
+    #[core::prelude::v1::test]
+    fn traffic_lights_follow_chrome_height() {
+        assert_eq!(traffic_light_origin(px(16.)), point(px(9.), px(9.)));
+        // 1.25 倍：顶栏 44 → 55px，长了 11px，往下挪一半
+        assert_eq!(traffic_light_origin(px(20.)), point(px(9.), px(14.5)));
+    }
 }

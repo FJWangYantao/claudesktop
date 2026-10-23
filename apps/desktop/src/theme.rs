@@ -691,32 +691,35 @@ pub fn raised_shadow() -> Vec<BoxShadow> {
     vec![BoxShadow::new(px(0.), px(1.), ink).blur_radius(px(3.))]
 }
 
-/// 三层焦点环（原版 `--cds-focus-shadow`）：
-/// ① 内挖 1px 底色，让实边和元素自己的底之间留一道缝；
-/// ② 1px 实边，真正的边界；
+/// 三层焦点环（原版 `--cds-focus-shadow`），都画在元素边框**外面**：
+/// ① 贴着边框一圈 1px 外部底色，让环和元素之间留一道缝；
+/// ② 再往外 1px 实边（spread 2px，里面那 1px 被 ① 盖住）；
 /// ③ 6px 光晕（σ 3px，CSS 值减半），40% 透明度。
+///
+/// 不用 `inset`：内阴影画在边框底下（`Style::paint` 先画内阴影再画边框），有边框的元素上看不见。
+/// gpui 里后插入的阴影盖在前面的上面（和 CSS「第一层在最上」相反），所以 vec 里是 ③ ② ① 的顺序。
 ///
 /// 描边宽度不跟字号走，所以这里是少数**该用 `px`** 的地方。
 /// `accent` 传 `INK_FAINT`（输入框这种中性的）/ `CORAL`（按钮、链接）/ `RED`（危险操作）。
-/// ① 的间隙色默认是 `CARD`（输入框、卡片、弹层都是卡片底）；放在纸底上的元素用
-/// [`focus_ring_on`] 传 `PAPER`，否则会看到一道比周围更浅的缝。
+/// ① 的缝取元素**外面**的底色，默认 `PAPER`（输入框放在纸底上）；放在卡片里的元素用
+/// [`focus_ring_on`] 传 `CARD`，否则会看到一道和周围不一样的缝。
 pub fn focus_ring(accent: Color) -> Vec<BoxShadow> {
-    focus_ring_on(accent, CARD)
+    focus_ring_on(accent, PAPER)
 }
 
-/// 同 [`focus_ring`]，间隙色自己给（见那里的说明）。
+/// 同 [`focus_ring`]，缝的颜色（元素外面的底色）自己给（见那里的说明）。
 pub fn focus_ring_on(accent: Color, gap: Color) -> Vec<BoxShadow> {
     let line = hsla_of(accent);
     vec![
-        BoxShadow::new(px(0.), px(0.), hsla_of(gap)).spread_radius(px(1.)).inset(),
-        BoxShadow::new(px(0.), px(0.), line).spread_radius(px(1.)),
         BoxShadow::new(px(0.), px(0.), line.alpha(line.a * 0.4))
             .blur_radius(px(3.))
-            .spread_radius(px(1.)),
+            .spread_radius(px(2.)),
+        BoxShadow::new(px(0.), px(0.), line).spread_radius(px(2.)),
+        BoxShadow::new(px(0.), px(0.), hsla_of(gap)).spread_radius(px(1.)),
     ]
 }
 
-/// 状态色（红 / 绿）的描边：前景色 40%，直接拿前景色描边会喧宾夺主（原版状态描边一律取浅档）。
+/// 状态色（红 / 绿 / 待处理的赤陶）的描边：前景色 40%，直接拿前景色描边会喧宾夺主（原版状态描边一律取浅档）。
 pub fn state_line(color: Color) -> Rgba {
     with_alpha(rgb(color), 0.4)
 }
@@ -748,9 +751,19 @@ pub fn settings_page_w() -> Pixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// 色板、明暗、字号、字体族是进程级全局状态，cargo test 默认多线程并行：
+    /// 改它们（或读了要断言）的测试先拿这把锁，否则会读到别的测试刚设的值。
+    fn theme_globals() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        // 别的测试断言失败会毒化锁；状态每个测试开头自己设，接着用就行
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[core::prelude::v1::test]
     fn rgb_follows_palette_and_appearance() {
+        let _g = theme_globals();
         set_palette(0);
         set_dark(false);
         assert_eq!(rgb(PAPER), gpui_kit::rgb(0xFAF9F5));
@@ -815,6 +828,7 @@ mod tests {
     /// 缩放：标准档是 16px，改倍率后根字号等比变，且越界会被夹住。
     #[core::prelude::v1::test]
     fn font_scale_drives_root_size_and_clamps() {
+        let _g = theme_globals();
         set_font_scale(1.0);
         assert_eq!(root_font_size(), px(16.));
         // 字号阶梯本身是 rem：跟着根字号走
@@ -858,6 +872,7 @@ mod tests {
     /// 字体族：没选过时回到内嵌 Inter；`cached_fonts` 在没枚举过时返回空表而不是 panic。
     #[core::prelude::v1::test]
     fn font_family_defaults_to_embedded_inter() {
+        let _g = theme_globals();
         // 单测里没有 `App`，系统字体多半还没枚举；关键是取它不会炸
         let _ = cached_fonts();
         assert_eq!(sans(), DEFAULT_SANS);
@@ -874,6 +889,7 @@ mod tests {
     /// 不用等到肉眼发现「放大字号后侧栏标题和相对时间互挤」。
     #[core::prelude::v1::test]
     fn layout_boxes_scale_with_font() {
+        let _g = theme_globals();
         const fn as_rems(v: Rems) -> Rems {
             v
         }
@@ -890,26 +906,28 @@ mod tests {
         assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(256.));
     }
 
-    /// 焦点环必须是三层（内挖底色 + 实边 + 光晕），光晕的 σ 是 CSS 值的一半。
+    /// 焦点环必须是三层（缝 + 实边 + 光晕），都在边框外面，光晕的 σ 是 CSS 值的一半。
     #[core::prelude::v1::test]
     fn focus_ring_has_three_layers() {
+        let _g = theme_globals();
         set_palette(0);
         set_dark(false);
         let ring = focus_ring(CORAL);
         assert_eq!(ring.len(), 3);
-        // ① 内挖：1px spread、无模糊、底色取卡片底（输入框的底）
-        assert!(ring[0].inset);
-        assert_eq!(ring[0].spread_radius, px(1.));
-        assert_eq!(ring[0].blur_radius, px(0.));
-        assert_eq!(ring[0].color, hsla_of(CARD));
-        // ② 实边：1px、无模糊、不 inset
-        assert!(!ring[1].inset);
-        assert_eq!(ring[1].spread_radius, px(1.));
+        // 内阴影画在边框底下看不见，三层都得是外阴影
+        assert!(ring.iter().all(|s| !s.inset));
+        // ③ 光晕（最先画、在最底下）：CSS 的 6px 减半成 σ 3px，40% 透明度
+        assert_eq!(ring[0].blur_radius, px(3.));
+        assert!((ring[0].color.a - 0.4).abs() < 1e-4);
+        // ② 实边：spread 2px、无模糊，里面那 1px 被缝盖住
+        assert_eq!(ring[1].spread_radius, px(2.));
         assert_eq!(ring[1].blur_radius, px(0.));
-        // ③ 光晕：CSS 的 6px 减半成 σ 3px，40% 透明度
-        assert_eq!(ring[2].blur_radius, px(3.));
-        assert!((ring[2].color.a - 0.4).abs() < 1e-4);
-        // 放在纸底上的元素换间隙色
-        assert_eq!(focus_ring_on(CORAL, PAPER)[0].color, hsla_of(PAPER));
+        assert_eq!(ring[1].color, hsla_of(CORAL));
+        // ① 缝（最后画、在最上面）：1px、无模糊、取元素外面的纸底
+        assert_eq!(ring[2].spread_radius, px(1.));
+        assert_eq!(ring[2].blur_radius, px(0.));
+        assert_eq!(ring[2].color, hsla_of(PAPER));
+        // 放在卡片里的元素换缝的颜色
+        assert_eq!(focus_ring_on(CORAL, CARD)[2].color, hsla_of(CARD));
     }
 }

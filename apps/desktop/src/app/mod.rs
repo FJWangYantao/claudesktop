@@ -172,6 +172,9 @@ pub struct ChatApp {
     settings_scroll: ScrollHandle,
     /// 侧栏会话列表的滚动位置（底部渐隐跟手，见 `ScrollEdge`）
     sidebar_scroll: ScrollHandle,
+    /// macOS 红绿灯上次按哪个根字号摆的（字号变了才重摆，见 `chrome::traffic_light_origin`）
+    #[cfg(target_os = "macos")]
+    traffic_lights_rem: Option<Pixels>,
     /// 鼠标停在侧栏哪个会话上（令牌；行右侧的操作按钮淡入淡出）
     sidebar_hover: Option<u64>,
     /// 侧栏只列哪些会话（全部 / 进行中 / 待查看）
@@ -498,6 +501,8 @@ impl ChatApp {
             task_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
+            #[cfg(target_os = "macos")]
+            traffic_lights_rem: None,
             sidebar_hover: None,
             sidebar_filter: Default::default(),
             sidebar_expanded: Default::default(),
@@ -2554,6 +2559,16 @@ impl Render for ChatApp {
             .absolute()
             .size_0()
         });
+
+        // 顶栏高度跟字号缩放，系统红绿灯要跟着挪（字号没变就不动）
+        #[cfg(target_os = "macos")]
+        {
+            let rem = window.rem_size();
+            if self.traffic_lights_rem != Some(rem) {
+                self.traffic_lights_rem = Some(rem);
+                window.set_traffic_light_position(chrome::traffic_light_origin(rem));
+            }
+        }
 
         // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
         self.sync_sidebar(cx);
