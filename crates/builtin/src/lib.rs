@@ -106,6 +106,8 @@ const MAX_USER_MESSAGES_KEPT: usize = 50;
 const MAX_DENIAL_STREAK: u32 = 3;
 /// 自动模式：一个会话累计被拦这么多次也停下来
 const MAX_DENIALS: u32 = 20;
+/// 一轮里连着这么多次回复被输出上限截断就停下来（模型重发也还是截断，再试没意义）
+const MAX_TRUNCATED_STEPS: u32 = 2;
 
 const MODE_DEFAULT: &str = "default";
 const MODE_ACCEPT_EDITS: &str = "acceptEdits";
@@ -2710,6 +2712,8 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
     // 上一步刚压缩过（不连着压两次）/ 这一轮已经因为超限报错压缩过（只压一次）
     let mut just_compacted = false;
     let mut overflow_compacted = false;
+    // 连着几步的回复被输出上限截断（中间只要有一整步正常就清零）
+    let mut truncated_steps: u32 = 0;
     // 会话级档位（输入框下拉选的）按轮取：一轮中途换了档，后面的步骤仍用开头那一档
     //（工具循环中途开 / 关思考，Anthropic 会因上一条助手消息没有 thinking 块报 400）
     let Some(thinking) = inner.sessions.lock().unwrap().get(session).map(|s| s.thinking) else {
@@ -2862,6 +2866,70 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             reply = text.clone();
         }
 
+        // 回复被输出上限截断（`finish_reason == "length"`）：流式解析器会把半截 JSON 尽量补全成
+        // 能过 schema 的参数，`edit_file` 的 `old_string` / `write_file` 的 `content` 可能就是残缺的前半段。
+        // 所以这一批调用一个都不执行（不看参数是否合法），全部回错误让模型重发——pi 的
+        // `failToolCallsFromTruncatedMessage` 也是这么做的
+        if outcome.finish_reason.as_deref() == Some("length") && !outcome.tool_calls.is_empty() {
+            truncated_steps += 1;
+            if truncated_steps >= MAX_TRUNCATED_STEPS {
+                return Steps::Failed(format!(
+                    "连续 {truncated_steps} 次回复被输出上限截断（finish_reason = length），已停止。"
+                ));
+            }
+            let contents: Vec<String> =
+                outcome.tool_calls.iter().map(|c| truncated_tool_message(&c.function.name)).collect();
+            let results: Vec<_> = outcome
+                .tool_calls
+                .iter()
+                .zip(&contents)
+                .map(|(call, content)| {
+                    ChatMessage::tool_result(call.id.clone(), content.clone())
+                })
+                .collect();
+            // 界面：每个调用都报一行工具，状态直接是 failed。不走 `start_tool`：截断的参数不该被
+            // 解析（`Action::parse` 可能成功），也不该发 diff 预览
+            for (call, content) in outcome.tool_calls.iter().zip(&contents) {
+                inner.emit(
+                    Some(session),
+                    KernelEvent::ToolCallStarted {
+                        id: call.id.clone(),
+                        title: call.function.name.clone(),
+                        status: "failed".into(),
+                        kind: "other".into(),
+                        parent: None,
+                    },
+                );
+                inner.emit(
+                    Some(session),
+                    KernelEvent::ToolCallUpdated {
+                        id: call.id.clone(),
+                        title: None,
+                        status: Some("failed".into()),
+                        raw_output: Some("回复被截断，未执行".into()),
+                        output: Some(claudesktop_core::output_preview(content)),
+                    },
+                );
+            }
+            // assistant 消息 + 这批错误结果照常写进历史：下一步请求里的 tool_calls 必须有对应的
+            // tool 消息，否则端点直接报错
+            let unmeasured = results.len();
+            let mut call = ChatMessage::assistant_tool_calls(text, outcome.tool_calls);
+            call.thinking = outcome.thinking;
+            let mut step = Vec::with_capacity(unmeasured + 1);
+            step.push(call);
+            step.extend(results);
+            if !inner.commit(session, flag, step) {
+                return Steps::Stopped;
+            }
+            inner.measure(session, step_tokens, unmeasured);
+            inner.count_step(session, false);
+            // 继续循环，让模型下一步重发完整的调用
+            continue;
+        }
+        // 这一步没被截断：连续计数清零
+        truncated_steps = 0;
+
         if outcome.tool_calls.is_empty() {
             if !text.is_empty() {
                 inner.commit(session, flag, vec![ChatMessage::new("assistant", text)]);
@@ -2918,6 +2986,14 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         }
     }
     Steps::Done { stop, reply }
+}
+
+/// 被输出上限截断的工具调用：回给模型的错误（说清楚原因、要求重发完整参数）。
+fn truncated_tool_message(name: &str) -> String {
+    format!(
+        "Tool call `{name}` was not executed: the reply hit the output token limit, so its \
+         arguments may be truncated. Re-issue the call with complete arguments."
+    )
 }
 
 /// 一条消息里的文字部分（给钩子看用户说了什么）。
