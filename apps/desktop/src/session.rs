@@ -600,6 +600,8 @@ impl Session {
 /// 滚动时内容区本来就在重画，这里零额外成本。侧栏是缓存 view，档位要并进 `sync_sidebar` 的指纹。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ScrollEdge {
+    /// 内容不满一屏（滚不动）：两头都到头了，两条都不画
+    Fits,
     Top,
     Middle,
     Bottom,
@@ -614,18 +616,18 @@ impl ScrollEdge {
     /// `top` = 离顶部多远，`remaining` = 离底部还有多远（都按像素）。
     /// 差 1px 以内就算到头（浮点累加的滚动位置不会正好是 0）。
     pub fn of(top: Pixels, remaining: Pixels) -> Self {
-        if top <= px(1.) {
-            Self::Top
-        } else if remaining <= px(1.) {
-            Self::Bottom
-        } else {
-            Self::Middle
+        match (top <= px(1.), remaining <= px(1.)) {
+            (true, true) => Self::Fits,
+            (true, false) => Self::Top,
+            (false, true) => Self::Bottom,
+            (false, false) => Self::Middle,
         }
     }
 
     /// 上下两条渐隐的高度。
     pub fn heights(self) -> (Rems, Rems) {
         match self {
+            Self::Fits => (Rems::ZERO, Rems::ZERO),
             Self::Top => (Rems::ZERO, FADE_BOTTOM),
             Self::Middle => (FADE_TOP, FADE_BOTTOM),
             Self::Bottom => (FADE_TOP, Rems::ZERO),
@@ -1740,6 +1742,20 @@ mod tests {
 
     // 注意：本文件顶层 `use gpui_kit::*` 会把 gpui 的 test 宏带进作用域，
     // 遮蔽内建 #[test]，必须用全路径（原文件其他测试同理）。
+    /// 渐隐跟着滚动位置收放：滚不动时两条都不画（不然最后一行会被底下那条盖住一截）。
+    #[core::prelude::v1::test]
+    fn scroll_edge_hides_fades_at_the_ends() {
+        assert_eq!(ScrollEdge::of(px(0.), px(0.)), ScrollEdge::Fits);
+        assert_eq!(ScrollEdge::Fits.heights(), (Rems::ZERO, Rems::ZERO));
+        // 差 1px 以内算到头
+        assert_eq!(ScrollEdge::of(px(0.5), px(300.)), ScrollEdge::Top);
+        assert_eq!(ScrollEdge::Top.heights(), (Rems::ZERO, FADE_BOTTOM));
+        assert_eq!(ScrollEdge::of(px(300.), px(0.5)), ScrollEdge::Bottom);
+        assert_eq!(ScrollEdge::Bottom.heights(), (FADE_TOP, Rems::ZERO));
+        assert_eq!(ScrollEdge::of(px(40.), px(40.)), ScrollEdge::Middle);
+        assert_eq!(ScrollEdge::Middle.heights(), (FADE_TOP, FADE_BOTTOM));
+    }
+
     #[core::prelude::v1::test]
     fn markdown_export_covers_item_kinds() {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("C:/proj"));

@@ -33,9 +33,9 @@ const STEP_GAP: Rems = rems(0.375);
 /// 块与块之间的行距
 pub(super) const BLOCK_GAP: Rems = rems(1.);
 /// 步骤行左侧的图标格宽度；组内细线对着它的中线。
-/// 固定图标格，**不**跟着字号缩放（图标本身也是固定档，见 AGENTS.md 的例外）
-const ICON_COL: Pixels = px(16.);
-/// 图标格 + 间距：步骤的展开内容（思考正文等）缩进到文字起点
+/// 和图标（`size_3p5` 这类也是 rem）、`STEP_INDENT` 一起跟字号缩放，放大后正文才和标题文字对齐
+const ICON_COL: Rems = rems(1.);
+/// 图标格 + 间距（`step_line` 的 `gap_2`）：步骤的展开内容（思考正文等）缩进到文字起点
 pub(super) const STEP_INDENT: Rems = rems(1.5);
 /// 输入框上方的计划最多露出几条
 const PINNED_PLAN_ROWS: usize = 5;
@@ -364,9 +364,10 @@ impl ChatApp {
             let body = if nested {
                 // 组内步骤：缩进到组头文字下面，左侧一条细线串起来；
                 // 行距算在细线里面，相邻两行的线才连得上
+                // 细线落在图标格中线上（左边距 + 1px 线宽 + 右边距 ≈ `STEP_INDENT`）
                 div()
-                    .ml(px(7.))
-                    .pl(px(16.))
+                    .ml(rems(0.4375))
+                    .pl(rems(1.))
                     .border_l_1()
                     .border_color(rgb(LINE))
                     .when(tight, |d| d.pb(STEP_GAP))
@@ -990,6 +991,10 @@ impl ChatApp {
                 div().text_size(TEXT_META).opacity(0.7).child(Self::kbd(key).appearance(false))
             })
         };
+        // 同一个键给读屏（不是最早那条待定请求时没有快捷键，就不挂这个属性）
+        let key_name = |n: usize| {
+            super::keys::PERMISSION_KEYS.get(n).filter(|_| keyed).map(|key| Self::key_text(key))
+        };
         let mut buttons = div().h_flex().flex_wrap().gap_2();
         for (n, opt) in options.iter().enumerate() {
             let allow = opt.kind.starts_with("allow");
@@ -1017,13 +1022,7 @@ impl ChatApp {
                         d.bg(rgb(SAND)).hover(|d| d.bg(rgb(SELECTED))).text_color(rgb(INK))
                     })
                     .when(!allow, |d| d.hover(|d| d.bg(rgb(HOVER))).text_color(rgb(RED)))
-                    .aria_keyshortcuts(
-                        super::keys::PERMISSION_KEYS
-                            .get(n)
-                            .filter(|_| keyed)
-                            .map(|k| Self::key_text(k))
-                            .unwrap_or_default(),
-                    )
+                    .when_some(key_name(n), |d, key| d.aria_keyshortcuts(key))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.resolve_permission(idx, Some((id.clone(), name.clone())), cx);
                     }))
@@ -1045,13 +1044,7 @@ impl ChatApp {
                 .text_size(TEXT_BODY)
                 .text_color(rgb(INK_SOFT))
                 .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
-                .aria_keyshortcuts(
-                    super::keys::PERMISSION_KEYS
-                        .get(options.len())
-                        .filter(|_| keyed)
-                        .map(|k| Self::key_text(k))
-                        .unwrap_or_default(),
-                )
+                .when_some(key_name(options.len()), |d, key| d.aria_keyshortcuts(key))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.reject_and_steer(idx, window, cx);
                 }))
@@ -1066,7 +1059,7 @@ impl ChatApp {
             .rounded_xl()
             .border_1()
             // 状态描边取浅档：拿赤陶实色描边太抢，40% 就够指出「这行需要你」
-            .border_color(with_alpha(rgb(CORAL), 0.4))
+            .border_color(state_line(CORAL))
             .bg(rgb(CARD))
             .child(
                 div()

@@ -72,7 +72,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   - 交互态：纸底 / 卡片上悬停用 `HOVER`，选中态和沙色底上悬停用 `SELECTED`，已选中行里再叠一层用
     `HOVER_STRONG`；不要拿 `LINE` / `PAPER` / 透明度当悬停。
     整块可点的卡片（输入框）悬停时加深边框而不是换底色：静止 `LINE` → 悬停 `LINE_STRONG` →
-    聚焦 `INK_FAINT` + 阴影。焦点几乎总在输入框上，「聚焦」要同时看 `window.is_window_active()`，
+    聚焦再套 `focus_ring(INK_FAINT)`。焦点几乎总在输入框上，「聚焦」要同时看 `window.is_window_active()`，
     否则切到别的程序后也一直显示聚焦态，悬停态永远看不到。
   - 带文字的主按钮底色用 `CORAL_DEEP`（悬停 `CORAL_DEEP_HOVER`）；`CORAL` 上白字只有 3.1:1，只给图标按钮。
   - `INK_FAINT` 只给占位、禁用、分隔符和装饰（纸底上 2.05:1），承载信息的文字用 `INK_SOFT`。
@@ -84,11 +84,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   是「框」，是 `Rems`，拿它算加减时要 `.to_pixels(window.rem_size())`（设置页整页宽度用 `theme::settings_page_w()`）。
 - **阴影**：`raised_shadow()`（贴地一档）/ `float_shadow()`（悬浮两层）在 `theme.rs`，σ 已按 CSS 减半；
   `.shadow_xs/sm/md/lg` 是 Tailwind 原值（没减半），别当设计值用。
-- **焦点环**：`theme::focus_ring(accent)` 是三层（内挖 1px 底色 + 1px 实边 + σ3px 光晕）。
+- **焦点环**：`theme::focus_ring(accent)` 是三层，都在边框外（1px 外部底色的缝 + 1px 实边 + σ3px 光晕；
+  元素在卡片里用 `focus_ring_on(.., CARD)`）。别用 `inset` 阴影画环：内阴影在边框底下，看不见。
   输入框这种「点了就是在这里打字」的用 `focus`；按钮类要「键盘 Tab 才出环」用 `.focus_visible(..)`，
   gpui-kit `Button` 自带（`focus_ring_style`），别在调用处覆盖。
 - **状态色描边**取浅档：`theme::state_line(color)`（前景色 40%），不要拿 `RED` / `GREEN` 实色描边。
-- **滚动渐隐**：`session::ScrollEdge` + `scroll_handle_edge` 给三档高度（贴顶 / 贴底时对应那条收成 0），
+- **滚动渐隐**：`session::ScrollEdge` + `scroll_handle_edge` 给渐隐高度（贴顶 / 贴底时对应那条收成 0，滚不动时两条都不画），
   `widgets::edge_fade` 画（已用 `ColorSpace::Oklab`）。侧栏那条的档位要并进 `sync_sidebar` 的指纹。
 - **字号 / 行高**：只用 `theme.rs` 的 `TEXT_*` 阶梯。**它们是 `Rems` 不是 `Pixels`**——
   字号、间距、圆角、图标全按窗口 rem 换算，而 `gpui-component` 的 Root 每帧把

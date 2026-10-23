@@ -90,7 +90,7 @@ impl ChatApp {
 /// 滚动区边缘的渐隐条（从 `from` 渐变到 `to`），不挂事件，不挡点击和滚轮。
 ///
 /// gpui 没有 `mask-image`（只有矩形 `ContentMask`），所以只能用「纸色 → 透明」的覆盖层近似；
-/// 高度由调用方按滚动位置给（贴顶 / 贴底时对应的那条收成 0，见 `ChatApp::fade_heights`）。
+/// 高度由调用方按滚动位置给（贴顶 / 贴底时对应的那条收成 0，见 `session::ScrollEdge::heights`）。
 ///
 /// 插值走 `ColorSpace::Oklab`：`linear_gradient` 只有两个色标，原版 4 段 / 16 段的做法搬不过来，
 /// 但 sRGB 线性插值在低 alpha 段发灰（人眼对暗部不线性），换 Oklab 至少让过渡在感知上均匀。
