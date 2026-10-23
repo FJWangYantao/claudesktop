@@ -674,6 +674,7 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
             "list_dir",
             "glob",
             "todo_write",
+            "ask_user",
             "grep",
             "web_fetch",
             "web_search",
@@ -1072,6 +1073,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
             "list_dir",
             "glob",
             "todo_write",
+            "ask_user",
             "grep",
             "web_fetch",
             "web_search",
@@ -1543,6 +1545,8 @@ fn provider(base: String) -> ProviderConfig {
 
 #[test]
 fn reminds_to_update_a_stale_todo_list_once_per_interval() {
+    // 间隔从常量取（门槛调过也不会让这个测试失去意义）
+    let steps = claudesktop_builtin::TODO_REMIND_STEPS as usize;
     let mut script = vec![tool_call(
         "t0",
         "todo_write",
@@ -1551,8 +1555,8 @@ fn reminds_to_update_a_stale_todo_list_once_per_interval() {
             { "content": "改代码", "status": "in_progress" }
         ]}),
     )];
-    // 之后连着 9 步都没更新清单
-    for i in 1..=9 {
+    // 之后连着 `steps + 1` 步都没更新清单（多出来的那一步用来看「提醒只挂一次」）
+    for i in 1..=steps + 1 {
         script.push(tool_call(
             &format!("g{i}"),
             "glob",
@@ -1567,17 +1571,17 @@ fn reminds_to_update_a_stale_todo_list_once_per_interval() {
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
 
     let has_reminder = |i: usize| bodies.lock().unwrap()[i].contains("system-reminder");
-    // 写完清单后第 8 步走完，下一次请求（第 10 个，下标 9）挂上提醒
-    for i in 0..9 {
+    // 写完清单后第 `steps` 步走完，再下一次请求（下标 `steps + 1`，最后一条消息是第 `steps` 步的结果）挂上提醒
+    for i in 0..=steps {
         assert!(!has_reminder(i), "请求 {i} 不该有提醒");
     }
-    let reminded = body(&bodies, 9);
+    let reminded = body(&bodies, steps + 1);
     let last = reminded["messages"].as_array().unwrap().last().unwrap().clone();
-    assert_eq!(last["tool_call_id"], "g8");
+    assert_eq!(last["tool_call_id"], format!("g{steps}"));
     let content = last["content"].as_str().unwrap();
     assert!(content.contains("<system-reminder>") && content.contains("[>] 改代码"), "{content}");
     // 提醒不进历史，提醒过就重新计数
-    assert!(!has_reminder(10), "提醒只挂一次请求");
+    assert!(!has_reminder(steps + 2), "提醒只挂一次请求");
 }
 
 #[test]
@@ -2401,7 +2405,7 @@ fn chat_session_gets_only_web_and_memory_tools() {
     let first = first_body(&bodies);
     assert_eq!(
         tool_names(&first),
-        ["web_fetch", "web_search", "memory_search", "memory_write", "memory_forget"]
+        ["ask_user", "web_fetch", "web_search", "memory_search", "memory_write", "memory_forget"]
     );
     // 聊天里记记忆一律全局，所以没有 scope 参数
     let write = first["tools"]
@@ -2421,7 +2425,7 @@ fn chat_session_gets_only_web_and_memory_tools() {
     kernel.send_prompt(&sid, UserPrompt::text("再想想")).unwrap();
     wait_second_body(&bodies, 2);
     let second = tool_names(&serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap());
-    assert_eq!(second, ["memory_search", "memory_write", "memory_forget"]);
+    assert_eq!(second, ["ask_user", "memory_search", "memory_write", "memory_forget"]);
 }
 
 /// 聊天会话：带的文本附件内容内联进这一轮的用户消息（聊天没有 `read_file`）。

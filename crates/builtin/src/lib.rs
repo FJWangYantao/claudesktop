@@ -39,7 +39,7 @@ mod sse;
 mod subagent;
 pub mod suggest;
 mod tools;
-pub use tools::{ToolOutput, run_command};
+pub use tools::{ToolOutput, TODO_REMIND_STEPS, run_command};
 pub mod websearch;
 
 pub use anthropic::AnthropicProvider;
@@ -298,6 +298,9 @@ struct SessionState {
     todos: Vec<PlanEntryView>,
     /// 上次写清单之后又走了几步（每步一次请求）：到 `TODO_REMIND_STEPS` 提醒一次
     steps_since_todo: u32,
+    /// 本会话已经通过 `tool_search` 额外声明给模型的工具（见 `tools::exposure`）。
+    /// 骨架阶段恒为空；续接时从日志的 `Record::ToolLoadout` 拿回来。
+    loaded_tools: Vec<String>,
 }
 
 impl SessionState {
@@ -555,6 +558,12 @@ impl Inner {
     fn is_chat(&self, session: &str) -> bool {
         let sessions = self.sessions.lock().unwrap();
         sessions.get(session).is_some_and(|s| s.kind == SessionKind::Chat)
+    }
+
+    /// 本会话已经通过 `tool_search` 加载的工具（交给 `tools::for_model` 决定哪些要声明）。
+    fn loaded_tools(&self, session: &str) -> Vec<String> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session).map(|s| s.loaded_tools.clone()).unwrap_or_default()
     }
 
     /// 这个模型看不了图片吗（能力表说只吃文字，或端点回过 400、界面记进了名单）。
@@ -1679,6 +1688,8 @@ impl Inner {
                     // 子会话没有待办清单
                     todos: Vec::new(),
                     steps_since_todo: 0,
+                    // 子会话的工具按角色清单筛（`subagent::allows`），不走 exposure 那一套
+                    loaded_tools: Vec::new(),
                 };
                 Some((flag, state))
             }) else {
@@ -2357,6 +2368,8 @@ impl BuiltinKernel {
             // 续接的会话接着用日志里最后那份清单
             todos: history.todos,
             steps_since_todo: 0,
+            // 续接的会话要把加载过的工具还给模型，否则模型手里的工具和日志里的调用对不上
+            loaded_tools: history.loaded_tools,
         };
         // 记住的东西一开始就带上（之后每轮重读）
         for warning in state.reload_memory_for_turn(self.inner.memory_path.as_deref()) {
@@ -2397,6 +2410,7 @@ struct Context<'a> {
     memory_global: &'a [claudesktop_core::memory::Entry],
 }
 
+/// 系统提示词。节之间用空行连起来（每节的内容里不带前导空行）。
 fn system_prompt(
     cwd: &Path,
     mode: &str,
@@ -2405,7 +2419,28 @@ fn system_prompt(
     agent: Option<&AgentDef>,
     ctx: Context<'_>,
 ) -> String {
+    prompt_sections(cwd, mode, restored, summary, agent, ctx)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// 系统提示词按「多久变一次」分节（见「方案-内核提速.md」阶段 2 B）。
+///
+/// 骨架阶段只是把原来一次拼完的字符串拆成节、再原样拼回去（结果逐字节相同）；
+/// 阶段 2 再改成「只把变了的节追加成新的 system 消息」，好让前面的提示缓存前缀不动。
+/// 名字只用来比对，不进提示词；越靠前的节越稳定（记忆 / 技能 / 摘要一变就全废，所以放后面）。
+fn prompt_sections(
+    cwd: &Path,
+    mode: &str,
+    restored: bool,
+    summary: Option<&str>,
+    agent: Option<&AgentDef>,
+    ctx: Context<'_>,
+) -> Vec<(&'static str, String)> {
     let Context { instructions: project, skills, memory_project, memory_global } = ctx;
+    let mut sections: Vec<(&'static str, String)> = Vec::new();
     // 子会话没有待办清单（计划是主会话的），也不能再派子任务
     let todo = if agent.is_none() {
         "For tasks with several steps, track progress with todo_write and keep it current: \
@@ -2415,92 +2450,95 @@ fn system_prompt(
     };
     let delegation =
         if agent.is_none() { format!("{}\n", subagent::DELEGATION) } else { String::new() };
-    let mut prompt = format!(
-        "You are a coding agent running inside claudesktop, a desktop agent harness, \
-         working on the user's machine.\n\
-         Working directory: {}\n\
-         Platform: {}\n\n\
-         Use the tools to inspect and change the project: find files with glob and search code with grep \
-         (rather than shell commands), read files before editing them, \
-         request independent reads and searches together in one step (they run in parallel), \
-         prefer edit_file for small changes, read URLs the user gives with web_fetch, and verify your work (e.g. build or run tests) \
-         when it makes sense. {todo}\
-         Tool calls that change things may need the user's approval; \
-         if one is denied, do not retry it.\n\
-         When a decision is really the user's (which of two approaches, whether to overwrite \
-         something they own, anything irreversible), call `ask_user` with 2-4 concrete options \
-         instead of guessing or picking one yourself. Do not use it for anything a tool can find \
-         out, and do not ask the same question twice.\n\
-         {delegation}\
-         {BACKGROUND}\n\
-         Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
-        cwd.display(),
-        std::env::consts::OS,
-    );
+    sections.push((
+        "preamble",
+        format!(
+            "You are a coding agent running inside claudesktop, a desktop agent harness, \
+             working on the user's machine.\n\
+             Working directory: {}\n\
+             Platform: {}\n\n\
+             Use the tools to inspect and change the project: find files with glob and search code with grep \
+             (rather than shell commands), read files before editing them, \
+             request independent reads and searches together in one step (they run in parallel), \
+             prefer edit_file for small changes, read URLs the user gives with web_fetch, and verify your work (e.g. build or run tests) \
+             when it makes sense. {todo}\
+             Tool calls that change things may need the user's approval; \
+             if one is denied, do not retry it.\n\
+             When a decision is really the user's (which of two approaches, whether to overwrite \
+             something they own, anything irreversible), call `ask_user` with 2-4 concrete options \
+             instead of guessing or picking one yourself. Do not use it for anything a tool can find \
+             out, and do not ask the same question twice.\n\
+             {delegation}\
+             {BACKGROUND}\n\
+             Keep replies concise. Answer in the user's language. Use Markdown for structure and code.",
+            cwd.display(),
+            std::env::consts::OS,
+        ),
+    ));
     if let Some(agent) = agent {
-        prompt.push_str("\n\n");
-        prompt.push_str(&subagent::prompt_section(agent));
+        sections.push(("agent", subagent::prompt_section(agent)));
     }
     if restored {
-        prompt.push_str(
-            "\n\nThis conversation was restored from a saved log. Earlier tool calls appear as \
+        sections.push((
+            "restored",
+            "This conversation was restored from a saved log. Earlier tool calls appear as \
              `[tool] <title> → <status>: <summary>` lines; their full inputs and outputs are not \
-             available, so re-read files if you need details. Never write such lines yourself.",
-        );
+             available, so re-read files if you need details. Never write such lines yourself."
+                .to_string(),
+        ));
     }
     if let Some(section) = instructions::prompt_section(project) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&section);
+        sections.push(("project", section));
     }
     if let Some(section) = claudesktop_core::memory::prompt_section(memory_project, memory_global) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&section);
+        sections.push(("memory", section));
     }
     if !skills.is_empty() {
-        prompt.push_str(
-            "\n\n# Skills\n\
+        let mut text = "# Skills\n\
              The user's plugins provide these skills: instructions for specific kinds of tasks. \
              When a task matches a skill's description, read its file with read_file before starting \
-             and follow it; paths it mentions are relative to the skill's folder.",
-        );
+             and follow it; paths it mentions are relative to the skill's folder."
+            .to_string();
         for skill in skills {
-            prompt.push_str(&format!(
+            text.push_str(&format!(
                 "\n- {}: {} ({})",
                 skill.name,
                 skill.description,
                 skill.path.display()
             ));
         }
+        sections.push(("skills", text));
     }
     if let Some(summary) = summary {
-        prompt.push_str("\n\n");
-        prompt.push_str(&compact::prompt_section(summary));
+        sections.push(("summary", compact::prompt_section(summary)));
     }
     if mode == MODE_PLAN {
-        prompt.push_str(
-            "\n\nPlan mode is active: only read-only tools are available. \
+        let mut text = "Plan mode is active: only read-only tools are available. \
              Investigate, then present a concrete step-by-step plan for the user to approve. \
-             Do not attempt to modify anything.",
-        );
+             Do not attempt to modify anything."
+            .to_string();
         if agent.is_none() {
-            prompt.push_str(
+            text.push_str(
                 " When the change touches parts of the codebase you have not seen yet, map them \
                  first with `explore` subagents (in parallel when they are independent) and build \
                  the plan on their findings.",
             );
         }
+        sections.push(("plan", text));
     }
     if mode == MODE_AUTO {
-        prompt.push_str(
-            "\n\nAutomatic mode is active: a safety classifier reviews every action that changes \
+        sections.push((
+            "auto",
+            "Automatic mode is active: a safety classifier reviews every action that changes \
              something, instead of the user approving it. It blocks actions that go beyond what the \
              user asked for and anything irreversible, and it does not see your explanations or the \
              contents of tool results, so it judges each action on its own. When it blocks a call, \
              the reason comes back in the tool result: do not retry the same thing in another form. \
-             Either take a clearly safer route, or use `ask_user` to have the user decide.",
-        );
+             Either take a clearly safer route, or use `ask_user` to have the user decide."
+                .to_string(),
+        ));
     }
-    prompt
+    sections
 }
 
 /// 聊天会话的系统提示词：通用助手 + 用户的「聊天说明」+ 全局记忆。
@@ -2744,6 +2782,8 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             }
             specs
         };
+        // 工具分层（见 `tools::exposure`）：骨架阶段 `exposure` 全是 `Direct`，原样返回
+        let specs = tools::for_model(specs, &inner.loaded_tools(session));
         let mut text = String::new();
         // 会话级档位覆盖档案里的那份；没覆盖时直接用构造好的 provider
         let provider: &dyn ChatProvider = match thinking {
@@ -3222,5 +3262,67 @@ impl Kernel for BuiltinKernel {
         }
         self.inner.mcp.stop();
         bgtasks::unregister(self.inner.kernel_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 骨架阶段的分节重构必须逐字节等于原来的拼法：节之间用空行连起来，每节自身不带
+    /// 前导 / 尾随空行，所以拼回去不会多出或吃掉空行（见 `prompt_sections`）。
+    #[test]
+    fn prompt_sections_join_back_into_the_prompt() {
+        let cwd = Path::new("/tmp/proj");
+        let empty = || Context {
+            instructions: &[],
+            skills: &[],
+            memory_project: &[],
+            memory_global: &[],
+        };
+        let sections = prompt_sections(cwd, MODE_DEFAULT, false, None, None, empty());
+        assert_eq!(sections.len(), 1, "没有背景材料时只有 preamble");
+        assert_eq!(sections[0].0, "preamble");
+        assert!(sections[0].1.contains("Working directory: /tmp/proj"));
+        // 节名唯一（阶段 2 按名字算差异，重名会互相覆盖）
+        let names: std::collections::HashSet<_> = sections.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names.len(), sections.len());
+        assert_eq!(
+            system_prompt(cwd, MODE_DEFAULT, false, None, None, empty()),
+            sections.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n\n")
+        );
+    }
+
+    /// 模式、续接、技能、摘要各自多出一节，顺序固定（越稳定的越靠前）。
+    #[test]
+    fn prompt_sections_grow_in_a_stable_order() {
+        let cwd = Path::new("/tmp/proj");
+        let instructions = vec![instructions::Instruction {
+            path: PathBuf::from("/tmp/proj/AGENTS.md"),
+            text: "用中文".into(),
+        }];
+        let skills = vec![Skill {
+            name: "demo".into(),
+            description: "说明".into(),
+            path: PathBuf::from("/tmp/proj/skills/demo"),
+        }];
+        let ctx = Context {
+            instructions: &instructions,
+            skills: &skills,
+            memory_project: &[],
+            memory_global: &[],
+        };
+        let sections = prompt_sections(cwd, MODE_PLAN, true, Some("## 摘要"), None, ctx);
+        let names: Vec<_> = sections.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            ["preamble", "restored", "project", "skills", "summary", "plan"],
+            "节的顺序就是缓存前缀的顺序，改顺序等于让所有会话的缓存失效一次"
+        );
+        // 每节自身不带空行，拼起来才不会出现三个空行
+        for (name, text) in &sections {
+            assert!(!text.starts_with('\n'), "{name} 以空行开头");
+            assert!(!text.ends_with('\n'), "{name} 以空行结尾");
+        }
     }
 }

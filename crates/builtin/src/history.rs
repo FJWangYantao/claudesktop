@@ -81,6 +81,9 @@ pub struct Rebuilt {
     pub user_messages: Vec<String>,
     /// 最后一次的待办清单（回退掉的不算；压缩前写的也算）
     pub todos: Vec<PlanEntryView>,
+    /// 内核通过 `tool_search` 额外声明给模型的工具（见 `Record::ToolLoadout`）。
+    /// 骨架阶段恒为空；阶段 2 填上之后，续接的会话才不会丢掉加载过的工具。
+    pub loaded_tools: Vec<String>,
 }
 
 /// 日志 → 对话历史。
@@ -91,6 +94,7 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
     let mut summary = None;
     let mut user_messages = Vec::new();
     let mut todos = Vec::new();
+    let mut loaded_tools: Vec<String> = Vec::new();
     // 提问的 id → 问了什么（`QuestionAnswered` 只记选了几号，摘要要回到这里拿）
     let mut questions: std::collections::HashMap<u64, Vec<QuestionView>> = Default::default();
     let mut assistant = Assistant::default();
@@ -200,10 +204,18 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
             | Record::Thought { .. }
             | Record::FileChanged { .. }
             | Record::Rewind { .. } => {}
+            // 工具加载状态不产生消息，只交回给内核（续接时模型手里的工具要和日志一致）
+            Record::ToolLoadout { names } => {
+                for name in names {
+                    if !loaded_tools.contains(name) {
+                        loaded_tools.push(name.clone());
+                    }
+                }
+            }
         }
     }
     messages.extend(assistant.take());
-    Rebuilt { summary, messages: trim(messages), user_messages, todos }
+    Rebuilt { summary, messages: trim(messages), user_messages, todos, loaded_tools }
 }
 
 /// 超出上限时从最早的轮次丢，并保证从一条用户消息开始。

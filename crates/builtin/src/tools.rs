@@ -37,8 +37,9 @@ pub const MEMORY_FORGET: &str = "memory_forget";
 pub const MEMORY_SEARCH_MAX: usize = 12;
 /// 待办清单最多几项
 const TODO_MAX: usize = 50;
-/// 清单里还有没做完的项、连续这么多步没更新时，提醒模型一次
-pub const TODO_REMIND_STEPS: u32 = 8;
+/// 清单里还有没做完的项、连续这么多步没更新时，提醒模型一次。
+/// 原来取 8，太密（一个五项的活至少多出五六次调用），按「方案-内核提速.md」阶段 1 提到 15。
+pub const TODO_REMIND_STEPS: u32 = 15;
 /// 压缩摘要末尾附的清单的标题（再压缩时先去掉，免得旧清单被抄进新摘要）
 const TODO_SECTION: &str = "\n\n## Todo list at the time of compaction\n";
 
@@ -221,6 +222,46 @@ impl ToolOutput {
     }
 }
 
+/// 工具对模型的暴露档位（「方案-内核提速.md」阶段 2）。
+///
+/// `Direct` 每次请求都声明；`Deferred` 不声明，模型得先用 `tool_search` 把它找出来。
+/// **骨架阶段全部 `Direct`，行为不变**；阶段 2 再填表，`for_model` 是唯一的开关点。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Exposure {
+    Direct,
+    Deferred,
+}
+
+/// 哪些工具默认不声明给模型，要先用 `tool_search` 找出来（「方案-内核提速.md」阶段 2）。
+/// **骨架阶段是空的**（全部 `Direct`，行为不变）；阶段 2 往这里添名字就行。
+const DEFERRED: &[&str] = &[];
+
+/// 工具名 → 暴露档位。阶段 2 把不常用的工具改成 `Deferred` 就改 [`DEFERRED`]，
+/// 别在调用处散着写。
+pub fn exposure(name: &str) -> Exposure {
+    if DEFERRED.contains(&name) { Exposure::Deferred } else { Exposure::Direct }
+}
+
+/// 按 exposure 筛掉这次请求不该声明的工具定义。`loaded` 是本会话已经通过 `tool_search`
+/// 加载的名字（`SessionState::loaded_tools`）。骨架阶段 `exposure` 全是 `Direct`，原样返回。
+pub fn for_model(specs: Vec<Value>, loaded: &[String]) -> Vec<Value> {
+    if specs.iter().all(|spec| exposure(spec_name(spec)) == Exposure::Direct) {
+        return specs;
+    }
+    specs
+        .into_iter()
+        .filter(|spec| {
+            let name = spec_name(spec);
+            exposure(name) == Exposure::Direct || loaded.iter().any(|loaded| loaded == name)
+        })
+        .collect()
+}
+
+/// 一份工具定义里的名字（`{"function": {"name": ..}}`）。
+fn spec_name(spec: &Value) -> &str {
+    spec["function"]["name"].as_str().unwrap_or_default()
+}
+
 /// 发给 provider 的工具定义（OpenAI `tools`）；`writable = false`（Plan 模式）只给只读工具。
 pub fn specs(writable: bool) -> Vec<Value> {
     let f = |name: &str, description: String, parameters: Value| {
@@ -273,13 +314,14 @@ pub fn specs(writable: bool) -> Vec<Value> {
         f(
             TODO_WRITE,
             "Create or update the task list for the current work; the user sees it as a checklist. \
-             Use it for tasks with three or more steps: write the whole list up front, then call it again \
-             as you go. Mark an item completed as soon as it is done (do not batch several completions), \
-             and mark the next one in_progress before starting it; keep exactly one item in_progress while \
-             working. Add items you discover along the way and remove ones that no longer apply. \
+             Use it only for work that is clearly multi-step and will take several tool-calling rounds \
+             (a migration, a feature across files, a long investigation); skip it for anything you can \
+             finish in one or two steps. Write the whole list up front, then call it again when the \
+             picture changes. Mark items completed as soon as they are done — batching several \
+             completions into one call is fine — and keep at most one item in_progress. Add items you \
+             discover along the way and remove ones that no longer apply. \
              Always send the complete list (it replaces the previous one); an empty list clears it. \
-             Before your final reply, make sure the list matches what was actually done. \
-             Do not use it for simple one-step requests."
+             Before your final reply, make sure the list matches what was actually done."
                 .into(),
             json!({
                 "type": "object",
