@@ -428,6 +428,9 @@ pub struct Settings {
     pub sidebar_by_date: bool,
     /// 侧栏里折叠起来的组（`SessionGroup::key`：`dir:<工作目录>` 或 `date:<日期组名>`），点组名切换后写回
     pub sidebar_folded: Vec<String>,
+    /// 侧栏会话的人工顺序（会话 ID，按先后的显示顺序）：在侧栏里上下拖动会话排出来的。
+    /// 不在这里的会话排在排过的后面（各自保持原来的先后）。「按最近活动排列」时不套用
+    pub sidebar_order: Vec<String>,
     /// 启用了的插件（按插件名）；插件目录里新放进来的不在这里 = 停用，在设置页「插件」里打开
     pub plugins_enabled: Vec<String>,
     /// 自研内核一轮里最多请求模型的次数（工具循环上限，默认 200）；
@@ -578,6 +581,7 @@ impl Default for Settings {
             workspace: None,
             sidebar_by_date: false,
             sidebar_folded: Vec::new(),
+            sidebar_order: Vec::new(),
             plugins_enabled: Vec::new(),
             max_steps: claudesktop_builtin::DEFAULT_MAX_STEPS,
             usage_gateway: yes(),
