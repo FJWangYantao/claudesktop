@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Out = (Join-Path $PSScriptRoot "shot.png"),
     [int]$X = -1,
     [int]$Y = -1,
