@@ -267,7 +267,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   和 `Session::apply_event`（重放时怎么显示）三处。读日志一律先过 `claudesktop_core::effective`（折算回退）。
 - **magpie 网关**（`crates/builtin/src/magpie.rs`，「设计说明-本机agent.md」第十四、十五节）：把本机订阅/key
   汇成 `http://127.0.0.1:<port>/v1` 的 Anthropic 端点，自研内核当普通档案用（`settings.rs` 的 `magpie_profile`，
-  `ProviderProfile.magpie` 标记自动建的）。「内核与模型」页是**统一清单**（自研内核经 magpie + ACP agent + 演示），
+  `ProviderProfile.magpie` 标记自动建的）。「内核与模型」页是**本机内核清单**（对齐 magpie 的 Agents 页）：
+  检测到的 agent 列出、开关即接入；默认内核只有「演示回放」显式选，其余走自动（`Settings::kernel`）；
   手填档案在「自定义端点」折叠区。启动引导（`ChatApp::magpie_bootstrap`）：探活 `/api/hello`（用户自己开的直接复用，
   端口读它 settings.json 的 `port`）→ 自动建档案 + 拉 `/v1/models`；当前档案是 magpie 而网关没跑、sidecar 已下载 →
   `auto_start_magpie_if_active` 顺手起 serve（`magpie serve`，进程挂 `ChatApp::magpie_child`，job object 之外的显式兜底）。

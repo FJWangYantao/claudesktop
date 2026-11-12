@@ -75,16 +75,6 @@ impl KernelChoice {
         matches!(self, Self::Demo)
     }
 
-    /// 是不是同一种内核（ACP 的不比档案 ID：「默认内核」三选一只分自研 / agent / 演示）。
-    pub fn same_kind(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Builtin, Self::Builtin)
-                | (Self::Demo, Self::Demo)
-                | (Self::Acp(_), Self::Acp(_))
-        )
-    }
-
     pub fn label(&self, acp: &AcpSettings) -> String {
         match self {
             Self::Builtin => "自研内核".into(),

@@ -965,8 +965,9 @@ impl ChatApp {
             None => {}
         }
         s.acp.agents = agents;
-        // 三选一只选了「本机 agent」没选档案：落第一个启用的档案（一家都没启用就在保存时拦下来）
-        s.kernel = Some(s.kernel_for(&f.kernel));
+        // 默认内核只有「演示回放」是显式选的（清单里那个开关）；其余走自动：
+        // magpie 网关在跑用自研内核，否则第一个启用的 agent（见 `Settings::kernel`）
+        s.kernel = (f.kernel == KernelChoice::Demo).then_some(KernelChoice::Demo);
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
         s.auto_mode.enabled = f.auto_enabled;
         s.auto_mode.use_session_model = f.auto_follow;
@@ -1948,13 +1949,15 @@ impl ChatApp {
         }
     }
 
-    /// 「本机内核」统一清单：自研内核（模型经 magpie 网关）+ 本机 agent + 演示回放。
-    /// 全部自动检测，点一下就能用；端点 / Key 那套手填的在下面「自定义」折叠区。
+    /// 「本机内核」清单（对齐 magpie 的 Agents 页）：本机检测到的 agent 直接列出来，
+    /// 开关即接入；自研内核的模型经 magpie 网关；演示回放开关即默认。不选手填那套，
+    /// 它在下面「自定义」折叠区。
     fn render_kernel_list(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let mut list = choice_panel();
 
-        // 自研内核：状态行 = magpie 网关状态（探活 / 下载 / 启动都走 MagpieForm）
+        // magpie 网关行：自研内核的模型来源。状态行 + 按需动作（没装 → 下载并启动；没跑 → 启动）。
+        // 这一行不是开关：网关起了、档案配好了，新会话自动走自研内核（见 `Settings::kernel`）。
         let m = &f.magpie;
         let exe_installed = claudesktop_core::default_data_dir()
             .ok()
@@ -1969,7 +1972,6 @@ impl ChatApp {
         } else if m.starting {
             "正在启动网关…".into()
         } else if let Some(version) = &m.running {
-            // 模型数跟着 magpie 档案走（启动时自动拉过）
             let models = f.profiles.iter().find(|p| p.magpie).map_or(0, |p| p.models.len());
             if models > 0 {
                 format!("网关运行中 · {version} · {models} 个模型").into()
@@ -1977,13 +1979,12 @@ impl ChatApp {
                 format!("网关运行中 · {version}").into()
             }
         } else if exe_installed {
-            "已下载，网关没在运行".into()
+            "已下载，没在运行".into()
         } else if m.probed {
-            "本机没有 magpie".into()
+            "未安装".into()
         } else {
             "正在检测…".into()
         };
-        // 动作按钮（点它不触发行点击）：没装 → 下载并启动；装了没跑 → 启动；失败 → 重试
         let action: Option<(&'static str, &'static str)> = if m.downloading.is_some() || m.starting
         {
             None
@@ -2007,33 +2008,14 @@ impl ChatApp {
                 }))
                 .into_any_element()
         });
-        list = list.child(
-            choice_row(
-                "kernel-builtin",
-                IconAll::Cpu,
-                "自研内核 · 经 magpie 网关",
-                status,
-                f.kernel.same_kind(&KernelChoice::Builtin),
-                trailing,
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.settings_form.kernel = KernelChoice::Builtin;
-                this.settings_form.message = None;
-                // 尽量自动：选了自研内核、网关装了没跑，就顺手起 serve
-                if this.settings_form.magpie.running.is_none()
-                    && !this.settings_form.magpie.starting
-                    && this.settings_form.magpie.downloading.is_none()
-                    && let Ok(dir) = claudesktop_core::default_data_dir()
-                {
-                    let exe = claudesktop_builtin::magpie::installed_path(&dir);
-                    if exe.is_file() {
-                        this.start_magpie(&exe, cx);
-                    }
-                }
-                cx.notify();
-            })),
-        );
-        // 条款风险提示常驻（不收进 ⓘ）
+        list = list.child(choice_row(
+            "kernel-magpie",
+            IconAll::Cpu,
+            "自研内核 · 经 magpie 网关",
+            status,
+            false,
+            trailing,
+        ));
         list = list.child(
             div()
                 .px_3()
@@ -2046,53 +2028,85 @@ impl ChatApp {
                 ),
         );
 
-        // 本机 agent：每家一行，点一下 = 启用并设为默认
+        // 本机 agent：检测到的直接列出，开关即接入（启用 = 出现在输入框的内核菜单里）
         for preset in claudesktop_core::agents::PRESETS {
             let enabled = f.agents.iter().any(|a| a.id == preset.id);
-            let is_default = matches!(&f.kernel, KernelChoice::Acp(id) if id == preset.id);
             let detect = match &f.agent_detect {
                 AgentDetect::Idle | AgentDetect::Running => None,
                 AgentDetect::Done(found) => found.iter().find(|d| d.preset.id == preset.id),
             };
-            // 行的说明：装没装 / 版本；「没找到」只说明探测没找到，仍可手动启用
+            // 没装 / 版本不对：给「如何安装 / 如何升级」小按钮（复制命令到剪贴板）；
+            // 装好的：开关接入。检测中只显示说明。
+            let trailing: Option<AnyElement> = match detect {
+                Some(d) if d.state == claudesktop_core::agents::DetectState::Ready => Some(
+                    Switch::new(format!("agent-sw-{}", preset.id))
+                        .checked(enabled)
+                        .color(rgb(CORAL))
+                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                            if *checked {
+                                if !this.settings_form.agents.iter().any(|a| a.id == preset.id) {
+                                    this.settings_form
+                                        .agents
+                                        .push(AgentProfile::from_preset(preset));
+                                }
+                            } else {
+                                this.settings_form.agents.retain(|a| a.id != preset.id);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                ),
+                Some(d) => {
+                    let hint = d.preset.install_hint.to_string();
+                    let label = d.fix_label();
+                    Some(
+                        Self::text_button(format!("agent-fix-{}", preset.id), label, false)
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    hint.clone(),
+                                ));
+                                this.toast(Notification::success("安装命令已复制"), cx);
+                            }))
+                            .into_any_element(),
+                    )
+                }
+                None if matches!(f.agent_detect, AgentDetect::Done(_)) => {
+                    let hint = preset.install_hint.to_string();
+                    Some(
+                        Self::text_button(
+                            format!("agent-install-{}", preset.id),
+                            "如何安装",
+                            false,
+                        )
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(hint.clone()));
+                            this.toast(Notification::success("安装命令已复制"), cx);
+                        }))
+                        .into_any_element(),
+                    )
+                }
+                None => None,
+            };
+            // 行的说明：装没装 / 版本
             let desc: String = match detect {
                 Some(d) => d.summary(),
                 None => match &f.agent_detect {
                     AgentDetect::Idle | AgentDetect::Running => "检测中…".into(),
-                    AgentDetect::Done(_) => "本机没找到（可手动启用）".into(),
+                    AgentDetect::Done(_) => "未安装".into(),
                 },
             };
-            // 已启用但不是默认：右边给个「停用」小按钮（默认中的行不能再停）
-            let trailing = (enabled && !is_default).then(|| {
-                Self::text_button(format!("agent-off-{}", preset.id), "停用", false)
-                    .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.settings_form.agents.retain(|a| a.id != preset.id);
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            });
-            list = list.child(
-                choice_row(
-                    format!("agent-{}", preset.id),
-                    IconAll::SquareTerminal,
-                    preset.name,
-                    desc,
-                    is_default,
-                    trailing,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    // 点一下 = 启用并设为默认
-                    if !this.settings_form.agents.iter().any(|a| a.id == preset.id) {
-                        this.settings_form.agents.push(AgentProfile::from_preset(preset));
-                    }
-                    this.settings_form.kernel = KernelChoice::Acp(preset.id.to_string());
-                    this.settings_form.message = None;
-                    cx.notify();
-                })),
-            );
-            // 风险提示常驻在这一行下面（条款风险不收进 ⓘ）
+            list = list.child(choice_row(
+                format!("agent-{}", preset.id),
+                IconAll::SquareTerminal,
+                preset.name,
+                desc,
+                false,
+                trailing,
+            ));
             if let Some(risk) = preset.risk {
                 list = list.child(
                     div().px_3().pb_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk),
@@ -2100,22 +2114,25 @@ impl ChatApp {
             }
         }
 
-        // 演示回放
-        list = list.child(
-            choice_row(
-                "kernel-demo",
-                IconAll::Play,
-                "演示回放",
-                "不连模型，播放界面演示",
-                f.kernel.same_kind(&KernelChoice::Demo),
-                None,
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.settings_form.kernel = KernelChoice::Demo;
+        // 演示回放：开关 = 新会话默认进演示（关掉回自动）
+        let demo_on = matches!(f.kernel, KernelChoice::Demo);
+        let demo_switch = Switch::new("kernel-demo-sw")
+            .checked(demo_on)
+            .color(rgb(CORAL))
+            .on_change(cx.listener(|this, on: &bool, _, cx| {
+                this.settings_form.kernel =
+                    if *on { KernelChoice::Demo } else { KernelChoice::Builtin };
                 this.settings_form.message = None;
                 cx.notify();
-            })),
-        );
+            }));
+        list = list.child(choice_row(
+            "kernel-demo",
+            IconAll::Play,
+            "演示回放",
+            "不连模型，播放界面演示",
+            demo_on,
+            Some(demo_switch.into_any_element()),
+        ));
 
         let detect_note = match &f.agent_detect {
             AgentDetect::Idle | AgentDetect::Running => Some(
@@ -2129,7 +2146,7 @@ impl ChatApp {
         let body = div().v_flex().gap_4().child(list).children(detect_note);
         section(
             "本机内核",
-            "自动检测，点一下就能用；模型和订阅在 magpie / agent 那边，这里不用填端点",
+            "检测到的直接列出来，开关即接入；新会话默认走 magpie 网关（在跑的话），否则第一个启用的 agent",
             None,
             body,
         )
