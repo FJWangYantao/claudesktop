@@ -224,6 +224,10 @@ pub struct ChatApp {
     /// 每个空间上次看的是哪个会话（[0] 代码 / [1] 聊天；按 `Session::token` 记，
     /// 删会话不会错位）。切空间时回到它，见 `ChatApp::switch_space`
     last_active: [Option<u64>; 2],
+    /// magpie 网关 sidecar（设置页「magpie 网关」启动的 `magpie serve`）。
+    /// Windows 上退出有 `kill_children_on_exit` 的 job object 兜底，这里再显式收一次，
+    /// 其他平台的进程守卫是空操作，全靠这里
+    magpie_child: Option<std::process::Child>,
 }
 
 /// 一种内核的运行状态。
@@ -255,6 +259,10 @@ impl Drop for ChatApp {
             if let Some(kernel) = &slot.1.kernel {
                 kernel.shutdown();
             }
+        }
+        if let Some(mut child) = self.magpie_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -533,6 +541,7 @@ impl ChatApp {
             suggestion: suggest::SuggestionState::default(),
             next_suggestion: suggest::NextSuggestion::default(),
             last_active: [None, None],
+            magpie_child: None,
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
         cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))

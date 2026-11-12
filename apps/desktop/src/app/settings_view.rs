@@ -28,6 +28,21 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::HashSet;
 
+/// 设置页里 magpie 网关的状态（探测 / 下载 / 启动各是一个后台任务，见「设计说明-本机agent.md」第十四节）。
+#[derive(Default)]
+pub(super) struct MagpieForm {
+    /// 探过了没（后台探活回来置 true；`false` 时状态行显示「正在检测…」）
+    probed: bool,
+    /// 网关在跑时的版本号（谁起的都一样：用户自己开的 magpie 也直接复用）
+    running: Option<String>,
+    /// 正在下载（已收字节 / 总字节）
+    downloading: Option<(u64, u64)>,
+    /// 正在启动（`serve` 起来后探活确认，最多等十几秒）
+    starting: bool,
+    /// 下载 / 启动失败的一句话（能照着做的）
+    error: Option<String>,
+}
+
 /// 本机 agent 检测的状态：进设置页后台跑一次（要起子进程探版本）。
 #[derive(Default)]
 enum AgentDetect {
@@ -158,6 +173,8 @@ pub struct SettingsForm {
     pub(super) content_w: MeasuredWidth,
     /// 上次「获取列表」的结果，显示在模型那一栏下面：(失败了吗, 给人看的话, 服务商的原文)
     fetch_result: Option<(bool, SharedString, Option<SharedString>)>,
+    /// magpie 网关的探测 / 下载 / 启动状态
+    magpie: MagpieForm,
 }
 
 impl SettingsForm {
@@ -225,6 +242,7 @@ impl SettingsForm {
             open_help: HashSet::new(),
             content_w: MeasuredWidth::default(),
             fetch_result: None,
+            magpie: MagpieForm::default(),
         }
     }
 
@@ -381,6 +399,13 @@ impl ChatApp {
         if tab == KERNEL_TAB && matches!(self.settings_form.agent_detect, AgentDetect::Idle) {
             self.detect_agents(cx);
         }
+        // magpie 网关也探一次（纯本地 HTTP，很便宜；下载 / 启动进行中不打扰）
+        if tab == KERNEL_TAB
+            && self.settings_form.magpie.downloading.is_none()
+            && !self.settings_form.magpie.starting
+        {
+            self.probe_magpie(cx);
+        }
         cx.notify();
     }
 
@@ -401,6 +426,159 @@ impl ChatApp {
             })
         })
         .detach();
+    }
+
+    /// 探一遍 magpie 网关：在跑（不管是我们起的还是用户自己开的）就记下版本。
+    /// 进「内核与模型」时和每个动作之后都会跑。
+    fn probe_magpie(&mut self, cx: &mut Context<Self>) {
+        self.settings_form.magpie.probed = false;
+        self.settings_form.magpie.running = None;
+        let port = claudesktop_builtin::magpie::gateway_port();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { claudesktop_builtin::magpie::probe(port) })
+                .await;
+            this.update(cx, |this, cx| {
+                let magpie = &mut this.settings_form.magpie;
+                magpie.probed = true;
+                magpie.running = found;
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    /// 下载 magpie CLI（约 75 MB，后台线程）并启动网关。已下载过就直接启动。
+    fn setup_magpie(&mut self, cx: &mut Context<Self>) {
+        let data_dir = claudesktop_core::default_data_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("claudesktop-magpie"));
+        let exe = claudesktop_builtin::magpie::installed_path(&data_dir);
+        if exe.is_file() {
+            self.start_magpie(&exe, cx);
+            return;
+        }
+        self.settings_form.magpie.downloading = Some((0, 0));
+        self.settings_form.magpie.error = None;
+        // 下载线程拿走一份，下载完回来还要拿同一路径去启动
+        let exe_for_start = exe.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let release = claudesktop_builtin::magpie::latest_release()?;
+                    claudesktop_builtin::magpie::download(&release, &exe, &mut |_, _| {}, &|| {
+                        false
+                    })?;
+                    Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.settings_form.magpie.downloading = None;
+                match result {
+                    Ok(()) => this.start_magpie(&exe_for_start, cx),
+                    Err(err) => {
+                        this.settings_form.magpie.error = Some(magpie_net_hint(&err));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 启动 sidecar（已在跑的网关它会让位复用），起来后探活确认。
+    fn start_magpie(&mut self, exe: &std::path::Path, cx: &mut Context<Self>) {
+        self.settings_form.magpie.starting = true;
+        self.settings_form.magpie.error = None;
+        let exe = exe.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let port = claudesktop_builtin::magpie::gateway_port();
+            let spawned = cx
+                .background_executor()
+                .spawn(async move { claudesktop_builtin::magpie::spawn(&exe) })
+                .await;
+            let child = match spawned {
+                Ok(child) => child,
+                Err(err) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.settings_form.magpie.starting = false;
+                        this.settings_form.magpie.probed = true;
+                        this.settings_form.magpie.error = Some(format!("magpie 没能启动：{err}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            // 挂到 ChatApp 上：应用退出时连带收掉（其他平台的进程守卫是空操作）
+            let _ = this.update(cx, |this, _| {
+                this.magpie_child = Some(child);
+            });
+            // serve 起监听要几秒：探到 /api/hello 应答为止，最多等 15 秒
+            let mut ok = None;
+            for _ in 0..15 {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                if let Some(version) = cx
+                    .background_executor()
+                    .spawn(async move { claudesktop_builtin::magpie::probe(port) })
+                    .await
+                {
+                    ok = Some(version);
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                let magpie = &mut this.settings_form.magpie;
+                magpie.starting = false;
+                magpie.probed = true;
+                match ok {
+                    Some(version) => {
+                        magpie.running = Some(version);
+                        this.toast(
+                            Notification::success("magpie 网关已就绪，点「添加为档案」使用"),
+                            cx,
+                        );
+                    }
+                    None => {
+                        magpie.error =
+                            Some("网关没有应答：试试在终端里手动跑 `magpie serve` 看报错".into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 把 magpie 网关加成一套服务商档案（已有一套就不重复加，只切过去）。
+    fn add_magpie_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let profile = magpie_profile(claudesktop_builtin::magpie::gateway_port());
+        if let Some(at) =
+            self.settings_form.profiles.iter().position(|p| p.base_url == profile.base_url)
+        {
+            self.settings_form.active = at;
+            cx.notify();
+            return;
+        }
+        // 选中的那套还什么都没填（首次配置时补的空档案）就直接换掉它，不留一套空的
+        let inputs = ProfileInputs::new(window, cx, &profile);
+        let f = &mut self.settings_form;
+        let blank = f.current().is_some_and(|(_, i)| {
+            [&i.name, &i.base_url, &i.api_key, &i.model]
+                .iter()
+                .all(|input| value(input, cx).is_empty())
+        });
+        if blank {
+            f.profiles[f.active] = profile;
+            f.inputs[f.active] = inputs;
+        } else {
+            f.inputs.push(inputs);
+            f.profiles.push(profile);
+            f.active = f.profiles.len() - 1;
+        }
+        f.message = None;
+        f.fetch_result = None;
+        cx.notify();
     }
 
     /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
@@ -1685,6 +1863,7 @@ impl ChatApp {
         match f.kernel {
             KernelChoice::Builtin => body
                 .child(self.render_providers(window, cx))
+                .child(self.render_magpie(cx))
                 .child(self.render_auto_mode(window, cx))
                 .child(self.render_suggest(cx))
                 .child(self.render_memory_options(cx))
@@ -2274,6 +2453,99 @@ impl ChatApp {
         ))
     }
 
+    /// 「magpie 网关」（见「设计说明-本机agent.md」第十四节）：把本机的订阅和 key 汇成
+    /// 一个本地端点，自研内核当普通 Anthropic 服务用。状态行 + 按需下载 / 启动 / 添加为档案；
+    /// 订阅经第三方网关的条款风险常驻提示（风险提示不收进 ⓘ）。
+    fn render_magpie(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form.magpie;
+        // 已下载过（状态行按它区分「没装」和「装了没跑」）
+        let exe_installed = claudesktop_core::default_data_dir()
+            .ok()
+            .map(|d| claudesktop_builtin::magpie::installed_path(&d))
+            .is_some_and(|p| p.is_file());
+        let mut error = false;
+        let status: SharedString = if let Some((done, total)) = f.downloading {
+            format!("正在下载… {} / {} MB", done >> 20, total.max(1) >> 20).into()
+        } else if let Some(err) = &f.error {
+            error = true;
+            err.clone().into()
+        } else if f.starting {
+            "正在启动网关…".into()
+        } else if let Some(version) = &f.running {
+            format!("网关运行中 · {version}").into()
+        } else if exe_installed {
+            "已下载，网关没在运行".into()
+        } else if f.probed {
+            "本机没有 magpie".into()
+        } else {
+            "正在检测…".into()
+        };
+        let status_line = div()
+            .text_size(TEXT_SMALL)
+            .text_color(rgb(if error { RED } else { INK_SOFT }))
+            .child(status);
+        // 动作按钮：没装 → 下载并启动；装了没跑 → 启动；在跑 → 添加为档案（加过就切过去）
+        let mut buttons = div().h_flex().items_center().gap_2().flex_none();
+        if f.downloading.is_none() && !f.starting {
+            if f.error.is_some() {
+                buttons = buttons.child(
+                    Self::text_button("magpie-retry", "重试", false)
+                        .on_click(cx.listener(|this, _, _, cx| this.setup_magpie(cx))),
+                );
+            } else if f.running.is_some() {
+                let base =
+                    format!("http://127.0.0.1:{}/v1", claudesktop_builtin::magpie::gateway_port());
+                let added = self.settings_form.profiles.iter().any(|p| p.base_url == base);
+                buttons = buttons.child(
+                    Self::text_button(
+                        "magpie-add",
+                        if added { "去档案里选模型" } else { "添加为档案" },
+                        true,
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.add_magpie_profile(window, cx)),
+                    ),
+                );
+            } else if exe_installed {
+                buttons = buttons.child(Self::text_button("magpie-start", "启动", true).on_click(
+                    cx.listener(|this, _, _, cx| match claudesktop_core::default_data_dir() {
+                        Ok(dir) => {
+                            let exe = claudesktop_builtin::magpie::installed_path(&dir);
+                            this.start_magpie(&exe, cx);
+                        }
+                        Err(_) => {
+                            this.settings_form.magpie.error = Some("找不到数据目录".into());
+                        }
+                    }),
+                ));
+            } else if f.probed {
+                buttons = buttons.child(
+                    Self::text_button("magpie-setup", "下载并启动（约 75 MB）", true)
+                        .on_click(cx.listener(|this, _, _, cx| this.setup_magpie(cx))),
+                );
+            }
+        }
+        let body = div()
+            .v_flex()
+            .gap_3()
+            .child(setting_row_with(
+                "网关",
+                "订阅和 key 在 magpie 自己的界面里配置，这里只管启动和接入",
+                status_line,
+                buttons,
+            ))
+            .child(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(
+                "风险：订阅账号经 magpie（第三方网关）使用可能违反各家条款；\
+                         magpie 会读取各 agent 的登录信息，claudesktop 自己不碰凭据",
+            ));
+        section(
+            "magpie 网关",
+            "把本机的订阅和 key 汇成一个本地端点，自研内核当普通 Anthropic 端点用",
+            None,
+            body,
+        )
+    }
+
     /// ACP agent：本机装了哪些（后台检测的），每行一个开关；下面是自定义 agent 的命令。
     /// 登录和模型在 agent 那边设置；保存后每条启用的档案各起一个内核进程。
     fn render_acp(&self, cx: &mut Context<Self>) -> Div {
@@ -2649,6 +2921,16 @@ claude-sonnet-4   $3      $15     $0.3
 fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     rest.split('/').next().unwrap_or(rest)
+}
+
+/// magpie 下载 / 查询失败转成能照着做的话（GitHub 直连慢是最常见原因，本机实测约 70 KB/s）。
+fn magpie_net_hint(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    if text.contains("github") || text.contains("timed out") || text.contains("超时") {
+        format!("{text}；GitHub 直连很慢时给系统设代理环境变量（如 HTTPS_PROXY）后重试")
+    } else {
+        text
+    }
 }
 
 /// 「添加」菜单：常用服务预设 + 自定义。

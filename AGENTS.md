@@ -265,6 +265,11 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 本文件会整份进自研内核的系统提示词（`crates/builtin/src/instructions.rs`，每次请求都带），新增内容保持精炼。
 - 新增要进日志的 `KernelEvent` 时，同时想清楚 `Record::worth_keeping`、`history::rebuild`（续接时进不进上下文）
   和 `Session::apply_event`（重放时怎么显示）三处。读日志一律先过 `claudesktop_core::effective`（折算回退）。
+- **magpie 网关**（`crates/builtin/src/magpie.rs` + 设置页「内核与模型」的「magpie 网关」分区，见
+  「设计说明-本机agent.md」第十四节）：把本机订阅/key 汇成 `http://127.0.0.1:<port>/v1` 的 Anthropic 端点，
+  自研内核当普通档案用（`settings.rs` 的 `magpie_profile`）。探活 `/api/hello`（用户自己开的 magpie 直接复用，
+  端口读它 settings.json 的 `port`）；下载走 GitHub release（哈希校验、产物地址和 SHA256SUMS 必须同一次 API 应答里拿）；
+  `magpie serve` 起来后进程挂 `ChatApp::magpie_child`（job object 之外的显式兜底）。凭据读取全部发生在 magpie 里，我们不碰。
 - MCP 客户端在 `crates/builtin/src/mcp.rs`（配置是数据目录的 `mcp.json`，格式同 Claude Code 的 `.mcp.json`；
   本地命令走 stdio，远程的 Streamable HTTP / 旧版 SSE 在 `mcp_http.rs`；连上过又断了的自动退避重连）；工具以 `mcp__服务器__工具` 交给模型、走 `Action::Mcp` 和正常的权限流程，
   状态经 `KernelEvent::McpStatus` 到设置页「MCP」（`app/mcp_view.rs`）。改 MCP 用 `tools/mock-mcp-server.mjs` 测（`--http` / `--sse` 起远程模式，测试在 `tests/mcp.rs`）。

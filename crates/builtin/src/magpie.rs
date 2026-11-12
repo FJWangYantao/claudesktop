@@ -68,7 +68,8 @@ fn port_in_text(text: &str) -> Option<u16> {
 
 /// 探活：网关在跑且真是 magpie 时返回它的版本号。1 秒连不上就当没在跑。
 pub fn probe(port: u16) -> Option<String> {
-    let agent = probe_agent();    let url = format!("http://127.0.0.1:{port}/api/hello");
+    let agent = probe_agent();
+    let url = format!("http://127.0.0.1:{port}/api/hello");
     let response = agent.get(&url).call().ok()?;
     let text = response.into_body().read_to_string().ok()?;
     parse_hello(&text)
@@ -106,9 +107,8 @@ fn api_agent() -> ureq::Agent {
 
 /// sidecar 落盘位置：数据目录 `magpie/<可执行名>`（和 sessions、mcp.json 同一层）。
 pub fn installed_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("magpie").join(
-        if cfg!(windows) { "magpie.exe".to_string() } else { "magpie".to_string() },
-    )
+    let name = if cfg!(windows) { "magpie.exe" } else { "magpie" };
+    data_dir.join("magpie").join(name)
 }
 
 /// 已下载的 magpie 的版本号：跑一次 `--version`（3 秒超时、不弹窗口）。
@@ -122,11 +122,7 @@ pub fn installed_version(exe: &Path) -> Option<String> {
 /// 一次要被杀掉前拦住的子进程：stdin 关掉（不问交互问题），不弹窗口。
 fn run_quiet(exe: &Path, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
     let mut command = Command::new(exe);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -180,8 +176,7 @@ fn parse_release_meta(api: &str, asset: &str) -> Option<(String, String, u64, St
     let value: Value = serde_json::from_str(api).ok()?;
     let tag = value.get("tag_name")?.as_str()?.trim().to_string();
     let assets = value.get("assets")?.as_array()?;
-    let entry =
-        assets.iter().find(|a| a.get("name").and_then(Value::as_str) == Some(asset))?;
+    let entry = assets.iter().find(|a| a.get("name").and_then(Value::as_str) == Some(asset))?;
     let url = entry.get("browser_download_url")?.as_str()?.to_string();
     let size = entry.get("size")?.as_u64()?;
     let sums_url = assets
@@ -197,10 +192,12 @@ fn parse_release_meta(api: &str, asset: &str) -> Option<(String, String, u64, St
 fn sha_from_sums(sums: &str, asset: &str) -> Option<String> {
     for line in sums.lines() {
         let mut parts = line.split_whitespace();
-        if let (Some(hash), Some(name)) = (parts.next(), parts.next()) {
-            if name == asset && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(hash.to_ascii_lowercase());
-            }
+        if let (Some(hash), Some(name)) = (parts.next(), parts.next())
+            && name == asset
+            && hash.len() == 64
+            && hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
         }
     }
     None
@@ -218,10 +215,7 @@ pub fn download(
         std::fs::create_dir_all(parent)?;
     }
     let tmp = to.with_extension("download");
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
     let response = agent
         .get(&release.url)
         .call()
@@ -302,10 +296,7 @@ pub fn spawn(exe: &Path) -> std::io::Result<std::process::Child> {
 }
 
 fn get_text(agent: &ureq::Agent, url: &str) -> anyhow::Result<String> {
-    let response = agent
-        .get(url)
-        .call()
-        .map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
+    let response = agent.get(url).call().map_err(|e| anyhow::anyhow!("请求 {url} 失败: {e}"))?;
     let status = response.status().as_u16();
     let text = response.into_body().read_to_string().unwrap_or_default();
     if !(200..300).contains(&status) {
@@ -321,8 +312,10 @@ mod tests {
     /// magpie 官方文档里写明的应答形状
     #[test]
     fn parses_hello() {
-        assert_eq!(parse_hello(r#"{"name":"magpie","version":"v0.1.3866"}"#).as_deref(),
-            Some("v0.1.3866"));
+        assert_eq!(
+            parse_hello(r#"{"name":"magpie","version":"v0.1.3866"}"#).as_deref(),
+            Some("v0.1.3866")
+        );
         assert_eq!(parse_hello(r#"{"name":"magpie"}"#), None);
         // 端口被别家占了：name 对不上不算
         assert_eq!(parse_hello(r#"{"name":"other","version":"1"}"#), None);
@@ -408,10 +401,15 @@ f3145fe6 0x6ec74cdd7022cb930bdad7f30b78f87c0d947126911cdf185f18  magpie-cli-darw
         let _ = std::fs::remove_dir_all(&dir);
         let to = installed_path(&dir);
         let mut last = 0u64;
-        download(&release, &to, &mut |done, total| {
-            assert!(done <= total);
-            last = total;
-        }, &|| false)
+        download(
+            &release,
+            &to,
+            &mut |done, total| {
+                assert!(done <= total);
+                last = total;
+            },
+            &|| false,
+        )
         .expect("下载并校验");
         assert_eq!(last, release.size);
         assert!(to.is_file());

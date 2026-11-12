@@ -247,10 +247,46 @@ pub struct AgentProfile {
 
 先做 1 → 2 → 3 → 4：已经登录过的用户一键就能用、能切模型；登录流程第 5 步再补。每步单独提交。
 
-## 十三、参考
+## 十四、magpie 网关（sidecar，2026-11-12 定稿）
+
+「读订阅凭据、任意 agent 配任意模型」这两件事不自己写（第十一节的原则不变），改由
+[magpie](https://github.com/yetone/magpie)（MIT，Go）承担：它读凭据、改配置、在本地起一个
+OpenAI / Anthropic / Gemini 三协议直通的网关；**我们把它当一个普通 Anthropic 端点用**
+（官方集成文档 `docs/integrating.md` 明确支持，等级 1，对 magpie 零改动）。条款风险用户已
+拍板接受（订阅经第三方网关可能违反各家条款），界面上常驻一句提示。
+
+要点：
+
+- **接入零改内核**：provider 档案 = `http://127.0.0.1:<port>/v1` + key `magpie-claudesktop`
+  （`settings.rs` 的 `magpie_profile`）。magpie 按 key 把用量记到 claudesktop 名下；
+  模型列表走它的 `/v1/models`（`data[].id`，和 OpenAI 同形，现有 `list_models` 直接能读）。
+- **sidecar 管理**（`crates/builtin/src/magpie.rs`）：
+  - 探活 `GET /api/hello`（`name == "magpie"` 才算）；端口从 magpie 自己的
+    `~/.config/magpie/settings.json` 读 `port`，只读不写，默认 3425。
+    **用户自己开的 magpie 直接复用**（它自己会让位：另一个实例 serve 时新起的会等它停）。
+  - 下载：GitHub release 的 CLI 二进制（按平台选产物，约 75 MB），落数据目录 `magpie/`；
+    `latest_release()` 把产物地址、大小、SHA256SUMS **都从同一次 release API 应答里拿**——
+    magpie 一天多版，分开走 `/latest/download/` 会在两次请求间撞上换版、校验和对不上。
+    下载流式校验 SHA256，先写 `.download` 再原子改名；ureq 3 默认吃 `HTTPS_PROXY` 等环境变量，
+    本机 GitHub 直连约 70 KB/s，慢时提示设代理。
+  - 启动：`magpie serve`，`CREATE_NO_WINDOW`、stdin 关掉；进程不持有句柄——
+    Windows 上 `kill_children_on_exit` 的 job object 兜底，另在 `ChatApp::magpie_child`
+    挂一份显式 kill（其他平台的进程守卫是空操作，全靠这份）。
+- **设置页**：「内核与模型」自研内核分支新增「magpie 网关」分区（`render_magpie`），
+  状态行（正在检测 / 本机没有 / 已下载没跑 / 网关运行中 · 版本）+ 按需动作
+  （下载并启动 / 启动 / 添加为档案 / 重试）；进页面时探活一次，下载 / 启动进行中不打扰。
+  「添加为档案」把档案推进服务商表单（复用空档案替换逻辑），模型列表让用户点「获取」拉。
+- **不做**：不读 magpie 的任何凭据文件（settings.json 也只读 `port` 一个数字）；
+  不替用户在 magpie 里配 provider（那是它自己界面的事）；不经我们的用量网关二次转发
+  （magpie 自己有用量页，需求出现再说）。
+- **跟版**：release 版本极快（一天数版），sidecar 固定在「下载时的最新」，不自动升级；
+  想升级删掉数据目录 `magpie/` 重下。沙箱 / 权限模式下用户自己决定装不装。
+
+## 十五、参考
 
 - OpenCode ACP：<https://opencode.ai/docs/acp>
 - pi 的 ACP 适配器：<https://github.com/DxTa/pi-acp>、<https://docs.rs/pi-acpinator>
 - Anthropic 第三方订阅认证：<https://alternativeto.net/news/2026/2/anthropic-officially-bans-using-subscription-authentication-for-third-party-claude-use>
 - Google 封停借用 Antigravity OAuth 的账号：<https://venturebeat.com/ai/google-clamps-down-on-antigravity-malicious-usage-cutting-off-openclaw-users>
 - ACP 登录方式与配置项：`agent-client-protocol-schema` 1.11 的 `AuthMethod`、`SetSessionConfigOptionRequest`、`ConfigOptionUpdate`
+- magpie 集成文档（网关端点、key 记账、`/v1/models` 形状）：<https://github.com/yetone/magpie/blob/main/docs/integrating.md>
