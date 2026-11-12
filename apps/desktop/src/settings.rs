@@ -1179,9 +1179,15 @@ impl BuiltinSettings {
         &self.current().models
     }
 
-    /// 进输入框 / 命令面板菜单的模型（清单里关掉的除外）。
-    pub fn menu_models(&self) -> Vec<&String> {
-        self.current().menu_models()
+    /// 输入框模型菜单 / 命令面板的全量清单：所有来源勾选的模型（`menu_hidden` 之外的）
+    /// 按来源顺序摊平，每项带供应商档案下标——挑了别家来源的模型据此切过去
+    /// （见 `ChatApp::choose_model_from`）。
+    pub fn menu_flat(&self) -> Vec<(usize, String)> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| p.menu_models().into_iter().cloned().map(move |m| (i, m)))
+            .collect()
     }
 
     pub fn context_window(&self, model: &str) -> Option<u64> {
@@ -1222,6 +1228,34 @@ mod tests {
         .unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::Dark, ViewMode::Verbose));
         assert!(!s.sidebar_kernel_status);
+    }
+
+    /// 跨来源模型清单：所有档案勾选的模型都进 `menu_flat`，每项带档案下标；
+    /// `menu_hidden` 关掉的跳过；同 ID 模型在不同来源各算一项（挑哪个切哪个）。
+    #[core::prelude::v1::test]
+    fn menu_flat_spans_all_profiles() {
+        let profile = |models: &[&str], hidden: &[&str]| ProviderProfile {
+            models: models.iter().map(|s| s.to_string()).collect(),
+            menu_hidden: hidden.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let b = BuiltinSettings {
+            profiles: vec![
+                profile(&["mag-a", "mag-off", "shared"], &["mag-off"]),
+                profile(&["custom-a", "shared"], &[]),
+            ],
+            active: 0,
+        };
+        assert_eq!(
+            b.menu_flat(),
+            vec![
+                (0, "mag-a".to_string()),
+                (0, "shared".to_string()),
+                (1, "custom-a".to_string()),
+                (1, "shared".to_string()),
+            ]
+        );
+        assert_eq!(b.profiles[0].menu_models(), vec!["mag-a", "shared"]);
     }
 
     /// 配色：旧设置文件读出默认的暖纸，写盘回读一致。

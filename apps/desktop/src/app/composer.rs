@@ -1311,9 +1311,59 @@ fn model_menu_items(
     if !builtin {
         return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
     }
-    // 只列在「模型」页勾选进菜单的（没勾选的留在清单里，不进这个下拉）
-    let models = app.settings.builtin.menu_models();
-    if models.is_empty() {
+    // 所有来源的模型都列出来（在「设置 · 模型」里勾掉的不进），按来源分组；
+    // 挑别家来源的模型会自动切到那家（端点跟着换，见 `choose_model_from`）。
+    let multi = app.settings.builtin.profiles.len() > 1;
+    let mut any = false;
+    let current = app.session().model_label.clone();
+    for (pi, p) in app.settings.builtin.profiles.iter().enumerate() {
+        let models = p.menu_models();
+        if models.is_empty() {
+            continue;
+        }
+        any = true;
+        if multi {
+            menu = menu.child(
+                div()
+                    .px_2p5()
+                    .pt_2()
+                    .pb_0p5()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child(p.display_name().to_string()),
+            );
+        }
+        for (i, model) in models.iter().enumerate() {
+            let active = current.as_ref() == model.as_str();
+            let m = (*model).clone();
+            menu = menu.pick(
+                div()
+                    .id(("model-item", pi * 10000 + i))
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2p5()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(HOVER)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(TEXT_BODY)
+                            .font_family(MONO)
+                            .text_color(rgb(INK))
+                            .child(m.clone()),
+                    )
+                    .when(active, |d| {
+                        d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
+                    }),
+                move |this, cx| this.choose_model_from(pi, m.clone(), cx),
+            );
+        }
+    }
+    if !any {
         menu = menu.child(hint(if app.fetching_models {
             "正在获取模型列表…".into()
         } else if app.settings.builtin.models().is_empty() {
@@ -1321,36 +1371,6 @@ fn model_menu_items(
         } else {
             "模型都在「设置 · 模型」里关着，去勾几个进来".into()
         }));
-    }
-    let current = app.session().model_label.clone();
-    for (i, model) in models.iter().enumerate() {
-        let active = current.as_ref() == model.as_str();
-        let m = (*model).clone();
-        menu = menu.pick(
-            div()
-                .id(("model-item", i))
-                .h_flex()
-                .items_center()
-                .gap_2()
-                .px_2p5()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(HOVER)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(TEXT_BODY)
-                        .font_family(MONO)
-                        .text_color(rgb(INK))
-                        .child(m.clone()),
-                )
-                .when(active, |d| {
-                    d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                }),
-            move |this, cx| this.choose_model(m.clone(), cx),
-        );
     }
     let handle = handle.clone();
     menu.child(

@@ -270,7 +270,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `ProviderProfile.magpie` 标记自动建的）。「设置 · 内核」页是**本机内核清单**（对齐 magpie 的 Agents 页）：
   检测到的 agent 列出、开关即接入；默认内核只有「演示回放」显式选，其余走自动（`Settings::kernel`）。
   「设置 · 模型」页是模型来源清单（magpie 网关 + 各套档案）+ 模型清单（开关决定进不进
-  输入框菜单 `ProviderProfile.menu_hidden`、点名字设默认），手填档案在页底「服务商」。启动引导（`ChatApp::magpie_bootstrap`）：探活 `/api/hello`（用户自己开的直接复用，
+  输入框菜单 `ProviderProfile.menu_hidden`、点名字设默认），手填档案在页底「服务商」；
+  点来源行只是查看管理——**所有来源的模型在输入框菜单都能挑**（按来源分组，挑别家的自动
+  切过去 `choose_model_from` = 改 `builtin.active` + 重启自研内核），「内核」页的供应商
+  单选只管默认走哪套端点。启动引导（`ChatApp::magpie_bootstrap`）：探活 `/api/hello`（用户自己开的直接复用，
   端口读它 settings.json 的 `port`）→ 自动建档案 + 拉 `/v1/models`；当前档案是 magpie 而网关没跑、sidecar 已下载 →
   `auto_start_magpie_if_active` 顺手起 serve（`magpie serve`，进程挂 `ChatApp::magpie_child`，job object 之外的显式兜底）。
   下载走 GitHub release（哈希校验；产物地址和 SHA256SUMS 必须同一次 API 应答里拿）。凭据读取全部发生在 magpie 里，我们不碰。

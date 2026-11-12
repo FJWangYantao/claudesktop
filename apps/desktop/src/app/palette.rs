@@ -54,7 +54,8 @@ enum PaletteCmd {
     /// 配色
     Theme(ThemeChoice),
     Mode(usize),
-    Model(String),
+    /// 挑模型（供应商档案下标, 模型 ID；挑别家的会切到那家，见 `choose_model_from`）
+    Model(usize, String),
 }
 
 /// 一条命令的显示内容。
@@ -289,17 +290,18 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         })
         .collect();
 
-    // 只有自研内核能在这里换模型（别的内核由 agent 自己决定）
+    // 只有自研内核能在这里换模型（别的内核由 agent 自己决定）；所有来源的模型都列
     let models = if s.kernel == KernelChoice::Builtin {
         let current = s.model_label.clone();
         app.settings
             .builtin
-            .menu_models()
+            .menu_flat()
             .into_iter()
-            .map(|m| {
-                Entry::new(IconAll::Cpu, m.clone(), PaletteCmd::Model(m.clone()))
+            .map(|(pi, m)| {
+                let checked = current.as_ref() == m.as_str();
+                Entry::new(IconAll::Cpu, m.clone(), PaletteCmd::Model(pi, m))
                     .mono()
-                    .checked(current.as_ref() == m.as_str())
+                    .checked(checked)
             })
             .collect()
     } else {
@@ -429,7 +431,7 @@ impl ChatApp {
             PaletteCmd::View(mode) => self.set_view_mode(mode, cx),
             PaletteCmd::Theme(theme) => self.set_theme(theme, cx),
             PaletteCmd::Mode(i) => self.choose_mode(i, cx),
-            PaletteCmd::Model(model) => self.choose_model(model, cx),
+            PaletteCmd::Model(pi, model) => self.choose_model_from(pi, model, cx),
         }
         self.restore_focus(window, cx);
         cx.notify();

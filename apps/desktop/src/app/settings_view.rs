@@ -115,8 +115,10 @@ pub struct SettingsForm {
     kernel: KernelChoice,
     /// 编辑中的档案列表（保存才生效）
     profiles: Vec<ProviderProfile>,
-    /// 正在编辑第几套
+    /// 自研内核当前在用哪套（「内核」页的供应商单选；保存写进 `Settings.builtin.active`）
     active: usize,
+    /// 「模型」页正在查看 / 编辑哪套（不跟在用的那套走）
+    view: usize,
     /// 每套档案的输入框
     inputs: Vec<ProfileInputs>,
     /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核 / 3 模型 / 4 权限 / 5 MCP / 6 插件 / 7 用量页 / 8 记忆）
@@ -218,6 +220,7 @@ impl SettingsForm {
             kernel: KernelChoice::Builtin,
             profiles: Vec::new(),
             active: 0,
+            view: 0,
             inputs: Vec::new(),
             tab: 0,
             agents: Vec::new(),
@@ -254,10 +257,10 @@ impl SettingsForm {
         }
     }
 
-    /// 正在编辑的档案（没有时给空档案占位）。
+    /// 正在查看 / 编辑的档案（没有时给空档案占位）。
     fn current(&self) -> Option<(&ProviderProfile, &ProfileInputs)> {
-        let p = self.profiles.get(self.active)?;
-        let i = self.inputs.get(self.active)?;
+        let p = self.profiles.get(self.view)?;
+        let i = self.inputs.get(self.view)?;
         Some((p, i))
     }
 }
@@ -376,6 +379,7 @@ impl ChatApp {
             profiles.push(ProviderProfile::default());
         }
         self.settings_form.active = s.builtin.active.min(profiles.len() - 1);
+        self.settings_form.view = self.settings_form.active;
         self.settings_form.inputs =
             profiles.iter().map(|p| ProfileInputs::new(window, cx, p)).collect();
         self.settings_form.profiles = profiles;
@@ -1259,10 +1263,10 @@ impl ChatApp {
 
     // ---------- 档案编辑（表单内） ----------
 
-    /// 表单里切到第 `i` 套档案。
+    /// 「模型」页切到第 `i` 套来源（只改正在查看的，不改在用的）。
     fn select_form_profile(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         if i < self.settings_form.profiles.len() {
-            self.settings_form.active = i;
+            self.settings_form.view = i;
             self.settings_form.fetch_result = None;
             // 搜索词是上一个来源的，别带过来
             self.settings_form
@@ -1283,11 +1287,16 @@ impl ChatApp {
         let f = &mut self.settings_form;
         if len == 0 {
             f.active = 0;
+            f.view = 0;
         } else {
             if i < f.active {
                 f.active -= 1;
             }
+            if i < f.view {
+                f.view -= 1;
+            }
             f.active = f.active.min(len - 1);
+            f.view = f.view.min(len - 1);
         }
         cx.notify();
     }
@@ -1314,21 +1323,22 @@ impl ChatApp {
                 .all(|input| value(input, cx).is_empty())
         });
         if blank {
-            f.profiles[f.active] = p;
-            f.inputs[f.active] = inputs;
+            f.profiles[f.view] = p;
+            f.inputs[f.view] = inputs;
         } else {
             f.inputs.push(inputs);
             f.profiles.push(p);
-            f.active = f.profiles.len() - 1;
+            // 新档案只是加进来，不切成在用；切过去是「内核」页供应商单选的事
+            f.view = f.profiles.len() - 1;
         }
         f.message = None;
         f.fetch_result = None;
         cx.notify();
     }
 
-    /// 表单里切当前档案的协议。
+    /// 表单里切正在查看那套档案的协议。
     fn set_form_protocol(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
-        if let Some(p) = self.settings_form.profiles.get_mut(self.settings_form.active) {
+        if let Some(p) = self.settings_form.profiles.get_mut(self.settings_form.view) {
             p.protocol = protocol;
             cx.notify();
         }
@@ -1375,11 +1385,11 @@ impl ChatApp {
         let from_form = why == Fetch::Form;
         let mut config = if from_form {
             let f = &self.settings_form;
-            let Some(inputs) = f.inputs.get(f.active) else {
+            let Some(inputs) = f.inputs.get(f.view) else {
                 return;
             };
             ProviderConfig {
-                protocol: f.profiles.get(f.active).map_or(Protocol::OpenAiCompat, |p| p.protocol),
+                protocol: f.profiles.get(f.view).map_or(Protocol::OpenAiCompat, |p| p.protocol),
                 base_url: value(&inputs.base_url, cx),
                 api_key: Some(value(&inputs.api_key, cx)).filter(|k| !k.is_empty()),
                 model: String::new(),
@@ -1398,7 +1408,7 @@ impl ChatApp {
             }
             return;
         }
-        let form_active = if from_form { Some(self.settings_form.active) } else { None };
+        let form_active = if from_form { Some(self.settings_form.view) } else { None };
         self.fetching_models = true;
         cx.notify();
         let base_url = config.base_url.clone();
@@ -1754,7 +1764,7 @@ impl ChatApp {
         let Some((base_url, key)) = antigravity_gateway() else {
             return;
         };
-        let i = self.settings_form.active;
+        let i = self.settings_form.view;
         let Some(inputs) = self.settings_form.inputs.get(i) else {
             return;
         };
@@ -1769,6 +1779,25 @@ impl ChatApp {
     }
 
     /// 在模型下拉里选了一个：当前会话立即切换（还没建立的会话等 Started），并记为默认。
+    /// 从指定供应商档案挑模型（输入框模型菜单跨来源挑）：不是当前在用的那套就先切过去
+    /// （自研内核带着新端点重启，进行中的对话下次发消息自动续接），再记模型。
+    pub(crate) fn choose_model_from(
+        &mut self,
+        profile: usize,
+        model: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.builtin.profiles.get(profile).is_some()
+            && profile != self.settings.builtin.active
+        {
+            self.update_settings(|s| {
+                s.builtin.active = profile.min(s.builtin.profiles.len().saturating_sub(1))
+            });
+            self.restart_kernel(&KernelChoice::Builtin, cx);
+        }
+        self.choose_model(model, cx);
+    }
+
     pub(crate) fn choose_model(&mut self, model: String, cx: &mut Context<Self>) {
         // 记住上次用的模型：自研内核记在当前 provider 档案，agent 记在它的档案上
         // （新会话 Started 后按它切过去，见 `Session::apply_event` 的 Started 分支）
@@ -1999,6 +2028,7 @@ impl ChatApp {
             .child(self.render_advanced(window, cx));
         match f.kernel {
             KernelChoice::Builtin => body
+                .child(self.render_suppliers(cx))
                 .child(self.render_auto_mode(window, cx))
                 .child(self.render_suggest(cx))
                 .child(self.render_memory_options(cx))
@@ -2027,6 +2057,45 @@ impl ChatApp {
             // 自研内核以外的分区与内核无关（agent 的模型在它那边，演示没有模型）
             KernelChoice::Acp(_) | KernelChoice::Demo => body,
         }
+    }
+
+    /// 「内核」页的自研内核供应商单选：在用哪套端点（保存写进 `Settings.builtin.active`，
+    /// 自研内核重启后用它发请求）。这不限制模型——所有来源的模型在输入框菜单里都能挑，
+    /// 挑了别家的会自动切到那家（见 `choose_model_from`）。
+    fn render_suppliers(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let mut list = choice_panel();
+        // 和「模型」页一致的排序：magpie 网关注册的档案排最前
+        let mut order: Vec<usize> = (0..f.profiles.len()).collect();
+        order.sort_by_key(|&i| (!f.profiles[i].magpie, i));
+        for i in order {
+            let p = &f.profiles[i];
+            let host = host_of(&value(&f.inputs[i].base_url, cx)).to_string();
+            let model = value(&f.inputs[i].model, cx);
+            let title: SharedString =
+                if p.magpie { "magpie 网关".into() } else { p.display_name().to_string().into() };
+            let desc: SharedString = if host.is_empty() {
+                "还没填端点地址".into()
+            } else if model.is_empty() {
+                host.into()
+            } else {
+                format!("{host} · 默认 {model}").into()
+            };
+            list = list.child(
+                choice_row(("supplier", i), IconAll::Server, title, desc, i == f.active, None)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_form.active = i;
+                        this.settings_form.message = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        section(
+            "供应商",
+            "自研内核的模型经哪套端点发；只管默认，输入框里所有来源的模型都能直接挑",
+            None,
+            list,
+        )
     }
 
     /// 「本机内核」清单（对齐 magpie 的 Agents 页）：本机检测到的 agent 直接列出来，
@@ -2541,6 +2610,8 @@ impl ChatApp {
     }
 
     /// 来源清单：一行一个来源（magpie 网关注册的档案排最前），点选切到下面的模型清单。
+    /// 不挑「在用」——所有来源的模型都可用；在用哪套是「内核」页供应商单选的事，
+    /// 这里只给在用的那行标一句。
     fn render_model_sources(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let mut list = choice_panel();
@@ -2549,7 +2620,10 @@ impl ChatApp {
         order.sort_by_key(|&i| (!f.profiles[i].magpie, i));
         for i in order {
             let p = &f.profiles[i];
-            let active = i == f.active;
+            let active = i == f.view;
+            let mark_in_use = |desc: String| -> SharedString {
+                if i == f.active { format!("在用 · {desc}").into() } else { desc.into() }
+            };
             let (icon, title, desc, trailing): (
                 IconAll,
                 SharedString,
@@ -2581,7 +2655,7 @@ impl ChatApp {
                         }))
                         .into_any_element()
                 });
-                (IconAll::Cpu, "magpie 网关".into(), desc, trailing)
+                (IconAll::Cpu, "magpie 网关".into(), mark_in_use(desc.to_string()), trailing)
             } else {
                 let host = host_of(&value(&f.inputs[i].base_url, cx)).to_string();
                 let n = p.models.len();
@@ -2592,7 +2666,7 @@ impl ChatApp {
                 } else {
                     host
                 };
-                (IconAll::Server, p.display_name().to_string().into(), desc.into(), None)
+                (IconAll::Server, p.display_name().to_string().into(), mark_in_use(desc), None)
             };
             list = list.child(
                 choice_row(("model-source", i), icon, title, desc, active, trailing).on_click(
@@ -2601,7 +2675,12 @@ impl ChatApp {
             );
         }
         let body = div().v_flex().gap_4().child(list).child(self.render_model_list(window, cx));
-        section("模型来源", "模型从各来源自动获取；点一个来源，在下面管理它的模型", None, body)
+        section(
+            "模型来源",
+            "所有来源的模型都能在输入框直接挑；点一行管理它的模型和端点",
+            None,
+            body,
+        )
     }
 
     /// 选中来源的模型清单：搜索过滤；每个模型的开关决定它进不进输入框菜单；
@@ -2609,7 +2688,7 @@ impl ChatApp {
     fn render_model_list(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let Some((p, inputs)) = f.current() else { return div() };
-        let i = f.active;
+        let i = f.view;
         let fetch_label: &'static str = if p.models.is_empty() { "获取列表" } else { "刷新" };
         let header = div()
             .h_flex()
@@ -2732,7 +2811,7 @@ impl ChatApp {
 
     /// 「模型」页来源行的刷新：magpie 网关重拉 /v1/models，手填档案走「获取列表」。
     fn refresh_source_models(&mut self, i: usize, cx: &mut Context<Self>) {
-        self.settings_form.active = i;
+        self.settings_form.view = i;
         let is_magpie = self.settings_form.profiles.get(i).is_some_and(|p| p.magpie);
         if !is_magpie {
             self.fetch_models(true, cx);
@@ -2794,16 +2873,20 @@ impl ChatApp {
 
         let mut list = choice_panel();
         for (i, inputs) in f.inputs.iter().enumerate() {
-            let active = i == f.active;
+            // 高亮 = 正在查看的这套（点行只是切到它改 Key / 挑模型，不改成在用）
+            let active = i == f.view;
             let name = value(&inputs.name, cx);
             let base_url = value(&inputs.base_url, cx);
             let model = value(&inputs.model, cx);
-            let title = if name.is_empty() { format!("服务商 {}", i + 1) } else { name };
+            let mut title = if name.is_empty() { format!("服务商 {}", i + 1) } else { name };
             let desc = match (host_of(&base_url), model.is_empty()) {
                 ("", _) => "还没填端点地址".to_string(),
                 (host, true) => host.to_string(),
                 (host, false) => format!("{host} · {model}"),
             };
+            if i == f.active {
+                title = format!("{title}（在用）");
+            }
             // 删除只给选中的那行（先选中再删，不会误点）
             let remove = active.then(|| {
                 Self::quiet_button(("profile-remove", i), IconAll::Trash, Surface::Paper, cx)
@@ -2840,7 +2923,7 @@ impl ChatApp {
         if let Some((p, inputs)) = f.current() {
             body = body.child(self.render_profile_editor(p, inputs, window, cx));
         }
-        section("服务商", "选中的那套在用", Some(add), body)
+        section("服务商", "加端点、改 Key；所有来源的模型都能在输入框直接挑", Some(add), body)
     }
 
     /// 选中那套档案的表单：名称、协议、端点、Key、默认模型。
@@ -2962,8 +3045,7 @@ impl ChatApp {
             options,
             active,
             |this, level: Option<ThinkingLevel>, _, cx| {
-                if let Some(profile) =
-                    this.settings_form.profiles.get_mut(this.settings_form.active)
+                if let Some(profile) = this.settings_form.profiles.get_mut(this.settings_form.view)
                 {
                     profile.params.thinking = level;
                     this.settings_form.message = None;
@@ -3023,7 +3105,7 @@ impl ChatApp {
                             cx.listener(move |this, checked: &bool, _, cx| {
                                 let checked = *checked;
                                 if let Some(profile) =
-                                    this.settings_form.profiles.get_mut(this.settings_form.active)
+                                    this.settings_form.profiles.get_mut(this.settings_form.view)
                                 {
                                     let list = &mut profile.params.server_tools;
                                     list.retain(|s| s != name);
