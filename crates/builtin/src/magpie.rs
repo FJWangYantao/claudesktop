@@ -388,7 +388,19 @@ f3145fe6 0x6ec74cdd7022cb930bdad7f30b78f87c0d947126911cdf185f18  magpie-cli-darw
         }
     }
 
-    /// 实机联测（联网下载约 75 MB）：查最新 release → 下载 → 校验 → 读版本号。
+    /// 实机探活：对正在跑的本地网关 probe 一次（配了 HTTP(S)_PROXY 的环境也要能秒回，
+    /// 本机环回地址不走代理）。`cargo test -p claudesktop-builtin magpie -- --ignored`
+    #[test]
+    #[ignore = "实机，要本地有 magpie 网关"]
+    fn probes_local_gateway() {
+        let port = gateway_port();
+        eprintln!("gateway_port() = {port}");
+        let version = probe(port);
+        eprintln!("probe({port}) = {version:?}");
+        assert!(version.is_some(), "本地网关没在跑？");
+    }
+
+    /// 实机联测（联网，下载约 75 MB）：查最新 release → 下载 → 校验 → 读版本号。
     /// `cargo test -p claudesktop-builtin magpie -- --ignored`
     #[test]
     #[ignore = "联网，下载约 75 MB"]

@@ -439,12 +439,12 @@ impl ChatApp {
                 .background_executor()
                 .spawn(async move { claudesktop_builtin::magpie::probe(port) })
                 .await;
-            this.update(cx, |this, cx| {
+            let _ = this.update(cx, |this, cx| {
                 let magpie = &mut this.settings_form.magpie;
                 magpie.probed = true;
                 magpie.running = found;
                 cx.notify();
-            })
+            });
         })
         .detach();
     }
@@ -2721,6 +2721,19 @@ impl ChatApp {
                             }
                             this.settings_form.tab = i;
                             this.settings_form.message = None;
+                            // 「内核与模型」的探活挂在这里：设置已开着时切分类不走
+                            // `open_settings_at`，不补这趟就一直停在「正在检测…」
+                            if i == KERNEL_TAB
+                                && matches!(this.settings_form.agent_detect, AgentDetect::Idle)
+                            {
+                                this.detect_agents(cx);
+                            }
+                            if i == KERNEL_TAB
+                                && this.settings_form.magpie.downloading.is_none()
+                                && !this.settings_form.magpie.starting
+                            {
+                                this.probe_magpie(cx);
+                            }
                             // 「记忆」每次进来都重读文件（内核 / 手改都可能动过它）
                             if i == super::memory_view::MEMORY_TAB {
                                 this.reload_memory_view();
