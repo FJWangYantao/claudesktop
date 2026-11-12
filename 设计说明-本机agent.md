@@ -282,7 +282,27 @@ OpenAI / Anthropic / Gemini 三协议直通的网关；**我们把它当一个�
 - **跟版**：release 版本极快（一天数版），sidecar 固定在「下载时的最新」，不自动升级；
   想升级删掉数据目录 `magpie/` 重下。沙箱 / 权限模式下用户自己决定装不装。
 
-## 十五、参考
+## 十五、「内核与模型」页改版为统一清单（2026-11-12）
+
+页面从「档案编辑器」改成**本机内核清单**（`render_kernel_list`）：自研内核（模型经 magpie
+网关）+ 各家 ACP agent + 演示回放，全部自动检测，点一下即启用 / 设为默认。端点 / Key /
+协议那排手填表单收进页底「自定义端点与 agent 选项」折叠区（`render_advanced`，
+disclosure key `kernel-advanced`），已有档案照常能改能删，不占主路径。
+
+自动化（`magpie_bootstrap`，`ChatApp::new` 末尾调一次）：
+
+- 启动探活网关（本地 HTTP，毫秒级）：探到就自动建 magpie 档案（`ProviderProfile.magpie`
+  标记来源；之前什么都没配好就把它设为当前档案），并拉 `/v1/models` 填模型下拉——
+  不用再手动点「获取列表」。
+- 网关没跑、当前档案是 magpie、sidecar 已下载 → 顺手起 serve
+  （`auto_start_magpie_if_active`；保存设置把 magpie 存成当前档案后也会跑一次；
+  清单行点「自研内核」同样会起）。
+- 用户自己开的 magpie 直接复用（探活即认，不重复起进程）。
+
+sidecar 细节不变（第十四节）：探活 `/api/hello`、下载校验、进程回收。
+「下载并启动」按钮在清单行的状态里（没装才出现）。
+
+## 十六、参考
 
 - OpenCode ACP：<https://opencode.ai/docs/acp>
 - pi 的 ACP 适配器：<https://github.com/DxTa/pi-acp>、<https://docs.rs/pi-acpinator>

@@ -158,6 +158,10 @@ pub struct ProviderProfile {
     pub context_windows: BTreeMap<String, u64>,
     /// 透传参数（温度 / 最大 token / 额外 JSON 字段）
     pub params: RequestParams,
+    /// 这套是 magpie 网关自动建的（`magpie_profile`）：模型列表由网关自动喂，
+    /// 和手填档案区分开（列表里标来源、折叠区里好认）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub magpie: bool,
 }
 
 impl ProviderProfile {
@@ -275,6 +279,7 @@ pub fn magpie_profile(port: u16) -> ProviderProfile {
         base_url: format!("http://127.0.0.1:{port}/v1"),
         api_key: claudesktop_builtin::magpie::GATEWAY_KEY.into(),
         model: String::new(),
+        magpie: true,
         ..Default::default()
     }
 }
@@ -1147,6 +1152,7 @@ impl BuiltinSettings {
                 server_tools: Vec::new(),
                 extra: serde_json::Value::Null,
             },
+            magpie: false,
         };
         self.profiles.get(self.active).unwrap_or(&EMPTY)
     }

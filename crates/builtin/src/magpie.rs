@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::provider::{ModelInfo, parse_model_list};
+
 /// 自研内核连网关用的 key：`magpie-<应用名>`，magpie 按它把用量记到我们名下。
 pub const GATEWAY_KEY: &str = "magpie-claudesktop";
 /// 网关默认端口；magpie 的 `settings.json` 里写了别的就按那份。
@@ -73,6 +75,20 @@ pub fn probe(port: u16) -> Option<String> {
     let response = agent.get(&url).call().ok()?;
     let text = response.into_body().read_to_string().ok()?;
     parse_hello(&text)
+}
+
+/// 拉网关的模型目录（`GET /v1/models` → `data[]`，OpenAI / Anthropic 同形）。
+/// 这是自研内核 magpie 档案的模型来源：探到网关就自动拉，不用手点「获取列表」。
+pub fn models(port: u16) -> anyhow::Result<Vec<ModelInfo>> {
+    let agent = probe_agent();
+    let text = get_text(&agent, &format!("http://127.0.0.1:{port}/v1/models"))?;
+    parse_models(&text)
+}
+
+/// `/v1/models` 的应答 → 模型条目（复用 provider 的解析，窗口字段各家都认）。
+fn parse_models(text: &str) -> anyhow::Result<Vec<ModelInfo>> {
+    let value: Value = serde_json::from_str(text)?;
+    Ok(parse_model_list(value.get("data").and_then(Value::as_array).map_or(&[], Vec::as_slice)))
 }
 
 /// `/api/hello` 的应答 → 版本号；`name` 不是 `magpie` 的不算（端口被别家占了）。
@@ -320,6 +336,23 @@ mod tests {
         // 端口被别家占了：name 对不上不算
         assert_eq!(parse_hello(r#"{"name":"other","version":"1"}"#), None);
         assert_eq!(parse_hello("not json"), None);
+    }
+
+    /// `/v1/models` 的应答 → 模型条目（带上下文窗口）
+    #[test]
+    fn parses_model_catalog() {
+        let text = r#"{"data": [
+            {"id": "deepseek/deepseek-v4-pro", "context_window": 128000},
+            {"id": "auto/claude-opus-4-6", "context_window": 200000},
+            {"id": "no-window-model"},
+            {"no_id": true}
+        ]}"#;
+        let models = parse_models(text).unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "deepseek/deepseek-v4-pro");
+        assert_eq!(models[0].context_window, Some(128000));
+        assert_eq!(models[1].context_window, Some(200000));
+        assert_eq!(models[2].context_window, None);
     }
 
     #[test]

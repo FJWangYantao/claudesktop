@@ -589,6 +589,8 @@ impl ChatApp {
                 app.repair_worktree(idx, cx);
             }
         }
+        // magpie 网关引导：探活 → 自动建档案 / 拉模型；在用而没跑就顺手起 serve
+        app.magpie_bootstrap(cx);
         app
     }
 

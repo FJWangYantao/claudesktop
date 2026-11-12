@@ -550,35 +550,97 @@ impl ChatApp {
         .detach();
     }
 
-    /// 把 magpie 网关加成一套服务商档案（已有一套就不重复加，只切过去）。
-    fn add_magpie_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let profile = magpie_profile(claudesktop_builtin::magpie::gateway_port());
-        if let Some(at) =
-            self.settings_form.profiles.iter().position(|p| p.base_url == profile.base_url)
+    /// 启动引导（见「设计说明-本机agent.md」第十五节）：探到 magpie 网关就自动建档案
+    /// （没有的话；之前什么都没配好就选它）并拉 `/v1/models` 填模型下拉；
+    /// 网关没跑、当前档案是 magpie 而 sidecar 已下载——顺手起 serve。
+    pub(crate) fn magpie_bootstrap(&mut self, cx: &mut Context<Self>) {
+        let port = claudesktop_builtin::magpie::gateway_port();
+        cx.spawn(async move |this, cx| {
+            let running = cx
+                .background_executor()
+                .spawn(async move { claudesktop_builtin::magpie::probe(port) })
+                .await;
+            match running {
+                Some(version) => {
+                    // 网关已在跑（用户自己开的也算）：确保 magpie 档案在、模型列表满上
+                    let _ = this.update(cx, |this, cx| {
+                        this.settings_form.magpie.probed = true;
+                        this.settings_form.magpie.running = Some(version);
+                        this.update_settings(|s| {
+                            let base = format!("http://127.0.0.1:{port}/v1");
+                            if s.builtin.profiles.iter().any(|p| p.base_url == base) {
+                                return;
+                            }
+                            let unconfigured =
+                                s.builtin.profiles.iter().all(|p| !p.is_configured());
+                            s.builtin.profiles.push(crate::settings::magpie_profile(port));
+                            if unconfigured {
+                                s.builtin.active = s.builtin.profiles.len() - 1;
+                            }
+                        });
+                        cx.notify();
+                    });
+                    let base = format!("http://127.0.0.1:{port}/v1");
+                    let list = cx
+                        .background_executor()
+                        .spawn(async move { claudesktop_builtin::magpie::models(port) })
+                        .await;
+                    if let Ok(list) = list
+                        && !list.is_empty()
+                    {
+                        let _ = this.update(cx, |this, cx| {
+                            this.update_settings(|s| {
+                                if let Some(p) =
+                                    s.builtin.profiles.iter_mut().find(|p| p.base_url == base)
+                                {
+                                    p.set_models(&list);
+                                }
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+                None => {
+                    // 网关没在跑：当前档案是 magpie 的话顺手起 serve（装了才起）
+                    let _ = this.update(cx, |this, cx| this.auto_start_magpie_if_active(cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 尽量自动：当前自研内核档案是 magpie、网关没在跑、sidecar 已下载——顺手起 serve。
+    pub(crate) fn auto_start_magpie_if_active(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.builtin.current().magpie
+            || self.settings_form.magpie.starting
+            || self.settings_form.magpie.downloading.is_some()
         {
-            self.settings_form.active = at;
-            cx.notify();
             return;
         }
-        // 选中的那套还什么都没填（首次配置时补的空档案）就直接换掉它，不留一套空的
-        let inputs = ProfileInputs::new(window, cx, &profile);
-        let f = &mut self.settings_form;
-        let blank = f.current().is_some_and(|(_, i)| {
-            [&i.name, &i.base_url, &i.api_key, &i.model]
-                .iter()
-                .all(|input| value(input, cx).is_empty())
-        });
-        if blank {
-            f.profiles[f.active] = profile;
-            f.inputs[f.active] = inputs;
-        } else {
-            f.inputs.push(inputs);
-            f.profiles.push(profile);
-            f.active = f.profiles.len() - 1;
-        }
-        f.message = None;
-        f.fetch_result = None;
-        cx.notify();
+        let port = claudesktop_builtin::magpie::gateway_port();
+        cx.spawn(async move |this, cx| {
+            let running = cx
+                .background_executor()
+                .spawn(async move { claudesktop_builtin::magpie::probe(port) })
+                .await;
+            let alive = running.is_some();
+            let _ = this.update(cx, |this, _cx| {
+                this.settings_form.magpie.probed = true;
+                this.settings_form.magpie.running = running;
+            });
+            if alive {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(dir) = claudesktop_core::default_data_dir() {
+                    let exe = claudesktop_builtin::magpie::installed_path(&dir);
+                    if exe.is_file() {
+                        this.start_magpie(&exe, cx);
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
@@ -1110,6 +1172,10 @@ impl ChatApp {
         {
             self.ensure_kernel(&default);
             self.request_pending_sessions();
+        }
+        // 刚把 magpie 档案存成当前档案（或换了它的模型）：网关没在跑就顺手起 serve
+        if default == KernelChoice::Builtin {
+            self.auto_start_magpie_if_active(cx);
         }
         cx.notify();
     }
@@ -1845,25 +1911,13 @@ impl ChatApp {
     /// 「内核与模型」：默认内核三选一，下面是选中那种内核的配置。
     fn render_kernel_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let mut kernels = choice_panel();
-        for (kind, icon, title, desc) in kernel_choices() {
-            let key = kind.key();
-            let id: gpui_kit::ElementId = format!("kernel-{}", key.replace(':', "-")).into();
-            kernels = kernels.child(
-                choice_row(id, icon, title, desc, f.kernel.same_kind(&kind), None).on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        this.settings_form.kernel = kind.clone();
-                        this.settings_form.message = None;
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-        let body = div().v_flex().gap_8().child(section("默认内核", "", None, kernels));
+        let body = div()
+            .v_flex()
+            .gap_8()
+            .child(self.render_kernel_list(cx))
+            .child(self.render_advanced(window, cx));
         match f.kernel {
             KernelChoice::Builtin => body
-                .child(self.render_providers(window, cx))
-                .child(self.render_magpie(cx))
                 .child(self.render_auto_mode(window, cx))
                 .child(self.render_suggest(cx))
                 .child(self.render_memory_options(cx))
@@ -1889,9 +1943,244 @@ impl ChatApp {
                         self.prices_row(window, cx),
                     ]),
                 )),
-            KernelChoice::Acp(_) => body.child(self.render_acp(cx)),
-            KernelChoice::Demo => body,
+            // 自研内核以外的分区与内核无关（agent 的模型在它那边，演示没有模型）
+            KernelChoice::Acp(_) | KernelChoice::Demo => body,
         }
+    }
+
+    /// 「本机内核」统一清单：自研内核（模型经 magpie 网关）+ 本机 agent + 演示回放。
+    /// 全部自动检测，点一下就能用；端点 / Key 那套手填的在下面「自定义」折叠区。
+    fn render_kernel_list(&self, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let mut list = choice_panel();
+
+        // 自研内核：状态行 = magpie 网关状态（探活 / 下载 / 启动都走 MagpieForm）
+        let m = &f.magpie;
+        let exe_installed = claudesktop_core::default_data_dir()
+            .ok()
+            .map(|d| claudesktop_builtin::magpie::installed_path(&d))
+            .is_some_and(|p| p.is_file());
+        let mut status_error = false;
+        let status: SharedString = if let Some((done, total)) = m.downloading {
+            format!("正在下载… {} / {} MB", done >> 20, total.max(1) >> 20).into()
+        } else if let Some(err) = &m.error {
+            status_error = true;
+            err.clone().into()
+        } else if m.starting {
+            "正在启动网关…".into()
+        } else if let Some(version) = &m.running {
+            // 模型数跟着 magpie 档案走（启动时自动拉过）
+            let models = f.profiles.iter().find(|p| p.magpie).map_or(0, |p| p.models.len());
+            if models > 0 {
+                format!("网关运行中 · {version} · {models} 个模型").into()
+            } else {
+                format!("网关运行中 · {version}").into()
+            }
+        } else if exe_installed {
+            "已下载，网关没在运行".into()
+        } else if m.probed {
+            "本机没有 magpie".into()
+        } else {
+            "正在检测…".into()
+        };
+        // 动作按钮（点它不触发行点击）：没装 → 下载并启动；装了没跑 → 启动；失败 → 重试
+        let action: Option<(&'static str, &'static str)> = if m.downloading.is_some() || m.starting
+        {
+            None
+        } else if m.error.is_some() {
+            Some(("重试", "magpie-row-retry"))
+        } else if m.running.is_some() {
+            None
+        } else if exe_installed {
+            Some(("启动", "magpie-row-start"))
+        } else if m.probed {
+            Some(("下载并启动（约 75 MB）", "magpie-row-setup"))
+        } else {
+            None
+        };
+        let trailing = action.map(|(label, id)| {
+            Self::text_button(id, label, true)
+                .xsmall()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.setup_magpie(cx);
+                }))
+                .into_any_element()
+        });
+        list = list.child(
+            choice_row(
+                "kernel-builtin",
+                IconAll::Cpu,
+                "自研内核 · 经 magpie 网关",
+                status,
+                f.kernel.same_kind(&KernelChoice::Builtin),
+                trailing,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.settings_form.kernel = KernelChoice::Builtin;
+                this.settings_form.message = None;
+                // 尽量自动：选了自研内核、网关装了没跑，就顺手起 serve
+                if this.settings_form.magpie.running.is_none()
+                    && !this.settings_form.magpie.starting
+                    && this.settings_form.magpie.downloading.is_none()
+                    && let Ok(dir) = claudesktop_core::default_data_dir()
+                {
+                    let exe = claudesktop_builtin::magpie::installed_path(&dir);
+                    if exe.is_file() {
+                        this.start_magpie(&exe, cx);
+                    }
+                }
+                cx.notify();
+            })),
+        );
+        // 条款风险提示常驻（不收进 ⓘ）
+        list = list.child(
+            div()
+                .px_3()
+                .pb_1()
+                .text_size(TEXT_META)
+                .text_color(rgb(if status_error { RED } else { INK_SOFT }))
+                .child(
+                    "风险：订阅账号经 magpie（第三方网关）使用可能违反各家条款；\
+                     magpie 会读取各 agent 的登录信息，claudesktop 自己不碰凭据",
+                ),
+        );
+
+        // 本机 agent：每家一行，点一下 = 启用并设为默认
+        for preset in claudesktop_core::agents::PRESETS {
+            let enabled = f.agents.iter().any(|a| a.id == preset.id);
+            let is_default = matches!(&f.kernel, KernelChoice::Acp(id) if id == preset.id);
+            let detect = match &f.agent_detect {
+                AgentDetect::Idle | AgentDetect::Running => None,
+                AgentDetect::Done(found) => found.iter().find(|d| d.preset.id == preset.id),
+            };
+            // 行的说明：装没装 / 版本；「没找到」只说明探测没找到，仍可手动启用
+            let desc: String = match detect {
+                Some(d) => d.summary(),
+                None => match &f.agent_detect {
+                    AgentDetect::Idle | AgentDetect::Running => "检测中…".into(),
+                    AgentDetect::Done(_) => "本机没找到（可手动启用）".into(),
+                },
+            };
+            // 已启用但不是默认：右边给个「停用」小按钮（默认中的行不能再停）
+            let trailing = (enabled && !is_default).then(|| {
+                Self::text_button(format!("agent-off-{}", preset.id), "停用", false)
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.settings_form.agents.retain(|a| a.id != preset.id);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            });
+            list = list.child(
+                choice_row(
+                    format!("agent-{}", preset.id),
+                    IconAll::SquareTerminal,
+                    preset.name,
+                    desc,
+                    is_default,
+                    trailing,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // 点一下 = 启用并设为默认
+                    if !this.settings_form.agents.iter().any(|a| a.id == preset.id) {
+                        this.settings_form.agents.push(AgentProfile::from_preset(preset));
+                    }
+                    this.settings_form.kernel = KernelChoice::Acp(preset.id.to_string());
+                    this.settings_form.message = None;
+                    cx.notify();
+                })),
+            );
+            // 风险提示常驻在这一行下面（条款风险不收进 ⓘ）
+            if let Some(risk) = preset.risk {
+                list = list.child(
+                    div().px_3().pb_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk),
+                );
+            }
+        }
+
+        // 演示回放
+        list = list.child(
+            choice_row(
+                "kernel-demo",
+                IconAll::Play,
+                "演示回放",
+                "不连模型，播放界面演示",
+                f.kernel.same_kind(&KernelChoice::Demo),
+                None,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.settings_form.kernel = KernelChoice::Demo;
+                this.settings_form.message = None;
+                cx.notify();
+            })),
+        );
+
+        let detect_note = match &f.agent_detect {
+            AgentDetect::Idle | AgentDetect::Running => Some(
+                div()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child("正在检测本机安装的 agent…"),
+            ),
+            AgentDetect::Done(_) => None,
+        };
+        let body = div().v_flex().gap_4().child(list).children(detect_note);
+        section(
+            "本机内核",
+            "自动检测，点一下就能用；模型和订阅在 magpie / agent 那边，这里不用填端点",
+            None,
+            body,
+        )
+    }
+
+    /// 页底「自定义」折叠区：手填服务商档案 + agent 选项（网关开关、自定义命令）。
+    /// 主路径用不上，但已有档案照常能改能删。
+    fn render_advanced(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let gateway_rows: Vec<_> = f
+            .agents
+            .iter()
+            .filter(|a| a.supports_gateway())
+            .map(|a| {
+                let id = a.id.clone();
+                let name = a.display_name();
+                setting_row(
+                    format!("{} 经过用量网关", name),
+                    "把它的请求也记进「请求」页签",
+                    Switch::new(format!("agent-gw-{}", id))
+                        .checked(a.gateway)
+                        .color(rgb(CORAL))
+                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                            if let Some(a) =
+                                this.settings_form.agents.iter_mut().find(|a| a.id == id)
+                            {
+                                a.gateway = *checked;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .collect();
+        let content = div()
+            .v_flex()
+            .gap_8()
+            .child(self.render_providers(window, cx))
+            .when(!gateway_rows.is_empty(), |d| {
+                d.child(section("agent 选项", "", None, setting_group(gateway_rows)))
+            })
+            .child(section(
+                "自定义 agent",
+                "",
+                None,
+                form_field(
+                    "启动命令",
+                    Some("任何说 ACP 的 agent 都能接；登录和模型在它那边设置".into()),
+                    Self::text_input(&f.custom_command),
+                ),
+            ));
+        self.disclosure("kernel-advanced", "自定义端点与 agent 选项", content, window, cx)
     }
 
     /// 「自动」模式：开关 + 分类器用哪个模型 + 信任边界。默认关，开了必须配齐。
@@ -2452,201 +2741,6 @@ impl ChatApp {
             tools,
         ))
     }
-
-    /// 「magpie 网关」（见「设计说明-本机agent.md」第十四节）：把本机的订阅和 key 汇成
-    /// 一个本地端点，自研内核当普通 Anthropic 服务用。状态行 + 按需下载 / 启动 / 添加为档案；
-    /// 订阅经第三方网关的条款风险常驻提示（风险提示不收进 ⓘ）。
-    fn render_magpie(&self, cx: &mut Context<Self>) -> Div {
-        let f = &self.settings_form.magpie;
-        // 已下载过（状态行按它区分「没装」和「装了没跑」）
-        let exe_installed = claudesktop_core::default_data_dir()
-            .ok()
-            .map(|d| claudesktop_builtin::magpie::installed_path(&d))
-            .is_some_and(|p| p.is_file());
-        let mut error = false;
-        let status: SharedString = if let Some((done, total)) = f.downloading {
-            format!("正在下载… {} / {} MB", done >> 20, total.max(1) >> 20).into()
-        } else if let Some(err) = &f.error {
-            error = true;
-            err.clone().into()
-        } else if f.starting {
-            "正在启动网关…".into()
-        } else if let Some(version) = &f.running {
-            format!("网关运行中 · {version}").into()
-        } else if exe_installed {
-            "已下载，网关没在运行".into()
-        } else if f.probed {
-            "本机没有 magpie".into()
-        } else {
-            "正在检测…".into()
-        };
-        let status_line = div()
-            .text_size(TEXT_SMALL)
-            .text_color(rgb(if error { RED } else { INK_SOFT }))
-            .child(status);
-        // 动作按钮：没装 → 下载并启动；装了没跑 → 启动；在跑 → 添加为档案（加过就切过去）
-        let mut buttons = div().h_flex().items_center().gap_2().flex_none();
-        if f.downloading.is_none() && !f.starting {
-            if f.error.is_some() {
-                buttons = buttons.child(
-                    Self::text_button("magpie-retry", "重试", false)
-                        .on_click(cx.listener(|this, _, _, cx| this.setup_magpie(cx))),
-                );
-            } else if f.running.is_some() {
-                let base =
-                    format!("http://127.0.0.1:{}/v1", claudesktop_builtin::magpie::gateway_port());
-                let added = self.settings_form.profiles.iter().any(|p| p.base_url == base);
-                buttons = buttons.child(
-                    Self::text_button(
-                        "magpie-add",
-                        if added { "去档案里选模型" } else { "添加为档案" },
-                        true,
-                    )
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.add_magpie_profile(window, cx)),
-                    ),
-                );
-            } else if exe_installed {
-                buttons = buttons.child(Self::text_button("magpie-start", "启动", true).on_click(
-                    cx.listener(|this, _, _, cx| match claudesktop_core::default_data_dir() {
-                        Ok(dir) => {
-                            let exe = claudesktop_builtin::magpie::installed_path(&dir);
-                            this.start_magpie(&exe, cx);
-                        }
-                        Err(_) => {
-                            this.settings_form.magpie.error = Some("找不到数据目录".into());
-                        }
-                    }),
-                ));
-            } else if f.probed {
-                buttons = buttons.child(
-                    Self::text_button("magpie-setup", "下载并启动（约 75 MB）", true)
-                        .on_click(cx.listener(|this, _, _, cx| this.setup_magpie(cx))),
-                );
-            }
-        }
-        let body = div()
-            .v_flex()
-            .gap_3()
-            .child(setting_row_with(
-                "网关",
-                "订阅和 key 在 magpie 自己的界面里配置，这里只管启动和接入",
-                status_line,
-                buttons,
-            ))
-            .child(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(
-                "风险：订阅账号经 magpie（第三方网关）使用可能违反各家条款；\
-                         magpie 会读取各 agent 的登录信息，claudesktop 自己不碰凭据",
-            ));
-        section(
-            "magpie 网关",
-            "把本机的订阅和 key 汇成一个本地端点，自研内核当普通 Anthropic 端点用",
-            None,
-            body,
-        )
-    }
-
-    /// ACP agent：本机装了哪些（后台检测的），每行一个开关；下面是自定义 agent 的命令。
-    /// 登录和模型在 agent 那边设置；保存后每条启用的档案各起一个内核进程。
-    fn render_acp(&self, cx: &mut Context<Self>) -> Div {
-        let f = &self.settings_form;
-        let mut list = choice_panel();
-        // 每家预设一行：开关 = 档案表里有没有它
-        for preset in claudesktop_core::agents::PRESETS {
-            let enabled = f.agents.iter().any(|a| a.id == preset.id);
-            let detect = match &f.agent_detect {
-                AgentDetect::Idle | AgentDetect::Running => None,
-                AgentDetect::Done(found) => found.iter().find(|d| d.preset.id == preset.id),
-            };
-            // 行的说明：装没装 / 版本；「没找到」只说明探测没找到，仍可手动启用
-            let desc: String = match detect {
-                Some(d) => d.summary(),
-                None => match &f.agent_detect {
-                    AgentDetect::Idle | AgentDetect::Running => "检测中…".into(),
-                    AgentDetect::Done(_) => "本机没找到（可手动启用）".into(),
-                },
-            };
-            let id = format!("agent-{}", preset.id);
-            list = list.child(
-                choice_row(id, IconAll::SquareTerminal, preset.name, desc, enabled, None).on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        if let Some(at) =
-                            this.settings_form.agents.iter().position(|a| a.id == preset.id)
-                        {
-                            this.settings_form.agents.remove(at);
-                        } else {
-                            this.settings_form.agents.push(AgentProfile::from_preset(preset));
-                        }
-                        cx.notify();
-                    }),
-                ),
-            );
-            // 风险提示常驻在这一行下面（条款风险不收进 ⓘ）
-            if let Some(risk) = preset.risk {
-                list = list.child(
-                    div().px_3().pb_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk),
-                );
-            }
-        }
-        // 检测状态行：转圈 / 重新检测
-        let detect_note = match &f.agent_detect {
-            AgentDetect::Idle | AgentDetect::Running => Some(
-                div()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .child("正在检测本机安装的 agent…"),
-            ),
-            AgentDetect::Done(_) => None,
-        };
-        let gateway_rows: Vec<_> = f
-            .agents
-            .iter()
-            .filter(|a| a.supports_gateway())
-            .map(|a| {
-                let id = a.id.clone();
-                let name = a.display_name();
-                setting_row(
-                    format!("{} 经过用量网关", name),
-                    "把它的请求也记进「请求」页签",
-                    Switch::new(format!("agent-gw-{}", id))
-                        .checked(a.gateway)
-                        .color(rgb(CORAL))
-                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
-                            if let Some(a) =
-                                this.settings_form.agents.iter_mut().find(|a| a.id == id)
-                            {
-                                a.gateway = *checked;
-                            }
-                            cx.notify();
-                        })),
-                )
-            })
-            .collect();
-        let body = div()
-            .v_flex()
-            .gap_4()
-            .child(list)
-            .children(detect_note)
-            .children(gateway_rows.is_empty().then(|| {
-                div()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .child("启用一家后可以单独开关「它的请求经不经过用量网关」")
-            }))
-            .when(!gateway_rows.is_empty(), |d| d.child(setting_group(gateway_rows)))
-            .child(form_field(
-                "自定义 agent",
-                Some("任何说 ACP 的 agent 都能接；登录和模型在它那边设置".into()),
-                Self::text_input(&f.custom_command),
-            ));
-        section(
-            "本机 agent",
-            "直接用本机装好的 Claude Code / OpenCode 等：登录和模型都在 agent 那边，这里只管接不接",
-            None,
-            body,
-        )
-    }
-
     /// 「内核与模型」底部固定的保存栏：左边状态 / 提示，右边取消和保存。
     fn render_save_bar(&self, cx: &mut Context<Self>) -> Div {
         let dirty = self.form_dirty(cx);
@@ -2856,25 +2950,6 @@ enum Fetch {
     Probe,
     /// 保存后测一下连不连得上：成功、失败都弹提示
     Verify,
-}
-
-/// 「内核与模型」里默认内核的三种选择。
-fn kernel_choices() -> Vec<(KernelChoice, IconAll, &'static str, &'static str)> {
-    vec![
-        (
-            KernelChoice::Builtin,
-            IconAll::Cpu,
-            "自研内核",
-            "填 API Key 直连 DeepSeek、OpenAI、Ollama 等",
-        ),
-        (
-            KernelChoice::Acp(String::new()),
-            IconAll::SquareTerminal,
-            "本机 agent",
-            "用本机装好的 Claude Code / OpenCode 等，登录和模型都在 agent 那边",
-        ),
-        (KernelChoice::Demo, IconAll::Play, "演示回放", "不连模型，播放界面演示"),
-    ]
 }
 
 /// Antigravity Tools 借用 Antigravity 账号的登录，Google 2026-02 起按违反条款封过这样用的账号。
