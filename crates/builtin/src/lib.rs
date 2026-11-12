@@ -26,6 +26,7 @@ mod fetch;
 pub mod gateway;
 mod history;
 mod instructions;
+pub mod magpie;
 pub mod mcp;
 mod mcp_http;
 mod mcp_oauth;
