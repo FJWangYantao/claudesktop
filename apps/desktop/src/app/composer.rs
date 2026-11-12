@@ -1153,7 +1153,7 @@ fn thinking_menu_items(
             "thinking-default",
             IconAll::Circle,
             "默认",
-            "用设置里「内核与模型」给这个档案配的那一档",
+            "用「设置 · 内核」给这个档案配的那一档",
             active.is_none(),
         ),
         |this, cx| this.choose_thinking(None, cx),
@@ -1311,18 +1311,21 @@ fn model_menu_items(
     if !builtin {
         return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
     }
-    let models = app.settings.builtin.models();
+    // 只列在「模型」页勾选进菜单的（没勾选的留在清单里，不进这个下拉）
+    let models = app.settings.builtin.menu_models();
     if models.is_empty() {
         menu = menu.child(hint(if app.fetching_models {
             "正在获取模型列表…".into()
-        } else {
+        } else if app.settings.builtin.models().is_empty() {
             "没有模型列表，可在设置里获取".into()
+        } else {
+            "模型都在「设置 · 模型」里关着，去勾几个进来".into()
         }));
     }
     let current = app.session().model_label.clone();
     for (i, model) in models.iter().enumerate() {
         let active = current.as_ref() == model.as_str();
-        let m = model.clone();
+        let m = (*model).clone();
         menu = menu.pick(
             div()
                 .id(("model-item", i))
@@ -1341,7 +1344,7 @@ fn model_menu_items(
                         .text_size(TEXT_BODY)
                         .font_family(MONO)
                         .text_color(rgb(INK))
-                        .child(model.clone()),
+                        .child(m.clone()),
                 )
                 .when(active, |d| {
                     d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))

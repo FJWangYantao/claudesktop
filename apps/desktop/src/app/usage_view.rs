@@ -22,7 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 设置页里「用量」占的分类下标（不在导航里列，见 `render_settings`）
-pub(super) const USAGE_TAB: usize = 6;
+pub(super) const USAGE_TAB: usize = 7;
 
 /// 会话排行先列多少行；「再显示」每次多列这么多
 const PAGE_ROWS: usize = 6;

@@ -350,7 +350,7 @@ impl ChatApp {
         };
         if !self.settings.usage_gateway {
             return div().child(hint(
-                "用量网关关着，没有请求记录。在 设置 → 内核与模型 里打开后，自研内核的每个请求都会记下来。",
+                "用量网关关着，没有请求记录。在 设置 → 内核 里打开后，自研内核的每个请求都会记下来。",
             ));
         }
         let v = &self.requests_view;

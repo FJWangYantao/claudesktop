@@ -294,8 +294,8 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         let current = s.model_label.clone();
         app.settings
             .builtin
-            .models()
-            .iter()
+            .menu_models()
+            .into_iter()
             .map(|m| {
                 Entry::new(IconAll::Cpu, m.clone(), PaletteCmd::Model(m.clone()))
                     .mono()

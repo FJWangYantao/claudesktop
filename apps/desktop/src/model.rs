@@ -726,7 +726,7 @@ pub struct StatCard {
 }
 
 /// 权限模式（对应官方桌面版的 Manual / Accept edits / Plan / Auto）：(名称, 说明, 图标, ACP mode id)。
-/// 「自动」不在这张静态表里：要连上内核、并在设置页「内核与模型」里配好之后才出现。
+/// 「自动」不在这张静态表里：要连上内核、并在「设置 · 内核」里配好之后才出现。
 pub const PERMISSION_MODES: [(&str, &str, IconAll, &str); 3] = [
     ("逐项确认", "每次编辑和命令都先询问", IconAll::ShieldCheck, "default"),
     ("自动接受编辑", "自动接受文件编辑，命令仍询问", IconAll::SquarePen, "acceptEdits"),

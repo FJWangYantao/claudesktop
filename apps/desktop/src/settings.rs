@@ -143,6 +143,9 @@ pub struct ProviderProfile {
     pub model: String,
     /// 上次从端点获取的模型列表（模型下拉用）
     pub models: Vec<String>,
+    /// 在模型清单里关掉「进输入框菜单」的模型（空 = 全部进菜单）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub menu_hidden: Vec<String>,
     /// 同一次获取里端点报告的上下文窗口（模型 ID → token；输入框旁的上下文用量用）
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub context_windows: BTreeMap<String, u64>,
@@ -183,6 +186,11 @@ impl ProviderProfile {
         self.models = models.iter().map(|m| m.id.clone()).collect();
         self.context_windows =
             models.iter().filter_map(|m| Some((m.id.clone(), m.context_window?))).collect();
+    }
+
+    /// 进输入框模型菜单的模型：默认全进，清单里关掉的（`menu_hidden`）除外。
+    pub fn menu_models(&self) -> Vec<&String> {
+        self.models.iter().filter(|m| !self.menu_hidden.contains(m)).collect()
     }
 
     /// 某个模型的上下文窗口。顶栏显示的模型名可能只是 ID 的最后一段（`provider/name` → `name`），
@@ -449,7 +457,7 @@ pub struct Settings {
     /// 「自动」模式：开不开、分类器用哪个模型、信任边界（默认关）
     pub auto_mode: AutoModeSettings,
     /// 自研内核的请求经用量网关转发、每个请求记一行日志（数据目录 `gateway/`）；默认开。
-    /// 关掉就直连端点。设置页「内核与模型」有开关，`CLAUDESKTOP_GATEWAY` 覆盖它
+    /// 关掉就直连端点。「设置 · 内核」有开关，`CLAUDESKTOP_GATEWAY` 覆盖它
     pub usage_gateway: bool,
     /// 网关另存每个请求的原文（请求体和响应），首页「请求」页签点开一次请求可看；默认开
     pub gateway_bodies: bool,
@@ -1133,6 +1141,7 @@ impl BuiltinSettings {
             api_key: String::new(),
             model: String::new(),
             models: Vec::new(),
+            menu_hidden: Vec::new(),
             context_windows: BTreeMap::new(),
             params: RequestParams {
                 temperature: None,
@@ -1168,6 +1177,11 @@ impl BuiltinSettings {
 
     pub fn models(&self) -> &[String] {
         &self.current().models
+    }
+
+    /// 进输入框 / 命令面板菜单的模型（清单里关掉的除外）。
+    pub fn menu_models(&self) -> Vec<&String> {
+        self.current().menu_models()
     }
 
     pub fn context_window(&self, model: &str) -> Option<u64> {

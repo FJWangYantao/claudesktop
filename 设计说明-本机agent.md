@@ -307,7 +307,32 @@ OpenAI / Anthropic / Gemini 三协议直通的网关；**我们把它当一个�
 
 sidecar 细节不变（第十四节）：探活 `/api/hello`、下载校验、进程回收。
 
-## 十六、参考
+## 十六、「内核与模型」拆成「内核」「模型」两页（2026-11-12）
+
+设置页分类从 8 个变 9 个：通用 0 / 项目 1 / **内核 2** / **模型 3** / 权限 4 / MCP 5 /
+插件 6 / 用量 7 / 记忆 8（下标常量在 settings_view / usage_view / memory_view）。
+两页都走底栏保存（`form_dirty`），探活（agent 检测、magpie 探活）在进任一页时触发。
+
+- **内核页**（`render_kernel_tab`）：本机内核清单（第十五节那套）+ 自研内核的选项
+  （自动模式、输入补全、记忆、运行参数），页底折叠区只剩 agent 选项（网关开关、自定义命令）。
+  手填端点档案不在这页了。
+- **模型页**（`render_model_tab`）：**模型来源清单**（magpie 网关注册的档案排最前 + 各套
+  端点档案，点选切换，`render_model_sources`）→ 选中来源的**模型清单**（搜索过滤、
+  每个模型一个开关决定进不进输入框菜单、点模型名设为这套档案的默认模型，
+  `render_model_list`）→ 页底「服务商」（手填 / 增删档案，`render_providers`）。
+- **可见性**存在档案上：`ProviderProfile.menu_hidden`（关掉的模型 ID）。
+  输入框模型菜单和命令面板的模型组只列 `BuiltinSettings::menu_models()`
+  （勾选过的）；全关光时菜单给一句引导（「去设置 · 模型勾几个进来」）。
+- **自动获取**：magpie 的模型列表由 `magpie_bootstrap` 喂（网关探到就拉 `/v1/models`）；
+  保存设置后 `fetch_missing_models` 给「端点已填、模型列表还是空」的手填档案后台补拉
+  （成功写回设置和表单，失败不打扰；magpie 不重复拉）；来源行的「刷新」
+  （`refresh_source_models`）随时重拉。
+- **默认模型** = 档案的 `model` 字段（每个来源一个），模型清单里点名字就改
+  （写进表单的模型输入框，`form_settings` 保存时收进档案）。
+- **ACP agent 的模型不进清单**：在 agent 自己的 `/model` 里选（要拉起 agent 会话读
+  `available_models`，成本高；以后要做是第三期）。
+
+## 十七、参考
 
 - OpenCode ACP：<https://opencode.ai/docs/acp>
 - pi 的 ACP 适配器：<https://github.com/DxTa/pi-acp>、<https://docs.rs/pi-acpinator>

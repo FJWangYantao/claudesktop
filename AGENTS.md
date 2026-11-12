@@ -41,7 +41,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `choice_panel` + `choice_row`（沙色面板里的单选列表，同首页配置引导）、`seg_control`。
   说明只写一句「这是干什么的」（`section` / `setting_row` / `form_field` 都放进 ⓘ，页面上不铺灰字）；怎么用写成 `how_to` 编号步骤放空状态，格式细节收进 `ChatApp::disclosure`。
   例外：条款风险提示（`ANTIGRAVITY_RISK`、`ACP_PRESETS` 的第三列）常驻显示在入口下面（`TEXT_META` + `INK_SOFT`），不收进 ⓘ。
-  「内核与模型」要点保存（底栏固定，`form_dirty` 决定能不能点），其余分类即时生效。
+  「内核」「模型」两页要点保存（底栏固定，`form_dirty` 决定能不能点），其余分类即时生效。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
   分组规则在 `Session::compute_layout`）；
@@ -226,7 +226,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `with_content_mask(input_bounds)` 裁边再 `shape_line().paint()`。字号用 `TEXT_BODY`
   （gpui-kit 输入框 Medium 档就是 `text_sm`），行高取输入框排出来的那份。
   触发条件收得很紧（光标在末尾、没有选区、一轮没在跑、`/` `@` 列表没开），接上之后不连猜。
-  每次停顿就是一次请求：默认关，开关和补全模型在「内核与模型」（`suggestions` / `suggest_model`），
+  每次停顿就是一次请求：默认关，开关和补全模型在「设置 · 内核」（`suggestions` / `suggest_model`），
   只带最近 3 轮；过期的请求经 `should_stop` 当场中断；总要思考的模型（`suggest::is_reasoning_model`）不补。
   调试钩子 `CLAUDESKTOP_SUGGEST=<灰字>`（值 `-` 只填草稿不摆灰字，用来前后对比截图）。
 - 文件对话框与系统联动：`cx.prompt_for_paths(PathPromptOptions)`（注意有 `prompt`
@@ -267,9 +267,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   和 `Session::apply_event`（重放时怎么显示）三处。读日志一律先过 `claudesktop_core::effective`（折算回退）。
 - **magpie 网关**（`crates/builtin/src/magpie.rs`，「设计说明-本机agent.md」第十四、十五节）：把本机订阅/key
   汇成 `http://127.0.0.1:<port>/v1` 的 Anthropic 端点，自研内核当普通档案用（`settings.rs` 的 `magpie_profile`，
-  `ProviderProfile.magpie` 标记自动建的）。「内核与模型」页是**本机内核清单**（对齐 magpie 的 Agents 页）：
-  检测到的 agent 列出、开关即接入；默认内核只有「演示回放」显式选，其余走自动（`Settings::kernel`）；
-  手填档案在「自定义端点」折叠区。启动引导（`ChatApp::magpie_bootstrap`）：探活 `/api/hello`（用户自己开的直接复用，
+  `ProviderProfile.magpie` 标记自动建的）。「设置 · 内核」页是**本机内核清单**（对齐 magpie 的 Agents 页）：
+  检测到的 agent 列出、开关即接入；默认内核只有「演示回放」显式选，其余走自动（`Settings::kernel`）。
+  「设置 · 模型」页是模型来源清单（magpie 网关 + 各套档案）+ 模型清单（开关决定进不进
+  输入框菜单 `ProviderProfile.menu_hidden`、点名字设默认），手填档案在页底「服务商」。启动引导（`ChatApp::magpie_bootstrap`）：探活 `/api/hello`（用户自己开的直接复用，
   端口读它 settings.json 的 `port`）→ 自动建档案 + 拉 `/v1/models`；当前档案是 magpie 而网关没跑、sidecar 已下载 →
   `auto_start_magpie_if_active` 顺手起 serve（`magpie serve`，进程挂 `ChatApp::magpie_child`，job object 之外的显式兜底）。
   下载走 GitHub release（哈希校验；产物地址和 SHA256SUMS 必须同一次 API 应答里拿）。凭据读取全部发生在 magpie 里，我们不碰。

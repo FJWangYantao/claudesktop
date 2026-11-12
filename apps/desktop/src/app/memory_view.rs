@@ -26,7 +26,7 @@ use gpui_kit::*;
 use std::path::PathBuf;
 
 /// 设置页「记忆」分类的下标
-pub(super) const MEMORY_TAB: usize = 7;
+pub(super) const MEMORY_TAB: usize = 8;
 
 /// 条目攒到这个数就提示整理（设计说明第七节第 2 条）
 const TIDY_HINT: usize = 30;
@@ -850,7 +850,7 @@ impl ChatApp {
             div().v_flex().gap_2().child(card).child(
                 div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(
                     "收下写进「这个项目」（要全局就收下后改到全局）。不想每次都被问，\
-                         在「内核与模型」里关掉「回合结束后提炼记忆」",
+                         在「设置 · 内核」里关掉「回合结束后提炼记忆」",
                 ),
             ),
         ))
