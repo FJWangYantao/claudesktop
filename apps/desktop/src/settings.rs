@@ -264,6 +264,21 @@ pub fn preset_profiles() -> Vec<ProviderProfile> {
     ]
 }
 
+/// magpie 网关的 provider 档案（见「设计说明-本机agent.md」第十四节）：把它当一个
+/// Anthropic 端点，base URL 指向本地网关，key 固定为 [`claudesktop_builtin::magpie::GATEWAY_KEY`]
+/// （magpie 按它把用量记到 claudesktop 名下）。模型留空：点「获取」从它的
+/// `/v1/models` 拉（`data[].id`，和 OpenAI 同形，`list_models` 直接能读）。
+pub fn magpie_profile(port: u16) -> ProviderProfile {
+    ProviderProfile {
+        name: "magpie".into(),
+        protocol: Protocol::Anthropic,
+        base_url: format!("http://127.0.0.1:{port}/v1"),
+        api_key: claudesktop_builtin::magpie::GATEWAY_KEY.into(),
+        model: String::new(),
+        ..Default::default()
+    }
+}
+
 /// ACP 相关设置：启用了哪些本机 agent（每个一条档案），以及各自的选项。
 ///
 /// 一条档案 = 一个 ACP 内核进程（懒启动：用到它的会话第一次连接时才起）。可以同时启用好几家，
