@@ -161,7 +161,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   否则节拍器每拍通知 `ChatApp`，内容区跟着重画。
 - **性能压测**：`CLAUDESKTOP_STRESS=<行数>` 逐帧滚动出帧间隔和每帧工作量（`work`，render 到画完）；
   再加 `CLAUDESKTOP_STRESS_BUSY=1` 改成置忙 5 秒（末尾挂着思考中和跑着的工具），看转圈常驻时每秒重画几次、每帧工作量（CPU 在外面量）；
-  加 `CLAUDESKTOP_STRESS_TYPE=1` 改成逐帧往输入框打字；加 `CLAUDESKTOP_STRESS_VIEW=settings:N` / `home` /
+  加 `CLAUDESKTOP_STRESS_TYPE=1` 改成逐帧往输入框打字；加 `CLAUDESKTOP_STRESS_STREAM=1` 改成逐帧推
+  `AgentMessageChunk`（末尾另报多少个 chunk 真正并进正文，合批后远小于 chunk 数）；
+  加 `CLAUDESKTOP_STRESS_VIEW=settings:N` / `home` /
   `requests`（`requests-all` 全部列出）改成逐帧滚设置页 / 首页 / 「请求」页签（`<行数>` 是假请求的轮数）。
   动画 / 重画范围、设置页和首页的改动前后各跑一次。
 
@@ -317,6 +319,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 待办清单（`todo_write`）：内核在 `SessionState::todos` 记着当前清单（续接 / 回退从日志的 `PlanReplaced` 恢复）；
   还有没做完的项、连续 `TODO_REMIND_STEPS` 步没更新时，在那次请求的最后一条消息上临时挂提醒（不进历史，`todo_nudge`）；
   压缩时内核把当前清单附在摘要后面（`tools::summary_with_todos`），不靠总结的模型抄。
+- 流式文本合批上屏（`Session::stream_pending` / `STREAM_FLUSH`）：chunk 先进缓冲，短消息每 50ms 并进正文一次，
+  间隔随消息长度爬坡到 250ms（`stream_flush_interval`，8KB 起爬、64KB 封顶）——每次并进是整篇重解析，长消息砍刷新率省解析；
+  没并进的 chunk 不重画（`on_kernel_event` 的 `skip_notify`）。`flush_stream` 不分思考 / 正文一次全并，
+  正文 chunk 来了只想收尾思考时按 `stream_pending_thought` 判断后再调。flush 点要全：
+  实质事件进 `apply_event` 前、轮末 `close_turn`、停止、回退（`truncate_to` 直接清空）、切内核、`on_fatal`。
+  背景：`reading_markdown` 流式时补齐半截标记，交给 TextView 的文本每帧都不是上一帧的前缀，
+  gpui-kit 的增量解析（`push_str`）用不上，不合批就是整篇 markdown 每个 chunk 重解析一次。
 - 命令运行中的输出：`run_shell` 每 0.5 秒把最新几行经 `KernelEvent::ToolCallProgress` 报给界面（不进日志），跑完由最终的 `ToolCallUpdated` 覆盖；
   命令行（`ToolCard::shows_command`）随时可点开，展开后先列完整命令，所以行上不挂悬停提示。长文本的悬停提示用 `chat.rs` 的 `text_tip`（限宽、截断），别直接 `Tooltip::new`。
 - 逐块审查（`crates/core/src/review.rs` + `app/review.rs`）：只审最新一轮、跑完了才行；撤回 / 恢复写盘后追加带 `reverted` 的 `Record::FileChanged`（回退照常算），

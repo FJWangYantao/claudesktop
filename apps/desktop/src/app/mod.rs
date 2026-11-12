@@ -1391,6 +1391,47 @@ impl ChatApp {
         });
     }
 
+    /// 压测钩子：流式输出。先置忙，再逐帧推一个 `AgentMessageChunk`（走真实的
+    /// `Session::apply_event` + `cx.notify`）：前 20 帧正文，然后开一个代码块直到 250 帧才收尾，
+    /// 让流式补齐半截标记（`reading_markdown`）的路径全程生效。量「每来一个 chunk 画一帧多贵」，
+    /// 末尾另报「多少个 chunk 真正并进了正文」（流式合批后远小于 chunk 数）。
+    pub(crate) fn debug_stream_frames(
+        &mut self,
+        step: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const STEPS: usize = 300;
+        static FLUSHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if step >= STEPS {
+            self.stress_report();
+            eprintln!("stream: chunks={STEPS} flushes={}", FLUSHES.load(std::sync::atomic::Ordering::Relaxed));
+            return;
+        }
+        if step == 0 {
+            FLUSHES.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.sessions[self.active].begin_turn();
+        }
+        let text = match step {
+            0 => "先看这段代码：\n\n".to_string(),
+            1 => "```rust\n".to_string(),
+            250 => "```\n\n改完了。".to_string(),
+            _ if step < 250 => format!("fn f{step}() {{ i * {step} }}\n"),
+            _ => "收尾。\n\n".to_string(),
+        };
+        let _ = self.sessions[self.active]
+            .apply_event(KernelEvent::AgentMessageChunk { text: text.into() }, None);
+        // 和 on_kernel_event 同一条路径：只进合批缓冲的 chunk 不重画。
+        // 末尾报「300 个 chunk 实际并进正文几次」——那才是真正画帧的次数
+        let flushed = self.sessions[self.active].take_stream_dirty();
+        FLUSHES.fetch_add(flushed as usize, std::sync::atomic::Ordering::Relaxed);
+        cx.notify();
+        let this = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            let _ = this.update(cx, |app, cx| app.debug_stream_frames(step + 1, window, cx));
+        });
+    }
+
     /// 压测钩子：把记下的帧时刻整理成「帧数、每秒帧数、帧间隔 p50 / p95 / max」，
     /// 写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）。
     pub(crate) fn stress_report(&mut self) {
@@ -2175,6 +2216,7 @@ impl ChatApp {
         s.cancel_token += 1;
         s.busy = false;
         // 正在流式的思考块收起，不然停下后还挂着「思考中…」；压缩到一半的那行也收尾
+        s.flush_stream();
         s.finish_thinking();
         s.interrupt_running_tools();
         s.settle_compaction(CompactState::Failed("已停止".into()));
@@ -2213,6 +2255,11 @@ impl ChatApp {
             return;
         };
         let slot = &mut *slot;
+        let is_chunk = matches!(
+            event,
+            KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. }
+        );
+        let mut skip_notify = false;
         match event {
             KernelEvent::Connected { agent_name } => {
                 slot.ready = true;
@@ -2395,10 +2442,23 @@ impl ChatApp {
                             self.dispatch_queued(idx, cx);
                         }
                     }
+                    // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
+                    if matches!(event, KernelEvent::Started { .. }) {
+                        self.flush_pending_thinking(idx, kernel.as_deref());
+                        self.flush_pending_web(idx, kernel.as_deref());
+                        if !self.queued_compaction(idx) {
+                            self.dispatch_queued(idx, cx);
+                        }
+                    }
+                    // 流式 chunk 只是进了合批缓冲、还没并进正文时不重画
+                    // （界面按 STREAM_FLUSH 的节奏出字）；并进过的那一拍照常重画
+                    skip_notify = is_chunk && !self.sessions[idx].take_stream_dirty();
                 }
             }
         }
-        cx.notify();
+        if !skip_notify {
+            cx.notify();
+        }
     }
 
     /// 确保第 `idx` 个会话的日志已打开（首次写入时建档）；失败时提示并停用存储。

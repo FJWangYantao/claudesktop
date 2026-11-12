@@ -99,6 +99,17 @@ pub struct Session {
     /// 本轮收到、端点还没数过的输出（正文 + 思考）：流式期间状态行据此估算 token，
     /// 每次 `UsageUpdated` 到来时清掉（那之前的输出已经被端点数过了）
     turn_streamed: Streamed,
+    /// 流式 chunk 的合批缓冲：先攒在这里，每 `STREAM_FLUSH` 才并进正文一次。
+    /// chunk 来多快就画多快的话，长回复期间「补齐半截标记」会让整篇 markdown 每个 chunk
+    /// 重解析一次（见 chat.rs 的 `reading_markdown`），合批把解析和重画压到每秒约 20 次
+    stream_pending: String,
+    /// 缓冲喂给哪一行：true = 思考，false = 正文
+    stream_pending_thought: bool,
+    /// 上一次并进正文的时刻（初始化为「很久以前」，第一个 chunk 立即上屏）
+    stream_flushed_at: Instant,
+    /// 上次调用方取走进标志（[`Session::take_stream_dirty`]）之后是否又并进过：
+    /// 没并进过的 chunk 不改对话内容，不用重画
+    stream_dirty: bool,
     /// 本轮开始的时刻（状态条计时用；只在 busy 时有意义）
     pub turn_started: Option<Instant>,
     /// 用户手动改过标题（首条消息不再覆盖）
@@ -236,6 +247,17 @@ pub struct Retry {
 
 /// 进行中的过程组露出最近几步，其余收在组头里
 pub const LIVE_TAIL: usize = 3;
+
+/// 流式文本两次并进正文的最小间隔：界面按这个节奏出字（每秒约 20 次），
+/// 而不是 chunk 来多快就画多快（见 `Session::stream_pending`）
+const STREAM_FLUSH: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 合批间隔的上限：消息越长每次并进越贵（整篇重解析，见 `Session::stream_pending`），
+/// 刷新率砍到 4 次/秒手感也无差——人眼对文字的流畅感知上限远低于此。
+const STREAM_FLUSH_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+/// 间隔从这条消息的长度起爬坡（以下恒为 `STREAM_FLUSH`），到 `STREAM_FLUSH_LONG` 封顶。
+const STREAM_FLUSH_RAMP: usize = 8 * 1024;
+const STREAM_FLUSH_LONG: usize = 64 * 1024;
 
 /// 滚轮平滑滚动：滚轮只推进 `target`（离列表顶部的像素），实际位置每帧往它逼近一步。
 #[derive(Clone, Copy, Debug)]
@@ -378,6 +400,10 @@ impl Session {
             pending_thinking: None,
             turn_usage: TurnUsage::default(),
             turn_streamed: Streamed::default(),
+            stream_pending: String::new(),
+            stream_pending_thought: false,
+            stream_flushed_at: Instant::now().checked_sub(STREAM_FLUSH).unwrap_or_else(Instant::now),
+            stream_dirty: false,
             turn_started: None,
             renamed: false,
             title_generated: false,
@@ -821,6 +847,7 @@ impl Session {
 
     /// 一轮结束：取走本轮用量、算出用时，记到这一轮名下（回复末尾显示），也交给调用方写日志。
     pub fn close_turn(&mut self) -> TurnSummary {
+        self.flush_stream();
         let summary = TurnSummary {
             elapsed_ms: self.turn_started.take().map(|t| t.elapsed().as_millis() as u64),
             usage: std::mem::take(&mut self.turn_usage),
@@ -984,6 +1011,7 @@ impl Session {
 
     /// 一轮开始：置忙并开始计时。
     pub fn begin_turn(&mut self) {
+        self.flush_stream();
         self.busy = true;
         self.compact_turn = false;
         self.retry = None;
@@ -1155,6 +1183,74 @@ impl Session {
             }
         }
         out
+    }
+
+    /// 把一个流式 chunk 攒进缓冲；距离上次并进够 `STREAM_FLUSH` 了就并进正文。
+    /// 重放不缓冲：那是一次性补完，只画一次。
+    fn buffer_chunk(&mut self, text: String, thought: bool) {
+        if !self.stream_pending.is_empty() && self.stream_pending_thought != thought {
+            self.flush_stream();
+        }
+        self.stream_pending_thought = thought;
+        self.stream_pending.push_str(&text);
+        if self.replaying || self.stream_flushed_at.elapsed() >= self.stream_flush_interval() {
+            self.flush_stream();
+        }
+    }
+
+    /// 当前该用的合批间隔：随正在写的那条消息的长度在
+    /// `STREAM_FLUSH..STREAM_FLUSH_MAX` 之间线性爬坡。
+    fn stream_flush_interval(&self) -> std::time::Duration {
+        let len = match self.transcript.last() {
+            Some(ChatItem::Agent(t)) | Some(ChatItem::Info { text: t, .. }) => t.len(),
+            Some(ChatItem::Thinking { text, .. }) => text.len(),
+            _ => 0,
+        } + self.stream_pending.len();
+        let ramp = (STREAM_FLUSH_LONG - STREAM_FLUSH_RAMP) as u64;
+        let extra = len.saturating_sub(STREAM_FLUSH_RAMP).min(ramp as usize) as u64;
+        STREAM_FLUSH + (STREAM_FLUSH_MAX - STREAM_FLUSH).mul_f64(extra as f64 / ramp as f64)
+    }
+
+    /// 把缓冲的流式文本并进正文（思考或回复行）。任何实质事件、回退、停止、轮末到来前
+    /// 都必须先并进，让对话状态始终一致；调用方在并进后需要重画（[`Session::take_stream_dirty`]）。
+    pub fn flush_stream(&mut self) {
+        if self.stream_pending.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.stream_pending);
+        if self.stream_pending_thought {
+            match self.transcript.last_mut() {
+                Some(ChatItem::Thinking { text: buf, streaming: true, .. }) => {
+                    buf.push_str(&text)
+                }
+                // 默认收起：流式时只扫光「思考中…」，不先展开再收回（那样每段思考都会跳一下）
+                _ => {
+                    let started = (!self.replaying).then(Instant::now);
+                    self.transcript.push(ChatItem::thinking(text, started));
+                }
+            }
+        } else {
+            // 首条提示之前到达的文本是 agent 的启动信息，折叠显示
+            let before_first_prompt = !self.has_user_message();
+            match self.transcript.last_mut() {
+                Some(ChatItem::Info { text: buf, .. }) if before_first_prompt => {
+                    buf.push_str(&text)
+                }
+                Some(ChatItem::Agent(buf)) => buf.push_str(&text),
+                _ if before_first_prompt => {
+                    self.transcript.push(ChatItem::Info { text, open: false })
+                }
+                _ => self.transcript.push(ChatItem::Agent(text)),
+            }
+        }
+        self.stream_dirty = true;
+        self.stream_flushed_at = Instant::now();
+    }
+
+    /// 上次取走进标志之后，流式缓冲是否又并进过正文。`false` 表示 chunk 只是进了缓冲，
+    /// 对话内容没变，调用方不用重画。
+    pub fn take_stream_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.stream_dirty)
     }
 
     /// 正在流式的思考块收尾，记下想了多久（计时的才有）。
@@ -1376,6 +1472,7 @@ impl Session {
 
     /// 回退对话：对话截到第 `idx` 行之前（那条用户消息起都不要了），挂在这些行上的状态一并清掉。
     pub fn truncate_to(&mut self, idx: usize) {
+        self.stream_pending.clear();
         self.transcript.truncate(idx);
         self.turn_summaries.retain(|&i, _| i < idx);
         self.open_groups.retain(|&i| i < idx);
@@ -1410,6 +1507,7 @@ impl Session {
     /// 内核要换了：收尾进行中的一轮，断开与旧内核会话的关联。
     /// 有对话的会话变成「历史会话」，下次发消息时在新内核上续接。
     pub fn detach_kernel(&mut self, kernel: Option<&Arc<dyn Kernel>>) {
+        self.flush_stream();
         self.cancel_pending_permissions(kernel);
         // 排着的压缩是给旧内核会话的：撤掉，免得新会话接上时和第一轮撞在一起
         self.drop_queued_compaction("内核已切换");
@@ -1441,6 +1539,7 @@ impl Session {
 
     /// 内核致命错误：这个会话不再可用。
     pub fn on_fatal(&mut self, message: &str, kernel: Option<&Arc<dyn Kernel>>) {
+        self.flush_stream();
         self.busy = false;
         self.stopping = false;
         self.ready = false;
@@ -1458,6 +1557,13 @@ impl Session {
     ) -> Option<claudesktop_core::UserPrompt> {
         if Record::worth_keeping(&event) {
             self.content_seq += 1;
+        }
+        // 实质事件（工具、轮末、用量……）动手前先让攒着的流式文本落进正文，状态始终一致
+        if !matches!(
+            event,
+            KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. }
+        ) {
+            self.flush_stream();
         }
         // 重试的倒计时只撑到下一个实质事件（重发后出字、出错或结束）
         if !matches!(
@@ -1543,33 +1649,18 @@ impl Session {
                 return self.autoprompt.take();
             }
             KernelEvent::AgentMessageChunk { text } => {
+                // 思考可能还攒在缓冲里：只把思考并进再收尾（用时挂在完整的思考上），
+                // 正文的缓冲不动——flush_stream 不分种类，这里不能调它
+                if self.stream_pending_thought {
+                    self.flush_stream();
+                }
                 self.finish_thinking();
                 self.turn_streamed.push(&text);
-                // 首条提示之前到达的文本是 agent 的启动信息，折叠显示
-                let before_first_prompt = !self.has_user_message();
-                match self.transcript.last_mut() {
-                    Some(ChatItem::Info { text: buf, .. }) if before_first_prompt => {
-                        buf.push_str(&text)
-                    }
-                    Some(ChatItem::Agent(buf)) => buf.push_str(&text),
-                    _ if before_first_prompt => {
-                        self.transcript.push(ChatItem::Info { text, open: false })
-                    }
-                    _ => self.transcript.push(ChatItem::Agent(text)),
-                }
+                self.buffer_chunk(text, false);
             }
             KernelEvent::AgentThoughtChunk { text } => {
                 self.turn_streamed.push(&text);
-                match self.transcript.last_mut() {
-                    Some(ChatItem::Thinking { text: buf, streaming: true, .. }) => {
-                        buf.push_str(&text)
-                    }
-                    // 默认收起：流式时只扫光「思考中…」，不先展开再收回（那样每段思考都会跳一下）
-                    _ => {
-                        let started = (!self.replaying).then(Instant::now);
-                        self.transcript.push(ChatItem::thinking(text, started));
-                    }
-                }
+                self.buffer_chunk(text, true);
             }
             KernelEvent::SubagentStarted { task, agent, prompt } => {
                 *self.subagent(&task) =
@@ -2233,6 +2324,32 @@ mod tests {
         let paths: Vec<_> = card.diffs.iter().map(|d| d.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "b.txt"]);
         assert_eq!(card.diffs[0].lines.last().unwrap().text, "z");
+    }
+
+    #[core::prelude::v1::test]
+    fn stream_flush_interval_ramps_with_message_length() {
+        let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("."));
+        s.transcript.push(ChatItem::User {
+            text: "hi".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.transcript.push(ChatItem::Agent(String::new()));
+        assert_eq!(s.stream_flush_interval(), STREAM_FLUSH);
+        if let Some(ChatItem::Agent(t)) = s.transcript.last_mut() {
+            *t = "x".repeat(STREAM_FLUSH_LONG);
+        }
+        assert_eq!(s.stream_flush_interval(), STREAM_FLUSH_MAX);
+        // 缓冲里还没并进的也算长度
+        if let Some(ChatItem::Agent(t)) = s.transcript.last_mut() {
+            t.clear();
+        }
+        s.stream_pending = "x".repeat(STREAM_FLUSH_LONG);
+        assert_eq!(s.stream_flush_interval(), STREAM_FLUSH_MAX);
+        // 中间档在两端之间
+        s.stream_pending = "x".repeat((STREAM_FLUSH_RAMP + STREAM_FLUSH_LONG) / 2);
+        let mid = s.stream_flush_interval();
+        assert!(mid > STREAM_FLUSH && mid < STREAM_FLUSH_MAX);
     }
 
     #[core::prelude::v1::test]
@@ -2925,8 +3042,9 @@ mod tests {
         // 组头那行自己没露出来，但下面紧跟着组内的步骤
         assert!(!l[1].body && l[1].tight);
 
-        // 出了正文：组收起，只剩组头
+        // 出了正文：组收起，只剩组头（流式 chunk 先进合批缓冲，并进正文才算出了正文）
         s.apply_event(KernelEvent::AgentMessageChunk { text: "好了".into() }, None);
+        s.flush_stream();
         let l = s.compute_layout(ViewMode::Normal);
         assert!(!l[1].head.unwrap().live);
         assert!((1..7).all(|i| !l[i].body) && !l[1].tight);

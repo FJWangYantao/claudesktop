@@ -15,6 +15,20 @@
 
 ## UI / gpui
 
+- **流式输出的真正成本是「每个 chunk 整篇 markdown 重解析一次」**（2026-11-13 实测）：
+  `reading_markdown` 流式时补齐半截标记（`\n``` ` 之类），交给 TextView 的文本每帧都不是上一帧的
+  前缀，gpui-kit 的增量解析（`TextViewState::push_str`，前缀追加只解析增量）整条用不上——
+  压测里 7 KB 的流式消息解析一帧 p95 3ms+、max 10ms，消息越长越贵。修法不是改解析，
+  是合批：chunk 先进 `Session::stream_pending`，50ms 才并进正文一次（300 chunk → 32 次上屏），
+  没并进的 chunk 连 `cx.notify()` 都跳过。另外 `flush_stream` 不分思考 / 正文一次全并，
+  正文 chunk  handler 里「先收尾思考」不能直接调它（会把正文缓冲也提前并掉，合批失效），
+  要先看 `stream_pending_thought`。
+- **压测实例收尾用 `taskkill //IM claudesktop.exe //F`**：bash 里 `&` 起的 `$!` 和真正的 exe PID
+  对不上（起过一轮没杀干净的，占着 exe 让下一次 `cargo build` 链接失败：
+  `failed to remove file D:/t3/release/claudesktop.exe`）。
+- **压测数字本身有 ±0.5ms 漂移**（机器负载、热状态）：滚动 p50 同一基线不同时间跑出 2.56→3.94ms。
+  对比优化前后要交替 A/B 连跑几次取中位，别拿两次单跑说事。
+
 - **验证 UI 别用会抢前台的招**：`tools/shot.ps1` 走 PrintWindow，不抢焦点不移动光标，
   随便截；`tools/demo-drive.ps1` 要置顶 + SetCursorPos + 点击，会打断用户手头的事，
   用户明确要求"起无头的、不占前台"后就不要再用它驱动交互。交互逻辑改走单元测试
