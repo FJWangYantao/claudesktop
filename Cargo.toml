@@ -22,3 +22,5 @@ smol = "2"
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+# 打过补丁的 markdown：GFM 自动链接遇全角标点收尾（vendor/markdown）
+markdown = { path = "vendor/markdown" }

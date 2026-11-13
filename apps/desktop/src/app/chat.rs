@@ -246,7 +246,7 @@ pub(super) fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
 /// 回复 / 思考共用的 Markdown 样式。
 pub(super) fn markdown_style() -> TextViewStyle {
     TextViewStyle::default()
-        .paragraph_gap(rems(0.75))
+        .paragraph_gap(rems(0.875))
         // 标题接口只收 Pixels，所以按当前缩放换算一次
         // 正文 15px：一级 24 / 二级 20 / 三级 17，四级起和正文同大、只靠加粗分（相邻两档拉开 3px 以上，
         // 长回复扫一眼能看出分节）。标题上方的段间距由组件按标题字号算，字号拉开留白也跟着变大
@@ -2502,5 +2502,92 @@ mod tests {
         );
         // 没收尾的反引号当普通字
         assert_eq!(tidy("单个 ` ，号"), "单个 `，号");
+    }
+
+    /// GFM 自动链接遇全角标点收尾是 vendor/markdown 的补丁（见 `vendor/README.md`）：
+    /// 上游只认 ASCII 空白为终点，`http://a.b/（注）` 会把全角括号连同后面的字吞进 URL，
+    /// `**http://a.b/**（注）` 的星号也因此露出来。升级 markdown crate 后补丁没打上这里会挂。
+    /// 用和 gpui-base 相同的选项（gfm + math）直接看 AST。
+    #[core::prelude::v1::test]
+    fn autolink_ends_at_fullwidth_punctuation() {
+        use markdown::{ParseOptions, mdast::Node};
+
+        let link_urls = |source: &str| -> Vec<String> {
+            let mut options = ParseOptions::gfm();
+            options.constructs.math_text = true;
+            options.constructs.math_flow = true;
+            let ast = markdown::to_mdast(source, &options).expect("parse");
+            let mut urls = Vec::new();
+            fn walk(node: &Node, urls: &mut Vec<String>) {
+                if let Node::Link(link) = node {
+                    urls.push(link.url.clone());
+                }
+                if let Some(children) = node.children() {
+                    for child in children {
+                        walk(child, urls);
+                    }
+                }
+            }
+            walk(&ast, &mut urls);
+            urls
+        };
+        let strong_texts = |source: &str| -> Vec<String> {
+            let mut options = ParseOptions::gfm();
+            options.constructs.math_text = true;
+            options.constructs.math_flow = true;
+            let ast = markdown::to_mdast(source, &options).expect("parse");
+            let mut texts = Vec::new();
+            fn subtree_text(node: &Node, buf: &mut String) {
+                match node {
+                    Node::Text(t) => buf.push_str(&t.value),
+                    _ => {
+                        if let Some(children) = node.children() {
+                            for child in children {
+                                subtree_text(child, buf);
+                            }
+                        }
+                    }
+                }
+            }
+            fn walk(node: &Node, texts: &mut Vec<String>) {
+                if let Node::Strong(strong) = node {
+                    let mut buf = String::new();
+                    for child in &strong.children {
+                        subtree_text(child, &mut buf);
+                    }
+                    texts.push(buf);
+                }
+                if let Some(children) = node.children() {
+                    for child in children {
+                        walk(child, texts);
+                    }
+                }
+            }
+            walk(&ast, &mut texts);
+            texts
+        };
+
+        // 图二原样：URL 不再吞 `**（等价，200）`，加粗成立、无星号露出
+        assert_eq!(
+            link_urls("Chrome 里请用 **http://localhost:4390/**（等价，200）"),
+            ["http://localhost:4390/".to_string()]
+        );
+        assert_eq!(
+            strong_texts("Chrome 里请用 **http://localhost:4390/**（等价，200）"),
+            ["http://localhost:4390/".to_string()]
+        );
+        // 斜体、下划线强调同病同治（URL 的尾斜线保留）
+        assert_eq!(link_urls("*http://a.b/*（好）"), ["http://a.b/".to_string()]);
+        assert_eq!(link_urls("__http://a.b/__（好）"), ["http://a.b/".to_string()]);
+        // 裸链接后跟全角标点：只链 URL 本身
+        assert_eq!(link_urls("打开 http://a.b/，好的"), ["http://a.b/".to_string()]);
+        assert_eq!(link_urls("见 **文档 http://a.b/**（好）"), ["http://a.b/".to_string()]);
+        // 半角括号 / 空格的旧行为不变
+        assert_eq!(link_urls("x (http://a.b/) y"), ["http://a.b/".to_string()]);
+        // URL 带全角字符（罕见）时仍整段链住，不会断成两半
+        assert_eq!(
+            link_urls("看 http://example.com/页面 名称"),
+            ["http://example.com/页面".to_string()]
+        );
     }
 }

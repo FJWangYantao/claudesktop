@@ -5,6 +5,13 @@
 
 ## 构建 / 测试
 
+- **调试环境变量是 `CLAUDESKTOP_*`，不是 `CLAUDEDESKTOP_*`**：多拼一个 `DE` 会让截图、样本、启动计时等钩子全部无效，表现为窗口照常启动但没有截图或日志。先核对 `main.rs` 实际读取的名字，不要据此推断启动卡死。
+- **markdown crate 在 vendor 里打过补丁（2026-11-14）**：GFM 自动链接只把 ASCII 空白当 URL 终点，
+  全角标点（`，。（）`）被连字吞进 URL（`http://a.b/，好的` 整句成链接；`**http://a.b/**（注）` 星号露出）。
+  改动在 `vendor/markdown/src/construct/gfm_autolink_literal.rs`（标 `claudesktop patch`，详见
+  `vendor/README.md`），回归测试 `chat.rs` 的 `autolink_ends_at_fullwidth_punctuation`。
+  坑：路径里的 ASCII 标点（`/` `?` `=` `&`）必须继续吞、只有非 ASCII 标点才收尾——第一版补丁按
+  「是标点就收」写，URL 的路径被砍掉，被这个测试当场抓回来。
 - 本机内存小，本地 `cargo test` / `cargo check` 会因页面文件太小（os error 1455）失败：改动直接提交，验证交给 CI。
 - **`target/` 旧产物会坏**（2026-11-12 实锤）：`target/debug/build/ring-*/` 的 build script
   残留一旦被杀毒 / 360 动过，再编就在 `cc-rs` 报 `exit code: 2`（cl.exe 的 `D8050: 未能将命令行

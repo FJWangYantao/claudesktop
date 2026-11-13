@@ -836,7 +836,7 @@ pub fn state_line(color: Color) -> Rgba {
 // 字号放大时列宽不该跟着放大，否则一行字数跟着变。
 // 侧栏、分类导航、顶栏高度是界面的「框」，跟字号缩放（放大后标题和相对时间才不会互挤）。
 
-/// 对话列与输入框的最大宽度（阅读列）
+/// 对话内容与输入框共用容器的最大宽度（含两侧留白）。
 pub const READING_W: Pixels = px(760.);
 /// 设置页内容最大宽度
 pub const FORM_W: Pixels = px(720.);
@@ -845,7 +845,7 @@ pub const SETTINGS_NAV_W: Rems = rems(12.5);
 /// 首页用量概览面板宽度
 pub const OVERVIEW_W: Pixels = px(724.);
 /// 侧栏宽度（含外圈留白）
-pub const SIDEBAR_W: Rems = rems(16.);
+pub const SIDEBAR_W: Rems = rems(12.5);
 /// 设置页里填数字的小输入框（步数上限这类）
 pub const NUMBER_INPUT_W: Pixels = px(120.);
 
@@ -1004,13 +1004,13 @@ mod tests {
         set_font_scale(scale);
         let rem = root_font_size();
         // 放大后侧栏、导航、顶栏跟着变宽变高
-        assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(256. * scale));
+        assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(200. * scale));
         assert_eq!(as_rems(SETTINGS_NAV_W).to_pixels(rem), px(200. * scale));
         // 阅读列是 measure：不跟字号走（一行字数的量纲不变）
         assert_eq!(READING_W, px(760.));
         assert_eq!(FORM_W, px(720.));
         set_font_scale(FONT_SCALE_DEFAULT);
-        assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(256.));
+        assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(200.));
     }
 
     /// 焦点环必须是三层（缝 + 实边 + 光晕），都在边框外面，光晕的 σ 是 CSS 值的一半。

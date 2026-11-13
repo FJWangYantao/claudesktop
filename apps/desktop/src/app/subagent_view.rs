@@ -353,7 +353,7 @@ impl ChatApp {
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(&self.task_scroll)
-                .child(div().max_w(READING_W).mx_auto().w_full().px_6().py_6().child(page))
+                .child(div().max_w(READING_W).mx_auto().w_full().px_8().py_6().child(page))
                 .into_any_element(),
         )
     }

@@ -1224,6 +1224,20 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 调试钩子：CLAUDESKTOP_OPEN=sample-reply，把 `tools/markdown-sample.md` 作为一轮
+    /// 回复摆进当前会话——无头截图验证回复排版用（见「方案-回复排版对比修复.md」）。
+    pub(crate) fn debug_sample_reply(&mut self, cx: &mut Context<Self>) {
+        let s = &mut self.sessions[self.active];
+        s.transcript.push(ChatItem::User {
+            text: "daemon 排障进展到哪了".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.transcript
+            .push(ChatItem::Agent(include_str!("../../../../tools/markdown-sample.md").into()));
+        cx.notify();
+    }
+
     /// 压测钩子：往当前会话灌 `n` 行混合内容（用户消息 / markdown 回复 / 工具行 / 备注）。
     pub(crate) fn debug_stress(&mut self, n: usize, busy: bool, cx: &mut Context<Self>) {
         let s = &mut self.sessions[self.active];
@@ -2708,9 +2722,14 @@ impl Render for ChatApp {
         self.sync_placeholder(window, cx);
 
         // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
-        let body =
-            v_flex().flex_1().min_h_0().child(self.content_slot()).when(!self.settings_open, |d| {
-                d.child(div().px_6().pb_4().pt_2().child(self.render_composer(window, cx)))
+        let body = v_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .when(!self.settings_open, |d| d.max_w(READING_W))
+            .child(self.content_slot())
+            .when(!self.settings_open, |d| {
+                d.child(div().px_8().pb_4().pt_2().child(self.render_composer(window, cx)))
             });
         let main = v_flex()
             .flex_1()

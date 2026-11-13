@@ -120,7 +120,7 @@ impl ChatApp {
             cx.processor(|this, ix: usize, window, cx| {
                 let s = &this.sessions[this.active];
                 let n = s.transcript.len();
-                let row = div().max_w(READING_W).mx_auto().w_full().px_6();
+                let row = div().max_w(READING_W).mx_auto().w_full().px_8();
                 // 过程组里的一步：展开 / 收起走弹簧，收起没走完之前照样画、按进度裁切
                 // （每帧都要问一次进度，状态才留得住）
                 let reveal = match s.layout.get(ix) {
@@ -148,7 +148,7 @@ impl ChatApp {
                             this.with_flash(div().relative().child(body), ix, card, window, cx);
                         row.pt(px(if ix == 0 { 16. } else { 0. })).child(body)
                     }
-                    (None, _) if ix == n => row.pb_6().children(this.render_turn_status()),
+                    (None, _) if ix == n => row.pb_12().children(this.render_turn_status()),
                     _ => row,
                 };
                 div().w_full().child(content).into_any_element()

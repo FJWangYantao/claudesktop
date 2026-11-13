@@ -2634,6 +2634,9 @@ fn prompt_sections(
              {delegation}\
              {BACKGROUND}\n\
              Keep replies concise. Answer in the user's language. Use Markdown for structure and code.\n\
+             When a reply runs past three paragraphs or covers more than one topic, split it with \
+short headings (numbered or a few words), one topic per section, list items within a section, \
+and keep headings bare (no trailing explanation).\n\
              Act on the task directly: don't restate a plan or narrate what you are about to do \
              before a tool call, and don't re-confirm facts you already have from the conversation \
              or from tool results. A short reply is better than a thorough-looking one.",

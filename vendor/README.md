@@ -18,6 +18,26 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
   测试在 `apps/desktop/src/app/chat.rs` 的 `cjk_wrap_follows_kinsoku`（用 `NoopTextSystem` 驱动真的 `LineWrapper`），
   升级后补丁没打上它会挂。
 
+## markdown 1.0.0
+
+gpui-kit → gpui-base 的 Markdown `TextView` 用的解析器。原样拷自 crates.io 发布包（`Cargo.toml` / `LICENSE` /
+`README.md` / `src`）。
+
+改动都标了 `claudesktop patch`（`grep -rn "claudesktop patch" vendor/markdown/`）：
+
+- **GFM 自动链接遇全角标点收尾**（`src/construct/gfm_autolink_literal.rs` 的 `path_inside` /
+  `trail` 分支及 `is_non_ascii_punctuation_after` 辅助函数）：上游只把 ASCII 空白当 URL 终点，全角逗号 / 句号 /
+  括号被当普通字符连着后面的字一起吞进链接（`http://a.b/，好的` 整句变成 URL；`**http://a.b/**（注）`
+  的 `**` 进了 URL，加粗失效、星号原样露出）。按整字符分类，让非 ASCII 标点收尾；路径中的 `/`、`?`、`=` 等 ASCII 标点仍保留。
+  测试在 `apps/desktop/src/app/chat.rs` 的 `autolink_ends_at_fullwidth_punctuation`（和 gpui-base 同
+  gfm+math 选项直接看 AST），升级后补丁没打上它会挂。
+
+### 升级
+
+markdown crate 换版本时：把新版发布包拷进来，重打上面的补丁（`grep -rn "claudesktop patch"` 核对三处），
+跑 `cargo test -p claudesktop autolink`。上游若已修（micromark 上游同样只认 ASCII 空白，短期不会），
+删掉本目录和根 `Cargo.toml` 的 patch 行。
+
 ## gpui-pre-windows 0.3.9
 
 gpui 的 Windows 平台层（lib 名 `gpui_windows`），原样拷自 crates.io 发布包（删了 `Cargo.toml.orig` / `Cargo.lock`）。

@@ -101,6 +101,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     组件颜色不对时先补映射，别在调用处逐个覆盖。派生的 `button_*` 色要和基色一起写。
 - **圆角 / 宽度**：圆角只用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
   不写 `rounded(px(..))`；阅读列 / 设置页 / 概览 / 侧栏宽度用 `READING_W` / `FORM_W` / `OVERVIEW_W` / `SIDEBAR_W`。
+  对话内容和输入框由 `app/mod.rs` 的同一个 body 容器限宽 `READING_W`、整体靠左，两侧留 `px_8` 内边距；设置 / 用量页独立布局。
   `READING_W` / `FORM_W` / `OVERVIEW_W` 是 measure，**保持 px**；`SIDEBAR_W` / `SETTINGS_NAV_W` / `CHROME_H`
   是「框」，是 `Rems`，拿它算加减时要 `.to_pixels(window.rem_size())`（设置页整页宽度用 `theme::settings_page_w()`）。
 - **阴影**：`raised_shadow()`（贴地一档）/ `float_shadow()`（悬浮两层）在 `theme.rs`，σ 已按 CSS 减半；
@@ -261,7 +262,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 ## 其他
 
 - 会话 / 内核逻辑放 `crates/*`（可单测），UI 层保持薄。
-- 调试钩子统一走环境变量（`CLAUDEDESKTOP_*`），入口集中在 `main.rs`；
+- 调试钩子统一走环境变量（`CLAUDESKTOP_*`），入口集中在 `main.rs`；
   涉及 Popover 内部状态的钩子做不了（open 状态不在我们手里），别为此改成受控模式。
 - 提交信息用英文 conventional commits（见 git log），代码注释用中文。
 - 本文件会整份进自研内核的系统提示词（`crates/builtin/src/instructions.rs`，每次请求都带），新增内容保持精炼。

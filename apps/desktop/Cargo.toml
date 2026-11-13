@@ -26,3 +26,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 
 [build-dependencies]
 embed-resource = "3"
+
+[dev-dependencies]
+# 单测里直接喂 markdown 解析器（vendor 补丁的回归测试，见 chat.rs 的 autolink_ends_at_fullwidth_punctuation）
+markdown = "=1.0.0"
