@@ -3347,15 +3347,20 @@ impl Render for ChatApp {
         self.sync_placeholder(window, cx);
 
         // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
-        let body = v_flex()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .when(!self.settings_open, |d| d.max_w(READING_W))
-            .child(self.content_slot())
-            .when(!self.settings_open, |d| {
-                d.child(div().px_8().pb_4().pt_2().child(self.render_composer(window, cx)))
-            });
+        let body = v_flex().flex_1().min_h_0().w_full().child(self.content_slot()).when(
+            !self.settings_open,
+            |d| {
+                d.child(
+                    div()
+                        .max_w(READING_W)
+                        .w_full()
+                        .px_8()
+                        .pb_4()
+                        .pt_2()
+                        .child(self.render_composer(window, cx)),
+                )
+            },
+        );
         let main = v_flex()
             .flex_1()
             .min_w_0()

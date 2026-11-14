@@ -1,4 +1,4 @@
-//! 资源：gpui-kit 图标、内嵌内核标志，以及运行时登记的公式 SVG 和远程图片
+//! 资源：gpui-kit 图标、内嵌内核和服务商标志，以及运行时登记的公式 SVG 和远程图片
 //! （见「设计说明-聊天与Code分离.md」6.3、7.5）。
 //!
 //! 公式的结果是自包含 SVG（字形转路径），排版在后台线程做完就按内容哈希登记到
@@ -41,6 +41,40 @@ const KERNEL_LOGOS: &[(&str, &str, &[u8])] = &[
 
 pub fn kernel_logo_path(id: &str) -> Option<&'static str> {
     KERNEL_LOGOS.iter().find(|(name, _, _)| *name == id).map(|(_, path, _)| *path)
+}
+
+const PROVIDER_LOGOS: &[(&str, &str, &[u8])] = &[
+    ("deepseek", "providers/deepseek.svg", include_bytes!("../assets/providers/deepseek.svg")),
+    ("zhipu", "providers/zhipu.svg", include_bytes!("../assets/providers/zhipu.svg")),
+    ("kimi", "providers/kimi.svg", include_bytes!("../assets/providers/kimi.svg")),
+    ("anthropic", "providers/anthropic.svg", include_bytes!("../assets/providers/anthropic.svg")),
+    ("openai", "providers/openai.svg", include_bytes!("../assets/providers/openai.svg")),
+    (
+        "openrouter",
+        "providers/openrouter.svg",
+        include_bytes!("../assets/providers/openrouter.svg"),
+    ),
+    ("ollama", "providers/ollama.svg", include_bytes!("../assets/providers/ollama.svg")),
+];
+
+pub fn provider_logo_path(id: &str) -> Option<&'static str> {
+    PROVIDER_LOGOS.iter().find(|(name, _, _)| *name == id).map(|(_, path, _)| *path)
+}
+
+pub fn provider_logo_for_url(base_url: &str) -> Option<&'static str> {
+    let url = base_url.to_ascii_lowercase();
+    [
+        ("deepseek.com", "deepseek"),
+        ("bigmodel.cn", "zhipu"),
+        ("moonshot.cn", "kimi"),
+        ("moonshot.ai", "kimi"),
+        ("anthropic.com", "anthropic"),
+        ("openai.com", "openai"),
+        ("openrouter.ai", "openrouter"),
+        ("11434", "ollama"),
+    ]
+    .into_iter()
+    .find_map(|(host, id)| url.contains(host).then_some(id))
 }
 
 /// 内存里登记的资源。字节装在 `Arc` 里，淘汰就是最后一个引用放手。
@@ -177,12 +211,15 @@ pub fn math_name(svg: &str) -> String {
     format!("{MATH_PREFIX}{}", crate::app::math::hash_of(svg))
 }
 
-/// 资源源：内核标志查静态表，公式和图片查登记表（内存 → 磁盘缓存），其余转发给 gpui-kit。
+/// 资源源：内核和服务商标志查静态表，公式和图片查登记表（内存 → 磁盘缓存），其余转发给 gpui-kit。
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
         if let Some((_, _, bytes)) = KERNEL_LOGOS.iter().find(|(_, name, _)| *name == path) {
+            return Ok(Some(Cow::Borrowed(*bytes)));
+        }
+        if let Some((_, _, bytes)) = PROVIDER_LOGOS.iter().find(|(_, name, _)| *name == path) {
             return Ok(Some(Cow::Borrowed(*bytes)));
         }
         for prefix in [MATH_PREFIX, IMAGE_PREFIX] {
@@ -212,6 +249,9 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> gpui_kit::Result<Vec<gpui_kit::SharedString>> {
         if path.trim_end_matches('/') == "kernels" {
             return Ok(KERNEL_LOGOS.iter().map(|(_, name, _)| (*name).into()).collect());
+        }
+        if path.trim_end_matches('/') == "providers" {
+            return Ok(PROVIDER_LOGOS.iter().map(|(_, name, _)| (*name).into()).collect());
         }
         let math = path.starts_with(MATH_PREFIX) || path.trim_end_matches('/') == "math";
         let image = path.starts_with(IMAGE_PREFIX) || path.trim_end_matches('/') == "remote";
@@ -292,6 +332,16 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0)
+    }
+
+    #[core::prelude::v1::test]
+    fn provider_logos_cover_all_presets() {
+        for p in crate::settings::preset_profiles() {
+            let id = provider_logo_for_url(&p.base_url).expect(&p.name);
+            let path = provider_logo_path(id).expect(id);
+            assert!(Assets.load(path).unwrap().is_some(), "{path}");
+        }
+        assert_eq!(provider_logo_for_url("https://api.example.com/v1"), None);
     }
 
     #[core::prelude::v1::test]

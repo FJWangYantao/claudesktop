@@ -2,15 +2,15 @@
 
 use super::ChatApp;
 use super::mascot::brand_mark;
+use super::settings_view::{kernel_icon, provider_icon};
 use super::widgets::Surface;
 use crate::model::*;
-use crate::settings::{KernelChoice, Space};
+use crate::settings::Space;
 use crate::theme::rgb;
 use crate::theme::*;
-use crate::usage::{self, HEAT_COLS, HEAT_ROWS, Overview};
+use crate::usage::{self, Overview};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::Position;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -34,65 +34,9 @@ impl ChatApp {
         )
     }
 
-    /// 聊天接不上模型（没配自研内核的端点，只配了 ACP agent）时的引导卡：
-    /// 聊天直接连模型，得先在设置里填端点。分段切换照样显示，别藏起来。
+    /// 聊天接不上模型（没配自研内核的端点，只配了 ACP agent）时，按品牌选一个模型服务。
     fn render_chat_setup(&self, cx: &mut Context<Self>) -> Div {
-        div()
-            .v_flex()
-            .gap_3()
-            .w(OVERVIEW_W)
-            .p_5()
-            .rounded_xl()
-            .bg(rgb(SAND))
-            .child(
-                div()
-                    .v_flex()
-                    .gap_1()
-                    .pb_1()
-                    .child(
-                        div()
-                            .text_size(TEXT_LEAD)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(INK))
-                            .child("聊天要先接上一个模型"),
-                    )
-                    .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
-                        "聊天直接连模型，不需要工作目录；本机装的 agent 是写代码的，跑不了聊天。",
-                    )),
-            )
-            .child(
-                div()
-                    .id("chat-setup-builtin")
-                    .h_flex()
-                    .gap_3()
-                    .p_4()
-                    .rounded_lg()
-                    .bg(rgb(CARD))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)))
-                    .child(Icon::new(IconAll::Cpu).size_5().flex_shrink_0().text_color(rgb(CORAL)))
-                    .child(
-                        div()
-                            .v_flex()
-                            .gap_0p5()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(TEXT_LARGE)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(INK))
-                                    .child("设定点和密钥"),
-                            )
-                            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
-                                "DeepSeek、Kimi、GLM、Anthropic、OpenAI 等，或本机的 Ollama",
-                            )),
-                    )
-                    .child(Icon::new(IconAll::ChevronRight).size_4().text_color(rgb(INK_SOFT)))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.start_setup(KernelChoice::Builtin, window, cx)
-                    })),
-            )
+        div().v_flex().gap_2p5().w_full().child(self.render_provider_logos(cx))
     }
 
     pub(super) fn heat_color(v: u8) -> Color {
@@ -109,7 +53,9 @@ impl ChatApp {
             .p_3()
             .rounded_lg()
             .bg(rgb(CARD))
-            .shadow_xs()
+            .border_1()
+            .border_color(rgb(LINE))
+            .shadow(raised_shadow())
             .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(c.label))
             .child(
                 div()
@@ -123,158 +69,67 @@ impl ChatApp {
             )
     }
 
-    /// 可点的统计卡：点了打开用量页（右上角一个小箭头示意）。
-    pub(super) fn stat_link(c: &StatCard, cx: &mut Context<Self>) -> Stateful<Div> {
-        Self::stat_card(c)
-            .id(c.label)
-            .relative()
-            .cursor_pointer()
-            .hover(|d| d.bg(rgb(HOVER)))
-            .child(
-                Icon::new(IconAll::ArrowUpRight)
-                    .size_3p5()
-                    .absolute()
-                    .top_3()
-                    .right_3()
-                    .text_color(rgb(INK_FAINT)),
-            )
-            .on_click(cx.listener(|this, _, window, cx| this.open_usage(window, cx)))
-    }
-
-    /// 概览页签：6 张统计卡 + 最近 26 周热力图。卡片和有过去日子的格子都能点，进用量页。
-    pub(super) fn render_usage_cards(o: &Overview, cx: &mut Context<Self>) -> Div {
-        let dash = || SharedString::from("—");
-        let stats = [
-            StatCard { label: "会话数", value: usage::compact(o.sessions as u64).into() },
-            StatCard { label: "消息数", value: usage::compact(o.messages as u64).into() },
-            StatCard { label: "Token 总量", value: usage::compact(o.tokens).into() },
-            StatCard { label: "活跃天数", value: o.active_days.to_string().into() },
-            StatCard {
-                label: "高峰时段",
-                value: o.peak_hour.map_or_else(dash, |h| usage::hour_label(h).into()),
-            },
-            StatCard {
-                label: "最常用模型",
-                value: o.models.first().map_or_else(dash, |m| m.name.clone().into()),
-            },
-        ];
-        let mut cards: Vec<Stateful<Div>> = stats.iter().map(|c| Self::stat_link(c, cx)).collect();
-        let second = cards.split_off(3);
-
-        // 格子按列数均分整行宽度，与上面的统计卡两端对齐
-        let today = usage::day_of(super::now_ms(), usage::local_offset_secs());
-        let mut grid = div().v_flex().w_full().gap(px(3.));
-        for row in 0..HEAT_ROWS {
-            let mut line = div().h_flex().w_full().gap(px(3.));
-            for col in 0..HEAT_COLS {
-                let i = row * HEAT_COLS + col;
-                let cell = div().flex_1().h(px(14.)).rounded_sm();
-                let Some(v) = o.heat[i] else {
-                    line = line.child(cell);
-                    continue;
-                };
-                let day = o.heat_first + (col * 7 + row) as i64;
-                let tip: SharedString = match o.heat_turns[i] {
-                    0 => format!("{} · 没有对话", usage::date_label(day, today)),
-                    n => format!("{} · {n} 轮", usage::date_label(day, today)),
-                }
-                .into();
-                line = line.child(
-                    cell.id(("heat", i))
-                        .bg(rgb(Self::heat_color(v)))
-                        .cursor_pointer()
-                        .hover(|d| d.border_1().border_color(rgb(INK_SOFT)))
-                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_usage_day(day, window, cx)
-                        })),
-                );
+    /// 首页轻量用量摘要条：只留一行关键数字，完整热力图与排行点进侧栏「用量」页查看。
+    fn render_usage_strip(&self, o: &Overview, cx: &mut Context<Self>) -> Stateful<Div> {
+        let detail = if o.sessions == 0 && o.tokens == 0 {
+            "还没有用量记录".to_string()
+        } else {
+            let mut text = format!(
+                "{} 个会话 · {} token · 活跃 {} 天",
+                usage::compact(o.sessions as u64),
+                usage::compact(o.tokens),
+                o.active_days
+            );
+            if let Some(m) = o.models.first() {
+                text.push_str(&format!(" · 常用 {}", m.name));
             }
-            grid = grid.child(line);
-        }
-
+            text
+        };
         div()
-            .v_flex()
-            .gap_4()
+            .id("overview-usage-strip")
+            .h_flex()
+            .items_center()
+            .gap_2p5()
+            .w_full()
+            .px_3p5()
+            .py_2p5()
+            .rounded_xl()
+            .bg(rgb(SAND))
+            .cursor_pointer()
+            .hover(|d| d.bg(rgb(SELECTED)))
+            .on_click(cx.listener(|this, _, window, cx| this.open_usage(window, cx)))
+            .child(Icon::new(IconAll::ChartColumn).size_4().flex_shrink_0().text_color(rgb(CORAL)))
             .child(
                 div()
-                    .v_flex()
-                    .gap_3()
-                    .child(div().h_flex().gap_3().children(cards))
-                    .child(div().h_flex().gap_3().children(second)),
+                    .flex_shrink_0()
+                    .text_size(TEXT_SMALL)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(INK))
+                    .child("最近用量"),
             )
-            .child(grid)
-    }
-
-    /// 模型页签：每个模型的轮数和 token（列前 8 个），条形按轮数。点一行进用量页、只看这个模型。
-    pub(super) fn render_usage_models(o: &Overview, cx: &mut Context<Self>) -> Div {
-        let mut list = div().v_flex().gap_2().w_full();
-        if o.models.is_empty() {
-            return list.child(
+            .child(
                 div()
-                    .py_6()
-                    .text_size(TEXT_BODY)
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
-                    .child("这段时间还没有记录到模型（ACP agent 不上报模型时不计入）"),
-            );
-        }
-        let max = o.models.first().map_or(1, |m| m.turns.max(1));
-        for (i, m) in o.models.iter().take(8).enumerate() {
-            let share = m.turns as f32 / max as f32;
-            let name = m.name.clone();
-            list = list.child(
+                    .font_features(tabular_nums())
+                    .child(detail),
+            )
+            .child(
                 div()
-                    .id(("model-row", i))
-                    .v_flex()
+                    .flex_shrink_0()
+                    .h_flex()
+                    .items_center()
                     .gap_1()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(CARD))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_usage_model(&name, window, cx)
-                    }))
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .font_family(MONO)
-                                    .text_size(TEXT_BODY)
-                                    .text_color(rgb(INK))
-                                    .child(m.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(TEXT_SMALL)
-                                    .text_color(rgb(INK_SOFT))
-                                    .child(format!(
-                                        "{} 轮 · {} token",
-                                        usage::compact(m.turns as u64),
-                                        usage::compact(m.tokens)
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div().h(px(6.)).w_full().rounded_full().bg(rgb(Self::heat_color(0))).child(
-                            div()
-                                .h_full()
-                                .w(relative(share))
-                                .rounded_full()
-                                .bg(rgb(Self::heat_color(3))),
-                        ),
-                    ),
-            );
-        }
-        list
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK_SOFT))
+                    .child("详情")
+                    .child(Icon::new(IconAll::ArrowUpRight).size_3p5()),
+            )
     }
 
     fn tab(
@@ -297,87 +152,100 @@ impl ChatApp {
             .child(Self::seg(label, active))
     }
 
-    /// 新装还没配内核时，首页的用量面板换成两种接法（见 `Settings::needs_setup`）。
+    /// 新装还没配内核时，首页直接按品牌选择；点了进入该服务商或 agent 的配置。
     fn render_setup(&self, cx: &mut Context<Self>) -> Div {
-        let option = |id: &'static str,
-                      icon: IconAll,
-                      title: &'static str,
-                      detail: &'static str,
-                      kind: KernelChoice,
-                      cx: &mut Context<Self>| {
+        div().v_flex().gap_4().w_full().child(self.render_provider_logos(cx)).child(
             div()
-                .id(id)
-                .h_flex()
-                .gap_3()
-                .p_4()
-                .rounded_lg()
-                .bg(rgb(CARD))
-                .cursor_pointer()
-                .hover(|d| d.bg(rgb(HOVER)))
-                .child(Icon::new(icon).size_5().flex_shrink_0().text_color(rgb(CORAL)))
+                .v_flex()
+                .gap_2()
+                .w_full()
                 .child(
                     div()
-                        .v_flex()
-                        .gap_0p5()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(TEXT_LARGE)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(INK))
-                                .child(title),
-                        )
-                        .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(detail)),
+                        .px_1()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_SOFT))
+                        .child("本机 agent"),
                 )
-                .child(Icon::new(IconAll::ChevronRight).size_4().text_color(rgb(INK_SOFT)))
+                .child(div().h_flex().gap_3().w_full().children(
+                    claudesktop_core::agents::PRESETS.iter().map(|preset| {
+                        let id = preset.id;
+                        Self::setup_tile(
+                            ElementId::Name(format!("setup-agent-{id}").into()),
+                            kernel_icon(id),
+                            preset.name,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.start_setup_agent(id, window, cx),
+                        ))
+                    }),
+                )),
+        )
+    }
+
+    fn render_provider_logos(&self, cx: &mut Context<Self>) -> Div {
+        let tiles = crate::settings::preset_profiles()
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let id = crate::assets::provider_logo_for_url(&p.base_url).unwrap_or("custom");
+                let name = provider_name(&p.name);
+                Self::setup_tile(
+                    ElementId::Name(format!("setup-provider-{id}").into()),
+                    provider_icon(&p.base_url),
+                    name,
+                )
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    let kind = kind.clone();
-                    this.start_setup(kind, window, cx)
+                    this.start_setup_provider(Some(i), window, cx)
                 }))
-        };
+            })
+            .chain(std::iter::once(
+                Self::setup_tile("setup-provider-custom", Icon::new(IconAll::Plus), "自定义")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_setup_provider(None, window, cx)
+                    })),
+            ))
+            .collect::<Vec<_>>();
+        let mut grid = div().v_flex().gap_3().w_full();
+        let mut tiles = tiles.into_iter();
+        loop {
+            let row: Vec<_> = tiles.by_ref().take(4).collect();
+            if row.is_empty() {
+                break;
+            }
+            grid = grid.child(div().h_flex().gap_3().w_full().children(row));
+        }
+        grid
+    }
+
+    fn setup_tile(id: impl Into<ElementId>, icon: Icon, name: &'static str) -> Stateful<Div> {
         div()
+            .id(id)
             .v_flex()
-            .gap_3()
-            .w(OVERVIEW_W)
-            .p_5()
-            .rounded_xl()
-            .bg(rgb(SAND))
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .flex_1()
+            .min_w_0()
+            .py_4()
+            .rounded_lg()
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(LINE))
+            .shadow(raised_shadow())
+            .cursor_pointer()
+            .hover(|d| d.border_color(rgb(LINE_STRONG)))
+            .child(icon.size_6().flex_shrink_0().text_color(rgb(INK)))
             .child(
                 div()
-                    .v_flex()
-                    .gap_1()
-                    .pb_1()
-                    .child(
-                        div()
-                            .text_size(TEXT_LEAD)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(INK))
-                            .child("先接上一个模型"),
-                    )
-                    .child(
-                        div()
-                            .text_size(TEXT_SMALL)
-                            .text_color(rgb(INK_SOFT))
-                            .child("claudesktop 自己不带模型。选一种接法，之后随时能在设置里改。"),
-                    ),
+                    .w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_center()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK))
+                    .child(name),
             )
-            .child(option(
-                "setup-builtin",
-                IconAll::Cpu,
-                "用 API Key",
-                "DeepSeek、Kimi、GLM、Anthropic、OpenAI 等，或本机的 Ollama：选个预设，填上密钥",
-                KernelChoice::Builtin,
-                cx,
-            ))
-            .child(option(
-                "setup-acp",
-                IconAll::SquareTerminal,
-                "用本机装好的 agent",
-                "Claude Code / OpenCode / pi：检测到就一键启用，登录和模型都在 agent 那边",
-                KernelChoice::Acp(String::new()),
-                cx,
-            ))
     }
 
     pub(super) fn render_overview(&self, cx: &mut Context<Self>) -> Div {
@@ -390,11 +258,6 @@ impl ChatApp {
         let o = usage::overview(&self.usage_stats(), now, usage::local_offset_secs(), range);
         let needs_setup = self.settings.needs_setup();
         let setup = needs_setup.then(|| self.render_setup(cx));
-        let body = match self.overview_tab {
-            1 => Self::render_usage_models(&o, cx),
-            2 => self.render_usage_requests(false, cx),
-            _ => Self::render_usage_cards(&o, cx),
-        };
         // 聊天空间：问候语 + 最近会话，**不放用量概览**（用量在侧栏「用量」里）。
         // 聊天接不上模型（只配了 ACP agent）时换成一张引导卡
         let chat = self.space() == Space::Chat;
@@ -404,7 +267,7 @@ impl ChatApp {
                 .v_flex()
                 .flex_1()
                 .min_h_0()
-                .items_center()
+                .items_start()
                 .justify_center()
                 .gap_6()
                 .child(self.render_greeting())
@@ -416,109 +279,84 @@ impl ChatApp {
             .v_flex()
             .flex_1()
             .min_h_0()
-            .items_center()
+            .items_start()
             .justify_center()
             .gap_6()
             .child(self.render_greeting())
             .children(setup)
             .children((!needs_setup).then(|| self.render_recent(cx)).flatten())
             .when(!needs_setup, |d| {
-                d.child(
-                    div()
-                        .v_flex()
-                        .gap_4()
-                        .w(OVERVIEW_W)
-                        .p_5()
-                        .rounded_xl()
-                        .bg(rgb(SAND))
-                        .child(
-                            // 顶行：左侧 tabs，右侧范围
-                            div()
-                                .h_flex()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .h_flex()
-                                        .gap_1()
-                                        .child(self.tab(
-                                            "tab-overview",
-                                            "概览",
-                                            self.overview_tab == 0,
-                                            cx,
-                                            |t| t.overview_tab = 0,
-                                        ))
-                                        .child(self.tab(
-                                            "tab-model",
-                                            "模型",
-                                            self.overview_tab == 1,
-                                            cx,
-                                            |t| t.overview_tab = 1,
-                                        ))
-                                        .child(self.tab(
-                                            "tab-requests",
-                                            "请求",
-                                            self.overview_tab == 2,
-                                            cx,
-                                            |t| t.overview_tab = 2,
-                                        )),
-                                )
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .h_flex()
-                                        .gap_1()
-                                        .child(self.tab(
-                                            "range-all",
-                                            "全部",
-                                            self.overview_range == 0,
-                                            cx,
-                                            |t| t.overview_range = 0,
-                                        ))
-                                        .child(self.tab(
-                                            "range-30",
-                                            "30 天",
-                                            self.overview_range == 1,
-                                            cx,
-                                            |t| t.overview_range = 1,
-                                        ))
-                                        .child(self.tab(
-                                            "range-7",
-                                            "7 天",
-                                            self.overview_range == 2,
-                                            cx,
-                                            |t| t.overview_range = 2,
-                                        )),
-                                )
-                                .child(
-                                    div().pl_2().child(
-                                        Self::quiet_button(
-                                            "usage-detail",
-                                            IconAll::ArrowUpRight,
-                                            Surface::Sand,
-                                            cx,
-                                        )
-                                        .small()
-                                        .tooltip("看用量详情")
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.open_usage(window, cx)
-                                            }),
+                // `CLAUDESKTOP_STRESS_VIEW=requests` 压测钩子显式切到 tab 2 时仍画请求明细面板
+                if self.overview_tab == 2 {
+                    d.child(
+                        div()
+                            .v_flex()
+                            .gap_4()
+                            .w_full()
+                            .p_5()
+                            .rounded_xl()
+                            .bg(rgb(SAND))
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(TEXT_BODY)
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(INK))
+                                            .child("请求明细"),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .gap_1()
+                                            .child(self.tab(
+                                                "range-all",
+                                                "全部",
+                                                self.overview_range == 0,
+                                                cx,
+                                                |t| t.overview_range = 0,
+                                            ))
+                                            .child(self.tab(
+                                                "range-30",
+                                                "30 天",
+                                                self.overview_range == 1,
+                                                cx,
+                                                |t| t.overview_range = 1,
+                                            ))
+                                            .child(self.tab(
+                                                "range-7",
+                                                "7 天",
+                                                self.overview_range == 2,
+                                                cx,
+                                                |t| t.overview_range = 2,
+                                            )),
+                                    )
+                                    .child(
+                                        div().pl_2().child(
+                                            Self::quiet_button(
+                                                "usage-detail",
+                                                IconAll::ArrowUpRight,
+                                                Surface::Sand,
+                                                cx,
+                                            )
+                                            .small()
+                                            .tooltip("看用量详情")
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.open_usage(window, cx)
+                                                }),
+                                            ),
                                         ),
                                     ),
-                                ),
-                        )
-                        .child(body)
-                        // 「请求」页签自己有汇总行，不再挂书本换算
-                        .when(self.overview_tab != 2, |d| {
-                            d.child(
-                                div()
-                                    .pt_1()
-                                    .text_size(TEXT_SMALL)
-                                    .text_color(rgb(INK_SOFT))
-                                    .child(usage::book_line(o.tokens)),
                             )
-                        }),
-                )
+                            .child(self.render_usage_requests(false, cx)),
+                    )
+                } else {
+                    d.child(self.render_usage_strip(&o, cx))
+                }
             })
     }
 }
@@ -568,7 +406,7 @@ impl ChatApp {
                 .bg(rgb(CARD))
                 .border_1()
                 .border_color(rgb(LINE))
-                .shadow_xs()
+                .shadow(raised_shadow())
                 .cursor_pointer()
                 .hover(|d| d.border_color(rgb(LINE_STRONG)))
                 .child(
@@ -598,7 +436,7 @@ impl ChatApp {
             div()
                 .v_flex()
                 .gap_2()
-                .w(OVERVIEW_W)
+                .w_full()
                 .child(
                     div().px_1().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("最近会话"),
                 )
@@ -650,6 +488,19 @@ impl ChatApp {
             state.focus(window, cx);
         });
         self.refresh_composer(cx);
+    }
+}
+
+fn provider_name(name: &str) -> &'static str {
+    match name {
+        "GLM 智谱" => "GLM",
+        "Kimi 月之暗面" => "Kimi",
+        "Ollama 本地" => "Ollama",
+        "DeepSeek" => "DeepSeek",
+        "Anthropic" => "Anthropic",
+        "OpenAI" => "OpenAI",
+        "OpenRouter" => "OpenRouter",
+        _ => "模型服务",
     }
 }
 

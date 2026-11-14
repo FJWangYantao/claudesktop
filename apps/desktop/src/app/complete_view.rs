@@ -715,7 +715,7 @@ impl ChatApp {
                 .border_1()
                 .border_color(rgb(LINE))
                 .bg(rgb(CARD))
-                .shadow_md()
+                .shadow(float_shadow())
                 .child(header)
                 .child(rows),
         )

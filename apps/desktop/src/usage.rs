@@ -609,18 +609,6 @@ impl Streamed {
     }
 }
 
-/// 首页底部那句话：token 换算成《善恶的彼岸》（按一本约 8 万 token）。
-pub fn book_line(tokens: u64) -> String {
-    const BOOK: u64 = 80_000;
-    match tokens {
-        0 => "还没有 token 用量记录（自研内核每轮都会上报，ACP agent 一般不报）。".into(),
-        t if t < BOOK => {
-            format!("你的 Token 用量大约是一本《善恶的彼岸》的 {}%。", (t * 100 / BOOK).max(1))
-        }
-        t => format!("你的 Token 用量相当于 {} 本《善恶的彼岸》。", compact(t / BOOK)),
-    }
-}
-
 /// 本地时区相对 UTC 的秒数。
 pub fn local_offset_secs() -> i64 {
     use chrono::Offset as _;
@@ -827,8 +815,6 @@ mod tests {
         assert_eq!(compact(4194), "4,194");
         assert_eq!(compact(299_400_000), "299.4M");
         assert_eq!(compact(12_345), "12.3K");
-        assert!(book_line(40_000).contains("50%"));
-        assert!(book_line(800_000).contains("10 本"));
     }
 
     #[core::prelude::v1::test]

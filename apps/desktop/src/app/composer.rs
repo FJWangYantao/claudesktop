@@ -417,6 +417,16 @@ impl ChatApp {
                 )
             })
             .when(chat, |d| d.child(self.render_web_chip(cx)))
+            .child(
+                Self::quiet_button("attach-file", IconAll::Plus, Surface::Paper, cx)
+                    .small()
+                    .tooltip(if chat {
+                        "添加图片或文本文件"
+                    } else {
+                        "添加图片或 @ 引用文件"
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_attachment(window, cx))),
+            )
             .child(div().flex_1().self_stretch().on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
@@ -517,8 +527,6 @@ impl ChatApp {
 
         div()
             .v_flex()
-            .max_w(READING_W)
-            .mx_auto()
             .w_full()
             .gap_2()
             // 进行中这一轮的计划钉在最上面（对话往下走它也一直看得见）
@@ -970,6 +978,24 @@ impl ChatApp {
         }
         self.focus_input(window, cx);
         cx.notify();
+    }
+
+    /// 输入框工具栏「+」：系统文件对话框选图片或文件，复用 `drop_paths` 的添加逻辑。
+    pub(crate) fn pick_attachment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("选择图片或文件".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && !paths.is_empty()
+            {
+                let _ = this.update_in(cx, |app, window, cx| app.drop_paths(&paths, window, cx));
+            }
+        })
+        .detach();
     }
 
     /// 拖拽中盖在会话区上的提示（不挡事件：松开落在下面的会话区上）。

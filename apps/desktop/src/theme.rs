@@ -842,10 +842,8 @@ pub const READING_W: Pixels = px(760.);
 pub const FORM_W: Pixels = px(720.);
 /// 设置页左侧分类导航宽度
 pub const SETTINGS_NAV_W: Rems = rems(11.);
-/// 首页用量概览面板宽度
-pub const OVERVIEW_W: Pixels = px(724.);
 /// 侧栏宽度（含外圈留白）
-pub const SIDEBAR_W: Rems = rems(12.5);
+pub const SIDEBAR_W: Rems = rems(15.);
 /// 设置页里填数字的小输入框（步数上限这类）
 pub const NUMBER_INPUT_W: Pixels = px(120.);
 
@@ -1004,13 +1002,13 @@ mod tests {
         set_font_scale(scale);
         let rem = root_font_size();
         // 放大后侧栏、导航、顶栏跟着变宽变高
-        assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(200. * scale));
+        assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(240. * scale));
         assert_eq!(as_rems(SETTINGS_NAV_W).to_pixels(rem), px(176. * scale));
         // 阅读列是 measure：不跟字号走（一行字数的量纲不变）
         assert_eq!(READING_W, px(760.));
         assert_eq!(FORM_W, px(720.));
         set_font_scale(FONT_SCALE_DEFAULT);
-        assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(200.));
+        assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(240.));
     }
 
     /// 焦点环必须是三层（缝 + 实边 + 光晕），都在边框外面，光晕的 σ 是 CSS 值的一半。

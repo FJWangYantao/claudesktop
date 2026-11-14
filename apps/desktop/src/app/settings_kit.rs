@@ -135,7 +135,7 @@ pub(super) fn choice_panel() -> Div {
 /// 返回的行还没挂点击，`trailing` 放在对勾前（如删除按钮）。
 pub(super) fn choice_row(
     id: impl Into<ElementId>,
-    icon: IconAll,
+    icon: impl Into<Icon>,
     title: impl Into<SharedString>,
     desc: impl Into<SharedString>,
     active: bool,

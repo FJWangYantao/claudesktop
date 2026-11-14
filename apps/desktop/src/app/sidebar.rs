@@ -659,10 +659,10 @@ impl ChatApp {
                     .text_color(rgb(INK))
                     .child("claudesktop"),
             );
-        // 贴边的面板：纸色底 + 右侧一条分隔线，占满窗口左缘，把视觉重心让给会话区
+        // 贴边的面板：沙色底 + 右侧一条分隔线，占满窗口左缘，靠面差把视觉重心让给主区
         let panel = v_flex()
             .size_full()
-            .bg(rgb(PAPER))
+            .bg(rgb(SAND))
             .border_r_1()
             .border_color(rgb(LINE))
             .overflow_hidden()
@@ -697,6 +697,7 @@ impl ChatApp {
                 nav_item("usage", IconAll::ChartColumn, "用量", usage_open)
                     .on_click(cx.listener(|this, _, window, cx| this.open_usage(window, cx))),
             )
+            .child(div().mx_3().my_1().border_t_1().border_color(rgb(LINE)))
             .child(
                 // 列表滚到底部「设置」上面时渐隐，不是一刀切（同对话区的下边缘）；
                 // 列表底下留出渐隐的高度，滚到头时最后一行不被盖住。滚到底了渐隐收成 0
@@ -721,8 +722,8 @@ impl ChatApp {
                         div().absolute().left_0().right_0().bottom_0().h(h.to_pixels(rem)).bg(
                             linear_gradient(
                                 180.,
-                                linear_color_stop(Rgba { a: 0., ..rgb(PAPER) }, 0.),
-                                linear_color_stop(rgb(PAPER), 1.),
+                                linear_color_stop(Rgba { a: 0., ..rgb(SAND) }, 0.),
+                                linear_color_stop(rgb(SAND), 1.),
                             )
                             .color_space(ColorSpace::Oklab),
                         )
@@ -813,7 +814,7 @@ impl ChatApp {
                     .text_color(rgb(if active { INK } else { INK_SOFT }))
                     .when(active, |d| {
                         d.font_weight(FontWeight::MEDIUM)
-                            .shadow_xs()
+                            .shadow(raised_shadow())
                             .border_1()
                             .border_color(rgb(LINE))
                     })
@@ -825,10 +826,17 @@ impl ChatApp {
                     .on_click(cx.listener(move |this, _, _, cx| this.switch_space(space, cx))),
             );
         }
-        div()
-            .px_2()
-            .pb_1()
-            .child(div().h_flex().items_center().rounded_md().bg(rgb(PAPER)).p_0p5().child(segs))
+        div().px_2().pb_1().child(
+            div()
+                .h_flex()
+                .items_center()
+                .rounded_md()
+                .bg(rgb(PAPER))
+                .border_1()
+                .border_color(rgb(LINE))
+                .p_0p5()
+                .child(segs),
+        )
     }
 
     /// 侧栏分组标题上的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
@@ -1150,7 +1158,7 @@ impl ChatApp {
                 )));
         }
 
-        // 状态标记：等授权红点、运行中转圈、待查看赤陶实心点，其余空心圈（与官方一样，每行都有个标记位）
+        // 状态标记：等授权红点、运行中转圈、待查看赤陶实心点，空闲会话保持安静不挂圈
         let marker = if s.busy && s.waiting_user() {
             div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
         } else if s.busy {
@@ -1173,12 +1181,7 @@ impl ChatApp {
             // 有还没看的新结果：赤陶实心点
             div().size(px(7.)).rounded_full().bg(rgb(CORAL)).into_any_element()
         } else {
-            div()
-                .size(px(9.))
-                .rounded_full()
-                .border_1()
-                .border_color(rgb(if active { INK_SOFT } else { INK_FAINT }))
-                .into_any_element()
+            div().into_any_element()
         };
         let age = s.meta.as_ref().map(|m| age_label(m.updated_ms));
         let token = s.token;

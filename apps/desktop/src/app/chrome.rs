@@ -240,6 +240,11 @@ impl ChatApp {
                         ),
                 )
             })
+            .when(
+                window_controls(window).is_some()
+                    && (can_export || running_count > 0 || self.session().worktree.is_some()),
+                |d| d.child(div().w(px(1.)).h(rems(1.)).mr_1().bg(rgb(LINE))),
+            )
             .children(window_controls(window))
     }
 }

@@ -152,7 +152,7 @@ pub struct SettingsForm {
     agents: Vec<AgentProfile>,
     /// 本机 agent 的检测结果（同一次应用启动中保留，手动刷新才重测）
     agent_detect: AgentDetect,
-    /// 首页引导选了「本机 agent」时检测还没跑完：跑完再顺手启用（见 `start_setup`）
+    /// 首页选了本机 agent、检测还没跑完时，跑完启用选中的那一家
     enable_on_detect: bool,
     /// 自定义 agent 的启动命令（空 = 没有自定义 agent）
     custom_command: Entity<InputState>,
@@ -1084,37 +1084,98 @@ impl ChatApp {
         self.settings_form.message = Some((true, why.into()));
     }
 
-    /// 首页配置引导选了一种接法：打开「内核」并选好那种内核；
-    /// 还没启用任何 agent 且本机装了 Claude Code 时顺手把它启用上。
-    pub(crate) fn start_setup(
+    /// 首页选了某家模型服务：直接展开它的端点和密钥表单。
+    pub(crate) fn start_setup_provider(
         &mut self,
-        kind: KernelChoice,
+        preset: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_at(PROVIDER_TAB, window, cx);
+        self.settings_form.kernel = KernelChoice::Builtin;
+        let profile = preset.map(|i| preset_profiles().remove(i));
+        let existing = profile.as_ref().and_then(|preset| {
+            self.settings_form
+                .profiles
+                .iter()
+                .position(|p| p.base_url.trim().eq_ignore_ascii_case(preset.base_url.trim()))
+        });
+        let i = match existing {
+            Some(i) => {
+                self.select_form_profile(i, window, cx);
+                self.settings_form.editing_profile = true;
+                i
+            }
+            None => {
+                self.add_form_profile(preset, window, cx);
+                self.settings_form.view
+            }
+        };
+        if !self.settings.builtin.is_configured()
+            && self.settings_form.profiles[i].model.trim().is_empty()
+        {
+            self.settings_form.active = i;
+        }
+        let local = profile.as_ref().is_none_or(|p| p.base_url.contains("11434"));
+        self.settings_form.message = Some((
+            false,
+            if profile.is_none() {
+                "填上服务商的端点、API Key 和模型名，再点「保存」".into()
+            } else if profile.as_ref().is_some_and(|p| p.model.trim().is_empty()) {
+                "填好端点后保存，再到「模型」页选择模型".into()
+            } else {
+                "填上 API Key，点右上角「保存」即可开始".into()
+            },
+        ));
+        let input = {
+            let inputs = &self.settings_form.inputs[i];
+            if local { inputs.base_url.clone() } else { inputs.api_key.clone() }
+        };
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// 首页选了某个本机 agent：定位到它，检测到已安装时只启用这一家。
+    pub(crate) fn start_setup_agent(
+        &mut self,
+        id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.open_settings_at(KERNEL_TAB, window, cx);
-        self.settings_form.kernel = kind.clone();
-        if matches!(kind, KernelChoice::Acp(_)) {
-            // 设置页刚打开时检测多半还在跑：跑完再启用
-            match self.settings_form.agent_detect {
-                AgentDetect::Done(_) => self.enable_detected_agent(),
-                _ => self.settings_form.enable_on_detect = true,
+        self.settings_form.kernel = KernelChoice::Acp(id.to_string());
+        match self.settings_form.agent_detect {
+            AgentDetect::Done(_) => self.enable_detected_agent(),
+            _ => {
+                self.settings_form.enable_on_detect = true;
+                self.settings_form.message =
+                    Some((false, "正在检测本机安装，检测后自动启用".into()));
             }
         }
         cx.notify();
     }
 
-    /// 还没启用任何 agent、表单选的是「本机 agent」时，把检测到的第一家能用的启用上（只改表单）。
+    /// 启用首页选中的那家 agent（只改表单，保存后生效）。
     fn enable_detected_agent(&mut self) {
         let f = &mut self.settings_form;
-        if !matches!(f.kernel, KernelChoice::Acp(_)) || !f.agents.is_empty() {
+        let KernelChoice::Acp(id) = &f.kernel else { return };
+        let AgentDetect::Done(list) = &f.agent_detect else { return };
+        let Some(preset) = claudesktop_core::agents::AgentPreset::find(id) else { return };
+        let Some(hit) = list.iter().find(|d| d.preset.id == preset.id) else {
+            f.message = Some((
+                false,
+                format!("还没有安装{}，点右侧「如何安装」查看命令", preset.name).into(),
+            ));
+            return;
+        };
+        if !hit.is_ready() {
+            f.message = Some((true, hit.summary().into()));
             return;
         }
-        let AgentDetect::Done(list) = &f.agent_detect else { return };
-        let Some(hit) = list.iter().find(|d| d.is_ready()) else { return };
-        let preset = hit.preset;
-        f.agents.push(AgentProfile::from_preset(preset));
-        f.message = Some((false, format!("已启用本机的{}，点「保存」生效", preset.name).into()));
+        if !f.agents.iter().any(|a| a.id == preset.id) {
+            f.agents.push(AgentProfile::from_preset(preset));
+        }
+        f.message = Some((false, format!("已选择{}，点「保存」生效", preset.name).into()));
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
@@ -2981,7 +3042,7 @@ impl ChatApp {
             entry = entry.child(
                 choice_row(
                     ("provider-source", i),
-                    if p.magpie { IconAll::Cpu } else { IconAll::Server },
+                    if p.magpie { Icon::new(IconAll::Cpu) } else { provider_icon(&p.base_url) },
                     profile_title(p, &value(&inputs.name, cx), &value(&inputs.base_url, cx)),
                     "",
                     active,
@@ -4038,9 +4099,20 @@ fn settings_thinking_menu_items(
 }
 
 fn kernel_logo(id: &str) -> Icon {
+    kernel_icon(id)
+}
+
+pub(super) fn kernel_icon(id: &str) -> Icon {
     crate::assets::kernel_logo_path(id)
         .map(|path| Icon::empty().path(path))
         .unwrap_or_else(|| Icon::new(IconAll::SquareTerminal))
+}
+
+pub(super) fn provider_icon(base_url: &str) -> Icon {
+    crate::assets::provider_logo_for_url(base_url)
+        .and_then(crate::assets::provider_logo_path)
+        .map(|path| Icon::empty().path(path))
+        .unwrap_or_else(|| Icon::new(IconAll::Server))
 }
 
 fn settings_tab_menu_items(
@@ -4090,7 +4162,7 @@ fn add_profile_menu_items(
         menu = menu.pick_in(
             menu_item(
                 ("preset", i),
-                IconAll::Server,
+                provider_icon(&p.base_url),
                 p.name.clone(),
                 host_of(&p.base_url).to_string(),
                 false,

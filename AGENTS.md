@@ -42,13 +42,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `widgets.rs` 的 `message_action()`。
 - **设置页**：排版件在 `app/settings_kit.rs`——`section`（分区标题 + 右侧操作）、
   `setting_row` / `setting_group`（标题 + 右侧控件；标题下要挂路径 / 按钮用 `setting_row_with`）、`form_field`（左标签右输入）、
-  `choice_panel` + `choice_row`（沙色面板里的单选列表，同首页配置引导）、`seg_control`。
+  `choice_panel` + `choice_row`（沙色面板里的单选列表）、`seg_control`。
   标题旁不挂 ⓘ，不铺固定解释和重复的操作提示；空状态保留必要操作指引，格式细节收进 `ChatApp::disclosure`。
   设置打开时只留分类导航（会话侧栏状态不变，退出恢复）；窄窗口把导航收进页头分类菜单，切分类复用 `select_settings_tab`，不重置草稿。分类页头固定，设置行紧凑排列。
   错误、未保存状态和已有条款风险提示仍显示；内核 / 服务商 / 模型共用草稿，有改动时页头出现「撤销更改 / 保存」，其余分类即时生效。
   自动模式、补全的附属参数按开关展开，用量记录和单价表收进「高级」；文件路径按需查看。
   内核清单同模型页用 2.25rem 单行、细分隔线，名称 / 版本状态 / 启用复选框对齐；风险和错误完整放在列表下。配置组用 `compact_setting_group`，输入和开关用小号。
-  内核标志用 `assets/kernels/` 内嵌的单色 SVG（来源和许可见同目录 `LICENSE`），经 `assets::kernel_logo_path` + gpui-kit `Icon` 着 `INK`，不重画品牌轮廓；没有专属标志时用通用终端图标。
+  内核标志用 `assets/kernels/` 内嵌的单色 SVG（来源和许可见同目录 `LICENSE`），经 `assets::kernel_logo_path` + gpui-kit `Icon` 着 `INK`，不重画品牌轮廓；没有专属标志时用通用终端图标。服务商标志同理放在 `assets/providers/`，按 `assets::provider_logo_for_url` 匹配；首页首次配置直接列这些标志，点哪一家就展开那一家的表单（本机 agent 只启用点中的那家）。
   内核检测结果在本次应用启动中缓存（未安装 / 未运行也缓存）：magpie 启动时探一次，agent 首进内核页测一次，之后用内核页头的「刷新」统一重测；切页、重开设置不重测。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
@@ -110,9 +110,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   - gpui-kit 组件的配色由 `theme::apply_colors` 从色板映射（`Button` 的 primary / secondary / danger 等直接可用）；
     组件颜色不对时先补映射，别在调用处逐个覆盖。派生的 `button_*` 色要和基色一起写。
 - **圆角 / 宽度**：圆角只用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
-  不写 `rounded(px(..))`；阅读列 / 设置页 / 概览 / 侧栏宽度用 `READING_W` / `FORM_W` / `OVERVIEW_W` / `SIDEBAR_W`。
-  对话内容和输入框由 `app/mod.rs` 的同一个 body 容器限宽 `READING_W`、整体靠左，两侧留 `px_8` 内边距；设置 / 用量页独立布局。
-  `READING_W` / `FORM_W` / `OVERVIEW_W` 是 measure，**保持 px**；`SIDEBAR_W` / `SETTINGS_NAV_W` / `CHROME_H`
+  不写 `rounded(px(..))`；阅读列 / 设置页 / 侧栏宽度用 `READING_W` / `FORM_W` / `SIDEBAR_W`。
+  `content_slot()` 铺满主区（保证全窗滚轮和右缘滚动条可用），对话行、首页和输入区各自限宽 `READING_W` 靠左对齐并留 `px_8` 内边距；设置 / 用量页独立布局。
+  `READING_W` / `FORM_W` 是 measure，**保持 px**；`SIDEBAR_W` / `SETTINGS_NAV_W` / `CHROME_H`
   是「框」，是 `Rems`，拿它算加减时要 `.to_pixels(window.rem_size())`（设置页整页宽度用 `theme::settings_page_w()`）。
 - **阴影**：`raised_shadow()`（贴地一档）/ `float_shadow()`（悬浮两层）在 `theme.rs`，σ 已按 CSS 减半；
   `.shadow_xs/sm/md/lg` 是 Tailwind 原值（没减半），别当设计值用。

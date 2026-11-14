@@ -273,6 +273,18 @@ fn main() {
                                 _ => {}
                             }
                             #[cfg(feature = "headless-screenshot")]
+                            if let Ok(id) = std::env::var("CLAUDESKTOP_SETUP") {
+                                if let Some(i) = crate::settings::preset_profiles().iter().position(|p| {
+                                    crate::assets::provider_logo_for_url(&p.base_url) == Some(id.as_str())
+                                }) {
+                                    app.start_setup_provider(Some(i), window, cx);
+                                } else if id == "custom" {
+                                    app.start_setup_provider(None, window, cx);
+                                } else {
+                                    app.start_setup_agent(&id, window, cx);
+                                }
+                            }
+                            #[cfg(feature = "headless-screenshot")]
                             if std::env::var_os("CLAUDESKTOP_SCREENSHOT").is_some() {
                                 let preview = std::env::var("CLAUDESKTOP_SETTINGS_PREVIEW").unwrap_or_default();
                                 let scale = std::env::var("CLAUDESKTOP_SCREENSHOT_SCALE").ok().and_then(|s| s.parse().ok());

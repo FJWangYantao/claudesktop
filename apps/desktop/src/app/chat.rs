@@ -388,8 +388,14 @@ impl ChatApp {
                 body.into_any_element()
             });
         }
-        // 正在收起、自己已不显示的步骤不留块间距（组头那行会留）
-        let gap = Self::row_gap(layout);
+        // 用户消息和回合末尾正文下面已经挂着操作行，块间距收成 STEP_GAP，避免每轮留出过多空白
+        let gap = if matches!(item, ChatItem::User { .. })
+            || (matches!(item, ChatItem::Agent(_)) && self.session().is_turn_end(ix))
+        {
+            if layout.tight { Rems::ZERO } else { STEP_GAP }
+        } else {
+            Self::row_gap(layout)
+        };
         col.when(gap != Rems::ZERO, |d| d.pb(gap))
     }
 
@@ -1448,7 +1454,7 @@ impl ChatApp {
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
-            .shadow_xs()
+            .shadow(raised_shadow())
             .overflow_hidden()
             .child(header)
             .child(
@@ -1633,7 +1639,7 @@ impl ChatApp {
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(CARD))
-            .shadow_xs()
+            .shadow(raised_shadow())
             .child(header);
         if folded {
             card = card.children(current.map(plan_row));
@@ -2044,7 +2050,7 @@ impl ChatApp {
             .id(("user-msg", idx))
             .v_flex()
             .items_end()
-            .gap_1()
+            .gap_0p5()
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.set_hovered_msg(idx, *hovered, cx)
             }))
@@ -2158,7 +2164,7 @@ impl ChatApp {
                     .h_flex()
                     .items_center()
                     .gap_2()
-                    .pt_2()
+                    .pt_1()
                     .child(self.copy_action(("copy-agent", idx), idx, window, cx, |s, idx| {
                         s.turn_text(idx)
                     }))

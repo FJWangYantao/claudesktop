@@ -55,34 +55,9 @@ pub(super) struct UsagePage {
 }
 
 impl ChatApp {
-    /// 打开用量页，不带筛选（侧栏、命令面板、首页卡片）。
+    /// 打开用量页，不带筛选（侧栏、命令面板、首页摘要条）。
     pub(super) fn open_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_usage(None, None, window, cx);
-    }
-
-    /// 打开用量页、只看某一天（首页热力图的格子）。
-    pub(super) fn open_usage_day(&mut self, day: i64, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_usage(Some(day), None, window, cx);
-    }
-
-    /// 打开用量页、只看某个模型（首页「模型」页签的一行）。
-    pub(super) fn open_usage_model(
-        &mut self,
-        model: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.show_usage(None, Some(model.to_string()), window, cx);
-    }
-
-    fn show_usage(
-        &mut self,
-        day: Option<i64>,
-        model: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_usage_filter(day, model, None);
+        self.set_usage_filter(None, None, None);
         if self.settings_form.tab != USAGE_TAB {
             self.usage_page.settings_tab = self.settings_form.tab;
         }

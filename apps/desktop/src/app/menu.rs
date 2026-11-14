@@ -299,7 +299,7 @@ impl MenuList {
 /// 交给 [`MenuList::pick`]，点击动作由它挂。
 pub(super) fn menu_item(
     id: impl Into<ElementId>,
-    icon: IconAll,
+    icon: impl Into<Icon>,
     name: impl Into<SharedString>,
     desc: impl Into<SharedString>,
     active: bool,
