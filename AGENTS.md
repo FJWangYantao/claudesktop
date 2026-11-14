@@ -288,7 +288,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 调试钩子统一走环境变量（`CLAUDESKTOP_*`），入口集中在 `main.rs`；
   菜单预览用 `Popover::default_open` 只初始化一次（`CLAUDESKTOP_OPEN=model-menu` 预览默认模型菜单），不改成受控模式。
   截图用 `--features headless-screenshot` 编译，设 `CLAUDESKTOP_SCREENSHOT=<PNG 路径>`：隐藏窗口离屏渲染后自动退出；`QUIET` 只是不激活，不能代替无头截图。
+  正式 exe 的无前台验收可设 `CLAUDESKTOP_HEADLESS=1`（隐藏窗口、每 250ms 离屏绘制，不启用文件控制入口）。
 - 提交信息用英文 conventional commits（见 git log），代码注释用中文。
+- Windows 分发包统一走 `tools/package-windows.ps1`（校对 exe 版本 / x64、压缩包内容和两份 SHA256）；`v*` tag 生成 Release 草稿，下载产物验收后再发布。
 - 本文件会整份进自研内核的系统提示词（`crates/builtin/src/instructions.rs`，每次请求都带），新增内容保持精炼。
 - 新增要进日志的 `KernelEvent` 时，同时想清楚 `Record::worth_keeping`、`history::rebuild`（续接时进不进上下文）
   和 `Session::apply_event`（重放时怎么显示）三处。读日志一律先过 `claudesktop_core::effective`（折算回退）。

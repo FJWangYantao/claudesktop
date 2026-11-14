@@ -274,7 +274,8 @@ mod tests {
 
     fn isolated() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
         let guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = std::env::temp_dir().join(format!("claudesktop-assets-{:016x}", std::process::id() as u64 ^ nanos()));
+        let dir = std::env::temp_dir()
+            .join(format!("claudesktop-assets-{:016x}", std::process::id() as u64 ^ nanos()));
         let _ = std::fs::remove_dir_all(&dir);
         {
             let mut reg = registry().lock().unwrap();

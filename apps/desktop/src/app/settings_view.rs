@@ -3321,16 +3321,16 @@ impl ChatApp {
                                 app.update_settings(|s| {
                                     s.builtin.profiles[saved].set_models(&models)
                                 });
-                                if saved == app.settings.builtin.active {
-                                    if let Some(kernel) = app.kernel_of(&KernelChoice::Builtin) {
-                                        kernel.set_context_windows(
-                                            app.settings.builtin.profiles[saved]
-                                                .context_windows
-                                                .clone()
-                                                .into_iter()
-                                                .collect(),
-                                        );
-                                    }
+                                if saved == app.settings.builtin.active
+                                    && let Some(kernel) = app.kernel_of(&KernelChoice::Builtin)
+                                {
+                                    kernel.set_context_windows(
+                                        app.settings.builtin.profiles[saved]
+                                            .context_windows
+                                            .clone()
+                                            .into_iter()
+                                            .collect(),
+                                    );
                                 }
                             }
                         }
@@ -4079,33 +4079,6 @@ fn protocol_menu_items(
     menu
 }
 
-#[cfg(test)]
-mod model_management_tests {
-    use super::*;
-
-    #[core::prelude::v1::test]
-    fn management_keeps_hidden_and_manual_models_separate_by_source() {
-        let profiles = vec![
-            ProviderProfile {
-                model: "manual".into(),
-                models: vec!["shared".into(), "GPT-5".into()],
-                menu_hidden: vec!["shared".into()],
-                ..Default::default()
-            },
-            ProviderProfile {
-                model: "shared".into(),
-                models: vec!["shared".into()],
-                ..Default::default()
-            },
-        ];
-        assert_eq!(model_options(&profiles, None, "shared"), vec![(0, "shared"), (1, "shared")]);
-        assert_eq!(model_options(&profiles, Some(0), "manual"), vec![(0, "manual")]);
-        assert_eq!(model_options(&profiles, Some(1), "manual"), Vec::<(usize, &str)>::new());
-        assert_eq!(model_options(&profiles, None, " gPt "), vec![(0, "GPT-5")]);
-        assert_eq!(model_options(&profiles, None, "").len(), 4);
-    }
-}
-
 /// 「添加」菜单：常用服务预设 + 自定义。
 fn add_profile_menu_items(
     _: &ChatApp,
@@ -4235,4 +4208,31 @@ fn font_family_menu_items(
         );
     }
     menu
+}
+
+#[cfg(test)]
+mod model_management_tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn management_keeps_hidden_and_manual_models_separate_by_source() {
+        let profiles = vec![
+            ProviderProfile {
+                model: "manual".into(),
+                models: vec!["shared".into(), "GPT-5".into()],
+                menu_hidden: vec!["shared".into()],
+                ..Default::default()
+            },
+            ProviderProfile {
+                model: "shared".into(),
+                models: vec!["shared".into()],
+                ..Default::default()
+            },
+        ];
+        assert_eq!(model_options(&profiles, None, "shared"), vec![(0, "shared"), (1, "shared")]);
+        assert_eq!(model_options(&profiles, Some(0), "manual"), vec![(0, "manual")]);
+        assert_eq!(model_options(&profiles, Some(1), "manual"), Vec::<(usize, &str)>::new());
+        assert_eq!(model_options(&profiles, None, " gPt "), vec![(0, "GPT-5")]);
+        assert_eq!(model_options(&profiles, None, "").len(), 4);
+    }
 }

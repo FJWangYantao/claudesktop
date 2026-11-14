@@ -1042,7 +1042,7 @@ impl Session {
 
     /// 显示数据换回占位会话（元信息、模式、滚动、展开状态保留；正文释放）。
     /// 令牌不变，侧栏和 `last_active` 的引用不受影响。
-    pub fn to_placeholder(&mut self, settings: &crate::settings::Settings) {
+    pub fn evict_to_placeholder(&mut self, settings: &crate::settings::Settings) {
         let Some(meta) = self.meta.clone() else { return };
         let reveal = self.pending_reveal_turn.take();
         let mut cold = Self::placeholder(self.token, meta, settings);
@@ -2427,7 +2427,7 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
-    fn to_placeholder_keeps_identity_and_frees_transcript() {
+    fn evict_to_placeholder_keeps_identity_and_frees_transcript() {
         let records = vec![
             Record::user("读 README"),
             ev(KernelEvent::AgentMessageChunk { text: "总结完毕".into() }),
@@ -2446,7 +2446,7 @@ mod tests {
         let token = s.token;
         let title = s.title.clone();
         let view = s.viewing_task.is_some();
-        let _ = s.to_placeholder(&Default::default());
+        s.evict_to_placeholder(&Default::default());
         assert_eq!(s.token, token, "令牌不变（侧栏和 last_active 的引用不受影响）");
         assert_eq!(s.title, title);
         assert!(s.transcript.is_empty());

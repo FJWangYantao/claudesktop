@@ -721,7 +721,9 @@ impl ChatItem {
                             + q.options
                                 .iter()
                                 .map(|o| {
-                                    o.label.len() + o.description.as_deref().map_or(0, str::len) + HEAD
+                                    o.label.len()
+                                        + o.description.as_deref().map_or(0, str::len)
+                                        + HEAD
                                 })
                                 .sum::<usize>()
                             + HEAD * 2
@@ -730,9 +732,7 @@ impl ChatItem {
                     + answer.is_some() as usize * 64
                     + 96
             }
-            Self::Plan(rows) => {
-                rows.iter().map(|r| r.text.len() + HEAD).sum::<usize>()
-            }
+            Self::Plan(rows) => rows.iter().map(|r| r.text.len() + HEAD).sum::<usize>(),
             Self::Note(t) | Self::Failed { message: t, .. } => t.len() + 64,
             Self::Compaction { state, .. } => {
                 let text = match state {

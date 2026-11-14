@@ -8,9 +8,9 @@ mod complete_view;
 mod composer;
 mod content;
 mod gauge;
-mod history;
 #[cfg(feature = "headless-screenshot")]
 mod hibernate_bench;
+mod history;
 pub(crate) mod keys;
 mod mascot;
 pub mod math;
@@ -115,7 +115,6 @@ impl SessionStress {
         false
     }
 }
-
 
 pub struct ChatApp {
     input: Entity<TextareaState>,
@@ -459,7 +458,7 @@ impl ChatApp {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |app, cx| {
                     ticks += 1;
-                    if ticks % 30 == 0 {
+                    if ticks.is_multiple_of(30) {
                         app.reclaim_idle_processes(cx);
                         if std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_none() {
                             app.hibernate_idle_sessions(cx);
@@ -938,7 +937,7 @@ impl ChatApp {
         while order.len() > WARM_SESSIONS || total - freed > SESSION_CACHE_BUDGET {
             let Some(idx) = order.first().copied() else { break };
             freed += self.sessions[idx].retained_bytes();
-            self.sessions[idx].to_placeholder(&self.settings);
+            self.sessions[idx].evict_to_placeholder(&self.settings);
             order.remove(0);
             evicted += 1;
         }
@@ -1574,7 +1573,12 @@ impl ChatApp {
     /// 压测钩子：`CLAUDESKTOP_STRESS_SESSIONS=N` 生成 N 个历史会话并逐轮激活。
     /// 每个会话 80 轮问答、每轮回复约 12 KB，合计约 1 MB/会话（50 个约 50 MB，
     /// 超 32 MiB 显示预算，用来触发回收）。`CLAUDESKTOP_STRESS_ROUNDS` 默认 3。
-    pub(crate) fn debug_stress_sessions(&mut self, n: usize, rounds: usize, cx: &mut Context<Self>) {
+    pub(crate) fn debug_stress_sessions(
+        &mut self,
+        n: usize,
+        rounds: usize,
+        cx: &mut Context<Self>,
+    ) {
         let Some(store) = self.store.clone() else {
             eprintln!("[stress] 无存储目录，跳过会话压测");
             return;
@@ -1623,13 +1627,7 @@ impl ChatApp {
         if ids.is_empty() {
             return;
         }
-        self.session_stress = Some(SessionStress {
-            ids,
-            round: 0,
-            next: 0,
-            rounds,
-            done_at: None,
-        });
+        self.session_stress = Some(SessionStress { ids, round: 0, next: 0, rounds, done_at: None });
         self.sync_sidebar(cx);
         cx.notify();
     }
@@ -1846,8 +1844,8 @@ impl ChatApp {
             _ if step < 250 => format!("fn f{step}() {{ i * {step} }}\n"),
             _ => "收尾。\n\n".to_string(),
         };
-        let _ = self.sessions[self.active]
-            .apply_event(KernelEvent::AgentMessageChunk { text: text.into() }, None);
+        let _ =
+            self.sessions[self.active].apply_event(KernelEvent::AgentMessageChunk { text }, None);
         // 和 on_kernel_event 同一条路径：只进合批缓冲的 chunk 不重画。
         // 末尾报「300 个 chunk 实际并进正文几次」——那才是真正画帧的次数
         let flushed = self.sessions[self.active].take_stream_dirty();

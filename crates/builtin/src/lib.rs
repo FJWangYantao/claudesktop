@@ -475,8 +475,8 @@ pub fn default_memory_path() -> Option<PathBuf> {
 
 /// 闲置历史默认允许落盘；`CLAUDESKTOP_HIBERNATE=0` 可关闭。
 pub fn default_hibernation_dir() -> Option<PathBuf> {
-    let enabled =
-        std::env::var("CLAUDESKTOP_HIBERNATE").map_or(true, |value| !value.is_empty() && value != "0");
+    let enabled = std::env::var("CLAUDESKTOP_HIBERNATE")
+        .map_or(true, |value| !value.is_empty() && value != "0");
     enabled
         .then(|| claudesktop_core::default_data_dir().ok())
         .flatten()
@@ -2888,13 +2888,16 @@ fn run_pending_prompt(
         return;
     };
     if std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_some() {
-        eprintln!("[hibernate_send] {}", json!({
-            "session": session,
-            "queue_ms": worker_at.duration_since(submitted_at).as_secs_f64() * 1000.,
-            "restore_ms": restored_at.duration_since(worker_at).as_secs_f64() * 1000.,
-            "prepare_ms": restored_at.elapsed().as_secs_f64() * 1000.,
-            "preflight_ms": submitted_at.elapsed().as_secs_f64() * 1000.,
-        }));
+        eprintln!(
+            "[hibernate_send] {}",
+            json!({
+                "session": session,
+                "queue_ms": worker_at.duration_since(submitted_at).as_secs_f64() * 1000.,
+                "restore_ms": restored_at.duration_since(worker_at).as_secs_f64() * 1000.,
+                "prepare_ms": restored_at.elapsed().as_secs_f64() * 1000.,
+                "preflight_ms": submitted_at.elapsed().as_secs_f64() * 1000.,
+            })
+        );
     }
     inner.reset_denials(&session);
     for warning in warnings {

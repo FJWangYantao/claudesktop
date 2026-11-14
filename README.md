@@ -48,6 +48,7 @@ Claude 风格的 AI 编程桌面端（Rust + GPUI），Windows 原生，**内核
 - 每会话一份追加式事件日志，启动时重放恢复；历史会话续聊时优先 ACP `session/resume`，其次 `session/load`，
   都不行就用本地日志重建上下文
 - 检查点与回退：写文件前后按内容寻址存下旧内容，用户消息上可选「回退对话和文件 / 只回对话 / 只回文件」
+- 自研内核闲置会话休眠：保留当前和最近 2 个会话，其余闲置 10 分钟后把完整历史暂存磁盘，切回时后台恢复；运行中的任务和待审批会话不会休眠
 - Windows job object 防孤儿进程：应用退出（含被强杀）时连带结束 agent 进程树
 
 **界面**
@@ -115,6 +116,7 @@ mcp.json             MCP 服务器配置
 memory.json          全局记忆（项目记忆在项目根的 .claudesktop/memory.json）
 plugins/             插件
 sessions/            每会话一份事件日志 + 元信息，图片附件在同级 .assets/
+session-hibernation/ 本次运行的闲置历史快照（正常退出时清理）
 gateway/<日期>.jsonl 用量日志
 ```
 
@@ -123,14 +125,15 @@ gateway/<日期>.jsonl 用量日志
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                                    # 335 个，不需要网络和密钥
+cargo test --workspace                                    # 不需要网络和密钥
 
 # 真实端点 / 真实 agent / 远程 MCP（默认 ignore，会花钱并需要网络）
 cargo test -p claudesktop-builtin -- --ignored
 ```
 
 CI（[.github/workflows/ci.yml](./.github/workflows/ci.yml)）在 windows-latest 上跑上面的 fmt + clippy + test。
-打 `v*` tag 会触发 [release.yml](./.github/workflows/release.yml) 生成 GitHub Release。
+打 `v*` tag 会触发 [release.yml](./.github/workflows/release.yml) 构建 Windows x64 分发包并生成 GitHub Release 草稿，验收下载产物后再发布。
+本地打包用 `powershell -NoProfile -File tools/package-windows.ps1 -Executable D:/t3/release/claudesktop.exe`，生成单文件、便携压缩包及两者的 SHA256 校验值。
 
 ## 开发
 
@@ -159,6 +162,7 @@ CLAUDESKTOP_RERUN=builtin|acp           # 把首条提示词放到另一个内�
 # 性能压测：逐帧滚动并输出帧间隔与每帧工作量
 CLAUDESKTOP_STRESS=10000                # 灌 1 万行再滚；加 _BUSY=1 看转圈，_TYPE=1 看打字
 CLAUDESKTOP_QUIET=1                     # 开窗口但不抢前台、不激活（压测会自动开启）
+CLAUDESKTOP_HEADLESS=1                  # 隐藏窗口离屏运行，可验收正式 exe（不自动退出）
 ```
 
 提交约定：英文 conventional commits，代码注释中文。改 UI 前请先读 [AGENTS.md](./AGENTS.md)（组件、配色、

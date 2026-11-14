@@ -13,6 +13,12 @@
   坑：路径里的 ASCII 标点（`/` `?` `=` `&`）必须继续吞、只有非 ASCII 标点才收尾——第一版补丁按
   「是标点就收」写，URL 的路径被砍掉，被这个测试当场抓回来。
 - 本机内存小，本地 `cargo test` / `cargo check` 会因页面文件太小（os error 1455）失败：改动直接提交，验证交给 CI。
+- **v0.15.0 分发验收**：本地普通 release 已通过 604 项 workspace 测试、fmt 和 Clippy；打包核对 exe 版本 / x64、ZIP 内三份文件及两份 SHA256。
+  隐藏运行实际分发 exe，走真实窗口消息新建 / 切换 / 发送，4 个会话、7 次回环模型请求已验证历史无损恢复、运行中回合不休眠、流取消、正常退出清快照和重启续接。
+  快查仅把 idle 阈值缩到 2 秒，仍走生产的 30 秒回收定时器；默认 10 分钟另验。原始记录在 `.claudesktop/bench/release-local-07/`。
+- **正式包也要用同一份 exe 验收**：`CLAUDESKTOP_HEADLESS=1` 隐藏窗口、每 250ms 离屏绘制；不用截图 feature 或文件控制入口。
+  本机把 GUI 放到 `CreateDesktop` 新建桌面时，进程在 `main` 前以 `0xc0000142` 退出，不能拿它判断业务启动失败；
+  验收走隐藏窗口、隔离数据目录和回环模拟端点，按自己创建的 PID 发送窗口消息，不切前台、不移动用户鼠标。
 - **含中文的 `.ps1` 必须带 UTF-8 BOM**（2026-11-14 实锤）：PowerShell 5.1 对无 BOM 文件按
   ANSI（GBK）解码，中文注释 / 字符串里的 UTF-8 字节会跟后面的 ASCII 配对吞字符，
   报一堆莫须有的语法错（「,」后面缺少表达式、字符串缺少终止符）。Edit/Write 工具重写整个
@@ -45,7 +51,7 @@
   （按 `hash(Resource)` 持 `Arc<RenderImage>`），登记表释放省的主要是原始字节那份。
   单条超过 12 MiB 的图不入表（一张图占掉大半个预算不划算，按「读不出来」处理）。
 - **会话冷回收**：`Session::evictable` 豁免一切活状态（忙 / 排队 / 等应答 / 连着内核会话
-  `acp_id.is_some()` / 加载中 / 读取失败）；`to_placeholder` 换占位时**令牌不变**——侧栏、
+  `acp_id.is_some()` / 加载中 / 读取失败）；`evict_to_placeholder` 换占位时**令牌不变**——侧栏、
   `last_active`、`session_index` 都按令牌引用。温会话保 2 个 + 32 MiB 预算（初始提案，
   `app/mod.rs` 的 `WARM_SESSIONS` / `SESSION_CACHE_BUDGET`），`CLAUDESKTOP_MEM_REPORT=1`
   时每 30 秒回收周期打一行 `[mem]`（会话保留字节、资源登记表现状）。

@@ -94,16 +94,17 @@ fn main() {
             fonts::register(cx);
             let t_fonts = t0.elapsed();
 
-            // 静默模式不抢前台；截图模式隐藏窗口，直接离屏渲染。
+            // 静默模式不抢前台；无头模式隐藏窗口，直接离屏渲染。
+            let headless = std::env::var("CLAUDESKTOP_HEADLESS").as_deref() == Ok("1");
             let screenshot = std::env::var_os("CLAUDESKTOP_SCREENSHOT");
             let hibernate_bench = std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH");
-            let quiet = screenshot.is_some() || hibernate_bench.is_some()
+            let quiet = headless || screenshot.is_some() || hibernate_bench.is_some()
                 || std::env::var_os("CLAUDESKTOP_QUIET").is_some()
                 || std::env::var_os("CLAUDESKTOP_STRESS").is_some();
 
             let mut options = TitleBar::window_options();
             options.focus = !quiet;
-            options.show = screenshot.is_none() && hibernate_bench.is_none();
+            options.show = !headless && screenshot.is_none() && hibernate_bench.is_none();
             if quiet {
                 // 非活动窗口默认限到 30 帧，压测量到的就不是真实帧间隔了
                 options.inactive_frame_interval = None;
@@ -196,6 +197,19 @@ fn main() {
                             }
                         }).detach();
                         return app;
+                    }
+                    if headless && screenshot.is_none() {
+                        cx.spawn_in(window, async move |_, cx| {
+                            loop {
+                                cx.background_executor().timer(Duration::from_millis(250)).await;
+                                if cx.update(|window, cx| {
+                                    window.refresh();
+                                    window.draw(cx).clear(cx);
+                                }).is_err() {
+                                    break;
+                                }
+                            }
+                        }).detach();
                     }
                     // 延迟 1.5s 触发自动演示，避开启动阶段的窗口初始化。
                     cx.spawn_in(window, async move |this, cx| {

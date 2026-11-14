@@ -32,10 +32,19 @@ impl ChatApp {
                     "activate" => self.activate_session(idx, cx),
                     "send" => {
                         let text = command["text"].as_str().ok_or("缺少 text")?.to_string();
-                        let images = command.get("images").cloned().map(serde_json::from_value)
-                            .transpose().map_err(|err| err.to_string())?.unwrap_or_default();
+                        let images = command
+                            .get("images")
+                            .cloned()
+                            .map(serde_json::from_value)
+                            .transpose()
+                            .map_err(|err| err.to_string())?
+                            .unwrap_or_default();
                         let sent_at_ms = bench_epoch_ms();
-                        if !self.submit_to(idx, UserPrompt { text, images, attachments: Vec::new() }, cx) {
+                        if !self.submit_to(
+                            idx,
+                            UserPrompt { text, images, attachments: Vec::new() },
+                            cx,
+                        ) {
                             return Err("发送被拒绝".into());
                         }
                         result = json!({"sent_at_ms": sent_at_ms});
@@ -56,10 +65,14 @@ impl ChatApp {
                     "answer" => {
                         self.activate_session(idx, cx);
                         if let Some(item) = self.sessions[idx].pending_permission() {
-                            let Some(ChatItem::Permission { options, .. }) = self.sessions[idx].transcript.get(item) else {
+                            let Some(ChatItem::Permission { options, .. }) =
+                                self.sessions[idx].transcript.get(item)
+                            else {
                                 return Err("权限行缺失".into());
                             };
-                            let option = options.iter().find(|option| option.kind == "allow_once")
+                            let option = options
+                                .iter()
+                                .find(|option| option.kind == "allow_once")
                                 .ok_or("没有单次允许选项")?;
                             let choice = Some((option.id.clone(), option.name.clone()));
                             self.resolve_permission(item, choice, cx);
@@ -95,11 +108,18 @@ impl ChatApp {
                 "display_bytes": s.retained_bytes(), "failures": failures,
             })
         }).collect();
-        let stats = self.kernel_of(&KernelChoice::Builtin).map(|kernel| kernel.history_stats()).unwrap_or_default();
+        let stats = self
+            .kernel_of(&KernelChoice::Builtin)
+            .map(|kernel| kernel.history_stats())
+            .unwrap_or_default();
         let tasks: Vec<_> = self.kernels.iter().flat_map(|(_, slot)| slot.tasks.iter()).collect();
         let snapshots: Vec<_> = claudesktop_builtin::default_hibernation_dir()
-            .and_then(|dir| std::fs::read_dir(dir).ok()).into_iter().flatten().flatten()
-            .map(|entry| entry.file_name().to_string_lossy().to_string()).collect();
+            .and_then(|dir| std::fs::read_dir(dir).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
         Ok(json!({
             "result": result, "sessions": sessions, "tasks": tasks, "snapshots": snapshots,
             "epoch_ms": bench_epoch_ms(),
@@ -115,20 +135,30 @@ pub(super) fn bench_epoch_ms() -> f64 {
 
 pub(super) fn record_event(session: &Option<String>, event: &KernelEvent) {
     let Some(dir) = std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH") else { return };
-    if matches!(event, KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. }
-        | KernelEvent::ToolCallProgress { .. } | KernelEvent::SubagentChunk { .. }) {
+    if matches!(
+        event,
+        KernelEvent::AgentMessageChunk { .. }
+            | KernelEvent::AgentThoughtChunk { .. }
+            | KernelEvent::ToolCallProgress { .. }
+            | KernelEvent::SubagentChunk { .. }
+    ) {
         return;
     }
     use std::io::Write as _;
     let detail = match event {
-        KernelEvent::Fatal(message) | KernelEvent::Notice(message)
-        | KernelEvent::PromptFailed { message } | KernelEvent::CompactFailed { message }
+        KernelEvent::Fatal(message)
+        | KernelEvent::Notice(message)
+        | KernelEvent::PromptFailed { message }
+        | KernelEvent::CompactFailed { message }
         | KernelEvent::SessionFailed { message, .. } => Some(message.as_str()),
         _ => None,
     };
     let row = json!({"epoch_ms": bench_epoch_ms(), "session": session, "event": event.tag(), "detail": detail});
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true)
-        .open(PathBuf::from(dir).join("events.jsonl")) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PathBuf::from(dir).join("events.jsonl"))
+    {
         let _ = writeln!(file, "{row}");
     }
 }

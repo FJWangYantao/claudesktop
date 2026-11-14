@@ -85,7 +85,9 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let item = self.sessions[self.active].transcript.iter()
+        let item = self.sessions[self.active]
+            .transcript
+            .iter()
             .rposition(|item| matches!(item, ChatItem::User { .. }))
             .ok_or("没有可以回退的消息")?;
         let preview = self.rewind_preview(item);
