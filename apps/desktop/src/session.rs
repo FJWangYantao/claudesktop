@@ -82,7 +82,7 @@ pub struct Session {
     pub log: Option<SessionLog>,
     /// 从磁盘恢复、还没接上内核会话的历史会话（不自动 session/new）
     pub restored: bool,
-    /// 日志是否已读进内存；启动时侧栏里的历史会话只有元信息
+    /// 界面显示数据是否已加载；启动历史从日志读取，连接中的休眠会话从显示快照恢复
     pub history_loaded: bool,
     pub history_loading: bool,
     pub history_error: Option<String>,
@@ -1030,7 +1030,7 @@ impl Session {
             && !self.waiting_question()
     }
 
-    /// 能否只把自研内核的完整历史休眠；连接、正文和会话 ID 都保留。
+    /// 能否把自研内核的完整历史休眠；连接和会话 ID 保留，显示缓存可另行暂存。
     pub fn idle_hibernatable(&self) -> bool {
         self.idle_detachable()
             && !self.history_loading
@@ -1044,8 +1044,8 @@ impl Session {
 
     /// 能否把显示数据（正文、布局表、子任务过程）换成磁盘占位：冷会话化。
     /// 忙、有排队的消息 / 压缩、等应答、正在建 worktree、正在读日志、上次读取失败
-    /// （重读同一份多半还失败，先留着错误行）、还连着内核会话（`acp_id` 在：
-    /// 内核上下文还活着，界面把正文丢了就对不上了）都排除；
+    /// （重读同一份多半还失败，先留着错误行）、还连着内核的会话都排除；
+    /// 连接中的自研会话走 `display_evictable`，不能用这条整对象替换的路径。
     /// 没落盘的（`meta` 不在）也不动——换占位会把活会话标成「历史会话」。
     /// 换成占位后一切走 `ensure_history_loaded` 的重读路径，和启动占位完全一样。
     pub fn evictable(&self) -> bool {

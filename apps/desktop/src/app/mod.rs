@@ -1444,7 +1444,7 @@ impl ChatApp {
         dirs.into_iter().map(|(d, _)| d.to_path_buf()).filter(|d| d.is_dir()).take(8).collect()
     }
 
-    /// 历史会话只在激活时读日志。读取期间会话保留元信息，删除或切走都不会被迟到的结果覆盖。
+    /// 按需加载历史日志或显示快照；显示快照恢复保留原会话，后台结果按令牌和快照身份接回。
     fn ensure_history_loaded(&mut self, idx: usize, cx: &mut Context<Self>) {
         if self.sessions[idx].history_loaded || self.sessions[idx].history_loading {
             return;
@@ -1545,7 +1545,7 @@ impl ChatApp {
             self.settle_undo();
             self.reveal_pending_turn(idx);
         }
-        // 读取期间发出去的消息走现有队列；加载完成后由 submit_to 续接内核。
+        // 读取期间的消息留在队列；启动历史需续接内核，显示快照沿用原来的会话绑定。
         if !self.queued_compaction(idx) {
             if self.sessions[idx].restored && !self.sessions[idx].queued.is_empty() {
                 let queued = self.sessions[idx].queued.remove(0);
