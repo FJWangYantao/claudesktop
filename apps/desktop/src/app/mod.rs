@@ -9,6 +9,8 @@ mod composer;
 mod content;
 mod gauge;
 mod history;
+#[cfg(feature = "headless-screenshot")]
+mod hibernate_bench;
 pub(crate) mod keys;
 mod mascot;
 pub mod math;
@@ -459,7 +461,9 @@ impl ChatApp {
                     ticks += 1;
                     if ticks % 30 == 0 {
                         app.reclaim_idle_processes(cx);
-                        app.hibernate_idle_sessions(cx);
+                        if std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_none() {
+                            app.hibernate_idle_sessions(cx);
+                        }
                         app.reclaim_idle_sessions(cx);
                         if std::env::var("CLAUDESKTOP_MEM_REPORT").is_ok() {
                             app.mem_report();
@@ -670,7 +674,9 @@ impl ChatApp {
             }
         }
         // magpie 网关引导：探活 → 自动建档案 / 拉模型；在用而没跑就顺手起 serve
-        app.magpie_bootstrap(cx);
+        if std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_none() {
+            app.magpie_bootstrap(cx);
+        }
         app
     }
 
@@ -696,6 +702,18 @@ impl ChatApp {
                 KernelChoice::Builtin => {
                     match self.settings.builtin_config(self.cwd.clone()).and_then(|mut config| {
                         config.plugins = plugins;
+                        #[cfg(feature = "headless-screenshot")]
+                        if std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_some() {
+                            config.session_titles = false;
+                            config.memory_suggest = false;
+                            config.user_instructions = None;
+                            config.chat_instructions = None;
+                            config.mcp_config = None;
+                            config.memory_path = None;
+                            config.rules_path = None;
+                            config.plugins.clear();
+                            config.auto_mode = None;
+                        }
                         let identity = config.identity();
                         BuiltinKernel::spawn(config, sink).map(|k| (k, identity))
                     }) {
@@ -837,7 +855,7 @@ impl ChatApp {
         }
     }
 
-    /// 自研内核的历史休眠原型：当前会话和最近两个温会话保留，其余闲置十分钟后台落盘。
+    /// 自研内核的历史休眠：当前会话和最近两个温会话保留，其余闲置十分钟后台落盘。
     fn hibernate_idle_sessions(&mut self, cx: &mut Context<Self>) {
         if claudesktop_builtin::default_hibernation_dir().is_none() {
             return;
@@ -2679,6 +2697,8 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         let RoutedEvent { session, event } = routed;
+        #[cfg(feature = "headless-screenshot")]
+        hibernate_bench::record_event(&session, &event);
         let kernel = self.kernel_by_key(&key);
         let acp = self.settings.acp.clone();
         let kind = KernelChoice::from_key(&key, &acp);

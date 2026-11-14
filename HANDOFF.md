@@ -50,6 +50,8 @@
   `app/mod.rs` 的 `WARM_SESSIONS` / `SESSION_CACHE_BUDGET`），`CLAUDESKTOP_MEM_REPORT=1`
   时每 30 秒回收周期打一行 `[mem]`（会话保留字节、资源登记表现状）。
   记忆点：占位会话的 `has_user_message()` 也为真（按元信息算），删除保护照常工作。
+- **手动离屏绘制必须清帧 arena**：调用 `window.draw(cx).clear(cx)`，不要丢掉 `draw` 返回的 `ArenaClearNeeded`。
+  正常呈现会自动清，手动循环不清会让临时元素随帧堆积，污染内存验收；原截图 / 滚动测试入口也已一起修正。
 - **无头截图不要只设 `QUIET`**：它仍会显示窗口。用 `--features headless-screenshot` 编译，设 `CLAUDESKTOP_SCREENSHOT=<PNG 路径>`，
   窗口从创建起隐藏，手动排帧后用 `render_to_image` 离屏导出并退出，不触碰前台。
   配 `CLAUDESKTOP_OPEN=model-menu` 可预览真实默认模型菜单；用组件的 `default_open(true)` 初始化，不用改受控模式。
@@ -64,9 +66,8 @@
   没并进的 chunk 连 `cx.notify()` 都跳过。另外 `flush_stream` 不分思考 / 正文一次全并，
   正文 chunk  handler 里「先收尾思考」不能直接调它（会把正文缓冲也提前并掉，合批失效），
   要先看 `stream_pending_thought`。
-- **压测实例收尾用 `taskkill //IM claudesktop.exe //F`**：bash 里 `&` 起的 `$!` 和真正的 exe PID
-  对不上（起过一轮没杀干净的，占着 exe 让下一次 `cargo build` 链接失败：
-  `failed to remove file D:/t3/release/claudesktop.exe`）。
+- **压测只收尾自己启动的 PID**：Git Bash 的 `$!` 可能是包装进程，不要按 `claudesktop.exe` 名称整批杀进程。
+  用 Node `spawn` 取得真实 PID 并等待退出（新休眠验收脚本已如此处理）；未退出的实例会占住 exe，导致下次链接失败。
 - **压测数字本身有 ±0.5ms 漂移**（机器负载、热状态）：滚动 p50 同一基线不同时间跑出 2.56→3.94ms。
   对比优化前后要交替 A/B 连跑几次取中位，别拿两次单跑说事。
 - **模型页压测后不一定回到顶部**：`CLAUDESKTOP_STRESS_VIEW=settings:4` 的合成滚轮落在右侧模型清单时，
@@ -94,11 +95,25 @@
 - **自研历史休眠别只看 `TurnEnded`**（2026-11-14）：标题生成 / 记忆提炼在这之后仍读历史，靠 `history_activity`
   阻止搬空；事件一到就立刻 `hibernate_session` 可能什么都不做（不是状态机坏了）。竞态测试先完成一次休眠 +
   唤醒把这段活动放完，再等 `transitioning_sessions == 1`，才是真的 `Spilling`。Windows 原子重命名前先 `drop(File)`。
-- **自研历史休眠首轮 A/B（2026-11-14，release，50 会话 × 约 2.25 MiB × 3 轮）**：PB 中位数
-  117.3 → 2.0 MiB（降 115.3），WS 120.2 → 7.3 MiB（降 112.9）；切换峰值 118.5 MiB = 对照 101.1%，
-  唤醒 p95 5.16ms、驻留再唤醒 p95 0.002ms，均过方案门槛。30 分钟混合使用未跑，所以仍由
-  `CLAUDESKTOP_HIBERNATE=1` 显式开启，不默认启用。复跑 `cargo test -p claudesktop-builtin
-  hibernation_ab_memory --release -- --ignored --nocapture`。
+- **自研历史休眠的内核合成测试（2026-11-14，release，50 会话 × 约 2.25 MiB × 3 轮）**：仅测试进程的 PB
+  中位数 117.3 → 2.0 MiB、WS 120.2 → 7.3 MiB，不能当桌面应用总占用。唤醒 p95 5.16ms；
+  0.002ms 只是驻留后再次 wake，不是真实发送延迟。118.5 MiB 峰值每 5 会话才采一次，不能据此认定峰值门槛通过。
+  复跑 `cargo test -p claudesktop-builtin hibernation_ab_memory --release -- --ignored --nocapture`；正式验收用下面的完整桌面场景。
+- **完整桌面休眠 A/B（2026-11-15）**：`tools/hibernate-bench.mjs --mode=ab`，release + `headless-screenshot`，
+  50 个真实内核完成会话 × 每个约 1.92 MiB 快照，含有效 PNG、完整工具结果和思考签名；保留界面正文，交替 3 轮。
+  主进程 PB 中位数 366.53 → 236.50 MiB（省 130.04），WS 251.09 → 143.19 MiB（省 107.89）；A/B 无外部子进程，进程树相同。
+  每轮分别达标：最差峰值比 1.00436（用 Windows 的 PeakPagefileUsage，非采样峰值），恢复 p95 ≤2.617ms，
+  激活预恢复 200ms 后实际发送至本地服务收到请求的 p95 差值 ≤1.410ms，内核发送前处理 p95 差值 ≤0.047ms。
+  外部采样目标间隔 100ms、实测最长间隔 263ms；稳态只读约 4KiB 控制数据，没有读取约 2MiB 的历史快照。
+  PowerShell 采样用 `OpenProcess` 持句柄、`DateTimeOffset.ToUnixTimeMilliseconds()` 记时间，避免动态 Handle 空值和 UTC / 本地时间相差 8 小时。
+  窗口隐藏、每 250ms 手动离屏重画，CPU 含控制与绘制开销，不代表正常应用空闲 CPU。结果在 `.claudesktop/bench/desktop-ab-01/`。
+- **30 分钟混合验收（2026-11-15）**：`tools/hibernate-bench.mjs --mode=soak`，实际 1800.414 秒、60 轮、1280 次请求、
+  700 次历史内容校验。读文件 / 单次授权写文件 / 提问 / 子任务 / 后台命令 / 停止流式 / 压缩 / 回退 / 新建关闭各 60 次，
+  后台任务运行时确认不休眠，所有会话 ID 和权限模式保持不变，无失败、无重复 Started，正常退出无遗留快照。
+  长测主进程 PB 峰值 439.19 MiB、恢复 p95 3.751ms；后台命令的进程树另计，不与无子进程的 A/B 峰值混比。
+  原始结果在 `.claudesktop/bench/desktop-soak-01/`。通过后默认开启（仍保留当前 + 最近 2 个会话、闲置 10 分钟），
+  可用 `CLAUDESKTOP_HIBERNATE=0` 关闭；`--mode=smoke --sessions=4 --activation=default` 验证不设开关时的真实路径。
+  默认开启版本已重新通过 workspace 604 项测试、普通构建和 release 截图构建；默认路径混合快查也通过（31 次请求、17 次内容校验）。
 - **测试用 `BuiltinConfig::new` 要隔离默认路径**：它会带上用户的 MCP / 说明 / 记忆 / 规则文件。测试显式设对应字段为 `None`，否则会连真实 MCP，Windows 上还可能因子进程占着临时工作目录导致清理报 os error 32。
 - **每一步的用量当场报**：`run_steps` 里每次 `stream_chat` 拿到用量就 `Inner::report_usage`，
   `context_tokens` = 这一步的输入 + 输出（`Steps::Done` 不再带用量）。原来攒到轮末才报一次，

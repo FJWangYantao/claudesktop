@@ -186,7 +186,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `CLAUDESKTOP_BENCH_STARTUP=1`；内存用 `tools/memwatch.ps1 -Tree`，主进程和进程树分开记；
   `CLAUDESKTOP_MEM_REPORT=1` 让 30 秒回收周期打一行 `[mem]`（各会话显示数据保留字节、
   资源登记表条数 / 字节 / 挤到磁盘缓存的条数，冷会话回收时另有 `session_evict` 行）。
-  无头测量要保持窗口时用 `CLAUDESKTOP_SCREENSHOT_HOLD_MS=<毫秒>`（仅截图构建）。
+  无头测量要保持窗口时用 `CLAUDESKTOP_SCREENSHOT_HOLD_MS=<毫秒>`（仅截图构建）；手动绘制必须 `window.draw(cx).clear(cx)` 清掉帧 arena。
+  自研休眠完整验收：release + `headless-screenshot` 后跑 `node tools/hibernate-bench.mjs --mode=all`
+  （默认 50 会话、3 轮交替 A/B + 1800 秒混合；`--mode=smoke --sessions=4` 快查）。隔离数据 / 本地模拟端点 / 隐藏窗口，
+  `CLAUDESKTOP_HIBERNATE_BENCH` 是仅截图构建可用的文件控制入口；采样按精确 PID，PB 峰值读 Windows 保存值，原始结果在 `.claudesktop/bench/`。
 
 ### gpui-kit 踩坑备忘
 
@@ -353,13 +356,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **外部 agent 延迟与回收**：空白 ACP 会话不启动进程，首次发送存 `autoprompt`，`Started` 后自动发。
   仅当 agent 握手声明 resume / load、所有会话 `Session::idle_detachable`、无后台任务且 10 分钟无活动时，
   `reclaim_idle_processes` 才关闭；builtin 的 MCP 回收走同一个周期入口。
-- **自研历史休眠原型**（`crates/builtin/src/hibernate.rs`）：`CLAUDESKTOP_HIBERNATE=1` 才开启，
+- **自研历史休眠**（`crates/builtin/src/hibernate.rs`）：默认开启，`CLAUDESKTOP_HIBERNATE=0` 可关闭，
   只把完整 `SessionState.history` 原子写入数据目录 `session-hibernation/`，其余会话状态、`acp_id` 和 `restored` 不变，
   恢复不发 `Started`、不走有损日志续接。界面保留当前 + 最近 2 个温会话，其余闲置 10 分钟后台休眠
   （压测可用 `CLAUDESKTOP_HIBERNATE_IDLE_SECS` 改阈值），激活后台 `wake_session`，发送在内核线程兜底恢复。
   发送 / 压缩 / 回退 / 关闭共用每会话 `history_io`，轮末标题和记忆提炼另算 `history_activity`；磁盘 I/O 不持全局会话锁。
   读取失败保留快照且明确报错，不自动降级。`history_stats` 只给估算值，真实内存仍用进程工具测；
-  性能日志是 `[perf] session_hibernate` / `session_wake`，`[mem]` 另有 resident / dormant 数。通过正确性和实测内存门槛前不默认开。
+  性能日志是 `[perf] session_hibernate` / `session_wake`，`[mem]` 另有 resident / dormant 数。完整桌面 3 轮 A/B 与 30 分钟混合验收已过，数据见 HANDOFF.md。
 - 流式文本合批上屏（`Session::stream_pending` / `STREAM_FLUSH`）：chunk 先进缓冲，短消息每 50ms 并进正文一次，
   间隔随消息长度爬坡到 250ms（`stream_flush_interval`，8KB 起爬、64KB 封顶）——每次并进是整篇重解析，长消息砍刷新率省解析；
   没并进的 chunk 不重画（`on_kernel_event` 的 `skip_notify`）。`flush_stream` 不分思考 / 正文一次全并，

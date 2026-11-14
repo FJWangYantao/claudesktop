@@ -65,8 +65,10 @@ fn log_panics() {
 
 fn main() {
     #[cfg(not(feature = "headless-screenshot"))]
-    if std::env::var_os("CLAUDESKTOP_SCREENSHOT").is_some() {
-        eprintln!("无头截图需要用 --features headless-screenshot 编译");
+    if std::env::var_os("CLAUDESKTOP_SCREENSHOT").is_some()
+        || std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_some()
+    {
+        eprintln!("无头验收需要用 --features headless-screenshot 编译");
         std::process::exit(1);
     }
     let t0 = std::time::Instant::now();
@@ -94,13 +96,14 @@ fn main() {
 
             // 静默模式不抢前台；截图模式隐藏窗口，直接离屏渲染。
             let screenshot = std::env::var_os("CLAUDESKTOP_SCREENSHOT");
-            let quiet = screenshot.is_some()
+            let hibernate_bench = std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH");
+            let quiet = screenshot.is_some() || hibernate_bench.is_some()
                 || std::env::var_os("CLAUDESKTOP_QUIET").is_some()
                 || std::env::var_os("CLAUDESKTOP_STRESS").is_some();
 
             let mut options = TitleBar::window_options();
             options.focus = !quiet;
-            options.show = screenshot.is_none();
+            options.show = screenshot.is_none() && hibernate_bench.is_none();
             if quiet {
                 // 非活动窗口默认限到 30 帧，压测量到的就不是真实帧间隔了
                 options.inactive_frame_interval = None;
@@ -147,6 +150,52 @@ fn main() {
                             "[startup_bench] main -> app_initialized:  {:>6.2} ms",
                             t_app_new.as_secs_f64() * 1000.0
                         );
+                    }
+                    #[cfg(feature = "headless-screenshot")]
+                    if let Some(dir) = hibernate_bench {
+                        let dir = std::path::PathBuf::from(dir);
+                        cx.spawn_in(window, async move |this, cx| {
+                            let mut last_id = 0;
+                            let mut last_draw = std::time::Instant::now();
+                            let mut last_command = std::time::Instant::now();
+                            loop {
+                                cx.background_executor().timer(Duration::from_millis(50)).await;
+                                let command = std::fs::read(dir.join("command.json")).ok()
+                                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                                if let Some(command) = command
+                                    && let Some(id) = command["id"].as_u64().filter(|id| *id > last_id)
+                                {
+                                    last_id = id;
+                                    last_command = std::time::Instant::now();
+                                    let result = this.update_in(cx, |app, window, cx| {
+                                        app.hibernate_bench_command(&command, window, cx)
+                                    }).expect("无头验收窗口已关闭");
+                                    let response = match result {
+                                        Ok(value) => serde_json::json!({"id": id, "ok": true, "value": value}),
+                                        Err(error) => serde_json::json!({"id": id, "ok": false, "error": error}),
+                                    };
+                                    let tmp = dir.join("response.tmp");
+                                    std::fs::write(&tmp, response.to_string()).expect("写验收结果失败");
+                                    std::fs::rename(tmp, dir.join("response.json")).expect("发布验收结果失败");
+                                    if command["action"] == "quit" {
+                                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                                        let _ = cx.update(|_, cx| cx.quit());
+                                        return;
+                                    }
+                                }
+                                if last_command.elapsed() > Duration::from_secs(90) {
+                                    panic!("验收控制进程失联");
+                                }
+                                if last_draw.elapsed() >= Duration::from_millis(250) {
+                                    cx.update(|window, cx| {
+                                        window.refresh();
+                                        window.draw(cx).clear(cx);
+                                    }).expect("无头验收绘制窗口已关闭");
+                                    last_draw = std::time::Instant::now();
+                                }
+                            }
+                        }).detach();
+                        return app;
                     }
                     // 延迟 1.5s 触发自动演示，避开启动阶段的窗口初始化。
                     cx.spawn_in(window, async move |this, cx| {
@@ -243,7 +292,7 @@ fn main() {
                             for _ in 0..3 {
                                 let _ = cx.update(|window, cx| {
                                     window.refresh();
-                                    let _ = window.draw(cx);
+                                    window.draw(cx).clear(cx);
                                 });
                                 cx.background_executor().timer(Duration::from_millis(100)).await;
                             }
@@ -295,7 +344,7 @@ fn main() {
                                         );
                                         let start = std::time::Instant::now();
                                         window.refresh();
-                                        let _ = window.draw(cx);
+                                        window.draw(cx).clear(cx);
                                         work.push(start.elapsed().as_secs_f64() * 1000.);
                                     });
                                 }
@@ -321,7 +370,7 @@ fn main() {
                             }
                             let result = cx.update(|window, cx| {
                                 window.refresh();
-                                let _ = window.draw(cx);
+                                window.draw(cx).clear(cx);
                                 window
                                     .render_to_image()
                                     .and_then(|image| image.save(&path).map_err(Into::into))

@@ -167,7 +167,7 @@ pub struct BuiltinConfig {
     pub chat_web: bool,
     /// 用户的「聊天说明」文件（每轮重读）：每次聊天都带上的话
     pub chat_instructions: Option<PathBuf>,
-    /// 闲置会话的完整历史快照目录；None = 不休眠（原型默认关闭）
+    /// 闲置会话的完整历史快照目录；None = 不休眠
     pub hibernation_dir: Option<PathBuf>,
 }
 
@@ -473,10 +473,10 @@ pub fn default_memory_path() -> Option<PathBuf> {
     claudesktop_core::memory::global_path()
 }
 
-/// 原型开关：`CLAUDESKTOP_HIBERNATE=1` 时才允许闲置历史落盘。
+/// 闲置历史默认允许落盘；`CLAUDESKTOP_HIBERNATE=0` 可关闭。
 pub fn default_hibernation_dir() -> Option<PathBuf> {
     let enabled =
-        std::env::var("CLAUDESKTOP_HIBERNATE").is_ok_and(|value| !value.is_empty() && value != "0");
+        std::env::var("CLAUDESKTOP_HIBERNATE").map_or(true, |value| !value.is_empty() && value != "0");
     enabled
         .then(|| claudesktop_core::default_data_dir().ok())
         .flatten()
@@ -2873,7 +2873,9 @@ fn run_pending_prompt(
     session: String,
     prompt: claudesktop_core::UserPrompt,
     flag: Arc<AtomicBool>,
+    submitted_at: std::time::Instant,
 ) {
+    let worker_at = std::time::Instant::now();
     if let Err(err) = inner.wake_history(&session) {
         if !flag.load(Ordering::SeqCst) {
             inner.finish(&session, &flag);
@@ -2881,9 +2883,19 @@ fn run_pending_prompt(
         }
         return;
     }
+    let restored_at = std::time::Instant::now();
     let Some(warnings) = inner.prepare_prompt(&session, prompt, &flag) else {
         return;
     };
+    if std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_some() {
+        eprintln!("[hibernate_send] {}", json!({
+            "session": session,
+            "queue_ms": worker_at.duration_since(submitted_at).as_secs_f64() * 1000.,
+            "restore_ms": restored_at.duration_since(worker_at).as_secs_f64() * 1000.,
+            "prepare_ms": restored_at.elapsed().as_secs_f64() * 1000.,
+            "preflight_ms": submitted_at.elapsed().as_secs_f64() * 1000.,
+        }));
+    }
     inner.reset_denials(&session);
     for warning in warnings {
         inner.emit(Some(&session), KernelEvent::Notice(warning));
@@ -3474,6 +3486,7 @@ impl Kernel for BuiltinKernel {
         session: &str,
         prompt: claudesktop_core::UserPrompt,
     ) -> anyhow::Result<()> {
+        let submitted_at = std::time::Instant::now();
         let flag = {
             let mut sessions = self.inner.sessions.lock().unwrap();
             let state =
@@ -3491,7 +3504,7 @@ impl Kernel for BuiltinKernel {
         let worker_session = session.clone();
         let spawned = std::thread::Builder::new()
             .name("builtin-turn".into())
-            .spawn(move || run_pending_prompt(inner, worker_session, prompt, flag));
+            .spawn(move || run_pending_prompt(inner, worker_session, prompt, flag, submitted_at));
         if let Err(err) = spawned {
             let mut sessions = self.inner.sessions.lock().unwrap();
             if let Some(state) = sessions.get_mut(&session) {

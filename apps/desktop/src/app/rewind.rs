@@ -79,6 +79,24 @@ impl ChatApp {
         store.load(&meta.id).ok().map(|records| claudesktop_core::effective(&records))
     }
 
+    #[cfg(feature = "headless-screenshot")]
+    pub(super) fn hibernate_bench_rewind(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let item = self.sessions[self.active].transcript.iter()
+            .rposition(|item| matches!(item, ChatItem::User { .. }))
+            .ok_or("没有可以回退的消息")?;
+        let preview = self.rewind_preview(item);
+        if let Some(error) = preview.error {
+            return Err(error.to_string());
+        }
+        self.rewind = Some(preview);
+        self.rewind_to(item, true, false, window, cx);
+        Ok(())
+    }
+
     /// 当前会话第 `item` 行（一条用户消息）的回退预览。
     fn rewind_preview(&mut self, item: usize) -> RewindPreview {
         let active = self.active;
