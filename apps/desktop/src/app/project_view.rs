@@ -308,18 +308,7 @@ impl ChatApp {
             .child(note(IconAll::FolderTree, format!("项目根：{}", form.root.display())))
             .child(note(IconAll::Braces, format!("配置文件：{}", form.path.display())));
 
-        // 模型：留空就跟全局
-        let global_model = self.settings.builtin.current().model.clone();
-        let model_hint = if global_model.is_empty() {
-            "新会话默认用的模型；留空 = 跟全局".to_string()
-        } else {
-            format!("新会话默认用的模型；留空 = 跟全局（现在是 {global_model}）")
-        };
-        let model = div()
-            .v_flex()
-            .gap_1p5()
-            .child(Self::text_input(&form.model))
-            .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(model_hint));
+        let model = Self::text_input(&form.model);
 
         let rules = div()
             .v_flex()
@@ -493,14 +482,13 @@ impl ChatApp {
                 .text_color(rgb(if *error { RED } else { GREEN }))
                 .child(text.clone())
                 .into_any_element(),
-            None => div().text_color(rgb(INK_SOFT)).child("改完即生效").into_any_element(),
+            None => div().into_any_element(),
         };
         let footer = div().text_size(TEXT_SMALL).line_height(LEADING).child(status);
 
         let warnings = form.warnings.clone();
         section(
             "这个项目",
-            "只写和全局不一样的，其余跟全局",
             Some(actions),
             div()
                 .v_flex()
@@ -513,16 +501,12 @@ impl ChatApp {
                     div()
                         .v_flex()
                         .gap_5()
-                        .child(form_field("模型", None, model))
-                        .child(form_field("权限规则", None, rules))
-                        .child(form_field("停用的 MCP", Some("只在这个项目里不连".into()), mcp))
-                        .child(form_field("插件", Some("从全局已启用的插件里挑".into()), plugins))
-                        .child(form_field("说明文件", None, instructions))
-                        .child(form_field(
-                            "worktree",
-                            Some("建 worktree 时复制哪些文件、跑什么命令".into()),
-                            worktree,
-                        )),
+                        .child(form_field("模型", model))
+                        .child(form_field("权限规则", rules))
+                        .child(form_field("停用的 MCP", mcp))
+                        .child(form_field("插件", plugins))
+                        .child(form_field("说明文件", instructions))
+                        .child(form_field("worktree", worktree)),
                 )
                 .child(footer),
         )

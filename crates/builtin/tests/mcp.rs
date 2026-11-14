@@ -61,13 +61,32 @@ struct Hub {
 
 impl Hub {
     fn new(name: &str, servers: serde_json::Value) -> Self {
-        let dir = workdir(name);
+        Self::open(name, Some(servers), false)
+    }
+
+    fn new_lazy(name: &str) -> Self {
+        Self::open(name, None, true)
+    }
+
+    fn open(name: &str, servers: Option<serde_json::Value>, lazy: bool) -> Self {
+        let dir = if servers.is_some() {
+            workdir(name)
+        } else {
+            std::env::temp_dir().join(format!("claudesktop-mcp-{}-{name}", std::process::id()))
+        };
         let config = dir.join("mcp.json");
-        std::fs::write(&config, serde_json::json!({ "mcpServers": servers }).to_string()).unwrap();
+        if let Some(servers) = servers {
+            std::fs::write(&config, serde_json::json!({ "mcpServers": servers }).to_string())
+                .unwrap();
+        }
         let history = Arc::new(Mutex::new(Vec::new()));
         let sink = history.clone();
         let hub = McpHub::new(Some(config), dir, move |s| sink.lock().unwrap().push(s));
-        hub.reload();
+        if lazy {
+            hub.reload_lazy()
+        } else {
+            hub.reload()
+        }
         Self { hub, history }
     }
 
@@ -135,6 +154,25 @@ fn stdio_servers_reconnect_after_the_process_dies() {
     assert!(out.images[0].data.starts_with("iVBOR"));
     crash_and_recover(&h, "local");
     h.hub.stop();
+}
+
+#[test]
+fn cached_stdio_tools_connect_on_first_call() {
+    let first =
+        Hub::new("lazy", serde_json::json!({ "local": { "command": "node", "args": [script()] } }));
+    first.ready("local", 4);
+    first.hub.stop();
+    drop(first);
+
+    let lazy = Hub::new_lazy("lazy");
+    lazy.wait("idle with cached tools", "local", |s| s.state == McpState::Idle && s.tools == 4);
+    assert_eq!(lazy.hub.specs(true, &[]).len(), 4);
+    assert_eq!(
+        lazy.call("local", "echo", serde_json::json!({ "text": "lazy" })),
+        (true, "echo: lazy".into())
+    );
+    lazy.ready("local", 4);
+    lazy.hub.stop();
 }
 
 #[test]

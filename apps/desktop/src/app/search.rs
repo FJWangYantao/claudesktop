@@ -1,9 +1,9 @@
 //! 搜消息：命令面板（Ctrl+K）里打字时，在已载入的会话里搜用户消息和回复的正文，
 //! 命中的一条列成「消息」组（摘一小段上下文），确认后切到那个会话、滚到那条消息并闪一下底色。
 //!
-//! 内存里只有最近的一百个会话（`MAX_RESTORED`），更早的搜不到；所以同时让
-//! [`claudesktop_core::history_search`] 在后台线程里扫磁盘上的会话日志，
-//! 命中的列在「历史」组（会话还在磁盘上、没载入内存的那些），选中后把它恢复进侧栏再跳过去。
+//! 侧栏里的历史会话也只有元信息；正文搜索同时让
+//! [`claudesktop_core::history_search`] 在后台线程里扫尚未载入的会话日志，
+//! 命中的列在「历史」组，选中后加载对应会话再跳过去。
 
 use super::ChatApp;
 use crate::model::ChatItem;
@@ -171,10 +171,11 @@ impl ChatApp {
                 let order: Vec<usize> =
                     this.session_groups().into_iter().flat_map(|g| g.members).collect();
                 this.palette_hits = search_messages(&this.sessions, &order, &query);
-                // 已经在内存里的会话（侧栏有）不再重复扫磁盘
+                // 只有日志已读进内存的会话不再扫磁盘；侧栏占位仍由后台搜索覆盖。
                 let loaded: std::collections::HashSet<String> = this
                     .sessions
                     .iter()
+                    .filter(|s| s.history_loaded)
                     .filter_map(|s| s.meta.as_ref().map(|m| m.id.clone()))
                     .collect();
                 let dir = this.store.as_ref().map(|s| s.dir().to_path_buf());
@@ -226,17 +227,23 @@ impl ChatApp {
                 let Some(meta) = store.list().into_iter().find(|m| m.id == hit.session) else {
                     return;
                 };
-                let Ok(records) = store.load(&meta.id) else { return };
-                let session =
-                    Session::from_records(self.next_token, meta, records, &self.settings.acp);
+                let session = Session::placeholder(self.next_token, meta, &self.settings);
                 self.next_token += 1;
                 self.sessions.push(session);
                 self.sessions.len() - 1
             }
         };
+        self.sessions[idx].pending_reveal_turn = Some(turn);
         self.settings_open = false;
         self.activate_session(idx, cx);
-        // 定位到那一轮的用户消息
+        self.reveal_pending_turn(idx);
+    }
+
+    pub(super) fn reveal_pending_turn(&mut self, idx: usize) {
+        if !self.sessions[idx].history_loaded {
+            return;
+        }
+        let Some(turn) = self.sessions[idx].pending_reveal_turn.take() else { return };
         let item = self.sessions[idx]
             .transcript
             .iter()

@@ -4,7 +4,7 @@
 //! 存菜单 bool；条目动作经 `Entity<ChatApp>` 回到根视图，选中后调
 //! `PopoverState::dismiss` 收起面板。
 //!
-//! 条目用 [`MenuList`] 组：前 9 个可选条目右侧标上数字，面板开着时按数字键直接选。
+//! 条目用 [`MenuList`] 组：默认给前 9 个可选条目右侧标上数字，面板开着时按数字键直接选。
 //! 按键要落在焦点链上，所以面板打开时焦点给 `ChatApp::menu_focus`（挂在条目列表外层），
 //! 而不是 Popover 自己的外壳（列表是外壳的子元素，不在它的按键分发路径上）。
 
@@ -14,6 +14,7 @@ use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::{PopoverState, Selectable};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -158,10 +159,14 @@ const MAX_KEYED: usize = 9;
 /// 菜单面板里的条目列表。[`pick`](Self::pick) 加可选条目（点了执行动作并收起面板，
 /// 前 9 个标数字），[`child`](Self::child) 加别的内容（提示、不收起面板的操作）。
 pub(super) struct MenuList {
+    id: ElementId,
     handle: Entity<ChatApp>,
     popover: Entity<PopoverState>,
     body: Stateful<Div>,
+    header: Option<AnyElement>,
     picks: Vec<Pick>,
+    shortcuts: bool,
+    scrollbar: bool,
 }
 
 impl MenuList {
@@ -170,17 +175,39 @@ impl MenuList {
         handle: &Entity<ChatApp>,
         popover: &Entity<PopoverState>,
     ) -> Self {
+        let id = id.into();
         Self {
+            id: id.clone(),
             handle: handle.clone(),
             popover: popover.clone(),
             body: div().id(id).v_flex().gap_0p5(),
+            header: None,
             picks: Vec::new(),
+            shortcuts: true,
+            scrollbar: false,
         }
+    }
+
+    /// 在添加条目前调用：不显示数字键帽，也不绑定数字快捷键。
+    pub(super) fn without_shortcuts(mut self) -> Self {
+        self.shortcuts = false;
+        self
+    }
+
+    pub(super) fn compact(mut self) -> Self {
+        self.body = self.body.gap_0();
+        self
     }
 
     /// 条目多时限高滚动。
     pub(super) fn scroll(mut self, max_h: Rems) -> Self {
         self.body = self.body.max_h(max_h).overflow_y_scroll();
+        self
+    }
+
+    pub(super) fn scroll_with_bar(mut self, max_h: Rems) -> Self {
+        self = self.scroll(max_h);
+        self.scrollbar = true;
         self
     }
 
@@ -206,11 +233,13 @@ impl MenuList {
         });
         let n = self.picks.len() + 1;
         let on_click = pick.clone();
-        self.picks.push(pick);
+        if self.shortcuts {
+            self.picks.push(pick);
+        }
         // 键帽样式，免得和条目里的数字（如增删行数）连成一串
         let row = row
             .on_click(move |_, window, cx| on_click(window, cx))
-            .when(n <= MAX_KEYED, |d| d.child(ChatApp::kbd(&n.to_string())));
+            .when(self.shortcuts && n <= MAX_KEYED, |d| d.child(ChatApp::kbd(&n.to_string())));
         self.body = self.body.child(row);
         self
     }
@@ -220,22 +249,49 @@ impl MenuList {
         self
     }
 
+    pub(super) fn header(mut self, header: impl IntoElement) -> Self {
+        self.header = Some(header.into_any_element());
+        self
+    }
+
     /// 收尾：外层挂上 `focus`（面板打开时焦点在这里），数字键选对应条目。
-    pub(super) fn finish(self, focus: &FocusHandle) -> Div {
+    pub(super) fn finish(self, focus: &FocusHandle, window: &mut Window, cx: &mut App) -> Div {
         let picks = self.picks;
-        div().track_focus(focus).child(self.body).on_key_down(move |event, window, cx| {
-            let keys = &event.keystroke;
-            // 只放行 Shift：AZERTY 等布局上打数字要按住 Shift，`key` 仍是 "1"。
-            // Ctrl / Alt 要留给 Ctrl+K、Alt+1..4 这些快捷键
-            if keys.modifiers.control || keys.modifiers.alt || keys.modifiers.platform {
-                return;
-            }
-            let n = keys.key.parse::<usize>().ok().filter(|n| (1..=MAX_KEYED).contains(n));
-            if let Some(pick) = n.and_then(|n| picks.get(n - 1)) {
-                pick(window, cx);
-                cx.stop_propagation();
-            }
-        })
+        let body = if self.scrollbar {
+            let scroll = window
+                .use_keyed_state((self.id, "scroll"), cx, |_, _| ScrollHandle::new())
+                .read(cx)
+                .clone();
+            div()
+                .relative()
+                .child(self.body.track_scroll(&scroll).pr_4())
+                .child(Scrollbar::vertical(&scroll).mode(ScrollbarMode::Always))
+                .into_any_element()
+        } else {
+            self.body.into_any_element()
+        };
+        div()
+            .track_focus(focus)
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .when_some(self.header, |d, header| d.child(header))
+                    .child(body),
+            )
+            .on_key_down(move |event, window, cx| {
+                let keys = &event.keystroke;
+                // 只放行 Shift：AZERTY 等布局上打数字要按住 Shift，`key` 仍是 "1"。
+                // Ctrl / Alt 要留给 Ctrl+K、Alt+1..4 这些快捷键
+                if keys.modifiers.control || keys.modifiers.alt || keys.modifiers.platform {
+                    return;
+                }
+                let n = keys.key.parse::<usize>().ok().filter(|n| (1..=MAX_KEYED).contains(n));
+                if let Some(pick) = n.and_then(|n| picks.get(n - 1)) {
+                    pick(window, cx);
+                    cx.stop_propagation();
+                }
+            })
     }
 }
 
@@ -261,19 +317,61 @@ pub(super) fn menu_item(
         .rounded_md()
         .cursor_pointer()
         .hover(|d| d.bg(rgb(HOVER)))
-        .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
+        .text_size(TEXT_BODY)
+        .child(Icon::new(icon).size_4().flex_shrink_0().text_color(rgb(INK_SOFT)))
         .child(
             // min_w_0：长说明（如路径）在面板宽度内换行，不撑出去
             div()
                 .v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(name.into()))
+                .child(
+                    div()
+                        .when(desc.is_empty(), |d| {
+                            d.overflow_hidden().text_ellipsis().whitespace_nowrap()
+                        })
+                        .text_color(rgb(INK))
+                        .child(name.into()),
+                )
                 .when(!desc.is_empty(), |d| {
                     d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc))
                 }),
         )
         .when(active, |d| d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL))))
+}
+
+pub(super) fn menu_text_item(
+    id: impl Into<ElementId>,
+    name: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(Role::MenuItem)
+        .aria_selected(active)
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .px_2p5()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(HOVER)))
+        .text_size(TEXT_SMALL)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(name.into()),
+        )
+        .child(
+            div().size_3p5().flex_none().when(active, |d| {
+                d.child(Icon::new(IconAll::Check).size_3p5().text_color(rgb(INK)))
+            }),
+        )
 }
 
 /// 字体预览行用的样例字：拉丁字母（字宽 / 字形差异最明显）、数字、中文
@@ -406,9 +504,9 @@ pub(super) fn menu_popover(
             p.trigger_style(StyleRefinement::default().flex_shrink_1().min_w(CHIP_MIN_W))
         })
         .trigger(chip)
-        .content(move |_, _, cx| {
+        .content(move |_, window, cx| {
             let popover = cx.entity();
-            items(handle.read(cx), &handle, &popover).finish(&list_focus)
+            items(handle.read(cx), &handle, &popover).finish(&list_focus, window, cx)
         })
 }
 

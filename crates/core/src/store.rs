@@ -73,6 +73,9 @@ pub struct SessionMeta {
     /// 聊天会话的「联网」开关（会话级，重开应用后还是用户选的那样）；Code 会话 / 老元信息为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<bool>,
+    /// 会话选中的权限模式 ID；老记录未保存，按内核默认模式处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// 会话的 git worktree：[`SessionMeta::cwd`] 是检出目录，这里记它从哪个仓库、哪个分支分出来。
@@ -278,6 +281,7 @@ impl SessionStore {
             worktree: None,
             kind: SessionKind::Code,
             web: None,
+            mode: None,
         };
         self.save_meta(&meta)?;
         let log = self.append_log(&meta.id)?;
@@ -353,7 +357,8 @@ impl SessionStore {
         self.dir.join(format!("{id}.json"))
     }
 
-    fn log_path(&self, id: &str) -> PathBuf {
+    /// 会话的追加式日志路径；用量增量索引按字节偏移读取它。
+    pub fn log_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.jsonl"))
     }
 }
@@ -509,6 +514,26 @@ mod tests {
         let text = serde_json::to_string(&chat).unwrap();
         assert!(text.contains("\"kind\":\"chat\""), "{text}");
         assert_eq!(serde_json::from_str::<SessionMeta>(&text).unwrap(), chat);
+    }
+
+    #[test]
+    fn permission_mode_round_trips_and_old_metas_still_load() {
+        let old = r#"{"id":"s","title":"t","cwd":".","agent":"a","created_ms":1,"updated_ms":2}"#;
+        let meta: SessionMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(meta.mode, None);
+        assert!(!serde_json::to_string(&meta).unwrap().contains("\"mode\""));
+        let store = temp_store("permission-mode");
+        let (mut meta, log) = store.create("t", ".".into(), "builtin:test").unwrap();
+        drop(log);
+        let updated_ms = meta.updated_ms;
+        for mode in ["auto", "default", "plan", "agent-mode"] {
+            meta.mode = Some(mode.into());
+            store.save_meta(&meta).unwrap();
+            let restored = store.list().pop().unwrap();
+            assert_eq!(restored.mode.as_deref(), Some(mode));
+            assert_eq!(restored.updated_ms, updated_ms);
+        }
+        fs::remove_dir_all(store.dir()).unwrap();
     }
 
     #[test]

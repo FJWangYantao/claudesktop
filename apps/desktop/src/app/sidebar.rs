@@ -1,4 +1,4 @@
-//! 侧栏：浮起的圆角面板，含导航、对话历史、设置与内核状态。
+//! 侧栏：贴满窗口左缘的纸色面板，含导航、对话历史、设置与内核状态。
 //! 对话历史分两区：上面是**项目区**（按工作目录分组，当前项目在前），下面是**任务区**
 //! （[`TASKS_KEY`]：建立时没为它选过文件夹的对话，见 [`Session::task`]），
 //! 最后是「已归档」组。会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
@@ -20,13 +20,14 @@ use super::mascot::brand_mark;
 use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
-use super::{ChatApp, project_label};
+use super::{ChatApp, project_label, short_path};
 use crate::session::scroll_handle_edge;
 use crate::settings::{KernelChoice, Space};
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::SessionKind;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::base::PopoverState;
 use gpui_kit::base::motion::{Transition, transition};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Input;
@@ -658,20 +659,18 @@ impl ChatApp {
                     .text_color(rgb(INK))
                     .child("claudesktop"),
             );
-        // 浮起的面板：沙色底 + 细边 + 淡阴影，和纸色的会话区分出前后
+        // 贴边的面板：纸色底 + 右侧一条分隔线，占满窗口左缘，把视觉重心让给会话区
         let panel = v_flex()
             .size_full()
-            .rounded_xl()
-            .bg(rgb(SAND))
-            .border_1()
+            .bg(rgb(PAPER))
+            .border_r_1()
             .border_color(rgb(LINE))
-            .shadow_xs()
             .overflow_hidden()
             .child(
                 // 头部：侧栏开关 + 品牌，其余是拖拽区（与会话区顶栏同高）
                 div()
                     .h_flex()
-                    .h(CHROME_H.to_pixels(window.rem_size()) - px(8.))
+                    .h(CHROME_H.to_pixels(window.rem_size()))
                     .flex_shrink_0()
                     .items_center()
                     .pl_2()
@@ -686,6 +685,9 @@ impl ChatApp {
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
                     .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
             )
+            .when(self.space() == Space::Code, |d| {
+                d.child(div().mx_2().child(self.sidebar_project_menu(cx)))
+            })
             .child(nav_item("plugins", IconAll::Blocks, "插件", plugins_open).on_click(
                 cx.listener(|this, _, window, cx| {
                     this.open_settings_at(super::settings_view::PLUGINS_TAB, window, cx)
@@ -719,8 +721,8 @@ impl ChatApp {
                         div().absolute().left_0().right_0().bottom_0().h(h.to_pixels(rem)).bg(
                             linear_gradient(
                                 180.,
-                                linear_color_stop(Rgba { a: 0., ..rgb(SAND) }, 0.),
-                                linear_color_stop(rgb(SAND), 1.),
+                                linear_color_stop(Rgba { a: 0., ..rgb(PAPER) }, 0.),
+                                linear_color_stop(rgb(PAPER), 1.),
                             )
                             .color_space(ColorSpace::Oklab),
                         )
@@ -765,8 +767,8 @@ impl ChatApp {
                     )),
             );
 
-        // 侧栏是浮在窗口底色上的圆角面板，四周留一圈窗口底色
-        div().w(SIDEBAR_W).flex_shrink_0().h_full().pl_2().py_2().child(panel)
+        // 侧栏占满窗口左缘：全高、无外边距、不浮起
+        div().w(SIDEBAR_W).flex_shrink_0().h_full().child(panel)
     }
 
     /// 空间切换（品牌行下面那格）：聊天 | 代码。
@@ -853,6 +855,84 @@ impl ChatApp {
         }
     }
 
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_sidebar_projects(&mut self, verify_flow: bool, cx: &mut Context<Self>) {
+        let idx = self
+            .sessions
+            .iter()
+            .position(|s| s.restored && s.kind == SessionKind::Code && s.has_user_message())
+            .expect("没有可预览的项目会话");
+        self.activate_session(idx, cx);
+        if !verify_flow {
+            return;
+        }
+        let original = self.session().token;
+        let original_dir = self.session().cwd.clone();
+        let target = self
+            .recent_workspaces()
+            .into_iter()
+            .find(|dir| *dir != original_dir)
+            .expect("需要另一个项目目录验证切换");
+        let chat_dirs: Vec<_> =
+            self.sessions.iter().filter(|s| s.is_chat()).map(|s| s.cwd.clone()).collect();
+        assert!(self.recent_workspaces().iter().all(|dir| !chat_dirs.contains(dir)));
+        self.switch_workspace(target.clone(), cx);
+        assert_ne!(self.session().token, original);
+        assert_eq!(self.session().cwd, target);
+        assert!(!self.session().task);
+        assert_eq!(self.settings.workspace.as_ref(), Some(&target));
+        let old = self.sessions.iter().find(|s| s.token == original).unwrap();
+        assert_eq!(old.cwd, original_dir);
+        assert!(old.has_user_message());
+        self.as_task(cx);
+        assert!(self.session().task);
+        assert_eq!(self.session().cwd, self.acp_base.cwd);
+        let blank = self.session().token;
+        let total = self.sessions.len();
+        self.switch_workspace(target.clone(), cx);
+        assert_eq!(self.session().cwd, target);
+        assert!(!self.session().task);
+        assert_eq!(self.sessions.len(), total);
+        assert_ne!(self.session().token, blank);
+        eprintln!(
+            "sidebar projects verified: existing conversation, blank conversation, task, recent projects"
+        );
+    }
+
+    fn sidebar_project_menu(&self, cx: &mut Context<Self>) -> Popover {
+        let handle = cx.entity();
+        let focus = self.menu_focus.clone();
+        let trigger = Self::quiet_button("sidebar-projects", IconAll::Folder, Surface::Sand, cx)
+            .h(rems(2.))
+            .w_full()
+            .px_2()
+            .accessibility_label("项目")
+            .child(
+                div()
+                    .h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .pl_0p5()
+                    .child(div().flex_1().text_size(TEXT_BODY).text_color(rgb(INK)).child("项目"))
+                    .child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT))),
+            );
+        menu_panel(Popover::new("sidebar-project-menu"), &self.menu_focus)
+            .anchor(Anchor::TopLeft)
+            .w(rems(16.))
+            .p_0p5()
+            .trigger_style(StyleRefinement::default().w_full())
+            .trigger(trigger)
+            .default_open(
+                cfg!(feature = "headless-screenshot")
+                    && std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("project-menu"),
+            )
+            .content(move |_, window, cx| {
+                let popover = cx.entity();
+                project_menu_items(handle.read(cx), &handle, &popover).finish(&focus, window, cx)
+            })
+    }
+
     /// 第一组组名旁的筛选按钮：点开选全部 / 进行中 / 待查看。筛选中时图标高亮、常显。
     fn sidebar_filter_menu(&self, cx: &mut Context<Self>) -> Popover {
         let on = self.sidebar_filter != SidebarFilter::All;
@@ -865,7 +945,7 @@ impl ChatApp {
             .anchor(Anchor::TopRight)
             .w(rems(16.25))
             .trigger(trigger)
-            .content(move |_, _, cx| {
+            .content(move |_, window, cx| {
                 let popover = cx.entity();
                 let current = handle.read(cx).sidebar_filter;
                 let mut menu = MenuList::new("filter-menu-list", &handle, &popover);
@@ -878,7 +958,7 @@ impl ChatApp {
                         },
                     );
                 }
-                menu.finish(&focus)
+                menu.finish(&focus, window, cx)
             })
     }
 
@@ -1316,6 +1396,7 @@ impl ChatApp {
         // 先关掉日志文件再删
         drop(removed);
         if let Some(id) = id {
+            self.usage_index_generation += 1;
             self.usage.retain(|t| t.session != id);
             if let Some(store) = &self.store
                 && let Err(err) = store.delete(&id)
@@ -1331,6 +1412,58 @@ impl ChatApp {
         }
         cx.notify();
     }
+}
+
+fn project_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let session = app.session();
+    let current = session.group_dir();
+    let mut menu = MenuList::new("sidebar-project-list", handle, popover)
+        .without_shortcuts()
+        .compact()
+        .scroll_with_bar(rems(18.));
+    for (i, dir) in app.recent_workspaces().into_iter().enumerate() {
+        let active = !session.task && dir == current;
+        let path = short_path(&dir);
+        menu = menu.pick(
+            project_menu_item(("project-item", i), IconAll::Folder, project_label(&dir), active)
+                .tooltip(move |window, cx| super::chat::text_tip(&path, window, cx)),
+            move |this, cx| this.switch_workspace(dir.clone(), cx),
+        );
+    }
+    menu = menu.child(div().my_0p5().border_t_1().border_color(rgb(LINE)));
+    if app.git_repo_here() {
+        menu = menu.pick(
+            project_menu_item("project-worktree", IconAll::GitBranch, "新建 worktree", false),
+            |this, cx| this.start_in_worktree(cx),
+        );
+    }
+    menu.pick(
+        project_menu_item("project-task", IconAll::ListTodo, "不选项目（任务）", session.task),
+        |this, cx| this.as_task(cx),
+    )
+    .pick(
+        project_menu_item("project-pick", IconAll::FolderOpen, "选择文件夹…", false),
+        |this, cx| this.pick_workspace(cx),
+    )
+}
+
+fn project_menu_item(
+    id: impl Into<ElementId>,
+    icon: IconAll,
+    name: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    menu_item(id, icon, name, "", active)
+        .h(rems(1.75))
+        .gap_1p5()
+        .px_2()
+        .py_0()
+        .line_height(relative(1.25))
+        .text_size(TEXT_SMALL)
 }
 
 /// 侧栏分组的收尾：在项目分组后面补「任务」和「已归档」两组。
@@ -1437,6 +1570,7 @@ mod tests {
             worktree: s.worktree.clone(),
             kind: claudesktop_core::SessionKind::Code,
             web: None,
+            mode: None,
         };
         let restored =
             crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());

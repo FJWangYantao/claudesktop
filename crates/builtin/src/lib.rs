@@ -233,7 +233,7 @@ impl BuiltinConfig {
 }
 
 /// 「自动」模式可用的前提下才有它（没配置就不出现，见 [`AutoModeConfig`]）。
-fn modes(auto_available: bool) -> Vec<ModeView> {
+pub fn permission_modes(auto_available: bool) -> Vec<ModeView> {
     let m = |id: &str, name: &str, desc: &str| ModeView {
         id: id.into(),
         name: name.into(),
@@ -2424,8 +2424,8 @@ impl BuiltinKernel {
                 }),
             );
         }
-        // MCP 服务器在后台连，连上之前的轮次没有它们的工具
-        inner.mcp.reload();
+        // 首次连接在后台列工具并缓存；已有有效缓存的服务器等首次调用再连。
+        inner.mcp.reload_lazy();
         Ok(Self { inner })
     }
 
@@ -2550,7 +2550,11 @@ impl BuiltinKernel {
                 session_id: session_id.clone(),
                 model: Some(model),
                 // 聊天没有权限模式：模式表为空，界面据此不画模式 chip
-                modes: if chat { Vec::new() } else { modes(self.inner.auto_mode.is_some()) },
+                modes: if chat {
+                    Vec::new()
+                } else {
+                    permission_modes(self.inner.auto_mode.is_some())
+                },
                 current_mode: (!chat).then(|| MODE_DEFAULT.to_string()),
                 resumed,
             },
@@ -3243,7 +3247,13 @@ fn message_text(message: &ChatMessage) -> String {
 fn plugin_servers(plugins: &[Plugin]) -> Vec<mcp::ServerConfig> {
     plugins
         .iter()
-        .flat_map(|p| p.mcp_servers.iter().map(|s| mcp::ServerConfig::from_plugin(&p.name, s)))
+        .flat_map(|p| {
+            p.mcp_servers.iter().map(|s| {
+                let mut config = mcp::ServerConfig::from_plugin(&p.name, s);
+                config.cache_salt = p.version.clone().unwrap_or_default();
+                config
+            })
+        })
         .collect()
 }
 
@@ -3419,7 +3429,7 @@ impl Kernel for BuiltinKernel {
     }
 
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()> {
-        if !modes(self.inner.auto_mode.is_some()).iter().any(|m| m.id == mode_id) {
+        if !permission_modes(self.inner.auto_mode.is_some()).iter().any(|m| m.id == mode_id) {
             anyhow::bail!("未知模式 {mode_id}");
         }
         let mut sessions = self.inner.sessions.lock().unwrap();
@@ -3551,6 +3561,10 @@ impl Kernel for BuiltinKernel {
 
     fn reload_mcp(&self) {
         self.inner.mcp.reload();
+    }
+
+    fn reclaim_idle_mcp(&self) {
+        self.inner.mcp.reclaim_idle();
     }
 
     fn set_plugins(&self, plugins: Vec<Plugin>) {

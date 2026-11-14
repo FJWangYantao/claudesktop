@@ -11,7 +11,7 @@ use super::ChatApp;
 use super::catalog_view::{
     Shelf, ShelfState, list_card, matches, no_match, pick_done, pick_row, shelf_bar,
 };
-use super::settings_kit::{example_block, how_to, note, section};
+use super::settings_kit::{example_block, how_to, note};
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
@@ -245,7 +245,6 @@ impl ChatApp {
             .child(
                 Self::text_button("mcp-reload", "重新加载", false)
                     .small()
-                    .tooltip("改完配置文件后点它，重新读配置并重连全部服务器")
                     .on_click(cx.listener(|this, _, _, cx| this.reload_mcp(cx))),
             )
             .into_any_element();
@@ -264,11 +263,13 @@ impl ChatApp {
                 IconAll::ShieldCheck,
                 "调用 MCP 工具同样会弹权限卡片；模型看到的工具名是 mcp__服务器__工具。启用的插件带来的服务器也列在这里",
             ));
-        let footer = div()
-            .v_flex()
-            .gap_1()
-            .child(self.disclosure("mcp-example", "配置示例", example, window, cx))
-            .child(note(IconAll::Braces, format!("配置文件：{path}")));
+        let footer = div().v_flex().gap_1().child(self.disclosure(
+            "mcp-example",
+            "配置文件与示例",
+            example.child(note(IconAll::Braces, format!("配置文件：{path}"))),
+            window,
+            cx,
+        ));
 
         let running = self.kernel_of(&KernelChoice::Builtin).is_some();
         let servers: Vec<McpServerView> = if running {
@@ -311,7 +312,8 @@ impl ChatApp {
             MCP_PICKS.len(),
             |this| &mut this.mcp_form.shelf,
             cx,
-        );
+        )
+        .child(actions);
         let list = match shelf.current(servers.len()) {
             Shelf::Picks => self.mcp_picks(&servers, &query, cx),
             Shelf::Installed if servers.is_empty() => how_to(
@@ -337,12 +339,7 @@ impl ChatApp {
                 if shown == 0 { no_match(&query) } else { card }
             }
         };
-        section(
-            "MCP 服务器",
-            "给自研内核接上浏览器、数据库等外部工具",
-            Some(actions),
-            div().v_flex().gap_4().child(bar).child(list).child(footer),
-        )
+        div().v_flex().gap_3().child(bar).child(list).child(footer)
     }
 
     /// 「推荐」栏：每个常用服务一行，已经在 mcp.json 里的写「已添加」。
@@ -453,6 +450,9 @@ impl ChatApp {
                 None,
             ),
             McpState::Ready => (GREEN, format!("{} 个工具", server.tools), None, None),
+            McpState::Idle => {
+                (INK_FAINT, format!("按需连接 · {} 个工具", server.tools), None, None)
+            }
             McpState::Connecting if !running => {
                 (INK_FAINT, "未连接（自研内核没在运行）".into(), None, None)
             }

@@ -26,10 +26,7 @@ use gpui_kit::*;
 use std::path::PathBuf;
 
 /// 设置页「记忆」分类的下标
-pub(super) const MEMORY_TAB: usize = 8;
-
-/// 条目攒到这个数就提示整理（设计说明第七节第 2 条）
-const TIDY_HINT: usize = 30;
+pub(super) const MEMORY_TAB: usize = 9;
 
 /// 「记忆」页的状态：看哪一栏、搜索词、读到的两份记忆、待确认的候选、正在编辑的那条。
 pub(super) struct MemoryForm {
@@ -329,8 +326,13 @@ impl ChatApp {
         let scope = form.scope;
         // 两栏切换 + 搜索框 + 新增
         let add_label = if form.adding { "取消" } else { "新增" };
+        let location = form
+            .path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "找不到数据目录".into());
         let bar = div()
             .h_flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .child(seg_control(
@@ -351,7 +353,7 @@ impl ChatApp {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(rems(9.))
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(LINE))
@@ -396,38 +398,18 @@ impl ChatApp {
         } else {
             self.memory_list(&shown, cx)
         };
-        // 底部：文件位置 + 攒多了提示整理
-        let path_line = match form.path() {
-            Some(path) => note(IconAll::Folder, format!("文件：{}", path.display())),
-            None => note(IconAll::Info, "找不到数据目录，全局记忆不生效"),
-        };
-        let footer = div()
-            .v_flex()
-            .gap_1p5()
-            .when(scope == Scope::Project, |d| {
-                d.child(note(IconAll::Info, "跟着仓库进 git；私人偏好记到「全局」"))
-            })
-            .child(path_line)
-            .when(total >= TIDY_HINT, |d| {
-                d.child(note(
-                    IconAll::Lightbulb,
-                    format!(
-                        "已经 {total} 条了：构建、规范这类该进 AGENTS.md（用 edit_file 写进去，再在这里删掉）",
-                    ),
-                ))
-            });
+        let footer = div().when(form.path().is_none(), |d| {
+            d.child(note(IconAll::Info, "找不到数据目录，全局记忆不生效"))
+        });
         let warnings = form.warnings.clone();
         let error = form.error.clone();
         let adding = form.adding;
-        let actions = div()
-            .h_flex()
-            .gap_1p5()
-            .child(
-                Self::text_button("memory-reveal", "打开文件位置", false)
-                    .small()
-                    .on_click(cx.listener(move |this, _, _, cx| this.reveal_memory(scope, cx))),
-            )
-            .into_any_element();
+        let bar = bar.child(
+            Self::quiet_button("memory-reveal", IconAll::FolderOpen, Surface::Paper, cx)
+                .small()
+                .tooltip(format!("打开文件位置：{location}"))
+                .on_click(cx.listener(move |this, _, _, cx| this.reveal_memory(scope, cx))),
+        );
         let add_panel = adding.then(|| {
             let new_text = self.memory_form.new_text.clone();
             let new_tags = self.memory_form.new_tags.clone();
@@ -455,31 +437,26 @@ impl ChatApp {
                         ),
                 )
         });
-        section(
-            "记住的事",
-            "跨会话记住的偏好和约定：每轮自动带上相关的，置顶的永远带上",
-            Some(actions),
-            div()
-                .v_flex()
-                .gap_4()
-                .children(self.render_memory_candidates(cx))
-                .child(bar)
-                .when_some(add_panel, |d, panel| d.child(panel))
-                .child(body)
-                .child(footer)
-                .when_some(error, |d, err| {
-                    d.child(
-                        div()
-                            .text_size(TEXT_SMALL)
-                            .line_height(LEADING)
-                            .text_color(rgb(RED))
-                            .child(err),
-                    )
-                })
-                .children(warnings.into_iter().map(|w| {
-                    div().text_size(TEXT_SMALL).line_height(LEADING).text_color(rgb(RED)).child(w)
-                })),
-        )
+        div()
+            .v_flex()
+            .gap_3()
+            .children(self.render_memory_candidates(cx))
+            .child(bar)
+            .when_some(add_panel, |d, panel| d.child(panel))
+            .child(body)
+            .child(footer)
+            .when_some(error, |d, err| {
+                d.child(
+                    div()
+                        .text_size(TEXT_SMALL)
+                        .line_height(LEADING)
+                        .text_color(rgb(RED))
+                        .child(err),
+                )
+            })
+            .children(warnings.into_iter().map(|w| {
+                div().text_size(TEXT_SMALL).line_height(LEADING).text_color(rgb(RED)).child(w)
+            }))
     }
 
     /// 条目卡片：一句话结论 + 灰色标签 +（置顶 / 编辑 / 来源 / 删除）。
@@ -845,7 +822,6 @@ impl ChatApp {
         }
         Some(section(
             "待确认",
-            "对话里看着值得记下的话；收下才写进记忆，不要的直接丢掉",
             None,
             div().v_flex().gap_2().child(card).child(
                 div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(

@@ -1,9 +1,9 @@
 //! 设置页（内核 / provider 档案 / 模型）与输入框旁的模型下拉。
 
 use super::ChatApp;
-use super::keys::{ZOOM_IN_KEY, ZOOM_OUT_KEY};
 use super::menu::{
-    FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover, theme_menu_item,
+    FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover, menu_text_item,
+    theme_menu_item,
 };
 use super::motion::{self, Reveal};
 use super::settings_kit::*;
@@ -18,8 +18,10 @@ use claudesktop_builtin::{
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
 use gpui_kit::component::button::{ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::theme::{Theme, ThemeMode};
@@ -33,6 +35,7 @@ use std::collections::HashSet;
 pub(super) struct MagpieForm {
     /// 探过了没（后台探活回来置 true；`false` 时状态行显示「正在检测…」）
     probed: bool,
+    probing: bool,
     /// 网关在跑时的版本号（谁起的都一样：用户自己开的 magpie 也直接复用）
     running: Option<String>,
     /// 正在下载（已收字节 / 总字节）
@@ -43,7 +46,7 @@ pub(super) struct MagpieForm {
     error: Option<String>,
 }
 
-/// 本机 agent 检测的状态：进设置页后台跑一次（要起子进程探版本）。
+/// 本机 agent 检测的状态：首次进「内核」时检测，之后缓存到手动刷新。
 #[derive(Default)]
 enum AgentDetect {
     /// 还没测
@@ -56,10 +59,11 @@ enum AgentDetect {
 }
 
 /// 设置页左侧的分类（下标即 `SettingsForm::tab`）。
-const SETTINGS_TABS: [(IconAll, &str); 9] = [
+const SETTINGS_TABS: [(IconAll, &str); 10] = [
     (IconAll::Settings, "通用"),
     (IconAll::FolderTree, "项目"),
     (IconAll::Cpu, "内核"),
+    (IconAll::Server, "服务商"),
     (IconAll::Bot, "模型"),
     (IconAll::ShieldCheck, "权限"),
     (IconAll::Plug, "MCP"),
@@ -72,18 +76,20 @@ const SETTINGS_TABS: [(IconAll, &str); 9] = [
 /// 设置页「内核」分类的下标（首页配置引导、失败卡片的「打开设置」直接打开它）
 pub(super) const KERNEL_TAB: usize = 2;
 
-/// 设置页「模型」分类的下标（模型来源清单 + 手填端点）
-pub(super) const MODEL_TAB: usize = 3;
+/// 设置页「服务商」分类的下标（来源清单 + 手填端点）
+pub(super) const PROVIDER_TAB: usize = 3;
+
+/// 设置页「模型」分类的下标（默认模型、思考强度、模型清单）
+pub(super) const MODEL_TAB: usize = 4;
 
 /// 设置页「插件」分类的下标（侧栏的「插件」入口直接打开它）
-pub(super) const PLUGINS_TAB: usize = 6;
+pub(super) const PLUGINS_TAB: usize = 7;
 
 /// 一套档案在表单里的输入框（与 `SettingsForm::profiles` 一一对应）。
 pub struct ProfileInputs {
     name: Entity<InputState>,
     base_url: Entity<InputState>,
     api_key: Entity<InputState>,
-    model: Entity<InputState>,
 }
 
 impl ProfileInputs {
@@ -93,19 +99,37 @@ impl ProfileInputs {
                     masked: bool,
                     window: &mut Window,
                     cx: &mut Context<ChatApp>| {
-            cx.new(|cx| {
+            let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(placeholder)
                     .masked(masked)
                     .default_value(value)
+            });
+            cx.subscribe(&input, |this: &mut ChatApp, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = input.read(cx).value().to_string();
+                    for (profile, fields) in
+                        this.settings_form.profiles.iter_mut().zip(&this.settings_form.inputs)
+                    {
+                        if input == fields.name {
+                            profile.name = text.clone();
+                        } else if input == fields.base_url {
+                            profile.base_url = text.clone();
+                        } else if input == fields.api_key {
+                            profile.api_key = text.clone();
+                        }
+                    }
+                    this.settings_form.message = None;
+                    cx.notify();
+                }
             })
+            .detach();
+            input
         };
-        // 思考强度是档位（`seg_control`，跟着模型输入框现算），这里不再有输入框
         Self {
             name: make(p.name.clone(), "如 DeepSeek（可留空）", false, window, cx),
             base_url: make(p.base_url.clone(), "如 https://api.deepseek.com/v1", false, window, cx),
             api_key: make(p.api_key.clone(), "没有可留空", true, window, cx),
-            model: make(p.model.clone(), "如 deepseek-chat", false, window, cx),
         }
     }
 }
@@ -115,17 +139,18 @@ pub struct SettingsForm {
     kernel: KernelChoice,
     /// 编辑中的档案列表（保存才生效）
     profiles: Vec<ProviderProfile>,
-    /// 自研内核当前在用哪套（「内核」页的供应商单选；保存写进 `Settings.builtin.active`）
+    /// 全局默认模型所属的来源，随模型选择一起更新
     active: usize,
-    /// 「模型」页正在查看 / 编辑哪套（不跟在用的那套走）
+    /// 「服务商」页正在查看 / 编辑哪套（不跟默认模型所属来源走）
     view: usize,
+    editing_profile: bool,
     /// 每套档案的输入框
     inputs: Vec<ProfileInputs>,
-    /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核 / 3 模型 / 4 权限 / 5 MCP / 6 插件 / 7 用量页 / 8 记忆）
+    /// 设置页当前所在的 tab（0 通用 / 1 项目 / 2 内核 / 3 服务商 / 4 模型 / 5 权限 / 6 MCP / 7 插件 / 8 用量页 / 9 记忆）
     pub(super) tab: usize,
     /// 编辑中的 agent 档案表（保存才生效；预设的启用 / 网关在这里改）
     agents: Vec<AgentProfile>,
-    /// 本机 agent 的检测结果（进「内核」时后台跑一次）
+    /// 本机 agent 的检测结果（同一次应用启动中保留，手动刷新才重测）
     agent_detect: AgentDetect,
     /// 首页引导选了「本机 agent」时检测还没跑完：跑完再顺手启用（见 `start_setup`）
     enable_on_detect: bool,
@@ -167,7 +192,7 @@ pub struct SettingsForm {
     brave_key: Entity<InputState>,
     /// `web_search` 的后端选择（存在内核那边的数据目录 `search.json`，所以不在 `Settings` 里）
     search: claudesktop_builtin::websearch::SearchConfig,
-    /// DeepSeek 搜索单独填的 key（空 = 用「服务商」里 DeepSeek 那份的 key）
+    /// DeepSeek 搜索单独填的 key（空 = 用「服务商」页里 DeepSeek 那份的 key）
     deepseek_search_key: Entity<InputState>,
     /// (是否错误, 文本)
     message: Option<(bool, SharedString)>,
@@ -179,8 +204,13 @@ pub struct SettingsForm {
     pub(super) content_w: MeasuredWidth,
     /// 上次「获取列表」的结果，显示在模型那一栏下面：(失败了吗, 给人看的话, 服务商的原文)
     fetch_result: Option<(bool, SharedString, Option<SharedString>)>,
-    /// 「模型」页模型清单的搜索词（切来源时清空）
     model_search: Entity<InputState>,
+    model_menu_search: Entity<InputState>,
+    model_menu_query: String,
+    model_source: Option<usize>,
+    hovered_action: Option<SharedString>,
+    /// 模型清单自己的滚动位置；外层滚轮不会抢走它
+    pub(super) model_scroll: ScrollHandle,
     /// magpie 网关的探测 / 下载 / 启动状态
     magpie: MagpieForm,
 }
@@ -198,7 +228,7 @@ impl SettingsForm {
         let prices = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 12));
         let auto_model =
             cx.new(|cx| InputState::new(window, cx).placeholder("如 deepseek-chat / glm-4-flash"));
-        let auto_environment = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10));
+        let auto_environment = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 10));
         let suggest_model = cx.new(|cx| {
             InputState::new(window, cx).placeholder("留空用会话的模型，如 deepseek-chat")
         });
@@ -213,14 +243,29 @@ impl SettingsForm {
         let brave_key =
             cx.new(|cx| InputState::new(window, cx).placeholder("没有也能搜（DuckDuckGo 兜底）"));
         let deepseek_search_key = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("留空就用「服务商」里 DeepSeek 那份的 key")
+            InputState::new(window, cx).placeholder("留空就用「服务商」页里 DeepSeek 那份的 key")
         });
-        let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型"));
+        let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索或输入模型名"));
+        let model_menu_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型"));
+        for search in [&model_search, &model_menu_search] {
+            cx.subscribe(search, |this: &mut ChatApp, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    if input == this.settings_form.model_menu_search {
+                        this.settings_form.model_menu_query = input.read(cx).value().to_string();
+                    }
+                    this.model_wheel = None;
+                    this.settings_form.model_scroll.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         Self {
             kernel: KernelChoice::Builtin,
             profiles: Vec::new(),
             active: 0,
             view: 0,
+            editing_profile: false,
             inputs: Vec::new(),
             tab: 0,
             agents: Vec::new(),
@@ -253,6 +298,11 @@ impl SettingsForm {
             content_w: MeasuredWidth::default(),
             fetch_result: None,
             model_search,
+            model_menu_search,
+            model_menu_query: String::new(),
+            model_source: None,
+            hovered_action: None,
+            model_scroll: ScrollHandle::new(),
             magpie: MagpieForm::default(),
         }
     }
@@ -281,10 +331,14 @@ fn parse_max_steps(text: &str) -> usize {
         .clamp(claudesktop_builtin::MIN_MAX_STEPS, claudesktop_builtin::MAX_MAX_STEPS)
 }
 
-// 设置页的「思考强度」是档位（`seg_control`），直接写在表单的档案里，不用输入框解析；
+// 设置页的「思考强度」通过下拉档位直接写进默认模型所属档案，不用输入框解析；
 // 老的「思考预算」在 `Settings::normalize` 里折算成档位了（见 `render_thinking_row`）。
 
 impl ChatApp {
+    pub(super) fn settings_navigation_only(&self) -> bool {
+        self.settings_open && self.settings_form.tab != super::usage_view::USAGE_TAB
+    }
+
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 记住上次看的 tab（打开时不动它），要指定 tab 的走 `open_settings_at`；
         // 停在用量页时回到进用量页之前的分类（用量不算设置的分类）
@@ -295,7 +349,7 @@ impl ChatApp {
         self.open_settings_at(tab, window, cx);
     }
 
-    /// 打开设置页并切到第 `tab` 个分类（0 通用 / 1 项目 / 2 内核 / 3 模型 / 4 权限 / 5 MCP / 6 插件 / 7 用量页 / 8 记忆）。
+    /// 打开设置页并切到第 `tab` 个分类（下标见 `SETTINGS_TABS`）。
     /// 失败卡片的「打开设置」用它直接落到服务商配置。
     pub(crate) fn open_settings_at(
         &mut self,
@@ -380,6 +434,12 @@ impl ChatApp {
         }
         self.settings_form.active = s.builtin.active.min(profiles.len() - 1);
         self.settings_form.view = self.settings_form.active;
+        self.settings_form.editing_profile = false;
+        self.settings_form.model_source = None;
+        self.settings_form.model_menu_query.clear();
+        self.settings_form
+            .model_menu_search
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.settings_form.inputs =
             profiles.iter().map(|p| ProfileInputs::new(window, cx, p)).collect();
         self.settings_form.profiles = profiles;
@@ -396,6 +456,10 @@ impl ChatApp {
             .custom_command
             .update(cx, |state, cx| state.set_value(custom, window, cx));
         self.settings_form.tab = tab;
+        self.settings_wheel = None;
+        self.model_wheel = None;
+        self.settings_scroll.set_offset(point(px(0.), px(0.)));
+        self.settings_form.model_scroll.set_offset(point(px(0.), px(0.)));
         self.settings_open = true;
         // 设置页开着时输入框不在画面上：光标后面那句灰字先撤掉（关掉设置页后接着打字会重猜）
         self.suggestion.clear();
@@ -407,23 +471,33 @@ impl ChatApp {
         if tab == super::project_view::PROJECT_TAB {
             self.reload_project_view(window, cx);
         }
-        // 「内核」一栏进页面时后台测一次本机的 agent（要起子进程探版本）
         if tab == KERNEL_TAB && matches!(self.settings_form.agent_detect, AgentDetect::Idle) {
             self.detect_agents(cx);
         }
-        // magpie 网关也探一次（纯本地 HTTP，很便宜；下载 / 启动进行中不打扰）。
-        // 「内核」「模型」两页都显示它的状态。
-        if matches!(tab, KERNEL_TAB | MODEL_TAB)
-            && self.settings_form.magpie.downloading.is_none()
-            && !self.settings_form.magpie.starting
-        {
-            self.probe_magpie(cx);
+        cx.notify();
+    }
+
+    fn kernel_status_busy(&self) -> bool {
+        matches!(self.settings_form.agent_detect, AgentDetect::Running)
+            || self.settings_form.magpie.probing
+            || self.settings_form.magpie.starting
+            || self.settings_form.magpie.downloading.is_some()
+    }
+
+    fn refresh_kernel_status(&mut self, cx: &mut Context<Self>) {
+        if self.kernel_status_busy() {
+            return;
         }
+        self.detect_agents(cx);
+        self.probe_magpie(cx);
         cx.notify();
     }
 
     /// 后台探一遍本机装了哪些 agent（PATH + 常见安装目录，每家起一次子进程问版本）。
     fn detect_agents(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.settings_form.agent_detect, AgentDetect::Running) {
+            return;
+        }
         self.settings_form.agent_detect = AgentDetect::Running;
         cx.spawn(async move |this, cx| {
             let found = cx
@@ -441,11 +515,13 @@ impl ChatApp {
         .detach();
     }
 
-    /// 探一遍 magpie 网关：在跑（不管是我们起的还是用户自己开的）就记下版本。
-    /// 进「内核」「模型」时和每个动作之后都会跑。
+    /// 手动刷新网关状态，检测期间保留上次结果。
     fn probe_magpie(&mut self, cx: &mut Context<Self>) {
-        self.settings_form.magpie.probed = false;
-        self.settings_form.magpie.running = None;
+        let magpie = &mut self.settings_form.magpie;
+        if magpie.probing || magpie.starting || magpie.downloading.is_some() {
+            return;
+        }
+        magpie.probing = true;
         let port = claudesktop_builtin::magpie::gateway_port();
         cx.spawn(async move |this, cx| {
             let found = cx
@@ -454,7 +530,11 @@ impl ChatApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let magpie = &mut this.settings_form.magpie;
+                magpie.probing = false;
                 magpie.probed = true;
+                if found.is_some() {
+                    magpie.error = None;
+                }
                 magpie.running = found;
                 cx.notify();
             });
@@ -567,6 +647,10 @@ impl ChatApp {
     /// （没有的话；之前什么都没配好就选它）并拉 `/v1/models` 填模型下拉；
     /// 网关没跑、当前档案是 magpie 而 sidecar 已下载——顺手起 serve。
     pub(crate) fn magpie_bootstrap(&mut self, cx: &mut Context<Self>) {
+        if self.settings_form.magpie.probed || self.settings_form.magpie.probing {
+            return;
+        }
+        self.settings_form.magpie.probing = true;
         let port = claudesktop_builtin::magpie::gateway_port();
         cx.spawn(async move |this, cx| {
             let running = cx
@@ -577,6 +661,7 @@ impl ChatApp {
                 Some(version) => {
                     // 网关已在跑（用户自己开的也算）：确保 magpie 档案在、模型列表满上
                     let _ = this.update(cx, |this, cx| {
+                        this.settings_form.magpie.probing = false;
                         this.settings_form.magpie.probed = true;
                         this.settings_form.magpie.running = Some(version);
                         this.update_settings(|s| {
@@ -614,8 +699,14 @@ impl ChatApp {
                     }
                 }
                 None => {
-                    // 网关没在跑：当前档案是 magpie 的话顺手起 serve（装了才起）
-                    let _ = this.update(cx, |this, cx| this.auto_start_magpie_if_active(cx));
+                    let _ = this.update(cx, |this, cx| {
+                        let magpie = &mut this.settings_form.magpie;
+                        magpie.probing = false;
+                        magpie.probed = true;
+                        magpie.running = None;
+                        this.auto_start_magpie_if_active(cx);
+                        cx.notify();
+                    });
                 }
             }
         })
@@ -624,36 +715,22 @@ impl ChatApp {
 
     /// 尽量自动：当前自研内核档案是 magpie、网关没在跑、sidecar 已下载——顺手起 serve。
     pub(crate) fn auto_start_magpie_if_active(&mut self, cx: &mut Context<Self>) {
+        let magpie = &self.settings_form.magpie;
         if !self.settings.builtin.current().magpie
-            || self.settings_form.magpie.starting
-            || self.settings_form.magpie.downloading.is_some()
+            || !magpie.probed
+            || magpie.probing
+            || magpie.running.is_some()
+            || magpie.starting
+            || magpie.downloading.is_some()
         {
             return;
         }
-        let port = claudesktop_builtin::magpie::gateway_port();
-        cx.spawn(async move |this, cx| {
-            let running = cx
-                .background_executor()
-                .spawn(async move { claudesktop_builtin::magpie::probe(port) })
-                .await;
-            let alive = running.is_some();
-            let _ = this.update(cx, |this, _cx| {
-                this.settings_form.magpie.probed = true;
-                this.settings_form.magpie.running = running;
-            });
-            if alive {
-                return;
+        if let Ok(dir) = claudesktop_core::default_data_dir() {
+            let exe = claudesktop_builtin::magpie::installed_path(&dir);
+            if exe.is_file() {
+                self.start_magpie(&exe, cx);
             }
-            let _ = this.update(cx, |this, cx| {
-                if let Ok(dir) = claudesktop_core::default_data_dir() {
-                    let exe = claudesktop_builtin::magpie::installed_path(&dir);
-                    if exe.is_file() {
-                        this.start_magpie(&exe, cx);
-                    }
-                }
-            });
-        })
-        .detach();
+        }
     }
 
     /// 表单当前的值 → 设置（档案里的模型列表沿用已保存的，除非表单里重新获取过）。
@@ -761,13 +838,13 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 侧栏底部要不要列出内核状态（立即生效，不走「保存并应用」）。
+    /// 侧栏底部要不要列出内核状态（立即生效，不走「保存」）。
     pub(crate) fn set_sidebar_kernel_status(&mut self, on: bool, cx: &mut Context<Self>) {
         self.save_ui_pref(move |s| s.sidebar_kernel_status = on, cx);
         cx.notify();
     }
 
-    /// 「通用」分类：外观、字号、字体、侧栏、通知（都即时生效，不走「保存并应用」），以及设置文件在哪。
+    /// 「通用」分类：外观、字号、字体、侧栏、通知（都即时生效，不走「保存」），以及设置文件在哪。
     fn render_general(&self, cx: &mut Context<Self>) -> Div {
         let motion = self.settings.motion;
         let motion_control = seg_control(
@@ -777,16 +854,10 @@ impl ChatApp {
             |this, m, _, cx| this.set_motion_pref(m, cx),
             cx,
         );
-        let motion_tip = if motion == MotionPref::System && self.system_reduce_motion {
-            "展开收起、转圈这类过渡效果（系统里已关闭）"
-        } else {
-            "展开收起、转圈这类过渡效果"
-        };
-        let motion_row = setting_row("动画", motion_tip, motion_control);
+        let motion_row = setting_row("动画", motion_control);
         let appearance = setting_group([
             setting_row(
                 "明暗",
-                "跟随系统，或固定浅色 / 深色；每套配色都有这两版",
                 seg_control(
                     "appearance",
                     Appearance::ALL.map(|a| (a, a.label())),
@@ -804,7 +875,6 @@ impl ChatApp {
         let reminders = setting_group([
             setting_row(
                 "系统通知",
-                "后台时回复完成、等你授权或出错就提醒",
                 Switch::new("notifications")
                     .checked(self.settings.notifications)
                     .color(rgb(CORAL))
@@ -816,7 +886,6 @@ impl ChatApp {
             ),
             setting_row(
                 "侧栏显示内核状态",
-                "在侧栏底部显示内核连接状态",
                 Switch::new("sidebar-kernel-status")
                     .checked(self.settings.sidebar_kernel_status)
                     .color(rgb(CORAL))
@@ -827,10 +896,10 @@ impl ChatApp {
         ]);
         div()
             .v_flex()
-            .gap_8()
-            .child(section("外观", "", None, appearance))
-            .child(section("提醒", "", None, reminders))
-            .child(section("数据", "", None, setting_group([self.settings_file_row(cx)])))
+            .gap_5()
+            .child(section("外观", None, appearance))
+            .child(section("提醒", None, reminders))
+            .child(section("数据", None, setting_group([self.settings_file_row(cx)])))
     }
 
     /// 设置文件在哪：路径 + 「打开文件夹」。
@@ -842,7 +911,6 @@ impl ChatApp {
         };
         setting_row_with(
             "设置文件",
-            "API Key 以明文保存；启动时设置的环境变量优先于这里",
             location,
             div().when_some(path, |d, path| {
                 d.child(
@@ -858,7 +926,6 @@ impl ChatApp {
     fn auto_load_images_row(&self, cx: &mut Context<Self>) -> Div {
         setting_row(
             "自动加载回复里的网络图片",
-            "关着时先显示「图片 · 域名」和「加载」，点一次才去取；打开后一出现就请求",
             Switch::new("auto-load-images")
                 .checked(self.settings.auto_load_images)
                 .color(rgb(CORAL))
@@ -893,12 +960,7 @@ impl ChatApp {
                     .font_features(tabular_nums())
                     .child(format!("{percent:.0}%")),
             );
-        let tip = format!(
-            "文字、间距、圆角一起等比缩放；{} 放大，{} 缩小",
-            Self::key_text(ZOOM_IN_KEY),
-            Self::key_text(ZOOM_OUT_KEY)
-        );
-        setting_row("界面字号", tip, slider)
+        setting_row("界面字号", slider)
     }
 
     /// 配色下拉：九套色板，每项下面一行色块预览。换配色即时生效。
@@ -906,7 +968,6 @@ impl ChatApp {
         let app = cx.entity();
         setting_row(
             "配色",
-            "整套界面的底色和强调色",
             menu_popover(
                 "theme-menu",
                 Anchor::BottomRight,
@@ -926,7 +987,6 @@ impl ChatApp {
             self.settings.font_family_or_default().unwrap_or_else(|| "Inter（内嵌）".into());
         setting_row(
             "界面字体",
-            "代码固定用 JetBrains Mono",
             menu_popover(
                 "font-family-menu",
                 Anchor::BottomRight,
@@ -947,7 +1007,6 @@ impl ChatApp {
             p.name = value(&inputs.name, cx);
             p.base_url = value(&inputs.base_url, cx);
             p.api_key = value(&inputs.api_key, cx);
-            p.model = value(&inputs.model, cx);
             // 思考强度（`p.params.thinking`）由档位开关直接写在表单的档案里，这里不用再收
             // 服务端工具（`p.params.server_tools`）同样由多选开关直接写
         }
@@ -978,9 +1037,7 @@ impl ChatApp {
             None => {}
         }
         s.acp.agents = agents;
-        // 默认内核只有「演示回放」是显式选的（清单里那个开关）；其余走自动：
-        // magpie 网关在跑用自研内核，否则第一个启用的 agent（见 `Settings::kernel`）
-        s.kernel = (f.kernel == KernelChoice::Demo).then_some(KernelChoice::Demo);
+        s.kernel = None;
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
         s.auto_mode.enabled = f.auto_enabled;
         s.auto_mode.use_session_model = f.auto_follow;
@@ -1006,21 +1063,18 @@ impl ChatApp {
         s
     }
 
-    /// 失败卡片上的「打开设置」：落到服务商配置，底栏写着上一轮为什么失败、该改哪一项。
+    /// 失败卡片上的「打开设置」：落到服务商配置，页头写着上一轮为什么失败、该改哪一项。
     pub(crate) fn open_settings_for_failure(
         &mut self,
         kind: FailureKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_settings_at(KERNEL_TAB, window, cx);
+        let tab = if matches!(kind, FailureKind::Model) { MODEL_TAB } else { PROVIDER_TAB };
+        self.open_settings_at(tab, window, cx);
         let why = match kind {
-            FailureKind::Auth => {
-                "上一轮被服务商拒绝：检查下面的 API Key，改好后点「获取列表」验证一下"
-            }
-            FailureKind::Endpoint => {
-                "上一轮找不到接口：检查下面的端点地址，改好后点「获取列表」验证一下"
-            }
+            FailureKind::Auth => "上一轮被服务商拒绝：检查下面的 API Key，改好后保存",
+            FailureKind::Endpoint => "上一轮找不到接口：检查下面的端点地址，改好后保存",
             FailureKind::Model => {
                 "上一轮找不到模型：点「获取列表」挑一个能用的；当前会话的模型在输入框右下角换"
             }
@@ -1060,8 +1114,7 @@ impl ChatApp {
         let Some(hit) = list.iter().find(|d| d.is_ready()) else { return };
         let preset = hit.preset;
         f.agents.push(AgentProfile::from_preset(preset));
-        f.message =
-            Some((false, format!("已启用本机的{}，点「保存并应用」生效", preset.name).into()));
+        f.message = Some((false, format!("已启用本机的{}，点「保存」生效", preset.name).into()));
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
@@ -1091,7 +1144,7 @@ impl ChatApp {
                 let why = if new.builtin.current().is_configured() {
                     "「自动」模式开着：要么选「跟随当前模型」，要么在上面填分类器用哪个模型"
                 } else {
-                    "「自动」模式开着：先在「服务商」里配好端点地址和模型"
+                    "「自动」模式开着：先在「服务商」页配好端点，再到「模型」页选模型"
                 };
                 self.settings_form.message = Some((true, why.into()));
                 cx.notify();
@@ -1141,7 +1194,7 @@ impl ChatApp {
             .map(|a| a.id.clone())
             .collect();
         let restart_acp = new.acp != self.settings.acp;
-        // 三选一只选了「本机 agent」没选档案：form_settings 已经落过第一个档案，这里就是具体内核
+        // 根据当前模型配置和启用的 agent 自动选择新会话的内核。
         let default = new.kernel();
         let default_changed = default != self.settings.kernel();
         // 存不存原文对已经跑着的网关立刻生效，不用重启内核
@@ -1180,8 +1233,9 @@ impl ChatApp {
                 self.rebind_session(idx, default.clone());
             }
         }
-        // 首次配置：启动时没起内核（见 `open_session`），现在把等着的会话接上
-        if !self.slot(&default.key()).is_some_and(|s| s.started)
+        // 首次配置自研内核：把等着的会话接上；外部 agent 仍等首次发送。
+        if default == KernelChoice::Builtin
+            && !self.slot(&default.key()).is_some_and(|s| s.started)
             && self.sessions.iter().any(|s| s.kernel == default && !s.has_user_message())
         {
             self.ensure_kernel(&default);
@@ -1263,17 +1317,268 @@ impl ChatApp {
 
     // ---------- 档案编辑（表单内） ----------
 
-    /// 「模型」页切到第 `i` 套来源（只改正在查看的，不改在用的）。
+    /// 查看服务商 Profile，不改全局默认模型。
     fn select_form_profile(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         if i < self.settings_form.profiles.len() {
             self.settings_form.view = i;
+            self.settings_form.editing_profile = false;
             self.settings_form.fetch_result = None;
+            self.settings_wheel = None;
+            self.model_wheel = None;
+            self.settings_form.model_scroll.set_offset(point(px(0.), px(0.)));
             // 搜索词是上一个来源的，别带过来
             self.settings_form
                 .model_search
                 .update(cx, |s, cx| s.set_value(String::new(), window, cx));
             cx.notify();
         }
+    }
+
+    pub(crate) fn select_form_model(
+        &mut self,
+        profile: usize,
+        model: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = model.trim().to_string();
+        if model.is_empty() || profile >= self.settings_form.profiles.len() {
+            return;
+        }
+        let f = &mut self.settings_form;
+        f.profiles[profile].model = model;
+        f.active = profile;
+        f.message = None;
+        cx.notify();
+    }
+
+    fn set_form_thinking(&mut self, level: Option<ThinkingLevel>, cx: &mut Context<Self>) {
+        let active = self.settings_form.active;
+        if let Some(profile) = self.settings_form.profiles.get_mut(active) {
+            profile.params.thinking = level;
+        }
+        self.settings_form.message = None;
+        cx.notify();
+    }
+
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_settings_preview(
+        &mut self,
+        preview: &str,
+        scale: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(scale) = scale {
+            self.settings.font_scale = (scale / 100.).clamp(FONT_SCALE_MIN, FONT_SCALE_MAX);
+            self.apply_font(cx);
+        }
+        if let Some(i) = preview.strip_prefix("edit:").and_then(|i| i.parse().ok()) {
+            self.select_form_profile(i, window, cx);
+            self.settings_form.editing_profile = true;
+        } else if let Some(query) = preview.strip_prefix("search:") {
+            self.settings_form
+                .model_search
+                .update(cx, |state, cx| state.set_value(query, window, cx));
+        } else if let Some(query) = preview.strip_prefix("menu:") {
+            self.settings_form
+                .model_menu_search
+                .update(cx, |state, cx| state.set_value(query, window, cx));
+            self.settings_form.model_menu_query = query.into();
+        } else if preview == "refresh" {
+            if let Ok(endpoint) = std::env::var("CLAUDESKTOP_TEST_PROVIDER_URL") {
+                assert!(endpoint.starts_with("http://127.0.0.1:"));
+                let profiles: Vec<_> = ["a", "b"]
+                    .into_iter()
+                    .map(|source| ProviderProfile {
+                        name: format!("验证来源 {source}"),
+                        base_url: format!("{endpoint}/{source}/v1"),
+                        model: "shared".into(),
+                        ..Default::default()
+                    })
+                    .collect();
+                self.settings_form.inputs =
+                    profiles.iter().map(|p| ProfileInputs::new(window, cx, p)).collect();
+                self.settings_form.profiles = profiles;
+                self.settings_form.active = 0;
+                self.settings_form.view = 0;
+                self.settings_form.model_source = None;
+                self.settings.usage_gateway = false;
+                self.refresh_model_sources(cx);
+            }
+        } else if preview == "dark" || preview == "light" {
+            self.settings.appearance =
+                if preview == "dark" { Appearance::Dark } else { Appearance::Light };
+            self.apply_appearance(window, cx);
+        } else if preview == "kernel-status" {
+            self.open_settings_at(KERNEL_TAB, window, cx);
+        } else if preview == "advanced" {
+            self.settings_form.open_help.insert("kernel-advanced");
+        } else if preview == "auto" {
+            self.settings_form.auto_enabled = true;
+            self.settings_form.auto_follow = false;
+        } else if preview == "check" {
+            let sidebar = self.sidebar_open;
+            let profiles = vec![
+                ProviderProfile {
+                    name: "验证来源 A".into(),
+                    base_url: "https://first.invalid/v1".into(),
+                    model: "gpt-5".into(),
+                    models: vec!["gpt-5".into()],
+                    ..Default::default()
+                },
+                ProviderProfile {
+                    name: "验证来源 B".into(),
+                    base_url: "https://second.invalid/v1".into(),
+                    model: "gpt-5".into(),
+                    models: vec!["gpt-5".into()],
+                    ..Default::default()
+                },
+            ];
+            self.settings_form.inputs =
+                profiles.iter().map(|p| ProfileInputs::new(window, cx, p)).collect();
+            self.settings_form.profiles = profiles;
+            self.settings_form.active = 0;
+            self.settings_form.view = 0;
+            self.select_model_source(None, cx);
+            self.select_form_model(1, "gpt-5".into(), window, cx);
+            assert_eq!(self.settings_form.active, 1);
+            assert_eq!(self.settings_form.model_source, None);
+            self.select_model_source(Some(0), cx);
+            assert_eq!(self.settings_form.active, 1);
+            self.set_form_thinking(Some(ThinkingLevel::Low), cx);
+            assert_eq!(self.settings_form.profiles[0].params.thinking, None);
+            assert_eq!(self.settings_form.profiles[1].params.thinking, Some(ThinkingLevel::Low));
+            let draft = self.form_settings(cx);
+            assert_eq!(draft.builtin.current().base_url, "https://second.invalid/v1");
+            self.remove_form_profile(0, cx);
+            assert_eq!(self.settings_form.active, 0);
+            assert_eq!(self.settings_form.model_source, None);
+            assert_eq!(self.settings_form.profiles[0].name, "验证来源 B");
+            self.select_form_model(0, "manual-model".into(), window, cx);
+            assert!(
+                model_options(&self.settings_form.profiles, None, "manual")
+                    .iter()
+                    .any(|(_, model)| *model == "manual-model")
+            );
+            assert!(self.form_dirty(cx));
+            self.open_settings_at(MODEL_TAB, window, cx);
+            assert!(!self.form_dirty(cx));
+            assert_eq!(self.sidebar_open, sidebar);
+            assert!(self.settings_navigation_only());
+            eprintln!(
+                "settings checks passed: source filter, default routing, thinking ownership, removal, manual model, discard, sidebar state"
+            );
+        }
+        cx.notify();
+    }
+
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_refresh_finished(&self, verify: bool) -> bool {
+        if self.fetching_models {
+            return false;
+        }
+        if verify {
+            let profiles = &self.settings_form.profiles;
+            assert!(profiles[0].models.iter().any(|m| m == "only-a"));
+            assert!(!profiles[0].models.iter().any(|m| m == "only-b"));
+            assert!(profiles[1].models.iter().any(|m| m == "only-b"));
+            assert!(!profiles[1].models.iter().any(|m| m == "only-a"));
+            assert!(self.settings_form.fetch_result.as_ref().is_some_and(|(error, _, _)| !*error));
+            eprintln!(
+                "provider refresh checks passed: two real HTTP calls, shared IDs kept separate"
+            );
+        }
+        true
+    }
+
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_kernel_status_ready(&self) -> bool {
+        !self.kernel_status_busy()
+            && self.settings_form.magpie.probed
+            && matches!(self.settings_form.agent_detect, AgentDetect::Done(_))
+    }
+
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_check_kernel_status(
+        &mut self,
+        refreshed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(self.debug_kernel_status_ready());
+        if refreshed {
+            assert_eq!(value(&self.settings_form.max_steps, cx), "77");
+            self.open_settings_at(KERNEL_TAB, window, cx);
+            assert!(self.debug_kernel_status_ready());
+            eprintln!(
+                "kernel status checks passed: tab switches and reopen reuse cached results; manual refresh completes and keeps drafts"
+            );
+            return;
+        }
+        let running = self.settings_form.magpie.running.clone();
+        let AgentDetect::Done(agents) = &self.settings_form.agent_detect else { unreachable!() };
+        let agents = agents.clone();
+        for tab in [PROVIDER_TAB, MODEL_TAB, KERNEL_TAB, 0, KERNEL_TAB] {
+            self.select_settings_tab(tab, window, cx);
+            assert!(self.debug_kernel_status_ready());
+            assert_eq!(self.settings_form.magpie.running, running);
+            let AgentDetect::Done(found) = &self.settings_form.agent_detect else { unreachable!() };
+            assert_eq!(found, &agents);
+        }
+        self.settings_open = false;
+        self.open_settings_at(KERNEL_TAB, window, cx);
+        self.magpie_bootstrap(cx);
+        assert!(self.debug_kernel_status_ready());
+        assert_eq!(self.settings_form.magpie.running, running);
+        self.settings_form.max_steps.update(cx, |input, cx| input.set_value("77", window, cx));
+        self.refresh_kernel_status(cx);
+        assert!(matches!(self.settings_form.agent_detect, AgentDetect::Running));
+        assert!(self.settings_form.magpie.probing);
+        self.refresh_kernel_status(cx);
+        assert!(self.kernel_status_busy());
+    }
+
+    pub(crate) fn ask_remove_form_profile(
+        &mut self,
+        i: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let f = &self.settings_form;
+        let (Some(profile), Some(inputs)) = (f.profiles.get(i), f.inputs.get(i)) else {
+            return;
+        };
+        if profile.magpie || window.has_active_dialog(cx) {
+            return;
+        }
+        let name = profile_title(profile, &value(&inputs.name, cx), &value(&inputs.base_url, cx));
+        let target = inputs.name.clone();
+        let app = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let app = app.clone();
+            let target = target.clone();
+            alert
+                .title("确认删除？")
+                .description(format!("将移除「{name}」及其连接配置，保存后生效。"))
+                .show_cancel(true)
+                .ok_text("删除")
+                .ok_variant(ButtonVariant::Danger)
+                .cancel_text("取消")
+                .on_ok(move |_, _, cx| {
+                    app.update(cx, |this, cx| {
+                        let index = this
+                            .settings_form
+                            .inputs
+                            .iter()
+                            .position(|inputs| inputs.name == target);
+                        if let Some(index) = index {
+                            this.remove_form_profile(index, cx);
+                        }
+                    });
+                    true
+                })
+        });
     }
 
     /// 表单里删掉第 `i` 套档案。
@@ -1285,6 +1590,7 @@ impl ChatApp {
         self.settings_form.inputs.remove(i);
         let len = self.settings_form.profiles.len();
         let f = &mut self.settings_form;
+        f.editing_profile = false;
         if len == 0 {
             f.active = 0;
             f.view = 0;
@@ -1298,6 +1604,11 @@ impl ChatApp {
             f.active = f.active.min(len - 1);
             f.view = f.view.min(len - 1);
         }
+        f.model_source = f.model_source.and_then(|source| {
+            if source == i { None } else { Some(if source > i { source - 1 } else { source }) }
+        });
+        self.model_wheel = None;
+        f.model_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -1317,10 +1628,11 @@ impl ChatApp {
         });
         let inputs = ProfileInputs::new(window, cx, &p);
         let f = &mut self.settings_form;
-        let blank = f.current().is_some_and(|(_, i)| {
-            [&i.name, &i.base_url, &i.api_key, &i.model]
-                .iter()
-                .all(|input| value(input, cx).is_empty())
+        let blank = f.current().is_some_and(|(p, i)| {
+            p.model.trim().is_empty()
+                && [&i.name, &i.base_url, &i.api_key]
+                    .iter()
+                    .all(|input| value(input, cx).is_empty())
         });
         if blank {
             f.profiles[f.view] = p;
@@ -1328,11 +1640,14 @@ impl ChatApp {
         } else {
             f.inputs.push(inputs);
             f.profiles.push(p);
-            // 新档案只是加进来，不切成在用；切过去是「内核」页供应商单选的事
+            // 新来源只加入清单；选了它的模型才会改变全局默认
             f.view = f.profiles.len() - 1;
         }
+        f.editing_profile = true;
         f.message = None;
         f.fetch_result = None;
+        self.model_wheel = None;
+        f.model_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -1584,14 +1899,13 @@ impl ChatApp {
                     .child(text),
             )
         });
-        section("总是允许的操作", "按项目生效，删除立即生效", None, body)
-            .child(self.render_web_search(cx))
+        section("总是允许的操作", None, body).child(self.render_web_search(cx))
     }
 
     /// 「网页搜索」：先用的后端 + 允许哪些后端 + 各自的 key。
     ///
     /// 选择存在内核那边的数据目录 `search.json`（搜索是即时读取的，不经 `Kernel::set_*`），
-    /// 所以这里不走底栏「保存」：改了就写盘，下一轮搜索立刻用新顺序。默认顺序和加 DeepSeek
+    /// 所以这里不走页头「保存」：改了就写盘，下一轮搜索立刻用新顺序。默认顺序和加 DeepSeek
     /// 之前一致（Brave → DuckDuckGo），DeepSeek 是按次计费的新花费，要用户自己选。
     fn render_web_search(&self, cx: &mut Context<Self>) -> Div {
         use claudesktop_builtin::websearch::SearchBackend;
@@ -1661,17 +1975,12 @@ impl ChatApp {
                 this.save_search(cfg, "搜索后端已更新", cx);
             }));
         let body = setting_group([
-            setting_row("先用哪个", "它没配好或失败时按固定顺序退到下一个", prefer),
-            setting_row(
-                "也允许 DeepSeek",
-                "按次计费（1000 次 $0.75），打开了才会用到它，配了 key 不算",
-                deepseek_toggle,
-            ),
-            setting_row("也允许 Brave", "要自己的 API key（api.search.brave.com）", brave_toggle),
-            setting_row("也允许 DuckDuckGo", "不要 key 的最后兜底，可能被限流", ddg_toggle),
+            setting_row("先用哪个", prefer),
+            setting_row("也允许 DeepSeek", deepseek_toggle),
+            setting_row("也允许 Brave", brave_toggle),
+            setting_row("也允许 DuckDuckGo", ddg_toggle),
             setting_row(
                 "Brave API key",
-                "也可以用环境变量 CLAUDEDESKTOP_BRAVE_KEY；保存后立即生效",
                 div()
                     .h_flex()
                     .gap_2()
@@ -1693,7 +2002,6 @@ impl ChatApp {
             ),
             setting_row(
                 "DeepSeek key",
-                "免费额度用完后按次计费（1000 次 $0.75）；留空就用「服务商」里 DeepSeek 那份的 key",
                 div()
                     .h_flex()
                     .gap_2()
@@ -1718,7 +2026,6 @@ impl ChatApp {
         ]);
         section(
             "网页搜索",
-            "web_search 用哪个后端搜，失败时自动降级并在结果里写明用了哪个",
             None,
             div()
                 .v_flex()
@@ -1733,7 +2040,7 @@ impl ChatApp {
         )
     }
 
-    /// 「服务商」里 DeepSeek 那份档案的 key（搜索页只说有没有，不显示内容）。
+    /// 「服务商」页里 DeepSeek 那份档案的 key（搜索页只说有没有，不显示内容）。
     fn deepseek_search_key_from_profiles(&self) -> Option<String> {
         self.settings_form
             .profiles
@@ -1743,7 +2050,7 @@ impl ChatApp {
             .find(|k| !k.is_empty())
     }
 
-    /// 把搜索后端的选择写进数据目录（不用点底栏「保存」）。
+    /// 把搜索后端的选择写进数据目录（不用点页头「保存」）。
     fn save_search(
         &mut self,
         cfg: claudesktop_builtin::websearch::SearchConfig,
@@ -1760,24 +2067,6 @@ impl ChatApp {
         cx.notify();
     }
 
-    fn import_antigravity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((base_url, key)) = antigravity_gateway() else {
-            return;
-        };
-        let i = self.settings_form.view;
-        let Some(inputs) = self.settings_form.inputs.get(i) else {
-            return;
-        };
-        inputs.base_url.update(cx, |s, cx| s.set_value(base_url.clone(), window, cx));
-        inputs.api_key.update(cx, |s, cx| s.set_value(key, window, cx));
-        self.settings_form.message = Some((
-            false,
-            format!("已填入 Antigravity Tools 本地网关 {base_url}（需要它的反代服务在运行）")
-                .into(),
-        ));
-        self.fetch_models(true, cx);
-    }
-
     /// 在模型下拉里选了一个：当前会话立即切换（还没建立的会话等 Started），并记为默认。
     /// 从指定供应商档案挑模型（输入框模型菜单跨来源挑）：不是当前在用的那套就先切过去
     /// （自研内核带着新端点重启，进行中的对话下次发消息自动续接），再记模型。
@@ -1787,11 +2076,13 @@ impl ChatApp {
         model: String,
         cx: &mut Context<Self>,
     ) {
-        if self.settings.builtin.profiles.get(profile).is_some()
-            && profile != self.settings.builtin.active
-        {
+        let model = model.trim().to_string();
+        if self.settings.builtin.profiles.get(profile).is_none() || model.is_empty() {
+            return;
+        }
+        if profile != self.settings.builtin.active {
             self.update_settings(|s| {
-                s.builtin.active = profile.min(s.builtin.profiles.len().saturating_sub(1))
+                s.builtin.select_model(profile, &model);
             });
             self.restart_kernel(&KernelChoice::Builtin, cx);
         }
@@ -1864,14 +2155,15 @@ impl ChatApp {
             });
         setting_row_with(
             "用量网关",
-            "记下每次请求的耗时、用量和重试（不记提示词和 Key），在首页「请求」页签查看；关掉就直连服务商",
             actions,
-            Switch::new("usage-gateway").checked(f.usage_gateway).color(rgb(CORAL)).on_change(
-                cx.listener(|this, checked: &bool, _, cx| {
+            Switch::new("usage-gateway")
+                .small()
+                .checked(f.usage_gateway)
+                .color(rgb(CORAL))
+                .on_change(cx.listener(|this, checked: &bool, _, cx| {
                     this.settings_form.usage_gateway = *checked;
                     cx.notify();
-                }),
-            ),
+                })),
         )
     }
 
@@ -1880,8 +2172,8 @@ impl ChatApp {
         let f = &self.settings_form;
         setting_row(
             "保存请求原文",
-            "另存每次请求的完整内容和返回（压缩，留 7 天），在「请求」页签点开查看；里面有对话和代码，只存本机",
             Switch::new("gateway-bodies")
+                .small()
                 .checked(f.gateway_bodies && f.usage_gateway)
                 .disabled(!f.usage_gateway)
                 .color(rgb(CORAL))
@@ -1898,7 +2190,6 @@ impl ChatApp {
         let open = self.settings_form.open_help.contains(KEY);
         let row = setting_row(
             "模型单价",
-            "用来估算费用，内置的是参考价",
             Self::text_button("prices-edit", if open { "收起" } else { "编辑" }, false)
                 .small()
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -2001,7 +2292,7 @@ impl ChatApp {
         div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).px_1().child(input)
     }
 
-    /// 表单和生效中的设置有没有不同（底栏据此提示、决定「保存」能不能点）。
+    /// 表单和生效中的设置有没有不同（页头据此提示、决定「保存」能不能点）。
     fn form_dirty(&self, cx: &App) -> bool {
         // 单价表写错了也算改动：点「保存」才看得到错在哪
         if crate::pricing::parse_text(&self.settings_form.prices.read(cx).value()).is_err() {
@@ -2021,92 +2312,126 @@ impl ChatApp {
     /// 「内核与模型」拆页后的「内核」：本机内核清单 + 自研内核的选项（自动模式、运行参数）。
     fn render_kernel_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let body = div()
-            .v_flex()
-            .gap_8()
-            .child(self.render_kernel_list(cx))
-            .child(self.render_advanced(window, cx));
+        let body = div().v_flex().gap_4().child(self.render_kernel_list(window, cx));
         match f.kernel {
             KernelChoice::Builtin => body
-                .child(self.render_suppliers(cx))
                 .child(self.render_auto_mode(window, cx))
                 .child(self.render_suggest(cx))
                 .child(self.render_memory_options(cx))
                 .child(self.render_chat(cx))
-                .child(section(
-                    "运行",
-                    "",
-                    None,
-                    setting_group([
-                        setting_row(
-                            "一轮最多几步",
-                            "一轮里最多请求模型几次，默认 200；调大能跑更长的任务，也更费 token",
-                            div().w(NUMBER_INPUT_W).child(Self::text_input(&f.max_steps)),
-                        ),
-                        setting_row(
-                            "子任务模型",
-                            "派出去的子 agent（如只读调研）用哪个模型，同一端点；\
-                             填个快一点、便宜一点的能省钱提速，留空用会话的",
-                            div().w(rems(20.)).child(Input::new(&f.subagent_model).cleanable(true)),
-                        ),
-                        self.gateway_row(cx),
-                        self.bodies_row(cx),
-                        self.prices_row(window, cx),
-                    ]),
-                )),
-            // 自研内核以外的分区与内核无关（agent 的模型在它那边，演示没有模型）
-            KernelChoice::Acp(_) | KernelChoice::Demo => body,
+                .child(
+                    section(
+                        "运行",
+                        None,
+                        compact_setting_group([
+                            setting_row(
+                                "一轮最多几步",
+                                div().w(NUMBER_INPUT_W).child(Self::text_input_with(
+                                    Input::new(&f.max_steps)
+                                        .small()
+                                        .appearance(false)
+                                        .bordered(false),
+                                )),
+                            ),
+                            setting_row(
+                                "子任务模型",
+                                div()
+                                    .w(rems(20.))
+                                    .child(Input::new(&f.subagent_model).small().cleanable(true)),
+                            ),
+                        ]),
+                    )
+                    .gap_2(),
+                )
+                .child(self.render_advanced(window, cx)),
+            KernelChoice::Acp(_) | KernelChoice::Demo => {
+                body.child(self.render_advanced(window, cx))
+            }
         }
     }
 
-    /// 「内核」页的自研内核供应商单选：在用哪套端点（保存写进 `Settings.builtin.active`，
-    /// 自研内核重启后用它发请求）。这不限制模型——所有来源的模型在输入框菜单里都能挑，
-    /// 挑了别家的会自动切到那家（见 `choose_model_from`）。
-    fn render_suppliers(&self, cx: &mut Context<Self>) -> Div {
+    fn render_kernel_list(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let mut list = choice_panel();
-        // 和「模型」页一致的排序：magpie 网关注册的档案排最前
-        let mut order: Vec<usize> = (0..f.profiles.len()).collect();
-        order.sort_by_key(|&i| (!f.profiles[i].magpie, i));
-        for i in order {
-            let p = &f.profiles[i];
-            let host = host_of(&value(&f.inputs[i].base_url, cx)).to_string();
-            let model = value(&f.inputs[i].model, cx);
-            let title: SharedString =
-                if p.magpie { "magpie 网关".into() } else { p.display_name().to_string().into() };
-            let desc: SharedString = if host.is_empty() {
-                "还没填端点地址".into()
-            } else if model.is_empty() {
-                host.into()
-            } else {
-                format!("{host} · 默认 {model}").into()
-            };
-            list = list.child(
-                choice_row(("supplier", i), IconAll::Server, title, desc, i == f.active, None)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_form.active = i;
-                        this.settings_form.message = None;
-                        cx.notify();
-                    })),
+        let compact = f.content_w.get().unwrap_or(FORM_W) < rems(34.).to_pixels(window.rem_size());
+        let status_w = if compact { rems(9.) } else { rems(12.) };
+        let action_w = rems(4.5);
+        let row = |id: SharedString,
+                   icon: Icon,
+                   name: SharedString,
+                   status: SharedString,
+                   failed: bool,
+                   control: Option<AnyElement>| {
+            let name_tip = name.clone();
+            let status_tip = status.clone();
+            let name_id = ElementId::Name(format!("{id}-name").into());
+            let status_id = ElementId::Name(format!("{id}-status").into());
+            div()
+                .id(ElementId::Name(id))
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .h(rems(2.25))
+                .flex_none()
+                .px_2()
+                .border_b_1()
+                .border_color(rgb(LINE))
+                .hover(|d| d.bg(rgb(HOVER)))
+                .child(
+                    div()
+                        .id(name_id)
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_1()
+                        .min_w_0()
+                        .tooltip(move |window, cx| super::chat::text_tip(&name_tip, window, cx))
+                        .child(icon.size_4().flex_none().text_color(rgb(INK)))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(TEXT_SMALL)
+                                .child(name),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(status_id)
+                        .w(status_w)
+                        .flex_none()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(if failed { RED } else { INK_SOFT }))
+                        .font_features(tabular_nums())
+                        .tooltip(move |window, cx| super::chat::text_tip(&status_tip, window, cx))
+                        .child(status),
+                )
+                .child(div().w(action_w).flex_none().h_flex().justify_center().children(control))
+        };
+        let mut list = div().v_flex().child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(rgb(LINE))
+                .text_size(TEXT_META)
+                .text_color(rgb(INK_SOFT))
+                .child(div().flex_1().min_w_0().child("内核名称"))
+                .child(div().w(status_w).flex_none().child("版本 / 状态"))
+                .child(div().w(action_w).flex_none().text_center().child("启用")),
+        );
+        let mut risks =
+            div().v_flex().gap_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(
+                "风险：订阅账号经 magpie（第三方网关）使用可能违反各家条款；\
+                 magpie 会读取各 agent 的登录信息，claudesktop 自己不碰凭据",
             );
-        }
-        section(
-            "供应商",
-            "自研内核的模型经哪套端点发；只管默认，输入框里所有来源的模型都能直接挑",
-            None,
-            list,
-        )
-    }
-
-    /// 「本机内核」清单（对齐 magpie 的 Agents 页）：本机检测到的 agent 直接列出来，
-    /// 开关即接入；自研内核的模型经 magpie 网关；演示回放开关即默认。不选手填那套，
-    /// 它在下面「自定义」折叠区。
-    fn render_kernel_list(&self, cx: &mut Context<Self>) -> Div {
-        let f = &self.settings_form;
-        let mut list = choice_panel();
-
-        // magpie 网关行：自研内核的模型来源。状态行 + 按需动作（没装 → 下载并启动；没跑 → 启动）。
-        // 这一行不是开关：网关起了、档案配好了，新会话自动走自研内核（见 `Settings::kernel`）。
         let m = &f.magpie;
         let exe_installed = claudesktop_core::default_data_dir()
             .ok()
@@ -2115,69 +2440,60 @@ impl ChatApp {
         let mut status_error = false;
         let status: SharedString = if let Some((done, total)) = m.downloading {
             format!("正在下载… {} / {} MB", done >> 20, total.max(1) >> 20).into()
-        } else if let Some(err) = &m.error {
+        } else if m.error.is_some() {
             status_error = true;
-            err.clone().into()
+            "操作失败".into()
         } else if m.starting {
-            "正在启动网关…".into()
+            "启动中…".into()
+        } else if m.probing && !m.probed {
+            "检测中…".into()
         } else if let Some(version) = &m.running {
-            let models = f.profiles.iter().find(|p| p.magpie).map_or(0, |p| p.models.len());
-            if models > 0 {
-                format!("网关运行中 · {version} · {models} 个模型").into()
-            } else {
-                format!("网关运行中 · {version}").into()
-            }
+            format!("运行中 · {version}").into()
         } else if exe_installed {
-            "已下载，没在运行".into()
+            "未运行".into()
         } else if m.probed {
             "未安装".into()
         } else {
-            "正在检测…".into()
+            "检测中…".into()
         };
-        let action: Option<(&'static str, &'static str)> = if m.downloading.is_some() || m.starting
-        {
-            None
-        } else if m.error.is_some() {
-            Some(("重试", "magpie-row-retry"))
-        } else if m.running.is_some() {
-            None
-        } else if exe_installed {
-            Some(("启动", "magpie-row-start"))
-        } else if m.probed {
-            Some(("下载并启动（约 75 MB）", "magpie-row-setup"))
-        } else {
-            None
-        };
+        let action: Option<(&'static str, &'static str)> =
+            if m.downloading.is_some() || m.starting || m.probing {
+                None
+            } else if m.error.is_some() {
+                Some(("重试", "magpie-row-retry"))
+            } else if m.running.is_some() {
+                None
+            } else if exe_installed {
+                Some(("启动", "magpie-row-start"))
+            } else if m.probed {
+                Some(("下载", "magpie-row-setup"))
+            } else {
+                None
+            };
         let trailing = action.map(|(label, id)| {
-            Self::text_button(id, label, true)
+            Self::text_button(id, label, false)
                 .xsmall()
+                .tooltip(if id == "magpie-row-setup" {
+                    "下载并启动（约 75 MB）"
+                } else {
+                    label
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.setup_magpie(cx);
                 }))
                 .into_any_element()
         });
-        list = list.child(choice_row(
-            "kernel-magpie",
-            IconAll::Cpu,
-            "自研内核 · 经 magpie 网关",
+        list = list.child(row(
+            "kernel-magpie".into(),
+            kernel_logo("magpie"),
+            "magpie 网关".into(),
             status,
-            false,
+            status_error,
             trailing,
         ));
-        list = list.child(
-            div()
-                .px_3()
-                .pb_1()
-                .text_size(TEXT_META)
-                .text_color(rgb(if status_error { RED } else { INK_SOFT }))
-                .child(
-                    "风险：订阅账号经 magpie（第三方网关）使用可能违反各家条款；\
-                     magpie 会读取各 agent 的登录信息，claudesktop 自己不碰凭据",
-                ),
-        );
 
-        // 本机 agent：检测到的直接列出，开关即接入（启用 = 出现在输入框的内核菜单里）
+        // 本机 agent：检测到的直接列出，勾选即接入（启用 = 出现在输入框的内核菜单里）
         for preset in claudesktop_core::agents::PRESETS {
             let enabled = f.agents.iter().any(|a| a.id == preset.id);
             let detect = match &f.agent_detect {
@@ -2188,9 +2504,10 @@ impl ChatApp {
             // 装好的：开关接入。检测中只显示说明。
             let trailing: Option<AnyElement> = match detect {
                 Some(d) if d.state == claudesktop_core::agents::DetectState::Ready => Some(
-                    Switch::new(format!("agent-sw-{}", preset.id))
+                    Checkbox::new(format!("agent-sw-{}", preset.id))
+                        .small()
+                        .accessibility_label(format!("启用 {}", preset.name))
                         .checked(enabled)
-                        .color(rgb(CORAL))
                         .on_change(cx.listener(move |this, checked: &bool, _, cx| {
                             if *checked {
                                 if !this.settings_form.agents.iter().any(|a| a.id == preset.id) {
@@ -2211,6 +2528,7 @@ impl ChatApp {
                     Some(
                         Self::text_button(format!("agent-fix-{}", preset.id), label, false)
                             .xsmall()
+                            .tooltip(d.summary())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(
@@ -2248,61 +2566,32 @@ impl ChatApp {
                     AgentDetect::Done(_) => "未安装".into(),
                 },
             };
-            list = list.child(choice_row(
-                format!("agent-{}", preset.id),
-                IconAll::SquareTerminal,
-                preset.name,
-                desc,
-                false,
+            let needs_fix = detect.is_some_and(|d| !d.is_ready());
+            list = list.child(row(
+                format!("agent-{}", preset.id).into(),
+                kernel_logo(preset.id),
+                preset.name.into(),
+                desc.into(),
+                needs_fix,
                 trailing,
             ));
             if let Some(risk) = preset.risk {
-                list = list.child(
-                    div().px_3().pb_1().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(risk),
-                );
+                risks = risks.child(risk);
             }
         }
 
-        // 演示回放：开关 = 新会话默认进演示（关掉回自动）
-        let demo_on = matches!(f.kernel, KernelChoice::Demo);
-        let demo_switch = Switch::new("kernel-demo-sw")
-            .checked(demo_on)
-            .color(rgb(CORAL))
-            .on_change(cx.listener(|this, on: &bool, _, cx| {
-                this.settings_form.kernel =
-                    if *on { KernelChoice::Demo } else { KernelChoice::Builtin };
-                this.settings_form.message = None;
-                cx.notify();
-            }));
-        list = list.child(choice_row(
-            "kernel-demo",
-            IconAll::Play,
-            "演示回放",
-            "不连模型，播放界面演示",
-            demo_on,
-            Some(demo_switch.into_any_element()),
-        ));
-
-        let detect_note = match &f.agent_detect {
-            AgentDetect::Idle | AgentDetect::Running => Some(
-                div()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .child("正在检测本机安装的 agent…"),
-            ),
-            AgentDetect::Done(_) => None,
-        };
-        let body = div().v_flex().gap_4().child(list).children(detect_note);
-        section(
-            "本机内核",
-            "检测到的直接列出来，开关即接入；新会话默认走 magpie 网关（在跑的话），否则第一个启用的 agent",
-            None,
-            body,
-        )
+        div()
+            .v_flex()
+            .gap_2()
+            .child(list)
+            .when_some(m.error.as_ref(), |d, error| {
+                d.child(div().text_size(TEXT_SMALL).text_color(rgb(RED)).child(error.clone()))
+            })
+            .child(risks)
     }
 
-    /// 页底「自定义」折叠区：agent 选项（网关开关、自定义命令）。
-    /// 手填端点档案搬到「模型」页了；这里的开关保存才生效。
+    /// 页底「高级」折叠区：agent 选项、自定义命令、用量记录与单价表。
+    /// 手填端点档案在「服务商」页；这里的开关保存才生效。
     fn render_advanced(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let gateway_rows: Vec<_> = f
@@ -2314,8 +2603,8 @@ impl ChatApp {
                 let name = a.display_name();
                 setting_row(
                     format!("{} 经过用量网关", name),
-                    "把它的请求也记进「请求」页签",
                     Switch::new(format!("agent-gw-{}", id))
+                        .small()
                         .checked(a.gateway)
                         .color(rgb(CORAL))
                         .on_change(cx.listener(move |this, checked: &bool, _, cx| {
@@ -2331,21 +2620,32 @@ impl ChatApp {
             .collect();
         let content = div()
             .v_flex()
-            .gap_8()
+            .gap_4()
             .when(!gateway_rows.is_empty(), |d| {
-                d.child(section("agent 选项", "", None, setting_group(gateway_rows)))
+                d.child(section("agent 选项", None, compact_setting_group(gateway_rows)).gap_2())
             })
-            .child(section(
-                "自定义 agent",
-                "",
-                None,
-                form_field(
-                    "启动命令",
-                    Some("任何说 ACP 的 agent 都能接；登录和模型在它那边设置".into()),
-                    Self::text_input(&f.custom_command),
-                ),
-            ));
-        self.disclosure("kernel-advanced", "agent 选项", content, window, cx)
+            .child(
+                section(
+                    "自定义 agent",
+                    None,
+                    form_field(
+                        "启动命令",
+                        Self::text_input_with(
+                            Input::new(&f.custom_command).small().appearance(false).bordered(false),
+                        ),
+                    ),
+                )
+                .gap_2(),
+            )
+            .when(f.kernel == KernelChoice::Builtin, |d| {
+                let mut rows = vec![self.gateway_row(cx)];
+                if f.usage_gateway {
+                    rows.push(self.bodies_row(cx));
+                }
+                rows.push(self.prices_row(window, cx));
+                d.child(section("用量记录", None, compact_setting_group(rows)).gap_2())
+            });
+        self.disclosure("kernel-advanced", "高级", content, window, cx)
     }
 
     /// 「自动」模式：开关 + 分类器用哪个模型 + 信任边界。默认关，开了必须配齐。
@@ -2353,56 +2653,57 @@ impl ChatApp {
         let f = &self.settings_form;
         let enabled = f.auto_enabled;
         let follow = f.auto_follow;
-        let switch = Switch::new("auto-mode-on").checked(enabled).color(rgb(CORAL)).on_change(
-            cx.listener(|this, checked: &bool, _, cx| {
-                this.settings_form.auto_enabled = *checked;
-                cx.notify();
-            }),
-        );
-        let follow_switch = Switch::new("auto-mode-follow")
-            .checked(follow)
-            .color(rgb(CORAL))
-            .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                this.settings_form.auto_follow = *checked;
-                cx.notify();
-            }));
-        let rows = setting_group([
-            setting_row("启用「自动」", "新对话默认用「自动」", switch),
-            setting_row("分类器跟随当前模型", "关掉可另填小模型，判得更快", follow_switch),
-            setting_row(
-                "分类器模型",
-                "同一端点的模型名，留空用会话的",
+        let switch =
+            Switch::new("auto-mode-on").small().checked(enabled).color(rgb(CORAL)).on_change(
+                cx.listener(|this, checked: &bool, _, cx| {
+                    this.settings_form.auto_enabled = *checked;
+                    cx.notify();
+                }),
+            );
+        let follow_switch =
+            Switch::new("auto-mode-follow").small().checked(follow).color(rgb(CORAL)).on_change(
+                cx.listener(|this, checked: &bool, _, cx| {
+                    this.settings_form.auto_follow = *checked;
+                    cx.notify();
+                }),
+            );
+        let mut rows = vec![setting_row("启用「自动」", switch)];
+        if enabled {
+            rows.push(setting_row("分类器跟随当前模型", follow_switch));
+            if !follow {
+                rows.push(setting_row(
+                    "分类器模型",
+                    div().w(rems(20.)).child(Input::new(&f.auto_model).small().cleanable(true)),
+                ));
+            }
+            rows.push(setting_row(
+                "信任边界",
                 div()
                     .w(rems(20.))
-                    .child(Input::new(&f.auto_model).cleanable(true))
-                    .when(follow, |d| d.opacity(0.5)),
-            ),
-            setting_row(
-                "信任边界",
-                "哪些仓库、域名算内部；留空只认工作目录",
-                div().w(rems(32.)).child(Textarea::new(&f.auto_environment).appearance(false)),
-            ),
-        ]);
+                    .max_w_full()
+                    .child(Textarea::new(&f.auto_environment).small().appearance(false)),
+            ));
+        }
+        let rows = compact_setting_group(rows);
         // 没配好时把话说在前面（保存时也会拦）
         let unconfigured = enabled && !self.settings.builtin.is_configured();
         let body = div()
             .v_flex()
             .gap_3()
             .child(rows)
-            .when(unconfigured, |d| d.child(note(IconAll::Info, "先在「服务商」里配好端点和模型")))
-            .child(self.disclosure(
-                "auto-mode-rules",
-                "它拦什么、放什么",
-                auto_mode_docs(),
-                window,
-                cx,
-            ));
-        section(
-            "自动模式",
-            "由分类器代替你逐项审批；它看不到助手的解释和工具结果，只按动作本身判，拦下时把理由交给 agent",
-            None,
-            body,
-        )
+            .when(unconfigured, |d| {
+                d.child(note(IconAll::Info, "先在「服务商」页配好端点，再到「模型」页选模型"))
+            })
+            .when(enabled, |d| {
+                d.child(self.disclosure(
+                    "auto-mode-rules",
+                    "它拦什么、放什么",
+                    auto_mode_docs(),
+                    window,
+                    cx,
+                ))
+            });
+        section("自动模式", None, body).gap_2()
     }
 
     /// 聊天空间的一组：用哪个模型、新建的聊天默认开不开联网、带一份「聊天说明」文件。
@@ -2440,21 +2741,19 @@ impl ChatApp {
         let missing = !path.is_empty() && !std::path::Path::new(&path).is_file();
         section(
             "聊天",
-            "聊天空间直接连模型：没有工作目录、不跑命令、只带联网和记忆；这里的三项只影响之后新建的聊天",
             None,
             div()
                 .v_flex()
                 .gap_3()
-                .child(setting_group([
+                .child(compact_setting_group([
                     setting_row(
                         "聊天用的模型",
-                        "同一端点的模型名，留空跟档案里的默认模型；聊天可以用便宜些的模型",
-                        div().w(rems(20.)).child(Input::new(&f.chat_model).cleanable(true)),
+                        div().w(rems(20.)).child(Input::new(&f.chat_model).small().cleanable(true)),
                     ),
                     setting_row(
                         "默认联网",
-                        "新建的聊天默认能搜索网页、读网页；输入框里可以随时关",
                         Switch::new("chat-web")
+                            .small()
                             .checked(f.chat_web)
                             .color(rgb(CORAL))
                             .on_change(cx.listener(|this, checked: &bool, _, cx| {
@@ -2464,21 +2763,24 @@ impl ChatApp {
                     ),
                     setting_row(
                         "聊天说明",
-                        "每次聊天都带上的话（一份文件，每轮重读）；比如「回答尽量简短」「我是前端工程师」",
                         div()
                             .h_flex()
                             .items_center()
                             .gap_1p5()
                             .w(rems(24.))
-                            .child(div().flex_1().min_w_0().child(Input::new(&f.chat_instructions)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&f.chat_instructions).small()),
+                            )
                             .child(pick),
                     ),
                 ]))
-                .when(missing, |d| {
-                    d.child(note(IconAll::Info, "这个文件不存在，聊天不会带上它"))
-                })
+                .when(missing, |d| d.child(note(IconAll::Info, "这个文件不存在，聊天不会带上它")))
                 .children(self.render_no_vision(cx)),
         )
+        .gap_2()
     }
 
     /// 被端点回过 400、确认看不了图片的模型：列出来，能清掉（万一是误判）。
@@ -2534,6 +2836,7 @@ impl ChatApp {
     fn render_suggest(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let typing = Switch::new("suggest-on")
+            .small()
             .checked(f.suggest_enabled)
             .color(rgb(CORAL))
             .on_change(cx.listener(|this, checked: &bool, _, cx| {
@@ -2541,6 +2844,7 @@ impl ChatApp {
                 cx.notify();
             }));
         let next = Switch::new("next-suggestion-on")
+            .small()
             .checked(f.next_suggestion)
             .color(rgb(CORAL))
             .on_change(cx.listener(|this, checked: &bool, _, cx| {
@@ -2552,382 +2856,564 @@ impl ChatApp {
                 }
                 cx.notify();
             }));
-        section(
-            "输入补全",
-            "你打字时猜你这句的下一半；每轮回复结束后猜你接下来会发的那一句",
-            None,
-            setting_group([
-                setting_row(
-                    "打字时续写",
-                    "停顿一下发一次请求，灰字画在光标后面，按 Tab 接上",
-                    typing,
-                ),
-                setting_row(
-                    "一轮结束后猜下一句",
-                    "回复结束时发一次请求，猜出的那句话用淡色画在空输入框里，按 Tab 填入；\
-                     输入框里已有草稿时不猜",
-                    next,
-                ),
-                setting_row(
-                    "补全模型",
-                    "同一端点的模型名，建议填便宜、不带思考的小模型；留空用会话的",
-                    div().w(rems(20.)).child(Input::new(&f.suggest_model).cleanable(true)),
-                ),
-            ]),
-        )
+        let mut rows =
+            vec![setting_row("打字时续写", typing), setting_row("一轮结束后猜下一句", next)];
+        if f.suggest_enabled || f.next_suggestion {
+            rows.push(setting_row(
+                "补全模型",
+                div().w(rems(20.)).child(Input::new(&f.suggest_model).small().cleanable(true)),
+            ));
+        }
+        section("输入补全", None, compact_setting_group(rows)).gap_2()
     }
 
     /// 记忆：一轮结束后要不要让模型提炼「候选」（只进设置页待确认，收下才落盘）。
     fn render_memory_options(&self, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let suggest = Switch::new("memory-suggest")
+            .small()
             .checked(f.memory_suggest)
             .color(rgb(CORAL))
             .on_change(cx.listener(|this, checked: &bool, _, cx| {
                 this.settings_form.memory_suggest = *checked;
                 cx.notify();
             }));
-        section(
-            "记忆",
-            "跨会话记住偏好和约定：每轮带上相关的几条，置顶的永远带上；在设置页「记忆」里看、改、删",
-            None,
-            setting_group([setting_row(
-                "回合结束后提炼记忆",
-                "每轮结束多一次请求，提炼出值得记下的话放进「记忆」页顶部等你收下（默认关，关着就是它自己觉得有用时才记）",
-                suggest,
-            )]),
-        )
+        section("记忆", None, compact_setting_group([setting_row("回合结束后提炼记忆", suggest)]))
+            .gap_2()
     }
 
-    /// 「模型」页：来源清单（magpie 网关 + 各套端点档案，点选看模型）+ 选中来源的
-    /// 模型清单 + 页底「服务商」（手填 / 增删档案）。
+    /// 全局默认模型跨来源选择；来源下拉只筛选下面用于管理的模型清单。
     fn render_model_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let f = &self.settings_form;
+        let app = cx.entity();
+        let selected = f.profiles.get(f.active).zip(f.inputs.get(f.active));
+        let label: SharedString = selected.filter(|(p, _)| !p.model.trim().is_empty()).map_or_else(
+            || "选择默认模型".into(),
+            |(p, inputs)| {
+                let model = p.model.trim();
+                let source =
+                    profile_title(p, &value(&inputs.name, cx), &value(&inputs.base_url, cx));
+                format!("{model} · {source}").into()
+            },
+        );
+        let default_model = menu_popover(
+            "default-model-menu",
+            Anchor::BottomLeft,
+            rems(20.),
+            &app,
+            &self.menu_focus,
+            MenuChip::new(IconAll::Bot, label).shrink(),
+            default_model_menu_items,
+        )
+        .default_open(std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("model-menu"));
+        let mut defaults = div()
+            .v_flex()
+            .gap_2()
+            .child(form_field("默认模型", div().h_flex().min_w_0().child(default_model)));
+        if let Some((p, _)) = selected {
+            defaults = defaults.child(self.render_thinking_row(p, &p.model, cx));
+        }
         div()
             .v_flex()
-            .gap_8()
-            .child(self.render_model_sources(window, cx))
-            .child(self.render_providers(window, cx))
+            .h_full()
+            .min_h_0()
+            .gap_4()
+            .child(defaults)
+            .child(self.render_model_list(window, cx))
     }
 
-    /// 来源清单：一行一个来源（magpie 网关注册的档案排最前），点选切到下面的模型清单。
-    /// 不挑「在用」——所有来源的模型都可用；在用哪套是「内核」页供应商单选的事，
-    /// 这里只给在用的那行标一句。
-    fn render_model_sources(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn render_provider_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let mut list = choice_panel();
-        // magpie 网关排最前：它是自动建的，模型由网关喂
+        let mut list = choice_panel().gap_0();
         let mut order: Vec<usize> = (0..f.profiles.len()).collect();
         order.sort_by_key(|&i| (!f.profiles[i].magpie, i));
-        for i in order {
+        for (row, i) in order.into_iter().enumerate() {
             let p = &f.profiles[i];
+            let inputs = &f.inputs[i];
             let active = i == f.view;
-            let mark_in_use = |desc: String| -> SharedString {
-                if i == f.active { format!("在用 · {desc}").into() } else { desc.into() }
-            };
-            let (icon, title, desc, trailing): (
-                IconAll,
-                SharedString,
-                SharedString,
-                Option<AnyElement>,
-            ) = if p.magpie {
-                let m = &f.magpie;
-                let desc: SharedString = if let Some((done, total)) = m.downloading {
-                    format!("正在下载… {} / {} MB", done >> 20, total.max(1) >> 20).into()
-                } else if m.starting {
-                    "正在启动网关…".into()
-                } else if let Some(version) = &m.running {
-                    if p.models.is_empty() {
-                        format!("网关运行中 · {version}").into()
-                    } else {
-                        format!("网关运行中 · {version} · {} 个模型", p.models.len()).into()
-                    }
-                } else if m.probed {
-                    "没在运行（「内核」页可以启动）".into()
-                } else {
-                    "正在检测…".into()
-                };
-                let trailing = m.running.is_some().then(|| {
-                    Self::text_button(("source-refresh", i), "刷新", false)
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.refresh_source_models(i, cx);
-                        }))
-                        .into_any_element()
-                });
-                (IconAll::Cpu, "magpie 网关".into(), mark_in_use(desc.to_string()), trailing)
-            } else {
-                let host = host_of(&value(&f.inputs[i].base_url, cx)).to_string();
-                let n = p.models.len();
-                let desc = if host.is_empty() {
-                    "还没填端点地址".to_string()
-                } else if n > 0 {
-                    format!("{host} · {n} 个模型")
-                } else {
-                    host
-                };
-                (IconAll::Server, p.display_name().to_string().into(), mark_in_use(desc), None)
-            };
-            list = list.child(
-                choice_row(("model-source", i), icon, title, desc, active, trailing).on_click(
-                    cx.listener(move |this, _, window, cx| this.select_form_profile(i, window, cx)),
-                ),
+            let group: SharedString = format!("provider-row-{i}").into();
+            let opacity = motion::hover_opacity(
+                ElementId::Name(format!("actions-{group}").into()),
+                active || f.hovered_action.as_ref() == Some(&group),
+                window,
+                cx,
             );
+            let actions = (!p.magpie).then(|| {
+                let surface = if active { Surface::Paper } else { Surface::Sand };
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        Self::quiet_button(("profile-edit", i), IconAll::Pencil, surface, cx)
+                            .small()
+                            .when(!active, |b| b.opacity(opacity).focus_visible(|s| s.opacity(1.)))
+                            .tooltip(if active && f.editing_profile {
+                                "收起编辑"
+                            } else {
+                                "编辑这个来源"
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                let editing = this.settings_form.view != i
+                                    || !this.settings_form.editing_profile;
+                                this.select_form_profile(i, window, cx);
+                                this.settings_form.editing_profile = editing;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Self::quiet_button(("profile-remove", i), IconAll::Trash, surface, cx)
+                            .small()
+                            .when(!active, |b| b.opacity(opacity).focus_visible(|s| s.opacity(1.)))
+                            .tooltip("删除这个来源")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.ask_remove_form_profile(i, window, cx);
+                            })),
+                    )
+                    .into_any_element()
+            });
+            if row > 0 {
+                list = list.child(div().mx_3().h(px(1.)).bg(rgb(LINE)).flex_shrink_0());
+            }
+            let mut entry = div().v_flex().rounded_lg().when(active, |d| d.bg(rgb(CARD)));
+            entry = entry.child(
+                choice_row(
+                    ("provider-source", i),
+                    if p.magpie { IconAll::Cpu } else { IconAll::Server },
+                    profile_title(p, &value(&inputs.name, cx), &value(&inputs.base_url, cx)),
+                    "",
+                    active,
+                    actions,
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.hover_settings_action(&group, *hovered, cx)
+                }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_form_profile(i, window, cx);
+                })),
+            );
+            if active {
+                let detail = if !p.magpie && f.editing_profile {
+                    self.render_profile_editor(p, inputs, window, cx)
+                } else {
+                    self.render_profile_summary(p, inputs, cx)
+                };
+                entry = entry.child(
+                    div().mx_3().pt_2().pb_3().border_t_1().border_color(rgb(LINE)).child(detail),
+                );
+            }
+            list = list.child(entry);
         }
-        let body = div().v_flex().gap_4().child(list).child(self.render_model_list(window, cx));
-        section(
-            "模型来源",
-            "所有来源的模型都能在输入框直接挑；点一行管理它的模型和端点",
-            None,
-            body,
-        )
+        list
     }
 
-    /// 选中来源的模型清单：搜索过滤；每个模型的开关决定它进不进输入框菜单；
-    /// 点模型名设为这套档案的默认模型。空列表给「获取列表」。
-    fn render_model_list(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    fn render_model_list(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
-        let Some((p, inputs)) = f.current() else { return div() };
-        let i = f.view;
-        let fetch_label: &'static str = if p.models.is_empty() { "获取列表" } else { "刷新" };
-        let header = div()
+        let search = value(&f.model_search, cx);
+        let options = model_options(&f.profiles, f.model_source, &search);
+        let source =
+            f.model_source.and_then(|i| f.profiles.get(i).zip(f.inputs.get(i))).map_or_else(
+                || SharedString::from("全部来源"),
+                |(p, inputs)| {
+                    profile_title(p, &value(&inputs.name, cx), &value(&inputs.base_url, cx))
+                },
+            );
+        let toolbar = div()
             .h_flex()
+            .flex_wrap()
             .items_center()
             .gap_2()
-            .child(div().flex_1().min_w_0().child(Self::text_input(&f.model_search)))
+            .flex_none()
+            .child(div().flex_1().min_w(rems(9.)).child(Self::text_input(&f.model_search)))
+            .child(menu_popover(
+                "model-provider-menu",
+                Anchor::BottomLeft,
+                rems(20.),
+                &cx.entity(),
+                &self.menu_focus,
+                MenuChip::new(IconAll::Server, source).filled().shrink(),
+                profile_menu_items,
+            ))
             .child(
-                Self::text_button("fetch-models", fetch_label, false)
+                Self::text_button("fetch-models", "刷新", false)
+                    .small()
                     .loading(self.fetching_models)
-                    .on_click(cx.listener(|this, _, _, cx| this.fetch_models(true, cx))),
+                    .disabled(self.fetching_models || f.profiles.is_empty())
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_model_sources(cx))),
             );
-        let mut body = div().v_flex().gap_2p5().child(header);
-        if let Some((error, text, raw)) = &f.fetch_result {
+        let mut body = div().v_flex().flex_1().min_h_0().gap_2().child(toolbar);
+        if let Some(source) = f.model_source
+            && !search.is_empty()
+            && !options.iter().any(|(_, model)| *model == search)
+        {
+            let query = search.clone();
+            body = body.child(div().h_flex().child(
+                Self::text_button("use-custom-model", "使用此模型", false).small().on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.select_form_model(source, query.clone(), window, cx);
+                    }),
+                ),
+            ));
+        }
+        if let Some((error, text, _)) = &f.fetch_result {
             body = body.child(
                 div()
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(if *error { RED } else { GREEN }))
                     .child(text.clone()),
             );
-            if let Some(raw) = raw {
-                body = body.child(
-                    div()
-                        .text_size(TEXT_META)
-                        .text_color(rgb(INK_SOFT))
-                        .line_clamp(2)
-                        .child(raw.clone()),
-                );
-            }
         }
-        if p.models.is_empty() {
-            body = body.child(
+        if options.is_empty() {
+            return body.child(div().py_4().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
+                if !search.is_empty() {
+                    "没有匹配的模型"
+                } else if f.profiles.is_empty() {
+                    "先在「服务商」页添加一个来源"
+                } else {
+                    "还没有模型列表，点「刷新」获取"
+                },
+            ));
+        }
+        let compact_rows =
+            f.content_w.get().unwrap_or(FORM_W) < rems(34.).to_pixels(window.rem_size());
+        let source_w = if compact_rows { rems(5.) } else { rems(8.) };
+        let action_w = if compact_rows { rems(2.25) } else { rems(5.) };
+        let columns = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .pr_4()
+            .py_1()
+            .text_size(TEXT_META)
+            .text_color(rgb(INK_SOFT))
+            .child(
                 div()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .child("还没有模型列表，点「获取列表」从端点拉"),
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child("模型名称"),
+            )
+            .when(f.model_source.is_none(), |d| {
+                d.child(div().w(source_w).flex_none().child("来源"))
+            })
+            .child(div().w(action_w).flex_none())
+            .child(div().w(rems(2.)).flex_none().text_center().child("菜单"));
+        let row_h = rems(2.25).to_pixels(window.rem_size());
+        let start =
+            ((-f.model_scroll.offset().y / row_h) as usize).saturating_sub(4).min(options.len());
+        let visible = ((f.model_scroll.bounds().size.height / row_h).ceil() as usize).max(12) + 8;
+        let end = (start + visible).min(options.len());
+        let mut rows = div()
+            .id("settings-model-rows")
+            .v_flex()
+            .h_full()
+            .overflow_y_scroll()
+            .track_scroll(&f.model_scroll)
+            .pr_4()
+            .child(div().h(row_h * start as f32).flex_shrink_0());
+        for &(i, model) in &options[start..end] {
+            let p = &f.profiles[i];
+            let is_default = i == f.active && p.model.trim() == model;
+            let pick = model.to_string();
+            let toggle = model.to_string();
+            let id: SharedString = format!("settings-model-{i}-{model}").into();
+            let hover_id = id.clone();
+            let opacity = motion::hover_opacity(
+                ElementId::Name(format!("actions-{id}").into()),
+                f.hovered_action.as_ref() == Some(&id),
+                window,
+                cx,
             );
-            return section("模型清单", "开关决定进不进输入框菜单；点名字设为默认", None, body);
-        }
-        let q = f.model_search.read(cx).value().trim().to_lowercase();
-        let default = value(&inputs.model, cx);
-        let mut n = 0usize;
-        let mut rows = div().v_flex().gap_0p5();
-        for (j, m) in p.models.iter().enumerate() {
-            if !q.is_empty() && !m.to_lowercase().contains(q.as_str()) {
-                continue;
-            }
-            n += 1;
-            let is_default = default.trim() == m.as_str();
-            let pick = m.clone();
-            let toggle = m.clone();
-            let name = div()
-                .id(("model-name", j))
-                .flex_1()
-                .min_w_0()
-                .h_flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .when(is_default, |d| d.bg(rgb(SELECTED)))
-                .when(!is_default, |d| d.hover(|d| d.bg(rgb(HOVER))))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_size(TEXT_SMALL)
-                        .font_weight(if is_default {
-                            FontWeight::MEDIUM
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .child(m.clone()),
-                )
-                .when(is_default, |d| {
-                    d.child(div().text_size(TEXT_META).text_color(rgb(CORAL)).child("默认"))
-                })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.settings_form.inputs[i]
-                        .model
-                        .update(cx, |s, cx| s.set_value(pick.clone(), window, cx));
-                    cx.notify();
-                }));
-            rows = rows.child(
-                div().h_flex().items_center().gap_2().px_1().child(name).child(
-                    Switch::new(("model-sw", j))
-                        .checked(!p.menu_hidden.contains(m))
-                        .color(rgb(CORAL))
-                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
-                            cx.stop_propagation();
-                            if let Some(p) = this.settings_form.profiles.get_mut(i) {
-                                if *checked {
-                                    p.menu_hidden.retain(|x| x != &toggle);
-                                } else if !p.menu_hidden.contains(&toggle) {
-                                    p.menu_hidden.push(toggle.clone());
-                                }
-                            }
-                            cx.notify();
-                        })),
-                ),
-            );
-        }
-        if n == 0 {
+            let source =
+                profile_title(p, &value(&f.inputs[i].name, cx), &value(&f.inputs[i].base_url, cx));
             rows = rows.child(
                 div()
+                    .id(ElementId::Name(id.clone()))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.hover_settings_action(&hover_id, *hovered, cx)
+                    }))
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .h(row_h)
+                    .flex_none()
                     .px_2()
-                    .py_2()
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_FAINT))
-                    .child("没有匹配的模型"),
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .when(is_default, |d| d.bg(rgb(SELECTED)))
+                    .when(!is_default, |d| d.hover(|s| s.bg(rgb(HOVER))))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(TEXT_SMALL)
+                            .child(model.to_string()),
+                    )
+                    .when(f.model_source.is_none(), |d| {
+                        d.child(
+                            div()
+                                .w(source_w)
+                                .flex_none()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(TEXT_META)
+                                .text_color(rgb(INK_SOFT))
+                                .child(source.clone()),
+                        )
+                    })
+                    .child(div().w(action_w).flex_none().h_flex().justify_end().map(|d| {
+                        if is_default {
+                            d.child(div().text_size(TEXT_META).text_color(rgb(INK)).child("默认"))
+                        } else {
+                            d.child(
+                                Self::quiet_button(
+                                    ElementId::Name(format!("default-{id}").into()),
+                                    IconAll::Star,
+                                    Surface::Paper,
+                                    cx,
+                                )
+                                .small()
+                                .when(!compact_rows, |b| b.label("设为默认"))
+                                .tooltip("设为默认")
+                                .opacity(opacity)
+                                .focus_visible(|s| s.opacity(1.))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.select_form_model(i, pick.clone(), window, cx)
+                                    },
+                                )),
+                            )
+                        }
+                    }))
+                    .child(
+                        div().w(rems(2.)).flex_none().h_flex().justify_center().child(
+                            Checkbox::new(ElementId::Name(format!("visible-{id}").into()))
+                                .small()
+                                .accessibility_label(format!("在菜单显示 {source} 的 {model}"))
+                                .checked(!p.menu_hidden.iter().any(|m| m == model))
+                                .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                                    if let Some(p) = this.settings_form.profiles.get_mut(i) {
+                                        p.menu_hidden.retain(|m| m != &toggle);
+                                        if !*checked {
+                                            p.menu_hidden.push(toggle.clone());
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
             );
         }
-        body = body.child(rows);
-        section("模型清单", "开关决定进不进输入框菜单；点名字设为默认", None, body)
+        rows = rows.child(div().h(row_h * (options.len() - end) as f32).flex_shrink_0());
+        body.child(columns).child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(rows)
+                .child(Scrollbar::vertical(&f.model_scroll).mode(ScrollbarMode::Always)),
+        )
     }
 
-    /// 「模型」页来源行的刷新：magpie 网关重拉 /v1/models，手填档案走「获取列表」。
-    fn refresh_source_models(&mut self, i: usize, cx: &mut Context<Self>) {
-        self.settings_form.view = i;
-        let is_magpie = self.settings_form.profiles.get(i).is_some_and(|p| p.magpie);
-        if !is_magpie {
-            self.fetch_models(true, cx);
+    fn hover_settings_action(&mut self, id: &SharedString, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            if self.settings_form.hovered_action.as_ref() != Some(id) {
+                self.settings_form.hovered_action = Some(id.clone());
+                cx.notify();
+            }
+        } else if self.settings_form.hovered_action.as_ref() == Some(id) {
+            self.settings_form.hovered_action = None;
+            cx.notify();
+        }
+    }
+
+    fn select_model_source(&mut self, source: Option<usize>, cx: &mut Context<Self>) {
+        self.settings_form.model_source = source.filter(|&i| i < self.settings_form.profiles.len());
+        self.settings_form.fetch_result = None;
+        self.model_wheel = None;
+        self.settings_form.model_scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    fn refresh_model_sources(&mut self, cx: &mut Context<Self>) {
+        if self.fetching_models {
             return;
         }
-        let port = claudesktop_builtin::magpie::gateway_port();
+        let f = &self.settings_form;
+        let jobs: Vec<_> = f
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| f.model_source.is_none_or(|source| *i == source))
+            .filter_map(|(i, p)| {
+                let inputs = f.inputs.get(i)?;
+                let mut config = p.provider_config();
+                config.base_url = value(&inputs.base_url, cx);
+                config.api_key = Some(value(&inputs.api_key, cx)).filter(|key| !key.is_empty());
+                config.gateway = self.settings.gateway();
+                Some((inputs.name.clone(), p.clone(), config))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        self.fetching_models = true;
+        self.settings_form.fetch_result = None;
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            let list = cx
-                .background_executor()
-                .spawn(async move { claudesktop_builtin::magpie::models(port) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                match list {
-                    Ok(list) if !list.is_empty() => {
-                        this.update_settings(|s| {
-                            if let Some(p) = s.builtin.profiles.iter_mut().find(|p| p.magpie) {
-                                p.set_models(&list);
-                            }
-                        });
-                        // 表单里那份也更新（来源行的个数显示、下面的清单）
-                        if let Some(p) = this.settings_form.profiles.get_mut(i) {
-                            p.set_models(&list);
+            let mut count = 0;
+            let mut failures = Vec::new();
+            for (target, original, config) in jobs {
+                let request = config.clone();
+                let magpie = original.magpie;
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if magpie {
+                            claudesktop_builtin::magpie::models(
+                                claudesktop_builtin::magpie::gateway_port(),
+                            )
+                            .map_err(|err| err.to_string())
+                        } else if request.base_url.trim().is_empty() {
+                            Err("先填端点地址".to_string())
+                        } else {
+                            claudesktop_builtin::fetch_models(request)
+                                .map_err(|err| err.to_string())
                         }
-                        this.settings_form.fetch_result = Some((
-                            false,
-                            format!("已从网关获取 {} 个模型", list.len()).into(),
-                            None,
-                        ));
+                    })
+                    .await;
+                let _ = this.update(cx, |app, cx| {
+                    let Some(i) =
+                        app.settings_form.inputs.iter().position(|inputs| inputs.name == target)
+                    else {
+                        return;
+                    };
+                    let inputs = &app.settings_form.inputs[i];
+                    if value(&inputs.base_url, cx) != config.base_url
+                        || value(&inputs.api_key, cx)
+                            != config.api_key.as_deref().unwrap_or_default()
+                        || app.settings_form.profiles[i].protocol != config.protocol
+                    {
+                        return;
                     }
-                    Ok(_) => {
-                        this.settings_form.fetch_result =
-                            Some((true, "网关没有返回模型".into(), None));
+                    match result {
+                        Ok(models) => {
+                            count += models.len();
+                            app.settings_form.profiles[i].set_models(&models);
+                            let saved = app.settings.builtin.profiles.iter().position(|p| {
+                                p.name == original.name
+                                    && p.magpie == original.magpie
+                                    && p.protocol == config.protocol
+                                    && p.base_url.trim() == config.base_url.trim()
+                                    && p.api_key.trim()
+                                        == config.api_key.as_deref().unwrap_or_default()
+                            });
+                            if let Some(saved) = saved {
+                                app.update_settings(|s| {
+                                    s.builtin.profiles[saved].set_models(&models)
+                                });
+                                if saved == app.settings.builtin.active {
+                                    if let Some(kernel) = app.kernel_of(&KernelChoice::Builtin) {
+                                        kernel.set_context_windows(
+                                            app.settings.builtin.profiles[saved]
+                                                .context_windows
+                                                .clone()
+                                                .into_iter()
+                                                .collect(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => failures.push(format!(
+                            "{}：{}",
+                            original.display_name(),
+                            crate::model::fetch_failure_text(&error, &config.base_url)
+                        )),
                     }
-                    Err(err) => {
-                        this.settings_form.fetch_result =
-                            Some((true, format!("拉取失败：{err}").into(), None));
-                    }
-                }
+                    cx.notify();
+                });
+            }
+            let _ = this.update(cx, |app, cx| {
+                app.fetching_models = false;
+                let failed = !failures.is_empty();
+                let text = if failed {
+                    failures.join("；")
+                } else {
+                    format!("已获取 {count} 个模型")
+                };
+                app.settings_form.fetch_result = Some((failed, text.into(), None));
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// 自研内核的服务商：档案列表（选中的那套在用）+「添加」菜单，下面编辑选中的那套。
-    fn render_providers(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let f = &self.settings_form;
-        let app = cx.entity();
-        let add = menu_popover(
-            "profile-add-menu",
-            Anchor::TopRight,
-            rems(20.),
-            &app,
-            &self.menu_focus,
-            MenuChip::new(IconAll::Plus, "添加").filled(),
-            add_profile_menu_items,
-        )
-        .into_any_element();
-
-        let mut list = choice_panel();
-        for (i, inputs) in f.inputs.iter().enumerate() {
-            // 高亮 = 正在查看的这套（点行只是切到它改 Key / 挑模型，不改成在用）
-            let active = i == f.view;
-            let name = value(&inputs.name, cx);
-            let base_url = value(&inputs.base_url, cx);
-            let model = value(&inputs.model, cx);
-            let mut title = if name.is_empty() { format!("服务商 {}", i + 1) } else { name };
-            let desc = match (host_of(&base_url), model.is_empty()) {
-                ("", _) => "还没填端点地址".to_string(),
-                (host, true) => host.to_string(),
-                (host, false) => format!("{host} · {model}"),
-            };
-            if i == f.active {
-                title = format!("{title}（在用）");
-            }
-            // 删除只给选中的那行（先选中再删，不会误点）
-            let remove = active.then(|| {
-                Self::quiet_button(("profile-remove", i), IconAll::Trash, Surface::Paper, cx)
-                    .small()
-                    .tooltip("删除这套")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.remove_form_profile(i, cx);
-                    }))
-                    .into_any_element()
-            });
-            list = list.child(
-                choice_row(("profile", i), IconAll::Server, title, desc, active, remove).on_click(
-                    cx.listener(move |this, _, window, cx| this.select_form_profile(i, window, cx)),
-                ),
+    fn render_profile_summary(&self, p: &ProviderProfile, inputs: &ProfileInputs, cx: &App) -> Div {
+        let field = |label: &'static str, text: SharedString| {
+            div()
+                .h_flex()
+                .items_center()
+                .min_w_0()
+                .gap_2()
+                .text_size(TEXT_SMALL)
+                .child(div().flex_none().text_color(rgb(INK_SOFT)).child(label))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(rgb(INK))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(text),
+                )
+        };
+        let endpoint = value(&inputs.base_url, cx);
+        let key_set = !inputs.api_key.read(cx).value().trim().is_empty();
+        let mut summary = div()
+            .v_flex()
+            .gap_2()
+            .child(field(
+                "端点地址",
+                if endpoint.is_empty() { "未设置".into() } else { endpoint.into() },
+            ))
+            .child(
+                div()
+                    .h_flex()
+                    .flex_wrap()
+                    .gap_x_5()
+                    .gap_y_2()
+                    .child(field("协议", p.protocol.label().into()).flex_1().flex_basis(rems(12.)))
+                    .child(
+                        field("API Key", if key_set { "已设置" } else { "未设置" }.into())
+                            .flex_1()
+                            .flex_basis(rems(12.)),
+                    ),
             );
-        }
-
-        let mut body = div().v_flex().gap_4();
-        // 按已保存的设置判断（不看正在填的输入框），免得填第一个字时说明忽然消失、整页往上跳
-        if f.inputs.len() <= 1 && !self.settings.builtin.is_configured() {
-            body = body.child(how_to(
-                "三步接上模型",
-                &[
-                    "点右上角「添加」选服务商，没有的选「自定义」",
-                    "填 API Key（本机 Ollama 不用）",
-                    "在上面「模型清单」挑个模型，再点「保存并应用」",
-                ],
+        if p.protocol == Protocol::Anthropic {
+            summary = summary.child(field(
+                "服务端工具",
+                if p.params.server_tools.is_empty() {
+                    "未启用".into()
+                } else {
+                    p.params.server_tools.join("、").into()
+                },
             ));
         }
-        if !f.inputs.is_empty() {
-            body = body.child(list);
-        }
-        if let Some((p, inputs)) = f.current() {
-            body = body.child(self.render_profile_editor(p, inputs, window, cx));
-        }
-        section("服务商", "加端点、改 Key；所有来源的模型都能在输入框直接挑", Some(add), body)
+        summary
     }
 
-    /// 选中那套档案的表单：名称、协议、端点、Key、默认模型。
-    /// 挑模型 / 获取列表在「模型来源」下面的模型清单里，这里只留手填入口。
+    /// 资料卡的编辑表单；默认模型与思考强度在「模型」页设置。
     fn render_profile_editor(
         &self,
         p: &ProviderProfile,
@@ -2935,82 +3421,35 @@ impl ChatApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let model_row = Self::text_input(&inputs.model);
-        let model_hint: Option<SharedString> = Some("在「模型清单」里点选，或直接填名字".into());
-        let mut endpoint = div().v_flex().gap_1p5().child(Self::text_input(&inputs.base_url));
-        if antigravity_gateway().is_some() {
-            endpoint = endpoint.child(
-                div()
-                    .v_flex()
-                    .gap_0p5()
-                    .child(
-                        div().h_flex().child(
-                            Self::quiet_button(
-                                "import-antigravity",
-                                IconAll::Download,
-                                Surface::Paper,
-                                cx,
-                            )
-                            .xsmall()
-                            .label("从 Antigravity Tools 导入端点和 Key")
-                            .px_2()
-                            .ml(rems(-0.5))
-                            .on_click(cx.listener(
-                                |this, _, window, cx| this.import_antigravity(window, cx),
-                            )),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .text_size(TEXT_META)
-                            .text_color(rgb(INK_SOFT))
-                            .child(ANTIGRAVITY_RISK),
-                    ),
-            );
-        }
         div()
             .v_flex()
-            .gap_4()
-            .pt_2()
-            .child(form_field("名称", None, Self::text_input(&inputs.name)))
+            .gap_2p5()
+            .child(form_field("名称", Self::text_input(&inputs.name)))
             .child(form_field(
                 "协议",
-                Some("大多数服务选 OpenAI 兼容；Anthropic 官方端点选原生；OpenAI 的 Responses API 选 Responses".into()),
-                div().h_flex().child(seg_control(
-                    "protocol",
-                    [
-                        (Protocol::OpenAiCompat, "OpenAI 兼容"),
-                        (Protocol::Anthropic, "Anthropic 原生"),
-                        (Protocol::Responses, "Responses"),
-                    ],
-                    p.protocol,
-                    |this, protocol, _, cx| this.set_form_protocol(protocol, cx),
-                    cx,
+                div().h_flex().child(menu_popover(
+                    "profile-protocol-menu",
+                    Anchor::BottomLeft,
+                    rems(15.),
+                    &cx.entity(),
+                    &self.menu_focus,
+                    MenuChip::new(IconAll::Server, p.protocol.label()).filled(),
+                    protocol_menu_items,
                 )),
             ))
-            .child(form_field(
-                "端点地址",
-                Some("不带 /chat/completions 或 /messages".into()),
-                endpoint,
-            ))
+            .child(form_field("端点地址", Self::text_input(&inputs.base_url)))
             .child(form_field(
                 "API Key",
-                None,
                 div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).px_1().child(
                     Input::new(&inputs.api_key).appearance(false).bordered(false).mask_toggle(),
                 ),
             ))
-            .child(form_field("模型", model_hint, model_row))
-            // 档位按模型输入框**现在**的字（`p.model` 要保存时才收进来），换模型这一排跟着变
-            .child(self.render_thinking_row(p, &value(&inputs.model, cx), cx))
-            .when(p.protocol == Protocol::Anthropic, |d| {
-                d.child(self.render_server_tools(p, cx))
-            })
+            .when(p.protocol == Protocol::Anthropic, |d| d.child(self.render_server_tools(p, cx)))
     }
 
-    /// 「思考强度」：档位一排（`seg_control`），三种协议下都显示。
+    /// 「思考强度」：紧凑下拉，只编辑全局默认模型所属的档案。
     ///
-    /// 能选哪些档跟着模型输入框的**当前值**现算（不额外存 Entity、不用同步代码），
+    /// 能选哪些档跟着选中的全局默认模型现算，
     /// 所以换模型之后这一排跟着变；存在档案里的档位如果新模型不支持，高亮和保存都按
     /// `ThinkingSpec::resolve` 降级后的那一档。
     ///
@@ -3021,52 +3460,25 @@ impl ChatApp {
         // 档位按模型现算：各家能选的档差了不止一点（DeepSeek 没有中档、GLM-5.3 关不掉、
         // Gemini 3 Pro 只有低/高），所以选项一律来自 `spec.choices()`，不手写固定列表
         let spec = claudesktop_builtin::thinking_spec(p.protocol, model);
-        let known = spec.is_known();
         let current = p.params.thinking;
         let options = thinking_options(&spec);
         let active = active_thinking(&spec, current);
-        // 认不出的模型：这一档旁边的说明短一点（整段解释在 ⓘ 里，别把行撑长）
-        let hint = if !known {
-            if current == Some(ThinkingLevel::Default) {
-                Some("按通用的 effort 字段发".to_string())
-            } else {
-                Some("还不知道这个模型认不认，选「兜底」试试".to_string())
-            }
-        } else if p.protocol == Protocol::Anthropic && spec.format.budget {
-            // 旧格式（预算）在当前档旁边标一句预算，其余协议不标（那边的档位不是预算翻出来的）
-            active
-                .filter(|l| !l.is_off())
-                .map(|l| format!("当前约 {} token", claudesktop_builtin::thinking_budget_for(l)))
-        } else {
-            None
-        };
-        let control = div().h_flex().items_center().gap_3().child(seg_control(
-            "thinking",
-            options,
-            active,
-            |this, level: Option<ThinkingLevel>, _, cx| {
-                if let Some(profile) = this.settings_form.profiles.get_mut(this.settings_form.view)
-                {
-                    profile.params.thinking = level;
-                    this.settings_form.message = None;
-                }
-                cx.notify();
-            },
-            cx,
-        ));
-        let control = match hint {
-            Some(hint) => {
-                control.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_FAINT)).child(hint))
-            }
-            None => control,
-        };
-        let mut field_hint: SharedString = "让模型回答前先想多久，越高越慢、越贵".into();
-        if !known {
-            field_hint = "没确认过的模型只有「兜底」可用：按通用的 effort 字段发，从「低」起；\
-                 选别的档位就不发，而不是猜一个。端点不认这个字段时一般直接忽略，不会报错"
-                .into();
-        }
-        form_field("思考强度", Some(field_hint), control)
+        let label = options
+            .iter()
+            .find(|(level, _)| *level == active)
+            .map_or("默认", |(_, label)| *label);
+        form_field(
+            "思考强度",
+            div().h_flex().child(menu_popover(
+                "settings-thinking-menu",
+                Anchor::BottomLeft,
+                rems(12.),
+                &cx.entity(),
+                &self.menu_focus,
+                MenuChip::new(IconAll::Brain, label).filled(),
+                settings_thinking_menu_items,
+            )),
+        )
     }
 
     /// 服务端工具：一排开关（沙色面板里的行，和 MCP / 插件那两页一个样式）。
@@ -3119,44 +3531,60 @@ impl ChatApp {
                     ),
             );
         }
-        div().v_flex().gap_4().child(form_field(
-            "服务端工具",
-            Some("在 Anthropic 服务器上执行，按次计费".into()),
-            tools,
-        ))
+        div().v_flex().gap_4().child(form_field("服务端工具", tools))
     }
-    /// 「内核」「模型」底部固定的保存栏：左边状态 / 提示，右边取消和保存。
-    fn render_save_bar(&self, cx: &mut Context<Self>) -> Div {
+    fn select_settings_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_form.tab == tab {
+            return;
+        }
+        if self.settings_form.tab == super::project_view::PROJECT_TAB {
+            self.apply_project(cx);
+        }
+        self.settings_form.tab = tab;
+        self.settings_wheel = None;
+        self.model_wheel = None;
+        self.settings_scroll.set_offset(point(px(0.), px(0.)));
+        self.settings_form.model_scroll.set_offset(point(px(0.), px(0.)));
+        self.settings_form.message = None;
+        self.settings_form.hovered_action = None;
+        if tab == KERNEL_TAB && matches!(self.settings_form.agent_detect, AgentDetect::Idle) {
+            self.detect_agents(cx);
+        }
+        if tab == super::memory_view::MEMORY_TAB {
+            self.reload_memory_view();
+        }
+        if tab == super::project_view::PROJECT_TAB {
+            self.reload_project_view(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_save_actions(&self, compact: bool, cx: &mut Context<Self>) -> Div {
         let dirty = self.form_dirty(cx);
-        let status = match &self.settings_form.message {
-            Some((error, text)) => {
-                div().text_color(rgb(if *error { RED } else { GREEN })).child(text.clone())
-            }
-            None if dirty => div().text_color(rgb(INK)).child("有未保存的改动"),
-            None => div().text_color(rgb(INK_SOFT)).child("点「保存并应用」后生效"),
-        };
         div()
             .h_flex()
             .items_center()
+            .justify_end()
             .gap_2()
-            .flex_none()
-            .px_8()
-            .py_3()
-            .border_t_1()
-            .border_color(rgb(LINE))
-            .child(div().flex_1().min_w_0().text_size(TEXT_SMALL).child(status))
-            .child(Self::text_button("settings-cancel", "取消", false).on_click(cx.listener(
-                |this, _, _, cx| {
-                    this.settings_open = false;
-                    cx.notify();
-                },
-            )))
-            .child(
-                Self::text_button("settings-save", "保存并应用", true)
-                    .disabled(!dirty)
-                    .tooltip("只重启配置变了的内核；它上面进行中的对话会中断，下次发消息时自动续接")
-                    .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-            )
+            .when(!compact && dirty, |d| d.min_w(rems(13.)))
+            .h(rems(2.))
+            .when(dirty, |d| {
+                d.child(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child("未保存"))
+                    .child(
+                        Self::text_button("settings-discard", "撤销更改", false).small().on_click(
+                            cx.listener(|this, _, window, cx| {
+                                let tab = this.settings_form.tab;
+                                this.open_settings_at(tab, window, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        Self::text_button("settings-save", "保存", true)
+                            .small()
+                            .tooltip("保存内核、服务商和模型的全部改动")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+                    )
+            })
     }
 
     pub(super) fn render_settings(
@@ -3169,8 +3597,33 @@ impl ChatApp {
         if f.tab == super::usage_view::USAGE_TAB {
             return self.render_usage_page(cx);
         }
+        let compact_navigation =
+            window.viewport_size().width < rems(37.).to_pixels(window.rem_size());
         // 左侧分类导航
-        let mut nav = div().v_flex().w(SETTINGS_NAV_W).flex_none().px_3().gap_0p5();
+        let mut nav = div()
+            .id("settings-navigation")
+            .v_flex()
+            .w(SETTINGS_NAV_W)
+            .h_full()
+            .flex_none()
+            .px_2()
+            .py_3()
+            .gap_0p5()
+            .bg(rgb(SAND))
+            .overflow_y_scroll()
+            .child(
+                Self::quiet_button("settings-back", IconAll::ArrowLeft, Surface::Sand, cx)
+                    .small()
+                    .label("返回对话")
+                    .mb_4()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.settings_form.tab == super::project_view::PROJECT_TAB {
+                            this.apply_project(cx);
+                        }
+                        this.settings_open = false;
+                        cx.notify();
+                    })),
+            );
         for (i, (icon, label)) in SETTINGS_TABS.into_iter().enumerate() {
             if i == super::usage_view::USAGE_TAB {
                 continue;
@@ -3180,10 +3633,11 @@ impl ChatApp {
                 div()
                     .id(("settings-tab", i))
                     .h_flex()
+                    .flex_none()
                     .items_center()
                     .gap_2p5()
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .rounded_lg()
                     .cursor_pointer()
                     .text_size(TEXT_BODY)
@@ -3191,134 +3645,188 @@ impl ChatApp {
                     .when(active, |d| d.bg(rgb(SELECTED)))
                     .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER))))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.settings_form.tab != i {
-                            // 离开「项目」时把还在输入框里的改动写掉：点分类不一定让输入框失焦，
-                            // 回来时会重读文件
-                            if this.settings_form.tab == super::project_view::PROJECT_TAB {
-                                this.apply_project(cx);
-                            }
-                            this.settings_form.tab = i;
-                            this.settings_form.message = None;
-                            // 探活挂在这里：设置已开着时切分类不走
-                            // `open_settings_at`，不补这趟就一直停在「正在检测…」
-                            if i == KERNEL_TAB
-                                && matches!(this.settings_form.agent_detect, AgentDetect::Idle)
-                            {
-                                this.detect_agents(cx);
-                            }
-                            if matches!(i, KERNEL_TAB | MODEL_TAB)
-                                && this.settings_form.magpie.downloading.is_none()
-                                && !this.settings_form.magpie.starting
-                            {
-                                this.probe_magpie(cx);
-                            }
-                            // 「记忆」每次进来都重读文件（内核 / 手改都可能动过它）
-                            if i == super::memory_view::MEMORY_TAB {
-                                this.reload_memory_view();
-                            }
-                            // 「项目」同理：重读项目根的配置文件
-                            if i == super::project_view::PROJECT_TAB {
-                                this.reload_project_view(window, cx);
-                            }
-                            cx.notify();
-                        }
+                        this.select_settings_tab(i, window, cx);
                     }))
                     .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
                     .child(label),
             );
         }
-        let save_bar_tab = matches!(f.tab, KERNEL_TAB | MODEL_TAB);
+        let save_bar_tab = matches!(f.tab, KERNEL_TAB | PROVIDER_TAB | MODEL_TAB);
         // 内容列定宽，滚动时不用每帧把整页来回排好几遍（见 `MeasuredWidth`）
         let content_w = f.content_w.get();
         let width_probe = f.content_w.probe();
         let tab_content: Div = match f.tab {
             super::project_view::PROJECT_TAB => self.render_project(cx),
             KERNEL_TAB => self.render_kernel_tab(window, cx),
+            PROVIDER_TAB => self.render_provider_tab(window, cx),
             MODEL_TAB => self.render_model_tab(window, cx),
-            4 => self.render_rules(cx),
-            5 => self.render_mcp(window, cx),
+            5 => self.render_rules(cx),
+            6 => self.render_mcp(window, cx),
             PLUGINS_TAB => self.render_plugins(cx),
             super::memory_view::MEMORY_TAB => self.render_memory(window, cx),
             _ => self.render_general(cx),
         };
+        let app = cx.entity().downgrade();
+        let line = rems(1.25).to_pixels(window.rem_size());
+        let wheel = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |_, hitbox, window, _| {
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                    if !phase.capture() || !hitbox.should_handle_scroll(window) {
+                        return;
+                    }
+                    let dy = event.delta.pixel_delta(line).y;
+                    if dy == px(0.) {
+                        return;
+                    }
+                    let precise = event.delta.precise()
+                        || std::env::var_os("CLAUDESKTOP_WHEEL").is_some_and(|v| v == "direct");
+                    app.update(cx, |this, cx| {
+                        this.settings_wheel_by(-dy, precise, event.position, cx)
+                    })
+                    .ok();
+                    cx.stop_propagation();
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
 
+        let title = SETTINGS_TABS.get(f.tab).map_or("通用", |(_, title)| *title);
+        let header = div()
+            .h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .min_h(rems(3.))
+            .pb_3()
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_1()
+                    .min_w(rems(4.))
+                    .when(compact_navigation, |d| {
+                        d.child(
+                            Self::quiet_button(
+                                "settings-back-compact",
+                                IconAll::ArrowLeft,
+                                Surface::Paper,
+                                cx,
+                            )
+                            .small()
+                            .tooltip("返回对话")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.settings_form.tab == super::project_view::PROJECT_TAB {
+                                    this.apply_project(cx);
+                                }
+                                this.settings_open = false;
+                                cx.notify();
+                            })),
+                        )
+                        .child(menu_popover(
+                            "settings-category-menu",
+                            Anchor::BottomLeft,
+                            rems(12.),
+                            &cx.entity(),
+                            &self.menu_focus,
+                            MenuChip::new(SETTINGS_TABS[f.tab].0, title).filled(),
+                            settings_tab_menu_items,
+                        ))
+                    })
+                    .when(!compact_navigation, |d| {
+                        d.child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(TEXT_HEADING)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title),
+                        )
+                    }),
+            )
+            .when(f.tab == KERNEL_TAB, |d| {
+                let refreshing = self.kernel_status_busy();
+                d.child(
+                    Self::quiet_button(
+                        "kernel-status-refresh",
+                        IconAll::RefreshCw,
+                        Surface::Paper,
+                        cx,
+                    )
+                    .small()
+                    .label(if refreshing { "刷新中" } else { "刷新" })
+                    .disabled(refreshing)
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_kernel_status(cx))),
+                )
+            })
+            .when(f.tab == PROVIDER_TAB, |d| {
+                d.child(menu_popover(
+                    "profile-add-menu",
+                    Anchor::TopRight,
+                    rems(20.),
+                    &cx.entity(),
+                    &self.menu_focus,
+                    MenuChip::new(IconAll::Plus, "添加").filled(),
+                    add_profile_menu_items,
+                ))
+            })
+            .when(save_bar_tab, |d| d.child(self.render_save_actions(compact_navigation, cx)));
+        let model_page = f.tab == MODEL_TAB;
+        let content = div()
+            .v_flex()
+            .px_6()
+            .pt_1()
+            .pb_4()
+            .when(model_page, |d| d.h_full().min_h(rems(18.)))
+            .when_some(content_w, |d, w| d.w(w))
+            .child(tab_content);
         div()
             .id("settings")
-            // 焦点锚：设置页里点空白处也留在 ChatApp 键上下文里（Esc 关设置页）
             .track_focus(&self.settings_focus)
             .flex_1()
             .min_h_0()
-            .v_flex()
+            .h_flex()
+            .when(!compact_navigation, |d| d.child(nav))
             .child(
                 div()
                     .v_flex()
                     .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .max_w(settings_page_w())
+                    .min_w_0()
+                    .max_w(FORM_W)
+                    .h_full()
                     .mx_auto()
-                    // 标题行：「设置」与导航项文字左对齐，关闭按钮在右
+                    .pt_3()
+                    .child(div().px_6().child(header))
+                    .when_some(f.message.as_ref(), |d, (error, text)| {
+                        d.child(
+                            div()
+                                .px_6()
+                                .pb_3()
+                                .text_size(TEXT_SMALL)
+                                .text_color(rgb(if *error { RED } else { GREEN }))
+                                .child(text.clone()),
+                        )
+                    })
                     .child(
                         div()
-                            .h_flex()
-                            .items_center()
-                            .flex_none()
-                            .px_6()
-                            .pt_6()
-                            .pb_4()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .text_size(TEXT_HEADING)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(INK))
-                                    .child("设置"),
+                                    .id("settings-scroll")
+                                    .track_scroll(&self.settings_scroll)
+                                    .h_full()
+                                    .overflow_y_scroll()
+                                    .child(content),
                             )
+                            .child(wheel)
+                            .child(width_probe)
                             .child(
-                                Self::quiet_button(
-                                    "settings-close",
-                                    IconAll::X,
-                                    Surface::Paper,
-                                    cx,
-                                )
-                                .tooltip("关闭设置")
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.settings_open = false;
-                                        cx.notify();
-                                    },
-                                )),
+                                Scrollbar::vertical(&self.settings_scroll)
+                                    .mode(ScrollbarMode::Always),
                             ),
-                    )
-                    // 导航固定，只滚右侧内容；「内核」「模型」的保存栏固定在右侧底部
-                    .child(
-                        div().flex().flex_1().min_h_0().child(nav).child(
-                            div()
-                                .v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .relative()
-                                .child(
-                                    div()
-                                        .id("settings-scroll")
-                                        .track_scroll(&self.settings_scroll)
-                                        .flex_1()
-                                        .min_h_0()
-                                        .overflow_y_scroll()
-                                        // pt_1：分区标题与导航第一项的文字对齐
-                                        .child(
-                                            div()
-                                                .v_flex()
-                                                .px_8()
-                                                .pt_1()
-                                                .pb_10()
-                                                .when_some(content_w, |d, w| d.w(w))
-                                                .child(tab_content),
-                                        ),
-                                )
-                                .child(width_probe)
-                                .when(save_bar_tab, |d| d.child(self.render_save_bar(cx))),
-                        ),
                     ),
             )
     }
@@ -3336,10 +3844,6 @@ enum Fetch {
     /// 保存后测一下连不连得上：成功、失败都弹提示
     Verify,
 }
-
-/// Antigravity Tools 借用 Antigravity 账号的登录，Google 2026-02 起按违反条款封过这样用的账号。
-const ANTIGRAVITY_RISK: &str =
-    "风险：它借用你 Antigravity 账号的登录调用模型，Google 封过这样用的账号";
 
 /// 思考强度能选的项（设置页那一排和输入框的下拉共用）：「默认」= 不发字段，排在「关」前面；
 /// 然后是这个模型的档位；认不出的模型只有「默认 / 兜底」（兜底见 `FALLBACK_LEVELS`）。
@@ -3406,6 +3910,202 @@ fn magpie_net_hint(err: &anyhow::Error) -> String {
     }
 }
 
+fn profile_title(p: &ProviderProfile, name: &str, base_url: &str) -> SharedString {
+    if p.magpie {
+        "magpie 网关".into()
+    } else if !name.trim().is_empty() {
+        name.into()
+    } else {
+        let host = host_of(base_url);
+        if host.is_empty() { "自定义服务商".into() } else { host.into() }
+    }
+}
+
+fn model_options<'a>(
+    profiles: &'a [ProviderProfile],
+    source: Option<usize>,
+    query: &str,
+) -> Vec<(usize, &'a str)> {
+    let query = query.trim().to_lowercase();
+    let mut options = Vec::new();
+    for (i, profile) in profiles.iter().enumerate() {
+        if source.is_some_and(|source| source != i) {
+            continue;
+        }
+        for model in profile.model_choices() {
+            if query.is_empty() || model.to_lowercase().contains(&query) {
+                options.push((i, model));
+            }
+        }
+    }
+    options
+}
+
+fn default_model_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let f = &app.settings_form;
+    let options = model_options(&f.profiles, None, &f.model_menu_query);
+    let mut menu = MenuList::new("default-model-list", handle, popover)
+        .without_shortcuts()
+        .scroll_with_bar(rems(20.))
+        .header(ChatApp::text_input(&f.model_menu_search));
+    for (row, &(i, model)) in options.iter().enumerate() {
+        let p = &f.profiles[i];
+        if row == 0 || options[row - 1].0 != i {
+            menu = menu.child(
+                div()
+                    .px_2p5()
+                    .pt_2()
+                    .pb_0p5()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child(profile_title(p, &p.name, &p.base_url)),
+            );
+        }
+        let picked = model.to_string();
+        menu = menu.pick_in(
+            menu_text_item(
+                ("default-model", row),
+                picked.clone(),
+                i == f.active && model == p.model.trim(),
+            ),
+            move |this, window, cx| this.select_form_model(i, picked.clone(), window, cx),
+        );
+    }
+    if options.is_empty() {
+        menu = menu.child(
+            div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
+                if f.model_menu_query.trim().is_empty() {
+                    "先获取模型列表，或在清单中输入模型名"
+                } else {
+                    "没有匹配的模型"
+                },
+            ),
+        );
+    }
+    menu
+}
+
+fn profile_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let f = &app.settings_form;
+    let mut menu = MenuList::new("model-provider-list", handle, popover).without_shortcuts().pick(
+        menu_text_item("all-model-sources", "全部来源", f.model_source.is_none()),
+        |this, cx| this.select_model_source(None, cx),
+    );
+    let mut order: Vec<usize> = (0..f.profiles.len()).collect();
+    order.sort_by_key(|&i| (!f.profiles[i].magpie, i));
+    for i in order {
+        let p = &f.profiles[i];
+        menu = menu.child(div().mx_2p5().h(px(1.)).bg(rgb(LINE)).flex_shrink_0()).pick(
+            menu_text_item(
+                ("model-provider", i),
+                profile_title(p, &p.name, &p.base_url),
+                f.model_source == Some(i),
+            ),
+            move |this, cx| this.select_model_source(Some(i), cx),
+        );
+    }
+    menu
+}
+
+fn settings_thinking_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let f = &app.settings_form;
+    let mut menu = MenuList::new("settings-thinking-list", handle, popover).without_shortcuts();
+    if let Some(p) = f.profiles.get(f.active) {
+        let spec = claudesktop_builtin::thinking_spec(p.protocol, &p.model);
+        let current = active_thinking(&spec, p.params.thinking);
+        for (i, (level, label)) in thinking_options(&spec).into_iter().enumerate() {
+            menu = menu.pick(
+                menu_text_item(("settings-thinking", i), label, current == level),
+                move |this, cx| {
+                    this.set_form_thinking(level, cx);
+                },
+            );
+        }
+    }
+    menu
+}
+
+fn kernel_logo(id: &str) -> Icon {
+    crate::assets::kernel_logo_path(id)
+        .map(|path| Icon::empty().path(path))
+        .unwrap_or_else(|| Icon::new(IconAll::SquareTerminal))
+}
+
+fn settings_tab_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let mut menu = MenuList::new("settings-category-list", handle, popover).without_shortcuts();
+    for (i, (_, title)) in SETTINGS_TABS.into_iter().enumerate() {
+        if i == super::usage_view::USAGE_TAB {
+            continue;
+        }
+        menu = menu.pick_in(
+            menu_text_item(("settings-category", i), title, app.settings_form.tab == i),
+            move |this, window, cx| this.select_settings_tab(i, window, cx),
+        );
+    }
+    menu
+}
+
+fn protocol_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let current = app.settings_form.current().map(|(p, _)| p.protocol);
+    let mut menu = MenuList::new("profile-protocol-list", handle, popover).without_shortcuts();
+    for (i, protocol) in
+        [Protocol::OpenAiCompat, Protocol::Anthropic, Protocol::Responses].into_iter().enumerate()
+    {
+        menu = menu.pick(
+            menu_text_item(("profile-protocol", i), protocol.label(), current == Some(protocol)),
+            move |this, cx| this.set_form_protocol(protocol, cx),
+        );
+    }
+    menu
+}
+
+#[cfg(test)]
+mod model_management_tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn management_keeps_hidden_and_manual_models_separate_by_source() {
+        let profiles = vec![
+            ProviderProfile {
+                model: "manual".into(),
+                models: vec!["shared".into(), "GPT-5".into()],
+                menu_hidden: vec!["shared".into()],
+                ..Default::default()
+            },
+            ProviderProfile {
+                model: "shared".into(),
+                models: vec!["shared".into()],
+                ..Default::default()
+            },
+        ];
+        assert_eq!(model_options(&profiles, None, "shared"), vec![(0, "shared"), (1, "shared")]);
+        assert_eq!(model_options(&profiles, Some(0), "manual"), vec![(0, "manual")]);
+        assert_eq!(model_options(&profiles, Some(1), "manual"), Vec::<(usize, &str)>::new());
+        assert_eq!(model_options(&profiles, None, " gPt "), vec![(0, "GPT-5")]);
+        assert_eq!(model_options(&profiles, None, "").len(), 4);
+    }
+}
+
 /// 「添加」菜单：常用服务预设 + 自定义。
 fn add_profile_menu_items(
     _: &ChatApp,
@@ -3437,7 +4137,6 @@ fn add_profile_menu_items(
     )
 }
 
-/// 「N 个可选」菜单：获取到的模型列表，点了填进模型输入框。
 /// 规则 → 给人看的说明
 fn rule_label(rule: &str) -> String {
     // 拒绝规则带一层前缀：剥掉后复用允许规则的文案，再改「总是拒绝」的说法

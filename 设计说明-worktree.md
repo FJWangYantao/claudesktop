@@ -4,7 +4,7 @@
 > 代码落点：`crates/core/src/git.rs`（git 调用 + worktree 增删查）、`project.rs`（认 worktree 根的 `.git` 文件、`shared_root`、
 > `worktree` 一栏的读取与复制规则）、`store.rs`（`SessionMeta::worktree`）、`apps/desktop/src/app/worktree.rs`（建 / 删 / 状态 / 分支 chip 与菜单）、
 > `app/worktree_setup.rs`（建好之后复制未跟踪文件、跑初始化命令）、`app/project_view.rs`（设置页「项目」里的 `worktree` 一栏）、
-> `mod.rs`（建会话、排队发送、目录丢失重接）、`composer.rs`（目录菜单）、`sidebar.rs`（分组、行标记、归档 / 删除时清理）、
+> `mod.rs`（建会话、排队发送、目录丢失重接）、`sidebar.rs`（项目菜单、分组、行标记、归档 / 删除时清理）、
 > `chrome.rs`（顶栏 chip）、`status.rs`（准备中的提示）。
 
 ## 一、要解决什么
@@ -93,8 +93,8 @@ pub struct WorktreeMeta {
 
 ## 六、生命周期
 
-1. **新建**：输入框上方目录菜单，当前目录是 git 仓库时多一项「在新 worktree 中开始」（`GitBranch` 图标）。
-   点了在后台线程建 worktree（大仓库检出要几秒），目录 chip 显示转圈和「正在准备 worktree…」，
+1. **新建**：侧栏「项目」菜单，当前目录是 git 仓库时多一项「新建 worktree」（`GitBranch` 图标）。
+   点了在后台线程建 worktree（大仓库检出要几秒），输入框上方的状态行显示「正在准备 worktree…」，
    输入框照常可写，期间发的消息排进 `Session::queued`，建好了再发。建失败（没装 git、磁盘满、分支名冲突）用 toast 说原因，会话留在原目录。
    命令面板加「在新 worktree 中新建对话」。
 2. **跑**：和普通会话没有区别。`cwd` 是 worktree 目录，「工作目录内的编辑不进分类器」、检查点、逐块审查都按它算；

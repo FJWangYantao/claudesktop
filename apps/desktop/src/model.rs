@@ -647,6 +647,103 @@ impl ChatItem {
         }
     }
 
+    /// 这一行显示数据占的堆字节（估算）：字符串按字节长度，容器加每元素的头，
+    /// 不含 `SharedString` / `Arc` 的共享与容量富余。给「测量计数」
+    /// （`Session::retained_bytes`，`CLAUDESKTOP_MEM_REPORT`）量趋势用；
+    /// 精确对账看 memwatch 的私有提交。
+    pub fn heap_bytes(&self) -> usize {
+        const HEAD: usize = std::mem::size_of::<String>() + 16;
+        let diff_bytes = |d: &DiffView| -> usize {
+            std::mem::size_of::<DiffView>()
+                + d.path.len()
+                + d.lines.iter().map(|l| l.text.len() + HEAD).sum::<usize>()
+        };
+        match self {
+            Self::User { text, images, files } => {
+                text.len()
+                    + images
+                        .iter()
+                        .map(|p| p.as_os_str().len() + std::mem::size_of::<std::path::PathBuf>())
+                        .sum::<usize>()
+                    + files
+                        .iter()
+                        .map(|a| a.name.len() + a.text.len() + a.path.as_os_str().len() + HEAD * 2)
+                        .sum::<usize>()
+            }
+            Self::Thinking { text, .. } | Self::Info { text, .. } | Self::Agent(text) => {
+                text.len() + 64
+            }
+            Self::Tool(c) => {
+                std::mem::size_of::<ToolCard>()
+                    + c.id.as_deref().map_or(0, str::len)
+                    + c.kind.len()
+                    + c.name.len()
+                    + c.arg.len()
+                    + c.result.len()
+                    + c.output.len()
+                    + c.diffs.iter().map(diff_bytes).sum::<usize>()
+                    + c.images.iter().map(|i| i.bytes.len()).sum::<usize>()
+                    + 16
+            }
+            Self::AutoApproved { title, chosen } => title.len() + chosen.len(),
+            Self::Permission { title, options, resolved, hunks, keep, .. } => {
+                title.len()
+                    + options
+                        .iter()
+                        .map(|o| o.id.len() + o.name.len() + o.kind.len() + HEAD * 3)
+                        .sum::<usize>()
+                    + resolved.as_ref().map_or(0, |r: &gpui_kit::SharedString| r.as_ref().len())
+                    + hunks
+                        .as_ref()
+                        .map(|h| {
+                            h.files
+                                .iter()
+                                .map(|f| {
+                                    f.path.len()
+                                        + f.hunks
+                                            .iter()
+                                            .flat_map(|h| &h.lines)
+                                            .map(|l| l.text.len() + HEAD)
+                                            .sum::<usize>()
+                                })
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0)
+                    + keep.as_ref().map_or(0, |k| k.len() * 4)
+                    + 96
+            }
+            Self::Question { questions, answer, .. } => {
+                questions
+                    .iter()
+                    .map(|q| {
+                        q.question.len()
+                            + q.header.as_deref().map_or(0, str::len)
+                            + q.options
+                                .iter()
+                                .map(|o| {
+                                    o.label.len() + o.description.as_deref().map_or(0, str::len) + HEAD
+                                })
+                                .sum::<usize>()
+                            + HEAD * 2
+                    })
+                    .sum::<usize>()
+                    + answer.is_some() as usize * 64
+                    + 96
+            }
+            Self::Plan(rows) => {
+                rows.iter().map(|r| r.text.len() + HEAD).sum::<usize>()
+            }
+            Self::Note(t) | Self::Failed { message: t, .. } => t.len() + 64,
+            Self::Compaction { state, .. } => {
+                let text = match state {
+                    CompactState::Done(s) | CompactState::Failed(s) => s.len(),
+                    CompactState::Running => 0,
+                };
+                text + 64
+            }
+        }
+    }
+
     /// 影响这一行渲染高度的内容摘要（虚拟列表据此判断要不要重新测量）。
     /// 内容只会追加或切换状态，所以长度 + 状态位就够了。
     pub fn fingerprint(&self) -> u64 {
@@ -726,7 +823,7 @@ pub struct StatCard {
 }
 
 /// 权限模式（对应官方桌面版的 Manual / Accept edits / Plan / Auto）：(名称, 说明, 图标, ACP mode id)。
-/// 「自动」不在这张静态表里：要连上内核、并在「设置 · 内核」里配好之后才出现。
+/// 未连接的 ACP 会话先用这张静态表；自研内核按当前设置使用完整模式列表。
 pub const PERMISSION_MODES: [(&str, &str, IconAll, &str); 3] = [
     ("逐项确认", "每次编辑和命令都先询问", IconAll::ShieldCheck, "default"),
     ("自动接受编辑", "自动接受文件编辑，命令仍询问", IconAll::SquarePen, "acceptEdits"),

@@ -582,6 +582,19 @@ impl WindowsWindow {
             }
             unsafe { SetWindowPlacement(hwnd, &placement)? };
         } else {
+            // claudesktop patch：隐藏窗口也先应用尺寸，禁止激活和调整窗口层级。
+            let bounds = placement.rcNormalPosition;
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    bounds.left,
+                    bounds.top,
+                    bounds.right - bounds.left,
+                    bounds.bottom - bounds.top,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                )?;
+            }
             this.state.initial_placement.set(Some(WindowOpenStatus {
                 placement,
                 state: WindowOpenState::Windowed,

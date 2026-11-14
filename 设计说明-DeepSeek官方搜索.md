@@ -107,17 +107,17 @@ fn deepseek(query: &str, key: &str) -> Result<Vec<Hit>, String> { … }
 ```
 网页搜索
   当前：DeepSeek → Brave → DuckDuckGo（Brave 没配 key，会跳过它）
-  先用哪个 ⓘ        [ DeepSeek | Brave | DuckDuckGo ]   ← seg_control
-  也允许 Brave ⓘ                                 [开关]
-  也允许 DuckDuckGo ⓘ                            [开关]
-  Brave API key ⓘ    [ 输入框 ] [保存]
-  DeepSeek key ⓘ     [ 输入框 ] [保存]   ← 留空就用「服务商」里 DeepSeek 那份的 key
+  先用哪个           [ DeepSeek | Brave | DuckDuckGo ]   ← seg_control
+  也允许 Brave                                    [开关]
+  也允许 DuckDuckGo                               [开关]
+  Brave API key      [ 输入框 ] [保存]
+  DeepSeek key       [ 输入框 ] [保存]   ← 留空就用「服务商」里 DeepSeek 那份的 key
 ```
 
 - 「顺序可拖」对设置页来说太重：**「先用哪个」一个分段切换 + 三个开关「也允许 …」**（选了先用哪个，它的开关一起打开），
   允许的后端按固定顺序 `DeepSeek → Brave → DuckDuckGo` 排（`SearchConfig::order`）。默认 Brave + DuckDuckGo。
 - DeepSeek key 那一行**不显示 provider 里的 key 内容**，只说「留空就用「服务商」里 DeepSeek 那份的 key」。
-- 每项说明收进 ⓘ（`setting_row` 已经这样做），页面上不铺灰字。
+- 设置项只留名称和控件，不挂说明图标，也不铺固定灰字。
 - 状态行：`当前：Brave → DuckDuckGo`，缺 key 的后端后面补一句「（Brave 没配 key，会跳过它）」；
   一个都不允许时红字「所有后端都不可用，web_search 会直接报错」。
   **不做「测试」按钮**（要多一个异步请求、要处理窗口生命周期）；状态按「配置是否齐全」算，不联网验。

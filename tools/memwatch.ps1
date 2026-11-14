@@ -2,10 +2,15 @@
 #
 #   powershell -NoProfile -File tools\memwatch.ps1
 #   powershell -NoProfile -File tools\memwatch.ps1 -Name claudesktop -Interval 2 -Tree
+#   powershell -NoProfile -File tools\memwatch.ps1 -Tree -Children -Mark 压测前
 #
 # 没在跑就一直等，跑起来自动开始记，进程退出后打一行汇总再退出。
 # 单位统一 MB；WS = 工作集（任务管理器里那列），PB = 私有提交（更接近真实占用），
 # 峰值取系统记的 PeakWorkingSet64（进程自己报的历史最高）。
+# -Tree：连同子进程（内核 / MCP 服务器 / acp agent）一起算，树 WS 和树 PB 都记
+#   （树 WS 把共享页重复计入，别当精确物理占用；对账用树 PB）。
+# -Children：每次打点顺带列出子进程清单（名字 PID WS PB），看哪个 sidecar 在吃内存。
+# -Mark：把场景标记写进 CSV 的 mark 列和打点行末尾，跑对照实验时切场景换标记。
 
 # 进程名支持通配符：下载来的副本常叫 “claudesktop (6).exe”，精确名对不上。
 param(
@@ -14,6 +19,8 @@ param(
   [double]$Interval = 1,
   [string]$Out = '',
   [switch]$Tree,          # 连同子进程（内核 / MCP 服务器 / acp agent）一起算
+  [switch]$Children,      # 每次打点列出子进程清单（配合 -Tree）
+  [string]$Mark = '',     # 场景标记：写进 CSV 的 mark 列和打点行
   [int]$Quiet = 1         # 每几秒打一行；1 = 每拍都打
 )
 
@@ -34,18 +41,22 @@ function Get-Tree([int]$rootId) {
   return $ids
 }
 
-# CSV 头
+# CSV 头（旧的 9 列 CSV 列数对不上：改名留档，重记新的）
+if ((Test-Path $Out) -and -not ((Get-Content $Out -TotalCount 1) -like '*pb_tree_mb*')) {
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  Move-Item $Out "$Out.$stamp.old"
+}
 if (-not (Test-Path $Out)) {
-  'time,pid,ws_mb,pb_mb,peak_ws_mb,cpu_pct,threads,handles,ws_tree_mb' | Set-Content -Path $Out -Encoding UTF8
+  'time,pid,ws_mb,pb_mb,peak_ws_mb,cpu_pct,threads,handles,ws_tree_mb,pb_tree_mb,nproc,mark' | Set-Content -Path $Out -Encoding UTF8
 }
 
 Write-Host ''
-Write-Host "memwatch  target=$Name  interval=${Interval}s  tree=$($Tree.IsPresent)  cores=$cores" -ForegroundColor Cyan
+Write-Host "memwatch  target=$Name  interval=${Interval}s  tree=$($Tree.IsPresent)  mark=$Mark  cores=$cores" -ForegroundColor Cyan
 Write-Host "log: $Out" -ForegroundColor DarkGray
 Write-Host ''
-$fmt = '{0,-8} {1,6} {2,8} {3,8} {4,8} {5,7} {6,6} {7,7} {8,8}'
-Write-Host ($fmt -f 'time', 'pid', 'WS(MB)', 'PB(MB)', 'peak(MB)', 'cpu%', 'thr', 'hdl', 'tree(MB)') -ForegroundColor DarkGray
-Write-Host ('-' * 76) -ForegroundColor DarkGray
+$fmt = '{0,-8} {1,6} {2,8} {3,8} {4,8} {5,7} {6,6} {7,7} {8,8} {9,8} {10,5}'
+Write-Host ($fmt -f 'time', 'pid', 'WS(MB)', 'PB(MB)', 'peak(MB)', 'cpu%', 'thr', 'hdl', 'treeWS', 'treePB', 'nprc') -ForegroundColor DarkGray
+Write-Host ('-' * 88) -ForegroundColor DarkGray
 
 $started = $null
 $peak = 0.0
@@ -56,6 +67,7 @@ $lastCpu = $null
 $lastAt = $null
 $waiting = $false
 $tick = 0
+$lastKids = ''
 
 while ($true) {
   $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
@@ -90,22 +102,46 @@ while ($true) {
   $lastCpu = $p.TotalProcessorTime; $lastAt = $now
 
   $treeWs = ''
-  $treeVal = $ws
+  $treePb = ''
+  $nproc = ''
   if ($Tree) {
     $ids = Get-Tree $p.Id
-    $treeVal = 0.0
+    $wsSum = 0.0; $pbSum = 0.0
+    $kids = @()
     foreach ($id in $ids) {
       $q = Get-Process -Id $id -ErrorAction SilentlyContinue
-      if ($q) { $treeVal += (MB $q.WorkingSet64) }
+      if ($q) {
+        $wsSum += $q.WorkingSet64; $pbSum += $q.PrivateMemorySize64
+        if ($q.Id -ne $p.Id) { $kids += $q }
+      }
     }
-    $treeWs = [math]::Round($treeVal, 1)
+    $treeWs = [math]::Round($wsSum / 1MB, 1)
+    $treePb = [math]::Round($pbSum / 1MB, 1)
+    $nproc = $ids.Count
+    # 子进程清单只在成员变了（或第一次）时列一次，别刷屏
+    if ($Children) {
+      $sig = ($kids | ForEach-Object { $_.ProcessName } | Sort-Object) -join ','
+      if ($sig -ne $lastKids) {
+        $lastKids = $sig
+        if ($kids.Count -gt 0) {
+          Write-Host ("  children ({0}):" -f $kids.Count) -ForegroundColor DarkGray
+          foreach ($k in ($kids | Sort-Object -Property WorkingSet64 -Descending)) {
+            Write-Host ("    {0,-24} pid={1,-7} WS={2,7}MB  PB={3,7}MB" -f $k.ProcessName, $k.Id, (MB $k.WorkingSet64), (MB $k.PrivateMemorySize64)) -ForegroundColor DarkGray
+          }
+        } else {
+          Write-Host '  children: none' -ForegroundColor DarkGray
+        }
+      }
+    }
   }
 
   $tick++
   if ($Quiet -le 1 -or ($tick % $Quiet) -eq 0) {
-    Write-Host ($fmt -f $now.ToString('HH:mm:ss'), $p.Id, $ws, $pb, $pk, $cpu, $p.Threads.Count, $p.HandleCount, $treeWs)
+    $line = $fmt -f $now.ToString('HH:mm:ss'), $p.Id, $ws, $pb, $pk, $cpu, $p.Threads.Count, $p.HandleCount, $treeWs, $treePb, $nproc
+    if ($Mark) { $line += "  [$Mark]" }
+    Write-Host $line
   }
-  ('{0},{1},{2},{3},{4},{5},{6},{7},{8}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'), $p.Id, $ws, $pb, $pk, $cpu, $p.Threads.Count, $p.HandleCount, $treeWs) |
+  ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'), $p.Id, $ws, $pb, $pk, $cpu, $p.Threads.Count, $p.HandleCount, $treeWs, $treePb, $nproc, $Mark) |
     Add-Content -Path $Out -Encoding UTF8
 
   Start-Sleep -Milliseconds ([int]($Interval * 1000))
@@ -114,7 +150,7 @@ while ($true) {
 # 走到这里说明进程没了
 $mins = if ($started) { [math]::Round(((Get-Date) - $started).TotalMinutes, 1) } else { 0 }
 Write-Host ''
-Write-Host ('-' * 76) -ForegroundColor DarkGray
+Write-Host ('-' * 88) -ForegroundColor DarkGray
 Write-Host ("'{0}' 已退出  观察 {1} 分钟 / {2} 次采样" -f $Name, $mins, $samples) -ForegroundColor Cyan
 if ($samples -gt 0) {
   Write-Host ("峰值 WS = {0} MB   峰值 PB = {1} MB   平均 WS = {2} MB" -f $peak, $peakPb, [math]::Round($sumWs / $samples, 1)) -ForegroundColor Cyan

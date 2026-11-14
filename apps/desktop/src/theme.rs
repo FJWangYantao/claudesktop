@@ -841,7 +841,7 @@ pub const READING_W: Pixels = px(760.);
 /// 设置页内容最大宽度
 pub const FORM_W: Pixels = px(720.);
 /// 设置页左侧分类导航宽度
-pub const SETTINGS_NAV_W: Rems = rems(12.5);
+pub const SETTINGS_NAV_W: Rems = rems(11.);
 /// 首页用量概览面板宽度
 pub const OVERVIEW_W: Pixels = px(724.);
 /// 侧栏宽度（含外圈留白）
@@ -1005,7 +1005,7 @@ mod tests {
         let rem = root_font_size();
         // 放大后侧栏、导航、顶栏跟着变宽变高
         assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(200. * scale));
-        assert_eq!(as_rems(SETTINGS_NAV_W).to_pixels(rem), px(200. * scale));
+        assert_eq!(as_rems(SETTINGS_NAV_W).to_pixels(rem), px(176. * scale));
         // 阅读列是 measure：不跟字号走（一行字数的量纲不变）
         assert_eq!(READING_W, px(760.));
         assert_eq!(FORM_W, px(720.));

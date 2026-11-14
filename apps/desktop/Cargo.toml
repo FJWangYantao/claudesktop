@@ -9,8 +9,13 @@ description = "Claude-style desktop harness with swappable agent kernels (GPUI)"
 name = "claudesktop"
 path = "src/main.rs"
 
+[features]
+headless-screenshot = ["gpui-screenshot/test-support", "gpui-platform-screenshot/test-support"]
+
 [dependencies]
 gpui-kit = { workspace = true }
+gpui-screenshot = { package = "gpui-pre", version = "=0.3.9", default-features = false, optional = true }
+gpui-platform-screenshot = { package = "gpui-pre-platform", version = "=0.3.9", default-features = false, optional = true }
 claudesktop-core = { path = "../../crates/core" }
 claudesktop-builtin = { path = "../../crates/builtin" }
 futures = { workspace = true }

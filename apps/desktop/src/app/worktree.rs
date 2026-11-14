@@ -46,7 +46,7 @@ fn short_hash(path: &Path) -> String {
 }
 
 impl ChatApp {
-    /// 输入框上方的目录菜单里的「在新 worktree 中开始」：当前目录是 git 仓库时才有。
+    /// 侧栏「项目」菜单里的「新建 worktree」：当前目录是 git 仓库时才有。
     /// 后台建 worktree（大仓库检出要几秒），会话的 `cwd` 换过去，消息照常发（没建好时排队）。
     pub(crate) fn start_in_worktree(&mut self, cx: &mut Context<Self>) {
         let repo = match git::repo_root(&self.session().cwd) {

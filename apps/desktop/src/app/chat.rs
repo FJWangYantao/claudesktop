@@ -1777,8 +1777,11 @@ impl ChatApp {
         window.request_animation_frame();
     }
 
-    /// 滚轮往末尾滚了 `delta`（负 = 往开头）：只推进目标，由 [`Self::step_wheel`] 每帧滑过去，
-    /// 一格不再硬跳 60px。触控板的精确位移本来就连续，和减少动态效果时一样直接滚到位。
+    /// 滚轮往末尾滚了 `delta`（负 = 往开头）：先同步走一小段（手指一动内容就动），
+    /// 剩下的推进平滑目标、由 [`Self::step_wheel`] 每帧滑过去，一格不再硬跳 60px。
+    /// 目标最多领先当前位置 [`motion::WHEEL_MAX_LEAD`]：连滚几格时欠账有上限，
+    /// 停下来之后不会还自己滑出一大段。触控板的精确位移本来就连续，
+    /// 和减少动态效果时一样直接滚到位。
     /// 只通知内容区：滚动不影响输入区。
     pub(super) fn wheel_by(&mut self, delta: Pixels, precise: bool, cx: &mut Context<Self>) {
         self.jump = None;
@@ -1789,16 +1792,29 @@ impl ChatApp {
             s.wheel = None;
             s.list.scroll_by((top + delta).clamp(px(0.), max) - top);
         } else {
-            // 接着上一格没滑完的目标往前推；反过来滚时从当前位置算，不先把剩下那段走完
+            let instant = delta * motion::WHEEL_INSTANT;
+            s.list.scroll_by((top + instant).clamp(px(0.), max) - top);
+            let top = scroll_top(&s.list);
+            // 接着上一格没滑完的目标往前推，但目标最多领先当前位置一段；
+            // 反过来滚时从当前位置算，不先把剩下那段走完
             let base = match s.wheel {
-                Some(w) if (w.target > top) == (delta > px(0.)) => w.target,
+                Some(w) if (w.target > top) == (delta > px(0.)) => {
+                    if delta > px(0.) {
+                        w.target.min(top + motion::WHEEL_MAX_LEAD)
+                    } else {
+                        w.target.max(top - motion::WHEEL_MAX_LEAD)
+                    }
+                }
                 _ => top,
             };
             let now = Instant::now();
             // 新的一串从「上一帧」算起，第一帧就走一帧的量，不是从零起步
             let last = s.wheel.map_or(now.checked_sub(FRAME).unwrap_or(now), |w| w.last);
-            s.wheel =
-                Some(WheelScroll { target: (base + delta).clamp(px(0.), max), started: now, last });
+            s.wheel = Some(WheelScroll {
+                target: (base + delta * (1. - motion::WHEEL_INSTANT)).clamp(px(0.), max),
+                started: now,
+                last,
+            });
         }
         self.content_view.update(cx, |_, cx| cx.notify());
     }
@@ -1817,8 +1833,21 @@ impl ChatApp {
         w.last = now;
         // 期间有行重测过，可滚的范围会变：目标跟着收进去，免得够不着一直排帧
         w.target = w.target.min(s.list.max_offset_for_scrollbar().y.max(px(0.)));
-        let rest = w.target - scroll_top(&s.list);
-        let step = rest * (1. - (-dt / motion::WHEEL_TAU).exp());
+        let top = scroll_top(&s.list);
+        // 目标被行重测 / 范围变化夹远时，只追领先上限那么一小段，剩下的直接放弃：
+        // 那是夹出来的假距离不是用户滚的，全追就是「突然滚一大截」
+        let rest = w.target - top;
+        if rest.abs() > motion::WHEEL_MAX_LEAD {
+            w.target = if rest > px(0.) {
+                top + motion::WHEEL_MAX_LEAD
+            } else {
+                top - motion::WHEEL_MAX_LEAD
+            };
+        }
+        let rest = w.target - top;
+        // 每帧步长封顶：卡顿帧不许瞬移（见 WHEEL_MAX_STEP）
+        let step = (rest * (1. - (-dt / motion::WHEEL_TAU).exp()))
+            .clamp(-motion::WHEEL_MAX_STEP, motion::WHEEL_MAX_STEP);
         if (rest - step).abs() < px(0.5) {
             s.list.scroll_by(rest);
             return;

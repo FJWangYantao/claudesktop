@@ -1,10 +1,10 @@
-//! 底部输入区（上方环境 / 工作目录，多行输入 + 发送，下方一行权限模式 / 附件 / 模型）与导出、附件等动作。
+//! 底部输入区（多行输入，下方一行权限模式 / 附件 / 模型 / 发送）与导出、附件等动作。
 
+use super::ChatApp;
 use super::chrome::CHROME_H;
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::settings_view::active_thinking;
 use super::widgets::Surface;
-use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
 use crate::settings::KernelChoice;
 use crate::theme::rgb;
@@ -27,6 +27,10 @@ impl ChatApp {
     /// 「分享」：当前会话导出为 Markdown，系统保存对话框选位置。
     pub(crate) fn share_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active;
+        if !self.sessions[idx].history_loaded {
+            self.toast(Notification::warning("这段对话还在读取，稍等再导出"), cx);
+            return;
+        }
         let markdown = self.sessions[idx].to_markdown(&self.settings.acp);
         let suggested = format!("{}.md", self.sessions[idx].title);
         let dir = self.cwd.clone();
@@ -39,56 +43,6 @@ impl ChatApp {
                         Err(err) => Notification::error(format!("导出失败：{err}")),
                     };
                     app.toast(note, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// 加号按钮：选文件加进待发送附件。
-    /// 聊天会话把文本内容内联进消息（聊天没有 `read_file`）；代码会话还是把路径插进输入框，
-    /// 等 agent 自己读。
-    pub(crate) fn attach_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let chat = self.session().is_chat();
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: !chat,
-            multiple: true,
-            prompt: Some(
-                if chat {
-                    "选择要一起发过去的文件"
-                } else {
-                    "选择要交给 agent 的文件"
-                }
-                .into(),
-            ),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                if paths.is_empty() {
-                    return;
-                }
-                let _ = this.update_in(cx, |app, window, cx| {
-                    if chat {
-                        app.add_pending_files(&paths, cx);
-                        app.focus_input(window, cx);
-                        return;
-                    }
-                    let add = paths
-                        .iter()
-                        .map(|p| format!("\"{}\"", p.display()))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    app.input.update(cx, |state, cx| {
-                        let current = state.value().to_string();
-                        let next = if current.trim().is_empty() {
-                            add
-                        } else {
-                            format!("{current}\n{add}")
-                        };
-                        state.set_value(next, window, cx);
-                    });
-                    cx.notify();
                 });
             }
         })
@@ -110,18 +64,54 @@ impl ChatApp {
     /// 权限模式菜单里选了一项：会话立即生效，已建立的内核会话同步 set_mode；
     /// 还没建立的会话等 Started 时再交给内核
     pub(crate) fn choose_mode(&mut self, i: usize, cx: &mut Context<Self>) {
-        let kernel = self.session_kernel(self.active);
-        let s = &mut self.sessions[self.active];
-        s.choose_mode_index(i);
-        if let Some(mode) = s.modes.get(i) {
-            match (kernel, s.acp_id.clone()) {
-                (Some(kernel), Some(id)) => {
-                    let _ = kernel.set_mode(&id, &mode.id);
+        let idx = self.active;
+        let Some(mode) = self.sessions[idx].modes.get(i).map(|m| m.id.clone()) else {
+            return;
+        };
+        let kernel = self.session_kernel(idx);
+        let connected = match (kernel.as_ref(), self.sessions[idx].acp_id.as_deref()) {
+            (Some(kernel), Some(id)) => {
+                if let Err(err) = kernel.set_mode(id, &mode) {
+                    self.sessions[idx].note(format!("切换权限模式失败：{err}"));
+                    cx.notify();
+                    return;
                 }
-                _ => s.pending_mode = Some(mode.id.clone()),
+                true
             }
+            _ => false,
+        };
+        let s = &mut self.sessions[idx];
+        s.choose_mode_index(i);
+        if !connected {
+            s.pending_mode = Some(mode);
         }
+        self.persist_session_mode(idx, cx);
         cx.notify();
+    }
+
+    pub(super) fn persist_session_mode(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let (Some(store), Some(meta)) = (&self.store, &self.sessions[idx].meta)
+            && let Err(err) = store.save_meta(meta)
+        {
+            self.toast(Notification::error(format!("权限模式未能保存：{err}")), cx);
+        }
+    }
+
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_history_mode_menu(&mut self, cx: &mut Context<Self>) {
+        let idx = self
+            .sessions
+            .iter()
+            .position(|s| s.restored && s.kernel == KernelChoice::Builtin && !s.is_chat())
+            .expect("没有可预览的自研内核历史会话");
+        self.activate_session(idx, cx);
+        let session = self.session();
+        assert!(!session.ready);
+        assert_eq!(
+            session.modes.iter().any(|m| m.id == crate::model::MODE_AUTO_ID),
+            self.settings.auto_mode_default(),
+        );
+        eprintln!("restored mode menu verified before reconnecting");
     }
 
     /// 思考强度下拉里选了一档：只作用于**这个会话**，不动设置文件里的档案。
@@ -344,18 +334,6 @@ impl ChatApp {
             .get(self.session().permission_mode)
             .map(|m| m.name.clone())
             .unwrap_or_else(|| "—".into());
-        let project = project_label(&self.session().cwd);
-        // 任务（建立时没选过文件夹的对话）：chip 上直说，点开可以挂到某个文件夹上。
-        // 项目名 / 模型名长度不由我们定，都允许压窄（否则一行排不下时会把右边的发送键挤出卡片）
-        let task = self.session().task;
-        let project_chip = if task {
-            MenuChip::new(IconAll::ListTodo, "任务")
-        } else if let Some(branch) = self.session().worktree.as_ref().map(|w| w.repo_name()) {
-            // worktree 会话：chip 写仓库名（目录是数据目录里的 worktree，显出来没意义）
-            MenuChip::new(IconAll::GitBranch, format!("{branch} · worktree")).shrink()
-        } else {
-            MenuChip::new(IconAll::Folder, project).shrink()
-        };
         // 焦点几乎总在输入框上（丢了由 restore_focus 找回），所以窗口不在前台时按没聚焦画：
         // 切去别的程序后输入框回到静止样子，鼠标移上来是悬停态，点回来才是聚焦态
         let focused =
@@ -409,10 +387,10 @@ impl ChatApp {
                 }
             }));
 
-        // 卡片底边一条工具栏：左侧项目目录 / 权限模式 / 添加文件，右侧上下文用量 / 模型 / 发送。
+        // 卡片底边一条工具栏：左侧权限模式，右侧上下文用量 / 模型 / 发送。
         // 和输入框是一整块（对照 Claude.ai 的输入卡片），chip 的 open 状态由 Popover 自管。
         // 中间的空白点了也把焦点给输入框（chip 和按钮自己处理点击，不挂这个）。
-        // 聊天空间没有工作目录和权限模式（没有工具要批），那两个 chip 不画，换成「联网」开关
+        // 聊天空间不画权限模式，换成「联网」开关
         let chat = self.session().is_chat();
         let unviewable = self.pending_images_unviewable();
         let toolbar = div()
@@ -420,31 +398,24 @@ impl ChatApp {
             .items_center()
             .gap_0p5()
             .when(!chat, |d| {
-                d.child(menu_popover(
-                    "workspace-menu",
-                    Anchor::BottomLeft,
-                    rems(20.),
-                    &app,
-                    &self.menu_focus,
-                    project_chip,
-                    workspace_menu_items,
-                ))
-                .child(menu_popover(
-                    "mode-menu",
-                    Anchor::BottomLeft,
-                    rems(20.),
-                    &app,
-                    &self.menu_focus,
-                    MenuChip::new(IconAll::Shield, mode_name),
-                    mode_menu_items,
-                ))
+                d.child(
+                    menu_popover(
+                        "mode-menu",
+                        Anchor::BottomLeft,
+                        rems(10.5),
+                        &app,
+                        &self.menu_focus,
+                        MenuChip::new(IconAll::Shield, mode_name),
+                        mode_menu_items,
+                    )
+                    .p_0p5()
+                    .default_open(
+                        cfg!(feature = "headless-screenshot")
+                            && std::env::var("CLAUDESKTOP_OPEN").as_deref()
+                                == Ok("history-mode-menu"),
+                    ),
+                )
             })
-            .child(
-                Self::quiet_button("attach-files", IconAll::Paperclip, Surface::Paper, cx)
-                    .small()
-                    .tooltip("添加文件")
-                    .on_click(cx.listener(|this, _, window, cx| this.attach_files(window, cx))),
-            )
             .when(chat, |d| d.child(self.render_web_chip(cx)))
             .child(div().flex_1().self_stretch().on_mouse_down(
                 MouseButton::Left,
@@ -1225,76 +1196,28 @@ fn thinking_hint(level: ThinkingLevel) -> &'static str {
     }
 }
 
-/// 权限模式条目：图标 + 名称（+说明），当前项打勾。
+/// 权限模式条目：单行图标与名称，当前项打勾。
 fn mode_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
 ) -> MenuList {
     let session = app.session();
-    let mut menu = MenuList::new("mode-menu-list", handle, popover);
+    let mut menu = MenuList::new("mode-menu-list", handle, popover).without_shortcuts().compact();
     for (i, mode) in session.modes.iter().enumerate() {
         let active = session.permission_mode == i;
         menu = menu.pick(
-            menu_item(("mode-item", i), mode.icon, mode.name.clone(), mode.desc.clone(), active),
+            menu_item(("mode-item", i), mode.icon, mode.name.clone(), "", active)
+                .h(rems(1.5))
+                .gap_1p5()
+                .px_2()
+                .py_0()
+                .line_height(relative(1.25))
+                .text_size(TEXT_SMALL),
             move |this, cx| this.choose_mode(i, cx),
         );
     }
     menu
-}
-
-/// 工作目录条目：用过的目录（当前会话所在的打对勾）+「不选项目（任务）」+「选择文件夹…」。
-fn workspace_menu_items(
-    app: &ChatApp,
-    handle: &Entity<ChatApp>,
-    popover: &Entity<PopoverState>,
-) -> MenuList {
-    let current = &app.session().cwd;
-    let task = app.session().task;
-    let mut menu = MenuList::new("workspace-menu-list", handle, popover);
-    for (i, dir) in app.recent_workspaces().into_iter().enumerate() {
-        // 任务会话没有「当前项目」，一个都不打勾
-        let active = !task && dir == *current;
-        let path = short_path(&dir);
-        let label = project_label(&dir);
-        menu = menu.pick(
-            menu_item(("workspace-item", i), IconAll::Folder, label, path, active),
-            move |this, cx| this.switch_workspace(dir.clone(), cx),
-        );
-    }
-    if app.git_repo_here() {
-        // 在新 worktree 中开始：从当前分支的最新提交拉一个分支，未提交的改动不会带过去
-        menu = menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE))).pick(
-            menu_item(
-                "workspace-worktree",
-                IconAll::GitBranch,
-                "在新 worktree 中开始",
-                "从当前分支的最新提交开始，未提交的改动不会带过去",
-                false,
-            ),
-            |this, cx| this.start_in_worktree(cx),
-        );
-    }
-    menu.child(div().mt_0p5().border_t_1().border_color(rgb(LINE)))
-        // 不选项目：这段对话算一件任务，归到侧栏下半区。已经跑在默认目录里就只改归类
-        .pick(
-            menu_item(
-                "workspace-task",
-                IconAll::ListTodo,
-                "不选项目（任务）",
-                if task {
-                    "这段对话已归在侧栏的「任务」里"
-                } else {
-                    "不指定文件夹，只作为一件任务"
-                },
-                task,
-            ),
-            |this, cx| this.as_task(cx),
-        )
-        .pick(
-            menu_item("workspace-pick", IconAll::FolderOpen, "选择文件夹…", "", false),
-            |this, cx| this.pick_workspace(cx),
-        )
 }
 
 /// 模型条目：非自研内核给提示；列表 + 刷新入口（刷新不收起面板，看得到进度）。
@@ -1334,7 +1257,7 @@ fn model_menu_items(
             );
         }
         for (i, model) in models.iter().enumerate() {
-            let active = current.as_ref() == model.as_str();
+            let active = pi == app.settings.builtin.active && current.as_ref() == model.as_str();
             let m = (*model).clone();
             menu = menu.pick(
                 div()

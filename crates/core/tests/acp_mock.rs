@@ -394,6 +394,7 @@ fn run_resume(mock_flag: &str) -> (String, bool, String) {
         .expect("started");
     kernel.send_prompt(&sid, UserPrompt::text("继续")).expect("send prompt");
     wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(kernel.can_idle_shutdown(), !mock_flag.is_empty());
     kernel.shutdown();
     let text = assistant_text(&events.lock().unwrap());
     (sid, resumed, text)
