@@ -71,8 +71,9 @@ pub(super) fn shelf_bar(
     let current = state.current(installed);
     div()
         .h_flex()
+        .flex_wrap()
         .items_center()
-        .gap_3()
+        .gap_2()
         .child(seg_control(
             id,
             [
@@ -89,7 +90,7 @@ pub(super) fn shelf_bar(
         .child(
             div()
                 .flex_1()
-                .min_w_0()
+                .min_w(rems(9.))
                 .rounded_lg()
                 .border_1()
                 .border_color(rgb(LINE))

@@ -50,7 +50,7 @@ use crate::usage::{self, TurnStat};
 use claudesktop_builtin::BuiltinKernel;
 use claudesktop_core::{
     AcpKernel, AcpKernelConfig, EventSink, Kernel, KernelEvent, PromptImage, Record, RoutedEvent,
-    SessionKind, SessionSpec, SessionStore, UserPrompt,
+    SessionKind, SessionMeta, SessionSpec, SessionStore, UserPrompt,
 };
 use content::ContentView;
 use futures::StreamExt;
@@ -69,6 +69,51 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 启动时最多恢复的历史会话数（最近更新的优先）。
 const MAX_RESTORED: usize = 100;
+const AGENT_IDLE_RECLAIM: Duration = Duration::from_secs(10 * 60);
+/// 冷会话回收：温会话（`last_touch` 最新的几个）保住不动，其余按预算收。
+/// 温会话个数和显示缓存预算是初始提案（见「轻量化」计划 C 节），按实测调。
+const WARM_SESSIONS: usize = 2;
+const SESSION_CACHE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// 压测钩子：`CLAUDESKTOP_STRESS_SESSIONS` 的逐会话激活状态机。
+/// 每秒 tick 推进一步：未加载的激活一下、加载中的等下一秒、已加载的推进到下一个。
+/// 跑完 `rounds` 轮后等 70 秒（两个回收周期）再退出，看冷态稳态。
+struct SessionStress {
+    ids: Vec<usize>,
+    round: usize,
+    next: usize,
+    rounds: usize,
+    done_at: Option<Instant>,
+}
+
+impl SessionStress {
+    /// 返回 true = 可以收尾退出了。
+    fn step(&mut self, app: &mut ChatApp, cx: &mut Context<ChatApp>) -> bool {
+        if let Some(done_at) = self.done_at {
+            return done_at.elapsed() >= Duration::from_secs(70);
+        }
+        if self.next >= self.ids.len() {
+            self.round += 1;
+            if self.round >= self.rounds {
+                self.done_at = Some(Instant::now());
+                return false;
+            }
+            self.next = 0;
+        }
+        let idx = self.ids[self.next];
+        let s = &app.sessions[idx];
+        if s.history_loading {
+            return false;
+        }
+        if !s.history_loaded {
+            app.activate_session(idx, cx);
+            return false;
+        }
+        self.next += 1;
+        false
+    }
+}
+
 
 pub struct ChatApp {
     input: Entity<TextareaState>,
@@ -86,7 +131,7 @@ pub struct ChatApp {
     store: Option<SessionStore>,
     /// 默认工作目录（新会话用）
     cwd: PathBuf,
-    /// 当前项目名（取工作目录名），侧栏分组名与输入框标签用
+    /// 当前项目名（取工作目录名），侧栏分组名用
     project_name: SharedString,
     overview_tab: usize, // 0 概览 / 1 模型 / 2 请求
     /// 首页「请求」页签：读到的用量网关日志、筛选、点开的轮
@@ -138,10 +183,14 @@ pub struct ChatApp {
     jump: Option<motion::JumpAnim>,
     /// 所有会话的每轮统计（首页用量概览）
     usage: Vec<TurnStat>,
+    usage_index_generation: u64,
+    usage_indexing: bool,
     /// 压测钩子：每次 render 的时刻（None = 不记录）
     pub(crate) frame_log: Option<Vec<std::time::Instant>>,
     /// 压测钩子：每帧从 render 开始到整棵树画完用了多少毫秒（只在记 `frame_log` 时记）
     frame_work: std::rc::Rc<std::cell::RefCell<Vec<f64>>>,
+    /// 压测钩子：`CLAUDESKTOP_STRESS_SESSIONS` 的逐会话激活状态机（每秒 tick 推进一步）
+    session_stress: Option<SessionStress>,
     /// 窗口在前台：激活且没最小化（不在前台时才发系统通知，见 `notify.rs`）
     window_active: bool,
     /// 发出去还没撤的系统通知标签（回到窗口时撤掉）
@@ -172,6 +221,9 @@ pub struct ChatApp {
     task_scroll: ScrollHandle,
     /// 设置页右侧内容（和用量页）的滚动位置（用量页的请求明细同样只排视口附近的几轮）
     settings_scroll: ScrollHandle,
+    /// 设置页外层和模型清单的滚轮平滑目标
+    settings_wheel: Option<WheelScroll>,
+    model_wheel: Option<WheelScroll>,
     /// 侧栏会话列表的滚动位置（底部渐隐跟手，见 `ScrollEdge`）
     sidebar_scroll: ScrollHandle,
     /// macOS 红绿灯上次按哪个根字号摆的（字号变了才重摆，见 `chrome::traffic_light_origin`）
@@ -251,6 +303,8 @@ pub(crate) struct KernelSlot {
     mcp: Vec<claudesktop_core::McpServerView>,
     /// 后台命令（只有自研内核有；会话顶栏显示运行中的）
     tasks: Vec<claudesktop_core::BackgroundTaskView>,
+    /// 最近一次用户操作或内核事件；只用于外部 agent 的空闲回收
+    last_used: Option<Instant>,
 }
 
 impl Drop for ChatApp {
@@ -398,9 +452,28 @@ impl ChatApp {
 
         // 运行状态行计时：当前会话忙时每秒重绘一次（等授权时没有转圈动画驱动重绘）
         cx.spawn(async move |this, cx| {
+            let mut ticks = 0u64;
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |app, cx| {
+                    ticks += 1;
+                    if ticks % 30 == 0 {
+                        app.reclaim_idle_processes(cx);
+                        app.hibernate_idle_sessions(cx);
+                        app.reclaim_idle_sessions(cx);
+                        if std::env::var("CLAUDESKTOP_MEM_REPORT").is_ok() {
+                            app.mem_report();
+                        }
+                    }
+                    if let Some(mut stress) = app.session_stress.take() {
+                        if stress.step(app, cx) {
+                            app.mem_report();
+                            eprintln!("[stress] 会话压测完成");
+                            cx.quit();
+                        } else {
+                            app.session_stress = Some(stress);
+                        }
+                    }
                     if app.session().busy {
                         cx.notify();
                     }
@@ -475,6 +548,7 @@ impl ChatApp {
             rename_input,
             rename_focused: false,
             completion: Default::default(),
+            session_stress: None,
             history: Default::default(),
             confirm_delete: None,
             kernels: Default::default(),
@@ -493,6 +567,8 @@ impl ChatApp {
             hovered_msg: None,
             jump: None,
             usage: Vec::new(),
+            usage_index_generation: 0,
+            usage_indexing: false,
             frame_log: None,
             frame_work: Default::default(),
             window_active: true,
@@ -512,6 +588,8 @@ impl ChatApp {
             home_scroll: ScrollHandle::new(),
             task_scroll: ScrollHandle::new(),
             settings_scroll: ScrollHandle::new(),
+            settings_wheel: None,
+            model_wheel: None,
             sidebar_scroll: ScrollHandle::new(),
             #[cfg(target_os = "macos")]
             traffic_lights_rem: None,
@@ -560,21 +638,23 @@ impl ChatApp {
         // 从磁盘恢复历史会话（演示回放模式下新会话不落盘，但历史照常显示）
         match SessionStore::open_default() {
             Ok(store) => {
-                // 最近的进侧栏；更早的只读进用量统计
-                for (i, meta) in store.list().into_iter().enumerate() {
-                    let records = store.load(&meta.id).unwrap_or_default();
-                    app.usage.extend(usage::collect(&meta, &records));
-                    if i < MAX_RESTORED {
-                        app.sessions.push(Session::from_records(
-                            app.next_token,
-                            meta,
-                            records,
-                            &app.settings.acp,
-                        ));
-                        app.next_token += 1;
-                    }
+                let listed_at = Instant::now();
+                let metas = store.list();
+                crate::perf_elapsed("store_list", listed_at);
+                if std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok() {
+                    eprintln!("[perf] store_list: {} sessions", metas.len());
+                }
+                // 首屏只恢复侧栏需要的元信息；日志在激活会话时后台读取。
+                for meta in metas.iter().take(MAX_RESTORED) {
+                    app.sessions.push(Session::placeholder(
+                        app.next_token,
+                        meta.clone(),
+                        &app.settings,
+                    ));
+                    app.next_token += 1;
                 }
                 app.store = Some(store);
+                app.start_usage_index(metas, cx);
             }
             Err(err) => {
                 app.toast(Notification::error(format!("会话历史不可用：{err}")).autohide(false), cx)
@@ -596,9 +676,11 @@ impl ChatApp {
 
     /// 按当前设置启动某种内核（不处理会话，见 [`Self::restart_kernel`]）。
     fn spawn_kernel(&mut self, kind: &KernelChoice) {
+        let started_at = Instant::now();
         let key = kind.key();
         let slot = self.slot_entry(&key);
         slot.started = true;
+        slot.last_used = Some(Instant::now());
         slot.generation += 1;
         let generation = slot.generation;
         let ev_key = key.clone();
@@ -656,6 +738,7 @@ impl ChatApp {
         slot.agent_cmd = agent_cmd;
         slot.fatal = None;
         slot.mcp.clear();
+        crate::perf_elapsed(&format!("kernel_spawn:{key}"), started_at);
     }
 
     /// 还没启动过就启动。
@@ -670,6 +753,12 @@ impl ChatApp {
     /// 有对话的会话下次发消息时按「历史会话」续接，空会话等新连接就绪后重新创建。
     /// 没启动过的内核什么也不做（用到时自然按新设置启动）。
     pub(crate) fn restart_kernel(&mut self, kind: &KernelChoice, cx: &mut Context<Self>) {
+        if *kind == KernelChoice::Builtin {
+            let auto_available = self.settings.auto_mode_default();
+            for s in self.sessions.iter_mut().filter(|s| s.kernel == KernelChoice::Builtin) {
+                s.sync_builtin_modes(auto_available);
+            }
+        }
         let key = kind.key();
         if !self.slot(&key).is_some_and(|s| s.started) {
             return;
@@ -710,6 +799,175 @@ impl ChatApp {
         if let Some(old) = old {
             old.shutdown();
         }
+    }
+
+    /// 回收十分钟无活动的 MCP，以及明确支持恢复上下文的外部 agent。
+    fn reclaim_idle_processes(&mut self, cx: &mut Context<Self>) {
+        for (_, slot) in &self.kernels {
+            if let Some(kernel) = &slot.kernel {
+                kernel.reclaim_idle_mcp();
+            }
+        }
+        let now = Instant::now();
+        let keys: Vec<String> = self
+            .kernels
+            .iter()
+            .filter(|(key, slot)| {
+                slot.ready
+                    && slot.tasks.is_empty()
+                    && slot.last_used.is_some_and(|at| now.duration_since(at) >= AGENT_IDLE_RECLAIM)
+                    && slot.kernel.as_ref().is_some_and(|k| k.can_idle_shutdown())
+                    && self
+                        .sessions
+                        .iter()
+                        .filter(|s| s.kernel_key == *key)
+                        .all(Session::idle_detachable)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let reclaimed = !keys.is_empty();
+        for key in keys {
+            if std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok() {
+                eprintln!("[perf] idle_reclaim:{key}");
+            }
+            self.shutdown_slot(&key);
+        }
+        if reclaimed {
+            cx.notify();
+        }
+    }
+
+    /// 自研内核的历史休眠原型：当前会话和最近两个温会话保留，其余闲置十分钟后台落盘。
+    fn hibernate_idle_sessions(&mut self, cx: &mut Context<Self>) {
+        if claudesktop_builtin::default_hibernation_dir().is_none() {
+            return;
+        }
+        let idle = std::env::var("CLAUDESKTOP_HIBERNATE_IDLE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(AGENT_IDLE_RECLAIM);
+        let now = Instant::now();
+        let mut order: Vec<usize> = (0..self.sessions.len())
+            .filter(|&i| {
+                i != self.active
+                    && self.sessions[i].kernel == KernelChoice::Builtin
+                    && self.sessions[i].idle_hibernatable()
+            })
+            .collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].last_touched()));
+        for idx in order.into_iter().skip(WARM_SESSIONS) {
+            if now.duration_since(self.sessions[idx].last_touched()) < idle {
+                continue;
+            }
+            let Some(kernel) = self.session_kernel(idx) else { continue };
+            let Some(id) = self.sessions[idx].acp_id.clone() else { continue };
+            let token = self.sessions[idx].token;
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { kernel.hibernate_session(&id) })
+                    .await;
+                if let Err(err) = result {
+                    eprintln!("[perf] session_hibernate error={err}");
+                }
+                let _ = this.update(cx, |app, cx| {
+                    if app.sessions.get(app.active).is_some_and(|s| s.token == token) {
+                        app.wake_kernel_session(app.active, cx);
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// 激活时后台预恢复；发送路径还有一次同步兜底（在内核工作线程，不占界面线程）。
+    fn wake_kernel_session(&self, idx: usize, cx: &mut Context<Self>) {
+        if self.sessions[idx].kernel != KernelChoice::Builtin {
+            return;
+        }
+        let Some(kernel) = self.session_kernel(idx) else { return };
+        let Some(id) = self.sessions[idx].acp_id.clone() else { return };
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = kernel.wake_session(&id) {
+                    eprintln!("[perf] session_wake error={err}");
+                }
+            })
+            .detach();
+    }
+
+    /// 冷会话回收（「轻量化下一步」计划 C 节）：温会话保 [`WARM_SESSIONS`] 个、
+    /// 显示数据合计不超过 [`SESSION_CACHE_BUDGET`]，超出把最久没用的可淘汰会话
+    /// 换回占位（释放正文 / 布局表 / 子任务记录；重开走 `ensure_history_loaded`
+    /// 的重读路径，和启动占位一样）。当前会话和忙会话由 `Session::evictable` 豁免。
+    fn reclaim_idle_sessions(&mut self, cx: &mut Context<Self>) {
+        // 测量钩子：同一可执行文件关回收跑基线，对照开回收的内存差异
+        if std::env::var_os("CLAUDESKTOP_DISABLE_RECLAIM").is_some() {
+            return;
+        }
+        // 可淘汰的按最近使用从旧到新排：温会话名额之外的换占位；预算超了再多收
+        let mut order: Vec<usize> = (0..self.sessions.len())
+            .filter(|&i| i != self.active && self.sessions[i].evictable())
+            .collect();
+        let total: usize = self.sessions.iter().map(Session::retained_bytes).sum();
+        if order.len() <= WARM_SESSIONS && total <= SESSION_CACHE_BUDGET {
+            return;
+        }
+        order.sort_by_key(|&i| self.sessions[i].last_touched());
+        let mut freed = 0usize;
+        let mut evicted = 0usize;
+        while order.len() > WARM_SESSIONS || total - freed > SESSION_CACHE_BUDGET {
+            let Some(idx) = order.first().copied() else { break };
+            freed += self.sessions[idx].retained_bytes();
+            self.sessions[idx].to_placeholder(&self.settings);
+            order.remove(0);
+            evicted += 1;
+        }
+        if evicted > 0 {
+            if std::env::var("CLAUDESKTOP_MEM_REPORT").is_ok() {
+                eprintln!(
+                    "[mem] session_evict count={evicted} freed≈{:.1}MB before≈{:.1}MB",
+                    freed as f64 / 1048576.,
+                    total as f64 / 1048576.
+                );
+            }
+            self.sync_sidebar(cx);
+            cx.notify();
+        }
+    }
+
+    /// 各类缓存现状一行（`CLAUDESKTOP_MEM_REPORT=1` 时每 30 秒随回收周期打）。
+    fn mem_report(&self) {
+        let loaded = self.sessions.iter().filter(|s| s.history_loaded).count();
+        let retained: usize = self.sessions.iter().map(Session::retained_bytes).sum();
+        let stats = crate::assets::registry_stats();
+        let history = self.kernels.iter().filter_map(|(_, slot)| slot.kernel.as_ref()).fold(
+            claudesktop_core::KernelHistoryStats::default(),
+            |mut total, kernel| {
+                let stats = kernel.history_stats();
+                total.resident_sessions += stats.resident_sessions;
+                total.dormant_sessions += stats.dormant_sessions;
+                total.transitioning_sessions += stats.transitioning_sessions;
+                total.resident_bytes += stats.resident_bytes;
+                total
+            },
+        );
+        eprintln!(
+            "[mem] sessions={} loaded={} retained≈{:.1}MB/{}MB kernel_history≈{:.1}MB resident={} dormant={} transitioning={} assets={} entries≈{:.1}MB/{}MB spilled={}",
+            self.sessions.len(),
+            loaded,
+            retained as f64 / 1048576.,
+            SESSION_CACHE_BUDGET / 1048576,
+            history.resident_bytes as f64 / 1048576.,
+            history.resident_sessions,
+            history.dormant_sessions,
+            history.transitioning_sessions,
+            stats.entries,
+            stats.bytes as f64 / 1048576.,
+            stats.budget / 1048576,
+            stats.spilled
+        );
     }
 
     /// 停掉一条后台命令（顶栏的小标点的）。
@@ -799,6 +1057,10 @@ impl ChatApp {
     /// 原来的聊天不动（转换会让原聊天消失，复制干净）。
     pub(crate) fn continue_in_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         let src = self.active;
+        if !self.sessions[src].history_loaded {
+            self.toast(Notification::warning("这段对话还在读取，稍等再接到项目里"), cx);
+            return;
+        }
         let Some(store) = self.store.as_ref() else {
             self.toast(Notification::warning("数据目录不可用，没法把这段聊天接到项目里"), cx);
             return;
@@ -915,11 +1177,11 @@ impl ChatApp {
         self.open_session_of(kind, cwd, SessionKind::Code)
     }
 
-    /// 在某种内核上开一个会话，返回下标。内核没启动就先启动；
-    /// 连接已就绪就立刻向内核要会话，否则等 Connected 时补发。
+    /// 在某种内核上开一个会话，返回下标。自研内核随默认会话启动；
+    /// 外部 agent 等首次发送，连接就绪后再创建会话。
     fn open_session_of(&mut self, kind: KernelChoice, cwd: PathBuf, sk: SessionKind) -> usize {
-        // 还没配置时先不起内核，配好保存时再起（见 `save_settings`）
-        if !self.settings.needs_setup() {
+        // 自研内核保持现有启动路径；外部 agent 等首次发送时再启动。
+        if !self.settings.needs_setup() && kind == KernelChoice::Builtin {
             self.ensure_kernel(&kind);
         }
         let token = self.next_token;
@@ -946,6 +1208,7 @@ impl ChatApp {
     ) -> Session {
         let is_builtin = kind == KernelChoice::Builtin;
         let mut session = Session::of_kind(token, kind, cwd.clone(), sk);
+        session.sync_builtin_modes(self.settings.auto_mode_default());
         session.task = sk == SessionKind::Code && !self.is_project_dir(&cwd);
         if sk == SessionKind::Chat {
             // 联网默认值取设置里的「默认联网」，用户可以在输入框里随时关
@@ -963,12 +1226,12 @@ impl ChatApp {
     }
 
     /// 这个目录是不是项目：默认目录（环境变量给的或启动目录）以外的都是用户选过的；
-    /// 默认目录本身只有在目录菜单里明确选过（记进设置）才算。不是项目的，在里面的对话算任务
+    /// 默认目录本身只有在侧栏「项目」菜单里明确选过（记进设置）才算。不是项目的，在里面的对话算任务
     pub(super) fn is_project_dir(&self, dir: &Path) -> bool {
         self.settings.workspace.as_deref() == Some(dir) || dir != self.acp_base.cwd
     }
 
-    /// 当前会话所在的目录是个 git 仓库（目录菜单里据此给「在新 worktree 中开始」）。
+    /// 当前会话所在的目录是个 git 仓库（侧栏「项目」菜单据此给「新建 worktree」）。
     /// 只看有没有 `.git`（目录或 worktree 的文件），不在 render 里跑 git。
     pub(super) fn git_repo_here(&self) -> bool {
         let s = self.session();
@@ -990,14 +1253,16 @@ impl ChatApp {
     fn replace_session(&mut self, idx: usize, kind: KernelChoice, cwd: PathBuf) {
         let old = self.session_kernel(idx);
         self.sessions[idx].cancel_pending_permissions(old.as_ref());
-        self.ensure_kernel(&kind);
+        if kind == KernelChoice::Builtin {
+            self.ensure_kernel(&kind);
+        }
         let token = self.next_token;
         self.next_token += 1;
         self.sessions[idx] = self.new_session(kind, cwd, token);
         self.request_pending_sessions();
     }
 
-    /// 切换工作目录（输入框上方的目录 chip）：设为新会话的默认目录并记进设置；
+    /// 侧栏切换项目：设为新会话的默认目录并记进设置；
     /// 当前会话还没对话就原地换到这个目录，已有对话就在那里开一个新会话（对话中途不换目录）。
     /// 选过文件夹之后，在当前这个目录里的对话不再算「任务」（见 `Session::task`）
     pub(crate) fn switch_workspace(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
@@ -1020,7 +1285,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 目录菜单里的「不选项目（任务）」：当前对话回到任务区（侧栏下半区）。
+    /// 侧栏「项目」菜单里的「不选项目（任务）」：当前对话回到任务区。
     /// 已经跑在默认目录里就只改归类；还没对话就原地换到默认目录，否则在默认目录另开一个（对话中途不换目录）。
     pub(crate) fn as_task(&mut self, cx: &mut Context<Self>) {
         let default_dir = self.acp_base.cwd.clone();
@@ -1070,7 +1335,7 @@ impl ChatApp {
         .detach();
     }
 
-    /// 目录菜单里的「选择文件夹…」：系统对话框选一个目录切过去。
+    /// 侧栏「项目」菜单里的「选择文件夹…」：系统对话框选一个目录切过去。
     pub(crate) fn pick_workspace(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1088,12 +1353,14 @@ impl ChatApp {
         .detach();
     }
 
-    /// 目录菜单列出的工作目录：默认目录在前，其余按会话最近活动排，已不存在的略去，最多 8 个。
-    /// worktree 会话不列（它们的 `cwd` 是数据目录里的 worktree，列出来是一串看不懂的路径）。
+    /// 侧栏「项目」菜单列出的工作目录：默认目录在前，其余按代码会话最近活动排，最多 8 个。
+    /// 不列聊天占位目录和 worktree 目录，已不存在的略去。
     pub(crate) fn recent_workspaces(&self) -> Vec<PathBuf> {
         // 无元信息的会话（刚开、还没落盘）视为最新；排序稳定，默认目录排在同为最新的前面
         let mut dirs: Vec<(&Path, u64)> = vec![(self.cwd.as_path(), u64::MAX)];
-        for s in self.sessions.iter().filter(|s| s.worktree.is_none()) {
+        for s in
+            self.sessions.iter().filter(|s| s.kind == SessionKind::Code && s.worktree.is_none())
+        {
             let dir = &s.cwd;
             let at = s.meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
             match dirs.iter_mut().find(|(d, _)| *d == dir.as_path()) {
@@ -1105,11 +1372,68 @@ impl ChatApp {
         dirs.into_iter().map(|(d, _)| d.to_path_buf()).filter(|d| d.is_dir()).take(8).collect()
     }
 
+    /// 历史会话只在激活时读日志。读取期间会话保留元信息，删除或切走都不会被迟到的结果覆盖。
+    fn ensure_history_loaded(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if self.sessions[idx].history_loaded || self.sessions[idx].history_loading {
+            return;
+        }
+        let (Some(store), Some(meta)) = (self.store.clone(), self.sessions[idx].meta.clone())
+        else {
+            return;
+        };
+        let token = self.sessions[idx].token;
+        self.sessions[idx].history_loading = true;
+        self.sessions[idx].history_error = None;
+        cx.spawn(async move |this, cx| {
+            let started_at = Instant::now();
+            let result = cx.background_executor().spawn(async move { store.load(&meta.id) }).await;
+            this.update(cx, |app, cx| {
+                crate::perf_elapsed("history_open", started_at);
+                let Some(idx) = app.sessions.iter().position(|s| s.token == token) else {
+                    return;
+                };
+                match result {
+                    Ok(records) => {
+                        let Some(meta) = app.sessions[idx].meta.clone() else { return };
+                        let reveal = app.sessions[idx].pending_reveal_turn;
+                        let mut loaded = Session::from_records(token, meta, records, &app.settings);
+                        loaded.pending_reveal_turn = reveal;
+                        app.sessions[idx] = loaded;
+                        app.finish_history_load(idx, cx);
+                    }
+                    Err(err) => {
+                        let s = &mut app.sessions[idx];
+                        s.history_loading = false;
+                        s.history_error = Some(format!("读取历史会话失败：{err}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_history_load(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.sessions[idx].touch();
+        if self.active == idx {
+            self.probe_context_window(idx, cx);
+            self.settle_undo();
+            self.reveal_pending_turn(idx);
+        }
+        // 读取期间发出去的消息走现有队列；加载完成后由 submit_to 续接内核。
+        if !self.sessions[idx].queued.is_empty() && !self.sessions[idx].busy {
+            let queued = self.sessions[idx].queued.remove(0);
+            self.submit_to(idx, queued.into_prompt(), cx);
+        }
+    }
+
     /// 切到第 `i` 个会话（侧栏点击 / 快捷键共用）：重开会话的模型名从日志恢复了，
     /// 但窗口大小可能还没缓存过，顺带悄悄探测一次（见 [`Self::probe_context_window`]）。
     pub(crate) fn activate_session(&mut self, i: usize, cx: &mut Context<Self>) {
         self.active = i;
         self.settings_open = false;
+        self.sessions[i].touch();
         // 从搜索结果、系统通知点进别的空间的会话时自动切过去（空间本来就是它那个）
         let space = Space::of(self.sessions[i].kind);
         if space != self.space() {
@@ -1118,6 +1442,8 @@ impl ChatApp {
         }
         self.last_active[Self::space_slot(space)] = Some(self.sessions[i].token);
         self.sessions[i].wheel = None;
+        self.ensure_history_loaded(i, cx);
+        self.wake_kernel_session(i, cx);
         // worktree 目录被用户删了 / 换了电脑：切过来时试着重新检出接上（见 worktree.rs）
         if ChatApp::worktree_is_missing(&self.sessions[i]) {
             self.repair_worktree(i, cx);
@@ -1133,8 +1459,11 @@ impl ChatApp {
         self.next_suggestion.clear();
         self.refresh_composer(cx);
         self.schedule_suggestion(cx);
-        self.probe_context_window(i, cx);
-        self.settle_undo();
+        if self.sessions[i].history_loaded {
+            self.probe_context_window(i, cx);
+            self.settle_undo();
+            self.reveal_pending_turn(i);
+        }
         cx.notify();
     }
 
@@ -1221,6 +1550,69 @@ impl ChatApp {
         } else {
             self.sessions[idx].autoprompt = Some(prompt);
         }
+        cx.notify();
+    }
+
+    /// 压测钩子：`CLAUDESKTOP_STRESS_SESSIONS=N` 生成 N 个历史会话并逐轮激活。
+    /// 每个会话 80 轮问答、每轮回复约 12 KB，合计约 1 MB/会话（50 个约 50 MB，
+    /// 超 32 MiB 显示预算，用来触发回收）。`CLAUDESKTOP_STRESS_ROUNDS` 默认 3。
+    pub(crate) fn debug_stress_sessions(&mut self, n: usize, rounds: usize, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else {
+            eprintln!("[stress] 无存储目录，跳过会话压测");
+            return;
+        };
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let title = format!("压测会话 {i}");
+            let created = store.create(&title, self.cwd.clone(), "");
+            let (meta, mut log) = match created {
+                Ok(pair) => pair,
+                Err(err) => {
+                    eprintln!("[stress] 建会话失败: {err}");
+                    continue;
+                }
+            };
+            for j in 0..80 {
+                let ask = format!("第 {i} 会话第 {j} 轮：请给出一段足够长的说明");
+                if let Err(err) = log.append(Record::user(&ask)) {
+                    eprintln!("[stress] 写日志失败: {err}");
+                    break;
+                }
+                let answer = "0123456789abcdef".repeat(800);
+                let event = KernelEvent::AgentMessageChunk { text: answer };
+                if let Err(err) = log.append(Record::Event { event }) {
+                    eprintln!("[stress] 写日志失败: {err}");
+                    break;
+                }
+            }
+            let _ = log.append(Record::Turn {
+                at_ms: 0,
+                model: Some("stress".into()),
+                input_tokens: 80,
+                output_tokens: 80 * 800,
+                elapsed_ms: Some(80),
+                context_tokens: Some(80 * 800),
+            });
+            if let Err(err) = store.save_meta(&meta) {
+                eprintln!("[stress] 写元信息失败: {err}");
+            }
+            let token = self.next_token;
+            self.next_token += 1;
+            let session = Session::placeholder(token, meta, &self.settings);
+            self.sessions.push(session);
+            ids.push(self.sessions.len() - 1);
+        }
+        if ids.is_empty() {
+            return;
+        }
+        self.session_stress = Some(SessionStress {
+            ids,
+            round: 0,
+            next: 0,
+            rounds,
+            done_at: None,
+        });
+        self.sync_sidebar(cx);
         cx.notify();
     }
 
@@ -1419,7 +1811,10 @@ impl ChatApp {
         static FLUSHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         if step >= STEPS {
             self.stress_report();
-            eprintln!("stream: chunks={STEPS} flushes={}", FLUSHES.load(std::sync::atomic::Ordering::Relaxed));
+            eprintln!(
+                "stream: chunks={STEPS} flushes={}",
+                FLUSHES.load(std::sync::atomic::Ordering::Relaxed)
+            );
             return;
         }
         if step == 0 {
@@ -1621,7 +2016,20 @@ impl ChatApp {
         // 发出去了：光标后面那句灰字、以及轮结束时猜的下一句都作废
         self.suggestion.clear();
         self.next_suggestion.clear();
-        if self.sessions[active].busy || self.sessions[active].stopping {
+        if !self.sessions[active].history_loaded {
+            self.ensure_history_loaded(active, cx);
+            self.input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.pending.clear();
+            self.pending_files.clear();
+            self.history.push(&queued.text);
+            self.sessions[active].queued.push(queued);
+            cx.notify();
+            return;
+        }
+        if self.sessions[active].busy
+            || self.sessions[active].stopping
+            || self.sessions[active].kernel_rewinding
+        {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
             self.pending.clear();
             self.pending_files.clear();
@@ -1657,7 +2065,7 @@ impl ChatApp {
     /// 其余等它这一轮结束再发。会话还没就绪时留着（`Started` 到来时再发，见 `apply` 里的事件处理）。
     fn dispatch_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
         let s = &mut self.sessions[idx];
-        if s.busy || s.stopping || s.queued.is_empty() || !s.ready {
+        if s.busy || s.stopping || s.kernel_rewinding || s.queued.is_empty() || !s.ready {
             return;
         }
         let queued = s.queued.remove(0);
@@ -1714,7 +2122,7 @@ impl ChatApp {
     pub(crate) fn send_queued(&mut self, i: usize, cx: &mut Context<Self>) {
         let active = self.active;
         let s = &mut self.sessions[active];
-        if s.busy || i >= s.queued.len() {
+        if s.busy || s.kernel_rewinding || i >= s.queued.len() {
             return;
         }
         let queued = s.queued.remove(i);
@@ -1931,7 +2339,10 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let kind = self.sessions[idx].kernel.clone();
-        if self.sessions[idx].busy {
+        if let Some(slot) = self.slot_mut(&kind.key()) {
+            slot.last_used = Some(Instant::now());
+        }
+        if self.sessions[idx].busy || self.sessions[idx].kernel_rewinding {
             return false;
         }
         if !kind.is_demo() {
@@ -1946,6 +2357,7 @@ impl ChatApp {
             }
         }
         let kernel = self.session_kernel(idx);
+        let kernel_fatal = self.slot(&kind.key()).is_some_and(|slot| slot.fatal.is_some());
         let mut start_demo_token = None;
         {
             let s = &mut self.sessions[idx];
@@ -1959,15 +2371,20 @@ impl ChatApp {
                 return true;
             }
             if kernel.is_some() && !s.ready {
-                // 内核已经报错退出了（多半是命令找不到）：重新启动一次，用户可能已经把问题修好了
-                // （比如刚装上 Node.js）；还是起不来的话内核会再报错，弹出原因
-                let reason = if self.slot(&kind.key()).is_some_and(|s| s.fatal.is_some()) {
-                    self.restart_kernel(&kind, cx);
-                    format!("正在重新启动「{}」，稍等一下再发送", kind.label(&self.settings.acp))
-                } else {
-                    "会话还在连接内核，稍等一下再发送".into()
-                };
-                self.refuse_send(idx, reason, cx);
+                if !kernel_fatal {
+                    // 首次发送才启动的 agent：保留这条消息，Started 后自动发出。
+                    s.autoprompt = Some(prompt);
+                    self.request_pending_sessions();
+                    cx.notify();
+                    return true;
+                }
+                // 内核已经报错退出了：用户可能已修好命令，重新启动一次。
+                self.restart_kernel(&kind, cx);
+                self.refuse_send(
+                    idx,
+                    format!("正在重新启动「{}」，稍等一下再发送", kind.label(&self.settings.acp)),
+                    cx,
+                );
                 return false;
             }
             s.steering = false;
@@ -2175,7 +2592,7 @@ impl ChatApp {
     /// 会话忙着、正在停、还没就绪时不动它，留着等下一个时机（一轮结束 / `Started`）。
     fn queued_compaction(&mut self, idx: usize) -> bool {
         let s = &self.sessions[idx];
-        if !s.compact_queued || s.busy || s.stopping || !s.ready {
+        if !s.compact_queued || s.busy || s.stopping || s.kernel_rewinding || !s.ready {
             return false;
         }
         self.sessions[idx].compact_queued = false;
@@ -2213,7 +2630,7 @@ impl ChatApp {
         let s = &mut self.sessions[active];
         // 发出去了：光标后面那句灰字作废（它按上下文猜的，压完就不成立了）
         self.suggestion.clear();
-        if s.busy || s.stopping {
+        if s.busy || s.stopping || s.kernel_rewinding {
             s.compact_queued = true;
             cx.notify();
             return;
@@ -2269,6 +2686,7 @@ impl ChatApp {
             return;
         };
         let slot = &mut *slot;
+        slot.last_used = Some(Instant::now());
         let is_chunk = matches!(
             event,
             KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. }
@@ -2350,6 +2768,8 @@ impl ChatApp {
                     }),
                 };
                 if let Some(idx) = idx {
+                    // 有事发生的会话算「在用」：LRU 冷会话回收不先冷它
+                    self.sessions[idx].touch();
                     // 检查点：内容存成 blob、日志里记哈希，不进对话
                     let event = match event {
                         KernelEvent::FileChanged { path, before, after } => {
@@ -2388,6 +2808,9 @@ impl ChatApp {
                         }
                     }
                     let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
+                    if matches!(event, KernelEvent::Started { .. }) {
+                        self.persist_session_mode(idx, cx);
+                    }
                     // 端点回了「这个模型看不了图片」：把这轮用过的模型记进设置，
                     // 下次附上图时直接按「看不了」提醒（设置页里能清掉）
                     if let KernelEvent::PromptFailed { message } = &event
@@ -2500,6 +2923,7 @@ impl ChatApp {
                 meta.worktree = s.worktree.clone();
                 meta.kind = s.kind;
                 meta.web = (s.kind == SessionKind::Chat).then_some(s.web);
+                meta.mode = s.mode_id().map(str::to_string);
                 let _ = store.save_meta(&meta);
                 s.meta = Some(meta);
                 log
@@ -2551,6 +2975,49 @@ impl ChatApp {
                 self.sessions[idx].note(format!("检查点没存上（回退时还原不了 {path}）：{err}"))
             }
         }
+    }
+
+    /// 首帧后在后台恢复用量缓存并补扫追加日志，不让统计读取阻塞启动。
+    fn start_usage_index(&mut self, metas: Vec<SessionMeta>, cx: &mut Context<Self>) {
+        if self.usage_indexing {
+            return;
+        }
+        let Some(store) = self.store.clone() else { return };
+        let indexed: std::collections::HashSet<String> =
+            metas.iter().map(|m| m.id.clone()).collect();
+        self.usage_indexing = true;
+        let generation = self.usage_index_generation;
+        let index_started_ms = now_ms();
+        cx.spawn(async move |this, cx| {
+            let started_at = Instant::now();
+            let turns = cx
+                .background_executor()
+                .spawn(async move { usage::build_index(&store, &metas) })
+                .await;
+            this.update(cx, |app, cx| {
+                app.usage_indexing = false;
+                if app.usage_index_generation != generation {
+                    let metas = app.store.as_ref().map(|s| s.list()).unwrap_or_default();
+                    app.start_usage_index(metas, cx);
+                    return;
+                }
+                crate::perf_elapsed("usage_index", started_at);
+                // 索引运行期间新产生的轮次不在快照里，不能被旧结果覆盖。
+                app.usage.retain(|t| !indexed.contains(&t.session) || t.at_ms >= index_started_ms);
+                let recent: std::collections::HashSet<(String, u64)> = app
+                    .usage
+                    .iter()
+                    .filter(|t| t.at_ms >= index_started_ms)
+                    .map(|t| (t.session.clone(), t.at_ms))
+                    .collect();
+                app.usage.extend(
+                    turns.into_iter().filter(|t| !recent.contains(&(t.session.clone(), t.at_ms))),
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 一轮结束：把时间、模型、token、用时记进日志和用量统计。
@@ -2616,6 +3083,7 @@ impl ChatApp {
         let key = self.sessions[idx].kernel_key.clone();
         let agent_cmd = self.slot(&key).map(|slot| slot.agent_cmd.clone()).unwrap_or_default();
         let s = &mut self.sessions[idx];
+        let mode = s.mode_id().map(str::to_string);
         if let Some(log) = &mut s.log {
             let _ = log.flush();
         }
@@ -2628,6 +3096,7 @@ impl ChatApp {
             meta.worktree = s.worktree.clone();
             meta.kind = s.kind;
             meta.web = (s.kind == SessionKind::Chat).then_some(s.web);
+            meta.mode = mode;
             meta.updated_ms = now_ms();
             let _ = store.save_meta(meta);
         }
@@ -2752,9 +3221,11 @@ impl Render for ChatApp {
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
             .relative()
-            .children(self.render_sidebar_slot(window, cx))
+            .when(!self.settings_navigation_only(), |d| {
+                d.children(self.render_sidebar_slot(window, cx))
+            })
             .child(main)
-            .child(self.sidebar_spinners_view.clone())
+            .when(!self.settings_navigation_only(), |d| d.child(self.sidebar_spinners_view.clone()))
             .children(frame_probe);
         // 快捷键（见 keys.rs）
         self.with_key_actions(root, cx)

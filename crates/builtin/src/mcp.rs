@@ -10,17 +10,20 @@
 //!   一开始就没连上的不自动重试，设置页每个服务旁有「重新连接」。
 //! - 工具以 `mcp__<服务器>__<工具>` 的名字交给模型（和 Claude Code 一致）；调用走内核的权限流程，
 //!   「总是允许」记成 `mcp:<服务器>:<工具>`。服务器标了只读（`readOnlyHint`）的工具 Plan 模式下也能用。
-//! - 状态（连接中 / 已连接 N 个工具 / 失败原因）变了就整份经回调上报，界面在设置页显示。
+//! - 状态（连接中 / 已连接 N 个工具 / 按需连接 / 失败原因）变了就整份经回调上报，界面在设置页显示。
+//! - 工具定义按配置指纹缓存；启动命中缓存时不连接，首次调用再连，空闲 10 分钟后断开。
 
 use crate::mcp_http::{self, Http, Sink};
 use crate::tools::{OutputImage, ToolOutput};
 use claudesktop_core::{McpServerView, McpState};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
@@ -30,6 +33,7 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// 一次工具调用最长等多久（用户随时可以停）
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
+const IDLE_RECLAIM: Duration = Duration::from_secs(10 * 60);
 /// 回给模型的工具结果最多这么多字符
 const OUTPUT_MAX_CHARS: usize = 30_000;
 /// 一张工具结果图片的上限（base64 字符数，约 768KB 原始字节）：超出的丢掉留一行占位
@@ -99,6 +103,8 @@ pub struct ServerConfig {
     pub unsupported: Option<String>,
     /// 来自哪个插件；None = mcp.json
     pub plugin: Option<String>,
+    /// 插件版本等缓存失效依据；不进界面，不写进 mcp.json
+    pub cache_salt: String,
     /// OAuth 配置（`mcp.json` 里的 `"oauth"`，可省）
     pub oauth: crate::mcp_oauth::OAuthConfig,
 }
@@ -252,6 +258,7 @@ fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
                 disabled: s.get("disabled").and_then(Value::as_bool).unwrap_or(false),
                 unsupported,
                 plugin: None,
+                cache_salt: String::new(),
                 oauth: oauth_config(s.get("oauth"), &env),
             }
         })
@@ -298,7 +305,7 @@ fn expand(text: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
 }
 
 /// 服务器提供的一个工具。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpTool {
     pub name: String,
     pub description: String,
@@ -326,6 +333,31 @@ struct Server {
     state: Mutex<McpState>,
     tools: Mutex<Vec<McpTool>>,
     client: Mutex<Option<Arc<Client>>>,
+    last_used: Mutex<Instant>,
+    active_calls: AtomicUsize,
+}
+
+struct ActiveCall<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveCall<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedTools {
+    fingerprint: String,
+    tools: Vec<McpTool>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ToolsCache {
+    servers: HashMap<String, CachedTools>,
+}
+
+fn fingerprint(config: &ServerConfig) -> String {
+    format!("{:x}", Sha256::digest(format!("{config:?}").as_bytes()))
 }
 
 type StatusSink = Arc<dyn Fn(Vec<McpServerView>) + Send + Sync>;
@@ -340,6 +372,8 @@ pub struct McpHub {
     extra: Mutex<Vec<ServerConfig>>,
     /// 每次重新加载 +1；旧一代的连接线程连上了也不再上报
     generation: AtomicU64,
+    cache_path: Option<PathBuf>,
+    cache_write: Mutex<()>,
 }
 
 impl McpHub {
@@ -348,6 +382,8 @@ impl McpHub {
         cwd: PathBuf,
         on_status: impl Fn(Vec<McpServerView>) + Send + Sync + 'static,
     ) -> Arc<Self> {
+        let cache_path =
+            config_path.as_deref().and_then(Path::parent).map(|dir| dir.join("mcp-tools.json"));
         Arc::new(Self {
             config_path,
             cwd,
@@ -355,6 +391,8 @@ impl McpHub {
             servers: Mutex::new(Vec::new()),
             extra: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
+            cache_path,
+            cache_write: Mutex::new(()),
         })
     }
 
@@ -368,8 +406,17 @@ impl McpHub {
         true
     }
 
-    /// 重新读配置、断开旧连接、在后台逐个连接（不阻塞调用方）。
+    /// 手动刷新：重新读配置并真实重连全部启用的服务器。
     pub fn reload(self: &Arc<Self>) {
+        self.reload_inner(false);
+    }
+
+    /// 内核启动：命中有效工具缓存的服务器先进入按需连接，不启动进程。
+    pub fn reload_lazy(self: &Arc<Self>) {
+        self.reload_inner(true);
+    }
+
+    fn reload_inner(self: &Arc<Self>, lazy: bool) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let configs = match &self.config_path {
             Some(path) => load_config(path),
@@ -385,20 +432,33 @@ impl McpHub {
             }
             configs
         });
+        let cache = self.cache_path.as_deref().and_then(|path| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ToolsCache>(&bytes).ok())
+        });
         let servers: Vec<Arc<Server>> = match configs {
             Ok(configs) => configs
                 .into_iter()
                 .map(|config| {
-                    let state = match (&config.unsupported, config.disabled) {
-                        (Some(reason), _) => McpState::Failed(reason.clone()),
-                        (None, true) => McpState::Disabled,
-                        (None, false) => McpState::Connecting,
+                    let cached = lazy
+                        .then(|| cache.as_ref()?.servers.get(&config.name))
+                        .flatten()
+                        .filter(|c| c.fingerprint == fingerprint(&config))
+                        .map(|c| c.tools.clone());
+                    let (state, tools) = match (&config.unsupported, config.disabled, cached) {
+                        (Some(reason), _, _) => (McpState::Failed(reason.clone()), Vec::new()),
+                        (None, true, _) => (McpState::Disabled, Vec::new()),
+                        (None, false, Some(tools)) => (McpState::Idle, tools),
+                        (None, false, None) => (McpState::Connecting, Vec::new()),
                     };
                     Arc::new(Server {
                         config,
                         state: Mutex::new(state),
-                        tools: Mutex::new(Vec::new()),
+                        tools: Mutex::new(tools),
                         client: Mutex::new(None),
+                        last_used: Mutex::new(Instant::now()),
+                        active_calls: AtomicUsize::new(0),
                     })
                 })
                 .collect(),
@@ -412,6 +472,8 @@ impl McpHub {
                 state: Mutex::new(McpState::Failed(reason)),
                 tools: Mutex::new(Vec::new()),
                 client: Mutex::new(None),
+                last_used: Mutex::new(Instant::now()),
+                active_calls: AtomicUsize::new(0),
             })],
         };
         // 旧连接在这里随 Server 一起释放（Client 的 Drop 结束子进程）
@@ -447,7 +509,10 @@ impl McpHub {
             let mut state = server.state.lock().unwrap();
             let stuck = matches!(
                 *state,
-                McpState::Failed(_) | McpState::Reconnecting(_) | McpState::NeedsAuth { .. }
+                McpState::Idle
+                    | McpState::Failed(_)
+                    | McpState::Reconnecting(_)
+                    | McpState::NeedsAuth { .. }
             );
             if !stuck || server.config.unsupported.is_some() || server.config.disabled {
                 return;
@@ -502,6 +567,58 @@ impl McpHub {
         Ok(())
     }
 
+    fn save_cached_tools(&self, server: &Server) {
+        let Some(path) = &self.cache_path else { return };
+        let _guard = self.cache_write.lock().unwrap();
+        let mut cache = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ToolsCache>(&bytes).ok())
+            .unwrap_or_default();
+        cache.servers.insert(
+            server.config.name.clone(),
+            CachedTools {
+                fingerprint: fingerprint(&server.config),
+                tools: server.tools.lock().unwrap().clone(),
+            },
+        );
+        let Some(parent) = path.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec(&cache)
+            && std::fs::write(&tmp, bytes).is_ok()
+        {
+            let _ = std::fs::rename(tmp, path);
+        }
+    }
+
+    /// 断开十分钟未使用的 MCP；缓存的工具定义保留，下次调用自动重连。
+    pub fn reclaim_idle(&self) {
+        let mut changed = false;
+        for server in self.servers.lock().unwrap().iter() {
+            if server.active_calls.load(Ordering::SeqCst) != 0
+                || server.last_used.lock().unwrap().elapsed() < IDLE_RECLAIM
+            {
+                continue;
+            }
+            let mut state = server.state.lock().unwrap();
+            if *state != McpState::Ready {
+                continue;
+            }
+            *state = McpState::Idle;
+            drop(state);
+            server.client.lock().unwrap().take();
+            changed = true;
+            if std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok() {
+                eprintln!("[perf] idle_reclaim:mcp:{}", server.config.name);
+            }
+        }
+        if changed {
+            self.report();
+        }
+    }
+
     fn report(&self) {
         (self.on_status)(self.status());
     }
@@ -540,7 +657,10 @@ impl McpHub {
     pub fn specs(&self, writable: bool, exclude: &[String]) -> Vec<Value> {
         let mut specs = Vec::new();
         for server in self.servers.lock().unwrap().iter() {
-            if *server.state.lock().unwrap() != McpState::Ready {
+            if !matches!(
+                *server.state.lock().unwrap(),
+                McpState::Ready | McpState::Idle | McpState::Connecting
+            ) {
                 continue;
             }
             if exclude.iter().any(|e| e == &server.config.name) {
@@ -574,29 +694,92 @@ impl McpHub {
         })
     }
 
-    /// 调用一个工具；`stopped` 为真时发取消通知并放弃等待。
+    fn ensure_client(
+        self: &Arc<Self>,
+        server: &Arc<Server>,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Arc<Client>, String> {
+        if let Some(client) = server.client.lock().unwrap().clone() {
+            return Ok(client);
+        }
+        let mut state_guard = server.state.lock().unwrap();
+        let lazy = *state_guard == McpState::Idle;
+        if lazy {
+            *state_guard = McpState::Connecting;
+        }
+        let state = state_guard.clone();
+        drop(state_guard);
+        if lazy {
+            self.report();
+            let started_at = Instant::now();
+            let result =
+                establish(&Arc::downgrade(self), server, self.generation.load(Ordering::SeqCst));
+            match result {
+                Ok((client, tools)) => {
+                    if std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok() {
+                        eprintln!(
+                            "[perf] mcp_lazy_connect:{}: {:.2} ms",
+                            server.config.name,
+                            started_at.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    server.ready(client.clone(), tools);
+                    self.save_cached_tools(server);
+                    self.report();
+                    return Ok(client);
+                }
+                Err(reason) => {
+                    *server.state.lock().unwrap() = McpState::Failed(reason.clone());
+                    self.report();
+                    return Err(reason);
+                }
+            }
+        }
+        if state == McpState::Connecting {
+            let started_at = Instant::now();
+            while started_at.elapsed() < INIT_TIMEOUT {
+                if stopped() {
+                    return Err("已中断".into());
+                }
+                if let Some(client) = server.client.lock().unwrap().clone() {
+                    return Ok(client);
+                }
+                if *server.state.lock().unwrap() != McpState::Connecting {
+                    return Err("服务器没连上".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return Err("等待服务器连接超时".into());
+        }
+        Err("服务器没连上".into())
+    }
+
+    /// 调用一个工具；按需连接会先建立连接，`stopped` 为真时放弃等待。
     pub fn call(
-        &self,
+        self: &Arc<Self>,
         server: &str,
         tool: &str,
         arguments: Value,
         stopped: &dyn Fn() -> bool,
     ) -> ToolOutput {
-        let client = self
-            .servers
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|s| s.config.name == server)
-            .and_then(|s| s.client.lock().unwrap().clone());
-        let Some(client) = client else {
-            return ToolOutput::fail(
-                format!("MCP server `{server}` is not connected."),
-                "服务器没连上",
-            );
+        let server = self.servers.lock().unwrap().iter().find(|s| s.config.name == server).cloned();
+        let Some(server) = server else {
+            return ToolOutput::fail("unknown MCP server", "没有这个服务器");
+        };
+        server.active_calls.fetch_add(1, Ordering::SeqCst);
+        let _active = ActiveCall(&server.active_calls);
+        *server.last_used.lock().unwrap() = Instant::now();
+        let client = match self.ensure_client(&server, stopped) {
+            Ok(client) => client,
+            Err(err) if stopped() => {
+                return ToolOutput::fail(format!("cancelled: {err}"), "已中断");
+            }
+            Err(err) => return ToolOutput::fail(format!("MCP error: {err}"), short(&err, 40)),
         };
         let params = json!({ "name": tool, "arguments": arguments });
-        match client.request("tools/call", params, CALL_TIMEOUT, stopped) {
+        let result = client.request("tools/call", params, CALL_TIMEOUT, stopped);
+        *server.last_used.lock().unwrap() = Instant::now();
+        match result {
             Ok(result) => render_result(&result),
             Err(e) if stopped() => ToolOutput::fail(format!("cancelled: {e}"), "已中断"),
             Err(e) => ToolOutput::fail(format!("MCP error: {e}"), short(&e, 40)),
@@ -612,6 +795,7 @@ impl Drop for McpHub {
 
 /// 后台连接一个服务器，成功 / 失败都上报（已经换代的不报）。一开始就没连上的不自动重试。
 fn connect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64) {
+    let started_at = Instant::now();
     let result = establish(&hub, &server, generation);
     let Some(hub) = hub.upgrade() else {
         return;
@@ -619,8 +803,20 @@ fn connect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64) {
     if hub.generation.load(Ordering::SeqCst) != generation {
         return;
     }
+    match &result {
+        Ok((_, tools)) if std::env::var("CLAUDESKTOP_BENCH_STARTUP").is_ok() => eprintln!(
+            "[perf] mcp_connect:{}: {:.2} ms ({} tools)",
+            server.config.name,
+            started_at.elapsed().as_secs_f64() * 1000.0,
+            tools.len()
+        ),
+        _ => {}
+    }
     match result {
-        Ok((client, tools)) => server.ready(client, tools),
+        Ok((client, tools)) => {
+            server.ready(client, tools);
+            hub.save_cached_tools(&server);
+        }
         Err(reason) => *server.state.lock().unwrap() = McpState::Failed(reason),
     }
     hub.report();
@@ -651,6 +847,7 @@ fn reconnect(hub: Weak<McpHub>, server: Arc<Server>, generation: u64, mut reason
             Ok((client, tools)) => {
                 let Some(hub) = hub.upgrade().filter(|h| current(h)) else { return };
                 server.ready(client, tools);
+                hub.save_cached_tools(&server);
                 hub.report();
                 return;
             }
@@ -725,6 +922,7 @@ fn establish(
                     && hub.generation.load(Ordering::SeqCst) == generation
                 {
                     *server.tools.lock().unwrap() = tools;
+                    hub.save_cached_tools(&server);
                     hub.report();
                 }
             });
@@ -804,6 +1002,7 @@ impl Server {
     fn ready(&self, client: Arc<Client>, tools: Vec<McpTool>) {
         *self.tools.lock().unwrap() = tools;
         *self.client.lock().unwrap() = Some(client);
+        *self.last_used.lock().unwrap() = Instant::now();
         *self.state.lock().unwrap() = McpState::Ready;
     }
 }
@@ -1334,6 +1533,32 @@ mod tests {
         assert_eq!(function_name("my server", "a.b"), "mcp__my_server__a_b");
         assert_eq!(function_name(&"s".repeat(80), "t").len(), 64);
         assert!(is_mcp_tool("mcp__x__y") && !is_mcp_tool("read_file"));
+    }
+
+    #[test]
+    fn cache_fingerprint_and_idle_reclaim_respect_activity() {
+        let mut config =
+            ServerConfig { name: "local".into(), command: "node".into(), ..Default::default() };
+        let first = fingerprint(&config);
+        config.cache_salt = "2.0".into();
+        assert_ne!(first, fingerprint(&config));
+
+        let server = Arc::new(Server {
+            config,
+            state: Mutex::new(McpState::Ready),
+            tools: Mutex::new(Vec::new()),
+            client: Mutex::new(None),
+            last_used: Mutex::new(Instant::now() - IDLE_RECLAIM),
+            active_calls: AtomicUsize::new(0),
+        });
+        let hub = McpHub::new(None, PathBuf::from("."), |_| {});
+        hub.servers.lock().unwrap().push(server.clone());
+        server.active_calls.fetch_add(1, Ordering::SeqCst);
+        hub.reclaim_idle();
+        assert_eq!(*server.state.lock().unwrap(), McpState::Ready);
+        server.active_calls.fetch_sub(1, Ordering::SeqCst);
+        hub.reclaim_idle();
+        assert_eq!(*server.state.lock().unwrap(), McpState::Idle);
     }
 
     #[test]

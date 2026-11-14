@@ -157,7 +157,7 @@ pub(super) fn version_chip(
                 }
             }
         })
-        .content(move |_, _, cx| {
+        .content(move |_, window, cx| {
             let form = handle.read(cx).version_form();
             let (loading, tags, busy) = (form.loading(&repo), form.tags(&repo), form.busy());
             let popover = cx.entity();
@@ -224,7 +224,7 @@ pub(super) fn version_chip(
                         .child("正在换版本，稍等"),
                 );
             }
-            list.finish(&focus)
+            list.finish(&focus, window, cx)
         });
     popover.into_any_element()
 }

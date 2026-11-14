@@ -192,6 +192,13 @@ pub(super) const JUMP_MAX: Duration = Duration::from_millis(500);
 pub(super) const WHEEL_TAU: f32 = 0.05;
 /// 一串滚轮最后一格之后最多再滑这么久（正常 4 倍 TAU 就到了，这是兜底）
 pub(super) const WHEEL_MAX: Duration = Duration::from_millis(600);
+/// 滚轮一格先同步走的比例：手指一滚内容就动（稳重感的来源），剩下部分才进平滑目标
+pub(super) const WHEEL_INSTANT: f32 = 0.5;
+/// 平滑目标最多领先当前位置这么多：连滚几格时欠账有上限，停下后不会还自己滑一大段
+pub(super) const WHEEL_MAX_LEAD: Pixels = px(120.);
+/// 平滑一帧最多走这么多：卡顿帧（进了高行要排版）不许一步跨出剩余距离的大半，
+/// 宁可多滑几帧，不能「瞬移」——否则滚动途中会突然跳一大截
+pub(super) const WHEEL_MAX_STEP: Pixels = px(48.);
 
 /// 「回到底部」的平滑滚动进行中：哪个会话、何时开始、上一帧的时刻。
 #[derive(Clone, Copy)]

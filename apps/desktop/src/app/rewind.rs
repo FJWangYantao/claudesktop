@@ -145,7 +145,7 @@ impl ChatApp {
             return;
         };
         let s = &self.sessions[active];
-        if p.key != (s.token, item) || p.error.is_some() || s.busy {
+        if p.key != (s.token, item) || p.error.is_some() || s.busy || s.kernel_rewinding {
             return;
         }
         let conversation = conversation && p.conversation;
@@ -206,9 +206,27 @@ impl ChatApp {
             let kernel = self.session_kernel(active);
             if let (Some(kernel), Some(sid)) = (kernel, self.sessions[active].acp_id.clone())
                 && let Some(records) = self.effective_records(active)
-                && let Err(err) = kernel.rewind(&sid, &records)
             {
-                self.sessions[active].note(format!("内核的上下文没能跟着回退：{err}"));
+                let token = self.sessions[active].token;
+                self.sessions[active].kernel_rewinding = true;
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { kernel.rewind(&sid, &records) })
+                        .await;
+                    let _ = this.update(cx, |app, cx| {
+                        let Some(idx) = app.session_index(token) else { return };
+                        app.sessions[idx].kernel_rewinding = false;
+                        if let Err(err) = result {
+                            app.sessions[idx].note(format!("内核的上下文没能跟着回退：{err}"));
+                        }
+                        if !app.queued_compaction(idx) {
+                            app.dispatch_queued(idx, cx);
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
         }
         let s = &mut self.sessions[active];
@@ -226,7 +244,8 @@ impl ChatApp {
 
     /// 用户消息下方的「回退」：点开是确认浮层（行内确认，不弹模态框）。这一轮在跑时置灰。
     pub(super) fn rewind_action(&self, item: usize, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.session().busy;
+        let session = self.session();
+        let busy = session.busy || session.kernel_rewinding;
         let button = Self::message_action(("rewind-user", item), IconAll::Undo2, "回退", cx);
         if busy {
             return button.disabled(true).tooltip("这一轮还在跑，先停下再回退").into_any_element();

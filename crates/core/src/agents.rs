@@ -186,8 +186,8 @@ impl Detected {
 
 /// 发现本机的 agent：结果为「装了的」（没装的不在列表里，界面按 [`PRESETS`] 补一行「未安装」）。
 ///
-/// 要起几个子进程（每家一次 `--version`），在后台线程里跑；界面缓存结果，
-/// 设置页打开 / 点「重新检测」时刷新。
+/// 要起几个子进程（每家一次 `--version`），在后台线程里跑；界面首次进入内核页时检测，
+/// 在本次应用启动中缓存结果，点「刷新」才重新检测。
 pub fn discover() -> Vec<Detected> {
     let mut paths = search_paths();
     paths.extend(common_install_dirs());

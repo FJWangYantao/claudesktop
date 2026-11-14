@@ -410,6 +410,8 @@ pub struct McpServerView {
 pub enum McpState {
     Connecting,
     Ready,
+    /// 工具定义来自有效缓存；进程或连接在首次调用时才建立
+    Idle,
     /// 起不来、握手失败或中途退出：原因（含服务器 stderr 的最后几行）
     Failed(String),
     /// 连上过、断了，正在退避重连：断开的原因和下次重连的说明
@@ -636,6 +638,15 @@ impl SessionSpec {
     }
 }
 
+/// 内核保存的完整历史现状；字节数是排查用的估算，不代替进程内存测量。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KernelHistoryStats {
+    pub resident_sessions: usize,
+    pub dormant_sessions: usize,
+    pub transitioning_sessions: usize,
+    pub resident_bytes: usize,
+}
+
 /// 可更换内核的统一抽象。
 ///
 /// 实现方负责把指令转发到自己的运行时；事件一律经
@@ -736,6 +747,8 @@ pub trait Kernel: Send + Sync {
     }
     /// 重新读 MCP 配置、重连全部服务器；结果经 `McpStatus` 回报。默认没有 MCP。
     fn reload_mcp(&self) {}
+    /// 回收长时间未调用的 MCP 连接；工具缓存保留。默认没有 MCP。
+    fn reclaim_idle_mcp(&self) {}
     /// 重连一个没连上的 MCP 服务器（设置页的「重新连接」）。
     fn reconnect_mcp(&self, _server: &str) {}
     /// 清除一个 MCP 服务器存着的登录状态（OAuth 令牌），并重连它：状态回到「没连上 / 需要登录」。
@@ -751,6 +764,23 @@ pub trait Kernel: Send + Sync {
     fn close_session(&self, _session: &str) {}
     /// 停掉一条后台命令（自研内核的 `shell_background` 起的）。默认没有后台命令。
     fn stop_background_task(&self, _id: &str) {}
+    /// 把空闲会话的完整历史落盘；默认不实现（ACP 内核不做）。
+    /// 实现方在自身工作线程里做磁盘 I/O，调用方不得在界面线程直接调用。
+    fn hibernate_session(&self, _session: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// 预恢复休眠的完整历史；会话 ID 和其余状态不变，不产生新的 `Started`。
+    fn wake_session(&self, _session: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// 完整历史的驻留 / 休眠现状，供内存日志和压测使用。
+    fn history_stats(&self) -> KernelHistoryStats {
+        KernelHistoryStats::default()
+    }
+    /// 空闲时能否关闭并在下次发送时恢复上下文；只有支持续接的外部内核返回 true。
+    fn can_idle_shutdown(&self) -> bool {
+        false
+    }
     /// 关闭内核。
     fn shutdown(&self);
 }

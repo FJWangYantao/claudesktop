@@ -1,36 +1,20 @@
 //! 设置页各分类共用的排版件：分区标题、设置行、选择列表、步骤式说明、可展开的示例。
 //!
-//! 和首页一个路子：用「面」分层（沙色面板里放白色行），少描边；说明只留一句「这是干什么的」，
-//! 收进标题旁的 ⓘ（悬停看），怎么用写成编号步骤放进空状态，格式细节收进「示例」里按需展开。
+//! 用「面」分层（沙色面板里放白色行），标题旁不挂说明图标；
+//! 空状态保留必要操作指引，格式细节收进「示例」里按需展开。
 
 use super::ChatApp;
 use super::motion::{self, Reveal};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-/// 标题旁的 ⓘ：悬停显示说明。说明一律收在这里，页面上只留标题和控件；空说明不画。
-pub(super) fn info_tip(key: &str, tip: SharedString) -> Option<AnyElement> {
-    (!tip.is_empty()).then(|| {
-        div()
-            .id(ElementId::Name(format!("info-tip-{key}").into()))
-            .flex_none()
-            .text_color(rgb(INK_FAINT))
-            .hover(|d| d.text_color(rgb(INK_SOFT)))
-            .child(Icon::new(IconAll::Info).size_3p5())
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-            .into_any_element()
-    })
-}
-
-/// 一个分区：标题（说明收进旁边的 ⓘ），右边可挂操作按钮，下面是内容。
+/// 一个分区：标题，右边可挂操作按钮，下面是内容。
 pub(super) fn section(
     title: &'static str,
-    desc: impl Into<SharedString>,
     actions: Option<AnyElement>,
     body: impl IntoElement,
 ) -> Div {
@@ -44,50 +28,33 @@ pub(super) fn section(
                 .gap_3()
                 .child(
                     div()
-                        .h_flex()
-                        .items_center()
                         .flex_1()
                         .min_w_0()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .text_size(TEXT_LEAD)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(INK))
-                                .child(title),
-                        )
-                        .children(info_tip(title, desc.into())),
+                        .text_size(TEXT_LEAD)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(INK))
+                        .child(title),
                 )
                 .when_some(actions, |d, a| d.child(div().flex_none().h_flex().gap_1p5().child(a))),
         )
         .child(body)
 }
 
-/// 设置项的一行：左边标题 + ⓘ 说明（空串不画），右边控件。
-pub(super) fn setting_row(
-    title: impl Into<SharedString>,
-    tip: impl Into<SharedString>,
-    control: impl IntoElement,
-) -> Div {
-    row(title.into(), tip.into(), None, control)
+/// 设置项的一行：左边标题，右边控件。
+pub(super) fn setting_row(title: impl Into<SharedString>, control: impl IntoElement) -> Div {
+    row(title.into(), None, control)
 }
 
 /// 同 [`setting_row`]，标题下面再挂一行不算说明的东西（文件路径、日志操作按钮）。
 pub(super) fn setting_row_with(
     title: impl Into<SharedString>,
-    tip: impl Into<SharedString>,
     extra: impl IntoElement,
     control: impl IntoElement,
 ) -> Div {
-    row(title.into(), tip.into(), Some(extra.into_any_element()), control)
+    row(title.into(), Some(extra.into_any_element()), control)
 }
 
-fn row(
-    title: SharedString,
-    tip: SharedString,
-    extra: Option<AnyElement>,
-    control: impl IntoElement,
-) -> Div {
+fn row(title: SharedString, extra: Option<AnyElement>, control: impl IntoElement) -> Div {
     // 放不下时控件换到下一行：文字列按 14rem 起算参与折行（不然宽控件会把它挤成一个字宽、竖着排），
     // 同一行放得下时再长满剩下的宽度
     div()
@@ -96,7 +63,7 @@ fn row(
         .items_center()
         .gap_x_4()
         .gap_y_2()
-        .py_3p5()
+        .py_2()
         .child(
             div()
                 .v_flex()
@@ -107,17 +74,10 @@ fn row(
                 .gap_0p5()
                 .child(
                     div()
-                        .h_flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .text_size(TEXT_BODY)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(INK))
-                                .child(title.clone()),
-                        )
-                        .children(info_tip(&title, tip)),
+                        .text_size(TEXT_BODY)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(INK))
+                        .child(title),
                 )
                 .when_some(extra, |d, extra| {
                     d.child(
@@ -143,34 +103,30 @@ pub(super) fn setting_group(rows: impl IntoIterator<Item = Div>) -> Div {
     group
 }
 
-/// 表单里的一项：左边固定宽的标签（提示收进旁边的 ⓘ），右边输入框。
-pub(super) fn form_field(
-    label: &'static str,
-    hint: Option<SharedString>,
-    input: impl IntoElement,
-) -> Div {
+pub(super) fn compact_setting_group(rows: impl IntoIterator<Item = Div>) -> Div {
+    setting_group(rows.into_iter().map(|row| row.min_h(rems(2.25)).py_1()))
+}
+
+/// 表单里的一项：左边固定宽的标签，右边输入框。
+pub(super) fn form_field(label: &'static str, input: impl IntoElement) -> Div {
     div()
         .h_flex()
         .items_start()
-        .gap_4()
+        .gap_3()
         .child(
             // 标签和输入框文字基线大致对齐：输入框上下各有内边距
             div()
-                .w(rems(6.5))
+                .w(rems(5.5))
                 .flex_none()
-                .h_flex()
-                .items_center()
-                .gap_1()
                 .pt_1p5()
                 .text_size(TEXT_BODY)
                 .text_color(rgb(INK))
-                .child(label)
-                .children(hint.and_then(|h| info_tip(label, h))),
+                .child(label),
         )
         .child(div().v_flex().flex_1().min_w_0().child(input))
 }
 
-/// 选择列表（默认内核、服务商档案）的外壳：沙色面板，和首页「先接上一个模型」同款。
+/// 选择列表（服务商档案、首页引导）的外壳：沙色面板。
 pub(super) fn choice_panel() -> Div {
     div().v_flex().gap_0p5().p_1().rounded_xl().bg(rgb(SAND))
 }
@@ -192,7 +148,7 @@ pub(super) fn choice_row(
         .items_center()
         .gap_3()
         .px_3()
-        .py_2p5()
+        .py_1p5()
         .rounded_lg()
         .cursor_pointer()
         .when(active, |d| d.bg(rgb(CARD)))

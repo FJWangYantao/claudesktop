@@ -3,8 +3,11 @@
 //! 每轮结束时日志里写一条 [`Record::Turn`]；这之前的旧日志没有它，
 //! 用户消息的时间就退回会话的最后更新时间、模型从内核标识里猜。
 
-use claudesktop_core::{Record, SessionMeta};
+use claudesktop_core::{Record, SessionMeta, SessionStore};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 /// 窗口用到这个比例，自研内核就会在下次请求前自动压缩（和内核同一个数，见
 /// [`claudesktop_builtin::AUTO_COMPACT_PERCENT`]）。
@@ -15,7 +18,7 @@ pub const HEAT_ROWS: usize = 7;
 pub const HEAT_COLS: usize = 26;
 
 /// 一轮对话（一条用户消息）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TurnStat {
     /// 本地会话 ID（统计会话数用）
     pub session: String,
@@ -25,21 +28,37 @@ pub struct TurnStat {
 }
 
 /// 从一个会话的日志里取出每轮统计。
+#[cfg(test)]
 pub fn collect(meta: &SessionMeta, records: &[Record]) -> Vec<TurnStat> {
-    let fallback_model = meta
-        .agent
+    let mut entry = UsageEntry::default();
+    for record in records {
+        entry.apply(meta, record);
+    }
+    entry.stats(meta)
+}
+
+fn fallback_model(meta: &SessionMeta) -> Option<String> {
+    meta.agent
         .strip_prefix("builtin:")
         .and_then(|rest| rest.rsplit_once('#'))
-        .map(|(_, model)| model.to_string());
-    let mut turns = Vec::new();
-    // 已发出、还没等到 Turn 记录的用户消息数
-    let mut pending = 0usize;
-    for record in records {
+        .map(|(_, model)| model.to_string())
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct UsageEntry {
+    offset: u64,
+    modified_ms: u64,
+    turns: Vec<TurnStat>,
+    pending: usize,
+}
+
+impl UsageEntry {
+    fn apply(&mut self, meta: &SessionMeta, record: &Record) {
         match record {
-            Record::User { .. } => pending += 1,
-            Record::Turn { at_ms, model, input_tokens, output_tokens, .. } if pending > 0 => {
-                pending -= 1;
-                turns.push(TurnStat {
+            Record::User { .. } => self.pending += 1,
+            Record::Turn { at_ms, model, input_tokens, output_tokens, .. } if self.pending > 0 => {
+                self.pending -= 1;
+                self.turns.push(TurnStat {
                     session: meta.id.clone(),
                     at_ms: *at_ms,
                     model: model.clone(),
@@ -49,15 +68,96 @@ pub fn collect(meta: &SessionMeta, records: &[Record]) -> Vec<TurnStat> {
             _ => {}
         }
     }
-    for _ in 0..pending {
-        turns.push(TurnStat {
+
+    fn stats(&self, meta: &SessionMeta) -> Vec<TurnStat> {
+        let mut turns = self.turns.clone();
+        turns.extend((0..self.pending).map(|_| TurnStat {
             session: meta.id.clone(),
             at_ms: meta.updated_ms,
-            model: fallback_model.clone(),
+            model: fallback_model(meta),
             tokens: 0,
-        });
+        }));
+        turns
     }
-    turns
+}
+
+#[derive(Serialize, Deserialize)]
+struct UsageCache {
+    version: u32,
+    sessions: HashMap<String, UsageEntry>,
+}
+
+impl Default for UsageCache {
+    fn default() -> Self {
+        Self { version: 1, sessions: HashMap::new() }
+    }
+}
+
+fn modified_ms(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// 后台建立用量索引：缓存命中时只读追加的完整行，末尾半行留到下次。
+pub fn build_index(store: &SessionStore, metas: &[SessionMeta]) -> Vec<TurnStat> {
+    let cache_path = store.dir().parent().unwrap_or(store.dir()).join("usage-cache.json");
+    let mut cache = std::fs::read(&cache_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<UsageCache>(&bytes).ok())
+        .filter(|cache| cache.version == 1)
+        .unwrap_or_default();
+    let mut all = Vec::new();
+    for meta in metas {
+        let path = store.log_path(&meta.id);
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let modified = modified_ms(&path);
+        let mut entry = cache
+            .sessions
+            .remove(&meta.id)
+            .filter(|e| e.offset <= len && (e.offset < len || e.modified_ms == modified))
+            .unwrap_or_default();
+        if entry.offset < len {
+            let read = (|| -> std::io::Result<()> {
+                let mut file = File::open(&path)?;
+                file.seek(SeekFrom::Start(entry.offset))?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                let mut consumed = 0usize;
+                for line in bytes.split_inclusive(|b| *b == b'\n') {
+                    if !line.ends_with(b"\n") {
+                        break;
+                    }
+                    consumed += line.len();
+                    if let Ok(line) = std::str::from_utf8(line)
+                        && let Ok(record) = serde_json::from_str::<Record>(line)
+                    {
+                        entry.apply(meta, &record);
+                    }
+                }
+                entry.offset += consumed as u64;
+                Ok(())
+            })();
+            if let Err(err) = read {
+                eprintln!("[claudesktop] 用量索引读取 {} 失败：{err}", meta.id);
+            }
+        }
+        entry.modified_ms = modified;
+        all.extend(entry.stats(meta));
+        cache.sessions.insert(meta.id.clone(), entry);
+    }
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = cache_path.with_extension("json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(&cache)
+        && std::fs::write(&tmp, bytes).is_ok()
+    {
+        let _ = std::fs::rename(tmp, &cache_path);
+    }
+    all
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -548,6 +648,7 @@ mod tests {
             worktree: None,
             kind: claudesktop_core::SessionKind::Code,
             web: None,
+            mode: None,
         }
     }
 
@@ -578,6 +679,46 @@ mod tests {
         // 没有 Turn 记录的：会话更新时间 + 从内核标识里取的模型
         assert_eq!((turns[2].at_ms, turns[2].model.as_deref()), (99, Some("gem")));
         assert_eq!(collect(&meta("node mock.mjs"), &[user()])[0].model, None);
+    }
+
+    #[core::prelude::v1::test]
+    fn index_reuses_offsets_and_tracks_pending_turns() {
+        let root = std::env::temp_dir().join(format!(
+            "claudesktop-usage-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let store = SessionStore::open(root.join("sessions")).unwrap();
+        let (meta, mut log) =
+            store.create("测试", std::path::PathBuf::from("."), "builtin:http://x/v1#m").unwrap();
+        log.append(user()).unwrap();
+        log.append(turn(10, Some("m"), 5)).unwrap();
+        log.flush().unwrap();
+        let metas = store.list();
+        assert_eq!(build_index(&store, &metas), collect(&meta, &store.load(&meta.id).unwrap()));
+        let cache_path = root.join("usage-cache.json");
+        let cache: UsageCache =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        let offset = cache.sessions[&meta.id].offset;
+        assert!(offset > 0);
+
+        log.append(user()).unwrap();
+        log.flush().unwrap();
+        let metas = store.list();
+        let pending = build_index(&store, &metas);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1].tokens, 0);
+        let cache: UsageCache =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        assert!(cache.sessions[&meta.id].offset > offset);
+
+        log.append(turn(20, Some("m"), 7)).unwrap();
+        log.flush().unwrap();
+        let complete = build_index(&store, &store.list());
+        assert_eq!(complete.len(), 2);
+        assert_eq!(complete[1].at_ms, 20);
+        drop(log);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[core::prelude::v1::test]

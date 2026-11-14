@@ -154,6 +154,7 @@ impl Harness {
                 subagent_model: None,
                 chat_web: true,
                 chat_instructions: None,
+                hibernation_dir: None,
             },
             sink,
         )

@@ -22,7 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 设置页里「用量」占的分类下标（不在导航里列，见 `render_settings`）
-pub(super) const USAGE_TAB: usize = 7;
+pub(super) const USAGE_TAB: usize = 8;
 
 /// 会话排行先列多少行；「再显示」每次多列这么多
 const PAGE_ROWS: usize = 6;
@@ -92,6 +92,8 @@ impl ChatApp {
         } else {
             self.open_settings_at(USAGE_TAB, window, cx);
         }
+        self.settings_wheel = None;
+        self.model_wheel = None;
         self.settings_scroll.set_offset(point(px(0.), px(0.)));
         self.sync_requests(cx);
         cx.notify();

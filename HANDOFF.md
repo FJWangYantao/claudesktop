@@ -13,15 +13,49 @@
   坑：路径里的 ASCII 标点（`/` `?` `=` `&`）必须继续吞、只有非 ASCII 标点才收尾——第一版补丁按
   「是标点就收」写，URL 的路径被砍掉，被这个测试当场抓回来。
 - 本机内存小，本地 `cargo test` / `cargo check` 会因页面文件太小（os error 1455）失败：改动直接提交，验证交给 CI。
+- **含中文的 `.ps1` 必须带 UTF-8 BOM**（2026-11-14 实锤）：PowerShell 5.1 对无 BOM 文件按
+  ANSI（GBK）解码，中文注释 / 字符串里的 UTF-8 字节会跟后面的 ASCII 配对吞字符，
+  报一堆莫须有的语法错（「,」后面缺少表达式、字符串缺少终止符）。Edit/Write 工具重写整个
+  脚本会丢 BOM——改完用 `printf '\xef\xbb\xbf'` 补回头三个字节，再用
+  `[System.Management.Automation.Language.Parser]::ParseFile` 验一遍。
 - **`target/` 旧产物会坏**（2026-11-12 实锤）：`target/debug/build/ring-*/` 的 build script
   残留一旦被杀毒 / 360 动过，再编就在 `cc-rs` 报 `exit code: 2`（cl.exe 的 `D8050: 未能将命令行
   放入调试记录中`，真实原因被 cc 吞了）。同样的源码换个 `CARGO_TARGET_DIR` 就能编。
   **修法：`CARGO_TARGET_DIR=D:/t3 cargo build`（干净目录，一次性编完约 2 分钟）**，
+  项目内新建 `target/compact-verify` 仍会在同一步失败（2026-11-13），仅换子目录不够。
   或删 `target/debug/build/ring-*` 后换新目录。别再顺着 cc-rs / vcvars / CFLAGS 排查——
   那条路本机已全部证伪（INCLUDE/LIB/并发内存都不是原因）。
 
 ## UI / gpui
 
+- **冷会话回收的首次实测（2026-11-14，50 会话×3 轮 A/B，`CLAUDESKTOP_STRESS_SESSIONS`）**：
+  逻辑数据确实回收了（`[mem]` retained 43 MB → 3 MB、loaded 45 → 4，淘汰 15 个省 ~15 MB），
+  **但主进程 PB 没降**——两组末段稳态都是 ~186 MB。原因：Windows 系统堆不把释放的页
+  还给系统（提交停在高水位），且 2/3 轮重加载又重新分配同量内存，峰值反而多 ~14 MB
+  （201 vs 187）。WS 只降 ~6 MB（132 vs 138）。结论：**冷回收挡住了「无限增长」
+  （不回收时 loaded=50 常驻），但要真降 PB 得分配器配合**（会话独立 arena、HeapCompact、
+  或换 mimalloc 这类带 decommit 的分配器）——这是下一批的事。数据在
+  `tools/mem-baseline.csv` / `tools/mem-reclaim.csv`。重加载的峰值代价也值得注意：
+  高频来回切 50 个会话时，重分配可能让高水位不降反升。
+- **资源登记表（公式 SVG / 远程图片）别再用 `Box::leak`**（2026-11-14 改）：现在字节装在
+  `Arc<Vec<u8>>` 里、按 24 MiB 预算 LRU 淘汰，挤出内存的写到数据目录 `cache/assets/`，
+  `Assets::load` 未命中内存再从盘读回。闭环成立的前提：**`svg().path()` 每次图集未命中
+  都会重新走 `AssetSource::load`**（`window.paint_svg` 只按名字查 sprite atlas），
+  所以登记表条目放掉后名字仍有效；`img()` 那边解码副本另存在全局 `RetainAllImageCache`
+  （按 `hash(Resource)` 持 `Arc<RenderImage>`），登记表释放省的主要是原始字节那份。
+  单条超过 12 MiB 的图不入表（一张图占掉大半个预算不划算，按「读不出来」处理）。
+- **会话冷回收**：`Session::evictable` 豁免一切活状态（忙 / 排队 / 等应答 / 连着内核会话
+  `acp_id.is_some()` / 加载中 / 读取失败）；`to_placeholder` 换占位时**令牌不变**——侧栏、
+  `last_active`、`session_index` 都按令牌引用。温会话保 2 个 + 32 MiB 预算（初始提案，
+  `app/mod.rs` 的 `WARM_SESSIONS` / `SESSION_CACHE_BUDGET`），`CLAUDESKTOP_MEM_REPORT=1`
+  时每 30 秒回收周期打一行 `[mem]`（会话保留字节、资源登记表现状）。
+  记忆点：占位会话的 `has_user_message()` 也为真（按元信息算），删除保护照常工作。
+- **无头截图不要只设 `QUIET`**：它仍会显示窗口。用 `--features headless-screenshot` 编译，设 `CLAUDESKTOP_SCREENSHOT=<PNG 路径>`，
+  窗口从创建起隐藏，手动排帧后用 `render_to_image` 离屏导出并退出，不触碰前台。
+  配 `CLAUDESKTOP_OPEN=model-menu` 可预览真实默认模型菜单；用组件的 `default_open(true)` 初始化，不用改受控模式。
+  不开 `gpui-kit/test-support`（会牵出 gpui-fast 的 Cocoa 版本冲突），截图 feature 只开启现有 gpui / platform 的测试接口。
+  Windows 的 `show=false` 原本不应用初始 bounds（只存 placement），截图总是默认尺寸；已在 vendor 隐藏分支用禁止激活 / 改层级的 `SetWindowPos` 修正。
+  `CLAUDESKTOP_SCREENSHOT_SIZE=900x650`、`CLAUDESKTOP_SCREENSHOT_SCALE=140` 可验窄窗和大字号；只在截图构建中生效，不写用户设置。
 - **流式输出的真正成本是「每个 chunk 整篇 markdown 重解析一次」**（2026-11-13 实测）：
   `reading_markdown` 流式时补齐半截标记（`\n``` ` 之类），交给 TextView 的文本每帧都不是上一帧的
   前缀，gpui-kit 的增量解析（`TextViewState::push_str`，前缀追加只解析增量）整条用不上——
@@ -35,6 +69,10 @@
   `failed to remove file D:/t3/release/claudesktop.exe`）。
 - **压测数字本身有 ±0.5ms 漂移**（机器负载、热状态）：滚动 p50 同一基线不同时间跑出 2.56→3.94ms。
   对比优化前后要交替 A/B 连跑几次取中位，别拿两次单跑说事。
+- **模型页压测后不一定回到顶部**：`CLAUDESKTOP_STRESS_VIEW=settings:4` 的合成滚轮落在右侧模型清单时，
+  内层滚动区会先吃掉事件，往返后外层仍可能停在底部；截首屏要在左侧分类导航上滚回顶部，别把压测中的画面当成初始位置。
+- **无前台且窗口被遮挡时，滚轮压测可能一直不出统计**：`on_next_frame` 等不到可见窗口的正常呈现，别把超时当通过，
+  也别为了拿数字抢前台；功能验证可用 `WM_MOUSEWHEEL` 的 `PostMessage` 驱动真实窗口，再用 `shot.ps1` 截图。
 
 - **验证 UI 别用会抢前台的招**：`tools/shot.ps1` 走 PrintWindow，不抢焦点不移动光标，
   随便截；`tools/demo-drive.ps1` 要置顶 + SetCursorPos + 点击，会打断用户手头的事，
@@ -53,6 +91,15 @@
 
 ## 内核 / 工具
 
+- **自研历史休眠别只看 `TurnEnded`**（2026-11-14）：标题生成 / 记忆提炼在这之后仍读历史，靠 `history_activity`
+  阻止搬空；事件一到就立刻 `hibernate_session` 可能什么都不做（不是状态机坏了）。竞态测试先完成一次休眠 +
+  唤醒把这段活动放完，再等 `transitioning_sessions == 1`，才是真的 `Spilling`。Windows 原子重命名前先 `drop(File)`。
+- **自研历史休眠首轮 A/B（2026-11-14，release，50 会话 × 约 2.25 MiB × 3 轮）**：PB 中位数
+  117.3 → 2.0 MiB（降 115.3），WS 120.2 → 7.3 MiB（降 112.9）；切换峰值 118.5 MiB = 对照 101.1%，
+  唤醒 p95 5.16ms、驻留再唤醒 p95 0.002ms，均过方案门槛。30 分钟混合使用未跑，所以仍由
+  `CLAUDESKTOP_HIBERNATE=1` 显式开启，不默认启用。复跑 `cargo test -p claudesktop-builtin
+  hibernation_ab_memory --release -- --ignored --nocapture`。
+- **测试用 `BuiltinConfig::new` 要隔离默认路径**：它会带上用户的 MCP / 说明 / 记忆 / 规则文件。测试显式设对应字段为 `None`，否则会连真实 MCP，Windows 上还可能因子进程占着临时工作目录导致清理报 os error 32。
 - **每一步的用量当场报**：`run_steps` 里每次 `stream_chat` 拿到用量就 `Inner::report_usage`，
   `context_tokens` = 这一步的输入 + 输出（`Steps::Done` 不再带用量）。原来攒到轮末才报一次，
   表现是用量环跑着的时候不动、轮末跳一下。压缩和子会话报 `context = 0`，

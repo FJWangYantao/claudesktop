@@ -1,4 +1,4 @@
-//! 演示回放脚本（CLAUDESKTOP_KERNEL=demo 或内核启动失败时使用）。
+//! 开发用演示回放数据，正常设置不提供入口，内核启动失败也不回退到这里。
 
 pub enum MockAction {
     BeginThinking,

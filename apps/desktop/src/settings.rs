@@ -29,7 +29,7 @@ pub enum KernelChoice {
     Acp(String),
     /// 自研内核（OpenAI 兼容端点）
     Builtin,
-    /// 纯演示回放
+    /// 开发回放与旧设置读取兼容，不参与正常内核选择。
     Demo,
 }
 
@@ -88,10 +88,8 @@ impl KernelChoice {
     /// 历史会话属于哪种内核：按元信息里记的 agent 标识判断。
     /// 老会话（`acp:<命令>`、没有档案 ID）归到第一个启用的档案。
     pub fn of_agent(agent: &str, acp: &AcpSettings) -> Self {
-        if agent.starts_with("builtin:") {
+        if agent.starts_with("builtin:") || agent.is_empty() {
             Self::Builtin
-        } else if agent.is_empty() {
-            Self::Demo
         } else if let Some(rest) = agent.strip_prefix("acp:") {
             // 新格式 `acp:<档案 ID>:<命令>`
             let id = rest.split(':').next().unwrap_or_default();
@@ -116,14 +114,13 @@ impl KernelChoice {
         match s.trim() {
             "acp" => Some(Self::Acp(acp.first().map(|a| a.id.clone())?)),
             "builtin" => Some(Self::Builtin),
-            "demo" => Some(Self::Demo),
             other => other.strip_prefix("acp:").map(|id| Self::Acp(id.to_string())),
         }
     }
 
     /// 由槽的 key 还原（事件分发用）。档案已停用时仍带原 ID，label 退回通用称呼。
     pub fn from_key(key: &str, acp: &AcpSettings) -> Self {
-        Self::parse(key, acp).unwrap_or(Self::Demo)
+        Self::parse(key, acp).unwrap_or(Self::Builtin)
     }
 }
 
@@ -139,7 +136,7 @@ pub struct ProviderProfile {
     /// OpenAI 兼容 / Anthropic 原生端点的 base URL（不含路径后缀）
     pub base_url: String,
     pub api_key: String,
-    /// 新会话的默认模型
+    /// 该来源上次选择的模型；只有 `BuiltinSettings::active` 所属的这一项是全局默认模型
     pub model: String,
     /// 上次从端点获取的模型列表（模型下拉用）
     pub models: Vec<String>,
@@ -193,6 +190,15 @@ impl ProviderProfile {
         self.models.iter().filter(|m| !self.menu_hidden.contains(m)).collect()
     }
 
+    pub fn model_choices(&self) -> Vec<&str> {
+        let mut models: Vec<&str> = self.models.iter().map(String::as_str).collect();
+        let remembered = self.model.trim();
+        if !remembered.is_empty() && !models.contains(&remembered) {
+            models.insert(0, remembered);
+        }
+        models
+    }
+
     /// 某个模型的上下文窗口。顶栏显示的模型名可能只是 ID 的最后一段（`provider/name` → `name`），
     /// 对不上完整 ID 时按最后一段找。
     pub fn context_window(&self, model: &str) -> Option<u64> {
@@ -205,7 +211,7 @@ impl ProviderProfile {
     }
 }
 
-/// 自研内核设置：多套档案 + 当前用哪套。
+/// 自研内核设置：多套来源；全局默认模型由 `active` 和该来源的 `model` 一起确定。
 /// 兼容旧版（单套扁平字段）的读取。
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct BuiltinSettings {
@@ -873,6 +879,9 @@ impl Settings {
         // 档案 ID 不能重（手改过文件时会撞）：留第一个
         let mut seen = std::collections::HashSet::new();
         s.acp.agents.retain(|a| !a.id.trim().is_empty() && seen.insert(a.id.clone()));
+        if s.kernel.as_ref().is_some_and(KernelChoice::is_demo) {
+            s.kernel = None;
+        }
         // 老设置的 `"kernel": "acp"`（没有档案 ID）、或选的档案已经没了 → 第一个档案，一个都没有就自研
         if let Some(KernelChoice::Acp(id)) = &s.kernel
             && s.acp.get(id).is_none()
@@ -958,15 +967,15 @@ impl Settings {
         self
     }
 
-    /// 实际使用的默认内核。从没选过时：有启用的 ACP 档案且自研内核没配好就用第一个档案，否则自研。
+    /// 实际使用的默认内核。自动选择时：有启用的 ACP 档案且自研内核没配好就用第一个档案，否则自研。
     pub fn kernel(&self) -> KernelChoice {
-        self.kernel.clone().unwrap_or(
+        self.kernel.as_ref().filter(|k| !k.is_demo()).cloned().unwrap_or_else(|| {
             if self.acp.first().is_none() || self.builtin.is_configured() {
                 KernelChoice::Builtin
             } else {
                 KernelChoice::Acp(self.acp_default_id().expect("first() 非空"))
-            },
-        )
+            }
+        })
     }
 
     /// 某一种内核的档案 ID：ACP 用第一个启用的档案。
@@ -974,7 +983,7 @@ impl Settings {
         self.acp.first().map(|a| a.id.clone())
     }
 
-    /// 「默认内核」三选一落到具体内核：ACP 只选了种类没选档案时用第一个启用的档案。
+    /// ACP 只选了种类没选档案时，落到第一个启用的档案。
     /// 一家都没启用时退回自研（设置页选了 agent 但一条档案都没勾）。
     pub fn kernel_for(&self, kind: &KernelChoice) -> KernelChoice {
         match kind {
@@ -1033,6 +1042,7 @@ impl Settings {
         config.chat_model = Some(self.chat.model.trim().to_string()).filter(|m| !m.is_empty());
         config.chat_web = self.chat.web;
         config.chat_instructions = self.chat.instructions_path();
+        config.hibernation_dir = claudesktop_builtin::default_hibernation_dir();
         Ok(config)
     }
 
@@ -1167,6 +1177,19 @@ impl BuiltinSettings {
         &mut self.profiles[idx]
     }
 
+    pub fn select_model(&mut self, profile: usize, model: &str) -> bool {
+        let model = model.trim();
+        if model.is_empty() {
+            return false;
+        }
+        let Some(provider) = self.profiles.get_mut(profile) else {
+            return false;
+        };
+        provider.model = model.to_string();
+        self.active = profile;
+        true
+    }
+
     pub fn is_configured(&self) -> bool {
         self.current().is_configured()
     }
@@ -1199,21 +1222,68 @@ impl BuiltinSettings {
     }
 }
 
-/// 本机装了 Antigravity Tools 时，读出它本地网关的地址和 key。
-pub fn antigravity_gateway() -> Option<(String, String)> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let path = PathBuf::from(home).join(".antigravity_tools").join("gui_config.json");
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    let proxy = value.get("proxy")?;
-    let port = proxy.get("port").and_then(|p| p.as_u64()).unwrap_or(8045);
-    let key = proxy.get("api_key").and_then(|k| k.as_str()).unwrap_or_default().to_string();
-    Some((format!("http://127.0.0.1:{port}/v1"), key))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[core::prelude::v1::test]
+    fn default_model_selects_its_provider_and_survives_reload() {
+        let mut settings = Settings::default();
+        settings.builtin.profiles = vec![
+            ProviderProfile {
+                name: "甲".into(),
+                base_url: "https://first.example/v1".into(),
+                model: "shared".into(),
+                models: vec!["shared".into()],
+                ..Default::default()
+            },
+            ProviderProfile {
+                name: "乙".into(),
+                protocol: Protocol::Anthropic,
+                base_url: "https://second.example".into(),
+                model: "previous".into(),
+                models: vec!["shared".into()],
+                ..Default::default()
+            },
+        ];
+        assert!(settings.builtin.select_model(1, " shared "));
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: Settings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.builtin.active, 1);
+        let config = loaded.builtin_config(PathBuf::from(".")).unwrap();
+        assert_eq!(config.provider.model, "shared");
+        assert_eq!(config.provider.base_url, "https://second.example");
+        assert_eq!(config.provider.protocol, Protocol::Anthropic);
+        assert_eq!(loaded.builtin.profiles[0].model, "shared");
+        assert_eq!(loaded.builtin.menu_flat(), vec![(0, "shared".into()), (1, "shared".into())]);
+    }
+
+    #[core::prelude::v1::test]
+    fn invalid_default_model_keeps_the_existing_selection() {
+        let mut builtin = BuiltinSettings {
+            active: 0,
+            profiles: vec![ProviderProfile { model: "existing".into(), ..Default::default() }],
+        };
+        let before = builtin.clone();
+        assert!(!builtin.select_model(3, "shared"));
+        assert_eq!(builtin, before);
+        assert!(!builtin.select_model(0, "  "));
+        assert_eq!(builtin, before);
+    }
+
+    #[core::prelude::v1::test]
+    fn default_model_choices_keep_manual_models_without_duplicates() {
+        let mut profile = ProviderProfile {
+            model: "manual-model".into(),
+            models: vec!["listed".into()],
+            ..Default::default()
+        };
+        assert_eq!(profile.model_choices(), vec!["manual-model", "listed"]);
+        profile.model = "listed".into();
+        assert_eq!(profile.model_choices(), vec!["listed"]);
+        profile.models.clear();
+        assert_eq!(profile.model_choices(), vec!["listed"]);
+    }
 
     #[core::prelude::v1::test]
     fn ui_prefs_default_and_parse() {
@@ -1481,7 +1551,7 @@ mod tests {
         s.acp.command = "npx agent".into();
         s.acp.migrate();
         assert_eq!(s.kernel(), KernelChoice::Builtin);
-        s.kernel = Some(KernelChoice::Demo);
+        s.kernel = Some(KernelChoice::Builtin);
         s.save(&path).unwrap();
         assert_eq!(Settings::load(Some(&path)).0, s);
 
@@ -1669,7 +1739,10 @@ mod tests {
             KernelChoice::of_agent("node mock.mjs", acp),
             KernelChoice::Acp("custom-1".into())
         );
-        assert_eq!(KernelChoice::of_agent("", acp), KernelChoice::Demo);
+        assert_eq!(KernelChoice::of_agent("", acp), KernelChoice::Builtin);
+        assert_eq!(KernelChoice::from_key("unknown", acp), KernelChoice::Builtin);
+        assert_eq!(KernelChoice::from_key("demo", acp), KernelChoice::Builtin);
+        assert_eq!(KernelChoice::parse("demo", acp), None);
         // 槽 key 互不相同
         let keys: Vec<String> = vec![
             KernelChoice::Builtin.key(),
@@ -1690,6 +1763,37 @@ mod tests {
         assert!(same_acp_agent(&b, &b));
         assert!(same_acp_agent("agent-b", &b), "升级前的会话还能续接");
         assert!(!same_acp_agent(&acp_agent_id("custom-1", "agent-a"), &b));
+    }
+
+    #[core::prelude::v1::test]
+    fn legacy_demo_returns_to_automatic_kernel() {
+        let dir =
+            std::env::temp_dir().join(format!("claudesktop-legacy-demo-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let mut acp = Settings::default();
+        let id = acp.acp.add_custom("agent");
+        let mut builtin = acp.clone();
+        builtin.builtin.current_mut().base_url = "http://x/v1".into();
+        builtin.builtin.current_mut().model = "m".into();
+        for (mut old, expected, needs_setup) in [
+            (Settings::default(), KernelChoice::Builtin, true),
+            (acp, KernelChoice::Acp(id), false),
+            (builtin, KernelChoice::Builtin, false),
+        ] {
+            old.kernel = Some(KernelChoice::Demo);
+            assert_eq!(old.kernel(), expected);
+            old.save(&path).unwrap();
+            let (s, err) = Settings::load(Some(&path));
+            assert!(err.is_none(), "{err:?}");
+            assert_eq!(s.kernel, None);
+            assert_eq!(s.kernel(), expected);
+            assert_eq!(s.needs_setup(), needs_setup);
+            old.kernel = None;
+            assert_eq!(s, old);
+            s.save(&path).unwrap();
+            assert_eq!(Settings::load(Some(&path)).0, s);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 老设置文件里的 `"kernel": "acp"`（没有档案 ID）不能把整份设置读坏。

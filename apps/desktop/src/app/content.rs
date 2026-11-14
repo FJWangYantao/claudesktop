@@ -11,7 +11,7 @@
 use super::widgets::edge_fade;
 use super::{ChatApp, motion};
 use crate::model::ChatItem;
-use crate::session::scroll_handle_edge;
+use crate::session::{WheelScroll, scroll_handle_edge};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::component::*;
@@ -52,9 +52,126 @@ impl ChatApp {
             .child(self.loop_overlay.clone())
     }
 
+    /// 设置页的普通滚动区也走对话那套滚轮曲线；模型清单有独立的内层滚动区。
+    pub(super) fn settings_wheel_by(
+        &mut self,
+        delta: Pixels,
+        precise: bool,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let model = &self.settings_form.model_scroll;
+        let top = -model.offset().y;
+        let max = model.max_offset().y.max(px(0.));
+        let in_model = self.settings_form.tab == super::settings_view::MODEL_TAB
+            && model.bounds().contains(&position)
+            && if delta > px(0.) { top < max } else { top > px(0.) };
+        let reduced = cx.reduce_motion();
+        if in_model {
+            self.settings_wheel = None;
+            Self::push_page_wheel(model, &mut self.model_wheel, delta, precise || reduced);
+        } else {
+            self.model_wheel = None;
+            Self::push_page_wheel(
+                &self.settings_scroll,
+                &mut self.settings_wheel,
+                delta,
+                precise || reduced,
+            );
+        }
+        self.content_view.update(cx, |_, cx| cx.notify());
+    }
+
+    fn push_page_wheel(
+        handle: &ScrollHandle,
+        wheel: &mut Option<WheelScroll>,
+        delta: Pixels,
+        direct: bool,
+    ) {
+        let max = handle.max_offset().y.max(px(0.));
+        let top = -handle.offset().y;
+        if direct {
+            *wheel = None;
+            Self::set_page_top(handle, top + delta);
+            return;
+        }
+        Self::set_page_top(handle, top + delta * motion::WHEEL_INSTANT);
+        let top = -handle.offset().y;
+        let base = match *wheel {
+            Some(w) if (w.target > top) == (delta > px(0.)) => {
+                if delta > px(0.) {
+                    w.target.min(top + motion::WHEEL_MAX_LEAD)
+                } else {
+                    w.target.max(top - motion::WHEEL_MAX_LEAD)
+                }
+            }
+            _ => top,
+        };
+        let now = std::time::Instant::now();
+        let last = wheel
+            .map_or(now.checked_sub(std::time::Duration::from_millis(16)).unwrap_or(now), |w| {
+                w.last
+            });
+        *wheel = Some(WheelScroll {
+            target: (base + delta * (1. - motion::WHEEL_INSTANT)).clamp(px(0.), max),
+            started: now,
+            last,
+        });
+    }
+
+    fn set_page_top(handle: &ScrollHandle, top: Pixels) {
+        let mut offset = handle.offset();
+        offset.y = -top.clamp(px(0.), handle.max_offset().y.max(px(0.)));
+        handle.set_offset(offset);
+    }
+
+    fn step_page_wheel(handle: &ScrollHandle, wheel: &mut Option<WheelScroll>) -> bool {
+        let Some(mut w) = wheel.take() else { return false };
+        if w.started.elapsed() > motion::WHEEL_MAX {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let dt = (now - w.last).as_secs_f32().min(0.1);
+        w.last = now;
+        w.target = w.target.clamp(px(0.), handle.max_offset().y.max(px(0.)));
+        let top = -handle.offset().y;
+        let rest = w.target - top;
+        if rest.abs() > motion::WHEEL_MAX_LEAD {
+            w.target = if rest > px(0.) {
+                top + motion::WHEEL_MAX_LEAD
+            } else {
+                top - motion::WHEEL_MAX_LEAD
+            };
+        }
+        let rest = w.target - top;
+        let step = (rest * (1. - (-dt / motion::WHEEL_TAU).exp()))
+            .clamp(-motion::WHEEL_MAX_STEP, motion::WHEEL_MAX_STEP);
+        if (rest - step).abs() < px(0.5) {
+            Self::set_page_top(handle, top + rest);
+            return false;
+        }
+        Self::set_page_top(handle, top + step);
+        *wheel = Some(w);
+        true
+    }
+
+    fn step_settings_wheel(&mut self, window: &mut Window) {
+        let outer = Self::step_page_wheel(&self.settings_scroll, &mut self.settings_wheel);
+        let inner = if self.settings_form.tab == super::settings_view::MODEL_TAB {
+            Self::step_page_wheel(&self.settings_form.model_scroll, &mut self.model_wheel)
+        } else {
+            self.model_wheel = None;
+            false
+        };
+        if outer || inner {
+            window.request_animation_frame();
+        }
+    }
+
     /// 内容区：设置页、首页（问候 + 用量概览）或当前会话的对话列表。
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.settings_open {
+            self.step_settings_wheel(window);
             return v_flex().size_full().child(self.render_settings(window, cx)).into_any_element();
         }
         let active = self.active;
@@ -70,6 +187,20 @@ impl ChatApp {
             return self.render_review_page(cx);
         }
         self.review = None;
+        let history = &self.sessions[active];
+        if !history.history_loaded {
+            let message =
+                history.history_error.clone().unwrap_or_else(|| "正在读取这段对话…".into());
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(message)
+                .into_any_element();
+        }
         // 还没发过消息的会话显示首页（与官方空会话一致，输入框在底部）
         if !self.sessions[active].has_user_message() {
             // 放大字号后放不下时整页往下长、可以滚（min_h 而不是 h：定高时居中的内容会从上下两头溢出，
@@ -181,7 +312,8 @@ impl ChatApp {
                     if dy == px(0.) {
                         return;
                     }
-                    let precise = event.delta.precise();
+                    let precise = event.delta.precise()
+                        || std::env::var_os("CLAUDESKTOP_WHEEL").is_some_and(|v| v == "direct");
                     app.update(cx, |this, cx| this.wheel_by(-dy, precise, cx)).ok();
                     cx.stop_propagation();
                 });

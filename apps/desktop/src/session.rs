@@ -5,7 +5,7 @@ use crate::model::*;
 use crate::settings::KernelChoice;
 use crate::usage::Streamed;
 use claudesktop_core::{
-    DiffView, Kernel, KernelEvent, Record, SessionKind, SessionLog, SessionMeta,
+    DiffView, Kernel, KernelEvent, ModeView, Record, SessionKind, SessionLog, SessionMeta,
 };
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -43,7 +43,7 @@ pub struct Session {
     pub measured: Vec<u64>,
     /// 列表末尾的运行状态行上次测量时是否在忙（忙时有一行，不忙时高度为 0）
     measured_busy: bool,
-    /// 当前可选模式（默认静态表，Started 后换成 agent 上报的）
+    /// 当前可选模式：自研内核按设置补齐，ACP 在 Started 后换成 agent 上报的。
     pub modes: Vec<ModeEntry>,
     pub permission_mode: usize, // modes 下标
     pub model_label: SharedString,
@@ -80,14 +80,22 @@ pub struct Session {
     pub log: Option<SessionLog>,
     /// 从磁盘恢复、还没接上内核会话的历史会话（不自动 session/new）
     pub restored: bool,
+    /// 日志是否已读进内存；启动时侧栏里的历史会话只有元信息
+    pub history_loaded: bool,
+    pub history_loading: bool,
+    pub history_error: Option<String>,
+    /// 从磁盘搜索跳过来时，等日志加载完再定位到第几轮
+    pub pending_reveal_turn: Option<usize>,
     /// 历史会话正在续接：Started 到达时告诉用户上下文是否延续
     pub resuming: bool,
+    /// 正在后台恢复完整历史并回退内核上下文；期间新消息先排队
+    pub kernel_rewinding: bool,
     /// 内核会话建立前选的模型：Started 之后再告诉内核
     pub pending_model: Option<String>,
     /// agent 档案记的上次模型（`AcpSettings::last_model` 的快照）：Started 后 agent 没报模型就切过去
     pub last_model: Option<String>,
-    /// 待同步给内核的权限模式：新会话的默认模式（设置里开着「自动」时是 `"auto"`），
-    /// 或用户在会话建立前自己选的。`Started` 时交给内核后清掉
+    /// 待同步给内核的权限模式：新会话默认值、保存的会话选择或连接前新选的模式。
+    /// `Started` 时交给内核后清掉。
     pub pending_mode: Option<String>,
     /// 会话级思考档位（输入框那个下拉选的）；`None` = 跟随设置里的档案，
     /// 「默认」这一项也是 `None`（不发字段）
@@ -167,6 +175,9 @@ pub struct Session {
     /// 最新一轮的改动撤回到了什么程度（审查页或改动卡片上的「撤回」写盘后更新）。
     /// 只在内存里：重启后卡片照常显示「撤回」，再点一次结果不变
     pub undo: Option<TurnUndo>,
+    /// 最近一次「看过或有事发生」的时刻（LRU 冷会话回收按它排，见
+    /// `ChatApp::reclaim_idle_sessions`）；每秒的计时器在更新，始终有效
+    last_touch: Instant,
 }
 
 /// 某一轮的改动撤回到了什么程度，见 [`Session::undo`]。
@@ -343,7 +354,7 @@ fn new_list_state() -> ListState {
 }
 
 impl Session {
-    /// 新会话（Code）；演示回放不需要内核会话，直接可用。
+    #[cfg(test)]
     pub fn new(token: u64, kernel: KernelChoice, cwd: PathBuf) -> Self {
         Self::of_kind(token, kernel, cwd, SessionKind::Code)
     }
@@ -392,7 +403,12 @@ impl Session {
             meta: None,
             log: None,
             restored: false,
+            history_loaded: true,
+            history_loading: false,
+            history_error: None,
+            pending_reveal_turn: None,
             resuming: false,
+            kernel_rewinding: false,
             pending_model: None,
             last_model: None,
             pending_mode: None,
@@ -402,7 +418,9 @@ impl Session {
             turn_streamed: Streamed::default(),
             stream_pending: String::new(),
             stream_pending_thought: false,
-            stream_flushed_at: Instant::now().checked_sub(STREAM_FLUSH).unwrap_or_else(Instant::now),
+            stream_flushed_at: Instant::now()
+                .checked_sub(STREAM_FLUSH)
+                .unwrap_or_else(Instant::now),
             stream_dirty: false,
             turn_started: None,
             renamed: false,
@@ -430,7 +448,19 @@ impl Session {
             review_pending: false,
             changes_open: HashSet::new(),
             undo: None,
+            last_touch: Instant::now(),
         }
+    }
+
+    /// 启动时给侧栏用的历史会话占位：不读日志，也不构造对话行。
+    pub fn placeholder(
+        token: u64,
+        meta: SessionMeta,
+        settings: &crate::settings::Settings,
+    ) -> Self {
+        let mut s = Self::from_records(token, meta, Vec::new(), settings);
+        s.history_loaded = false;
+        s
     }
 
     /// 从持久化记录重放出一个历史会话：事件走与实时完全相同的映射。
@@ -438,13 +468,16 @@ impl Session {
         token: u64,
         meta: SessionMeta,
         records: Vec<Record>,
-        acp: &crate::settings::AcpSettings,
+        settings: &crate::settings::Settings,
     ) -> Self {
-        let mut s = Self::new(token, KernelChoice::of_agent(&meta.agent, acp), meta.cwd.clone());
+        let mut s = Self::of_kind(
+            token,
+            KernelChoice::of_agent(&meta.agent, &settings.acp),
+            meta.cwd.clone(),
+            meta.kind,
+        );
         s.ready = false;
         // 不套档案的 `last_model`：历史会话用的是它自己当时的模型，不该被别的会话最近选的改掉
-        // 历史会话不该被「新对话默认自动」改掉模式：它的模式由重建的日志决定
-        s.pending_mode = None;
         // 是不是「任务」跟着元信息走：建的时候没选过文件夹的就是任务
         s.task = meta.task;
         s.kind = meta.kind;
@@ -600,6 +633,15 @@ impl Session {
         s.busy = false;
         // 重放出来的会话不带着「正在流式」的计数
         s.turn_streamed.clear();
+        s.sync_builtin_modes(settings.auto_mode_default());
+        if !s.is_chat() {
+            s.pending_mode = meta.mode.clone();
+            if let Some(mode) = &meta.mode
+                && let Some(i) = s.modes.iter().position(|m| &m.id == mode)
+            {
+                s.permission_mode = i;
+            }
+        }
         s.meta = Some(meta);
         s
     }
@@ -942,7 +984,90 @@ impl Session {
     }
 
     pub fn has_user_message(&self) -> bool {
-        self.transcript.iter().any(|i| matches!(i, ChatItem::User { .. }))
+        (!self.history_loaded && self.meta.is_some())
+            || self.transcript.iter().any(|i| matches!(i, ChatItem::User { .. }))
+    }
+
+    /// 能否在空闲回收时断开外部 agent；任何待发送、待应答或进行中的状态都排除。
+    pub fn idle_detachable(&self) -> bool {
+        self.history_loaded
+            && self.has_user_message()
+            && self.acp_id.is_some()
+            && !self.busy
+            && !self.stopping
+            && !self.resuming
+            && (!self.requested || self.ready)
+            && self.autoprompt.is_none()
+            && self.queued.is_empty()
+            && self.worktree_busy.is_none()
+            && !self.waiting_permission()
+            && !self.waiting_question()
+    }
+
+    /// 能否只把自研内核的完整历史休眠；连接、正文和会话 ID 都保留。
+    pub fn idle_hibernatable(&self) -> bool {
+        self.idle_detachable()
+            && !self.history_loading
+            && self.history_error.is_none()
+            && !self.compact_queued
+            && !self.kernel_rewinding
+            && !self.transcript.iter().any(|item| {
+                matches!(item, ChatItem::Tool(card) if card.task && card.phase == ToolPhase::Running)
+            })
+    }
+
+    /// 能否把显示数据（正文、布局表、子任务过程）换成磁盘占位：冷会话化。
+    /// 忙、有排队的消息 / 压缩、等应答、正在建 worktree、正在读日志、上次读取失败
+    /// （重读同一份多半还失败，先留着错误行）、还连着内核会话（`acp_id` 在：
+    /// 内核上下文还活着，界面把正文丢了就对不上了）都排除；
+    /// 没落盘的（`meta` 不在）也不动——换占位会把活会话标成「历史会话」。
+    /// 换成占位后一切走 `ensure_history_loaded` 的重读路径，和启动占位完全一样。
+    pub fn evictable(&self) -> bool {
+        self.history_loaded
+            && !self.history_loading
+            && self.meta.is_some()
+            && !self.busy
+            && !self.stopping
+            && !self.resuming
+            && self.autoprompt.is_none()
+            && self.queued.is_empty()
+            && !self.compact_queued
+            && !self.kernel_rewinding
+            && self.worktree_busy.is_none()
+            && self.history_error.is_none()
+            && self.acp_id.is_none()
+            && !self.waiting_permission()
+            && !self.waiting_question()
+    }
+
+    /// 显示数据换回占位会话（元信息、模式、滚动、展开状态保留；正文释放）。
+    /// 令牌不变，侧栏和 `last_active` 的引用不受影响。
+    pub fn to_placeholder(&mut self, settings: &crate::settings::Settings) {
+        let Some(meta) = self.meta.clone() else { return };
+        let reveal = self.pending_reveal_turn.take();
+        let mut cold = Self::placeholder(self.token, meta, settings);
+        cold.pending_reveal_turn = reveal;
+        // 正在看的子任务详情页是内存态：重开时回到对话本身
+        cold.viewing_task = None;
+        *self = cold;
+    }
+
+    /// 这一页显示数据保留的堆字节（估算，见 [`ChatItem::heap_bytes`]）。
+    pub fn retained_bytes(&self) -> usize {
+        let transcript: usize = self.transcript.iter().map(ChatItem::heap_bytes).sum();
+        let layout = self.layout.len() * std::mem::size_of::<RowLayout>()
+            + self.measured.len() * std::mem::size_of::<u64>();
+        let subagents: usize = self
+            .subagents
+            .values()
+            .map(|run| {
+                run.prompt.len()
+                    + run.agent.len()
+                    + 64
+                    + run.items.iter().map(ChatItem::heap_bytes).sum::<usize>()
+            })
+            .sum();
+        transcript + layout + subagents
     }
 
     /// 侧栏分组按哪个目录算：worktree 会话归到**主仓库**那一组（`cwd` 是数据目录里的 worktree，
@@ -954,6 +1079,45 @@ impl Session {
     /// 是不是聊天会话（没有工作目录：没有目录 chip、权限模式、`@` 文件补全那套）。
     pub fn is_chat(&self) -> bool {
         self.kind == SessionKind::Chat
+    }
+
+    pub fn mode_id(&self) -> Option<&str> {
+        if self.is_chat() {
+            return None;
+        }
+        self.modes.get(self.permission_mode).map(|m| m.id.as_str())
+    }
+
+    pub fn sync_builtin_modes(&mut self, auto_available: bool) {
+        if self.kernel != KernelChoice::Builtin || self.is_chat() {
+            return;
+        }
+        let selected = self.mode_id().map(str::to_string);
+        self.replace_modes(
+            claudesktop_builtin::permission_modes(auto_available),
+            selected.as_deref(),
+        );
+    }
+
+    fn replace_modes(&mut self, modes: Vec<ModeView>, current: Option<&str>) {
+        self.modes = modes
+            .into_iter()
+            .map(|m| ModeEntry {
+                icon: mode_icon(&m.id),
+                desc: m.description.unwrap_or_default().into(),
+                name: m.name.into(),
+                id: m.id,
+            })
+            .collect();
+        self.permission_mode =
+            current.and_then(|id| self.modes.iter().position(|m| m.id == id)).unwrap_or(0);
+    }
+
+    fn remember_mode(&mut self) {
+        let mode = self.mode_id().map(str::to_string);
+        if let Some(meta) = &mut self.meta {
+            meta.mode = mode;
+        }
     }
 
     /// 新会话默认的权限模式（设置里开着「自动」时是「自动」）：先把这一项补进模式表并选中
@@ -973,8 +1137,12 @@ impl Session {
 
     /// 用户选了模式（下标）：立即生效，与「新对话的默认模式」无关了
     pub fn choose_mode_index(&mut self, i: usize) {
+        if i >= self.modes.len() {
+            return;
+        }
         self.permission_mode = i;
         self.pending_mode = None;
+        self.remember_mode();
     }
 
     /// 有还没应答的权限请求
@@ -1048,6 +1216,16 @@ impl Session {
 
     pub fn note(&mut self, text: impl Into<SharedString>) {
         self.transcript.push(ChatItem::Note(text.into()));
+    }
+
+    /// 记一次「用过」（切到、来事件、收尾一轮）：LRU 回收把最久没碰的先冷掉。
+    pub fn touch(&mut self) {
+        self.last_touch = Instant::now();
+    }
+
+    /// 最近一次用过（或来过事件）的时刻。
+    pub fn last_touched(&self) -> Instant {
+        self.last_touch
     }
 
     /// 本轮失败：对话流里放一张带「重试」的卡片（超出上下文的另给「新开会话」）。
@@ -1220,9 +1398,7 @@ impl Session {
         let text = std::mem::take(&mut self.stream_pending);
         if self.stream_pending_thought {
             match self.transcript.last_mut() {
-                Some(ChatItem::Thinking { text: buf, streaming: true, .. }) => {
-                    buf.push_str(&text)
-                }
+                Some(ChatItem::Thinking { text: buf, streaming: true, .. }) => buf.push_str(&text),
                 // 默认收起：流式时只扫光「思考中…」，不先展开再收回（那样每段思考都会跳一下）
                 _ => {
                     let started = (!self.replaying).then(Instant::now);
@@ -1602,31 +1778,23 @@ impl Session {
                         model.rsplit('/').next().unwrap_or(&model).to_string().into();
                 }
                 if !modes.is_empty() {
-                    self.modes = modes
-                        .into_iter()
-                        .map(|m| ModeEntry {
-                            icon: mode_icon(&m.id),
-                            desc: m.description.unwrap_or_default().into(),
-                            name: m.name.into(),
-                            id: m.id,
-                        })
-                        .collect();
-                    self.permission_mode = current_mode
-                        .and_then(|id| self.modes.iter().position(|m| m.id == id))
-                        .unwrap_or(0);
+                    self.replace_modes(modes, current_mode.as_deref());
                 }
                 // 新建对话的默认模式 / 会话建立前选的模式：内核会话建立了才告诉它。
                 // 内核没报这个模式（如 ACP agent）就作罢，保留上面按 `current_mode` 定下的那个
                 if let Some(mode) = self.pending_mode.take()
                     && let Some(i) = self.modes.iter().position(|m| m.id == mode)
                 {
-                    self.permission_mode = i;
-                    if let (Some(kernel), Some(id)) = (kernel, self.acp_id.clone())
-                        && let Err(err) = kernel.set_mode(&id, &mode)
-                    {
-                        self.note(format!("切换权限模式失败：{err}"));
+                    let result = match (kernel, self.acp_id.as_deref()) {
+                        (Some(kernel), Some(id)) => kernel.set_mode(id, &mode),
+                        _ => Ok(()),
+                    };
+                    match result {
+                        Ok(()) => self.permission_mode = i,
+                        Err(err) => self.note(format!("切换权限模式失败：{err}")),
                     }
                 }
+                self.remember_mode();
                 // 会话建立前在下拉里选过模型：现在告诉内核
                 if let (Some(model), Some(kernel), Some(id)) =
                     (self.pending_model.take(), kernel, self.acp_id.clone())
@@ -2155,6 +2323,7 @@ mod tests {
             worktree: None,
             kind: SessionKind::Code,
             web: None,
+            mode: None,
         }
     }
 
@@ -2175,6 +2344,160 @@ mod tests {
             tool: None,
             hunks: None,
         })
+    }
+
+    #[core::prelude::v1::test]
+    fn placeholder_keeps_history_identity_without_transcript() {
+        let s = Session::placeholder(3, meta(), &Default::default());
+        assert!(s.restored && s.has_user_message());
+        assert!(!s.history_loaded && !s.history_loading);
+        assert!(s.transcript.is_empty());
+        assert_eq!(s.title.as_ref(), "读 README");
+    }
+
+    #[core::prelude::v1::test]
+    fn idle_detachable_excludes_unloaded_and_busy_sessions() {
+        let mut s = Session::new(4, KernelChoice::Acp("a".into()), PathBuf::from("."));
+        s.transcript.push(ChatItem::User {
+            text: "已结束".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.acp_id = Some("remote".into());
+        s.requested = true;
+        s.ready = true;
+        assert!(s.idle_detachable());
+        s.busy = true;
+        assert!(!s.idle_detachable());
+        s.busy = false;
+        s.history_loaded = false;
+        assert!(!s.idle_detachable());
+    }
+
+    #[core::prelude::v1::test]
+    fn idle_hibernatable_excludes_compaction_and_kernel_rewind() {
+        let mut s = Session::new(4, KernelChoice::Builtin, PathBuf::from("."));
+        s.transcript.push(ChatItem::User {
+            text: "已结束".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.acp_id = Some("builtin-1-1".into());
+        s.requested = true;
+        s.ready = true;
+        assert!(s.idle_hibernatable());
+        s.compact_queued = true;
+        assert!(!s.idle_hibernatable());
+        s.compact_queued = false;
+        s.kernel_rewinding = true;
+        assert!(!s.idle_hibernatable());
+    }
+
+    #[core::prelude::v1::test]
+    fn evictable_excludes_live_and_connected_sessions() {
+        let mut s = Session::from_records(1, meta(), vec![Record::user("问")], &Default::default());
+        assert!(s.evictable(), "未连内核的历史会话可冷");
+        // 连着内核会话的（ACP 或自研）不动：内核上下文还活着，界面上丢了正文对不上
+        s.acp_id = Some("remote".into());
+        assert!(!s.evictable());
+        s.acp_id = None;
+        s.busy = true;
+        assert!(!s.evictable());
+        s.busy = false;
+        s.queued.push(crate::model::QueuedPrompt {
+            text: "排队".into(),
+            images: Vec::new(),
+            files: Vec::new(),
+        });
+        assert!(!s.evictable());
+        s.queued.clear();
+        s.compact_queued = true;
+        assert!(!s.evictable());
+        s.compact_queued = false;
+        s.history_loading = true;
+        assert!(!s.evictable());
+        s.history_loading = false;
+        s.history_error = Some("读不了".into());
+        assert!(!s.evictable());
+        s.history_error = None;
+        s.stopping = true;
+        assert!(!s.evictable());
+        s.stopping = false;
+        assert!(s.evictable());
+    }
+
+    #[core::prelude::v1::test]
+    fn to_placeholder_keeps_identity_and_frees_transcript() {
+        let records = vec![
+            Record::user("读 README"),
+            ev(KernelEvent::AgentMessageChunk { text: "总结完毕".into() }),
+            Record::Turn {
+                at_ms: 0,
+                model: Some("m".into()),
+                input_tokens: 1,
+                output_tokens: 2,
+                elapsed_ms: Some(3),
+                context_tokens: Some(4),
+            },
+        ];
+        let mut s = Session::from_records(9, meta(), records, &Default::default());
+        let before = s.retained_bytes();
+        assert!(before > 0);
+        let token = s.token;
+        let title = s.title.clone();
+        let view = s.viewing_task.is_some();
+        let _ = s.to_placeholder(&Default::default());
+        assert_eq!(s.token, token, "令牌不变（侧栏和 last_active 的引用不受影响）");
+        assert_eq!(s.title, title);
+        assert!(s.transcript.is_empty());
+        assert!(!s.history_loaded && !s.history_loading);
+        assert!(s.has_user_message(), "占位对删除保护也算已发过消息");
+        assert!(s.retained_bytes() < before);
+        assert!(!view);
+    }
+
+    #[core::prelude::v1::test]
+    fn retained_bytes_counts_tools_and_subagents() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        assert_eq!(s.retained_bytes(), 0);
+        s.transcript.push(ChatItem::Agent("一句话".into()));
+        let one = s.retained_bytes();
+        assert!(one > 0);
+        s.transcript.push(ChatItem::Tool(ToolCard {
+            id: None,
+            kind: "read".into(),
+            name: "Read".into(),
+            arg: "src/a.rs".into(),
+            result: "120 行".into(),
+            output: SharedString::default(),
+            phase: ToolPhase::Done,
+            diffs: vec![DiffView {
+                path: "src/a.rs".into(),
+                created: false,
+                added: 1,
+                removed: 0,
+                lines: vec![claudesktop_core::DiffLineView {
+                    tag: '+',
+                    no: 1,
+                    text: "let x = 1;".into(),
+                }],
+                truncated: false,
+            }],
+            expanded: false,
+            task: false,
+            grant: None,
+            images: Vec::new(),
+        }));
+        assert!(s.retained_bytes() > one);
+        s.subagents.insert(
+            "t1".into(),
+            SubagentRun {
+                agent: "explore".into(),
+                prompt: "找一找".into(),
+                items: vec![ChatItem::Agent("找到了".into())],
+            },
+        );
+        assert!(s.retained_bytes() > s.transcript.iter().map(ChatItem::heap_bytes).sum::<usize>());
     }
 
     #[core::prelude::v1::test]
@@ -2931,12 +3254,127 @@ mod tests {
         assert_eq!(s.modes[s.permission_mode].id, "default");
     }
 
+    fn auto_mode_settings() -> crate::settings::Settings {
+        let mut settings = crate::settings::Settings::default();
+        settings.builtin.current_mut().base_url = "http://127.0.0.1:9/v1".into();
+        settings.builtin.current_mut().model = "test-model".into();
+        settings.auto_mode.enabled = true;
+        settings.usage_gateway = false;
+        settings
+    }
+
     #[core::prelude::v1::test]
     fn history_sessions_keep_their_own_mode() {
         let mut meta = meta();
         meta.agent = "builtin:test".into();
-        let s = Session::from_records(1, meta, vec![Record::user("问")], &Default::default());
+        let s = Session::from_records(1, meta, vec![Record::user("问")], &auto_mode_settings());
+        assert!(s.restored && !s.ready);
+        assert!(s.modes.iter().any(|m| m.id == MODE_AUTO_ID));
+        assert_eq!(s.mode_id(), Some("default"));
         assert!(s.pending_mode.is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn history_modes_roundtrip_and_reach_a_resumed_kernel() {
+        use claudesktop_builtin::{BuiltinConfig, BuiltinKernel};
+        use claudesktop_core::{SessionSpec, SessionStore};
+        use std::sync::Mutex;
+
+        let dir =
+            std::env::temp_dir().join(format!("claudesktop-session-mode-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("workspace")).unwrap();
+        let store = SessionStore::open(dir.join("sessions")).unwrap();
+        let settings = auto_mode_settings();
+        let mut config =
+            BuiltinConfig::new(settings.builtin.current().provider_config(), dir.join("workspace"));
+        config.auto_mode = settings.auto_mode.to_config(settings.builtin.current());
+        config.memory_path = None;
+        config.rules_path = None;
+        config.user_instructions = None;
+        config.mcp_config = None;
+        config.session_titles = false;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let kernel: Arc<dyn Kernel> = Arc::new(
+            BuiltinKernel::spawn(
+                config,
+                Arc::new(move |event| {
+                    captured.lock().unwrap().push(event.event);
+                }),
+            )
+            .unwrap(),
+        );
+        for (i, mode) in
+            ["auto", "default", "plan", "acceptEdits", "bypassPermissions"].into_iter().enumerate()
+        {
+            let (meta, mut log) =
+                store.create("恢复权限模式", dir.join("workspace"), "builtin:test").unwrap();
+            log.append(Record::user("继续")).unwrap();
+            drop(log);
+            let records = store.load(&meta.id).unwrap();
+            let mut session = Session::from_records(i as u64, meta, records.clone(), &settings);
+            let selected = session.modes.iter().position(|m| m.id == mode).unwrap();
+            session.choose_mode_index(selected);
+            store.save_meta(session.meta.as_ref().unwrap()).unwrap();
+            let id = session.meta.as_ref().unwrap().id.clone();
+            let saved = store.list().into_iter().find(|m| m.id == id).unwrap();
+            let mut restored = Session::from_records(i as u64, saved, records.clone(), &settings);
+            assert_eq!(restored.mode_id(), Some(mode));
+            assert_eq!(restored.pending_mode.as_deref(), Some(mode));
+            kernel
+                .resume_session(
+                    restored.token,
+                    "previous",
+                    SessionSpec::code(Some(dir.join("workspace"))),
+                    &records,
+                )
+                .unwrap();
+            let event = events
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|event| matches!(event, KernelEvent::Started { token, .. } if *token == restored.token))
+                .cloned()
+                .unwrap();
+            restored.apply_event(event, Some(&kernel));
+            assert_eq!(restored.mode_id(), Some(mode));
+            assert!(restored.pending_mode.is_none());
+            assert_eq!(restored.meta.as_ref().unwrap().mode.as_deref(), Some(mode));
+            assert!(!restored.transcript.iter().any(|row| matches!(row, ChatItem::Note(_))));
+            kernel.close_session(restored.acp_id.as_deref().unwrap());
+        }
+        kernel.shutdown();
+        drop(kernel);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[core::prelude::v1::test]
+    fn restored_modes_fall_back_when_unavailable() {
+        let mut settings = auto_mode_settings();
+        settings.auto_mode.enabled = false;
+        let mut saved = meta();
+        saved.agent = "builtin:test".into();
+        saved.mode = Some("auto".into());
+        let mut s = Session::from_records(1, saved.clone(), Vec::new(), &settings);
+        assert!(s.modes.iter().all(|m| m.id != MODE_AUTO_ID));
+        assert_eq!(s.mode_id(), Some("default"));
+        s.apply_event(started(&[("default", "逐项确认"), ("plan", "计划")]), None);
+        assert_eq!(s.mode_id(), Some("default"));
+        assert!(s.pending_mode.is_none());
+        assert_eq!(s.meta.as_ref().unwrap().mode.as_deref(), Some("default"));
+
+        saved.agent = "agent".into();
+        saved.mode = Some("agent-mode".into());
+        let mut agent = Session::from_records(2, saved.clone(), Vec::new(), &auto_mode_settings());
+        assert!(agent.modes.iter().all(|m| m.id != MODE_AUTO_ID));
+        agent.apply_event(started(&[("default", "逐项确认"), ("agent-mode", "自定义")]), None);
+        assert_eq!(agent.mode_id(), Some("agent-mode"));
+
+        saved.kind = SessionKind::Chat;
+        let chat = Session::from_records(3, saved, Vec::new(), &auto_mode_settings());
+        assert!(chat.modes.is_empty());
+        assert!(chat.mode_id().is_none() && chat.pending_mode.is_none());
     }
 
     #[core::prelude::v1::test]

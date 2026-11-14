@@ -17,7 +17,7 @@ use super::catalog_view::{
     Shelf, ShelfState, list_card, matches, no_match, pick_done, pick_row, shelf_bar,
 };
 use super::plugin_versions::{short_rev, version_label};
-use super::settings_kit::{how_to, note, section};
+use super::settings_kit::{how_to, note};
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::catalog::{PluginPick, all_plugin_picks};
@@ -298,12 +298,12 @@ impl ChatApp {
             .child(
                 Self::text_button("plugins-open", "打开插件目录", false)
                     .small()
+                    .tooltip(dir.clone())
                     .on_click(cx.listener(|this, _, _, cx| this.open_plugins_dir(cx))),
             )
             .child(
                 Self::text_button("plugins-rescan", "重新扫描", false)
                     .small()
-                    .tooltip("手动往插件目录里放了文件夹后点它")
                     .on_click(cx.listener(|this, _, _, cx| this.rescan_plugins(cx))),
             )
             .into_any_element();
@@ -317,8 +317,9 @@ impl ChatApp {
             all_plugin_picks().count(),
             |this| &mut this.plugins_form.shelf,
             cx,
-        );
-        let mut body = div().v_flex().gap_4().child(bar);
+        )
+        .child(actions);
+        let mut body = div().v_flex().gap_3().child(bar);
         body = match shelf.current(self.plugins.len()) {
             Shelf::Picks => body.child(self.plugin_picks(&query, cx)).child(self.git_install(cx)),
             Shelf::Installed if self.plugins.is_empty() => body.child(how_to(
@@ -350,21 +351,11 @@ impl ChatApp {
         let body = body.when_some(busy, |d, text| {
             d.child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text))
         });
-        let notes = div()
-            .v_flex()
-            .gap_1()
-            .child(note(
-                IconAll::ShieldCheck,
-                "填地址装的插件默认停用：它会在本机运行作者写的命令，看过再启用",
-            ))
-            .child(note(IconAll::Info, "对新会话生效；ACP agent 只用其中的指令和 MCP"))
-            .child(note(IconAll::Folder, format!("插件目录：{dir}")));
-        section(
-            "插件",
-            "斜杠命令、技能、子 agent 等，兼容 Claude Code",
-            Some(actions),
-            body.child(notes),
-        )
+        let notes = div().v_flex().gap_1().child(note(
+            IconAll::ShieldCheck,
+            "填地址装的插件默认停用：它会在本机运行作者写的命令，看过再启用",
+        ));
+        body.child(notes)
     }
 
     /// 「推荐」栏：官方市场里的常用插件 + 别的仓库里的几个，装过的写「已启用」或给「启用」按钮。

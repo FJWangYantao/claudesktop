@@ -329,6 +329,15 @@ pub fn stop(id: &str) -> Result<String, String> {
     Ok(format!("已结束 {}（{}）", task.id, task.command))
 }
 
+/// 这个会话（含它的子会话）是否还有运行中的后台命令。
+pub fn has_running(session: &str) -> bool {
+    table().tasks.lock().unwrap().values().any(|task| {
+        let owned = task.session == session
+            || task.session.strip_prefix(session).is_some_and(|rest| rest.starts_with('/'));
+        owned && *task.state.lock().unwrap() == State::Running
+    })
+}
+
 /// 会话结束时把它的任务全停掉（会话没了，模型再也读不到输出）。
 pub fn stop_session(session: &str) {
     let ids: Vec<String> = table()

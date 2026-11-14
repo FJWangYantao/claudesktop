@@ -9,6 +9,7 @@
 5. **上线 / 部署 / 生产环境的任务**：把性能开销（CPU、内存、请求数、启动时间）写进设计取舍和验收标准。
 6. **UI 不堆二级标题和说明**：能不写的标签、副标题、解释句就不写，让排版本身说明结构（同「设计指南-Claude风格UI.md」的反模式一节）。
    *Avoid unnecessary secondary labels and descriptions. Let the layout do the explaining.*
+7. **截图验证用无头窗口**：先起隐藏窗口离屏渲染，不抢前台、不移动鼠标、不操作用户正在使用的窗口。
 
 ## UI：优先用 gpui-kit 自带组件，不要手写
 
@@ -34,14 +35,21 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **菜单条目**：两行式（图标 + 名称 + 灰色说明 + 当前项对勾）用 `menu.rs` 的 `menu_item()`，
   「选的是观感」的条目（如字体）用 `font_menu_item()`（上面灰字名称，下面用该字体本身排一行预览）；
   装进 `MenuList::pick(row, action)`（点了执行并收起，前 9 个自动标键帽、按数字直接选；动作要 `Window` 时用 `pick_in`）；
-  不收起面板的内容用 `MenuList::child`。面板宽度用 rem。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
+  不收起面板的内容用 `MenuList::child`；不需要数字快捷键的菜单在加条目前调用 `.without_shortcuts()`。
+  长列表需要常驻滚动条时用 `.scroll_with_bar(max_h)`（溢出才显示，右侧留位）。默认模型菜单用紧凑单行小字号。
+  权限模式菜单宽 10.5rem、行高 1.5rem，用 `.compact()` 去掉条目间距，只留单行图标、名称和对勾，不显示说明和数字键帽，也不绑定数字选择。
+  服务商列表和模型页来源菜单只显示单行名称，条目间加细分隔线。面板宽度用 rem。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
   `widgets.rs` 的 `message_action()`。
-- **设置页**：排版件在 `app/settings_kit.rs`——`section`（分区标题 + 一句说明 + 右侧操作）、
-  `setting_row` / `setting_group`（标题 + 右侧控件，说明收进标题旁 ⓘ 的悬停提示；标题下要挂路径 / 按钮用 `setting_row_with`）、`form_field`（左标签右输入）、
+- **设置页**：排版件在 `app/settings_kit.rs`——`section`（分区标题 + 右侧操作）、
+  `setting_row` / `setting_group`（标题 + 右侧控件；标题下要挂路径 / 按钮用 `setting_row_with`）、`form_field`（左标签右输入）、
   `choice_panel` + `choice_row`（沙色面板里的单选列表，同首页配置引导）、`seg_control`。
-  说明只写一句「这是干什么的」（`section` / `setting_row` / `form_field` 都放进 ⓘ，页面上不铺灰字）；怎么用写成 `how_to` 编号步骤放空状态，格式细节收进 `ChatApp::disclosure`。
-  例外：条款风险提示（`ANTIGRAVITY_RISK`、`ACP_PRESETS` 的第三列）常驻显示在入口下面（`TEXT_META` + `INK_SOFT`），不收进 ⓘ。
-  「内核」「模型」两页要点保存（底栏固定，`form_dirty` 决定能不能点），其余分类即时生效。
+  标题旁不挂 ⓘ，不铺固定解释和重复的操作提示；空状态保留必要操作指引，格式细节收进 `ChatApp::disclosure`。
+  设置打开时只留分类导航（会话侧栏状态不变，退出恢复）；窄窗口把导航收进页头分类菜单，切分类复用 `select_settings_tab`，不重置草稿。分类页头固定，设置行紧凑排列。
+  错误、未保存状态和已有条款风险提示仍显示；内核 / 服务商 / 模型共用草稿，有改动时页头出现「撤销更改 / 保存」，其余分类即时生效。
+  自动模式、补全的附属参数按开关展开，用量记录和单价表收进「高级」；文件路径按需查看。
+  内核清单同模型页用 2.25rem 单行、细分隔线，名称 / 版本状态 / 启用复选框对齐；风险和错误完整放在列表下。配置组用 `compact_setting_group`，输入和开关用小号。
+  内核标志用 `assets/kernels/` 内嵌的单色 SVG（来源和许可见同目录 `LICENSE`），经 `assets::kernel_logo_path` + gpui-kit `Icon` 着 `INK`，不重画品牌轮廓；没有专属标志时用通用终端图标。
+  内核检测结果在本次应用启动中缓存（未安装 / 未运行也缓存）：magpie 启动时探一次，agent 首进内核页测一次，之后用内核页头的「刷新」统一重测；切页、重开设置不重测。
 - **视图模式**：新增对话行类型时，在 `ChatItem::visible_in` 里写清它在摘要模式下显示与否，
   在 `ChatItem::is_step` 里写清它算不算过程步骤（算的话会和相邻步骤收进一个可折叠的组，
   分组规则在 `Session::compute_layout`）；
@@ -57,6 +65,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   会话还没连上内核时先把这一项补进模式表（`model::auto_mode_entry`）并选中，`Started` 时走
   `Session::pending_mode` 交给内核（内核不认就退回它报的那个）；用户在下拉里改了就以此为准，
   内核重连（`detach_kernel`）时把当前模式重新挂上 `pending_mode`。
+  会话模式 ID 存 `SessionMeta.mode`，切换时立即保存，续接的 `Started` 再交给内核；历史会话不套新对话默认值。
+  自研会话在连接前就用 `builtin::permission_modes` 补齐菜单（自动是否可用仍看设置）；旧元信息没存模式时保留逐项确认。
 - **向用户提问（`ask_user`）**：在 `Inner::run_tool` 开头拦截，不走 `start_tool` / `authorize`——「自动」模式的分类器
   不能替用户答，也不发 `ToolCallStarted`（提问不占工具行）。事件是 `KernelEvent::UserQuestion`，应答走
   `Kernel::resolve_question`；`Inner::pending` 按 `Reply` 分权限 / 提问两种。界面在输入框上沿的提问面板
@@ -147,12 +157,15 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     （`RowLayout::member`）统一处理。悬停才出现的操作用 `hover_opacity`；刚出现的内容用 `entering`。
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
   - 对话列表的滚轮在 `content.rs` 的 capture 阶段截住，走 `ChatApp::wheel_by` / `step_wheel` 平滑滑动
-    （gpui `List` 自己一格硬跳 60px）；新的程序化滚动（跳转、跟随底部）要清掉 `Session::wheel`，否则两边抢。
+    （gpui `List` 自己一格硬跳 60px）；设置页外层和模型清单走 `settings_wheel_by` / `step_settings_wheel`，
+    按指针位置和边界选择内层或外层，切分类 / 来源要清掉对应的 `*_wheel`。新的程序化滚动（跳转、跟随底部）
+    也要清掉对应滚动状态，否则两边抢。
 - **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
   下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
   `SessionMeta::task`），最后是「已归档」。判定在 `ChatApp::new_session`（`is_project_dir`：
-  默认目录 `acp_base.cwd` 以外都算项目，默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）；输入框工具栏的目录菜单里有「不选项目（任务）」
-  （`ChatApp::as_task`，已经跑在默认目录就只改归类），chip 和顶栏面包屑对任务显示「任务」。
+  默认目录 `acp_base.cwd` 以外都算项目，默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）；
+  输入框不显示项目选择器。项目在侧栏「项目」菜单切换、选文件夹、改成任务（`ChatApp::as_task`，已经跑在默认目录就只改归类），
+  菜单列最近代码会话目录、跳过聊天占位目录和 worktree；git 仓库可从这里建 worktree，顶栏面包屑对任务显示「任务」。
   新增对话行状态时记得把它并进 `sync_sidebar` 的指纹。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
   否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。
@@ -165,8 +178,15 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   加 `CLAUDESKTOP_STRESS_TYPE=1` 改成逐帧往输入框打字；加 `CLAUDESKTOP_STRESS_STREAM=1` 改成逐帧推
   `AgentMessageChunk`（末尾另报多少个 chunk 真正并进正文，合批后远小于 chunk 数）；
   加 `CLAUDESKTOP_STRESS_VIEW=settings:N` / `home` /
-  `requests`（`requests-all` 全部列出）改成逐帧滚设置页 / 首页 / 「请求」页签（`<行数>` 是假请求的轮数）。
-  动画 / 重画范围、设置页和首页的改动前后各跑一次。
+  `requests`（`requests-all` 全部列出）改成逐帧滚设置页 / 首页 / 「请求」页签（`<行数>` 是假请求的轮数）；
+  `CLAUDESKTOP_STRESS_SESSIONS=<会话数>`（配 `CLAUDESKTOP_STRESS_ROUNDS`，默认 3）测冷会话回收：
+  生成 N 个历史会话（每个约 1 MB 正文）逐个激活跑几轮，结束后等 70 秒看冷态稳态再自动退出，
+  配 `CLAUDESKTOP_MEM_REPORT=1` 和 `CLAUDESKTOP_DISABLE_RECLAIM=1`（关回收跑基线）做 A/B。
+  动画 / 重画范围、设置页和首页的改动前后各跑一次。启动 / 历史读取 / 用量索引 / MCP 连接 / 空闲回收计时用
+  `CLAUDESKTOP_BENCH_STARTUP=1`；内存用 `tools/memwatch.ps1 -Tree`，主进程和进程树分开记；
+  `CLAUDESKTOP_MEM_REPORT=1` 让 30 秒回收周期打一行 `[mem]`（各会话显示数据保留字节、
+  资源登记表条数 / 字节 / 挤到磁盘缓存的条数，冷会话回收时另有 `session_evict` 行）。
+  无头测量要保持窗口时用 `CLAUDESKTOP_SCREENSHOT_HOLD_MS=<毫秒>`（仅截图构建）。
 
 ### gpui-kit 踩坑备忘
 
@@ -263,7 +283,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 
 - 会话 / 内核逻辑放 `crates/*`（可单测），UI 层保持薄。
 - 调试钩子统一走环境变量（`CLAUDESKTOP_*`），入口集中在 `main.rs`；
-  涉及 Popover 内部状态的钩子做不了（open 状态不在我们手里），别为此改成受控模式。
+  菜单预览用 `Popover::default_open` 只初始化一次（`CLAUDESKTOP_OPEN=model-menu` 预览默认模型菜单），不改成受控模式。
+  截图用 `--features headless-screenshot` 编译，设 `CLAUDESKTOP_SCREENSHOT=<PNG 路径>`：隐藏窗口离屏渲染后自动退出；`QUIET` 只是不激活，不能代替无头截图。
 - 提交信息用英文 conventional commits（见 git log），代码注释用中文。
 - 本文件会整份进自研内核的系统提示词（`crates/builtin/src/instructions.rs`，每次请求都带），新增内容保持精炼。
 - 新增要进日志的 `KernelEvent` 时，同时想清楚 `Record::worth_keeping`、`history::rebuild`（续接时进不进上下文）
@@ -271,17 +292,22 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **magpie 网关**（`crates/builtin/src/magpie.rs`，「设计说明-本机agent.md」第十四、十五节）：把本机订阅/key
   汇成 `http://127.0.0.1:<port>/v1` 的 Anthropic 端点，自研内核当普通档案用（`settings.rs` 的 `magpie_profile`，
   `ProviderProfile.magpie` 标记自动建的）。「设置 · 内核」页是**本机内核清单**（对齐 magpie 的 Agents 页）：
-  检测到的 agent 列出、开关即接入；默认内核只有「演示回放」显式选，其余走自动（`Settings::kernel`）。
-  「设置 · 模型」页是模型来源清单（magpie 网关 + 各套档案）+ 模型清单（开关决定进不进
-  输入框菜单 `ProviderProfile.menu_hidden`、点名字设默认），手填档案在页底「服务商」；
-  点来源行只是查看管理——**所有来源的模型在输入框菜单都能挑**（按来源分组，挑别家的自动
-  切过去 `choose_model_from` = 改 `builtin.active` + 重启自研内核），「内核」页的供应商
-  单选只管默认走哪套端点。启动引导（`ChatApp::magpie_bootstrap`）：探活 `/api/hello`（用户自己开的直接复用，
+  检测到的 agent 列出、勾选即接入；新会话自动选择真实内核（`Settings::kernel`），不提供演示回放，旧演示设置迁回自动。
+  「设置 · 服务商」页是单行来源清单，选中的 Profile 在对应行下展开；行内笔图标切换编辑，垃圾桶先弹「确认删除？」（点击阻止冒泡，确认时按输入框实体定位来源），新增来源自动进入编辑。
+  Profile 的 API Key 只显示是否已设置；改动走页头「保存」。「设置 · 模型」只有一个跨来源的默认模型，
+  选模型同时确定来源（`builtin.active` + 该档案的 `model`，兼容原设置）；思考下拉只改这个模型所属档案，不跟清单筛选走。
+  清单默认「全部来源」，来源筛选和搜索不改变默认；行内「设为默认」执行选择，复选框决定进不进输入框菜单（`ProviderProfile.menu_hidden`）。
+  手填模型先筛选一个来源；同名模型按来源区分。默认模型菜单带搜索、来源分组和滚动条；清单只渲染视口附近的固定行。刷新按输入框实体与连接参数核对归属。
+  **所有来源的模型在输入框菜单都能挑**（按来源分组，挑别家的自动切过去 `choose_model_from` =
+  改 `builtin.active` + 重启自研内核）。启动引导（`ChatApp::magpie_bootstrap`）：探活 `/api/hello`（用户自己开的直接复用，
   端口读它 settings.json 的 `port`）→ 自动建档案 + 拉 `/v1/models`；当前档案是 magpie 而网关没跑、sidecar 已下载 →
   `auto_start_magpie_if_active` 顺手起 serve（`magpie serve`，进程挂 `ChatApp::magpie_child`，job object 之外的显式兜底）。
   下载走 GitHub release（哈希校验；产物地址和 SHA256SUMS 必须同一次 API 应答里拿）。凭据读取全部发生在 magpie 里，我们不碰。
 - MCP 客户端在 `crates/builtin/src/mcp.rs`（配置是数据目录的 `mcp.json`，格式同 Claude Code 的 `.mcp.json`；
-  本地命令走 stdio，远程的 Streamable HTTP / 旧版 SSE 在 `mcp_http.rs`；连上过又断了的自动退避重连）；工具以 `mcp__服务器__工具` 交给模型、走 `Action::Mcp` 和正常的权限流程，
+  本地命令走 stdio，远程的 Streamable HTTP / 旧版 SSE 在 `mcp_http.rs`；连上过又断了的自动退避重连）。
+  首次连接把工具定义按配置 / 插件版本指纹缓存到 `mcp-tools.json`；启动命中缓存时显示「按需连接」，
+  先把工具给模型，首次调用再连接；手动刷新仍强制重连。10 分钟无调用且无进行中的调用时断开，缓存保留。
+  工具以 `mcp__服务器__工具` 交给模型、走 `Action::Mcp` 和正常的权限流程，
   状态经 `KernelEvent::McpStatus` 到设置页「MCP」（`app/mcp_view.rs`）。改 MCP 用 `tools/mock-mcp-server.mjs` 测（`--http` / `--sse` 起远程模式，测试在 `tests/mcp.rs`）。
 - 设置页「MCP」「插件」分「已安装 / 推荐」两栏带搜索（`app/catalog_view.rs`），推荐的内容在 `crates/core/src/catalog.rs`：
   MCP 推荐项点「添加」写进 mcp.json（`mcp::add_server`，还有 `remove_server` / `set_server_disabled`）；插件推荐项从官方市场
@@ -320,6 +346,20 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 待办清单（`todo_write`）：内核在 `SessionState::todos` 记着当前清单（续接 / 回退从日志的 `PlanReplaced` 恢复）；
   还有没做完的项、连续 `TODO_REMIND_STEPS` 步没更新时，在那次请求的最后一条消息上临时挂提醒（不进历史，`todo_nudge`）；
   压缩时内核把当前清单附在摘要后面（`tools::summary_with_todos`），不靠总结的模型抄。
+- **历史与用量按需读取**：启动时 `Session::placeholder` 只给最近 100 个会话建元信息占位，首屏不读 jsonl；
+  激活后 `ChatApp::ensure_history_loaded` 后台重放，读取期间发送进现有队列，磁盘搜索跳转等加载完成再定位。
+  `has_user_message` 对未加载占位也为真，别把占位误删成空会话。用量由 `usage::build_index` 在首帧后读
+  `usage-cache.json` 并按日志字节偏移补扫追加行；删除会话要换代，迟到的索引结果不能覆盖新轮次。
+- **外部 agent 延迟与回收**：空白 ACP 会话不启动进程，首次发送存 `autoprompt`，`Started` 后自动发。
+  仅当 agent 握手声明 resume / load、所有会话 `Session::idle_detachable`、无后台任务且 10 分钟无活动时，
+  `reclaim_idle_processes` 才关闭；builtin 的 MCP 回收走同一个周期入口。
+- **自研历史休眠原型**（`crates/builtin/src/hibernate.rs`）：`CLAUDESKTOP_HIBERNATE=1` 才开启，
+  只把完整 `SessionState.history` 原子写入数据目录 `session-hibernation/`，其余会话状态、`acp_id` 和 `restored` 不变，
+  恢复不发 `Started`、不走有损日志续接。界面保留当前 + 最近 2 个温会话，其余闲置 10 分钟后台休眠
+  （压测可用 `CLAUDESKTOP_HIBERNATE_IDLE_SECS` 改阈值），激活后台 `wake_session`，发送在内核线程兜底恢复。
+  发送 / 压缩 / 回退 / 关闭共用每会话 `history_io`，轮末标题和记忆提炼另算 `history_activity`；磁盘 I/O 不持全局会话锁。
+  读取失败保留快照且明确报错，不自动降级。`history_stats` 只给估算值，真实内存仍用进程工具测；
+  性能日志是 `[perf] session_hibernate` / `session_wake`，`[mem]` 另有 resident / dormant 数。通过正确性和实测内存门槛前不默认开。
 - 流式文本合批上屏（`Session::stream_pending` / `STREAM_FLUSH`）：chunk 先进缓冲，短消息每 50ms 并进正文一次，
   间隔随消息长度爬坡到 250ms（`stream_flush_interval`，8KB 起爬、64KB 封顶）——每次并进是整篇重解析，长消息砍刷新率省解析；
   没并进的 chunk 不重画（`on_kernel_event` 的 `skip_notify`）。`flush_stream` 不分思考 / 正文一次全并，

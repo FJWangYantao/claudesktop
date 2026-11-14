@@ -24,6 +24,7 @@ mod bgtasks;
 mod compact;
 mod fetch;
 pub mod gateway;
+mod hibernate;
 mod history;
 mod instructions;
 pub mod magpie;
@@ -166,6 +167,8 @@ pub struct BuiltinConfig {
     pub chat_web: bool,
     /// 用户的「聊天说明」文件（每轮重读）：每次聊天都带上的话
     pub chat_instructions: Option<PathBuf>,
+    /// 闲置会话的完整历史快照目录；None = 不休眠（原型默认关闭）
+    pub hibernation_dir: Option<PathBuf>,
 }
 
 impl BuiltinConfig {
@@ -189,6 +192,7 @@ impl BuiltinConfig {
             subagent_model: None,
             chat_web: true,
             chat_instructions: None,
+            hibernation_dir: None,
         }
     }
 
@@ -207,7 +211,7 @@ impl BuiltinConfig {
             Some("anthropic") => Protocol::Anthropic,
             _ => Protocol::OpenAiCompat,
         };
-        Ok(Self::new(
+        let mut config = Self::new(
             ProviderConfig {
                 protocol,
                 base_url,
@@ -218,7 +222,9 @@ impl BuiltinConfig {
                 deepseek_key: None,
             },
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        ))
+        );
+        config.hibernation_dir = default_hibernation_dir();
+        Ok(config)
     }
 
     /// 写进会话元信息的内核标识（见 [`ProviderConfig::identity`]）。
@@ -233,7 +239,7 @@ impl BuiltinConfig {
 }
 
 /// 「自动」模式可用的前提下才有它（没配置就不出现，见 [`AutoModeConfig`]）。
-fn modes(auto_available: bool) -> Vec<ModeView> {
+pub fn permission_modes(auto_available: bool) -> Vec<ModeView> {
     let m = |id: &str, name: &str, desc: &str| ModeView {
         id: id.into(),
         name: name.into(),
@@ -251,6 +257,14 @@ fn modes(auto_available: bool) -> Vec<ModeView> {
     list
 }
 
+#[derive(Debug)]
+enum HistoryStorage {
+    Resident,
+    Spilling(u64),
+    Dormant(hibernate::SnapshotLocation),
+    Restoring(hibernate::SnapshotLocation),
+}
+
 struct SessionState {
     cwd: PathBuf,
     /// 会话类型（聊天会话不带工作目录那套，见「设计说明-聊天与Code分离.md」）
@@ -261,8 +275,14 @@ struct SessionState {
     model: String,
     /// 本会话临时覆盖的思考档位（会话级 chip 选的）；None = 用档案里的
     thinking: Option<ThinkingLevel>,
-    /// 不含系统提示词的对话历史
+    /// 不含系统提示词的对话历史；只有 `HistoryStorage::Resident` 时驻留在这里
     history: Vec<ChatMessage>,
+    history_storage: HistoryStorage,
+    history_generation: u64,
+    /// 休眠、恢复、发送、压缩、回退和关闭共用的每会话 I/O 锁
+    history_io: Arc<Mutex<()>>,
+    /// `turn` 之外仍读历史的工作（轮末标题、记忆提炼）
+    history_activity: usize,
     mode: String,
     /// 历史是从本地日志重建的（工具调用只剩摘要）
     restored: bool,
@@ -406,6 +426,8 @@ struct Inner {
     chat_web: bool,
     /// 用户的「聊天说明」文件（每轮重读）
     chat_instructions: Option<PathBuf>,
+    /// 闲置历史快照目录（None = 功能关闭）
+    hibernation_dir: Option<PathBuf>,
 }
 
 /// 「自动」模式的运行时：配置 + 每个会话的拒绝计数。
@@ -449,6 +471,16 @@ pub fn default_mcp_config() -> Option<PathBuf> {
 /// 默认的全局记忆文件：数据目录下的 `memory.json`。
 pub fn default_memory_path() -> Option<PathBuf> {
     claudesktop_core::memory::global_path()
+}
+
+/// 原型开关：`CLAUDESKTOP_HIBERNATE=1` 时才允许闲置历史落盘。
+pub fn default_hibernation_dir() -> Option<PathBuf> {
+    let enabled =
+        std::env::var("CLAUDESKTOP_HIBERNATE").is_ok_and(|value| !value.is_empty() && value != "0");
+    enabled
+        .then(|| claudesktop_core::default_data_dir().ok())
+        .flatten()
+        .map(|dir| dir.join("session-hibernation"))
 }
 
 /// 一步要发给模型的东西（[`Inner::snapshot`]）。
@@ -873,6 +905,50 @@ impl Inner {
         if let Some(state) = self.sessions.lock().unwrap().get_mut(session) {
             state.measured = Some((tokens, state.history.len().saturating_sub(unmeasured)));
         }
+    }
+
+    /// 历史恢复完成后追加用户消息；取消、关闭或新一轮已经替换这一轮的占位时不再追加。
+    fn prepare_prompt(
+        &self,
+        session: &str,
+        prompt: claudesktop_core::UserPrompt,
+        flag: &Arc<AtomicBool>,
+    ) -> Option<Vec<String>> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let state = sessions.get_mut(session)?;
+        if flag.load(Ordering::SeqCst)
+            || state.turn.as_ref().is_none_or(|current| !Arc::ptr_eq(current, flag))
+        {
+            return None;
+        }
+        // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
+        if state.kind == SessionKind::Chat {
+            state.instructions = instructions::chat_instructions(self.chat_instructions.as_deref());
+        } else {
+            let project = claudesktop_core::project::load(&state.cwd);
+            state.instructions = session_instructions(
+                &state.cwd,
+                self.user_instructions.as_deref(),
+                project.as_ref(),
+            );
+            state.skills = self.skills(state.plugins_enabled.as_deref());
+        }
+        let warnings = state.reload_memory_for_turn(self.memory_path.as_deref());
+        let text = prompt.text.clone();
+        let full = if prompt.attachments.is_empty() {
+            text.clone()
+        } else {
+            claudesktop_core::attach::compose(&text, &prompt.attachments)
+        };
+        let mut parts = vec![ContentPart::Text(full)];
+        for image in prompt.images {
+            parts.push(ContentPart::Image { media_type: image.media_type, data: image.data });
+        }
+        state.history.push(ChatMessage::with_parts("user", parts));
+        state.user_messages.push(text);
+        let messages = std::mem::take(&mut state.user_messages);
+        state.user_messages = recent_user_messages(messages);
+        Some(warnings)
     }
 
     /// 把一次请求（或一次压缩）的用量报给界面。
@@ -1822,6 +1898,10 @@ impl Inner {
                     // 子任务跟主会话的档位走（用户中途换档也跟上）
                     thinking: parent.thinking,
                     history: vec![ChatMessage::new("user", prompt)],
+                    history_storage: HistoryStorage::Resident,
+                    history_generation: 0,
+                    history_io: Arc::new(Mutex::new(())),
+                    history_activity: 0,
                     mode: parent.mode.clone(),
                     restored: false,
                     instructions: parent.instructions.clone(),
@@ -2408,6 +2488,7 @@ impl BuiltinKernel {
             subagent_model: config.subagent_model,
             chat_web: config.chat_web,
             chat_instructions: config.chat_instructions,
+            hibernation_dir: config.hibernation_dir,
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
         inner.emit(None, KernelEvent::Connected { agent_name });
@@ -2424,8 +2505,8 @@ impl BuiltinKernel {
                 }),
             );
         }
-        // MCP 服务器在后台连，连上之前的轮次没有它们的工具
-        inner.mcp.reload();
+        // 首次连接在后台列工具并缓存；已有有效缓存的服务器等首次调用再连。
+        inner.mcp.reload_lazy();
         Ok(Self { inner })
     }
 
@@ -2513,6 +2594,10 @@ impl BuiltinKernel {
             // 会话级档位默认跟随档案，用户在下拉里选了才覆盖
             thinking: None,
             history: history.messages,
+            history_storage: HistoryStorage::Resident,
+            history_generation: 0,
+            history_io: Arc::new(Mutex::new(())),
+            history_activity: 0,
             mode: MODE_DEFAULT.into(),
             restored: resumed,
             instructions,
@@ -2550,7 +2635,11 @@ impl BuiltinKernel {
                 session_id: session_id.clone(),
                 model: Some(model),
                 // 聊天没有权限模式：模式表为空，界面据此不画模式 chip
-                modes: if chat { Vec::new() } else { modes(self.inner.auto_mode.is_some()) },
+                modes: if chat {
+                    Vec::new()
+                } else {
+                    permission_modes(self.inner.auto_mode.is_some())
+                },
                 current_mode: (!chat).then(|| MODE_DEFAULT.to_string()),
                 resumed,
             },
@@ -2778,6 +2867,75 @@ fn transcript_budget(window: Option<u64>) -> usize {
     })
 }
 
+/// 发送的后台兜底：先等休眠写盘 / 预恢复结束并恢复完整历史，再追加用户消息。
+fn run_pending_prompt(
+    inner: Arc<Inner>,
+    session: String,
+    prompt: claudesktop_core::UserPrompt,
+    flag: Arc<AtomicBool>,
+) {
+    if let Err(err) = inner.wake_history(&session) {
+        if !flag.load(Ordering::SeqCst) {
+            inner.finish(&session, &flag);
+            inner.emit(Some(&session), KernelEvent::PromptFailed { message: format!("{err:#}") });
+        }
+        return;
+    }
+    let Some(warnings) = inner.prepare_prompt(&session, prompt, &flag) else {
+        return;
+    };
+    inner.reset_denials(&session);
+    for warning in warnings {
+        inner.emit(Some(&session), KernelEvent::Notice(warning));
+    }
+    run_turn(inner, session, flag);
+}
+
+fn run_compact(inner: Arc<Inner>, session: String, model: String, flag: Arc<AtomicBool>) {
+    let restored = inner.wake_history(&session);
+    if flag.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Err(err) = restored {
+        inner.finish(&session, &flag);
+        inner.emit(Some(&session), KernelEvent::CompactFailed { message: format!("{err:#}") });
+        inner.emit(Some(&session), KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
+        return;
+    }
+    let empty = inner.sessions.lock().unwrap().get(&session).is_none_or(|s| s.history.is_empty());
+    if empty {
+        inner.finish(&session, &flag);
+        inner.emit(
+            Some(&session),
+            KernelEvent::CompactFailed { message: "还没有可以压缩的对话".into() },
+        );
+        inner.emit(Some(&session), KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
+        return;
+    }
+    let budget = transcript_budget(inner.window(&model));
+    let result = inner.compact(&session, &flag, &model, true, 0, budget);
+    if flag.load(Ordering::SeqCst) {
+        return;
+    }
+    inner.finish(&session, &flag);
+    if let Ok(Some(u)) = result {
+        inner.report_usage(&session, u, 0);
+    }
+    inner.emit(Some(&session), KernelEvent::TurnEnded { stop_reason: "end_turn".into() });
+}
+
+/// 轮末仍读历史的工作用活动计数保护（`turn` 已经先放掉，界面才能接着发下一轮）。
+struct HistoryActivityGuard {
+    inner: Arc<Inner>,
+    session: String,
+}
+
+impl Drop for HistoryActivityGuard {
+    fn drop(&mut self) {
+        self.inner.end_history_activity(&self.session);
+    }
+}
+
 /// 一轮对话（在独立线程里运行）：先跑提交消息的钩子，再走工具循环（用量逐步当场报），最后结束。
 fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
     if !inner.prompt_hooks(&session, &flag) {
@@ -2800,6 +2958,10 @@ fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
         Steps::Done { stop, .. } => stop,
     };
 
+    if !inner.begin_history_activity(&session) {
+        return;
+    }
+    let _activity = HistoryActivityGuard { inner: inner.clone(), session: session.clone() };
     inner.finish(&session, &flag);
     let cwd = inner.sessions.lock().unwrap().get(&session).map(|s| s.cwd.clone());
     inner.emit(Some(&session), KernelEvent::TurnEnded { stop_reason: stop.clone() });
@@ -3243,7 +3405,13 @@ fn message_text(message: &ChatMessage) -> String {
 fn plugin_servers(plugins: &[Plugin]) -> Vec<mcp::ServerConfig> {
     plugins
         .iter()
-        .flat_map(|p| p.mcp_servers.iter().map(|s| mcp::ServerConfig::from_plugin(&p.name, s)))
+        .flat_map(|p| {
+            p.mcp_servers.iter().map(|s| {
+                let mut config = mcp::ServerConfig::from_plugin(&p.name, s);
+                config.cache_salt = p.version.clone().unwrap_or_default();
+                config
+            })
+        })
         .collect()
 }
 
@@ -3306,61 +3474,32 @@ impl Kernel for BuiltinKernel {
         session: &str,
         prompt: claudesktop_core::UserPrompt,
     ) -> anyhow::Result<()> {
-        let (flag, warnings) = {
+        let flag = {
             let mut sessions = self.inner.sessions.lock().unwrap();
             let state =
                 sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
             if state.turn.is_some() {
                 anyhow::bail!("上一轮还没结束");
             }
-            // 说明文件可能改过：每轮重读（内容不变时系统提示词不变，不影响提示缓存）
-            if state.kind == SessionKind::Chat {
-                // 聊天说明每轮重读（改了下一轮就生效）；聊天没有技能
-                state.instructions =
-                    instructions::chat_instructions(self.inner.chat_instructions.as_deref());
-            } else {
-                let project = claudesktop_core::project::load(&state.cwd);
-                state.instructions = session_instructions(
-                    &state.cwd,
-                    self.inner.user_instructions.as_deref(),
-                    project.as_ref(),
-                );
-                state.skills = self.inner.skills(state.plugins_enabled.as_deref());
-            }
-            // 记忆文件同理：界面删掉一条，下一轮就不在提示词里了
-            let warnings = state.reload_memory_for_turn(self.inner.memory_path.as_deref());
-            // 自动模式的分类器靠这些判断「用户授权了什么」：只记用户说的话
-            let text = prompt.text.clone();
-            // 聊天附件的内容界面已经拼进 `text`（见 `attach::compose`）；这里再兜一次，
-            // 别的调用方（测试、命令行）直接带 `attachments` 时也能发出去
-            let full = if prompt.attachments.is_empty() {
-                text.clone()
-            } else {
-                claudesktop_core::attach::compose(&text, &prompt.attachments)
-            };
-            let mut parts = vec![ContentPart::Text(full)];
-            for image in prompt.images {
-                parts.push(ContentPart::Image { media_type: image.media_type, data: image.data });
-            }
-            state.history.push(ChatMessage::with_parts("user", parts));
-            state.user_messages.push(text);
-            let messages = std::mem::take(&mut state.user_messages);
-            state.user_messages = recent_user_messages(messages);
             let flag = Arc::new(AtomicBool::new(false));
             state.turn = Some(flag.clone());
             state.turns += 1;
-            (flag, warnings)
+            flag
         };
-        self.inner.reset_denials(session);
-        for warning in warnings {
-            self.inner.emit(Some(session), KernelEvent::Notice(warning));
-        }
         let inner = self.inner.clone();
         let session = session.to_string();
-        std::thread::Builder::new()
+        let worker_session = session.clone();
+        let spawned = std::thread::Builder::new()
             .name("builtin-turn".into())
-            .spawn(move || run_turn(inner, session, flag))
-            .map_err(|e| anyhow::anyhow!("spawn turn thread: {e}"))?;
+            .spawn(move || run_pending_prompt(inner, worker_session, prompt, flag));
+        if let Err(err) = spawned {
+            let mut sessions = self.inner.sessions.lock().unwrap();
+            if let Some(state) = sessions.get_mut(&session) {
+                state.turn = None;
+                state.turns = state.turns.saturating_sub(1);
+            }
+            return Err(anyhow::anyhow!("spawn turn thread: {err}"));
+        }
         Ok(())
     }
 
@@ -3419,7 +3558,7 @@ impl Kernel for BuiltinKernel {
     }
 
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()> {
-        if !modes(self.inner.auto_mode.is_some()).iter().any(|m| m.id == mode_id) {
+        if !permission_modes(self.inner.auto_mode.is_some()).iter().any(|m| m.id == mode_id) {
             anyhow::bail!("未知模式 {mode_id}");
         }
         let mut sessions = self.inner.sessions.lock().unwrap();
@@ -3470,6 +3609,9 @@ impl Kernel for BuiltinKernel {
     /// 回退：上下文换成日志折算出的样子（工具调用只剩摘要，和续接历史会话一样）。
     fn rewind(&self, session: &str, history: &[Record]) -> anyhow::Result<()> {
         let rebuilt = history::rebuild(history);
+        let io = self.inner.history_io(session)?;
+        let _guard = io.lock().unwrap();
+        self.inner.wake_history_locked(session, Duration::ZERO)?;
         let mut sessions = self.inner.sessions.lock().unwrap();
         let state =
             sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
@@ -3498,7 +3640,8 @@ impl Kernel for BuiltinKernel {
             if state.turn.is_some() {
                 anyhow::bail!("这一轮还没结束");
             }
-            if state.history.is_empty() {
+            if matches!(state.history_storage, HistoryStorage::Resident) && state.history.is_empty()
+            {
                 anyhow::bail!("还没有可以压缩的对话");
             }
             let flag = Arc::new(AtomicBool::new(false));
@@ -3508,26 +3651,18 @@ impl Kernel for BuiltinKernel {
         };
         let inner = self.inner.clone();
         let session = session.to_string();
-        std::thread::Builder::new()
+        let worker_session = session.clone();
+        let spawned = std::thread::Builder::new()
             .name("builtin-compact".into())
-            .spawn(move || {
-                let budget = transcript_budget(inner.window(&model));
-                let result = inner.compact(&session, &flag, &model, true, 0, budget);
-                if flag.load(Ordering::SeqCst) {
-                    return; // cancel() 已经报告过 TurnEnded
-                }
-                inner.finish(&session, &flag);
-                if let Ok(Some(u)) = result {
-                    // 上下文大小由 `Compacted` 报过，这里只并用量
-                    inner.report_usage(&session, u, 0);
-                }
-                // 失败已经以 CompactFailed 报过，这一轮照常结束
-                inner.emit(
-                    Some(&session),
-                    KernelEvent::TurnEnded { stop_reason: "end_turn".into() },
-                );
-            })
-            .map_err(|e| anyhow::anyhow!("spawn compact thread: {e}"))?;
+            .spawn(move || run_compact(inner, worker_session, model, flag));
+        if let Err(err) = spawned {
+            let mut sessions = self.inner.sessions.lock().unwrap();
+            if let Some(state) = sessions.get_mut(&session) {
+                state.turn = None;
+                state.turns = state.turns.saturating_sub(1);
+            }
+            return Err(anyhow::anyhow!("spawn compact thread: {err}"));
+        }
         Ok(())
     }
 
@@ -3539,10 +3674,26 @@ impl Kernel for BuiltinKernel {
         self.inner.mcp.clear_auth(server).map_err(|e| anyhow::anyhow!(e))
     }
 
+    fn hibernate_session(&self, session: &str) -> anyhow::Result<()> {
+        self.inner.hibernate_history(session)
+    }
+
+    fn wake_session(&self, session: &str) -> anyhow::Result<()> {
+        let result = self.inner.wake_history(session);
+        if let Err(err) = &result {
+            self.inner.emit(Some(session), KernelEvent::Notice(format!("{err:#}")));
+        }
+        result
+    }
+
+    fn history_stats(&self) -> claudesktop_core::KernelHistoryStats {
+        self.inner.history_stats()
+    }
+
     /// 会话结束（切走 / 关掉）时把它起的后台命令停掉：模型再也读不到输出了。
     fn close_session(&self, session: &str) {
         bgtasks::stop_session(session);
-        self.inner.sessions.lock().unwrap().remove(session);
+        self.inner.close_history(session);
     }
 
     fn stop_background_task(&self, id: &str) {
@@ -3551,6 +3702,10 @@ impl Kernel for BuiltinKernel {
 
     fn reload_mcp(&self) {
         self.inner.mcp.reload();
+    }
+
+    fn reclaim_idle_mcp(&self) {
+        self.inner.mcp.reclaim_idle();
     }
 
     fn set_plugins(&self, plugins: Vec<Plugin>) {
@@ -3570,6 +3725,7 @@ impl Kernel for BuiltinKernel {
         }
         self.inner.mcp.stop();
         bgtasks::unregister(self.inner.kernel_id);
+        self.inner.shutdown_history();
     }
 }
 
@@ -3628,5 +3784,85 @@ mod tests {
             assert!(!text.starts_with('\n'), "{name} 以空行开头");
             assert!(!text.ends_with('\n'), "{name} 以空行结尾");
         }
+    }
+
+    #[test]
+    fn hibernation_keeps_session_settings_and_auxiliary_state() {
+        let root = std::env::temp_dir()
+            .join(format!("claudesktop-hibernate-state-{}", std::process::id()));
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let sink: EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
+        let mut config = BuiltinConfig::new(
+            ProviderConfig { model: "session-model".into(), ..Default::default() },
+            cwd,
+        );
+        config.rules_path = None;
+        config.user_instructions = None;
+        config.mcp_config = None;
+        config.memory_path = None;
+        config.hibernation_dir = Some(root.join("snapshots"));
+        let kernel = BuiltinKernel::spawn(config, sink).unwrap();
+        kernel.new_session(1, SessionSpec::default()).unwrap();
+        let sid = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|event| match &event.event {
+                KernelEvent::Started { session_id, .. } => Some(session_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let history =
+            vec![ChatMessage::new("user", "完整历史"), ChatMessage::new("assistant", "回答")];
+        let todos = vec![PlanEntryView {
+            content: "保留待办".into(),
+            priority: "high".into(),
+            status: "in_progress".into(),
+        }];
+        {
+            let mut sessions = kernel.inner.sessions.lock().unwrap();
+            let state = sessions.get_mut(&sid).unwrap();
+            state.history = history.clone();
+            state.mode = MODE_PLAN.into();
+            state.model = "session-model-override".into();
+            state.thinking = Some(ThinkingLevel::High);
+            state.web = false;
+            state.summary = Some("已有摘要".into());
+            state.measured = Some((123, 1));
+            state.todos = todos.clone();
+            state.loaded_tools = vec!["mcp__demo__tool".into()];
+        }
+
+        kernel.inner.hibernate_history(&sid).unwrap();
+        assert!(kernel.inner.sessions.lock().unwrap().get(&sid).unwrap().history.is_empty());
+        kernel.inner.wake_history(&sid).unwrap();
+        let sessions = kernel.inner.sessions.lock().unwrap();
+        let state = sessions.get(&sid).unwrap();
+        assert_eq!(state.history, history);
+        assert_eq!(state.mode, MODE_PLAN);
+        assert_eq!(state.model, "session-model-override");
+        assert_eq!(state.thinking, Some(ThinkingLevel::High));
+        assert!(!state.web);
+        assert_eq!(state.summary.as_deref(), Some("已有摘要"));
+        assert_eq!(state.measured, Some((123, 1)));
+        assert_eq!(state.todos, todos);
+        assert_eq!(state.loaded_tools, ["mcp__demo__tool"]);
+        assert!(!state.restored);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, KernelEvent::Started { .. }))
+                .count(),
+            1,
+            "恢复不重新开会话"
+        );
+        drop(sessions);
+        drop(events);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

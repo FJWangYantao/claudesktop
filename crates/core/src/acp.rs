@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -125,6 +125,7 @@ pub struct AcpKernel {
     command_tx: UnboundedSender<KernelCommand>,
     pending: PendingPermissions,
     plugin_servers: PluginServers,
+    resumable: Arc<AtomicBool>,
 }
 
 impl AcpKernel {
@@ -138,14 +139,25 @@ impl AcpKernel {
         let pending_for_thread = pending.clone();
         let plugin_servers: PluginServers = Arc::default();
         let servers_for_thread = plugin_servers.clone();
+        let resumable = Arc::new(AtomicBool::new(false));
+        let resumable_for_thread = resumable.clone();
         emit(&sink, None, KernelEvent::Status(format!("启动 ACP 内核: {}", config.command)));
 
         let _handle: JoinHandle<()> = std::thread::Builder::new()
             .name("acp-kernel".into())
-            .spawn(move || run_kernel(config, rx, sink, pending_for_thread, servers_for_thread))
+            .spawn(move || {
+                run_kernel(
+                    config,
+                    rx,
+                    sink,
+                    pending_for_thread,
+                    servers_for_thread,
+                    resumable_for_thread,
+                )
+            })
             .map_err(|e| anyhow::anyhow!("spawn acp-kernel thread: {e}"))?;
 
-        Ok(Self { command_tx: tx, pending, plugin_servers })
+        Ok(Self { command_tx: tx, pending, plugin_servers, resumable })
     }
 
     fn send_command(&self, command: KernelCommand) -> anyhow::Result<()> {
@@ -236,6 +248,10 @@ impl Kernel for AcpKernel {
         })
     }
 
+    fn can_idle_shutdown(&self) -> bool {
+        self.resumable.load(Ordering::SeqCst)
+    }
+
     fn shutdown(&self) {
         let _ = self.command_tx.unbounded_send(KernelCommand::Shutdown);
     }
@@ -248,6 +264,7 @@ fn run_kernel(
     sink: EventSink,
     pending: PendingPermissions,
     plugin_servers: PluginServers,
+    resumable: Arc<AtomicBool>,
 ) {
     let sink_fatal = sink.clone();
     let result = smol::block_on(async move {
@@ -463,6 +480,7 @@ fn run_kernel(
                 };
                 let can_resume = caps.session_capabilities.resume.is_some();
                 let can_load = caps.load_session;
+                resumable.store(can_resume || can_load, Ordering::SeqCst);
                 let agent_name =
                     init.agent_info.map(|info| info.name).unwrap_or_else(|| "unknown-agent".into());
                 emit(

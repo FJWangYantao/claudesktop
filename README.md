@@ -12,13 +12,12 @@ Claude 风格的 AI 编程桌面端（Rust + GPUI），Windows 原生，**内核
 
 ## 功能
 
-**内核三种**
+**两种内核接入方式**
 
 | 内核 | 说明 |
 |---|---|
 | 自研内核（进程内） | 直接连 OpenAI 兼容或 Anthropic 原生端点；工具循环、权限、压缩、子 agent、MCP、插件全在这一层 |
 | ACP agent | 走 `agent-client-protocol` 起外部进程（Claude Code 适配器、pi 等），多会话、权限审批、续接都支持 |
-| 演示回放 | 内置假数据，改界面时用，不落盘 |
 
 **自研内核**
 
@@ -97,13 +96,13 @@ cargo run -p claudesktop
 **第一次启动**不会猜后端：没配过任何内核时，首页出来的是配置引导，
 选「自研内核」或「ACP agent」进设置页填好，再回首页开始用。
 
-- **自研内核**：设置 → 内核与模型 → 填端点、API Key、模型。
+- **自研内核**：设置 → 服务商 → 添加来源并填写端点和 API Key，再到「模型」选择全局默认模型。
   内置 DeepSeek / GLM / Kimi / Anthropic / OpenAI / OpenRouter / Ollama 预设，点一下就能带出端点
-- **ACP agent**：设置 → 内核与模型 → 选 ACP，命令填例如
+- **ACP agent**：设置 → 内核 → 启用检测到的 agent；自定义命令在「高级」中填写，例如
   `cmd /c npx -y @agentclientprotocol/claude-agent-acp`（Claude Code 适配器），
   之后按适配器自己的方式配密钥
 
-设置存在数据目录的 `settings.json`，点「保存并应用」会重启对应内核，有对话的会话下次发消息时自动续接。
+设置存在数据目录的 `settings.json`。内核、服务商和模型共用草稿，改动后点页头「保存」应用；需要重启的内核会自动重启，有对话的会话下次发消息时自动续接。
 
 ### 数据目录
 
@@ -138,7 +137,7 @@ CI（[.github/workflows/ci.yml](./.github/workflows/ci.yml)）在 windows-latest
 环境变量（都在 `main.rs` / `settings.rs` 里集中读取）：
 
 ```bash
-# 指定新会话的默认内核：builtin / acp / demo
+# 指定新会话的默认内核：builtin / acp
 CLAUDESKTOP_KERNEL=builtin
 
 # 自研内核的端点（等价于在设置页里填，启动时环境变量优先）
@@ -155,7 +154,7 @@ CLAUDESKTOP_MAX_STEPS=200               # 一轮最多的工具步数
 CLAUDESKTOP_DATA_DIR=D:\tmp\claudesktop
 CLAUDESKTOP_OPEN=settings|fetch|restart # 启动 1.5s 后打开某个界面
 CLAUDESKTOP_DROP='路径;路径'             # 模拟从资源管理器拖文件进来
-CLAUDESKTOP_RERUN=builtin|acp|demo      # 把首条提示词放到另一个内核上重跑
+CLAUDESKTOP_RERUN=builtin|acp           # 把首条提示词放到另一个内核上重跑
 
 # 性能压测：逐帧滚动并输出帧间隔与每帧工作量
 CLAUDESKTOP_STRESS=10000                # 灌 1 万行再滚；加 _BUSY=1 看转圈，_TYPE=1 看打字

@@ -101,7 +101,7 @@ impl ChatApp {
             .overflow_hidden()
             .whitespace_nowrap()
             .text_size(TEXT_BODY);
-        // 设置页自己有大标题，顶栏只留拖拽区
+        // 设置页有自己的分类页头，顶栏只留拖拽区
         let crumb = if self.settings_open {
             crumb
         } else {
@@ -172,7 +172,7 @@ impl ChatApp {
             .h(CHROME_H)
             .flex_shrink_0()
             .items_center()
-            .when(!self.sidebar_open, |d| {
+            .when(!self.sidebar_open && !self.settings_navigation_only(), |d| {
                 d.children(traffic_light_gap())
                     .pl_2()
                     .child(self.sidebar_toggle("header-sidebar-toggle", cx))

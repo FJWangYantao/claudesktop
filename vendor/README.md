@@ -49,6 +49,10 @@ gpui 的 Windows 平台层（lib 名 `gpui_windows`），原样拷自 crates.io 
   lineGap 为 0 的字体（内嵌的 Inter、微软雅黑）排版不变。只在 Windows 上编译，Linux 上验证用
   `cargo check -p gpui-pre-windows --target x86_64-pc-windows-msvc`（先 `rustup target add`）。
 
+- **隐藏窗口也应用初始尺寸**（`src/window.rs` 的 `WindowsWindow::new`）：上游在 `show=false` 时只保存 placement，
+  实际窗口仍使用 `CW_USEDEFAULT` 的大小，导致无头截图忽略指定的宽高。隐藏分支用
+  `SetWindowPos(SWP_NOACTIVATE | SWP_NOZORDER)` 应用 bounds，不显示窗口、不激活、不调整层级。
+
 ### 升级
 
 gpui-kit 换了 gpui-pre 版本时（gpui-pre-windows 跟着同一版本号走，一并换）：把新版发布包拷进来（同样删掉 `[[example]]` / `[[test]]`），

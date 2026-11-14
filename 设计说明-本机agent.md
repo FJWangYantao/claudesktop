@@ -85,7 +85,7 @@ pub struct AgentPreset {
 
 ## 四、发现
 
-`agents::discover() -> Vec<Detected>`，在后台线程跑（要起几个子进程），结果缓存在 `ChatApp`，设置页打开、点「重新检测」时刷新。
+`agents::discover() -> Vec<Detected>`，在后台线程跑（要起几个子进程），首次进入「内核」页时检测，结果缓存在 `ChatApp`，同一次启动中只在点「刷新」时重新检测。
 
 ```rust
 pub struct Detected {
@@ -191,7 +191,7 @@ pub struct AgentProfile {
 - 迁移：读到老的非空 `command` 时，生成一条 `custom-1` 档案，名字取「自定义 agent」，`gateway` 带过去。
 - 内核槽：现在 `kernels: [KernelSlot; 3]` 按 `KernelChoice::index` 下标。改成「自研 / 演示」两个固定槽 + 每个 ACP 档案一个槽
   （`Vec<(String, KernelSlot)>`，按档案 ID 找），`KernelChoice::Acp` 带上档案 ID：`Acp(String)`。
-  每个档案一个进程，**懒启动**：用到它的会话第一次连接时才起。
+  每个档案一个进程，**懒启动**：空白会话不起进程，首次发送或续接时才起。
 - 会话归属：日志 / `SessionMeta` 里的 agent 标识现在是 agent 自报名（`of_agent` 只分 builtin / 空 / 其他），
   改成 `acp:<档案 ID>:<自报名>`。老会话没有档案 ID → 归到第一个启用的档案（只有一个时就是迁移来的那条），续接时照旧。
 - 设置里的 `kernel: Option<KernelChoice>` 改为默认内核（`builtin` / `acp:<id>`），解析认老值 `acp`（= 第一个档案）。
@@ -205,8 +205,7 @@ pub struct AgentProfile {
 
 检测到就在「自研内核」档案区显示一行「检测到 OPENAI_API_KEY，导入为档案？」，用户点了才建档案（Key 进设置，同手填）。
 
-现有的「从 Antigravity Tools 导入端点和 Key」（`settings::antigravity_gateway`）走的是第三方反代 Antigravity 的 OAuth，
-正是第二节说的 B 路线。**定了：保留，按钮下面常驻一句风险提示**（已实施，`settings_view.rs` 的 `ANTIGRAVITY_RISK`）。
+「从 Antigravity Tools 导入端点和 Key」入口及其风险提示已按用户要求移除（2026-11-13）。
 
 ## 十、界面改动一览
 
@@ -225,12 +224,13 @@ pub struct AgentProfile {
 1. **Claude Code 适配器的条款**：适配器跑的是 Claude Code 本体（Zed 就是这么接的），但底层是 Agent SDK，Anthropic 的条款
    不允许把订阅登录经第三方程序使用。保留，预设带 `risk` 提示；用 API Key 登录的不受影响。现有设置页的「填入 Claude Code」
    下面已经加了这句（`CLAUDE_CODE_RISK`）。对外发版前再核对一次当时的条款，文案跟着改。
-2. **Antigravity Tools 导入**（第九节）：保留，加风险提示（已实施）。
+2. **Antigravity Tools 导入**（第九节）：入口和风险提示已移除。
 3. **pi 适配器成熟度**：社区的 `pi-acp` 还是 MVP（MCP 没接通，包名有过变动）。先用它；不够用再考虑自己写一个
    （参考 Rust 版 `pi-acpinator`，或在 `crates/` 里直接对 `pi --mode rpc` 写一层）。
 4. **Windows**：npm 装的是 `.cmd` 垫片，起进程要过 `cmd /c`；图形界面启动拿不到用户 shell 里改过的 PATH（第四节已补常见目录）；
    开终端登录要实机试。
-5. **多进程开销**：每个启用的档案一个常驻进程（Node 适配器每个几十 MB）。懒启动 + 档案停用时关掉；空闲很久的进程是否回收，实施时看实际占用再定。
+5. **多进程开销**：每个启用的档案一个进程（Node 适配器每个几十 MB）。懒启动 + 档案停用时关掉；
+   已支持恢复上下文、没有活动或等待状态的进程空闲 10 分钟后关闭，下次发送自动续接。
 6. **经用量网关**：只有认 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 的 agent 能经网关（`gateway::agent_env`），按预设的 `gateway_env` 决定给不给开；
    订阅登录走的是 agent 自己的端点，网关多半不生效，开关旁要说明。
 
@@ -274,7 +274,7 @@ OpenAI / Anthropic / Gemini 三协议直通的网关；**我们把它当一个�
     挂一份显式 kill（其他平台的进程守卫是空操作，全靠这份）。
 - **设置页**：「内核与模型」自研内核分支新增「magpie 网关」分区（`render_magpie`），
   状态行（正在检测 / 本机没有 / 已下载没跑 / 网关运行中 · 版本）+ 按需动作
-  （下载并启动 / 启动 / 添加为档案 / 重试）；进页面时探活一次，下载 / 启动进行中不打扰。
+  （下载并启动 / 启动 / 添加为档案 / 重试）；复用启动探活结果，点「刷新」才重测，下载 / 启动进行中不打扰。
   「添加为档案」把档案推进服务商表单（复用空档案替换逻辑），模型列表让用户点「获取」拉。
 - **不做**：不读 magpie 的任何凭据文件（settings.json 也只读 `port` 一个数字）；
   不替用户在 magpie 里配 provider（那是它自己界面的事）；不经我们的用量网关二次转发
@@ -284,17 +284,21 @@ OpenAI / Anthropic / Gemini 三协议直通的网关；**我们把它当一个�
 
 ## 十五、「内核与模型」页改版为本机内核清单（2026-11-12）
 
-页面从「档案编辑器」改成**本机内核清单**（`render_kernel_list`，对齐 magpie 的 Agents 页）：
-本机检测到的 agent 直接列出（图标 + 版本 + 状态），**开关即接入**（启用 = 出现在输入框的
-内核菜单里）；没装的给「如何安装」小按钮（复制安装命令）；版本过旧给「如何升级」。
-自研内核那行显示 magpie 网关状态 + 按需动作（没装 → 下载并启动；没跑 → 启动），
-它不是开关——网关起了、档案配好了，新会话自动走自研内核。演示回放一个开关（显式设为默认）。
+页面从「档案编辑器」改成**本机内核清单**（`render_kernel_list`）：按模型页排成
+名称 / 版本状态 / 启用三列，单行 2.25rem、细分隔线；**勾选即接入**（启用 = 出现在输入框的
+内核菜单里）。没装的给「如何安装」小按钮（复制安装命令）；版本过旧给「如何升级」。
+magpie 那行显示网关状态 + 按需动作（没装 → 下载并启动；没跑 → 启动），
+网关起了、档案配好了，新会话自动走自研内核。清单不再提供演示回放。
+刷新放在分类页头；完整错误和条款风险提示集中在清单下面，版本长文本可悬停查看。
+名称旁复用单色 SVG：Claude Code / OpenCode / pi / Gemini CLI 来自 Lobe Icons，magpie 来自其官方仓库；
+原始路径不重画，内嵌在 `apps/desktop/assets/kernels/`（同目录保留来源和许可），统一 1rem 图标格、用 `INK` 随明暗主题着色。
+下方配置使用 `compact_setting_group` 和小号输入 / 开关，保留按条件展开与整页滚动。
 端点 / Key / 协议那排手填表单收进页底「自定义端点与 agent 选项」折叠区
 （`render_advanced`，disclosure key `kernel-advanced`），已有档案照常能改能删。
 
-默认内核规则（保存时写 `Settings.kernel`）：**只有演示回放是显式选的**
-（`Some(Demo)`），其余一律 `None` = 自动——magpie 网关在跑（档案已配好）用自研内核，
-否则第一个启用的 agent。没有「默认内核」单选 UI 了，输入框的内核 chip 管单个会话的切换。
+默认内核规则（保存时写 `Settings.kernel = None`）：模型档案已配好就用自研内核，
+否则第一个启用的 agent；两者都没配置时显示配置引导。旧设置的 `Some(Demo)` 迁回自动，
+启动参数不再接受 `demo`。输入框的内核 chip 管单个会话的切换。
 
 自动化（`magpie_bootstrap`，`ChatApp::new` 末尾调一次）：
 
@@ -311,7 +315,7 @@ sidecar 细节不变（第十四节）：探活 `/api/hello`、下载校验、�
 
 设置页分类从 8 个变 9 个：通用 0 / 项目 1 / **内核 2** / **模型 3** / 权限 4 / MCP 5 /
 插件 6 / 用量 7 / 记忆 8（下标常量在 settings_view / usage_view / memory_view）。
-两页都走底栏保存（`form_dirty`），探活（agent 检测、magpie 探活）在进任一页时触发。
+内核、服务商、模型共用草稿（`form_dirty`）；改动后页头出现「撤销更改 / 保存」。agent 首次进入内核页时检测，magpie 在启动引导时探活；结果（含未安装 / 未运行）在本次启动中保留，切页和重开设置不重测。内核页头的「刷新」统一重测两者，检测期间禁用按钮，保留草稿；下载 / 启动的完成确认仍按动作更新状态。
 
 - **内核页**（`render_kernel_tab`）：本机内核清单（第十五节那套）+ **供应商单选**
   （`render_suppliers`：自研内核的模型经哪套端点发，保存写进 `Settings.builtin.active`）
@@ -331,9 +335,12 @@ sidecar 细节不变（第十四节）：探活 `/api/hello`、下载校验、�
 - **自动获取**：magpie 的模型列表由 `magpie_bootstrap` 喂（网关探到就拉 `/v1/models`）；
   保存设置后 `fetch_missing_models` 给「端点已填、模型列表还是空」的手填档案后台补拉
   （成功写回设置和表单，失败不打扰；magpie 不重复拉）；来源行的「刷新」
-  （`refresh_source_models`）随时重拉。
-- **默认模型** = 档案的 `model` 字段（每个来源一个），模型清单里点名字就改
-  （写进表单的模型输入框，`form_settings` 保存时收进档案）。
+  （`refresh_model_sources`）按当前筛选刷新，核对输入框实体与连接参数后更新对应来源。
+- **默认模型（2026-11-13 更新）**：全局只有一个，在「模型」页跨来源选择，清单行内的「设为默认」也会设置它。
+  模型与来源一起选定，仍以 `builtin.active` + 对应档案的 `model` 保存，旧设置直接兼容；其他档案的 `model` 仅记上次选择。
+  「服务商」页的 Profile 在对应来源行下展开，行内笔图标切换编辑、垃圾桶先确认；没有单独的「默认来源」。
+  模型页默认列出全部来源，筛选和搜索不改默认，复选框控制是否进入输入框菜单；清单只排视口附近的行。
+  手填未列出的模型时先筛选一个来源，再点「使用此模型」；同名模型按来源区分。
 - **ACP agent 的模型不进清单**：在 agent 自己的 `/model` 里选（要拉起 agent 会话读
   `available_models`，成本高；以后要做是第三期）。
 

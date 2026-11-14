@@ -141,6 +141,23 @@ impl Harness {
         Self::with_windows(provider, cwd, HashMap::new())
     }
 
+    fn with_hibernation(provider: ProviderConfig, cwd: PathBuf, snapshots: PathBuf) -> Self {
+        let events: Arc<Mutex<Vec<RoutedEvent>>> = Arc::default();
+        let sink: EventSink = {
+            let events = events.clone();
+            Arc::new(move |e| events.lock().unwrap().push(e))
+        };
+        let mut config = BuiltinConfig::new(provider, cwd);
+        config.rules_path = None;
+        config.user_instructions = None;
+        config.mcp_config = None;
+        config.memory_path = None;
+        config.session_titles = false;
+        config.hibernation_dir = Some(snapshots);
+        let kernel = BuiltinKernel::spawn(config, sink).unwrap();
+        Self { kernel, events }
+    }
+
     /// 带上下文窗口（自动压缩用）。
     fn with_windows(
         provider: ProviderConfig,
@@ -257,6 +274,7 @@ impl Harness {
                 subagent_model: None,
                 chat_web: true,
                 chat_instructions: None,
+                hibernation_dir: None,
             },
             sink,
         )
@@ -2641,6 +2659,7 @@ fn chat_kernel(
             subagent_model: None,
             chat_web,
             chat_instructions,
+            hibernation_dir: None,
         },
         sink,
     )
@@ -2816,6 +2835,7 @@ fn subagents_use_the_configured_subagent_model() {
             subagent_model: Some("small-model".into()),
             chat_web: true,
             chat_instructions: None,
+            hibernation_dir: None,
         },
         sink,
     )
@@ -3324,6 +3344,7 @@ fn session_title_comes_from_a_second_request() {
             subagent_model: None,
             chat_web: true,
             chat_instructions: None,
+            hibernation_dir: None,
         },
         sink,
     )
@@ -3851,6 +3872,358 @@ fn auto_mode_classifier_sees_resumed_messages_but_not_rewound_ones() {
     assert!(sent.contains("留下的那句话") && sent.contains("新的一句话"), "{sent}");
     assert!(!sent.contains("撤回的那句话"), "{sent}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- 闲置历史休眠 ----------
+
+fn hibernate_now(h: &Harness, sid: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        h.kernel.hibernate_session(sid).unwrap();
+        if h.kernel.history_stats().dormant_sessions == 1 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "会话没有进入休眠：{:?}", h.kernel.history_stats());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn hibernation_preserves_openai_tools_images_and_request_prefix() {
+    let dir = workdir("hibernate-openai");
+    let snapshots = workdir("hibernate-openai-snapshots");
+    std::fs::write(dir.join("notes.txt"), "秘密是 42\n").unwrap();
+    let (base, bodies) = serve(vec![
+        tool_call("call_1", "read_file", serde_json::json!({ "path": "notes.txt" })),
+        happy_stream("第一轮完成"),
+        happy_stream("恢复后完成"),
+    ]);
+    let h = Harness::with_hibernation(
+        ProviderConfig {
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "mock-model".into(),
+            ..Default::default()
+        },
+        dir.clone(),
+        snapshots.clone(),
+    );
+    let sid = h.start();
+    h.kernel
+        .send_prompt(
+            &sid,
+            claudesktop_core::UserPrompt {
+                text: "看图并读文件".into(),
+                images: vec![claudesktop_core::PromptImage {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    h.wait("first turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let baseline = body(&bodies, 1);
+
+    hibernate_now(&h, &sid);
+    assert_eq!(h.kernel.history_stats().resident_bytes, 0);
+    for _ in 0..2 {
+        h.kernel.wake_session(&sid).unwrap();
+        hibernate_now(&h, &sid);
+    }
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Started { .. })), 1);
+    h.kernel.send_prompt(&sid, UserPrompt::text("恢复后继续")).unwrap();
+    h.wait_n("second turn", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    let restored = body(&bodies, 2);
+    let expected = baseline["messages"].as_array().unwrap();
+    let actual = restored["messages"].as_array().unwrap();
+    assert_eq!(
+        &actual[..expected.len()],
+        expected.as_slice(),
+        "工具 ID、参数、完整结果、图片和分段顺序不变"
+    );
+    assert_eq!(actual.last().unwrap()["content"], "恢复后继续");
+    assert_eq!(h.kernel.history_stats().resident_sessions, 1);
+    assert_eq!(h.kernel.history_stats().dormant_sessions, 0);
+    assert!(
+        std::fs::read_dir(&snapshots)
+            .unwrap()
+            .all(|entry| { entry.unwrap().path().extension().is_none_or(|ext| ext != "json") })
+    );
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(snapshots);
+}
+
+#[test]
+fn hibernation_preserves_anthropic_thinking_and_redacted_blocks() {
+    fn acme(payload: &str) -> String {
+        format!("data: {payload}")
+    }
+    fn done(answer: &str) -> Reply {
+        Reply::Sse {
+            lines: vec![
+                acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":30}}}"#),
+                acme(
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                ),
+                acme(&format!(
+                    "{{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}",
+                    serde_json::to_string(answer).unwrap()
+                )),
+                acme(
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+                ),
+                acme(r#"{"type":"message_stop"}"#),
+            ],
+            gap_ms: 5,
+        }
+    }
+    let first = Reply::Sse {
+        lines: vec![
+            acme(r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#),
+            acme(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想想"}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-1"}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"notes.txt\"}"}}"#,
+            ),
+            acme(
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"encrypted-signature"}}"#,
+            ),
+            acme(
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}"#,
+            ),
+            acme(r#"{"type":"message_stop"}"#),
+        ],
+        gap_ms: 5,
+    };
+    let (base, bodies) = serve(vec![first, done("第一轮完成"), done("恢复后完成")]);
+    let dir = workdir("hibernate-anthropic");
+    let snapshots = workdir("hibernate-anthropic-snapshots");
+    std::fs::write(dir.join("notes.txt"), "magic 77\n").unwrap();
+    let h = Harness::with_hibernation(
+        ProviderConfig {
+            protocol: Protocol::Anthropic,
+            base_url: base,
+            api_key: Some("test-key".into()),
+            model: "claude-mock".into(),
+            ..Default::default()
+        },
+        dir.clone(),
+        snapshots.clone(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("读 notes.txt")).unwrap();
+    h.wait("first turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let baseline = body(&bodies, 1);
+
+    hibernate_now(&h, &sid);
+    h.kernel.send_prompt(&sid, UserPrompt::text("恢复后继续")).unwrap();
+    h.wait_n("second turn", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let restored = body(&bodies, 2);
+    let expected = baseline["messages"].as_array().unwrap();
+    let actual = restored["messages"].as_array().unwrap();
+    assert_eq!(&actual[..expected.len()], expected.as_slice());
+    let assistant = &actual[1]["content"];
+    assert_eq!(assistant[0]["signature"], "sig-1");
+    assert_eq!(assistant[1]["type"], "redacted_thinking");
+    assert_eq!(assistant[1]["data"], "encrypted-signature");
+    assert_eq!(assistant[2]["type"], "tool_use");
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(snapshots);
+}
+
+#[test]
+fn hibernation_write_failure_keeps_history_usable() {
+    let dir = workdir("hibernate-write-failure");
+    let snapshots = dir.join("not-a-directory");
+    std::fs::write(&snapshots, "file").unwrap();
+    let (base, bodies) = serve(vec![happy_stream("第一答"), happy_stream("第二答")]);
+    let h = Harness::with_hibernation(
+        ProviderConfig { base_url: base, model: "mock-model".into(), ..Default::default() },
+        dir.clone(),
+        snapshots,
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
+    h.wait("first turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if h.kernel.hibernate_session(&sid).is_err() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "写盘失败没有发生");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.kernel.history_stats().resident_sessions, 1);
+    assert_eq!(h.kernel.history_stats().dormant_sessions, 0);
+    h.kernel.send_prompt(&sid, UserPrompt::text("第二问")).unwrap();
+    h.wait_n("second turn", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let messages = body(&bodies, 1)["messages"].to_string();
+    assert!(
+        messages.contains("第一问") && messages.contains("第一答") && messages.contains("第二问")
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn hibernation_read_failure_keeps_snapshot_and_can_retry() {
+    let dir = workdir("hibernate-read-failure");
+    let snapshots = workdir("hibernate-read-failure-snapshots");
+    let (base, _) = serve(vec![happy_stream("第一答")]);
+    let h = Harness::with_hibernation(
+        ProviderConfig { base_url: base, model: "mock-model".into(), ..Default::default() },
+        dir.clone(),
+        snapshots.clone(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
+    h.wait("first turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    hibernate_now(&h, &sid);
+    let path = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(h.kernel.wake_session(&sid).is_err());
+    assert!(path.exists());
+    assert_eq!(h.kernel.history_stats().dormant_sessions, 1);
+
+    std::fs::write(&path, bytes).unwrap();
+    h.kernel.wake_session(&sid).unwrap();
+    assert_eq!(h.kernel.history_stats().resident_sessions, 1);
+    hibernate_now(&h, &sid);
+    h.kernel.close_session(&sid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_dir(&snapshots).unwrap().next().is_some() {
+        assert!(Instant::now() < deadline, "关闭后快照没有清理");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.kernel.history_stats().resident_sessions, 0);
+    assert_eq!(h.kernel.history_stats().dormant_sessions, 0);
+    assert!(h.kernel.wake_session(&sid).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(snapshots);
+}
+
+#[test]
+fn hibernation_compacts_and_rewinds_only_after_restore() {
+    let dir = workdir("hibernate-compact-rewind");
+    let snapshots = workdir("hibernate-compact-rewind-snapshots");
+    let (base, bodies) =
+        serve(vec![happy_stream("第一答"), happy_stream("完整摘要"), happy_stream("回退后的回答")]);
+    let h = Harness::with_hibernation(
+        ProviderConfig { base_url: base, model: "mock-model".into(), ..Default::default() },
+        dir.clone(),
+        snapshots.clone(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
+    h.wait("first turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    hibernate_now(&h, &sid);
+    h.kernel.compact(&sid).unwrap();
+    h.wait_n("compaction", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Compacted { .. })), 1);
+
+    hibernate_now(&h, &sid);
+    let event = |event| Record::Event { event };
+    let log = vec![
+        Record::user("第一问"),
+        event(KernelEvent::AgentMessageChunk { text: "第一答".into() }),
+        event(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+        Record::Rewind { turn: 0, conversation: true, files: 0, prompt: "第一问".into() },
+    ];
+    h.kernel.rewind(&sid, &log).unwrap();
+    h.kernel.send_prompt(&sid, UserPrompt::text("回退后重新问")).unwrap();
+    h.wait_n("turn after rewind", 3, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let messages = body(&bodies, 2)["messages"].as_array().unwrap().clone();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[1]["content"], "回退后重新问");
+    assert!(!serde_json::to_string(&messages).unwrap().contains("第一答"));
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(snapshots);
+}
+
+#[test]
+fn send_while_spilling_waits_and_appends_once() {
+    let dir = workdir("hibernate-send-spilling");
+    let snapshots = workdir("hibernate-send-spilling-snapshots");
+    let (base, bodies) = serve(vec![happy_stream(&"长历史".repeat(700_000)), happy_stream("继续")]);
+    let h = Harness::with_hibernation(
+        ProviderConfig { base_url: base, model: "mock-model".into(), ..Default::default() },
+        dir.clone(),
+        snapshots.clone(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
+    h.wait("first turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    hibernate_now(&h, &sid);
+    h.kernel.wake_session(&sid).unwrap();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| h.kernel.hibernate_session(&sid));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.kernel.history_stats().transitioning_sessions == 0 {
+            assert!(Instant::now() < deadline, "没有进入写盘状态");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        h.kernel.send_prompt(&sid, UserPrompt::text("休眠中发送")).unwrap();
+        worker.join().unwrap().unwrap();
+    });
+    h.wait_n("second turn", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let messages = body(&bodies, 1)["messages"].as_array().unwrap().clone();
+    assert_eq!(messages.iter().filter(|message| message["content"] == "休眠中发送").count(), 1);
+    assert_eq!(h.kernel.history_stats().resident_sessions, 1);
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(snapshots);
+}
+
+#[test]
+fn close_while_spilling_does_not_recreate_session() {
+    let dir = workdir("hibernate-close-spilling");
+    let snapshots = workdir("hibernate-close-spilling-snapshots");
+    let (base, _) = serve(vec![happy_stream(&"长历史".repeat(700_000))]);
+    let h = Harness::with_hibernation(
+        ProviderConfig { base_url: base, model: "mock-model".into(), ..Default::default() },
+        dir.clone(),
+        snapshots.clone(),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
+    h.wait("first turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    hibernate_now(&h, &sid);
+    h.kernel.wake_session(&sid).unwrap();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| h.kernel.hibernate_session(&sid));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.kernel.history_stats().transitioning_sessions == 0 {
+            assert!(Instant::now() < deadline, "没有进入写盘状态");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        h.kernel.close_session(&sid);
+        worker.join().unwrap().unwrap();
+    });
+    assert_eq!(h.kernel.history_stats().resident_sessions, 0);
+    assert_eq!(h.kernel.history_stats().dormant_sessions, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_dir(&snapshots).is_ok_and(|mut entries| entries.next().is_some()) {
+        assert!(Instant::now() < deadline, "关闭后快照没有清理");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Started { .. })), 1);
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(snapshots);
 }
 
 // ---------- 读图片（`read_file` 把图片当附件交给模型） ----------
