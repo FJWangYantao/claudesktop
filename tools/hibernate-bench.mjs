@@ -19,14 +19,16 @@ const count = Number(args.sessions || 50);
 const rounds = Number(args.rounds || 3);
 const soakSeconds = Number(args.soak || 1800);
 const mode = args.mode || 'all';
+const displayComparison = args.compare === 'display';
 const output = path.resolve(args.out || path.join(root, '.claudesktop', 'bench', new Date().toISOString().replace(/[:.]/g, '-')));
-assert(Number.isInteger(count) && count >= 4 && count <= 100);
+assert(Number.isInteger(count) && count >= 4 && count <= 200);
 assert(Number.isInteger(rounds) && rounds >= 1);
 assert(Number.isFinite(soakSeconds) && soakSeconds >= 0);
 assert(['all', 'ab', 'soak', 'smoke', 'summary'].includes(mode));
 assert(output.startsWith(path.join(root, '.claudesktop', 'bench') + path.sep));
 await mkdir(output, { recursive: true });
-if (mode !== 'summary') assert.equal((await readdir(output)).length, 0, 'Use a new output directory for each measurement.');
+if (mode !== 'summary' && !args.resume) assert.equal((await readdir(output)).length, 0, 'Use a new output directory for each measurement.');
+if (args.resume) assert(['ab', 'all'].includes(mode), 'Resume is supported for paired measurements.');
 
 const percentile = (values, p) => {
   assert(values.length > 0, 'empty measurement');
@@ -38,7 +40,7 @@ const hash = value => createHash('sha256').update(typeof value === 'string' ? va
 const normalize = value => Array.isArray(value) ? value.map(normalize) : value && typeof value === 'object'
   ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'cache_control').map(([key, item]) => [key, normalize(item)])) : value;
 const textOf = content => typeof content === 'string' ? content : (content || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
-const reply = Array.from({ length: 64 }, (_, i) => `Paragraph ${i.toString().padStart(4, '0')}: ${'measured local session history with tools, images and signed thinking. '.repeat(3)}\n\n`).join('');
+const reply = Array.from({ length: Number(args['reply-paragraphs'] || 64) }, (_, i) => `Paragraph ${i.toString().padStart(4, '0')}: ${'measured local session history with tools, images and signed thinking. '.repeat(3)}\n\n`).join('');
 const thinking = 'Reasoning retained verbatim with its signature.\n'.repeat(16000);
 
 function png() {
@@ -72,6 +74,20 @@ const runs = [];
 
 async function run(label, enabled, soak = 0) {
   const dir = path.join(output, label);
+  if (args.resume) {
+    let files;
+    try { files = await readdir(dir); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (files?.length) {
+      assert(files.includes('result.json') && files.includes('summary.json'), `Preserve or move aside the incomplete run before retrying: ${dir}`);
+      const result = JSON.parse(await readFile(path.join(dir, 'result.json'), 'utf8'));
+      const summary = JSON.parse(await readFile(path.join(dir, 'summary.json'), 'utf8'));
+      assert(result.passed && result.label === label && result.count === count && result.enabled === enabled);
+      assert(summary.comparison_kind === (displayComparison ? 'display' : 'kernel') && summary.count === count && summary.enabled === enabled);
+      assert(summary.displayChecks === (displayComparison ? count : 0));
+      console.log(`${label}: reuse verified completed run`);
+      return summary;
+    }
+  }
   const workspace = path.join(dir, 'workspace');
   const dataDir = path.join(dir, 'data');
   await mkdir(path.join(workspace, '.git'), { recursive: true });
@@ -86,6 +102,8 @@ async function run(label, enabled, soak = 0) {
   let requestSequence = 0;
   let canceledStreams = 0;
   let strictChecks = 0;
+  let displayChecks = 0;
+  const displayViews = new Map();
   const log = createWriteStream(path.join(dir, 'requests.jsonl'));
   const server = createServer(async (req, res) => {
     try {
@@ -202,6 +220,11 @@ async function run(label, enabled, soak = 0) {
     CLAUDESKTOP_DISABLE_RECLAIM: '1', ACP_CWD: workspace,
   });
   if (enabled && args.activation === 'default') delete env.CLAUDESKTOP_HIBERNATE;
+  if (displayComparison) {
+    env.CLAUDESKTOP_HIBERNATE = '1';
+    delete env.CLAUDESKTOP_DISABLE_RECLAIM;
+    if (!enabled) env.CLAUDESKTOP_DISABLE_DISPLAY_RECLAIM = '1';
+  }
   const stderr = createWriteStream(path.join(dir, 'app.log'));
   const app = spawn(exe, [], { cwd: workspace, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   app.stdout.pipe(stderr); app.stderr.pipe(stderr);
@@ -236,7 +259,10 @@ async function run(label, enabled, soak = 0) {
     while (Date.now() < deadline) {
       assert.equal(errors.length, 0, errors.join('\n'));
       const status = await command('status');
-      for (const s of status.sessions) assert.equal(s.failures.length, 0, JSON.stringify(s));
+      for (const s of status.sessions) {
+        assert.equal(s.failures.length, 0, JSON.stringify(s));
+        assert(!s.history_error, JSON.stringify(s));
+      }
       if (predicate(status)) return status;
       await delay(50);
     }
@@ -249,6 +275,7 @@ async function run(label, enabled, soak = 0) {
   const turn = async (token, kind, session, { seed = false, cancel = false } = {}) => {
     const seq = seed ? 0 : ++operation;
     const tag = `bench:${kind}:${session}:${seq}`;
+    if (displayComparison) await wait(status => status.sessions.find(s => s.token === token)?.history_loaded);
     const before = (await command('status')).sessions.find(s => s.token === token);
     assert(before?.ready && !before.busy && !before.rewinding);
     const sent = await command('send', { token, text: tag, ...(seed ? { images: [image] } : {}) });
@@ -305,21 +332,84 @@ async function run(label, enabled, soak = 0) {
       await wait(status => status.sessions.some(s => s.token === token && s.ready));
       const s = await turn(token, 'seed', i, { seed: true });
       identities.set(token, { id: s.id, mode: s.mode });
+      if (displayComparison) displayViews.set(token, (await command('inspect', { token })).result);
     }
     assert.equal(requests.filter(request => request.kind === 'seed').length, count * 2);
     await phase('resident');
     for (let i = 0; i < 20; i++) { await command('status'); await delay(250); }
     await phase('idle');
     await command('hibernate');
-    await wait(status => enabled ? status.dormant === count - 3 && status.transitioning === 0 : status.resident >= count && status.transitioning === 0);
+    await wait(status => {
+      const dormant = displayComparison || enabled;
+      return (dormant ? status.dormant === count - 3 : status.resident >= count)
+        && status.transitioning === 0
+        && (!displayComparison || status.sessions.every(s => !s.history_loading)
+          && status.display_loaded === (enabled ? 3 : count));
+    });
     await phase('dormant');
     for (let i = 0; i < 30; i++) { await command('status'); await delay(250); }
     await phase('probe');
     for (let i = 0; i < count; i++) {
       await command('activate', { token: tokens[i] });
       await delay(200);
+      if (displayComparison) {
+        await wait(status => status.sessions.find(s => s.token === tokens[i])?.history_loaded);
+        assert.deepEqual((await command('inspect', { token: tokens[i] })).result, displayViews.get(tokens[i]), 'UI display changed across reclaim');
+        displayChecks++;
+      }
       await turn(tokens[i], 'probe', i);
       if (enabled) await command('hibernate');
+    }
+    if (displayComparison && enabled) {
+      const token = tokens[0];
+      await delay(2200);
+      await command('hibernate');
+      await wait(status => status.sessions.find(s => s.token === token)?.display_cached && !status.sessions.find(s => s.token === token)?.history_loading);
+      const tag = `bench:queued_display:0:${++operation}`;
+      await command('send', { token, text: tag });
+      const queued = await wait(status => {
+        const s = status.sessions.find(s => s.token === token);
+        return s.history_loaded && !s.busy && !s.history_loading && s.users === 3;
+      });
+      const s = queued.sessions.find(s => s.token === token);
+      assert.equal(s.id, identities.get(token).id);
+      assert.equal(s.mode, identities.get(token).mode);
+      assert.equal(s.restored, false);
+      assert.equal(requests.filter(r => r.text === tag).length, 1);
+    }
+    if (displayComparison && enabled && mode === 'smoke') {
+      const token = tokens[1];
+      await delay(2200);
+      await command('hibernate');
+      await wait(status => status.sessions.find(s => s.token === token)?.display_cached && !status.sessions.find(s => s.token === token)?.history_loading);
+      const snapshotDir = path.join(dataDir, 'display-cache');
+      let snapshotPath, original;
+      for (const name of await readdir(snapshotDir)) {
+        if (!name.endsWith('.json')) continue;
+        const candidate = path.join(snapshotDir, name);
+        const bytes = await readFile(candidate);
+        if (JSON.parse(bytes).token === token) { snapshotPath = candidate; original = bytes; break; }
+      }
+      assert(snapshotPath, 'UI snapshot not found for fault check');
+      await writeFile(snapshotPath, '{invalid');
+      await command('activate', { token });
+      const failed = await command('status');
+      let failure = failed.sessions.find(s => s.token === token);
+      for (let n = 0; n < 100 && !failure.history_error; n++) { await delay(50); failure = (await command('status')).sessions.find(s => s.token === token); }
+      assert(failure.history_error && !failure.history_loaded && failure.ready);
+      const tag = `bench:after_display_retry:1:${++operation}`;
+      await command('send', { token, text: tag });
+      await delay(200);
+      assert.equal(requests.filter(r => r.text === tag).length, 0, 'corrupt UI fell back to a new kernel session');
+      assert.equal((await command('status')).sessions.find(s => s.token === token).queued, 1);
+      await writeFile(snapshotPath, original);
+      await command('activate', { token });
+      const recovered = await wait(status => {
+        const s = status.sessions.find(s => s.token === token);
+        return s.history_loaded && !s.busy && s.users === 3;
+      });
+      assert.equal(recovered.sessions.find(s => s.token === token).id, identities.get(token).id);
+      assert.equal(requests.filter(r => r.text === tag).length, 1, 'UI retry duplicated the queued prompt');
     }
     if (soak > 0 || mode === 'smoke') {
       await phase('mixed');
@@ -397,8 +487,10 @@ async function run(label, enabled, soak = 0) {
     assert.equal(appExit.code, 0);
     const snapshots = await readdir(path.join(dataDir, 'session-hibernation')).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
     assert.equal(snapshots.length, 0, 'shutdown left history snapshots');
+    const displays = await readdir(path.join(dataDir, 'display-cache')).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+    assert.equal(displays.length, 0, 'shutdown left UI snapshots');
     passed = true;
-    await writeFile(path.join(dir, 'result.json'), JSON.stringify({ label, enabled, count, phases, sends, strictChecks, requests: requests.length, canceledStreams, passed }, null, 2));
+    await writeFile(path.join(dir, 'result.json'), JSON.stringify({ label, enabled, count, phases, sends, strictChecks, displayChecks, requests: requests.length, canceledStreams, passed }, null, 2));
   } finally {
     await writeFile(path.join(dir, 'sample.stop'), 'stop');
     if (!appExit) app.kill();
@@ -421,7 +513,7 @@ async function run(label, enabled, soak = 0) {
   const dormantSamples = selected('dormant');
   const firstDormant = dormantSamples[0], lastDormant = dormantSamples.at(-1);
   const result = {
-    label, enabled, count, activation: env.CLAUDESKTOP_HIBERNATE ?? 'default',
+    label, enabled, count, comparison_kind: displayComparison ? 'display' : 'kernel', activation: env.CLAUDESKTOP_HIBERNATE ?? 'default',
     resident: summarize('resident'), dormant: summarize('dormant'),
     dormant_cpu_one_core_percent: (lastDormant.cpu_ms - firstDormant.cpu_ms) / (lastDormant.epoch_ms - firstDormant.epoch_ms) * 100,
     dormant_read_bytes: lastDormant.read_bytes - firstDormant.read_bytes,
@@ -432,7 +524,8 @@ async function run(label, enabled, soak = 0) {
     sampled_tree_peak: Math.max(...samples.map(row => row.tree_pb)), samples: samples.length,
     send_to_wire_p95_ms: percentile(sends.map(send => send.send_to_wire_ms), 0.95),
     probe_preflight_p95_ms: percentile(preflight.slice(count, count * 2).map(row => row.preflight_ms), 0.95),
-    wake_p95_ms: wake.length ? percentile(wake, 0.95) : null, wake_count: wake.length, strictChecks,
+    wake_p95_ms: wake.length ? percentile(wake, 0.95) : null, wake_count: wake.length, strictChecks, displayChecks,
+    display_wake_p95_ms: (() => { const values = [...appLog.matchAll(/display_wake total_ms=([\d.]+)/g)].map(m => Number(m[1])); return values.length ? percentile(values, 0.95) : null; })(),
   };
   await writeFile(path.join(dir, 'summary.json'), JSON.stringify(result, null, 2));
   console.log(JSON.stringify(result));
@@ -474,9 +567,9 @@ try {
       extra_send_to_wire_p95_ms: Math.max(...pairs.map(pair => pair.extra_send_to_wire_p95_ms)),
       extra_preflight_p95_ms: Math.max(...pairs.map(pair => pair.extra_preflight_p95_ms)),
     };
-    comparison.thresholds_passed = pairs.every(pair => pair.pb_saved_mib >= 30 && pair.ws_saved_mib >= 20 && pair.peak_ratio <= 1.1 && pair.wake_p95_ms <= 150 && pair.extra_send_to_wire_p95_ms <= 20);
+    comparison.thresholds_passed = pairs.every(pair => pair.pb_saved_mib >= (displayComparison ? 0 : 30) && pair.ws_saved_mib >= (displayComparison ? 0 : 20) && pair.peak_ratio <= 1.1 && pair.wake_p95_ms <= 150 && pair.extra_send_to_wire_p95_ms <= 20);
   }
-  await writeFile(path.join(output, 'summary.json'), JSON.stringify({ exe, count, rounds, soakSeconds, runs, comparison }, null, 2));
+  await writeFile(path.join(output, 'summary.json'), JSON.stringify({ exe, count, rounds, soakSeconds, comparison_kind: displayComparison ? 'display' : 'kernel', runs, comparison }, null, 2));
   console.log(JSON.stringify({ output, comparison }));
 } catch (error) {
   await writeFile(path.join(output, 'error.txt'), error.stack);

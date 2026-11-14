@@ -16,7 +16,7 @@ pub const MAX_TOTAL_BYTES: usize = 1024 * 1024;
 pub const SNIFF_BYTES: usize = 8 * 1024;
 
 /// 一份要内联进消息的文本附件。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TextAttachment {
     /// 显示用的文件名（不含目录）
     pub name: String,

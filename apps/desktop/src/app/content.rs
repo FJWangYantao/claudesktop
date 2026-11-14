@@ -175,6 +175,21 @@ impl ChatApp {
             return v_flex().size_full().child(self.render_settings(window, cx)).into_any_element();
         }
         let active = self.active;
+        if !self.sessions[active].history_loaded {
+            let message = self.sessions[active]
+                .history_error
+                .clone()
+                .unwrap_or_else(|| "正在读取这段对话…".into());
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(message)
+                .into_any_element();
+        }
         // 点开了子任务：详情页占内容区；那个子任务已经不在了（回退过）就回到对话
         if let Some(task) = self.sessions[active].viewing_task.clone() {
             if let Some(page) = self.render_task_page(&task, window, cx) {
@@ -187,20 +202,6 @@ impl ChatApp {
             return self.render_review_page(cx);
         }
         self.review = None;
-        let history = &self.sessions[active];
-        if !history.history_loaded {
-            let message =
-                history.history_error.clone().unwrap_or_else(|| "正在读取这段对话…".into());
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(TEXT_SMALL)
-                .text_color(rgb(INK_SOFT))
-                .child(message)
-                .into_any_element();
-        }
         // 还没发过消息的会话显示首页（与官方空会话一致，输入框在底部）
         if !self.sessions[active].has_user_message() {
             // 放大字号后放不下时整页往下长、可以滚（min_h 而不是 h：定高时居中的内容会从上下两头溢出，

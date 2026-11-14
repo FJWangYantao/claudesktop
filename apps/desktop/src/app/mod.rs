@@ -880,22 +880,77 @@ impl ChatApp {
             let Some(kernel) = self.session_kernel(idx) else { continue };
             let Some(id) = self.sessions[idx].acp_id.clone() else { continue };
             let token = self.sessions[idx].token;
+            let touched = self.sessions[idx].last_touched();
             cx.spawn(async move |this, cx| {
                 let result = cx
                     .background_executor()
                     .spawn(async move { kernel.hibernate_session(&id) })
                     .await;
-                if let Err(err) = result {
+                if let Err(err) = &result {
                     eprintln!("[perf] session_hibernate error={err}");
                 }
                 let _ = this.update(cx, |app, cx| {
-                    if app.sessions.get(app.active).is_some_and(|s| s.token == token) {
-                        app.wake_kernel_session(app.active, cx);
+                    let Some(idx) = app.session_index(token) else { return };
+                    if idx == app.active {
+                        app.wake_kernel_session(idx, cx);
+                    } else if result.is_ok() && app.sessions[idx].last_touched() == touched {
+                        app.hibernate_display(idx, cx);
                     }
                 });
             })
             .detach();
         }
+    }
+
+    fn hibernate_display(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if std::env::var_os("CLAUDESKTOP_DISABLE_RECLAIM").is_some()
+            || std::env::var_os("CLAUDESKTOP_DISABLE_DISPLAY_RECLAIM").is_some()
+            || !self.sessions[idx].display_evictable()
+            || self.slot(&self.sessions[idx].kernel_key).is_some_and(|slot| {
+                slot.tasks.iter().any(|task| {
+                    task.running
+                        && Some(task.session.as_str()) == self.sessions[idx].acp_id.as_deref()
+                })
+            })
+        {
+            return;
+        }
+        let Ok(root) = claudesktop_core::default_data_dir() else { return };
+        let token = self.sessions[idx].token;
+        let snapshot =
+            crate::session::cache::DisplaySnapshot::new(&root.join("display-cache"), token);
+        let retained = self.sessions[idx].retained_bytes();
+        let data = self.sessions[idx].take_display(snapshot.clone());
+        cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+            let result = cx.background_executor().spawn(async move {
+                let result = snapshot.write(data);
+                (snapshot, result)
+            }).await;
+            let _ = this.update(cx, |app, cx| {
+                let Some(idx) = app.session_index(token) else { return };
+                let (snapshot, result) = result;
+                if !app.sessions[idx].display_snapshot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &snapshot)) {
+                    return;
+                }
+                match result {
+                    Ok(bytes) => {
+                        app.sessions[idx].history_loading = false;
+                        eprintln!("[perf] display_hibernate bytes={bytes} retained={retained} total_ms={:.3}", started.elapsed().as_secs_f64() * 1000.);
+                        if idx == app.active || !app.sessions[idx].deferred_events.is_empty() || !app.sessions[idx].queued.is_empty() || app.sessions[idx].compact_queued {
+                            app.ensure_history_loaded(idx, cx);
+                        }
+                    }
+                    Err((error, data)) => {
+                        app.sessions[idx].restore_display(data);
+                        eprintln!("[perf] display_hibernate error={error}");
+                        app.finish_history_load(idx, cx);
+                    }
+                }
+                app.sync_sidebar(cx);
+                cx.notify();
+            });
+        }).detach();
     }
 
     /// 激活时后台预恢复；发送路径还有一次同步兜底（在内核工作线程，不占界面线程）。
@@ -1394,6 +1449,50 @@ impl ChatApp {
         if self.sessions[idx].history_loaded || self.sessions[idx].history_loading {
             return;
         }
+        if let Some(snapshot) = self.sessions[idx].display_snapshot.clone() {
+            let token = self.sessions[idx].token;
+            self.sessions[idx].history_loading = true;
+            self.sessions[idx].history_error = None;
+            cx.spawn(async move |this, cx| {
+                let started = Instant::now();
+                let (snapshot, result) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let result = snapshot.read();
+                        (snapshot, result)
+                    })
+                    .await;
+                let _ = this.update(cx, |app, cx| {
+                    let Some(idx) = app.session_index(token) else { return };
+                    if !app.sessions[idx]
+                        .display_snapshot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &snapshot))
+                    {
+                        return;
+                    }
+                    app.sessions[idx].history_loading = false;
+                    match result {
+                        Ok(data) => {
+                            app.sessions[idx].restore_display(data);
+                            eprintln!(
+                                "[perf] display_wake total_ms={:.3}",
+                                started.elapsed().as_secs_f64() * 1000.
+                            );
+                            app.finish_history_load(idx, cx);
+                        }
+                        Err(error) => {
+                            app.sessions[idx].history_error =
+                                Some(format!("恢复这段对话失败：{error:#}。切回可重试。"));
+                        }
+                    }
+                    app.sync_sidebar(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
         let (Some(store), Some(meta)) = (self.store.clone(), self.sessions[idx].meta.clone())
         else {
             return;
@@ -1415,6 +1514,8 @@ impl ChatApp {
                         let reveal = app.sessions[idx].pending_reveal_turn;
                         let mut loaded = Session::from_records(token, meta, records, &app.settings);
                         loaded.pending_reveal_turn = reveal;
+                        loaded.queued = std::mem::take(&mut app.sessions[idx].queued);
+                        loaded.compact_queued = app.sessions[idx].compact_queued;
                         app.sessions[idx] = loaded;
                         app.finish_history_load(idx, cx);
                     }
@@ -1432,6 +1533,12 @@ impl ChatApp {
     }
 
     fn finish_history_load(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let token = self.sessions[idx].token;
+        let events = std::mem::take(&mut self.sessions[idx].deferred_events);
+        for (key, event) in events {
+            self.on_kernel_event(key, event, cx);
+        }
+        let Some(idx) = self.session_index(token) else { return };
         self.sessions[idx].touch();
         if self.active == idx {
             self.probe_context_window(idx, cx);
@@ -1439,9 +1546,13 @@ impl ChatApp {
             self.reveal_pending_turn(idx);
         }
         // 读取期间发出去的消息走现有队列；加载完成后由 submit_to 续接内核。
-        if !self.sessions[idx].queued.is_empty() && !self.sessions[idx].busy {
-            let queued = self.sessions[idx].queued.remove(0);
-            self.submit_to(idx, queued.into_prompt(), cx);
+        if !self.queued_compaction(idx) {
+            if self.sessions[idx].restored && !self.sessions[idx].queued.is_empty() {
+                let queued = self.sessions[idx].queued.remove(0);
+                self.submit_to(idx, queued.into_prompt(), cx);
+            } else {
+                self.dispatch_queued(idx, cx);
+            }
         }
     }
 
@@ -2081,7 +2192,13 @@ impl ChatApp {
     /// 其余等它这一轮结束再发。会话还没就绪时留着（`Started` 到来时再发，见 `apply` 里的事件处理）。
     fn dispatch_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
         let s = &mut self.sessions[idx];
-        if s.busy || s.stopping || s.kernel_rewinding || s.queued.is_empty() || !s.ready {
+        if s.busy
+            || s.stopping
+            || s.kernel_rewinding
+            || !s.history_loaded
+            || s.queued.is_empty()
+            || !s.ready
+        {
             return;
         }
         let queued = s.queued.remove(0);
@@ -2360,6 +2477,19 @@ impl ChatApp {
         }
         if self.sessions[idx].busy || self.sessions[idx].kernel_rewinding {
             return false;
+        }
+        if !self.sessions[idx].history_loaded {
+            let queued = match QueuedPrompt::from_prompt(prompt) {
+                Ok(queued) => queued,
+                Err(error) => {
+                    self.toast(Notification::warning(error), cx);
+                    return false;
+                }
+            };
+            self.sessions[idx].queued.push(queued);
+            self.ensure_history_loaded(idx, cx);
+            cx.notify();
+            return true;
         }
         if !kind.is_demo() {
             // 历史会话的内核可能还没启动
@@ -2646,8 +2776,9 @@ impl ChatApp {
         let s = &mut self.sessions[active];
         // 发出去了：光标后面那句灰字作废（它按上下文猜的，压完就不成立了）
         self.suggestion.clear();
-        if s.busy || s.stopping || s.kernel_rewinding {
+        if s.busy || s.stopping || s.kernel_rewinding || !s.history_loaded {
             s.compact_queued = true;
+            self.ensure_history_loaded(active, cx);
             cx.notify();
             return;
         }
@@ -2738,9 +2869,7 @@ impl ChatApp {
                     .sessions
                     .iter()
                     .find(|s| s.acp_id.as_deref() == Some(sid.as_str()))
-                    .map(|s| {
-                        s.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count()
-                    })
+                    .map(Session::user_message_count)
                     .unwrap_or(0) as u64;
                 self.memory_candidates.push(candidates, &sid, turn);
                 cx.notify();
@@ -2786,6 +2915,15 @@ impl ChatApp {
                     }),
                 };
                 if let Some(idx) = idx {
+                    if !self.sessions[idx].history_loaded
+                        && self.sessions[idx].display_snapshot.is_some()
+                    {
+                        self.sessions[idx]
+                            .deferred_events
+                            .push((key, RoutedEvent { session, event }));
+                        self.ensure_history_loaded(idx, cx);
+                        return;
+                    }
                     // 有事发生的会话算「在用」：LRU 冷会话回收不先冷它
                     self.sessions[idx].touch();
                     // 检查点：内容存成 blob、日志里记哈希，不进对话

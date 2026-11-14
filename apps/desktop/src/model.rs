@@ -8,7 +8,7 @@ use gpui_kit::SharedString;
 use gpui_kit::assets::IconName as IconAll;
 use std::time::Instant;
 
-#[derive(Clone, Copy, PartialEq, Hash)]
+#[derive(Clone, Copy, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ToolPhase {
     Running,
     Done,
@@ -68,6 +68,7 @@ impl ViewMode {
 }
 
 /// 工具调用：一行「种类图标 + 名称 + 参数 + 结果摘要」；带 diff 时 diff 卡片的表头兼当这一行
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ToolCard {
     /// 内核侧的 tool_call_id（演示脚本为 None）
     pub id: Option<String>,
@@ -95,13 +96,13 @@ pub struct ToolCard {
 }
 
 /// 工具行上的授权结果：种类决定短标签，`label` 是选的那个选项的全名（悬停看）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Grant {
     pub kind: GrantKind,
     pub label: SharedString,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum GrantKind {
     /// 你点了「允许一次」
     Once,
@@ -193,6 +194,43 @@ pub struct ToolImage {
     pub ext: &'static str,
 }
 
+impl serde::Serialize for ToolImage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        PromptImage {
+            media_type: format!("image/{}", if self.ext == "jpg" { "jpeg" } else { self.ext }),
+            data: base64::engine::general_purpose::STANDARD.encode(self.bytes.as_slice()),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolImage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let image = <PromptImage as serde::Deserialize>::deserialize(deserializer)?;
+        thumb_from_prompt_image(&image).ok_or_else(|| serde::de::Error::custom("工具图片快照损坏"))
+    }
+}
+
+mod text_attachments {
+    use claudesktop_core::attach::TextAttachment;
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+
+    pub fn serialize<S: serde::Serializer>(
+        files: &Arc<Vec<TextAttachment>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        files.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<Vec<TextAttachment>>, D::Error> {
+        Vec::deserialize(deserializer).map(Arc::new)
+    }
+}
+
 /// 内核发来的图片 → 工具行缩略图。内核给的已经是重编码过的（PNG / JPEG / GIF），
 /// 解不开就跳过——宁可没图，也不要界面上留一个空框。
 pub fn thumb_from_prompt_image(image: &PromptImage) -> Option<ToolImage> {
@@ -229,7 +267,7 @@ pub fn tool_icon(kind: &str) -> IconAll {
 }
 
 /// 计划条目的状态（ACP：pending / in_progress / completed）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PlanStatus {
     Pending,
     InProgress,
@@ -246,6 +284,7 @@ impl PlanStatus {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PlanRow {
     pub text: SharedString,
     pub status: PlanStatus,
@@ -390,6 +429,7 @@ fn duration_label(ms: u64) -> String {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ChatItem {
     User {
         text: SharedString,
@@ -397,6 +437,7 @@ pub enum ChatItem {
         images: Vec<std::path::PathBuf>,
         /// 聊天的文本附件（重试 / 换内核重跑时原样再带上）。只在这次运行里有：
         /// 从日志恢复的会话为空（内容只在日志的 `sent` 里，已经拼进上下文了）
+        #[serde(with = "text_attachments")]
         files: std::sync::Arc<Vec<claudesktop_core::attach::TextAttachment>>,
     },
     Thinking {
@@ -404,6 +445,7 @@ pub enum ChatItem {
         streaming: bool,
         open: bool,
         /// 开始流式的时刻（只有实时的才有；重放历史时为 None，用时从日志里取）
+        #[serde(skip)]
         started: Option<Instant>,
         /// 想了多久：收尾时算出，或从日志恢复；旧日志没有
         elapsed_ms: Option<u64>,
@@ -459,7 +501,7 @@ pub enum ChatItem {
 }
 
 /// 上下文压缩的进度。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CompactState {
     Running,
     /// 完成，带模型写的摘要
@@ -572,6 +614,32 @@ pub struct QueuedPrompt {
 }
 
 impl QueuedPrompt {
+    pub fn from_prompt(prompt: UserPrompt) -> Result<Self, String> {
+        use base64::Engine as _;
+        let images = prompt
+            .images
+            .into_iter()
+            .map(|image| {
+                let format = match image.media_type.as_str() {
+                    "image/png" => gpui_kit::ImageFormat::Png,
+                    "image/gif" => gpui_kit::ImageFormat::Gif,
+                    "image/webp" => gpui_kit::ImageFormat::Webp,
+                    "image/bmp" => gpui_kit::ImageFormat::Bmp,
+                    "image/jpeg" => gpui_kit::ImageFormat::Jpeg,
+                    _ => return Err("图片格式无法加入发送队列".to_string()),
+                };
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&image.data)
+                    .map_err(|error| format!("图片无法加入发送队列：{error}"))?;
+                let mut pending = PendingImage::from_bytes("图片".into(), bytes, format);
+                pending.data = image.data;
+                pending.preparing = false;
+                Ok(pending)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { text: prompt.text, images, files: prompt.attachments })
+    }
+
     pub fn into_prompt(self) -> UserPrompt {
         let images = self
             .images
@@ -958,7 +1026,7 @@ pub use claudesktop_core::is_context_overflow;
 
 /// 一轮失败的原因（按报错文字认，各内核、网关说法不一，认不出的归 `Other`），
 /// 决定失败卡片的标题、建议和按钮。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FailureKind {
     /// 超出模型的上下文长度
     Overflow,

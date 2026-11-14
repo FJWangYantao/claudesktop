@@ -30,6 +30,24 @@ impl ChatApp {
                 let idx = idx.ok_or("找不到会话令牌")?;
                 match action {
                     "activate" => self.activate_session(idx, cx),
+                    "inspect" => {
+                        use std::hash::{Hash, Hasher};
+                        if !self.sessions[idx].history_loaded {
+                            return Err("显示历史尚未就绪".into());
+                        }
+                        let s = &self.sessions[idx];
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        serde_json::to_string(
+                            &json!({"transcript": &s.transcript, "subagents": &s.subagents}),
+                        )
+                        .unwrap()
+                        .hash(&mut hasher);
+                        result = json!({
+                            "hash": hasher.finish().to_string(), "id": s.acp_id,
+                            "mode": s.permission_mode, "thinking": s.thinking,
+                            "users": s.user_message_count(),
+                        });
+                    }
                     "send" => {
                         let text = command["text"].as_str().ok_or("缺少 text")?.to_string();
                         let images = command
@@ -100,7 +118,10 @@ impl ChatApp {
                 "stopping": s.stopping, "rewinding": s.kernel_rewinding,
                 "permission": s.waiting_permission(), "question": s.waiting_question(),
                 "restored": s.restored, "mode": s.permission_mode,
-                "users": s.transcript.iter().filter(|item| matches!(item, ChatItem::User { .. })).count(),
+                "history_loaded": s.history_loaded, "history_loading": s.history_loading,
+                "history_error": s.history_error, "display_cached": s.display_snapshot.is_some(),
+                "queued": s.queued.len(), "thinking": s.thinking,
+                "users": s.user_message_count(),
                 "agents": s.transcript.iter().filter(|item| matches!(item, ChatItem::Agent(_))).count(),
                 "tools": s.transcript.iter().filter(|item| matches!(item, ChatItem::Tool(_))).count(),
                 "subagents": s.subagents.len(),
@@ -122,6 +143,8 @@ impl ChatApp {
             .collect();
         Ok(json!({
             "result": result, "sessions": sessions, "tasks": tasks, "snapshots": snapshots,
+            "display_loaded": self.sessions.iter().filter(|s| s.history_loaded && s.acp_id.is_some() && s.has_user_message()).count(),
+            "display_bytes": self.sessions.iter().map(Session::retained_bytes).sum::<usize>(),
             "epoch_ms": bench_epoch_ms(),
             "resident": stats.resident_sessions, "dormant": stats.dormant_sessions,
             "transitioning": stats.transitioning_sessions, "history_bytes": stats.resident_bytes,

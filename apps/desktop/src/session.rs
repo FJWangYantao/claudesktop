@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub(crate) mod cache;
+
 /// 内核没上报模型时显示的模型名（统计时当作「未知模型」）
 pub const UNKNOWN_MODEL: &str = "默认模型";
 
@@ -84,6 +86,10 @@ pub struct Session {
     pub history_loaded: bool,
     pub history_loading: bool,
     pub history_error: Option<String>,
+    pub(crate) display_snapshot: Option<Arc<cache::DisplaySnapshot>>,
+    display_scroll: Option<(ListOffset, bool)>,
+    cached_user_count: usize,
+    pub(crate) deferred_events: Vec<(String, claudesktop_core::RoutedEvent)>,
     /// 从磁盘搜索跳过来时，等日志加载完再定位到第几轮
     pub pending_reveal_turn: Option<usize>,
     /// 历史会话正在续接：Started 到达时告诉用户上下文是否延续
@@ -193,7 +199,7 @@ pub struct TurnUndo {
 
 /// 一个子任务（自研内核的 `task` 调用）的过程：子 agent 的思考、回复和工具调用。
 /// 主会话的对话记录里只有 task 那一张卡片，这些在子任务详情页里看。
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct SubagentRun {
     /// 角色名（旧日志里没有 `SubagentStarted`，为空）
     pub agent: SharedString,
@@ -406,6 +412,10 @@ impl Session {
             history_loaded: true,
             history_loading: false,
             history_error: None,
+            display_snapshot: None,
+            display_scroll: None,
+            cached_user_count: 0,
+            deferred_events: Vec::new(),
             pending_reveal_turn: None,
             resuming: false,
             kernel_rewinding: false,
@@ -683,6 +693,13 @@ impl Session {
         if status != self.measured_busy {
             self.measured_busy = status;
             self.list.remeasure_items(n..n + 1);
+        }
+        if let Some((offset, following)) = self.display_scroll.take() {
+            if following {
+                self.list.scroll_to_end();
+            } else {
+                self.list.scroll_to(offset);
+            }
         }
         // 行数到位之后再滚，否则会被截到末尾；再往上让一点，别让顶上的渐隐盖住这一行
         if let Some(ix) = self.reveal.take().filter(|&ix| ix < n) {
@@ -969,6 +986,7 @@ impl Session {
 
     /// 发消息时重新跟到底部（哪怕之前往上翻过）
     pub fn follow_tail(&mut self) {
+        self.display_scroll = None;
         self.wheel = None;
         self.list.set_follow_mode(FollowMode::Tail);
     }
@@ -981,6 +999,14 @@ impl Session {
     /// 离开底部之后又来了新内容（「回到底部」按钮上带个点）
     pub fn has_unseen(&self) -> bool {
         self.content_seq > self.seen_seq
+    }
+
+    pub fn user_message_count(&self) -> usize {
+        if !self.history_loaded && self.display_snapshot.is_some() {
+            self.cached_user_count
+        } else {
+            self.transcript.iter().filter(|item| matches!(item, ChatItem::User { .. })).count()
+        }
     }
 
     pub fn has_user_message(&self) -> bool {
