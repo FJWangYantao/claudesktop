@@ -220,9 +220,8 @@ impl ChatApp {
 
     fn on_stop_turn(&mut self, _: &StopTurn, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_open {
-            self.settings_open = false;
+            self.close_settings(cx);
             self.focus_input(window, cx);
-            cx.notify();
         } else if self.review_open() {
             self.close_review(cx);
         } else if self.session().viewing_task.is_some() {

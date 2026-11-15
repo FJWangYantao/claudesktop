@@ -213,6 +213,8 @@ pub struct SettingsForm {
     pub(super) model_scroll: ScrollHandle,
     /// magpie 网关的探测 / 下载 / 启动状态
     magpie: MagpieForm,
+    /// 打开设置表单时对照的已保存设置：未保存时保留草稿；若外部改过设置则重新载入
+    base_settings: Option<Settings>,
 }
 
 impl SettingsForm {
@@ -304,6 +306,7 @@ impl SettingsForm {
             hovered_action: None,
             model_scroll: ScrollHandle::new(),
             magpie: MagpieForm::default(),
+            base_settings: None,
         }
     }
 
@@ -346,7 +349,31 @@ impl ChatApp {
         if tab == super::usage_view::USAGE_TAB {
             tab = self.usage_page.settings_tab;
         }
+        // 切走再回来时若外部没改过设置，保留未保存的草稿方便继续修改或保存
+        if self.settings_form.base_settings.as_ref() == Some(&self.settings) && self.form_dirty(cx)
+        {
+            self.settings_form.tab = tab;
+            self.settings_open = true;
+            self.suggestion.clear();
+            cx.notify();
+            return;
+        }
         self.open_settings_at(tab, window, cx);
+    }
+
+    pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_form.tab == super::project_view::PROJECT_TAB {
+            self.apply_project(cx);
+        }
+        let dirty = self.settings_form.tab != super::usage_view::USAGE_TAB && self.form_dirty(cx);
+        self.settings_open = false;
+        if dirty {
+            self.toast(
+                Notification::warning("设置里有未保存的改动，暂未生效（回设置页可保存或撤销）"),
+                cx,
+            );
+        }
+        cx.notify();
     }
 
     /// 打开设置页并切到第 `tab` 个分类（下标见 `SETTINGS_TABS`）。
@@ -456,6 +483,7 @@ impl ChatApp {
             .custom_command
             .update(cx, |state, cx| state.set_value(custom, window, cx));
         self.settings_form.tab = tab;
+        self.settings_form.base_settings = Some(s);
         self.settings_wheel = None;
         self.model_wheel = None;
         self.settings_scroll.set_offset(point(px(0.), px(0.)));
@@ -1501,8 +1529,12 @@ impl ChatApp {
             self.settings_form.profiles = profiles;
             self.settings_form.active = 0;
             self.settings_form.view = 0;
+            self.settings = self.form_settings(cx);
+            self.settings_form.base_settings = Some(self.settings.clone());
+            assert_eq!(self.dirty_tabs(cx), (false, false, false));
             self.select_model_source(None, cx);
             self.select_form_model(1, "gpt-5".into(), window, cx);
+            assert!(self.dirty_tabs(cx).2);
             assert_eq!(self.settings_form.active, 1);
             assert_eq!(self.settings_form.model_source, None);
             self.select_model_source(Some(0), cx);
@@ -1523,12 +1555,18 @@ impl ChatApp {
                     .any(|(_, model)| *model == "manual-model")
             );
             assert!(self.form_dirty(cx));
+            let dirty_tabs = self.dirty_tabs(cx);
+            self.close_settings(cx);
+            assert!(!self.settings_open);
+            self.open_settings(window, cx);
+            assert!(self.settings_open && self.form_dirty(cx));
+            assert_eq!(self.dirty_tabs(cx), dirty_tabs);
             self.open_settings_at(MODEL_TAB, window, cx);
             assert!(!self.form_dirty(cx));
             assert_eq!(self.sidebar_open, sidebar);
             assert!(self.settings_navigation_only());
             eprintln!(
-                "settings checks passed: source filter, default routing, thinking ownership, removal, manual model, discard, sidebar state"
+                "settings checks passed: source filter, default routing, thinking ownership, removal, manual model, draft preservation, discard, sidebar state"
             );
         }
         cx.notify();
@@ -2353,12 +2391,10 @@ impl ChatApp {
         div().rounded_lg().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).px_1().child(input)
     }
 
-    /// 表单和生效中的设置有没有不同（页头据此提示、决定「保存」能不能点）。
-    fn form_dirty(&self, cx: &App) -> bool {
-        // 单价表写错了也算改动：点「保存」才看得到错在哪
-        if crate::pricing::parse_text(&self.settings_form.prices.read(cx).value()).is_err() {
-            return true;
-        }
+    /// 内核 / 服务商 / 模型三个需要「保存」的页签各自有没有未保存草稿。
+    fn dirty_tabs(&self, cx: &App) -> (bool, bool, bool) {
+        let prices_err =
+            crate::pricing::parse_text(&self.settings_form.prices.read(cx).value()).is_err();
         let normalize = |mut s: Settings| {
             s.kernel = Some(s.kernel_for(s.kernel.as_ref().unwrap_or(&KernelChoice::Builtin)));
             // 打开设置页时补上的那套空档案不算改动
@@ -2367,7 +2403,66 @@ impl ChatApp {
             s.builtin.active = s.builtin.active.min(s.builtin.profiles.len().saturating_sub(1));
             s
         };
-        normalize(self.form_settings(cx)) != normalize(self.settings.clone())
+        let draft = normalize(self.form_settings(cx));
+        let saved = normalize(self.settings.clone());
+        let mut kernel = prices_err
+            || draft.kernel != saved.kernel
+            || draft.acp != saved.acp
+            || draft.max_steps != saved.max_steps
+            || draft.auto_mode != saved.auto_mode
+            || draft.suggestions != saved.suggestions
+            || draft.next_suggestion != saved.next_suggestion
+            || draft.memory_suggest != saved.memory_suggest
+            || draft.suggest_model != saved.suggest_model
+            || draft.subagent_model != saved.subagent_model
+            || draft.chat != saved.chat
+            || draft.usage_gateway != saved.usage_gateway
+            || draft.gateway_bodies != saved.gateway_bodies
+            || draft.model_prices != saved.model_prices
+            || draft.price_peaks != saved.price_peaks;
+        let same_provider_fields = |a: &ProviderProfile, b: &ProviderProfile| {
+            a.name == b.name
+                && a.protocol == b.protocol
+                && a.base_url == b.base_url
+                && a.api_key == b.api_key
+                && a.params.temperature == b.params.temperature
+                && a.params.max_tokens == b.params.max_tokens
+                && a.params.extra == b.params.extra
+                && a.params.server_tools == b.params.server_tools
+                && a.magpie == b.magpie
+        };
+        let same_model_fields = |a: &ProviderProfile, b: &ProviderProfile| {
+            a.model == b.model
+                && a.params.thinking == b.params.thinking
+                && a.menu_hidden == b.menu_hidden
+                && a.models == b.models
+                && a.context_windows == b.context_windows
+        };
+        let provider = draft.builtin.profiles.len() != saved.builtin.profiles.len()
+            || draft
+                .builtin
+                .profiles
+                .iter()
+                .zip(&saved.builtin.profiles)
+                .any(|(a, b)| !same_provider_fields(a, b));
+        let model = draft.builtin.active != saved.builtin.active
+            || (draft.builtin.profiles.len() == saved.builtin.profiles.len()
+                && draft
+                    .builtin
+                    .profiles
+                    .iter()
+                    .zip(&saved.builtin.profiles)
+                    .any(|(a, b)| !same_model_fields(a, b)));
+        if !kernel && !provider && !model && draft != saved {
+            kernel = true;
+        }
+        (kernel, provider, model)
+    }
+
+    /// 表单和生效中的设置有没有不同（页头据此提示、决定「保存」能不能点）。
+    fn form_dirty(&self, cx: &App) -> bool {
+        let (kernel, provider, model) = self.dirty_tabs(cx);
+        kernel || provider || model
     }
 
     /// 「内核与模型」拆页后的「内核」：本机内核清单 + 自研内核的选项（自动模式、运行参数）。
@@ -3620,8 +3715,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    fn render_save_actions(&self, compact: bool, cx: &mut Context<Self>) -> Div {
-        let dirty = self.form_dirty(cx);
+    fn render_save_actions(&self, compact: bool, dirty: bool, cx: &mut Context<Self>) -> Div {
         div()
             .h_flex()
             .items_center()
@@ -3660,6 +3754,8 @@ impl ChatApp {
         }
         let compact_navigation =
             window.viewport_size().width < rems(37.).to_pixels(window.rem_size());
+        let dirty_tabs = self.dirty_tabs(cx);
+        let dirty = dirty_tabs.0 || dirty_tabs.1 || dirty_tabs.2;
         // 左侧分类导航
         let mut nav = div()
             .id("settings-navigation")
@@ -3677,22 +3773,24 @@ impl ChatApp {
                     .small()
                     .label("返回对话")
                     .mb_4()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if this.settings_form.tab == super::project_view::PROJECT_TAB {
-                            this.apply_project(cx);
-                        }
-                        this.settings_open = false;
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
             );
         for (i, (icon, label)) in SETTINGS_TABS.into_iter().enumerate() {
             if i == super::usage_view::USAGE_TAB {
                 continue;
             }
             let active = i == f.tab;
+            let tab_dirty = match i {
+                KERNEL_TAB => dirty_tabs.0,
+                PROVIDER_TAB => dirty_tabs.1,
+                MODEL_TAB => dirty_tabs.2,
+                _ => false,
+            };
             nav = nav.child(
                 div()
                     .id(("settings-tab", i))
+                    .role(Role::Tab)
+                    .aria_selected(active)
                     .h_flex()
                     .flex_none()
                     .items_center()
@@ -3709,7 +3807,10 @@ impl ChatApp {
                         this.select_settings_tab(i, window, cx);
                     }))
                     .child(Icon::new(icon).size_4().text_color(rgb(INK_SOFT)))
-                    .child(label),
+                    .child(div().flex_1().min_w_0().child(label))
+                    .when(tab_dirty, |d| {
+                        d.child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(rgb(CORAL)))
+                    }),
             );
         }
         let save_bar_tab = matches!(f.tab, KERNEL_TAB | PROVIDER_TAB | MODEL_TAB);
@@ -3778,13 +3879,7 @@ impl ChatApp {
                             )
                             .small()
                             .tooltip("返回对话")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if this.settings_form.tab == super::project_view::PROJECT_TAB {
-                                    this.apply_project(cx);
-                                }
-                                this.settings_open = false;
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
                         )
                         .child(menu_popover(
                             "settings-category-menu",
@@ -3793,7 +3888,9 @@ impl ChatApp {
                             &cx.entity(),
                             &self.menu_focus,
                             MenuChip::new(SETTINGS_TABS[f.tab].0, title).filled(),
-                            settings_tab_menu_items,
+                            move |app, handle, popover| {
+                                settings_tab_menu_items(dirty_tabs, app, handle, popover)
+                            },
                         ))
                     })
                     .when(!compact_navigation, |d| {
@@ -3832,7 +3929,9 @@ impl ChatApp {
                     add_profile_menu_items,
                 ))
             })
-            .when(save_bar_tab, |d| d.child(self.render_save_actions(compact_navigation, cx)));
+            .when(save_bar_tab || dirty, |d| {
+                d.child(self.render_save_actions(compact_navigation, dirty, cx))
+            });
         let model_page = f.tab == MODEL_TAB;
         let content = div()
             .v_flex()
@@ -4116,6 +4215,7 @@ pub(super) fn provider_icon(base_url: &str) -> Icon {
 }
 
 fn settings_tab_menu_items(
+    dirty_tabs: (bool, bool, bool),
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
@@ -4125,8 +4225,16 @@ fn settings_tab_menu_items(
         if i == super::usage_view::USAGE_TAB {
             continue;
         }
+        let tab_dirty = match i {
+            KERNEL_TAB => dirty_tabs.0,
+            PROVIDER_TAB => dirty_tabs.1,
+            MODEL_TAB => dirty_tabs.2,
+            _ => false,
+        };
+        let label: SharedString =
+            if tab_dirty { format!("{title} · 未保存").into() } else { title.into() };
         menu = menu.pick_in(
-            menu_text_item(("settings-category", i), title, app.settings_form.tab == i),
+            menu_text_item(("settings-category", i), label, app.settings_form.tab == i),
             move |this, window, cx| this.select_settings_tab(i, window, cx),
         );
     }

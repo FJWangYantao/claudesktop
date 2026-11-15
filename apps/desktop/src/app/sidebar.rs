@@ -747,8 +747,7 @@ impl ChatApp {
                             if this.settings_open
                                 && this.settings_form.tab != super::usage_view::USAGE_TAB
                             {
-                                this.settings_open = false;
-                                cx.notify();
+                                this.close_settings(cx);
                             } else if this.settings_open {
                                 // 设置表单还是进用量页之前那份（可能有没保存的改动），只换分类
                                 this.settings_form.tab = this.usage_page.settings_tab;
