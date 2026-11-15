@@ -664,6 +664,43 @@ impl QueuedPrompt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplayBytes {
+    pub agent: usize,
+    pub thinking: usize,
+    pub info: usize,
+    pub diffs: usize,
+    pub attachments: usize,
+    pub tool_images: usize,
+    pub other: usize,
+}
+
+impl DisplayBytes {
+    pub fn add(&mut self, other: Self) {
+        self.agent += other.agent;
+        self.thinking += other.thinking;
+        self.info += other.info;
+        self.diffs += other.diffs;
+        self.attachments += other.attachments;
+        self.tool_images += other.tool_images;
+        self.other += other.other;
+    }
+
+    pub fn total(self) -> usize {
+        self.agent
+            + self.thinking
+            + self.info
+            + self.diffs
+            + self.attachments
+            + self.tool_images
+            + self.other
+    }
+
+    fn categorized(&self) -> usize {
+        self.total() - self.other
+    }
+}
+
 impl ChatItem {
     /// 新开一段流式中的思考（默认收起）；`started` 为 None 时不计时（重放历史）。
     pub fn thinking(text: impl Into<String>, started: Option<Instant>) -> Self {
@@ -750,7 +787,7 @@ impl ChatItem {
                     + c.result.len()
                     + c.output.len()
                     + c.diffs.iter().map(diff_bytes).sum::<usize>()
-                    + c.images.iter().map(|i| i.bytes.len()).sum::<usize>()
+                    + c.images.iter().map(|i| i.bytes.len() + i.image.bytes.len()).sum::<usize>()
                     + 16
             }
             Self::AutoApproved { title, chosen } => title.len() + chosen.len(),
@@ -810,6 +847,41 @@ impl ChatItem {
                 text + 64
             }
         }
+    }
+
+    pub fn heap_breakdown(&self) -> DisplayBytes {
+        const HEAD: usize = std::mem::size_of::<String>() + 16;
+        let mut out = DisplayBytes { other: self.heap_bytes(), ..DisplayBytes::default() };
+        match self {
+            Self::Agent(text) => out.agent = text.len() + 64,
+            Self::Thinking { text, .. } => out.thinking = text.len() + 64,
+            Self::Info { text, .. } => out.info = text.len() + 64,
+            Self::User { files, .. } => {
+                out.attachments = files
+                    .iter()
+                    .map(|a| a.name.len() + a.text.len() + a.path.as_os_str().len() + HEAD * 2)
+                    .sum();
+            }
+            Self::Tool(card) => {
+                out.diffs = card
+                    .diffs
+                    .iter()
+                    .map(|d| {
+                        std::mem::size_of::<DiffView>()
+                            + d.path.len()
+                            + d.lines.iter().map(|l| l.text.len() + HEAD).sum::<usize>()
+                    })
+                    .sum();
+                out.tool_images = card
+                    .images
+                    .iter()
+                    .map(|image| image.bytes.len() + image.image.bytes.len())
+                    .sum();
+            }
+            _ => {}
+        }
+        out.other = out.other.saturating_sub(out.categorized());
+        out
     }
 
     /// 影响这一行渲染高度的内容摘要（虚拟列表据此判断要不要重新测量）。

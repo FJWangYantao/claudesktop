@@ -11,6 +11,7 @@ mod gauge;
 #[cfg(feature = "headless-screenshot")]
 mod hibernate_bench;
 mod history;
+mod image_cache;
 pub(crate) mod keys;
 mod mascot;
 pub mod math;
@@ -208,6 +209,8 @@ pub struct ChatApp {
     /// 侧栏里运行中会话的转圈位置（侧栏记、叠在上面的 `SidebarSpinners` 画，见 `sidebar.rs`）
     sidebar_spinners: SharedSpots,
     sidebar_spinners_view: Entity<SidebarSpinners>,
+    /// 内容区祖先注入的图片解码缓存（分类账与回收预算见 `image_cache.rs`）
+    image_cache: Entity<image_cache::DecodedImageCache>,
     /// 输入框上方的内容区（缓存 view，`ChatApp` 每次通知都让它重画，见 `content.rs`）
     content_view: Entity<ContentView>,
     /// 内容区里的转圈 / 呼吸点 / 扫光叠在这上面画（见 motion.rs 文件头）
@@ -392,6 +395,10 @@ impl ChatApp {
                     InputEvent::Change => {
                         // 用户改了内容：退出历史回溯，别让下一条历史把新写的字冲掉
                         this.history.touch();
+                        if !this.input.read(cx).value().is_empty() {
+                            let active = this.active;
+                            this.sessions[active].steering = None;
+                        }
                         this.update_completion(cx);
                         // 停顿一下就猜一句下文（见 suggest.rs）
                         this.schedule_suggestion(cx);
@@ -584,6 +591,7 @@ impl ChatApp {
             sidebar_key: 0,
             sidebar_spinners: Default::default(),
             sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
+            image_cache: image_cache::DecodedImageCache::new(cx),
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             loop_overlay: cx.new(|_| motion::LoopOverlay),
             home_w: Default::default(),
@@ -1012,8 +1020,14 @@ impl ChatApp {
     /// 各类缓存现状一行（`CLAUDESKTOP_MEM_REPORT=1` 时每 30 秒随回收周期打）。
     fn mem_report(&self) {
         let loaded = self.sessions.iter().filter(|s| s.history_loaded).count();
-        let retained: usize = self.sessions.iter().map(Session::retained_bytes).sum();
+        let display = self.sessions.iter().fold(DisplayBytes::default(), |mut total, session| {
+            total.add(session.retained_breakdown());
+            total
+        });
+        let retained = display.total();
         let stats = crate::assets::registry_stats();
+        let math = claudesktop_core::math::cache_stats();
+        let images = image_cache::image_cache_stats();
         let history = self.kernels.iter().filter_map(|(_, slot)| slot.kernel.as_ref()).fold(
             claudesktop_core::KernelHistoryStats::default(),
             |mut total, kernel| {
@@ -1039,6 +1053,44 @@ impl ChatApp {
             stats.bytes as f64 / 1048576.,
             stats.budget / 1048576,
             stats.spilled
+        );
+        eprintln!(
+            "[mem] display agent={} thinking={} info={} diffs={} attachments={} tool_images={} other={} math_cache={} math_entries={} math_hits={} math_misses={} math_evictions={} raw_math={} raw_math_entries={} raw_images={} raw_image_entries={} asset_spilled={} asset_spilled_bytes={} asset_loads={} asset_memory_hits={} asset_disk_hits={} asset_misses={}",
+            display.agent,
+            display.thinking,
+            display.info,
+            display.diffs,
+            display.attachments,
+            display.tool_images,
+            display.other,
+            math.bytes,
+            math.entries,
+            math.hits,
+            math.misses,
+            math.evictions,
+            stats.math_bytes,
+            stats.math_entries,
+            stats.image_bytes,
+            stats.image_entries,
+            stats.spilled,
+            stats.spilled_bytes,
+            stats.loads,
+            stats.memory_hits,
+            stats.disk_hits,
+            stats.misses,
+        );
+        eprintln!(
+            "[mem] decoded entries={} loading={} bytes={} frames={} hits={} misses={} evictions={} first_draws={} first_draw_ms_total={:.3} first_draw_ms_max={:.3}",
+            images.entries,
+            images.loading,
+            images.decoded_bytes,
+            images.frames,
+            images.hits,
+            images.misses,
+            images.evictions,
+            images.first_draws,
+            images.first_draw_ms_total,
+            images.first_draw_ms_max,
         );
     }
 
@@ -2149,6 +2201,7 @@ impl ChatApp {
             self.pending.clear();
             self.pending_files.clear();
             self.history.push(&queued.text);
+            self.sessions[active].steering = None;
             self.sessions[active].queued.push(queued);
             cx.notify();
             return;
@@ -2161,6 +2214,7 @@ impl ChatApp {
             self.pending.clear();
             self.pending_files.clear();
             self.history.push(&queued.text);
+            self.sessions[active].steering = None;
             self.sessions[active].queued.push(queued);
             cx.notify();
             return;
@@ -2171,6 +2225,7 @@ impl ChatApp {
             self.pending.clear();
             self.pending_files.clear();
             self.history.push(&queued.text);
+            self.sessions[active].steering = None;
             self.sessions[active].queued.push(queued);
             cx.notify();
             return;
@@ -2533,7 +2588,7 @@ impl ChatApp {
                 );
                 return false;
             }
-            s.steering = false;
+            s.steering = None;
             // 聊天会话的文本附件：内容拼在发给内核的全文里；气泡和日志里只写文件名
             let attachments = std::mem::take(&mut prompt.attachments);
             let has_attachments = !attachments.is_empty();
@@ -2697,6 +2752,20 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 提问面板上的「自己说」：按自己说结束这一轮，把光标放回输入框，并提示用户输入想法。
+    pub(crate) fn self_answer_question(
+        &mut self,
+        item_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.answer_question(item_idx, claudesktop_core::QuestionAnswer::SelfAnswer, cx);
+        let active = self.active;
+        self.sessions[active].steering = Some("说说你的想法，回车发送");
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
     /// 所有题都选好了才提交（每题选中的下标交给内核），由 [`Self::pick_question`] 自动调。
     pub(crate) fn submit_question(&mut self, item_idx: usize, cx: &mut Context<Self>) {
         let Some(choices) = self.sessions[self.active].question_choices(item_idx) else {
@@ -2727,7 +2796,7 @@ impl ChatApp {
             self.stop(window, cx);
         }
         let active = self.active;
-        self.sessions[active].steering = true;
+        self.sessions[active].steering = Some("说说要它怎么改，回车发送");
         self.send(window, cx);
         self.focus_input(window, cx);
         cx.notify();
@@ -3347,19 +3416,21 @@ impl Render for ChatApp {
         self.sync_placeholder(window, cx);
 
         // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
-        let body = v_flex().flex_1().min_h_0().w_full().child(self.content_slot()).when(
-            !self.settings_open,
-            |d| {
-                d.child(
-                    div()
-                        .max_w(READING_W)
-                        .w_full()
-                        .px_8()
-                        .pb_4()
-                        .pt_2()
-                        .child(self.render_composer(window, cx)),
-                )
-            },
+        let body = image_cache(self.image_cache.clone()).flex_1().min_h_0().w_full().child(
+            v_flex().flex_1().min_h_0().w_full().child(self.content_slot()).when(
+                !self.settings_open,
+                |d| {
+                    d.child(
+                        div()
+                            .max_w(READING_W)
+                            .w_full()
+                            .px_8()
+                            .pb_4()
+                            .pt_2()
+                            .child(self.render_composer(window, cx)),
+                    )
+                },
+            ),
         );
         let main = v_flex()
             .flex_1()

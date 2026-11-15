@@ -87,8 +87,13 @@ struct Entry {
 struct Registry {
     map: HashMap<String, Entry>,
     bytes: usize,
-    /// 被预算挤出去、写到磁盘缓存的条数（`load` 未命中内存时去那儿找）
+    /// 被预算挤出去、写到磁盘缓存的累计条数与字节（`load` 未命中内存时去那儿找）
     spilled: usize,
+    spilled_bytes: usize,
+    loads: u64,
+    memory_hits: u64,
+    disk_hits: u64,
+    misses: u64,
     /// 磁盘缓存不可用（建目录失败等）后就不写盘，也不记 spilled
     spill_dir: Option<PathBuf>,
 }
@@ -100,6 +105,11 @@ fn registry() -> &'static Mutex<Registry> {
             map: HashMap::new(),
             bytes: 0,
             spilled: 0,
+            spilled_bytes: 0,
+            loads: 0,
+            memory_hits: 0,
+            disk_hits: 0,
+            misses: 0,
             // 建不成（数据目录不可用）就只留内存表，淘汰即丢、重画时按未登记处理
             spill_dir: claudesktop_core::default_data_dir()
                 .ok()
@@ -133,6 +143,7 @@ impl Registry {
             let freed = entry.bytes.len();
             if self.spill(&name, &entry.bytes) {
                 self.spilled += 1;
+                self.spilled_bytes += freed;
                 self.bytes -= freed;
             } else {
                 self.map.insert(name, Entry { bytes: entry.bytes, last_used: Instant::now() });
@@ -225,13 +236,16 @@ impl AssetSource for Assets {
         for prefix in [MATH_PREFIX, IMAGE_PREFIX] {
             if let Some(rest) = path.strip_prefix(prefix) {
                 let mut reg = registry().lock().unwrap();
+                reg.loads += 1;
                 if let Some(entry) = reg.map.get_mut(rest) {
                     entry.last_used = Instant::now();
                     let bytes = Arc::clone(&entry.bytes);
+                    reg.memory_hits += 1;
                     return Ok(Some(Cow::Owned(bytes.to_vec())));
                 }
                 // 内存里没有：可能被预算挤到磁盘缓存了
                 if let Some(bytes) = reg.unspill(rest) {
+                    reg.disk_hits += 1;
                     reg.bytes += bytes.len();
                     reg.map.insert(
                         rest.to_string(),
@@ -240,6 +254,7 @@ impl AssetSource for Assets {
                     reg.trim();
                     return Ok(Some(Cow::Owned(bytes.to_vec())));
                 }
+                reg.misses += 1;
                 return Ok(None);
             }
         }
@@ -275,18 +290,39 @@ impl AssetSource for Assets {
 pub struct RegistryStats {
     pub entries: usize,
     pub bytes: usize,
+    pub math_entries: usize,
+    pub math_bytes: usize,
+    pub image_entries: usize,
+    pub image_bytes: usize,
     pub budget: usize,
     pub spilled: usize,
+    pub spilled_bytes: usize,
+    pub loads: u64,
+    pub memory_hits: u64,
+    pub disk_hits: u64,
+    pub misses: u64,
 }
 
-/// 登记表现状：内存条数 / 字节 / 被挤到磁盘缓存的条数。
+/// 登记表现状：按公式 / 图片拆分的内存条数与字节，以及磁盘溢出和加载计数。
 pub fn registry_stats() -> RegistryStats {
     let reg = registry().lock().unwrap();
+    let math = reg.map.iter().filter(|(name, _)| name.ends_with(".svg"));
+    let (math_entries, math_bytes) =
+        math.fold((0, 0), |(entries, bytes), (_, entry)| (entries + 1, bytes + entry.bytes.len()));
     RegistryStats {
         entries: reg.map.len(),
         bytes: reg.bytes,
+        math_entries,
+        math_bytes,
+        image_entries: reg.map.len() - math_entries,
+        image_bytes: reg.bytes - math_bytes,
         budget: REGISTRY_BUDGET,
         spilled: reg.spilled,
+        spilled_bytes: reg.spilled_bytes,
+        loads: reg.loads,
+        memory_hits: reg.memory_hits,
+        disk_hits: reg.disk_hits,
+        misses: reg.misses,
     }
 }
 
@@ -322,6 +358,11 @@ mod tests {
             reg.map.clear();
             reg.bytes = 0;
             reg.spilled = 0;
+            reg.spilled_bytes = 0;
+            reg.loads = 0;
+            reg.memory_hits = 0;
+            reg.disk_hits = 0;
+            reg.misses = 0;
             reg.spill_dir = Some(dir.clone());
         }
         (guard, dir)

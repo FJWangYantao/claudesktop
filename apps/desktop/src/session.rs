@@ -161,8 +161,8 @@ pub struct Session {
     pub reveal: Option<usize>,
     /// 滚轮平滑滚动进行中（见 `ChatApp::step_wheel`）；跳转、回到底部时清掉，免得两边抢
     pub wheel: Option<WheelScroll>,
-    /// 刚在权限卡上「拒绝并说明」：输入框的占位文字请用户说要怎么改，下一条消息发出时清掉
-    pub steering: bool,
+    /// 刚在权限卡上「拒绝并说明」或提问面板「自己说」：输入框的占位文字提示，用户输入或发送时清掉
+    pub steering: Option<&'static str>,
     /// 最近一轮输入命中提示缓存的比例（%）；端点没报告时为 None
     pub cache_hit: Option<u32>,
     /// 收到过的内容事件个数，和 `seen_seq` 比较判断往上翻的时候底下有没有来新内容
@@ -1078,22 +1078,25 @@ impl Session {
         *self = cold;
     }
 
+    pub fn retained_breakdown(&self) -> DisplayBytes {
+        let mut out = DisplayBytes::default();
+        for item in self.transcript.iter().chain(self.subagents.values().flat_map(|run| &run.items))
+        {
+            out.add(item.heap_breakdown());
+        }
+        out.other += self.layout.len() * std::mem::size_of::<RowLayout>()
+            + self.measured.len() * std::mem::size_of::<u64>()
+            + self
+                .subagents
+                .values()
+                .map(|run| run.prompt.len() + run.agent.len() + 64)
+                .sum::<usize>();
+        out
+    }
+
     /// 这一页显示数据保留的堆字节（估算，见 [`ChatItem::heap_bytes`]）。
     pub fn retained_bytes(&self) -> usize {
-        let transcript: usize = self.transcript.iter().map(ChatItem::heap_bytes).sum();
-        let layout = self.layout.len() * std::mem::size_of::<RowLayout>()
-            + self.measured.len() * std::mem::size_of::<u64>();
-        let subagents: usize = self
-            .subagents
-            .values()
-            .map(|run| {
-                run.prompt.len()
-                    + run.agent.len()
-                    + 64
-                    + run.items.iter().map(ChatItem::heap_bytes).sum::<usize>()
-            })
-            .sum();
-        transcript + layout + subagents
+        self.retained_breakdown().total()
     }
 
     /// 侧栏分组按哪个目录算：worktree 会话归到**主仓库**那一组（`cwd` 是数据目录里的 worktree，

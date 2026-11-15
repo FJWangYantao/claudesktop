@@ -2042,7 +2042,13 @@ impl ChatApp {
                         .on_click(cx.listener(move |_, _, window, cx| {
                             Self::open_image(ImageView::Path(path.clone()), window, cx)
                         }))
-                        .child(img(p.clone()).size_20().rounded_md().object_fit(ObjectFit::Cover))
+                        .child(
+                            img(p.clone())
+                                .image_cache(&self.image_cache)
+                                .size_20()
+                                .rounded_md()
+                                .object_fit(ObjectFit::Cover),
+                        )
                 }),
             ))
         };

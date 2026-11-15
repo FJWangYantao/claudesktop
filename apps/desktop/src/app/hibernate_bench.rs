@@ -30,6 +30,25 @@ impl ChatApp {
                 let idx = idx.ok_or("找不到会话令牌")?;
                 match action {
                     "activate" => self.activate_session(idx, cx),
+                    "show_images" => {
+                        self.activate_session(idx, cx);
+                        self.settings.view_mode = ViewMode::Verbose;
+                        let mut reveal = None;
+                        for (item, row) in self.sessions[idx].transcript.iter_mut().enumerate() {
+                            match row {
+                                ChatItem::User { images, .. } if !images.is_empty() => {
+                                    reveal.get_or_insert(item);
+                                }
+                                ChatItem::Tool(card) if !card.images.is_empty() => {
+                                    card.expanded = true;
+                                    reveal = Some(item);
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.sessions[idx].reveal = reveal;
+                        cx.notify();
+                    }
                     "inspect" => {
                         use std::hash::{Hash, Hasher};
                         if !self.sessions[idx].history_loaded {
@@ -141,10 +160,42 @@ impl ChatApp {
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .collect();
+        let display = self.sessions.iter().fold(DisplayBytes::default(), |mut total, session| {
+            total.add(session.retained_breakdown());
+            total
+        });
+        let assets = crate::assets::registry_stats();
+        let math = claudesktop_core::math::cache_stats();
+        let decoded = super::image_cache::image_cache_stats();
         Ok(json!({
             "result": result, "sessions": sessions, "tasks": tasks, "snapshots": snapshots,
             "display_loaded": self.sessions.iter().filter(|s| s.history_loaded && s.acp_id.is_some() && s.has_user_message()).count(),
-            "display_bytes": self.sessions.iter().map(Session::retained_bytes).sum::<usize>(),
+            "display_bytes": display.total(),
+            "display_categories": {
+                "agent": display.agent, "thinking": display.thinking, "info": display.info,
+                "diffs": display.diffs, "attachments": display.attachments,
+                "tool_images": display.tool_images, "other": display.other,
+            },
+            "assets": {
+                "entries": assets.entries, "bytes": assets.bytes,
+                "math_entries": assets.math_entries, "math_bytes": assets.math_bytes,
+                "image_entries": assets.image_entries, "image_bytes": assets.image_bytes,
+                "spilled": assets.spilled, "spilled_bytes": assets.spilled_bytes,
+                "loads": assets.loads, "memory_hits": assets.memory_hits,
+                "disk_hits": assets.disk_hits, "misses": assets.misses,
+            },
+            "math_cache": {
+                "entries": math.entries, "bytes": math.bytes, "hits": math.hits,
+                "misses": math.misses, "evictions": math.evictions,
+            },
+            "decoded_cache": {
+                "entries": decoded.entries, "loading": decoded.loading,
+                "bytes": decoded.decoded_bytes, "frames": decoded.frames,
+                "hits": decoded.hits, "misses": decoded.misses, "evictions": decoded.evictions,
+                "first_draws": decoded.first_draws,
+                "first_draw_ms_total": decoded.first_draw_ms_total,
+                "first_draw_ms_max": decoded.first_draw_ms_max,
+            },
             "epoch_ms": bench_epoch_ms(),
             "resident": stats.resident_sessions, "dormant": stats.dormant_sessions,
             "transitioning": stats.transitioning_sessions, "history_bytes": stats.resident_bytes,

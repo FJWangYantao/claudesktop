@@ -73,25 +73,71 @@ impl std::error::Error for MathError {}
 /// 结果按「源码 + 行内 / 块」缓存：同一个公式在流式输出里会来回排好几次，只有第一次真排。
 pub fn typeset(latex: &str, display: bool) -> Result<Typeset, MathError> {
     let key = (latex.to_string(), display);
-    if let Some(hit) = cache().lock().unwrap().get(&key) {
-        return hit.clone();
+    let mut guard = cache().lock().unwrap();
+    if let Some(hit) = guard.map.get(&key) {
+        let hit = hit.clone();
+        guard.hits += 1;
+        return hit;
     }
+    drop(guard);
     let out = typeset_uncached(latex, display);
     let mut cache = cache().lock().unwrap();
-    if cache.len() >= CACHE_MAX {
+    cache.misses += 1;
+    if cache.map.len() >= CACHE_MAX {
         // 满了清一半：新的一批接着进来，不必真做 LRU（公式不多，简单够了）
-        cache.clear();
+        cache.evictions += cache.map.len() as u64;
+        cache.map.clear();
     }
-    cache.insert(key, out.clone());
+    cache.map.insert(key, out.clone());
     out
 }
 
-/// 排版缓存：（源码, 是不是块公式）→ 结果
-type Cache = Mutex<HashMap<(String, bool), Result<Typeset, MathError>>>;
+type Key = (String, bool);
+type Value = Result<Typeset, MathError>;
 
-fn cache() -> &'static Cache {
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+struct Cache {
+    map: HashMap<Key, Value>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+fn cache() -> &'static Mutex<Cache> {
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(Cache { map: HashMap::new(), hits: 0, misses: 0, evictions: 0 }))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MathCacheStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+pub fn cache_stats() -> MathCacheStats {
+    let cache = cache().lock().unwrap();
+    let bytes = cache.map.capacity() * std::mem::size_of::<(Key, Value)>()
+        + cache
+            .map
+            .iter()
+            .map(|((source, _), result)| {
+                source.capacity()
+                    + match result {
+                        Ok(typeset) => typeset.svg.capacity(),
+                        Err(error) => error.message.capacity(),
+                    }
+            })
+            .sum::<usize>();
+    MathCacheStats {
+        entries: cache.map.len(),
+        bytes,
+        hits: cache.hits,
+        misses: cache.misses,
+        evictions: cache.evictions,
+    }
 }
 
 fn typeset_uncached(latex: &str, display: bool) -> Result<Typeset, MathError> {

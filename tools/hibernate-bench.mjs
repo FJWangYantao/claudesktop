@@ -15,13 +15,19 @@ const args = Object.fromEntries(process.argv.slice(2).map(arg => {
   return [key, value.join('=') || 'true'];
 }));
 const exe = path.resolve(args.exe || 'D:/t3/release/claudesktop.exe');
-const count = Number(args.sessions || 50);
+const sample = args.sample || 'history';
+const count = Number(args.sessions || (sample === 'warm' ? 3 : 50));
 const rounds = Number(args.rounds || 3);
 const soakSeconds = Number(args.soak || 1800);
 const mode = args.mode || 'all';
-const displayComparison = args.compare === 'display';
+const comparisonKind = ['display', 'image', 'warm'].includes(args.compare) ? args.compare : 'kernel';
+const displayComparison = comparisonKind === 'display';
+const imageComparison = comparisonKind === 'image';
+const warmComparison = comparisonKind === 'warm';
+const displayIntegrity = displayComparison || warmComparison;
 const output = path.resolve(args.out || path.join(root, '.claudesktop', 'bench', new Date().toISOString().replace(/[:.]/g, '-')));
-assert(Number.isInteger(count) && count >= 4 && count <= 200);
+assert(['history', 'render', 'warm'].includes(sample));
+assert(Number.isInteger(count) && (sample === 'warm' ? count === 3 : count >= 4 && count <= 200));
 assert(Number.isInteger(rounds) && rounds >= 1);
 assert(Number.isFinite(soakSeconds) && soakSeconds >= 0);
 assert(['all', 'ab', 'soak', 'smoke', 'summary'].includes(mode));
@@ -42,8 +48,27 @@ const normalize = value => Array.isArray(value) ? value.map(normalize) : value &
 const textOf = content => typeof content === 'string' ? content : (content || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
 const reply = Array.from({ length: Number(args['reply-paragraphs'] || 64) }, (_, i) => `Paragraph ${i.toString().padStart(4, '0')}: ${'measured local session history with tools, images and signed thinking. '.repeat(3)}\n\n`).join('');
 const thinking = 'Reasoning retained verbatim with its signature.\n'.repeat(16000);
+const renderReply = session => {
+  const formulas = Array.from({ length: 24 }, (_, i) => `$$\n\\frac{\\sqrt{x_{${session}} + ${i}}}{\\sum_{j=1}^{${i + 2}} j^2} = \\int_0^\\infty e^{-t_{${i}}}dt\n$$\n\n`).join('');
+  const prose = Array.from({ length: 128 }, (_, i) => `### Section ${i}\n\nRender **Markdown** with distinct formulas and \`inline code ${session}\`. ${'Long rendering sample text. '.repeat(8)}\n\n`).join('');
+  return formulas + prose;
+};
+const warmReply = session => {
+  const bytes = Number(args['warm-reply-bytes'] || 2 * 1024 * 1024);
+  assert(Number.isInteger(bytes) && bytes >= 1024 && bytes <= 32 * 1024 * 1024);
+  const unit = `Warm session ${session}: **completed large Markdown reply** with a restorable preview. `;
+  const paragraphs = [];
+  let size = 0;
+  for (let i = 0; size < bytes; i++) {
+    const paragraph = `### Completed section ${i}\n\n${unit.repeat(40)}\n\n`;
+    paragraphs.push(paragraph);
+    size += Buffer.byteLength(paragraph);
+  }
+  return paragraphs.join('');
+};
+const replyFor = session => sample === 'render' ? renderReply(session) : sample === 'warm' ? warmReply(session) : reply;
 
-function png() {
+function png(seed = 1234567, width = 384, height = 768) {
   const crc = buffer => {
     let n = 0xffffffff;
     for (const byte of buffer) {
@@ -58,9 +83,8 @@ function png() {
     const checksum = Buffer.alloc(4); checksum.writeUInt32BE(crc(Buffer.concat([type, data])));
     return Buffer.concat([size, type, data, checksum]);
   };
-  const width = 384, height = 768;
   const pixels = Buffer.alloc((width * 3 + 1) * height);
-  let random = 1234567;
+  let random = seed | 0;
   for (let y = 0; y < height; y++) for (let x = 1; x <= width * 3; x++) {
     random ^= random << 13; random ^= random >>> 17; random ^= random << 5;
     pixels[y * (width * 3 + 1) + x] = random & 255;
@@ -82,8 +106,8 @@ async function run(label, enabled, soak = 0) {
       const result = JSON.parse(await readFile(path.join(dir, 'result.json'), 'utf8'));
       const summary = JSON.parse(await readFile(path.join(dir, 'summary.json'), 'utf8'));
       assert(result.passed && result.label === label && result.count === count && result.enabled === enabled);
-      assert(summary.comparison_kind === (displayComparison ? 'display' : 'kernel') && summary.count === count && summary.enabled === enabled);
-      assert(summary.displayChecks === (displayComparison ? count : 0));
+      assert(summary.comparison_kind === comparisonKind && summary.sample === sample && summary.count === count && summary.enabled === enabled);
+      assert(summary.displayChecks === (displayIntegrity ? count * (sample === 'warm' ? 8 : 1) : 0));
       console.log(`${label}: reuse verified completed run`);
       return summary;
     }
@@ -93,6 +117,9 @@ async function run(label, enabled, soak = 0) {
   await mkdir(path.join(workspace, '.git'), { recursive: true });
   await mkdir(dataDir, { recursive: true });
   await writeFile(path.join(workspace, 'fixture.txt'), 'fixture-marker: unchanged\n' + 'file payload checked by the real read_file tool\n'.repeat(1500));
+  if (sample === 'render') {
+    for (let i = 0; i < count; i++) await writeFile(path.join(workspace, `fixture-${i}.png`), png(9000 + i, 512, 1024));
+  }
   await writeFile(path.join(dataDir, 'settings.json'), JSON.stringify({ notifications: false, suggestions: false, memory_suggest: false, usage_gateway: false }));
   const requests = [];
   const expected = new Map();
@@ -130,7 +157,7 @@ async function run(label, enabled, soak = 0) {
         const prefix = expected.get(tag.session);
         if (prefix) {
           assert.deepEqual(messages.slice(0, prefix.length).map(hash), prefix, `${tag.text}: history changed across wake`);
-          assert(messages.some(message => textOf(message.content) === reply), 'final seed reply changed across wake');
+          assert(messages.some(message => textOf(message.content) === replyFor(tag.session)), 'final seed reply changed across wake');
           strictChecks++;
           const seedTag = `bench:seed:${tag.session}:0`;
           assert.equal(messages.filter(message => textOf(message.content).includes(seedTag)).length, 1, 'seed user duplicated');
@@ -152,12 +179,12 @@ async function run(label, enabled, soak = 0) {
       else if (tag.kind === 'seed' && !used.includes('read_file')) blocks = [
         { type: 'thinking', thinking, signature: `signed-thinking-${tag.session}` },
         { type: 'redacted_thinking', data: `opaque-thinking-${tag.session}` },
-        tool('read_file', { path: 'fixture.txt' }),
+        tool('read_file', { path: sample === 'render' ? `fixture-${tag.session}.png` : 'fixture.txt' }),
       ];
       else if (tag.kind === 'seed') {
-        assert(results.some(result => JSON.stringify(result).includes('fixture-marker')), 'read_file result missing');
+        if (sample !== 'render') assert(results.some(result => JSON.stringify(result).includes('fixture-marker')), 'read_file result missing');
         expected.set(tag.session, messages.map(hash));
-        blocks = [{ type: 'text', text: reply }];
+        blocks = [{ type: 'text', text: replyFor(tag.session) }];
       } else {
         const target = { read: 'read_file', write: 'write_file', question: 'ask_user', subagent: 'task', child: 'read_file', background: 'shell_background' }[tag.kind];
         if (target && !available.has(target) && !used.includes('tool_search')) blocks = [tool('tool_search', { query: target })];
@@ -225,6 +252,12 @@ async function run(label, enabled, soak = 0) {
     delete env.CLAUDESKTOP_DISABLE_RECLAIM;
     if (!enabled) env.CLAUDESKTOP_DISABLE_DISPLAY_RECLAIM = '1';
   }
+  if (imageComparison && !enabled) env.CLAUDESKTOP_DISABLE_IMAGE_RECLAIM = '1';
+  if (warmComparison) {
+    env.CLAUDESKTOP_HIBERNATE = '1';
+    delete env.CLAUDESKTOP_DISABLE_RECLAIM;
+    if (!enabled) env.CLAUDESKTOP_DISABLE_WARM_RECLAIM = '1';
+  }
   const stderr = createWriteStream(path.join(dir, 'app.log'));
   const app = spawn(exe, [], { cwd: workspace, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   app.stdout.pipe(stderr); app.stderr.pipe(stderr);
@@ -249,9 +282,16 @@ async function run(label, enabled, soak = 0) {
     throw new Error(`command timeout: ${action}`);
   };
   const phases = [];
+  const memoryStats = [];
   const phase = async name => {
     await writeFile(path.join(dir, 'phase.txt'), name);
     phases.push({ phase: name, epoch_ms: Date.now() });
+    const status = await command('status');
+    memoryStats.push({
+      phase: name, epoch_ms: Date.now(), display_bytes: status.display_bytes,
+      display_categories: status.display_categories, assets: status.assets,
+      math_cache: status.math_cache, decoded_cache: status.decoded_cache,
+    });
     console.log(`${label}: ${name}`);
   };
   const wait = async (predicate, timeout = 60000) => {
@@ -275,10 +315,13 @@ async function run(label, enabled, soak = 0) {
   const turn = async (token, kind, session, { seed = false, cancel = false } = {}) => {
     const seq = seed ? 0 : ++operation;
     const tag = `bench:${kind}:${session}:${seq}`;
-    if (displayComparison) await wait(status => status.sessions.find(s => s.token === token)?.history_loaded);
+    if (displayIntegrity) await wait(status => status.sessions.find(s => s.token === token)?.history_loaded);
     const before = (await command('status')).sessions.find(s => s.token === token);
     assert(before?.ready && !before.busy && !before.rewinding);
-    const sent = await command('send', { token, text: tag, ...(seed ? { images: [image] } : {}) });
+    const seedImage = sample === 'render'
+      ? { media_type: 'image/png', data: png(1234567 + session, 512, 1024).toString('base64') }
+      : image;
+    const sent = await command('send', { token, text: tag, ...(seed ? { images: [seedImage] } : {}) });
     if (cancel) {
       await wait(() => requests.some(request => request.text === tag));
       await delay(200);
@@ -331,8 +374,12 @@ async function run(label, enabled, soak = 0) {
       tokens.push(token);
       await wait(status => status.sessions.some(s => s.token === token && s.ready));
       const s = await turn(token, 'seed', i, { seed: true });
+      if (sample === 'render') {
+        await command('show_images', { token });
+        await delay(600);
+      }
       identities.set(token, { id: s.id, mode: s.mode });
-      if (displayComparison) displayViews.set(token, (await command('inspect', { token })).result);
+      if (displayIntegrity) displayViews.set(token, (await command('inspect', { token })).result);
     }
     assert.equal(requests.filter(request => request.kind === 'seed').length, count * 2);
     await phase('resident');
@@ -340,25 +387,33 @@ async function run(label, enabled, soak = 0) {
     await phase('idle');
     await command('hibernate');
     await wait(status => {
-      const dormant = displayComparison || enabled;
+      const dormant = displayComparison || warmComparison || enabled;
       return (dormant ? status.dormant === count - 3 : status.resident >= count)
         && status.transitioning === 0
-        && (!displayComparison || status.sessions.every(s => !s.history_loading)
-          && status.display_loaded === (enabled ? 3 : count));
+        && (!displayIntegrity || status.sessions.every(s => !s.history_loading)
+          && status.display_loaded === (displayComparison ? (enabled ? 3 : count) : count));
     });
     await phase('dormant');
     for (let i = 0; i < 30; i++) { await command('status'); await delay(250); }
     await phase('probe');
-    for (let i = 0; i < count; i++) {
-      await command('activate', { token: tokens[i] });
-      await delay(200);
-      if (displayComparison) {
-        await wait(status => status.sessions.find(s => s.token === tokens[i])?.history_loaded);
-        assert.deepEqual((await command('inspect', { token: tokens[i] })).result, displayViews.get(tokens[i]), 'UI display changed across reclaim');
-        displayChecks++;
+    const probeRounds = sample === 'warm' ? 8 : 1;
+    for (let round = 0; round < probeRounds; round++) {
+      for (let i = 0; i < count; i++) {
+        await command('activate', { token: tokens[i] });
+        await delay(200);
+        if (sample === 'render') {
+          await command('show_images', { token: tokens[i] });
+          await delay(600);
+        }
+        if (displayIntegrity) {
+          await wait(status => status.sessions.find(s => s.token === tokens[i])?.history_loaded);
+          assert.deepEqual((await command('inspect', { token: tokens[i] })).result, displayViews.get(tokens[i]), 'UI display changed across reclaim');
+          displayChecks++;
+        }
+        await turn(tokens[i], 'probe', i);
+        if (displayIntegrity) displayViews.set(tokens[i], (await command('inspect', { token: tokens[i] })).result);
+        if (enabled) await command('hibernate');
       }
-      await turn(tokens[i], 'probe', i);
-      if (enabled) await command('hibernate');
     }
     if (displayComparison && enabled) {
       const token = tokens[0];
@@ -513,7 +568,7 @@ async function run(label, enabled, soak = 0) {
   const dormantSamples = selected('dormant');
   const firstDormant = dormantSamples[0], lastDormant = dormantSamples.at(-1);
   const result = {
-    label, enabled, count, comparison_kind: displayComparison ? 'display' : 'kernel', activation: env.CLAUDESKTOP_HIBERNATE ?? 'default',
+    label, enabled, count, sample, comparison_kind: comparisonKind, activation: env.CLAUDESKTOP_HIBERNATE ?? 'default',
     resident: summarize('resident'), dormant: summarize('dormant'),
     dormant_cpu_one_core_percent: (lastDormant.cpu_ms - firstDormant.cpu_ms) / (lastDormant.epoch_ms - firstDormant.epoch_ms) * 100,
     dormant_read_bytes: lastDormant.read_bytes - firstDormant.read_bytes,
@@ -528,6 +583,7 @@ async function run(label, enabled, soak = 0) {
     display_wake_p95_ms: (() => { const values = [...appLog.matchAll(/display_wake total_ms=([\d.]+)/g)].map(m => Number(m[1])); return values.length ? percentile(values, 0.95) : null; })(),
   };
   await writeFile(path.join(dir, 'summary.json'), JSON.stringify(result, null, 2));
+  await writeFile(path.join(dir, 'memory-stats.json'), JSON.stringify(memoryStats, null, 2));
   console.log(JSON.stringify(result));
   return result;
 }
@@ -567,9 +623,11 @@ try {
       extra_send_to_wire_p95_ms: Math.max(...pairs.map(pair => pair.extra_send_to_wire_p95_ms)),
       extra_preflight_p95_ms: Math.max(...pairs.map(pair => pair.extra_preflight_p95_ms)),
     };
-    comparison.thresholds_passed = pairs.every(pair => pair.pb_saved_mib >= (displayComparison ? 0 : 30) && pair.ws_saved_mib >= (displayComparison ? 0 : 20) && pair.peak_ratio <= 1.1 && pair.wake_p95_ms <= 150 && pair.extra_send_to_wire_p95_ms <= 20);
+    const pbGate = displayComparison || warmComparison ? 0 : imageComparison ? 32 : 30;
+    const wsGate = displayComparison || warmComparison ? 0 : imageComparison ? 32 : 20;
+    comparison.thresholds_passed = pairs.every(pair => pair.pb_saved_mib >= pbGate && pair.ws_saved_mib >= wsGate && pair.peak_ratio <= 1.1 && pair.wake_p95_ms <= 150 && pair.extra_send_to_wire_p95_ms <= 20);
   }
-  await writeFile(path.join(output, 'summary.json'), JSON.stringify({ exe, count, rounds, soakSeconds, comparison_kind: displayComparison ? 'display' : 'kernel', runs, comparison }, null, 2));
+  await writeFile(path.join(output, 'summary.json'), JSON.stringify({ exe, count, rounds, soakSeconds, sample, comparison_kind: comparisonKind, runs, comparison }, null, 2));
   console.log(JSON.stringify({ output, comparison }));
 } catch (error) {
   await writeFile(path.join(output, 'error.txt'), error.stack);
