@@ -31,6 +31,13 @@
   `9ec9f9dc90a28b3a8dc0b16e6ef13c06eff3139f5da142d65c45b1ec28edbb03`。包内快查 `v016-package-fast-01`
   通过（4 会话、14 次请求、双层休眠、停止、清理与重启续接）；`v016-package-default-01` 也通过：
   604.174 秒自动双层休眠，随后恢复 / 运行中保护 / 停止 / 正常退出清快照 / 重启续接全部成功。
+- **v0.16.0 GitHub 构建**：master CI `43759000764` 通过（含 `-D warnings` Clippy 和 workspace 测试），tag 构建
+  `43759466703` 通过，Release 保持草稿。下载 exe 的 SHA256 为
+  `59ba57e093ad60a1dcb2fd9e39fae3a030ea465bb7e60536190b0efdc130cee9`，ZIP 为
+  `affa841d6db4dec627211c3aec1522fd01d3f2467be22d45c7a0c0b4a7877295`；与本地构建不同是工具链差异，
+  但 ZIP 内外和 `SHA256SUMS.txt` 一致。`v016-github-fast-01` 通过（4 会话、14 次请求、双层休眠、
+  停止、清理与重启续接）；`v016-github-default-01` 也通过：603.027 秒自动双层休眠，
+  随后恢复 / 运行中保护 / 停止 / 正常退出清快照 / 重启续接全部成功，`dist/` 已同步为下载产物。
 
 - **正式包也要用同一份 exe 验收**：`CLAUDESKTOP_HEADLESS=1` 隐藏窗口、每 250ms 离屏绘制；不用截图 feature 或文件控制入口。
   本机把 GUI 放到 `CreateDesktop` 新建桌面时，进程在 `main` 前以 `0xc0000142` 退出，不能拿它判断业务启动失败；
