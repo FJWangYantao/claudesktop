@@ -296,11 +296,13 @@ async function run(label, enabled, soak = 0) {
     await writeFile(path.join(dir, 'phase.txt'), name);
     phases.push({ phase: name, epoch_ms: Date.now() });
     if (sample === 'render') await command('reclaim_images');
+    if (sample === 'warm') await command('reclaim_warm');
     const status = await command('status');
     memoryStats.push({
       phase: name, epoch_ms: Date.now(), display_bytes: status.display_bytes,
       display_categories: status.display_categories, assets: status.assets,
       math_cache: status.math_cache, decoded_cache: status.decoded_cache,
+      warm_blocks: status.warm_blocks,
     });
     await writeFile(path.join(dir, 'memory-stats.json'), JSON.stringify(memoryStats, null, 2));
     console.log(`${label}: ${name}`);
@@ -313,6 +315,7 @@ async function run(label, enabled, soak = 0) {
       for (const s of status.sessions) {
         assert.equal(s.failures.length, 0, JSON.stringify(s));
         assert(!s.history_error, JSON.stringify(s));
+        assert(!s.blocks_error, JSON.stringify(s));
       }
       if (predicate(status)) return status;
       await delay(50);
@@ -483,6 +486,33 @@ async function run(label, enabled, soak = 0) {
       assert.equal(recovered.sessions.find(s => s.token === token).id, identities.get(token).id);
       assert.equal(requests.filter(r => r.text === tag).length, 1, 'UI retry duplicated the queued prompt');
     }
+    if (warmComparison && enabled && mode === 'smoke') {
+      const token = tokens[0];
+      await command('reclaim_warm');
+      const cached = await command('status');
+      assert(cached.sessions.find(s => s.token === token).external_blocks > 0, 'warm text was not externalized');
+      const blockDir = path.join(dataDir, 'display-cache', 'blocks', `${app.pid}-${token}`);
+      const blockName = (await readdir(blockDir)).find(name => name.endsWith('.txt'));
+      assert(blockName, 'warm block file not found');
+      const blockPath = path.join(blockDir, blockName);
+      const original = await readFile(blockPath);
+      await writeFile(blockPath, 'corrupted');
+      await command('activate', { token });
+      const failure = (await command('status')).sessions.find(s => s.token === token);
+      assert(failure.blocks_error && failure.external_blocks > 0, 'corrupt warm block was silently accepted');
+      const tag = `bench:after_warm_retry:0:${++operation}`;
+      await command('send', { token, text: tag });
+      await delay(200);
+      assert.equal(requests.filter(r => r.text === tag).length, 0, 'corrupt warm block allowed a send');
+      assert.equal((await command('status')).sessions.find(s => s.token === token).queued, 1);
+      await writeFile(blockPath, original);
+      await command('activate', { token });
+      await wait(status => {
+        const s = status.sessions.find(s => s.token === token);
+        return !s.busy && s.queued === 0 && s.external_blocks === 0;
+      });
+      assert.equal(requests.filter(r => r.text === tag).length, 1, 'warm retry duplicated the queued prompt');
+    }
     if (soak > 0 || mode === 'smoke') {
       await phase('mixed');
       const mixedStart = Date.now();
@@ -598,6 +628,7 @@ async function run(label, enabled, soak = 0) {
     probe_preflight_p95_ms: percentile(preflight.slice(count, count * 2).map(row => row.preflight_ms), 0.95),
     wake_p95_ms: wake.length ? percentile(wake, 0.95) : null, wake_count: wake.length, strictChecks, displayChecks,
     display_wake_p95_ms: (() => { const values = [...appLog.matchAll(/display_wake total_ms=([\d.]+)/g)].map(m => Number(m[1])); return values.length ? percentile(values, 0.95) : null; })(),
+    warm_wake_p95_ms: (() => { const values = [...appLog.matchAll(/warm_wake entries=\d+ total_ms=([\d.]+)/g)].map(m => Number(m[1])); return values.length ? percentile(values, 0.95) : null; })(),
   };
   await writeFile(path.join(dir, 'summary.json'), JSON.stringify(result, null, 2));
   await writeFile(path.join(dir, 'memory-stats.json'), JSON.stringify(memoryStats, null, 2));
@@ -627,6 +658,7 @@ try {
         ws_saved_mib: (disabled.dormant.ws - enabled.dormant.ws) / 1048576,
         peak_ratio: enabled.peak_pb / disabled.peak_pb,
         wake_p95_ms: enabled.wake_p95_ms,
+        warm_wake_p95_ms: enabled.warm_wake_p95_ms,
         extra_send_to_wire_p95_ms: enabled.send_to_wire_p95_ms - disabled.send_to_wire_p95_ms,
         extra_preflight_p95_ms: enabled.probe_preflight_p95_ms - disabled.probe_preflight_p95_ms,
       };
@@ -637,12 +669,13 @@ try {
       tree_pb_saved_mib: difference('tree_pb'), tree_ws_saved_mib: difference('tree_ws'),
       peak_ratio: Math.max(...pairs.map(pair => pair.peak_ratio)),
       wake_p95_ms: Math.max(...pairs.map(pair => pair.wake_p95_ms)),
+      warm_wake_p95_ms: Math.max(...pairs.map(pair => pair.warm_wake_p95_ms ?? 0)),
       extra_send_to_wire_p95_ms: Math.max(...pairs.map(pair => pair.extra_send_to_wire_p95_ms)),
       extra_preflight_p95_ms: Math.max(...pairs.map(pair => pair.extra_preflight_p95_ms)),
     };
     const pbGate = displayComparison || warmComparison || mathComparison ? 0 : imageComparison ? 32 : 30;
     const wsGate = displayComparison || warmComparison || mathComparison ? 0 : imageComparison ? 32 : 20;
-    comparison.thresholds_passed = pairs.every(pair => pair.pb_saved_mib >= pbGate && pair.ws_saved_mib >= wsGate && pair.peak_ratio <= 1.1 && pair.wake_p95_ms <= 150 && pair.extra_send_to_wire_p95_ms <= 20);
+    comparison.thresholds_passed = pairs.every(pair => pair.pb_saved_mib >= pbGate && pair.ws_saved_mib >= wsGate && pair.peak_ratio <= 1.1 && pair.wake_p95_ms <= 150 && (pair.warm_wake_p95_ms ?? 0) <= 150 && pair.extra_send_to_wire_p95_ms <= 20);
   }
   await writeFile(path.join(output, 'summary.json'), JSON.stringify({ exe, off_exe: args['off-exe'] ? path.resolve(args['off-exe']) : null, count, rounds, soakSeconds, sample, comparison_kind: comparisonKind, runs, comparison }, null, 2));
   console.log(JSON.stringify({ output, comparison }));

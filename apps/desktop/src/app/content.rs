@@ -179,6 +179,17 @@ impl ChatApp {
             return v_flex().size_full().child(self.render_settings(window, cx)).into_any_element();
         }
         let active = self.active;
+        if let Some(message) = self.sessions[active].blocks_error.clone() {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .child(message)
+                .into_any_element();
+        }
         if !self.sessions[active].history_loaded {
             let message = self.sessions[active]
                 .history_error

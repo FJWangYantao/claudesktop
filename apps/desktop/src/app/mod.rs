@@ -472,6 +472,7 @@ impl ChatApp {
                         }
                         app.reclaim_idle_sessions(cx);
                         app.image_cache.update(cx, |cache, cx| cache.reclaim(cx));
+                        app.reclaim_warm_blocks();
                         if std::env::var("CLAUDESKTOP_MEM_REPORT").is_ok() {
                             app.mem_report();
                         }
@@ -924,6 +925,12 @@ impl ChatApp {
         {
             return;
         }
+        if self.sessions[idx].has_external_blocks()
+            && self.sessions[idx].restore_all_blocks().is_err()
+        {
+            cx.notify();
+            return;
+        }
         let Ok(root) = claudesktop_core::default_data_dir() else { return };
         let token = self.sessions[idx].token;
         let snapshot =
@@ -1018,6 +1025,25 @@ impl ChatApp {
         }
     }
 
+    fn reclaim_warm_blocks(&mut self) {
+        if std::env::var_os("CLAUDESKTOP_DISABLE_WARM_RECLAIM").is_some() {
+            return;
+        }
+        let mut reclaimed = 0;
+        for idx in 0..self.sessions.len() {
+            if idx == self.active || !self.sessions[idx].display_evictable() {
+                continue;
+            }
+            match self.sessions[idx].externalize_completed() {
+                Ok(count) => reclaimed += count,
+                Err(error) => eprintln!("[mem] warm_blocks error={error}"),
+            }
+        }
+        if reclaimed > 0 && std::env::var("CLAUDESKTOP_MEM_REPORT").is_ok() {
+            eprintln!("[mem] warm_blocks externalized={reclaimed}");
+        }
+    }
+
     /// 各类缓存现状一行（`CLAUDESKTOP_MEM_REPORT=1` 时每 30 秒随回收周期打）。
     fn mem_report(&self) {
         let loaded = self.sessions.iter().filter(|s| s.history_loaded).count();
@@ -1029,6 +1055,15 @@ impl ChatApp {
         let stats = crate::assets::registry_stats();
         let math = claudesktop_core::math::cache_stats();
         let images = image_cache::image_cache_stats();
+        let warm = self.sessions.iter().fold(
+            crate::session::blocks::BlockStats::default(),
+            |mut total, session| {
+                let stats = session.block_stats();
+                total.entries += stats.entries;
+                total.bytes += stats.bytes;
+                total
+            },
+        );
         let history = self.kernels.iter().filter_map(|(_, slot)| slot.kernel.as_ref()).fold(
             claudesktop_core::KernelHistoryStats::default(),
             |mut total, kernel| {
@@ -1096,6 +1131,7 @@ impl ChatApp {
             images.first_draw_ms_total,
             images.first_draw_ms_max,
         );
+        eprintln!("[mem] warm_blocks entries={} bytes={}", warm.entries, warm.bytes);
     }
 
     /// 停掉一条后台命令（顶栏的小标点的）。
@@ -1616,6 +1652,22 @@ impl ChatApp {
     /// 但窗口大小可能还没缓存过，顺带悄悄探测一次（见 [`Self::probe_context_window`]）。
     pub(crate) fn activate_session(&mut self, i: usize, cx: &mut Context<Self>) {
         self.active = i;
+        let mut restored_blocks = false;
+        if self.sessions[i].has_external_blocks() || self.sessions[i].blocks_error.is_some() {
+            let started = Instant::now();
+            match self.sessions[i].restore_all_blocks() {
+                Ok(count) => {
+                    restored_blocks = count > 0;
+                    if count > 0 {
+                        eprintln!(
+                            "[perf] warm_wake entries={count} total_ms={:.3}",
+                            started.elapsed().as_secs_f64() * 1000.
+                        );
+                    }
+                }
+                Err(error) => eprintln!("[perf] warm_wake error={error}"),
+            }
+        }
         self.settings_open = false;
         self.sessions[i].touch();
         // 从搜索结果、系统通知点进别的空间的会话时自动切过去（空间本来就是它那个）
@@ -1647,6 +1699,9 @@ impl ChatApp {
             self.probe_context_window(i, cx);
             self.settle_undo();
             self.reveal_pending_turn(i);
+        }
+        if restored_blocks {
+            self.dispatch_queued(i, cx);
         }
         cx.notify();
     }
@@ -2537,7 +2592,10 @@ impl ChatApp {
         if self.sessions[idx].busy || self.sessions[idx].kernel_rewinding {
             return false;
         }
-        if !self.sessions[idx].history_loaded {
+        let blocks_failed = (self.sessions[idx].has_external_blocks()
+            || self.sessions[idx].blocks_error.is_some())
+            && self.sessions[idx].restore_all_blocks().is_err();
+        if !self.sessions[idx].history_loaded || blocks_failed {
             let queued = match QueuedPrompt::from_prompt(prompt) {
                 Ok(queued) => queued,
                 Err(error) => {

@@ -20,6 +20,7 @@ impl ChatApp {
             }
             "hibernate" => self.hibernate_idle_sessions(cx),
             "reclaim_images" => self.image_cache.update(cx, |cache, cx| cache.reclaim(cx)),
+            "reclaim_warm" => self.reclaim_warm_blocks(),
             "quit" => {
                 for (_, slot) in &self.kernels {
                     if let Some(kernel) = &slot.kernel {
@@ -142,6 +143,7 @@ impl ChatApp {
                 "restored": s.restored, "mode": s.permission_mode,
                 "history_loaded": s.history_loaded, "history_loading": s.history_loading,
                 "history_error": s.history_error, "display_cached": s.display_snapshot.is_some(),
+                "blocks_error": s.blocks_error, "external_blocks": s.block_stats().entries,
                 "queued": s.queued.len(), "thinking": s.thinking,
                 "users": s.user_message_count(),
                 "agents": s.transcript.iter().filter(|item| matches!(item, ChatItem::Agent(_))).count(),
@@ -170,6 +172,15 @@ impl ChatApp {
         let assets = crate::assets::registry_stats();
         let math = claudesktop_core::math::cache_stats();
         let decoded = super::image_cache::image_cache_stats();
+        let warm = self.sessions.iter().fold(
+            crate::session::blocks::BlockStats::default(),
+            |mut total, session| {
+                let stats = session.block_stats();
+                total.entries += stats.entries;
+                total.bytes += stats.bytes;
+                total
+            },
+        );
         Ok(json!({
             "result": result, "sessions": sessions, "tasks": tasks, "snapshots": snapshots,
             "display_loaded": self.sessions.iter().filter(|s| s.history_loaded && s.acp_id.is_some() && s.has_user_message()).count(),
@@ -191,6 +202,7 @@ impl ChatApp {
                 "entries": math.entries, "bytes": math.bytes, "budget": math.budget,
                 "hits": math.hits, "misses": math.misses, "evictions": math.evictions,
             },
+            "warm_blocks": { "entries": warm.entries, "bytes": warm.bytes },
             "decoded_cache": {
                 "entries": decoded.entries, "loading": decoded.loading,
                 "bytes": decoded.decoded_bytes, "unpinned_bytes": decoded.unpinned_bytes,

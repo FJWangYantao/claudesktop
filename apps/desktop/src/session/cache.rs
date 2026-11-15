@@ -88,6 +88,7 @@ impl Session {
     }
 
     pub fn take_display(&mut self, snapshot: Arc<DisplaySnapshot>) -> DisplayData {
+        debug_assert!(!self.has_external_blocks());
         self.flush_stream();
         self.cached_user_count = self.user_message_count();
         self.display_scroll = Some((self.list.logical_scroll_top(), self.list.is_following_tail()));
@@ -114,6 +115,7 @@ impl Session {
         self.history_loaded = true;
         self.history_loading = false;
         self.history_error = None;
+        self.blocks_error = None;
     }
 }
 

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub(crate) mod blocks;
 pub(crate) mod cache;
 
 /// 内核没上报模型时显示的模型名（统计时当作「未知模型」）
@@ -87,6 +88,8 @@ pub struct Session {
     pub history_loading: bool,
     pub history_error: Option<String>,
     pub(crate) display_snapshot: Option<Arc<cache::DisplaySnapshot>>,
+    pub(crate) blocks: blocks::BlockCache,
+    pub blocks_error: Option<String>,
     display_scroll: Option<(ListOffset, bool)>,
     cached_user_count: usize,
     pub(crate) deferred_events: Vec<(String, claudesktop_core::RoutedEvent)>,
@@ -413,6 +416,8 @@ impl Session {
             history_loading: false,
             history_error: None,
             display_snapshot: None,
+            blocks: blocks::BlockCache::new(token),
+            blocks_error: None,
             display_scroll: None,
             cached_user_count: 0,
             deferred_events: Vec::new(),

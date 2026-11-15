@@ -369,6 +369,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   保存期间切回或发送先等写完再读取；加载期间的消息排队、迟到事件缓存在会话里，恢复后按序处理。`CLAUDESKTOP_DISABLE_DISPLAY_RECLAIM=1` 仅关闭这层回收，便于 A/B。
   读取失败保留快照且明确报错，不自动降级。`history_stats` 只给估算值，真实内存仍用进程工具测；
   性能日志是 `[perf] session_hibernate` / `session_wake`，`[mem]` 另有 resident / dormant 数。完整桌面 3 轮 A/B 与 30 分钟混合验收已过，数据见 HANDOFF.md。
+- **渲染与温会话缓存**：远程 / 工具图片按内容哈希共用 `assets` 原始字节（24 MiB LRU），`ToolImage` 只存资源名；
+  `app/image_cache.rs` 按全部解码帧字节限制非钉住部分 64 MiB，渲染引用和加载中项钉住，淘汰逐窗口 `drop_image`，开关
+  `CLAUDESKTOP_DISABLE_IMAGE_RECLAIM`。公式节点只存哈希 / 尺寸 / 源码，`core::math` 按实际字节 4 MiB LRU，
+  开关 `CLAUDESKTOP_DISABLE_MATH_RECLAIM`。非活动且空闲会话的单项 256 KiB 以上回复 / 思考 / 启动信息 / diff /
+  文本附件由 `session/blocks.rs` 外置，预览 4 KiB；激活先校验恢复、发送兜底、冷休眠先还原成原快照，
+  读失败保留块与错误并留队，开关 `CLAUDESKTOP_DISABLE_WARM_RECLAIM`。压测 `tools/hibernate-bench.mjs`
+  有 `--sample=render|math|warm` 和对应 `--compare=image|math|warm`，原始结果与每阶段分类账都存 `.claudesktop/bench/`。
 - 流式文本合批上屏（`Session::stream_pending` / `STREAM_FLUSH`）：chunk 先进缓冲，短消息每 50ms 并进正文一次，
   间隔随消息长度爬坡到 250ms（`stream_flush_interval`，8KB 起爬、64KB 封顶）——每次并进是整篇重解析，长消息砍刷新率省解析；
   没并进的 chunk 不重画（`on_kernel_event` 的 `skip_notify`）。`flush_stream` 不分思考 / 正文一次全并，
