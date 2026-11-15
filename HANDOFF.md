@@ -19,6 +19,19 @@
   快查仅把 idle 阈值缩到 2 秒，仍走生产的 30 秒回收定时器。下载包不设休眠开关和 idle 阈值的完整验收也已通过：601.028 秒后自动休眠，随后恢复 / 运行中保护 / 停止 / 正常退出清快照 / 重启续接全部成功。
   下载包 SHA256 为 `8be90fc5cf8c7a15e38082a30444a34f1f45d5a77ef7baedf984475b6a99e948`；空数据首帧 485.62ms，4 会话重启首帧 303.73ms（本机快查，非冷缓存 A/B）。
   原始记录在 `.claudesktop/bench/release-local-07/`、`release-github-fast-02/` 和 `release-github-default-01/`。
+- **v0.16.0 发布候选**：`48026aa` 保留设置未保存草稿，`13ab5d1` 统一「自己说」提示；真实无头检查覆盖
+  修改 → 关闭 → 重进保留 → 手动重开丢弃，截图 `.claudesktop/bench/settings-drafts-03.png`。注意重进走
+  `open_settings`，不是同分类的 `select_settings_tab`。
+- **工具图片资源表测试要共隔离锁**：`assets::tests::isolated` 会清空进程级资源表，并行显示快照测试若不持同一把锁，
+  会偶发 `工具图片资源读取失败`。`7b4c7ee` 已统一隔离，随后 workspace 623 项测试、fmt、Clippy、普通构建和
+  `release-clean-fast-01` 全部通过。干净 worktree 内 `target/` 仍会踩已知 `ring/cc-rs` 问题，按旧约定用 `D:/t3`；
+  D 盘曾只剩 9 MiB，只清理了 24 GiB 可重建 debug 产物，未动原始验收数据。
+- **v0.16.0 包**：`384a887` 更新 workspace 与 lock 版本。包内 exe / README / LICENSE 三文件正确，构建 exe 与包内 exe
+  SHA256 同为 `1f3925b142f8d9e3299f7e1fa699c629988573ec1e30293fb6c272f0393bc6a7`，ZIP 为
+  `9ec9f9dc90a28b3a8dc0b16e6ef13c06eff3139f5da142d65c45b1ec28edbb03`。包内快查 `v016-package-fast-01`
+  通过（4 会话、14 次请求、双层休眠、停止、清理与重启续接）；`v016-package-default-01` 也通过：
+  604.174 秒自动双层休眠，随后恢复 / 运行中保护 / 停止 / 正常退出清快照 / 重启续接全部成功。
+
 - **正式包也要用同一份 exe 验收**：`CLAUDESKTOP_HEADLESS=1` 隐藏窗口、每 250ms 离屏绘制；不用截图 feature 或文件控制入口。
   本机把 GUI 放到 `CreateDesktop` 新建桌面时，进程在 `main` 前以 `0xc0000142` 退出，不能拿它判断业务启动失败；
   验收走隐藏窗口、隔离数据目录和回环模拟端点，按自己创建的 PID 发送窗口消息，不切前台、不移动用户鼠标。
