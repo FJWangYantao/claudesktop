@@ -1056,7 +1056,7 @@ impl ChatApp {
             stats.spilled
         );
         eprintln!(
-            "[mem] display agent={} thinking={} info={} diffs={} attachments={} tool_images={} other={} math_cache={} math_entries={} math_hits={} math_misses={} math_evictions={} raw_math={} raw_math_entries={} raw_images={} raw_image_entries={} asset_spilled={} asset_spilled_bytes={} asset_loads={} asset_memory_hits={} asset_disk_hits={} asset_misses={}",
+            "[mem] display agent={} thinking={} info={} diffs={} attachments={} tool_images={} other={} math_cache={} math_budget={} math_entries={} math_hits={} math_misses={} math_evictions={} raw_math={} raw_math_entries={} raw_images={} raw_image_entries={} asset_spilled={} asset_spilled_bytes={} asset_loads={} asset_memory_hits={} asset_disk_hits={} asset_misses={}",
             display.agent,
             display.thinking,
             display.info,
@@ -1065,6 +1065,7 @@ impl ChatApp {
             display.tool_images,
             display.other,
             math.bytes,
+            math.budget,
             math.entries,
             math.hits,
             math.misses,

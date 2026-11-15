@@ -20,13 +20,14 @@ const count = Number(args.sessions || (sample === 'warm' ? 3 : 50));
 const rounds = Number(args.rounds || 3);
 const soakSeconds = Number(args.soak || 1800);
 const mode = args.mode || 'all';
-const comparisonKind = ['display', 'image', 'warm'].includes(args.compare) ? args.compare : 'kernel';
+const comparisonKind = ['display', 'image', 'math', 'warm'].includes(args.compare) ? args.compare : 'kernel';
 const displayComparison = comparisonKind === 'display';
 const imageComparison = comparisonKind === 'image';
+const mathComparison = comparisonKind === 'math';
 const warmComparison = comparisonKind === 'warm';
 const displayIntegrity = displayComparison || warmComparison;
 const output = path.resolve(args.out || path.join(root, '.claudesktop', 'bench', new Date().toISOString().replace(/[:.]/g, '-')));
-assert(['history', 'render', 'warm'].includes(sample));
+assert(['history', 'render', 'math', 'warm'].includes(sample));
 assert(Number.isInteger(count) && (sample === 'warm' ? count === 3 : count >= 4 && count <= 200));
 assert(Number.isInteger(rounds) && rounds >= 1);
 assert(Number.isFinite(soakSeconds) && soakSeconds >= 0);
@@ -66,7 +67,7 @@ const warmReply = session => {
   }
   return paragraphs.join('');
 };
-const replyFor = session => sample === 'render' ? renderReply(session) : sample === 'warm' ? warmReply(session) : reply;
+const replyFor = session => ['render', 'math'].includes(sample) ? renderReply(session) : sample === 'warm' ? warmReply(session) : reply;
 
 function png(seed = 1234567, width = 384, height = 768) {
   const crc = buffer => {
@@ -256,13 +257,18 @@ async function run(label, enabled, soak = 0) {
     env.CLAUDESKTOP_HIBERNATE = '1';
     if (!enabled) env.CLAUDESKTOP_DISABLE_IMAGE_RECLAIM = '1';
   }
+  if (mathComparison) {
+    env.CLAUDESKTOP_HIBERNATE = '1';
+    if (!enabled) env.CLAUDESKTOP_DISABLE_MATH_RECLAIM = '1';
+  }
   if (warmComparison) {
     env.CLAUDESKTOP_HIBERNATE = '1';
     delete env.CLAUDESKTOP_DISABLE_RECLAIM;
     if (!enabled) env.CLAUDESKTOP_DISABLE_WARM_RECLAIM = '1';
   }
   const stderr = createWriteStream(path.join(dir, 'app.log'));
-  const app = spawn(exe, [], { cwd: workspace, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const program = !enabled && args['off-exe'] ? path.resolve(args['off-exe']) : exe;
+  const app = spawn(program, [], { cwd: workspace, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   app.stdout.pipe(stderr); app.stderr.pipe(stderr);
   let appExit;
   const appClosed = new Promise(resolve => app.once('exit', (code, signal) => { appExit = { code, signal }; resolve(appExit); }));
@@ -326,7 +332,8 @@ async function run(label, enabled, soak = 0) {
     const seedImage = sample === 'render'
       ? { media_type: 'image/png', data: png(1234567 + session, 512, 1024).toString('base64') }
       : image;
-    const sent = await command('send', { token, text: tag, ...(seed ? { images: [seedImage] } : {}) });
+    const seedImages = sample === 'math' ? [] : [seedImage];
+    const sent = await command('send', { token, text: tag, ...(seed ? { images: seedImages } : {}) });
     if (cancel) {
       await wait(() => requests.some(request => request.text === tag));
       await delay(200);
@@ -392,7 +399,7 @@ async function run(label, enabled, soak = 0) {
     await phase('idle');
     await command('hibernate');
     await wait(status => {
-      const dormant = displayComparison || warmComparison || imageComparison || enabled;
+      const dormant = displayComparison || warmComparison || imageComparison || mathComparison || enabled;
       return (dormant ? status.dormant === count - 3 : status.resident >= count)
         && status.transitioning === 0
         && (!displayIntegrity || status.sessions.every(s => !s.history_loading)
@@ -578,7 +585,7 @@ async function run(label, enabled, soak = 0) {
   const dormantSamples = selected('dormant');
   const firstDormant = dormantSamples[0], lastDormant = dormantSamples.at(-1);
   const result = {
-    label, enabled, count, sample, comparison_kind: comparisonKind, activation: env.CLAUDESKTOP_HIBERNATE ?? 'default',
+    label, enabled, count, sample, exe: program, comparison_kind: comparisonKind, activation: env.CLAUDESKTOP_HIBERNATE ?? 'default',
     resident: summarize('resident'), dormant: summarize('dormant'),
     dormant_cpu_one_core_percent: (lastDormant.cpu_ms - firstDormant.cpu_ms) / (lastDormant.epoch_ms - firstDormant.epoch_ms) * 100,
     dormant_read_bytes: lastDormant.read_bytes - firstDormant.read_bytes,
@@ -633,11 +640,11 @@ try {
       extra_send_to_wire_p95_ms: Math.max(...pairs.map(pair => pair.extra_send_to_wire_p95_ms)),
       extra_preflight_p95_ms: Math.max(...pairs.map(pair => pair.extra_preflight_p95_ms)),
     };
-    const pbGate = displayComparison || warmComparison ? 0 : imageComparison ? 32 : 30;
-    const wsGate = displayComparison || warmComparison ? 0 : imageComparison ? 32 : 20;
+    const pbGate = displayComparison || warmComparison || mathComparison ? 0 : imageComparison ? 32 : 30;
+    const wsGate = displayComparison || warmComparison || mathComparison ? 0 : imageComparison ? 32 : 20;
     comparison.thresholds_passed = pairs.every(pair => pair.pb_saved_mib >= pbGate && pair.ws_saved_mib >= wsGate && pair.peak_ratio <= 1.1 && pair.wake_p95_ms <= 150 && pair.extra_send_to_wire_p95_ms <= 20);
   }
-  await writeFile(path.join(output, 'summary.json'), JSON.stringify({ exe, count, rounds, soakSeconds, sample, comparison_kind: comparisonKind, runs, comparison }, null, 2));
+  await writeFile(path.join(output, 'summary.json'), JSON.stringify({ exe, off_exe: args['off-exe'] ? path.resolve(args['off-exe']) : null, count, rounds, soakSeconds, sample, comparison_kind: comparisonKind, runs, comparison }, null, 2));
   console.log(JSON.stringify({ output, comparison }));
 } catch (error) {
   await writeFile(path.join(output, 'error.txt'), error.stack);

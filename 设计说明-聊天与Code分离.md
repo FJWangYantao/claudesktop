@@ -314,8 +314,9 @@ gpui-kit 的 Markdown（`gpui-base` 的 `text/format/markdown.rs`）**已经把�
 
 1. **解析与排版在 `MarkdownPlugin::parse` 里做**（gpui-kit 在后台线程解析 Markdown，不占 render）：
    `ratex_parser::parse` → `ratex_layout::layout` → `to_display_list`，再用 `ratex_svg::render_to_svg`（`embed_glyphs: true`，
-   字形转成路径，不依赖系统字体）生成 SVG。结果连同宽 / 高 / 深（em）放进 `MarkdownNode` 的 data。
-   按「源码 + 行内 / 块」缓存（全局 LRU，512 条）：流式输出时整段回复每来一块就重新解析一次，前面的公式不重排。
+   字形转成路径，不依赖系统字体）生成 SVG。`MarkdownNode` 只存内容哈希、宽 / 高 / 深（em）和源码，不再另持一份 SVG。
+   按「源码 + 行内 / 块」保留近期排版结果（全局 LRU，实际堆字节 4 MiB）：流式输出时整段回复每来一块就重新解析一次，
+   前面的公式不重排；单条超过预算的不入缓存，`CLAUDESKTOP_DISABLE_MATH_RECLAIM=1` 可做回收对照。
 2. **渲染**：SVG 以 `math/<哈希>.svg` 的名字登记进我们自己的 `AssetSource`（新的 `Assets` 包一层 gpui-kit 的 `AllAssets`，
    `math/` 前缀从内存表里取，其余照旧转发），然后就是一个 `svg().path(..)`：
    - gpui 画 SVG 是**单色蒙版 + 着色**（图标就是这么画的），颜色在画的时候给——跟着 `INK` 和外观、配色走，换主题不用重新生成；

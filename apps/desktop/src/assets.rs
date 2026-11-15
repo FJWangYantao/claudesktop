@@ -220,11 +220,6 @@ fn insert(name: String, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-/// 一份公式 SVG 的资源名。
-pub fn math_name(svg: &str) -> String {
-    format!("{MATH_PREFIX}{}", crate::app::math::hash_of(svg))
-}
-
 /// 资源源：内核和服务商标志查静态表，公式和图片查登记表（内存 → 磁盘缓存），其余转发给 gpui-kit。
 pub struct Assets;
 
@@ -395,7 +390,7 @@ mod tests {
     fn registered_math_svgs_load_by_name() {
         let (_guard, _dir) = isolated();
         let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M0 0h1\"/></svg>";
-        let name = math_name(svg);
+        let name = format!("{MATH_PREFIX}{}", crate::app::math::hash_of(svg));
         assert!(name.starts_with(MATH_PREFIX));
         // 登记之前取不到（画的时候就是空白，不 panic）
         assert!(Assets.load(&name).unwrap().is_none());
@@ -403,7 +398,7 @@ mod tests {
         assert_eq!(&*Assets.load(&name).unwrap().unwrap(), svg.as_bytes());
         // 同一份内容登记一次就够，名字不变
         register_math(svg);
-        assert_eq!(name, math_name(svg));
+        assert_eq!(name, format!("{MATH_PREFIX}{}", crate::app::math::hash_of(svg)));
     }
 
     #[core::prelude::v1::test]

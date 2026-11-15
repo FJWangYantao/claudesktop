@@ -188,8 +188,8 @@ impl ChatApp {
                 "disk_hits": assets.disk_hits, "misses": assets.misses,
             },
             "math_cache": {
-                "entries": math.entries, "bytes": math.bytes, "hits": math.hits,
-                "misses": math.misses, "evictions": math.evictions,
+                "entries": math.entries, "bytes": math.bytes, "budget": math.budget,
+                "hits": math.hits, "misses": math.misses, "evictions": math.evictions,
             },
             "decoded_cache": {
                 "entries": decoded.entries, "loading": decoded.loading,

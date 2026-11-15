@@ -1,7 +1,7 @@
 //! 公式的 Markdown 插件（见「设计说明-聊天与Code分离.md」第六章）。
 //!
 //! 排版在 `MarkdownPlugin::parse` 里做（gpui-kit 在后台线程解析 Markdown，不占 render），
-//! 结果（自包含 SVG + 宽高深）放进 `MarkdownNode`，画的时候只是贴图。
+//! SVG 留在排版缓存和资源表；`MarkdownNode` 只放内容哈希、宽高深和源码，画的时候贴图。
 //! 颜色不写死：gpui 画 SVG 是单色蒙版 + 着色，跟着 `INK`、外观和配色走。
 //!
 //! 认领规则：行内公式按 Pandoc（`$5 和 $10` 不认领，交回普通文字）；语法错的、
@@ -29,7 +29,11 @@ const BLOCK_SCALE: f32 = 1.15;
 /// 排版好的公式（放进 `MarkdownNode` 的数据里）。
 #[derive(Clone, PartialEq)]
 pub struct Formula {
-    pub typeset: Typeset,
+    /// `math/<哈希>.svg` 的名字；SVG 全文只在排版缓存和资源表里
+    pub hash: String,
+    pub width: f64,
+    pub height: f64,
+    pub depth: f64,
     /// 源码（复制、悬停提示都用它）
     pub source: String,
 }
@@ -111,20 +115,30 @@ fn claimed(name: &str, typeset: Typeset, source: &str) -> Option<MarkdownNode> {
     if typeset.width <= 0. || typeset.total_height() <= 0. {
         return None;
     }
+    let hash = hash_of(&typeset.svg);
     crate::assets::register_math(&typeset.svg);
     Some(
-        MarkdownNode::new(name, Formula { typeset, source: source.to_string() })
-            .text(source.to_string())
-            .markdown(source.to_string()),
+        MarkdownNode::new(
+            name,
+            Formula {
+                hash,
+                width: typeset.width,
+                height: typeset.height,
+                depth: typeset.depth,
+                source: source.to_string(),
+            },
+        )
+        .text(source.to_string())
+        .markdown(source.to_string()),
     )
 }
 
 /// 行内公式：按基线对齐的 SVG，宽高跟着正文字号换算。
 fn inline_formula(formula: &Formula, context: &InlineRenderContext) -> InlineElement {
     let em = f32::from(context.font_size()) * INLINE_SCALE;
-    let width = px(em * formula.typeset.width as f32);
-    let height = px(em * formula.typeset.total_height() as f32);
-    let baseline = px(em * formula.typeset.height as f32);
+    let width = px(em * formula.width as f32);
+    let height = px(em * (formula.height + formula.depth) as f32);
+    let baseline = px(em * formula.height as f32);
     let element = svg()
         .path(math_path(formula))
         .w(width)
@@ -138,8 +152,8 @@ fn inline_formula(formula: &Formula, context: &InlineRenderContext) -> InlineEle
 fn block_formula(formula: &Formula) -> AnyElement {
     let em =
         f32::from(crate::theme::TEXT_LARGE.to_pixels(crate::theme::root_font_size())) * BLOCK_SCALE;
-    let width = px(em * formula.typeset.width as f32);
-    let height = px(em * formula.typeset.total_height() as f32);
+    let width = px(em * formula.width as f32);
+    let height = px(em * (formula.height + formula.depth) as f32);
     let source = formula.source.clone();
     let svg_el = svg().path(math_path(formula)).w(width).h(height);
     div()
@@ -151,7 +165,7 @@ fn block_formula(formula: &Formula) -> AnyElement {
         .items_center()
         .child(
             div()
-                .id(ElementId::Name(format!("math-block-{}", hash_of(&formula.typeset.svg)).into()))
+                .id(ElementId::Name(format!("math-block-{}", formula.hash).into()))
                 .w_full()
                 .min_w_0()
                 .overflow_x_scroll()
@@ -171,7 +185,7 @@ fn block_formula(formula: &Formula) -> AnyElement {
 
 /// 资源名：`math/<内容哈希>.svg`（和 `assets::register_math` 同一个名字）。
 fn math_path(formula: &Formula) -> String {
-    crate::assets::math_name(&formula.typeset.svg)
+    format!("{}{}", crate::assets::MATH_PREFIX, formula.hash)
 }
 
 /// 内容 → 名字的后半截（资源名和元素 id 共用）。
@@ -190,5 +204,22 @@ pub fn extensions() -> MarkdownExtensions {
         .plugin(InlineMath)
         .plugin(BlockMath)
         .plugin(super::remote_image::RemoteImagePlugin)
-        .parser_revision(2)
+        .parser_revision(3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn formula_node_keeps_hash_dimensions_and_source() {
+        let typeset = math::typeset("\\frac{1}{2}", true).unwrap();
+        let (width, height, depth) = (typeset.width, typeset.height, typeset.depth);
+        let node = claimed(BLOCK_MATH, typeset, "$$\\frac{1}{2}$$").unwrap();
+        let formula = node.data::<Formula>().unwrap();
+        assert_eq!((formula.width, formula.height, formula.depth), (width, height, depth));
+        assert_eq!(formula.source, "$$\\frac{1}{2}$$");
+        assert!(math_path(formula).starts_with(crate::assets::MATH_PREFIX));
+        assert!(math_path(formula).ends_with(".svg"));
+    }
 }

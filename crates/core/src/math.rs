@@ -16,9 +16,10 @@ use ratex_svg::{SvgOptions, render_to_svg};
 use ratex_types::math_style::MathStyle;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
-/// 缓存最多记多少条（流式输出时整段回复每来一块都重新解析一次，前面的公式不该重排）。
-const CACHE_MAX: usize = 512;
+/// 近期排版结果的堆字节预算；流式重解析只需要近期公式，不按条数一刀切。
+const CACHE_BUDGET: usize = 4 * 1024 * 1024;
 
 /// 一份排好的公式。
 #[derive(Debug, Clone, PartialEq)]
@@ -73,71 +74,119 @@ impl std::error::Error for MathError {}
 /// 结果按「源码 + 行内 / 块」缓存：同一个公式在流式输出里会来回排好几次，只有第一次真排。
 pub fn typeset(latex: &str, display: bool) -> Result<Typeset, MathError> {
     let key = (latex.to_string(), display);
-    let mut guard = cache().lock().unwrap();
-    if let Some(hit) = guard.map.get(&key) {
-        let hit = hit.clone();
-        guard.hits += 1;
+    let now = Instant::now();
+    if let Some(hit) = cache().lock().unwrap().get(&key, now) {
         return hit;
     }
-    drop(guard);
     let out = typeset_uncached(latex, display);
-    let mut cache = cache().lock().unwrap();
-    cache.misses += 1;
-    if cache.map.len() >= CACHE_MAX {
-        // 满了清一半：新的一批接着进来，不必真做 LRU（公式不多，简单够了）
-        cache.evictions += cache.map.len() as u64;
-        cache.map.clear();
-    }
-    cache.map.insert(key, out.clone());
+    cache().lock().unwrap().insert(key, out.clone(), now);
     out
 }
 
 type Key = (String, bool);
 type Value = Result<Typeset, MathError>;
 
+struct CacheEntry {
+    value: Value,
+    bytes: usize,
+    last_used: Instant,
+}
+
 struct Cache {
-    map: HashMap<Key, Value>,
+    map: HashMap<Key, CacheEntry>,
+    bytes: usize,
+    budget: usize,
     hits: u64,
     misses: u64,
     evictions: u64,
 }
 
+impl Cache {
+    fn new(budget: usize) -> Self {
+        Self { map: HashMap::new(), bytes: 0, budget, hits: 0, misses: 0, evictions: 0 }
+    }
+
+    fn get(&mut self, key: &Key, now: Instant) -> Option<Value> {
+        let entry = self.map.get_mut(key)?;
+        entry.last_used = now;
+        self.hits += 1;
+        Some(entry.value.clone())
+    }
+
+    fn insert(&mut self, key: Key, value: Value, now: Instant) {
+        self.misses += 1;
+        if let Some(entry) = self.map.get_mut(&key) {
+            entry.last_used = now;
+            return;
+        }
+        let bytes = entry_bytes(&key, &value);
+        if bytes > self.budget && std::env::var_os("CLAUDESKTOP_DISABLE_MATH_RECLAIM").is_none() {
+            return;
+        }
+        self.bytes += bytes;
+        self.map.insert(key.clone(), CacheEntry { value, bytes, last_used: now });
+        if std::env::var_os("CLAUDESKTOP_DISABLE_MATH_RECLAIM").is_some() {
+            return;
+        }
+        while self.bytes > self.budget {
+            let Some(oldest) = self
+                .map
+                .iter()
+                .filter(|(candidate, _)| **candidate != key)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(candidate, _)| candidate.clone())
+                .or_else(|| self.map.keys().next().cloned())
+            else {
+                break;
+            };
+            if let Some(entry) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+                self.evictions += 1;
+            }
+            if self.map.is_empty() {
+                break;
+            }
+        }
+    }
+
+    fn stats(&self) -> MathCacheStats {
+        MathCacheStats {
+            entries: self.map.len(),
+            bytes: self.bytes,
+            budget: self.budget,
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+        }
+    }
+}
+
+fn entry_bytes(key: &Key, value: &Value) -> usize {
+    std::mem::size_of::<(Key, CacheEntry)>()
+        + key.0.capacity()
+        + match value {
+            Ok(typeset) => typeset.svg.capacity(),
+            Err(error) => error.message.capacity(),
+        }
+}
+
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| Mutex::new(Cache { map: HashMap::new(), hits: 0, misses: 0, evictions: 0 }))
+    CACHE.get_or_init(|| Mutex::new(Cache::new(CACHE_BUDGET)))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MathCacheStats {
     pub entries: usize,
     pub bytes: usize,
+    pub budget: usize,
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
 }
 
 pub fn cache_stats() -> MathCacheStats {
-    let cache = cache().lock().unwrap();
-    let bytes = cache.map.capacity() * std::mem::size_of::<(Key, Value)>()
-        + cache
-            .map
-            .iter()
-            .map(|((source, _), result)| {
-                source.capacity()
-                    + match result {
-                        Ok(typeset) => typeset.svg.capacity(),
-                        Err(error) => error.message.capacity(),
-                    }
-            })
-            .sum::<usize>();
-    MathCacheStats {
-        entries: cache.map.len(),
-        bytes,
-        hits: cache.hits,
-        misses: cache.misses,
-        evictions: cache.evictions,
-    }
+    cache().lock().unwrap().stats()
 }
 
 fn typeset_uncached(latex: &str, display: bool) -> Result<Typeset, MathError> {
@@ -522,6 +571,36 @@ mod tests {
         assert!(claim_inline("$\\alpha+1$"));
         // 不是一对 $（调用方传错）时不拦
         assert!(claim_inline("\\frac{1}{2}"));
+    }
+
+    fn cached_value(svg: &str) -> Value {
+        Ok(Typeset { svg: svg.into(), width: 1., height: 1., depth: 0. })
+    }
+
+    #[test]
+    fn cache_evicts_the_least_recently_used_entry_by_bytes() {
+        let now = Instant::now();
+        let a = ("a".repeat(8), true);
+        let b = ("b".repeat(8), true);
+        let c = ("c".repeat(8), true);
+        let one = entry_bytes(&a, &cached_value("x"));
+        let mut cache = Cache::new(one * 2);
+        cache.insert(a.clone(), cached_value("a"), now);
+        cache.insert(b.clone(), cached_value("b"), now + std::time::Duration::from_secs(1));
+        assert!(cache.get(&a, now + std::time::Duration::from_secs(2)).is_some());
+        cache.insert(c.clone(), cached_value("c"), now + std::time::Duration::from_secs(3));
+        assert!(cache.map.contains_key(&a) && cache.map.contains_key(&c));
+        assert!(!cache.map.contains_key(&b));
+        assert!(cache.bytes <= cache.budget);
+        assert_eq!(cache.evictions, 1);
+    }
+
+    #[test]
+    fn cache_bypasses_an_entry_larger_than_the_whole_budget() {
+        let mut cache = Cache::new(1);
+        cache.insert(("large".into(), true), cached_value("svg"), Instant::now());
+        assert!(cache.map.is_empty());
+        assert_eq!(cache.bytes, 0);
     }
 
     #[test]
