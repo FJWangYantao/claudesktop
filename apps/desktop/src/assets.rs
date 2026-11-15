@@ -1,11 +1,11 @@
-//! 资源：gpui-kit 图标、内嵌内核和服务商标志，以及运行时登记的公式 SVG 和远程图片
+//! 资源：gpui-kit 图标、内嵌内核和服务商标志，以及运行时登记的公式 SVG、远程图片和工具图片
 //! （见「设计说明-聊天与Code分离.md」6.3、7.5）。
 //!
 //! 公式的结果是自包含 SVG（字形转路径），排版在后台线程做完就按内容哈希登记到
 //! [`MATH_PREFIX`] 下面，画的时候按名字取出来贴进 gpui 的图集缓存。换主题不用重新生成：
 //! gpui 画 SVG 是单色蒙版 + 着色，颜色在画的时候给。
 //!
-//! 远程图片同理登记在 [`IMAGE_PREFIX`] 下面：字节是按内容哈希存的，同一张图在几条
+//! 远程图片和工具图片同理登记在 [`IMAGE_PREFIX`] 下面：字节是按内容哈希存的，同一张图在几条
 //! 回复里出现只占一份，也不走 `img()` 的 URI 分支（那条路每帧都可能重试）。
 //!
 //! 登记表有预算（[`REGISTRY_BUDGET`]，按字节）：超了把最久没画的先写到数据目录
@@ -126,7 +126,10 @@ impl Registry {
         if std::env::var_os("CLAUDESKTOP_DISABLE_RECLAIM").is_some() {
             return;
         }
-        while self.bytes > REGISTRY_BUDGET && self.map.len() > 1 {
+        // 持续写盘失败会把条目重新插回并标成新；最多尝试现有条目一轮，不能在两条之间死循环。
+        let mut attempts = self.map.len();
+        while self.bytes > REGISTRY_BUDGET && self.map.len() > 1 && attempts > 0 {
+            attempts -= 1;
             let Some((name, oldest)) = self
                 .map
                 .iter()
@@ -165,7 +168,7 @@ impl Registry {
     }
 }
 
-/// 登记一张远程图片的原始字节，返回交给 `img()` 的资源名。
+/// 登记一张远程或工具图片的原始字节，返回交给 `img()` 的资源名。
 ///
 /// 认不出格式或大到不值得缓存返回 `None`（调用方据此报「读不出来」）。
 /// 名字按内容哈希，所以同一张图重复登记是同一个名字、只占一份内存。
@@ -326,11 +329,7 @@ pub fn registry_stats() -> RegistryStats {
     }
 }
 
-/// 一张远程图片已经取回并登记过的字节（`None` = 还没加载 / 加载失败）。
-///
-/// 「另存为…」写盘要原始字节；画图用 [`crate::app::remote_image::registered_name`]。
-pub fn cached(url: &str) -> Option<Vec<u8>> {
-    let name = crate::app::remote_image::registered_name(url)?;
+pub fn resource_bytes(name: &str) -> Option<Vec<u8>> {
     let key = name.strip_prefix(IMAGE_PREFIX)?;
     let mut reg = registry().lock().unwrap();
     if let Some(entry) = reg.map.get_mut(key) {
@@ -338,6 +337,13 @@ pub fn cached(url: &str) -> Option<Vec<u8>> {
         return Some(entry.bytes.to_vec());
     }
     reg.unspill(key).map(|arc| arc.to_vec())
+}
+
+/// 一张远程图片已经取回并登记过的字节（`None` = 还没加载 / 加载失败）。
+///
+/// 「另存为…」写盘要原始字节；画图用 [`crate::app::remote_image::registered_name`]。
+pub fn cached(url: &str) -> Option<Vec<u8>> {
+    resource_bytes(&crate::app::remote_image::registered_name(url)?)
 }
 
 #[cfg(test)]
@@ -423,9 +429,61 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn tool_images_deduplicate_and_serialize_from_the_registry() {
+        let (_guard, _dir) = isolated();
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x2D, 0xB4, 0x00, 0x00,
+            0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let prompt = claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png),
+        };
+        let first = crate::model::thumb_from_prompt_image(&prompt).unwrap();
+        let second = crate::model::thumb_from_prompt_image(&prompt).unwrap();
+        assert_eq!(first.name, second.name);
+        let stats = registry_stats();
+        assert_eq!(stats.image_entries, 1);
+        assert_eq!(stats.image_bytes, png.len());
+        let snapshot = serde_json::to_value(&first).unwrap();
+        assert_eq!(snapshot["data"], prompt.data);
+        let restored: crate::model::ToolImage = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(restored.name, first.name);
+        assert_eq!(resource_bytes(&restored.name).as_deref(), Some(png));
+    }
+
+    #[core::prelude::v1::test]
     fn oversized_entries_are_refused() {
         let (_guard, _dir) = isolated();
         assert!(register_image(&vec![0u8; ENTRY_MAX + 1]).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn failed_spill_keeps_original_bytes_and_missing_reads_return_none() {
+        let (_guard, dir) = isolated();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        {
+            let mut reg = registry().lock().unwrap();
+            for (name, tick) in [("one.png", 0), ("two.png", 1)] {
+                reg.map.insert(
+                    name.into(),
+                    Entry {
+                        bytes: Arc::new(vec![tick]),
+                        last_used: Instant::now()
+                            + std::time::Duration::from_millis(u64::from(tick)),
+                    },
+                );
+            }
+            reg.bytes = REGISTRY_BUDGET + 1;
+            reg.trim();
+            assert_eq!(reg.map.len(), 2);
+            assert_eq!(reg.bytes, REGISTRY_BUDGET + 1);
+            assert_eq!(reg.spilled, 0);
+        }
+        assert_eq!(resource_bytes("remote/missing.png"), None);
     }
 
     #[core::prelude::v1::test]

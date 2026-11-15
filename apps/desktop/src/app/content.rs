@@ -48,7 +48,11 @@ impl ChatApp {
             .flex_1()
             .min_h_0()
             .w_full()
-            .child(self.content_view.clone().cached(StyleRefinement::default().size_full()))
+            .child(
+                image_cache(self.image_cache.clone()).size_full().child(
+                    self.content_view.clone().cached(StyleRefinement::default().size_full()),
+                ),
+            )
             .child(self.loop_overlay.clone())
     }
 

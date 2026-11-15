@@ -168,9 +168,19 @@ fn main() {
                                 {
                                     last_id = id;
                                     last_command = std::time::Instant::now();
-                                    let result = this.update_in(cx, |app, window, cx| {
+                                    let mut result = this.update_in(cx, |app, window, cx| {
                                         app.hibernate_bench_command(&command, window, cx)
                                     }).expect("无头验收窗口已关闭");
+                                    if result.is_ok() && command["action"] == "capture" {
+                                        let path = dir.join("capture.png");
+                                        result = cx.update(|window, cx| {
+                                            window.refresh();
+                                            window.draw(cx).clear(cx);
+                                            window.render_to_image()
+                                                .and_then(|image| image.save(&path).map_err(Into::into))
+                                                .map_err(|error| format!("截图失败：{error:#}"))
+                                        }).expect("无头验收窗口已关闭").map(|_| serde_json::Value::Null);
+                                    }
                                     let response = match result {
                                         Ok(value) => serde_json::json!({"id": id, "ok": true, "value": value}),
                                         Err(error) => serde_json::json!({"id": id, "ok": false, "error": error}),

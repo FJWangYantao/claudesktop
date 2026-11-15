@@ -12,13 +12,14 @@ impl ChatApp {
         let idx = command["token"].as_u64().and_then(|token| self.session_index(token));
         let mut result = Value::Null;
         match action {
-            "status" => {}
+            "status" | "capture" => {}
             "open" => {
                 let idx = self.open_session(KernelChoice::Builtin, self.cwd.clone());
                 self.activate_session(idx, cx);
                 result = json!({"token": self.sessions[idx].token});
             }
             "hibernate" => self.hibernate_idle_sessions(cx),
+            "reclaim_images" => self.image_cache.update(cx, |cache, cx| cache.reclaim(cx)),
             "quit" => {
                 for (_, slot) in &self.kernels {
                     if let Some(kernel) = &slot.kernel {
@@ -32,8 +33,10 @@ impl ChatApp {
                     "activate" => self.activate_session(idx, cx),
                     "show_images" => {
                         self.activate_session(idx, cx);
-                        self.settings.view_mode = ViewMode::Verbose;
+                        self.settings.view_mode = ViewMode::Normal;
                         let mut reveal = None;
+                        let rows = self.sessions[idx].transcript.len();
+                        self.sessions[idx].open_groups.extend(0..rows);
                         for (item, row) in self.sessions[idx].transcript.iter_mut().enumerate() {
                             match row {
                                 ChatItem::User { images, .. } if !images.is_empty() => {
@@ -190,7 +193,8 @@ impl ChatApp {
             },
             "decoded_cache": {
                 "entries": decoded.entries, "loading": decoded.loading,
-                "bytes": decoded.decoded_bytes, "frames": decoded.frames,
+                "bytes": decoded.decoded_bytes, "unpinned_bytes": decoded.unpinned_bytes,
+                "budget": super::image_cache::DECODED_BUDGET, "frames": decoded.frames,
                 "hits": decoded.hits, "misses": decoded.misses, "evictions": decoded.evictions,
                 "first_draws": decoded.first_draws,
                 "first_draw_ms_total": decoded.first_draw_ms_total,

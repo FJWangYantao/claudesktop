@@ -471,6 +471,7 @@ impl ChatApp {
                             app.hibernate_idle_sessions(cx);
                         }
                         app.reclaim_idle_sessions(cx);
+                        app.image_cache.update(cx, |cache, cx| cache.reclaim(cx));
                         if std::env::var("CLAUDESKTOP_MEM_REPORT").is_ok() {
                             app.mem_report();
                         }
@@ -1080,10 +1081,12 @@ impl ChatApp {
             stats.misses,
         );
         eprintln!(
-            "[mem] decoded entries={} loading={} bytes={} frames={} hits={} misses={} evictions={} first_draws={} first_draw_ms_total={:.3} first_draw_ms_max={:.3}",
+            "[mem] decoded entries={} loading={} bytes={} unpinned={} budget={} frames={} hits={} misses={} evictions={} first_draws={} first_draw_ms_total={:.3} first_draw_ms_max={:.3}",
             images.entries,
             images.loading,
             images.decoded_bytes,
+            images.unpinned_bytes,
+            image_cache::DECODED_BUDGET,
             images.frames,
             images.hits,
             images.misses,
@@ -3416,21 +3419,19 @@ impl Render for ChatApp {
         self.sync_placeholder(window, cx);
 
         // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
-        let body = image_cache(self.image_cache.clone()).flex_1().min_h_0().w_full().child(
-            v_flex().flex_1().min_h_0().w_full().child(self.content_slot()).when(
-                !self.settings_open,
-                |d| {
-                    d.child(
-                        div()
-                            .max_w(READING_W)
-                            .w_full()
-                            .px_8()
-                            .pb_4()
-                            .pt_2()
-                            .child(self.render_composer(window, cx)),
-                    )
-                },
-            ),
+        let body = v_flex().flex_1().min_h_0().w_full().child(self.content_slot()).when(
+            !self.settings_open,
+            |d| {
+                d.child(
+                    div()
+                        .max_w(READING_W)
+                        .w_full()
+                        .px_8()
+                        .pb_4()
+                        .pt_2()
+                        .child(self.render_composer(window, cx)),
+                )
+            },
         );
         let main = v_flex()
             .flex_1()

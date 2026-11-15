@@ -252,7 +252,10 @@ async function run(label, enabled, soak = 0) {
     delete env.CLAUDESKTOP_DISABLE_RECLAIM;
     if (!enabled) env.CLAUDESKTOP_DISABLE_DISPLAY_RECLAIM = '1';
   }
-  if (imageComparison && !enabled) env.CLAUDESKTOP_DISABLE_IMAGE_RECLAIM = '1';
+  if (imageComparison) {
+    env.CLAUDESKTOP_HIBERNATE = '1';
+    if (!enabled) env.CLAUDESKTOP_DISABLE_IMAGE_RECLAIM = '1';
+  }
   if (warmComparison) {
     env.CLAUDESKTOP_HIBERNATE = '1';
     delete env.CLAUDESKTOP_DISABLE_RECLAIM;
@@ -286,12 +289,14 @@ async function run(label, enabled, soak = 0) {
   const phase = async name => {
     await writeFile(path.join(dir, 'phase.txt'), name);
     phases.push({ phase: name, epoch_ms: Date.now() });
+    if (sample === 'render') await command('reclaim_images');
     const status = await command('status');
     memoryStats.push({
       phase: name, epoch_ms: Date.now(), display_bytes: status.display_bytes,
       display_categories: status.display_categories, assets: status.assets,
       math_cache: status.math_cache, decoded_cache: status.decoded_cache,
     });
+    await writeFile(path.join(dir, 'memory-stats.json'), JSON.stringify(memoryStats, null, 2));
     console.log(`${label}: ${name}`);
   };
   const wait = async (predicate, timeout = 60000) => {
@@ -387,7 +392,7 @@ async function run(label, enabled, soak = 0) {
     await phase('idle');
     await command('hibernate');
     await wait(status => {
-      const dormant = displayComparison || warmComparison || enabled;
+      const dormant = displayComparison || warmComparison || imageComparison || enabled;
       return (dormant ? status.dormant === count - 3 : status.resident >= count)
         && status.transitioning === 0
         && (!displayIntegrity || status.sessions.every(s => !s.history_loading)
@@ -402,8 +407,13 @@ async function run(label, enabled, soak = 0) {
         await command('activate', { token: tokens[i] });
         await delay(200);
         if (sample === 'render') {
+          await wait(status => status.sessions.find(s => s.token === tokens[i])?.history_loaded);
           await command('show_images', { token: tokens[i] });
           await delay(600);
+          if (args.capture && round === 0 && i === 0) {
+            await command('reclaim_images');
+            await command('capture');
+          }
         }
         if (displayIntegrity) {
           await wait(status => status.sessions.find(s => s.token === tokens[i])?.history_loaded);

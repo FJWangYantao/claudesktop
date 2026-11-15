@@ -301,7 +301,7 @@ impl ChatApp {
                 ChatItem::Thinking { text, streaming, open, .. } => {
                     Self::render_task_thought(task, k, text, *streaming, *open, window, cx)
                 }
-                ChatItem::Tool(c) => Self::render_task_tool(task, k, c, &s.cwd, window, cx),
+                ChatItem::Tool(c) => self.render_task_tool(task, k, c, &s.cwd, window, cx),
                 ChatItem::Agent(text) => {
                     let streaming = running && k + 1 == run.items.len();
                     div().child(
@@ -416,6 +416,7 @@ impl ChatApp {
 
     /// 详情页里的一次工具调用：改了文件的画 diff，其余是工具行、有输出时点开看。
     fn render_task_tool(
+        &self,
         task: &str,
         k: usize,
         card: &ToolCard,
@@ -463,7 +464,7 @@ impl ChatApp {
         let progress =
             motion::reveal_progress(("task-tool", k), has_output && card.expanded, window, cx);
         if progress > 0. && has_output {
-            col = col.child(Reveal::new(("task-tool-body", k), progress, Self::tool_output(card)));
+            col = col.child(Reveal::new(("task-tool-body", k), progress, self.tool_output(card)));
         }
         col
     }

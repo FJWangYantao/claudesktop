@@ -449,7 +449,7 @@ impl Session {
             reveal: None,
             wheel: None,
             stopping: false,
-            steering: false,
+            steering: None,
             cache_hit: None,
             content_seq: 0,
             seen_seq: 0,

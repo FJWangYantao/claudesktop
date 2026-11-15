@@ -26,7 +26,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 同组相邻两步之间的行距
@@ -50,8 +49,8 @@ pub(super) enum ImageView {
     Path(PathBuf),
     /// 远程图片的地址
     Remote(String),
-    /// 工具结果里带回来的图（`read_file` 读到的、MCP 返回的）：字节只在内存里
-    Memory { image: Arc<gpui_kit::Image>, bytes: Arc<Vec<u8>>, ext: &'static str },
+    /// 工具结果里带回来的图（`read_file` 读到的、MCP 返回的）：资源表按内容寻址
+    Memory { name: String, ext: &'static str },
 }
 
 /// 图片大图：gpui-kit 的对话框，宽约窗口八成，图按原比例缩进去（小图不放大），
@@ -73,8 +72,8 @@ pub(super) fn open_image(image: ImageView, window: &mut Window, cx: &mut App) {
                 || div().text_color(rgb(INK_SOFT)).child("这张图还没加载").into_any_element(),
                 |name| img(name).size_full().object_fit(ObjectFit::ScaleDown).into_any_element(),
             ),
-            ImageView::Memory { image, .. } => {
-                img(image.clone()).size_full().object_fit(ObjectFit::ScaleDown).into_any_element()
+            ImageView::Memory { name, .. } => {
+                img(name.clone()).size_full().object_fit(ObjectFit::ScaleDown).into_any_element()
             }
         };
         let save = dialog_image.clone();
@@ -107,7 +106,10 @@ pub(super) fn save_image(image: ImageView, window: &mut Window, cx: &mut App) {
             }
             Err(err) => (None, format!("读不了这张图：{err}")),
         },
-        ImageView::Memory { bytes, ext, .. } => (Some(bytes.to_vec()), format!("tool-image.{ext}")),
+        ImageView::Memory { name, ext } => match crate::assets::resource_bytes(name) {
+            Some(bytes) => (Some(bytes), format!("tool-image.{ext}")),
+            None => (None, "读不了这张图：资源已不可用".into()),
+        },
         ImageView::Remote(url) => {
             // 扩展名按取回的实际格式（登记名 `remote/<哈希>.jpg` 的尾巴），别一律写 .png
             let ext = super::remote_image::registered_name(url)
@@ -578,6 +580,7 @@ impl ChatApp {
 
     /// 工具：一行「图标 名称 参数 · 结果」；带 diff 时 diff 卡片的表头兼当这一行。
     pub(super) fn render_tool(
+        &self,
         idx: usize,
         card: &ToolCard,
         cwd: &Path,
@@ -586,7 +589,7 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Div {
         if card.diffs.is_empty() {
-            return Self::render_tool_plain(idx, card, verbose, window, cx);
+            return self.render_tool_plain(idx, card, verbose, window, cx);
         }
         // 文件改动：默认每份只显示前若干行，超出的部分展开 / 收起走弹簧
         let preview = (!verbose).then_some(DIFF_PREVIEW_ROWS);
@@ -641,6 +644,7 @@ impl ChatApp {
     /// 不带 diff 的工具：工具行；有输出时点开看预览（读到的内容 / 命令输出，
     /// 内核已截到前若干行）。`verbose`（详细视图）时总是展开、不给开关。
     fn render_tool_plain(
+        &self,
         idx: usize,
         card: &ToolCard,
         verbose: bool,
@@ -677,14 +681,14 @@ impl ChatApp {
         let mut col = div().v_flex().child(line);
         let progress = motion::reveal_progress(("tool", idx), open, window, cx);
         if progress > 0. && has_output {
-            col = col.child(Reveal::new(("tool-body", idx), progress, Self::tool_output(card)));
+            col = col.child(Reveal::new(("tool-body", idx), progress, self.tool_output(card)));
         }
         col
     }
 
     /// 工具行点开后的内容（等宽、卡片底），缩进到工具名下面；和标题之间的空隙算在里面。
     /// 命令先列完整命令（`$` 开头，折行），下面是输出（跑着时是到目前为止的最后几行）。
-    pub(super) fn tool_output(card: &ToolCard) -> Div {
+    pub(super) fn tool_output(&self, card: &ToolCard) -> Div {
         // 空行给个空格占住行高
         let line =
             |l: &str| div().child(if l.is_empty() { " ".to_string() } else { l.to_string() });
@@ -713,11 +717,7 @@ impl ChatApp {
         let thumbs = (!card.images.is_empty()).then(|| {
             div().h_flex().gap_1p5().flex_wrap().children(
                 card.images.iter().cloned().enumerate().map(|(n, thumb)| {
-                    let big = ImageView::Memory {
-                        image: thumb.image.clone(),
-                        bytes: thumb.bytes.clone(),
-                        ext: thumb.ext,
-                    };
+                    let big = ImageView::Memory { name: thumb.name.clone(), ext: thumb.ext };
                     div()
                         .id(("tool-image", n))
                         .cursor_pointer()
@@ -725,7 +725,8 @@ impl ChatApp {
                         .hover(|d| d.opacity(0.85))
                         .on_click(move |_, window, cx| open_image(big.clone(), window, cx))
                         .child(
-                            img(thumb.image.clone())
+                            img(thumb.name.clone())
+                                .image_cache(&self.image_cache)
                                 .h_20()
                                 .max_w_48()
                                 .rounded_md()
@@ -2092,7 +2093,7 @@ impl ChatApp {
             }
             ChatItem::Tool(card) if card.task => self.render_task_card(idx, card, window, cx),
             ChatItem::Tool(card) => {
-                Self::render_tool(idx, card, &self.session().cwd, verbose, window, cx)
+                self.render_tool(idx, card, &self.session().cwd, verbose, window, cx)
             }
             ChatItem::AutoApproved { title, chosen } => {
                 Self::render_auto_approved(idx, title, chosen)

@@ -184,12 +184,10 @@ impl ToolCard {
 }
 
 /// 工具结果里带回来的图片（`read_file` 读到的图、MCP 的多模态结果）：
-/// 缩略图 + 原始字节（点开看大图、另存为都要用原字节）。
+/// 只存内容寻址资源名；原始字节由资源表统一去重、外溢和读回。
 #[derive(Clone)]
 pub struct ToolImage {
-    pub image: std::sync::Arc<gpui_kit::Image>,
-    /// 内核给的字节（已经重编码过；另存为写这份）
-    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub name: String,
     /// 另存为时用的扩展名
     pub ext: &'static str,
 }
@@ -197,9 +195,11 @@ pub struct ToolImage {
 impl serde::Serialize for ToolImage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use base64::Engine as _;
+        let bytes = crate::assets::resource_bytes(&self.name)
+            .ok_or_else(|| serde::ser::Error::custom("工具图片资源读取失败"))?;
         PromptImage {
             media_type: format!("image/{}", if self.ext == "jpg" { "jpeg" } else { self.ext }),
-            data: base64::engine::general_purpose::STANDARD.encode(self.bytes.as_slice()),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
         }
         .serialize(serializer)
     }
@@ -236,18 +236,15 @@ mod text_attachments {
 pub fn thumb_from_prompt_image(image: &PromptImage) -> Option<ToolImage> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD.decode(image.data.as_bytes()).ok()?;
-    let (format, ext) = match image.media_type.as_str() {
-        "image/png" => (gpui_kit::ImageFormat::Png, "png"),
-        "image/gif" => (gpui_kit::ImageFormat::Gif, "gif"),
-        "image/webp" => (gpui_kit::ImageFormat::Webp, "webp"),
-        "image/bmp" => (gpui_kit::ImageFormat::Bmp, "bmp"),
-        _ => (gpui_kit::ImageFormat::Jpeg, "jpg"),
+    let ext = match image.media_type.as_str() {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "jpg",
     };
-    Some(ToolImage {
-        image: std::sync::Arc::new(gpui_kit::Image::from_bytes(format, bytes.clone())),
-        bytes: std::sync::Arc::new(bytes),
-        ext,
-    })
+    let name = crate::assets::register_image(&bytes)?;
+    Some(ToolImage { name, ext })
 }
 
 /// 工具行左侧的种类图标。
@@ -787,7 +784,10 @@ impl ChatItem {
                     + c.result.len()
                     + c.output.len()
                     + c.diffs.iter().map(diff_bytes).sum::<usize>()
-                    + c.images.iter().map(|i| i.bytes.len() + i.image.bytes.len()).sum::<usize>()
+                    + c.images
+                        .iter()
+                        .map(|image| std::mem::size_of::<ToolImage>() + image.name.len())
+                        .sum::<usize>()
                     + 16
             }
             Self::AutoApproved { title, chosen } => title.len() + chosen.len(),
@@ -875,7 +875,7 @@ impl ChatItem {
                 out.tool_images = card
                     .images
                     .iter()
-                    .map(|image| image.bytes.len() + image.image.bytes.len())
+                    .map(|image| std::mem::size_of::<ToolImage>() + image.name.len())
                     .sum();
             }
             _ => {}
