@@ -342,14 +342,14 @@ pub fn cached(url: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// tests 并行跑、登记表是进程级的：所有用例串行持这把锁，磁盘缓存换成本用例
     /// 专属的临时目录（不碰真实数据目录）。
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn isolated() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+    pub(crate) fn isolated() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
         let guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir()
             .join(format!("claudesktop-assets-{:016x}", std::process::id() as u64 ^ nanos()));

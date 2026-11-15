@@ -152,6 +152,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn display_roundtrip_keeps_binding_ui_state_attachments_and_late_messages() {
+        let (_assets_guard, _assets_dir) = crate::assets::tests::isolated();
         let root = root();
         let mut s = live();
         if let ChatItem::User { files, .. } = &mut s.transcript[0] {
