@@ -460,7 +460,7 @@ impl ChatApp {
             SharedString::default()
         } else {
             match self.space() {
-                _ if s.steering => "说说要它怎么改，回车发送".into(),
+                _ if s.steering.is_some() => s.steering.unwrap_or_default().into(),
                 _ if s.busy || s.stopping => "回车排队，这一轮结束后自动发出".into(),
                 Space::Chat => CHAT_PLACEHOLDER.into(),
                 Space::Code => PLACEHOLDER.into(),

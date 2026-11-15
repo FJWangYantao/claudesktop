@@ -718,9 +718,11 @@ impl ChatApp {
             } else {
                 "选一个继续下一题"
             }))
-            .child(link("question-self", "自己说").on_click(cx.listener(move |this, _, _, cx| {
-                this.answer_question(item_idx, claudesktop_core::QuestionAnswer::SelfAnswer, cx);
-            })))
+            .child(link("question-self", "自己说").on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.self_answer_question(item_idx, window, cx);
+                },
+            )))
             .child(link("question-model", "你来定").on_click(cx.listener(
                 move |this, _, _, cx| {
                     this.answer_question(
