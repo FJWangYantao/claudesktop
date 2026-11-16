@@ -45,7 +45,7 @@ on:
         default: reference
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: gateway-validation
@@ -92,4 +92,5 @@ jobs:
           name: gateway-validation-${{ inputs.scope }}-${{ inputs.comparison_set }}-${{ inputs.condition }}
           path: ${{ runner.temp }}/gateway-validation/.claudesktop/bench/independent-validation/
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 14

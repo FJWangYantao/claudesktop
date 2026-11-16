@@ -68,7 +68,7 @@ jobs:
   gateway-validation:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.gateway_asset_id != '' }}
     permissions:
-      contents: read
+      contents: write
     uses: ./.github/workflows/gateway-validation.yml
     with:
       asset_id: ${{ inputs.gateway_asset_id }}
