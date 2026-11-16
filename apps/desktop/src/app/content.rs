@@ -240,13 +240,7 @@ impl ChatApp {
                                 // 定宽，滚动时不用每帧把整页来回排好几遍（见 `MeasuredWidth`）
                                 .when_some(self.home_w.get(), |d, w| d.w(w))
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .v_flex()
-                                        .justify_center()
-                                        .max_w(READING_W)
-                                        .w_full()
-                                        .px_8()
+                                    self.reading_column(div().flex_1().v_flex().justify_center())
                                         .child(self.render_overview(cx)),
                                 ),
                         ),
@@ -276,7 +270,7 @@ impl ChatApp {
             cx.processor(|this, ix: usize, window, cx| {
                 let s = &this.sessions[this.active];
                 let n = s.transcript.len();
-                let row = div().max_w(READING_W).w_full().px_8();
+                let row = this.reading_column(div());
                 // 过程组里的一步：展开 / 收起走弹簧，收起没走完之前照样画、按进度裁切
                 // （每帧都要问一次进度，状态才留得住）
                 let reveal = match s.layout.get(ix) {

@@ -69,6 +69,69 @@ pub struct ModeView {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthMethodView {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub kind: AuthMethodKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthMethodKind {
+    Agent,
+    Terminal { args: Vec<String>, env: Vec<(String, String)> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigChoiceView {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOptionView {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// model / mode / thought_level / model_config / 其他自定义分类
+    pub category: String,
+    pub current_value: String,
+    pub options: Vec<ConfigChoiceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableCommandView {
+    pub name: String,
+    pub description: String,
+    pub requires_input: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostView {
+    pub amount: f64,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextUsageView {
+    pub used: u64,
+    pub size: u64,
+    pub cost: Option<CostView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionView {
+    pub id: String,
+    pub status: String,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+}
+
 /// 权限请求里的一个可选项（协议无关的 UI 投影）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionOptionView {
@@ -98,6 +161,36 @@ pub struct QuestionOptionView {
     /// 按钮下面的灰字：说清后果
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 回传给 agent 的枚举值；自研提问回退到 label
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    #[default]
+    Choice,
+    Text,
+    Number,
+    Integer,
+    Boolean,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FormValueView {
+    pub id: String,
+    pub value: FormValueKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum FormValueKind {
+    Text(String),
+    Number(f64),
+    Integer(i64),
+    Boolean(bool),
+    Strings(Vec<String>),
 }
 
 /// 向用户提的一个问题（一次工具调用里可以有 1～3 个）。
@@ -110,10 +203,36 @@ pub struct QuestionView {
     pub header: Option<String>,
     /// 2～4 个选项
     pub options: Vec<QuestionOptionView>,
+    /// ACP elicitation 的字段名；自研提问没有
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub kind: QuestionKind,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default_value: Option<String>,
+}
+
+impl Default for QuestionView {
+    fn default() -> Self {
+        Self {
+            question: String::new(),
+            header: None,
+            options: Vec::new(),
+            id: None,
+            kind: QuestionKind::Choice,
+            multi_select: false,
+            required: false,
+            default_value: None,
+        }
+    }
 }
 
 /// 用户对一次 [`KernelEvent::UserQuestion`] 的应答。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QuestionAnswer {
     /// 每题选中的选项下标（和 `questions` 一一对应）
@@ -124,12 +243,14 @@ pub enum QuestionAnswer {
     ModelDecides,
     /// 取消这一轮
     Cancelled,
+    /// ACP elicitation 的字段值（保留文本、数字、布尔和数组类型）
+    Form { values: Vec<FormValueView> },
 }
 
 impl QuestionAnswer {
     /// 是不是真的选了（重放时据此决定卡片还点不点得动）
     pub fn is_choices(&self) -> bool {
-        matches!(self, Self::Choices { .. })
+        matches!(self, Self::Choices { .. } | Self::Form { .. })
     }
 
     /// 卡片答完那一行的中文说明（`None` = 还没答）
@@ -139,6 +260,7 @@ impl QuestionAnswer {
             Self::SelfAnswer => "自己说",
             Self::ModelDecides => "让模型自己定",
             Self::Cancelled => "已取消",
+            Self::Form { .. } => "已填写",
         }
     }
 }
@@ -177,7 +299,13 @@ pub enum KernelEvent {
     Connected {
         /// agent 自报的名称（`agentInfo.name`）
         agent_name: String,
+        #[serde(default)]
+        auth_methods: Vec<AuthMethodView>,
     },
+    /// 创建会话需要登录；方法由 agent 在 initialize 时上报
+    AuthRequired { token: u64, methods: Vec<AuthMethodView>, message: String },
+    /// 一次登录流程结束；成功才自动重试此前失败的会话
+    AuthCompleted { method_id: String, success: bool, message: String },
     /// 一个会话创建完成（`session/new` 响应到达）；事件的 `session` 即其 ID
     Started {
         /// 创建会话时调用方给的令牌，用来把响应对回发起方
@@ -242,6 +370,9 @@ pub enum KernelEvent {
     ToolCallProgress { id: String, output: String },
     /// 工具调用涉及的文件改动（可能在执行前作为预览发出，同一路径再次发出时替换）
     ToolCallDiff { id: String, diff: DiffView },
+    /// ACP 工具的结构化展示内容（文本、资源说明、终端占位）；和 `raw_output` 分开保存，
+    /// 后到的原始输出不会覆盖它。`content` 字段每次全量替换。
+    ToolCallContent { id: String, output: String },
     /// 计划整体替换（ACP 语义：每次都是全量列表）
     PlanReplaced { entries: Vec<PlanEntryView> },
     /// 权限请求已按策略自动应答（`auto_approve` 开启时：allow_once 优先）
@@ -298,6 +429,16 @@ pub enum KernelEvent {
         #[serde(default)]
         cache_read_tokens: u64,
     },
+    /// agent 的完整配置项变化（模型、思考档位及其他选项）；只更新会话状态，不进模型历史
+    ConfigOptionsChanged { options: Vec<ConfigOptionView> },
+    /// agent 从另一侧改变了权限模式；只同步选择，不回发 set_mode
+    CurrentModeChanged { mode_id: String },
+    /// agent 可执行的斜杠命令 / Skills 全量替换
+    AvailableCommandsChanged { commands: Vec<AvailableCommandView> },
+    /// ACP 的上下文占用与累计费用；不能累加进本轮 token
+    ContextUsageUpdated { usage: ContextUsageView },
+    /// ACP 按 ID 更新的压缩实体（摘要和错误总是当前完整状态）
+    CompactionUpdated { compaction: CompactionView },
     /// 创建会话失败（`session/new` 报错）；连接仍然可用
     SessionFailed { token: u64, message: String },
     /// 本轮提示失败（如未登录、模型报错）；连接仍然可用
@@ -432,6 +573,8 @@ impl KernelEvent {
             Self::Status(_) => "status",
             Self::Notice(_) => "notice",
             Self::Connected { .. } => "connected",
+            Self::AuthRequired { .. } => "auth_required",
+            Self::AuthCompleted { .. } => "auth_completed",
             Self::Started { .. } => "started",
             Self::AgentMessageChunk { .. } => "agent_message_chunk",
             Self::AgentThoughtChunk { .. } => "agent_thought_chunk",
@@ -442,6 +585,7 @@ impl KernelEvent {
             Self::ToolCallUpdated { .. } => "tool_call_updated",
             Self::ToolCallProgress { .. } => "tool_call_progress",
             Self::ToolCallDiff { .. } => "tool_call_diff",
+            Self::ToolCallContent { .. } => "tool_call_content",
             Self::PlanReplaced { .. } => "plan_replaced",
             Self::PermissionAuto { .. } => "permission_auto",
             Self::PermissionRequest { .. } => "permission_request",
@@ -450,6 +594,11 @@ impl KernelEvent {
             Self::FsWrite { .. } => "fs_write",
             Self::TurnEnded { .. } => "turn_ended",
             Self::UsageUpdated { .. } => "usage_updated",
+            Self::ConfigOptionsChanged { .. } => "config_options_changed",
+            Self::CurrentModeChanged { .. } => "current_mode_changed",
+            Self::AvailableCommandsChanged { .. } => "available_commands_changed",
+            Self::ContextUsageUpdated { .. } => "context_usage_updated",
+            Self::CompactionUpdated { .. } => "compaction_updated",
             Self::SessionFailed { .. } => "session_failed",
             Self::PromptFailed { .. } => "prompt_failed",
             Self::Retrying { .. } => "retrying",
@@ -618,6 +767,10 @@ pub enum KernelCommand {
     Cancel { session: String },
     /// 切换某会话的权限模式（ACP `session/set_mode`，如 `default` / `plan`）
     SetMode { session: String, mode_id: String },
+    /// 切换某会话的模型（ACP `session/set_config_option`）
+    SetModel { session: String, model: String },
+    /// 按 initialize 上报的方法登录
+    Authenticate { method_id: String },
     /// 关闭内核（断开连接、终止子进程）
     Shutdown,
 }
@@ -704,6 +857,11 @@ pub trait Kernel: Send + Sync {
     }
     /// 切换权限模式；结果经 `Status` 事件回报，不支持的 agent 会被忽略。
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()>;
+    /// 按 agent 上报的方法登录；终端方法由内核另起交互进程
+    fn authenticate(&self, method_id: &str) -> anyhow::Result<()> {
+        let _ = method_id;
+        anyhow::bail!("当前内核不支持登录")
+    }
     /// 切换某会话之后各轮使用的模型；默认不支持。
     fn set_model(&self, session: &str, model: &str) -> anyhow::Result<()> {
         let _ = (session, model);

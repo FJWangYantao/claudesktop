@@ -67,6 +67,13 @@ impl ViewMode {
     }
 }
 
+#[derive(Clone)]
+pub struct AuthRequestView {
+    pub methods: Vec<claudesktop_core::AuthMethodView>,
+    pub message: SharedString,
+    pub busy: bool,
+}
+
 /// 工具调用：一行「种类图标 + 名称 + 参数 + 结果摘要」；带 diff 时 diff 卡片的表头兼当这一行
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ToolCard {
@@ -79,6 +86,9 @@ pub struct ToolCard {
     pub result: SharedString,
     /// 输出正文预览（内核截好的，见 `claudesktop_core::output_preview`）；空 = 没有可看的
     pub output: SharedString,
+    /// ACP 的结构化展示内容，和原始输出分开；后到的 `raw_output` 不覆盖它
+    #[serde(default)]
+    pub content: SharedString,
     pub phase: ToolPhase,
     /// 该调用改动的文件（同一路径只保留最新一份）
     pub diffs: Vec<DiffView>,
@@ -152,7 +162,10 @@ impl ToolCard {
 
     /// 工具行能不能点开：有输出可看、有图片可看，或者是命令（跑着、还没输出时也能点开看完整命令）。
     pub fn can_open(&self) -> bool {
-        self.shows_command() || !self.output.trim().is_empty() || !self.images.is_empty()
+        self.shows_command()
+            || !self.output.trim().is_empty()
+            || !self.content.trim().is_empty()
+            || !self.images.is_empty()
     }
 
     /// 记录一份 diff：同一路径替换（执行前的预览会被之后的结果覆盖）。
@@ -479,6 +492,15 @@ pub enum ChatItem {
         questions: Vec<QuestionView>,
         /// 每题当前点着的选项（提交前可改；`None` = 这题还没点）
         picks: Vec<Option<usize>>,
+        /// ACP 多选字段的选中下标；单选仍只看 picks
+        #[serde(default)]
+        multi_picks: Vec<Vec<usize>>,
+        /// ACP 文本 / 数字字段的暂存值，全部字段完成后一起提交
+        #[serde(default)]
+        text_answers: Vec<Option<String>>,
+        /// 多选要显式确认才进入下一项；旧快照为空时仍按 picks 推断进度
+        #[serde(default)]
+        answered: Vec<bool>,
         /// 提交后的结果；`None` = 还在等你答
         answer: Option<QuestionAnswer>,
     },
@@ -490,8 +512,10 @@ pub enum ChatItem {
         message: SharedString,
         kind: FailureKind,
     },
-    /// 上下文压缩（自研内核）：一条分隔线，完成后可以点开看摘要
+    /// 上下文压缩：一条分隔线，完成后可以点开看摘要；ACP 按 ID 原位更新
     Compaction {
+        #[serde(default)]
+        id: Option<String>,
         state: CompactState,
         open: bool,
     },
@@ -783,6 +807,7 @@ impl ChatItem {
                     + c.arg.len()
                     + c.result.len()
                     + c.output.len()
+                    + c.content.len()
                     + c.diffs.iter().map(diff_bytes).sum::<usize>()
                     + c.images
                         .iter()
@@ -817,7 +842,7 @@ impl ChatItem {
                     + keep.as_ref().map_or(0, |k| k.len() * 4)
                     + 96
             }
-            Self::Question { questions, answer, .. } => {
+            Self::Question { questions, multi_picks, text_answers, answered, answer, .. } => {
                 questions
                     .iter()
                     .map(|q| {
@@ -834,6 +859,9 @@ impl ChatItem {
                             + HEAD * 2
                     })
                     .sum::<usize>()
+                    + multi_picks.iter().map(Vec::len).sum::<usize>() * 8
+                    + text_answers.iter().flatten().map(String::len).sum::<usize>()
+                    + answered.len()
                     + answer.is_some() as usize * 64
                     + 96
             }
@@ -901,6 +929,8 @@ impl ChatItem {
                 c.arg.len(),
                 c.result.len(),
                 c.output.len(),
+                c.content.len(),
+                c.images.len(),
                 c.phase,
                 c.expanded,
                 c.diffs.iter().map(|d| d.lines.len() + 1).sum::<usize>(),
@@ -921,7 +951,15 @@ impl ChatItem {
                 keep.as_ref().map(Vec::len),
             )
                 .hash(&mut h),
-            Self::Question { questions, picks, answer, .. } => (
+            Self::Question {
+                questions,
+                picks,
+                multi_picks,
+                text_answers,
+                answered,
+                answer,
+                ..
+            } => (
                 11u8,
                 questions.len(),
                 questions
@@ -931,6 +969,9 @@ impl ChatItem {
                     })
                     .sum::<usize>(),
                 picks.iter().filter(|p| p.is_some()).count(),
+                multi_picks.iter().map(Vec::len).sum::<usize>(),
+                text_answers.iter().flatten().map(String::len).sum::<usize>(),
+                answered.iter().filter(|done| **done).count(),
                 answer.is_some(),
             )
                 .hash(&mut h),
@@ -943,7 +984,7 @@ impl ChatItem {
             Self::Agent(t) => (6u8, t.len()).hash(&mut h),
             Self::Note(t) => (7u8, t.len()).hash(&mut h),
             Self::Failed { message, kind } => (9u8, message.len(), kind).hash(&mut h),
-            Self::Compaction { state, open } => {
+            Self::Compaction { state, open, .. } => {
                 let (phase, len) = match state {
                     CompactState::Running => (0u8, 0),
                     CompactState::Done(s) => (1, s.len()),
@@ -1368,6 +1409,7 @@ mod tests {
                 arg: "a.rs".into(),
                 result: "".into(),
                 output: SharedString::default(),
+                content: SharedString::default(),
                 phase,
                 diffs: if with_diff {
                     vec![DiffView {
@@ -1409,6 +1451,7 @@ mod tests {
             arg: arg.into(),
             result: "".into(),
             output: SharedString::default(),
+            content: SharedString::default(),
             phase,
             diffs: Vec::new(),
             expanded: false,
@@ -1416,6 +1459,15 @@ mod tests {
             grant: None,
             images: Vec::new(),
         })
+    }
+
+    #[core::prelude::v1::test]
+    fn tool_images_change_the_row_fingerprint() {
+        let mut item = tool("read", "Read", "image.png", ToolPhase::Done);
+        let before = item.fingerprint();
+        let ChatItem::Tool(card) = &mut item else { unreachable!() };
+        card.images.push(ToolImage { name: "tool/pixel".into(), ext: "png" });
+        assert_ne!(before, item.fingerprint());
     }
 
     #[core::prelude::v1::test]

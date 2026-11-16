@@ -20,6 +20,10 @@
 //! 网关从路径里取回真实端点，用途记成 `acp`。会话从请求体里认（Claude Code 在 `metadata.user_id`
 //! 里带会话 ID，和 ACP 会话 ID 一致，见 [`agent_session`]），第几轮由界面发消息时登记（[`note_turn`]）。
 
+mod request_stats;
+#[cfg(windows)]
+mod socket;
+
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -126,6 +130,8 @@ impl Gateway {
     fn serve(&self, mut client: TcpStream, agent: &ureq::Agent) {
         // 流式的小块要立刻发出去，不等 Nagle 攒包
         let _ = client.set_nodelay(true);
+        #[cfg(windows)]
+        let _ = socket::configure(&client);
         let started = Instant::now();
         let Ok(request) = read_request(&client) else {
             return;
@@ -237,30 +243,28 @@ impl Gateway {
 
     /// 补上请求体里的模型、消息数、工具数，追加一行到当天的日志；开着「存原文」就把请求体和响应另存。
     fn write(&self, entry: &RequestLog, body: &[u8], response: &[u8]) {
+        #[cfg(all(test, windows))]
+        let started = Instant::now();
         let mut entry = entry.clone();
         if crate::request_bodies::enabled() {
             let date = Local::now().date_naive();
             entry.body = crate::request_bodies::save(&self.dir, date, entry.at_ms, body, response);
         }
-        if let Ok(value) = serde_json::from_slice::<Value>(body) {
-            entry.model = value.get("model").and_then(Value::as_str).map(str::to_string);
-            // 外部 agent：会话从请求体里认，第几轮查界面登记的
+        #[cfg(all(test, windows))]
+        let parse_started = Instant::now();
+        if let Ok(stats) = request_stats::parse(body) {
+            entry.model = stats.model;
             if entry.session.is_none()
-                && let Some(session) = value
-                    .pointer("/metadata/user_id")
-                    .and_then(Value::as_str)
-                    .and_then(agent_session)
+                && let Some(session) = stats.user_id.as_deref().and_then(agent_session)
             {
                 entry.turn = turn_of(&session);
                 entry.session = Some(session);
             }
-            entry.messages = value
-                .get("messages")
-                .or_else(|| value.get("input"))
-                .and_then(Value::as_array)
-                .map(Vec::len);
-            entry.tools = value.get("tools").and_then(Value::as_array).map(Vec::len);
+            entry.messages = stats.messages;
+            entry.tools = stats.tools;
         }
+        #[cfg(all(test, windows))]
+        let parse_ms = parse_started.elapsed().as_secs_f64() * 1000.;
         let Ok(line) = serde_json::to_string(&entry) else {
             return;
         };
@@ -269,6 +273,8 @@ impl Gateway {
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(file, "{line}");
         }
+        #[cfg(all(test, windows))]
+        crate::request_memory::record_gateway_write(started, parse_ms);
     }
 }
 

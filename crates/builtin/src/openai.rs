@@ -55,17 +55,8 @@ impl ChatProvider for OpenAiProvider {
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
         let route = self.endpoint("/chat/completions");
-        let mut body = serde_json::json!({
-            "model": model,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-            "messages": messages,
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::from(tools.to_vec());
-        }
-        apply_params(&mut body, model, &self.config.params);
-        let body = body.to_string();
+        let body =
+            serde_json::to_string(&request_body(model, messages, tools, &self.config.params))?;
 
         let headers = self.auth_header().into_iter().collect::<Vec<_>>();
         let reader =
@@ -100,7 +91,24 @@ impl ChatProvider for OpenAiProvider {
     }
 }
 
-/// 把设置里透传的参数合并进请求体（`extra` 最后合入，可覆盖默认键）。
+fn request_body<'a>(
+    model: &str,
+    messages: &'a [ChatMessage],
+    tools: &[Value],
+    params: &'a RequestParams,
+) -> crate::request::RequestBody<'a, &'a [ChatMessage]> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::from(tools.to_vec());
+    }
+    apply_params(&mut body, model, params);
+    crate::request::RequestBody::new(body, &params.extra, "messages", messages)
+}
+
 fn apply_params(body: &mut Value, model: &str, params: &RequestParams) {
     if let Some(t) = params.temperature {
         body["temperature"] = serde_json::json!(t);
@@ -110,11 +118,6 @@ fn apply_params(body: &mut Value, model: &str, params: &RequestParams) {
     }
     // 思考强度（有的模型是 `reasoning_effort`，有的是 `enable_thinking` / `thinking`）
     crate::provider::apply_thinking(body, crate::provider::Protocol::OpenAiCompat, model, params);
-    if let Some(extra) = params.extra.as_object() {
-        for (key, value) in extra {
-            body[key] = value.clone();
-        }
-    }
 }
 
 /// `GET /models` 的响应 → 模型 ID 列表（OpenAI 格式 `{"data": [{"id": …}]}`）。
@@ -354,17 +357,14 @@ mod tests {
 
     #[test]
     fn params_are_merged_into_body() {
-        let mut body = serde_json::json!({"model": "m", "messages": []});
-        apply_params(
-            &mut body,
-            "some-local-model",
-            &RequestParams {
-                temperature: Some(0.2),
-                max_tokens: Some(4096),
-                extra: serde_json::json!({"top_k": 5, "model": "override"}),
-                ..Default::default()
-            },
-        );
+        let params = RequestParams {
+            temperature: Some(0.2),
+            max_tokens: Some(4096),
+            extra: serde_json::json!({"top_k": 5, "model": "override"}),
+            ..Default::default()
+        };
+        let body =
+            serde_json::to_value(request_body("some-local-model", &[], &[], &params)).unwrap();
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["top_k"], 5);
@@ -399,8 +399,7 @@ mod tests {
             extra: serde_json::json!({"reasoning_effort": "medium"}),
             ..Default::default()
         };
-        let mut body = serde_json::json!({});
-        apply_params(&mut body, "gpt-5", &with_extra);
+        let body = serde_json::to_value(request_body("gpt-5", &[], &[], &with_extra)).unwrap();
         assert_eq!(body["reasoning_effort"], "medium");
     }
 

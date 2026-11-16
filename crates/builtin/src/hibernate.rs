@@ -104,7 +104,7 @@ impl MessageSnapshot {
     }
 
     fn into_message(self) -> ChatMessage {
-        ChatMessage {
+        ChatMessage::from_data(crate::provider::ChatMessageData {
             role: self.role,
             parts: self
                 .parts
@@ -131,7 +131,7 @@ impl MessageSnapshot {
             tool_call_id: self.tool_call_id,
             thinking: self.thinking,
             tool_images: self.tool_images,
-        }
+        })
     }
 }
 
@@ -236,7 +236,8 @@ pub(crate) fn estimated_bytes(messages: &[ChatMessage]) -> usize {
                 })
                 .sum();
             let thinking = message.thinking.iter().map(json_bytes).sum::<usize>();
-            std::mem::size_of::<ChatMessage>()
+            std::mem::size_of::<crate::provider::ChatMessageData>()
+                + std::mem::size_of::<[usize; 2]>()
                 + message.role.capacity()
                 + message.parts.capacity() * std::mem::size_of::<ContentPart>()
                 + parts

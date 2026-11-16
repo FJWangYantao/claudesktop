@@ -151,7 +151,7 @@ fn inline_formula(formula: &Formula, context: &InlineRenderContext) -> InlineEle
 /// 块公式：居中；比阅读列宽的横向滚动（不缩小，缩了字就糊了）。
 fn block_formula(formula: &Formula) -> AnyElement {
     let em =
-        f32::from(crate::theme::TEXT_LARGE.to_pixels(crate::theme::root_font_size())) * BLOCK_SCALE;
+        f32::from(crate::theme::TEXT_BODY.to_pixels(crate::theme::root_font_size())) * BLOCK_SCALE;
     let width = px(em * formula.width as f32);
     let height = px(em * (formula.height + formula.depth) as f32);
     let source = formula.source.clone();

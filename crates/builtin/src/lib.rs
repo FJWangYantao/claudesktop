@@ -35,7 +35,10 @@ mod openai;
 mod permissions;
 mod provider;
 pub mod remember;
+mod request;
 pub mod request_bodies;
+#[cfg(all(test, windows))]
+mod request_memory;
 pub mod responses;
 mod sse;
 mod subagent;
@@ -2394,7 +2397,9 @@ impl Inner {
         };
         let (content, summary) = tools::question_result(&questions, &answer);
         match answer {
-            QuestionAnswer::Choices { .. } => ToolOutput::ok(content, summary),
+            QuestionAnswer::Choices { .. } | QuestionAnswer::Form { .. } => {
+                ToolOutput::ok(content, summary)
+            }
             // 「你来定」：模型自己挑一个继续，结果照常回给它
             QuestionAnswer::ModelDecides => ToolOutput::ok(content, summary),
             // 「自己说」/ 取消：这一轮停在这里，等用户下一条消息
@@ -2491,7 +2496,7 @@ impl BuiltinKernel {
             hibernation_dir: config.hibernation_dir,
         });
         inner.emit(None, KernelEvent::Status(format!("自研内核: {}", config.provider.base_url)));
-        inner.emit(None, KernelEvent::Connected { agent_name });
+        inner.emit(None, KernelEvent::Connected { agent_name, auth_methods: Vec::new() });
         // 后台命令的状态变化整份发一次（表是进程级的，出口在这里装上）
         // 出口只攥弱引用：表是进程级的，强引用会让关掉的内核一直释放不掉（`shutdown` 里也会摘掉）
         {

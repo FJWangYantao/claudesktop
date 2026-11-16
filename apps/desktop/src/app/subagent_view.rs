@@ -340,7 +340,7 @@ impl ChatApp {
                 div().v_flex().gap_2().child(section_label("交回的报告")).child(
                     TextView::markdown("task-report", reading_markdown(text, false))
                         .style(markdown_style())
-                        .text_size(TEXT_LARGE)
+                        .text_size(TEXT_BODY)
                         .text_color(rgb(INK))
                         .line_height(LEADING),
                 ),
@@ -353,7 +353,7 @@ impl ChatApp {
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(&self.task_scroll)
-                .child(div().max_w(READING_W).w_full().px_8().py_6().child(page))
+                .child(self.reading_column(div().py_6()).child(page))
                 .into_any_element(),
         )
     }
@@ -482,6 +482,7 @@ mod tests {
             arg: arg.to_string().into(),
             result: result.to_string().into(),
             output: SharedString::default(),
+            content: SharedString::default(),
             phase,
             diffs: Vec::new(),
             expanded: false,

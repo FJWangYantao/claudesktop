@@ -307,6 +307,7 @@ mod tests {
             arg: "long.rs".into(),
             result: "完成".into(),
             output: SharedString::default(),
+            content: SharedString::default(),
             phase: ToolPhase::Done,
             diffs: vec![DiffView {
                 path: "long.rs".into(),

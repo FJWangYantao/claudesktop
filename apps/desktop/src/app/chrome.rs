@@ -6,6 +6,7 @@
 use super::ChatApp;
 use super::keys::CYCLE_VIEW_KEY;
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::right_panel::RightTab;
 use super::widgets::Surface;
 use crate::model::ViewMode;
 use crate::theme::rgb;
@@ -17,7 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// 顶部一行的高度：侧栏头部与会话区顶栏对齐
-pub(super) const CHROME_H: Rems = rems(2.75);
+pub(super) const CHROME_H: Rems = rems(3.);
 
 /// macOS 红绿灯占位（窗口按钮由系统画在左上角）
 const TRAFFIC_LIGHT_W: Pixels = px(72.);
@@ -121,8 +122,11 @@ impl ChatApp {
             };
             // 顶栏窄到放不下「项目 / 标题」时只留标题（项目名在侧栏分组里也有）：
             // 带省略号的文字缩不到零，留着项目名会把标题挤没
-            let sidebar =
-                if self.sidebar_open { SIDEBAR_W.to_pixels(window.rem_size()) } else { px(0.) };
+            let sidebar = if self.sidebar_open {
+                self.sidebar_width().to_pixels(window.rem_size())
+            } else {
+                px(0.)
+            };
             let compact =
                 window.viewport_size().width - sidebar < rems(25.).to_pixels(window.rem_size());
             crumb
@@ -202,6 +206,25 @@ impl ChatApp {
                         })),
                 )
             })
+            // 右侧文件树 / Diff 辅助面板（Ctrl+Shift+D 切换）
+            .when(!self.settings_open && !s.is_chat(), |d| {
+                d.child(
+                    Self::quiet_button("open-files", IconAll::FolderTree, Surface::Paper, cx)
+                        .mr_1()
+                        .tooltip("文件与源码预览")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_right_panel(RightTab::Files, cx)
+                        })),
+                )
+                .child(
+                    Self::quiet_button("open-changes", IconAll::FileDiff, Surface::Paper, cx)
+                        .mr_2()
+                        .tooltip("逐文件改动（Ctrl+Shift+D）")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_right_panel(RightTab::Changes, cx)
+                        })),
+                )
+            })
             // 视图模式（Ctrl+O 循环）：只在有对话时出现
             .when(can_export, |d| {
                 d.child(div().mr_1().child(menu_popover(
@@ -241,11 +264,12 @@ impl ChatApp {
                 )
             })
             .when(
-                window_controls(window).is_some()
+                !self.right_panel_controls()
+                    && window_controls(window).is_some()
                     && (can_export || running_count > 0 || self.session().worktree.is_some()),
                 |d| d.child(div().w(px(1.)).h(rems(1.)).mr_1().bg(rgb(LINE))),
             )
-            .children(window_controls(window))
+            .when(!self.right_panel_controls(), |d| d.children(window_controls(window)))
     }
 }
 
@@ -285,7 +309,7 @@ mod tests {
     #[core::prelude::v1::test]
     fn traffic_lights_follow_chrome_height() {
         assert_eq!(traffic_light_origin(px(16.)), point(px(9.), px(9.)));
-        // 1.25 倍：顶栏 44 → 55px，长了 11px，往下挪一半
-        assert_eq!(traffic_light_origin(px(20.)), point(px(9.), px(14.5)));
+        // 1.25 倍：顶栏 48 → 60px，长了 12px，往下挪一半
+        assert_eq!(traffic_light_origin(px(20.)), point(px(9.), px(15.)));
     }
 }

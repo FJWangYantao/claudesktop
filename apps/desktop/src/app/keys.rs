@@ -8,6 +8,7 @@
 //! - 打开某个 Popover 的快捷键做不了（open 状态在组件里），权限模式改用 Shift+Tab 循环。
 
 use super::ChatApp;
+use super::right_panel::RightTab;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
@@ -39,6 +40,10 @@ actions!(
         ZoomReset,
         /// 打开命令面板
         OpenPalette,
+        /// 打开或关闭右侧文件树
+        ToggleFiles,
+        /// 打开或关闭右侧逐文件改动
+        ToggleChanges,
         /// 打开快捷键速查
         ShowShortcuts,
         /// 应答最早一条待定的权限请求：选第 1 / 2 / 3 / 4 个按钮
@@ -58,6 +63,8 @@ actions!(
 pub(super) const NEW_SESSION_KEY: &str = "secondary-n";
 pub(super) const TOGGLE_SIDEBAR_KEY: &str = "secondary-b";
 pub(super) const PALETTE_KEY: &str = "secondary-k";
+pub(super) const FILES_KEY: &str = "ctrl-shift-f";
+pub(super) const CHANGES_KEY: &str = "ctrl-shift-d";
 pub(super) const SHORTCUTS_KEY: &str = "secondary-/";
 /// 停止 / 循环权限模式 / 前后切会话
 pub(super) const STOP_KEY: &str = "escape";
@@ -96,6 +103,8 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(NEW_SESSION_KEY, NewSession, Some(CONTEXT)),
         KeyBinding::new(TOGGLE_SIDEBAR_KEY, ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new(PALETTE_KEY, OpenPalette, Some(CONTEXT)),
+        KeyBinding::new(FILES_KEY, ToggleFiles, Some(CONTEXT)),
+        KeyBinding::new(CHANGES_KEY, ToggleChanges, Some(CONTEXT)),
         KeyBinding::new(SHORTCUTS_KEY, ShowShortcuts, Some(CONTEXT)),
         KeyBinding::new(NEXT_SESSION_KEY, NextSession, Some(CONTEXT)),
         KeyBinding::new(PREV_SESSION_KEY, PrevSession, Some(CONTEXT)),
@@ -150,6 +159,12 @@ impl ChatApp {
             .on_action(
                 cx.listener(|this, _: &ShowShortcuts, window, cx| this.open_shortcuts(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleFiles, _, cx| {
+                this.toggle_right_panel(RightTab::Files, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
+                this.toggle_right_panel(RightTab::Changes, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();

@@ -12,7 +12,10 @@
 use crate::gateway::Route;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::io::{BufRead, BufReader};
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -889,8 +892,12 @@ pub enum ContentPart {
 
 /// 发给 provider 的一条消息。内部表示协议无关，序列化成 OpenAI 形状
 /// （单段文本 → `content` 为字符串，兼容所有网关；带图片 → 分段数组）。
+/// 克隆共享消息内容，修改时才复制这一条，避免每次请求重拷完整历史。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatMessage {
+pub struct ChatMessage(Arc<ChatMessageData>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessageData {
     pub role: String,
     pub parts: Vec<ContentPart>,
     /// 只有工具调用的 assistant 消息为空
@@ -906,20 +913,38 @@ pub struct ChatMessage {
     pub tool_images: bool,
 }
 
+impl Deref for ChatMessage {
+    type Target = ChatMessageData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ChatMessage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 impl ChatMessage {
+    pub(crate) fn from_data(data: ChatMessageData) -> Self {
+        Self(Arc::new(data))
+    }
+
     pub fn new(role: &str, text: impl Into<String>) -> Self {
         Self::with_parts(role, vec![ContentPart::Text(text.into())])
     }
 
     pub fn with_parts(role: &str, parts: Vec<ContentPart>) -> Self {
-        Self {
+        Self::from_data(ChatMessageData {
             role: role.to_string(),
             parts,
             tool_calls: Vec::new(),
             tool_call_id: None,
             thinking: Vec::new(),
             tool_images: false,
-        }
+        })
     }
 
     /// 用户说的话（一轮的开头）：role 是 user，且不是代工具发图片的那种
@@ -957,7 +982,6 @@ impl ChatMessage {
         m
     }
 
-    /// 文本内容（各文本段拼接）；没有文本返回 None
     /// 在文字末尾补一段（没有文字段就加一段；图片段留在原位）。请求前临时挂提醒用。
     pub fn append_text(&mut self, extra: &str) {
         match self.parts.iter_mut().rev().find_map(|p| match p {
@@ -970,15 +994,25 @@ impl ChatMessage {
     }
 
     pub fn text(&self) -> Option<String> {
-        let mut out = String::new();
-        let mut any = false;
-        for part in &self.parts {
-            if let ContentPart::Text(t) = part {
-                out.push_str(t);
-                any = true;
-            }
+        self.text_ref().map(Cow::into_owned)
+    }
+
+    pub(crate) fn text_ref(&self) -> Option<Cow<'_, str>> {
+        let mut parts = self.parts.iter().filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        });
+        let first = parts.next()?;
+        let Some(second) = parts.next() else {
+            return Some(Cow::Borrowed(first));
+        };
+        let mut text = String::with_capacity(first.len() + second.len());
+        text.push_str(first);
+        text.push_str(second);
+        for part in parts {
+            text.push_str(part);
         }
-        any.then_some(out)
+        Some(Cow::Owned(text))
     }
 
     fn has_image(&self) -> bool {
@@ -1025,52 +1059,53 @@ impl ChatMessage {
 /// 序列化为 OpenAI Chat Completions 的消息形状。
 impl Serialize for ChatMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::Error as _;
-        let mut message = serde_json::Map::new();
-        message.insert("role".into(), Value::String(self.role.clone()));
-        // 纯文本的工具结果和单段文本的普通消息保持字符串形状（网关兼容性最好）；
-        // 带图片的工具结果（MCP 多模态）用分段数组，文本段在前图片段在后。
-        // 空文本段一律跳过：纯工具调用的 assistant 消息 content 为 null。
-        let multipart = |msg: &ChatMessage| -> Option<Value> {
-            if !msg.has_image() {
-                return None;
-            }
-            let parts: Vec<Value> = msg
-                .parts
-                .iter()
-                .filter(|part| match part {
-                    ContentPart::Text(t) => !t.is_empty(),
-                    _ => true,
-                })
-                .map(|part| match part {
-                    ContentPart::Text(text) => serde_json::json!({
-                        "type": "text",
-                        "text": text,
-                    }),
-                    ContentPart::Image { media_type, data } => serde_json::json!({
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:{media_type};base64,{data}") },
-                    }),
-                })
-                .collect();
-            (!parts.is_empty()).then(|| Value::Array(parts))
-        };
-        let content =
-            multipart(self).unwrap_or_else(|| match self.text().filter(|t| !t.is_empty()) {
-                Some(text) => Value::String(text),
-                None => Value::Null,
-            });
-        message.insert("content".into(), content);
+        use serde::ser::SerializeMap as _;
+        let mut message = serializer.serialize_map(None)?;
+        message.serialize_entry("role", &self.role)?;
+        if self.has_image() {
+            message.serialize_entry("content", &OpenAiContent(&self.parts))?;
+        } else {
+            message.serialize_entry("content", &self.text_ref().filter(|text| !text.is_empty()))?;
+        }
         if !self.tool_calls.is_empty() {
-            message.insert(
-                "tool_calls".into(),
-                serde_json::to_value(&self.tool_calls).map_err(S::Error::custom)?,
-            );
+            message.serialize_entry("tool_calls", &self.tool_calls)?;
         }
         if let Some(id) = &self.tool_call_id {
-            message.insert("tool_call_id".into(), Value::String(id.clone()));
+            message.serialize_entry("tool_call_id", id)?;
         }
-        Value::Object(message).serialize(serializer)
+        message.end()
+    }
+}
+
+struct OpenAiContent<'a>(&'a [ContentPart]);
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAiPart<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: OpenAiImageUrl<'a> },
+}
+
+#[derive(Serialize)]
+struct OpenAiImageUrl<'a> {
+    url: crate::request::DataUrl<'a>,
+}
+
+impl Serialize for OpenAiContent<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        let mut sequence = serializer.serialize_seq(None)?;
+        for part in self.0 {
+            let part = match part {
+                ContentPart::Text(text) if text.is_empty() => continue,
+                ContentPart::Text(text) => OpenAiPart::Text { text },
+                ContentPart::Image { media_type, data } => OpenAiPart::ImageUrl {
+                    image_url: OpenAiImageUrl { url: crate::request::DataUrl { media_type, data } },
+                },
+            };
+            sequence.serialize_element(&part)?;
+        }
+        sequence.end()
     }
 }
 
@@ -1200,6 +1235,8 @@ pub(crate) fn post_sse_with_retry(
     static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
     let url = &route.real;
     debug_http(|| format!("→ POST {url}\n{body}"));
+    #[cfg(all(test, windows))]
+    crate::request_memory::record_request_ready(body.len());
     let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed).to_string();
     let mut attempt = 0;
     loop {
@@ -1333,6 +1370,38 @@ pub(crate) fn finish_stream(end: SseEnd, finish_reason: bool) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloned_messages_share_history_but_temporary_edits_are_isolated() {
+        let mut original = ChatMessage::new("user", "unchanged history\n".repeat(64_000));
+        original.thinking = vec![serde_json::json!({"type":"thinking", "signature":"original"})];
+        let mut request = original.clone();
+        assert!(Arc::ptr_eq(&original.0, &request.0));
+        request.append_text("\n<temporary reminder>");
+        request.thinking[0]["signature"] = Value::String("request".into());
+        assert!(!Arc::ptr_eq(&original.0, &request.0));
+        assert!(!original.text_ref().unwrap().contains("<temporary reminder>"));
+        assert_eq!(original.thinking[0]["signature"], "original");
+        assert_eq!(request.thinking[0]["signature"], "request");
+    }
+
+    #[test]
+    fn text_only_request_does_not_remove_images_from_shared_history() {
+        let original = ChatMessage::with_parts(
+            "user",
+            vec![
+                ContentPart::Text("before".into()),
+                ContentPart::Image { media_type: "image/png".into(), data: "QUJD".into() },
+                ContentPart::Text("after".into()),
+            ],
+        );
+        let mut request = original.clone();
+        request.replace_images_with_placeholder();
+        assert!(original.has_image());
+        assert!(!request.has_image());
+        assert!(serde_json::to_string(&original).unwrap().contains("data:image/png;base64,QUJD"));
+        assert!(request.text_ref().unwrap().contains("[image omitted"));
+    }
 
     #[test]
     fn serializes_plain_text_as_string() {

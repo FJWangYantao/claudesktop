@@ -195,6 +195,8 @@ impl Record {
                 | KernelEvent::AgentThoughtChunk { .. }
                 | KernelEvent::ToolCallStarted { .. }
                 | KernelEvent::ToolCallUpdated { .. }
+                | KernelEvent::ToolCallDiff { .. }
+                | KernelEvent::ToolCallContent { .. }
                 | KernelEvent::SubagentStarted { .. }
                 | KernelEvent::SubagentChunk { .. }
                 | KernelEvent::PlanReplaced { .. }
@@ -203,6 +205,7 @@ impl Record {
                 | KernelEvent::UserQuestion { .. }
                 | KernelEvent::PromptFailed { .. }
                 | KernelEvent::Compacting
+                | KernelEvent::CompactionUpdated { .. }
                 | KernelEvent::Compacted { .. }
                 | KernelEvent::CompactFailed { .. }
                 | KernelEvent::TurnEnded { .. }
@@ -669,6 +672,10 @@ mod tests {
     #[test]
     fn only_conversation_events_are_kept() {
         assert!(Record::worth_keeping(&KernelEvent::TurnEnded { stop_reason: "end_turn".into() }));
+        assert!(Record::worth_keeping(&KernelEvent::ToolCallDiff {
+            id: "t1".into(),
+            diff: crate::DiffView::compute("a.rs", Some("old"), "new"),
+        }));
         assert!(!Record::worth_keeping(&KernelEvent::Status("x".into())));
         assert!(!Record::worth_keeping(&KernelEvent::FsRead { path: "a".into(), ok: true }));
     }

@@ -194,9 +194,9 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
                 if let Some((_, status, output)) = assistant.tool(&key) {
                     // 和实时一致（`Inner::ask_user`）：选了 / 让模型定算成功，自己说 / 取消算失败
                     *status = match answer {
-                        QuestionAnswer::Choices { .. } | QuestionAnswer::ModelDecides => {
-                            "completed".into()
-                        }
+                        QuestionAnswer::Choices { .. }
+                        | QuestionAnswer::ModelDecides
+                        | QuestionAnswer::Form { .. } => "completed".into(),
                         QuestionAnswer::SelfAnswer | QuestionAnswer::Cancelled => "failed".into(),
                     };
                     *output = summary;
@@ -332,7 +332,9 @@ mod tests {
                     options: vec![claudesktop_core::QuestionOptionView {
                         label: "重写".into(),
                         description: None,
+                        value: None,
                     }],
+                    ..Default::default()
                 }],
             })
         };

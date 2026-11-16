@@ -895,6 +895,30 @@ impl ChatApp {
                 ),
             ),
             self.theme_row(cx),
+            setting_row(
+                "主区对齐",
+                seg_control(
+                    "content-align",
+                    ContentAlign::ALL.map(|a| (a, a.label())),
+                    self.settings.content_align,
+                    |this, align, _, cx| {
+                        this.save_ui_pref(move |s| s.content_align = align, cx);
+                        cx.notify();
+                    },
+                    cx,
+                ),
+            ),
+            setting_row(
+                "宽阅读列",
+                Switch::new("wide-reading")
+                    .checked(self.settings.wide_reading)
+                    .color(rgb(CORAL))
+                    .on_change(cx.listener(|this, checked, _, cx| {
+                        let wide = *checked;
+                        this.save_ui_pref(move |s| s.wide_reading = wide, cx);
+                        cx.notify();
+                    })),
+            ),
             motion_row,
             self.auto_load_images_row(cx),
             self.font_scale_row(),
@@ -991,7 +1015,7 @@ impl ChatApp {
         setting_row("界面字号", slider)
     }
 
-    /// 配色下拉：九套色板，每项下面一行色块预览。换配色即时生效。
+    /// 配色下拉：十套色板，每项下面一行色块预览。换配色即时生效。
     fn theme_row(&self, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
         setting_row(
@@ -4005,7 +4029,7 @@ enum Fetch {
     Verify,
 }
 
-/// 思考强度能选的项（设置页那一排和输入框的下拉共用）：「默认」= 不发字段，排在「关」前面；
+/// 思考强度能选的项（设置页那一排和模型弹层底栏共用）：「默认」= 不发字段，排在「关」前面；
 /// 然后是这个模型的档位；认不出的模型只有「默认 / 兜底」（兜底见 `FALLBACK_LEVELS`）。
 pub(super) fn thinking_options(spec: &ThinkingSpec) -> Vec<(Option<ThinkingLevel>, &'static str)> {
     let mut options = vec![(None, "默认")];
@@ -4414,5 +4438,57 @@ mod model_management_tests {
         assert_eq!(model_options(&profiles, Some(1), "manual"), Vec::<(usize, &str)>::new());
         assert_eq!(model_options(&profiles, None, " gPt "), vec![(0, "GPT-5")]);
         assert_eq!(model_options(&profiles, None, "").len(), 4);
+    }
+
+    #[core::prelude::v1::test]
+    fn thinking_bar_uses_each_models_presets() {
+        let toggle = claudesktop_builtin::thinking_spec(Protocol::OpenAiCompat, "qwen3-max");
+        assert_eq!(
+            thinking_options(&toggle),
+            vec![
+                (None, "默认"),
+                (Some(ThinkingLevel::Off), "关"),
+                (Some(ThinkingLevel::High), "高"),
+            ]
+        );
+
+        let multi = claudesktop_builtin::thinking_spec(Protocol::OpenAiCompat, "glm-5.3");
+        assert_eq!(
+            thinking_options(&multi),
+            vec![
+                (None, "默认"),
+                (Some(ThinkingLevel::Low), "低"),
+                (Some(ThinkingLevel::High), "高"),
+                (Some(ThinkingLevel::Max), "最高"),
+            ]
+        );
+
+        let unknown = claudesktop_builtin::thinking_spec(Protocol::OpenAiCompat, "new-model");
+        assert_eq!(
+            thinking_options(&unknown),
+            vec![(None, "默认"), (Some(ThinkingLevel::Default), "兜底")]
+        );
+    }
+
+    #[core::prelude::v1::test]
+    fn thinking_bar_highlights_the_level_effective_on_the_new_model() {
+        let source = claudesktop_builtin::thinking_spec(Protocol::OpenAiCompat, "gpt-5.2");
+        assert_eq!(
+            active_thinking(&source, Some(ThinkingLevel::XHigh)),
+            Some(ThinkingLevel::XHigh)
+        );
+
+        let toggle = claudesktop_builtin::thinking_spec(Protocol::OpenAiCompat, "qwen3-max");
+        assert_eq!(active_thinking(&toggle, Some(ThinkingLevel::XHigh)), Some(ThinkingLevel::High));
+
+        let no_off = claudesktop_builtin::thinking_spec(Protocol::OpenAiCompat, "glm-5.3");
+        assert_eq!(active_thinking(&no_off, Some(ThinkingLevel::Off)), Some(ThinkingLevel::Low));
+
+        let unknown = claudesktop_builtin::thinking_spec(Protocol::OpenAiCompat, "new-model");
+        assert_eq!(active_thinking(&unknown, Some(ThinkingLevel::High)), None);
+        assert_eq!(
+            active_thinking(&unknown, Some(ThinkingLevel::Default)),
+            Some(ThinkingLevel::Default)
+        );
     }
 }

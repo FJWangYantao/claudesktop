@@ -149,6 +149,363 @@ fn mock_agent_full_event_chain() {
     assert!(!tags.contains(&"fatal"), "unexpected fatal: {events:?}");
 }
 
+fn spawn_mock_with_args(args: &str, events: Arc<Mutex<Vec<KernelEvent>>>) -> AcpKernel {
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
+    };
+    AcpKernel::spawn(
+        AcpKernelConfig {
+            command: format!("{} {args}", mock_command()),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+            env: Vec::new(),
+        },
+        sink,
+    )
+    .expect("spawn kernel")
+}
+
+fn prompt_with_image(text: &str) -> UserPrompt {
+    UserPrompt {
+        text: text.into(),
+        images: vec![claudesktop_core::PromptImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAWElEQVR4nGO8Y+P2n2EAAdNAWj7qgNEQGA0BEGAhlE2c5KZRlM32PcoazYZ4ARPDAAOmUQcwjEbBAAOmUQcwjEbBAAOmEe8AxtF+AcNoIhxgwDTqAIYBBgAjBwf7jQE1sAAAAABJRU5ErkJggg==".into(),
+        }],
+        attachments: Vec::new(),
+    }
+}
+
+#[test]
+fn tool_content_keeps_text_images_resources_and_diffs() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text("content")).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let events = events.lock().unwrap();
+    let content = events
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::ToolCallContent { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("structured tool content");
+    assert!(content.contains("工具正文"), "{content}");
+    assert!(content.contains("ACP 文档"), "{content}");
+    assert!(content.contains("https://example.com/acp"), "{content}");
+    assert!(content.contains("嵌入正文"), "{content}");
+    assert!(content.contains("terminal-mock"), "{content}");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::ToolCallImages { images, .. } if images.len() == 1 && images[0].media_type == "image/png"
+    )));
+    assert!(events.iter().any(|e| matches!(e, KernelEvent::ToolCallDiff { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::ToolCallUpdated { raw_output: Some(raw), .. } if raw.contains("原始输出")
+    )));
+}
+
+#[test]
+fn session_updates_are_structured_and_config_changes_roundtrip() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.set_model(&sid, "model-b").unwrap();
+    wait_for(&events, 20_000, |e| {
+        matches!(
+            e,
+            KernelEvent::ConfigOptionsChanged { options }
+                if options.iter().any(|option| option.id == "model" && option.current_value == "model-b")
+        )
+    });
+    kernel.set_mode(&sid, "plan").unwrap();
+    wait_for(
+        &events,
+        20_000,
+        |e| matches!(e, KernelEvent::CurrentModeChanged { mode_id } if mode_id == "plan"),
+    );
+    kernel.send_prompt(&sid, UserPrompt::text("external")).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let events = events.lock().unwrap();
+    let started = events
+        .iter()
+        .position(|e| matches!(e, KernelEvent::Started { .. }))
+        .expect("Started position");
+    let commands = events
+        .iter()
+        .position(|e| matches!(e, KernelEvent::AvailableCommandsChanged { .. }))
+        .expect("commands position");
+    assert!(started < commands, "early updates must be replayed after Started: {events:?}");
+    let current_models: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            KernelEvent::ConfigOptionsChanged { options } => options
+                .iter()
+                .find(|option| option.id == "model")
+                .map(|option| option.current_value.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(current_models.contains(&"model-a".to_string()), "{current_models:?}");
+    assert!(current_models.contains(&"model-b".to_string()), "{current_models:?}");
+    assert_eq!(current_models.last().map(String::as_str), Some("model-c"));
+    let options = events
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::ConfigOptionsChanged { options } => Some(options.clone()),
+            _ => None,
+        })
+        .expect("config options");
+    let model = options.iter().find(|option| option.id == "model").unwrap();
+    assert!(
+        model
+            .options
+            .iter()
+            .any(|choice| { choice.id == "model-c" && choice.group.as_deref() == Some("深思") })
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::AvailableCommandsChanged { commands }
+            if commands.iter().any(|command| command.name == "skill:review" && command.requires_input)
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::ContextUsageUpdated { usage }
+            if usage.used == 1200 && usage.size == 10000
+                && usage.cost.as_ref().is_some_and(|cost| cost.amount == 0.125 && cost.currency == "USD")
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::CompactionUpdated { compaction }
+            if compaction.id == "compact-1" && compaction.status == "completed"
+                && compaction.summary.as_deref() == Some("第一段摘要")
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::TitleGenerated { title } if title == "Mock 配置会话"
+    )));
+    assert!(
+        events.iter().any(|e| matches!(e, KernelEvent::Notice(text) if text.contains("mock 通知")))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, KernelEvent::Status(text) if text.starts_with("update:")))
+    );
+}
+
+#[test]
+fn agent_auth_reports_methods_and_allows_retry() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("--require-auth --auth=both", events.clone());
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
+    kernel.new_session(99, SessionSpec::default()).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::AuthRequired { token: 99, .. }));
+    kernel.authenticate("login").unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::AuthCompleted { success: true, .. }));
+    kernel.new_session(99, SessionSpec::default()).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::Started { token: 99, .. }));
+    kernel.shutdown();
+    let events = events.lock().unwrap();
+    let methods = events
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::AuthRequired { methods, .. } => Some(methods.clone()),
+            _ => None,
+        })
+        .expect("auth methods");
+    assert_eq!(methods.len(), 2);
+    assert!(methods.iter().any(|method| method.id == "login"));
+    assert!(methods.iter().any(|method| method.id == "terminal-login"));
+    assert!(events.iter().any(|e| matches!(e, KernelEvent::AuthCompleted { success: true, .. })));
+    assert!(events.iter().any(|e| matches!(e, KernelEvent::Started { token: 99, .. })));
+}
+
+#[test]
+fn agent_auth_does_not_block_other_session_commands() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel =
+        spawn_mock_with_args("--require-auth --auth=agent --auth-delay=2000", events.clone());
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
+    kernel.new_session(99, SessionSpec::default()).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::AuthRequired { token: 99, .. }));
+    kernel.authenticate("login").unwrap();
+    kernel.new_session(100, SessionSpec::default()).unwrap();
+    wait_for(&events, 1_000, |e| matches!(e, KernelEvent::AuthRequired { token: 100, .. }));
+    assert!(!events.lock().unwrap().iter().any(|e| matches!(e, KernelEvent::AuthCompleted { .. })));
+    wait_for(&events, 5_000, |e| matches!(e, KernelEvent::AuthCompleted { success: true, .. }));
+    kernel.new_session(100, SessionSpec::default()).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::Started { token: 100, .. }));
+    kernel.shutdown();
+}
+
+#[test]
+fn elicitation_roundtrip_preserves_field_types() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text("elicit")).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::UserQuestion { .. }));
+    let (id, questions) = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::UserQuestion { id, questions, .. } => Some((*id, questions.clone())),
+            _ => None,
+        })
+        .expect("elicitation question");
+    assert_eq!(questions.len(), 5);
+    assert!(questions.iter().any(|question| {
+        question.id.as_deref() == Some("multi") && question.multi_select && question.required
+    }));
+    assert!(questions.iter().any(|question| {
+        question.id.as_deref() == Some("name")
+            && question.kind == claudesktop_core::QuestionKind::Text
+    }));
+    assert!(questions.iter().any(|question| {
+        question.id.as_deref() == Some("count")
+            && question.kind == claudesktop_core::QuestionKind::Integer
+    }));
+    assert!(questions.iter().any(|question| {
+        question.id.as_deref() == Some("flag")
+            && question.kind == claudesktop_core::QuestionKind::Boolean
+    }));
+    kernel
+        .resolve_question(
+            id,
+            claudesktop_core::QuestionAnswer::Form {
+                values: vec![
+                    claudesktop_core::FormValueView {
+                        id: "choice".into(),
+                        value: claudesktop_core::FormValueKind::Text("safe".into()),
+                    },
+                    claudesktop_core::FormValueView {
+                        id: "multi".into(),
+                        value: claudesktop_core::FormValueKind::Strings(vec![
+                            "core".into(),
+                            "ui".into(),
+                        ]),
+                    },
+                    claudesktop_core::FormValueView {
+                        id: "name".into(),
+                        value: claudesktop_core::FormValueKind::Text("demo".into()),
+                    },
+                    claudesktop_core::FormValueView {
+                        id: "count".into(),
+                        value: claudesktop_core::FormValueKind::Integer(3),
+                    },
+                    claudesktop_core::FormValueView {
+                        id: "flag".into(),
+                        value: claudesktop_core::FormValueKind::Boolean(true),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let text = assistant_text(&events.lock().unwrap());
+    assert!(text.contains("\"action\":\"accept\""), "{text}");
+    assert!(text.contains("\"choice\":\"safe\""), "{text}");
+    assert!(text.contains("\"multi\":[\"core\",\"ui\"]"), "{text}");
+    assert!(text.contains("\"name\":\"demo\""), "{text}");
+    assert!(text.contains("\"count\":3"), "{text}");
+    assert!(text.contains("\"flag\":true"), "{text}");
+}
+
+#[test]
+fn elicitation_cancel_wakes_agent() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text("elicit")).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::UserQuestion { .. }));
+    kernel.cancel(&sid).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    assert!(assistant_text(&events.lock().unwrap()).contains("\"action\":\"cancel\""));
+}
+
+#[test]
+fn prompt_images_follow_agent_capabilities() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("--prompt-image", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, prompt_with_image("blocks?")).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    assert_eq!(assistant_text(&events.lock().unwrap()), "prompt blocks: text,image");
+}
+
+#[test]
+fn prompt_images_are_rejected_before_an_unsupported_prompt() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, prompt_with_image("blocks?")).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::PromptFailed { .. }));
+    kernel.shutdown();
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::PromptFailed { message } if message.contains("不支持图片")
+    )));
+    assert!(!events.iter().any(|e| matches!(e, KernelEvent::TurnEnded { .. })));
+    assert!(!events.iter().any(|e| matches!(e, KernelEvent::AgentMessageChunk { .. })));
+}
+
+#[test]
+fn client_reads_apply_line_ranges_and_preserve_crlf() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let dir = std::env::temp_dir().join(format!("claudesktop-acp-range-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("range.txt");
+    std::fs::write(&file, "a\r\nb\r\nc\r\nd").unwrap();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text(format!("range:{}:2:2", file.display()))).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let events = events.lock().unwrap();
+    let raw = events
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::ToolCallUpdated { raw_output: Some(raw), .. } => Some(raw.clone()),
+            _ => None,
+        })
+        .expect("range output");
+    assert_eq!(raw, "b\r\nc\r\n");
+    assert!(events.iter().any(|e| matches!(e, KernelEvent::FsRead { ok: true, .. })));
+    drop(events);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn client_read_errors_are_real_protocol_errors() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let missing =
+        std::env::temp_dir().join(format!("claudesktop-acp-missing-{}", std::process::id()));
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text(format!("range:{}:1:2", missing.display()))).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|e| matches!(e, KernelEvent::FsRead { ok: false, .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::ToolCallUpdated { raw_output: Some(raw), status: Some(status), .. }
+            if raw.contains("-32002") && status == "failed"
+    )));
+}
+
 /// 等连接就绪 → 创建一个会话 → 返回它的 sessionId。
 fn start_session(kernel: &AcpKernel, events: &Arc<Mutex<Vec<KernelEvent>>>) -> String {
     wait_for(events, 10_000, |e| matches!(e, KernelEvent::Connected { .. }));
@@ -487,6 +844,28 @@ fn client_writes_report_file_changes() {
         _ => None,
     });
     assert_eq!(changed, Some((Some("旧".into()), Some("新".into()))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn client_write_errors_are_reported_to_the_agent() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let dir =
+        std::env::temp_dir().join(format!("claudesktop-acp-write-error-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text(format!("write:{}:新", dir.display()))).unwrap();
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|e| matches!(e, KernelEvent::FsWrite { ok: false, .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        KernelEvent::ToolCallUpdated { raw_output: Some(raw), status: Some(status), .. }
+            if raw.contains("-32603") && status == "failed"
+    )));
+    drop(events);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

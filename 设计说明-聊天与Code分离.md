@@ -219,7 +219,7 @@ Write math in LaTeX: $...$ inline and $$...$$ on its own lines for display. Do n
 |---|---|---|
 | 项目切换（侧栏「项目」菜单） | 有 | **没有** |
 | 权限模式 chip、Shift+Tab 切模式 | 有 | **没有**（快捷键 `cx.propagate()`） |
-| 模型 chip、思考 chip | 有 | 有 |
+| 模型 chip（弹层底部固定思考档位横栏） | 有 | 有 |
 | 附件（图片 / 文件） | 有 | 有，但文件是**内联**的（5.5） |
 | 「联网」chip（`Globe`，开 / 关） | 没有 | **有**：会话级，默认值取设置 `chat.web` |
 | `@` 文件补全 | 有 | **没有**（没有工作目录） |

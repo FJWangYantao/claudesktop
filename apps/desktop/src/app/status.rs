@@ -1,5 +1,5 @@
-//! 对话流末尾的运行状态行：本轮在干什么、跑了多久、正在下发多少 token、怎么停
-//! （对照官方「✳ 5s · ↓ 3.5k tokens · esc to interrupt」；我们的 ✳ 是一只按状态换表情的小陶）。只在当前会话忙时出现；
+//! 对话流末尾的运行状态行：本轮在干什么、跑了多久、正在下发多少 token、怎么停。
+//! 指示器使用极简几何图标或统一圆弧，不再使用卡通表情。
 //! 数据来自 `Session::activity` / `turn_usage` / `turn_started` / `live_output_tokens`
 //! （后者是本轮输出量：端点报过的 + 还在流式、靠字数估的，见 `usage::Streamed`）。
 //! 数出来的和估出来的得分得出来：端点报过用量是实色的 `↓ 1.2k token`，
@@ -49,7 +49,7 @@ impl ChatApp {
             });
         }
         let activity = s.activity();
-        // 左边一只小陶，按状态换表情（mascot.rs 的 Mood）；等授权要用户处理，文字是红的。
+        // 左边是统一的几何状态指示；等授权要用户处理，文字是红的。
         // 只分这几档：具体在跑哪一步看上面的过程组，这里不跟着每个工具来回切
         let (mood, label) = match activity {
             Activity::WaitingPermission => {

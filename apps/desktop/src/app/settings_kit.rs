@@ -31,7 +31,7 @@ pub(super) fn section(
                         .flex_1()
                         .min_w_0()
                         .text_size(TEXT_LEAD)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(WEIGHT_STRONG)
                         .text_color(rgb(INK))
                         .child(title),
                 )

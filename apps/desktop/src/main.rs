@@ -1,10 +1,10 @@
 //! claudesktop 桌面端入口。
 //!
-//! 目标界面：对照新版 Claude Code 桌面端（暖纸底 + 赤陶橙），含
-//! - 自绘窗口框架：浮起的圆角侧栏顶到窗口顶，会话区顶栏兼做拖拽区与窗口按钮
-//! - 会话视图：右对齐用户气泡、思考块、工具行、计划、流式 Markdown、末尾运行状态行
-//! - 空会话首页：问候语 + 用量概览（统计卡 + 热力图）
-//! - 底部输入区：上方环境 / 项目 chips，输入框，下方权限模式 / 内核 / 模型
+//! 目标界面：Kimi Code 风格的极简桌面工作台（中性灰三层表面 + 电光蓝），含
+//! - 自绘窗口框架：可拖拽侧栏、会话区与右侧文件 / Diff 辅助面板
+//! - 会话视图：居中阅读列、78% 用户气泡、思考块、工具行、计划、流式 Markdown、运行状态行
+//! - 空会话首页：简洁文字问候与配置引导
+//! - 底部输入区：同心大圆角卡片、权限模式 / 模型 / 黑底发送按钮
 
 // release 版双击打开不带控制台黑窗（子进程都带 CREATE_NO_WINDOW）；debug 版留着看 stderr
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -280,6 +280,21 @@ fn main() {
                                 "worktree" => app.debug_worktree(cx),
                                 // 把排版样本摆成一轮回复，供对比验证。
                                 "sample-reply" => app.debug_sample_reply(cx),
+                                #[cfg(feature = "headless-screenshot")]
+                                "auth-login" => app.debug_authenticate_first(cx),
+                                #[cfg(feature = "headless-screenshot")]
+                                "agent-question" => app.debug_answer_elicitation(window, cx),
+                                #[cfg(feature = "headless-screenshot")]
+                                "agent-completion" => app.debug_agent_completion(
+                                    std::env::var("CLAUDESKTOP_COMPLETION")
+                                        .unwrap_or_else(|_| "/".into()),
+                                    window,
+                                    cx,
+                                ),
+                                #[cfg(feature = "headless-screenshot")]
+                                "files" | "file-preview" | "changes" | "expanded" => {
+                                    app.debug_right_panel(open.as_str(), cx)
+                                }
                                 _ => {}
                             }
                             #[cfg(feature = "headless-screenshot")]

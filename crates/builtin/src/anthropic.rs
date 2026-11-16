@@ -11,7 +11,9 @@ use crate::provider::{
     StreamOutcome, ToolCall, debug_http, finish_stream, get_json, parse_model_list,
     post_sse_with_retry, read_sse,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
 /// Anthropic 要求必填的 max_tokens 默认值（设置里可覆盖）
 const MAX_TOKENS_DEFAULT: u64 = 16_384;
@@ -65,7 +67,8 @@ impl ChatProvider for AnthropicProvider {
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
         let route = self.endpoint("/messages");
-        let body = build_body(model, messages, tools, &self.config.params).to_string();
+        let body =
+            serde_json::to_string(&request_body(model, messages, tools, &self.config.params))?;
 
         let headers = self.headers();
         let reader =
@@ -155,46 +158,52 @@ fn server_tool_spec(name: &str) -> Option<Value> {
 /// - 服务端工具（[`SERVER_TOOLS`]）和客户端工具合进同一个 `tools` 数组；
 ///   缓存断点仍打在最后一个客户端工具上。
 /// - `extra` 最后浅合并，同名键覆盖上面所有默认值（留一个总开关）。
-fn build_body(
+fn request_body<'a>(
     model: &str,
-    messages: &[ChatMessage],
+    messages: &'a [ChatMessage],
     tools: &[Value],
-    params: &RequestParams,
-) -> Value {
-    let (system, converted) = convert_messages(messages);
+    params: &'a RequestParams,
+) -> impl Serialize + 'a {
     let mut body = json!({
         "model": model,
         "max_tokens": params.max_tokens.unwrap_or(MAX_TOKENS_DEFAULT),
         "stream": true,
-        "messages": converted,
     });
-    if !system.is_empty() {
-        // 提示缓存：系统提示词标记为可缓存（命中后按缓存价计费）
-        body["system"] = json!([{
-            "type": "text",
-            "text": system,
-            "cache_control": { "type": "ephemeral" },
-        }]);
-    }
     let server: Vec<Value> =
         params.server_tools.iter().filter_map(|n| server_tool_spec(n)).collect();
     if !tools.is_empty() || !server.is_empty() {
-        let mut all = convert_tools(tools).as_array().cloned().unwrap_or_default();
+        let Value::Array(mut all) = convert_tools(tools) else { unreachable!() };
         all.extend(server);
         body["tools"] = Value::Array(all);
     }
     if let Some(t) = params.temperature {
         body["temperature"] = json!(t);
     }
-    // 思考强度（档位 → `thinking` / `output_config`，开着时不发 temperature）；
-    // 修 temperature 的那半也在这里
     crate::provider::apply_thinking(&mut body, crate::provider::Protocol::Anthropic, model, params);
-    if let Some(extra) = params.extra.as_object() {
-        for (key, value) in extra {
-            body[key] = value.clone();
-        }
-    }
-    body
+    let system =
+        crate::request::system_text(messages, false).filter(|text| !text.is_empty()).map(|text| {
+            [SystemBlock { kind: "text", text, cache_control: json!({"type":"ephemeral"}) }]
+        });
+    crate::request::RequestBody::new(body, &params.extra, "messages", wire_messages(messages))
+        .with_system("system", system)
+}
+
+#[derive(Serialize)]
+struct SystemBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: Cow<'a, str>,
+    cache_control: Value,
+}
+
+#[cfg(test)]
+fn build_body(
+    model: &str,
+    messages: &[ChatMessage],
+    tools: &[Value],
+    params: &RequestParams,
+) -> Value {
+    serde_json::to_value(request_body(model, messages, tools, params)).unwrap()
 }
 
 /// 把统一消息形状翻译成 Anthropic messages：
@@ -202,109 +211,151 @@ fn build_body(
 /// - 连续的 tool 结果合并进一条 user 消息（Anthropic 要求 tool_result 在 user 轮里）
 /// - 图片段 → `image` block（base64 source）；工具调用 → `tool_use` block
 /// - 首条必须是 user：历史以 assistant 开头时补一条占位
-pub(crate) fn convert_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
-    let mut system_parts: Vec<String> = Vec::new();
-    let mut out: Vec<Value> = Vec::new();
-    // 待合并的 tool_result 块（遇到非 tool 消息或收尾时冲成一条 user 消息）
-    let mut tool_results: Vec<Value> = Vec::new();
-    let flush_results = |out: &mut Vec<Value>, tool_results: &mut Vec<Value>| {
+fn wire_messages<'a>(messages: &'a [ChatMessage]) -> Vec<WireMessage<'a>> {
+    let mut out = Vec::new();
+    let mut tool_results = Vec::new();
+    let flush_results = |out: &mut Vec<WireMessage<'a>>, tool_results: &mut Vec<WireBlock<'a>>| {
         if !tool_results.is_empty() {
-            out.push(json!({ "role": "user", "content": tool_results.clone() }));
-            tool_results.clear();
+            out.push(WireMessage {
+                role: "user",
+                content: WireMessageContent::Blocks(std::mem::take(tool_results)),
+            });
         }
     };
-
     for message in messages {
         match message.role.as_str() {
-            "system" => {
-                if let Some(text) = message.text() {
-                    system_parts.push(text);
-                }
-            }
             "tool" => {
-                // tool_result 的 content 可以是纯文本，也可以是 text + image 块（MCP 多模态结果）：
-                // 没有图片时保持纯字符串（和以前一样，也少一层嵌套）
-                let images: Vec<Value> = message
+                let mut images: Vec<_> = message
                     .parts
                     .iter()
                     .filter_map(|part| match part {
-                        crate::provider::ContentPart::Image { media_type, data } => Some(json!({
-                            "type": "image",
-                            "source": { "type": "base64", "media_type": media_type, "data": data },
-                        })),
+                        crate::provider::ContentPart::Image { media_type, data } => {
+                            Some(WireContent::Image {
+                                source: ImageSource { kind: "base64", media_type, data },
+                            })
+                        }
                         _ => None,
                     })
                     .collect();
+                let text = message.text_ref().unwrap_or_default();
                 let content = if images.is_empty() {
-                    json!(message.text().unwrap_or_default())
+                    WireToolContent::Text(text)
                 } else {
-                    let mut blocks = vec![json!({
-                        "type": "text",
-                        "text": message.text().unwrap_or_default(),
-                    })];
-                    blocks.extend(images);
-                    json!(blocks)
+                    images.insert(0, WireContent::Text { text });
+                    WireToolContent::Blocks(images)
                 };
-                tool_results.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "content": content,
+                tool_results.push(WireBlock::Content(WireContent::ToolResult {
+                    tool_use_id: message.tool_call_id.as_deref().unwrap_or_default(),
+                    content,
                 }));
             }
-            "user" => {
+            "user" | "assistant" => {
                 flush_results(&mut out, &mut tool_results);
-                let blocks = content_blocks(message);
-                if !blocks.is_empty() {
-                    out.push(json!({ "role": "user", "content": blocks }));
-                }
-            }
-            "assistant" => {
-                flush_results(&mut out, &mut tool_results);
-                // 思考块必须在最前（开了思考时，带 tool_use 的 assistant 轮缺了它会被拒）
-                let mut blocks = message.thinking.clone();
-                blocks.extend(content_blocks(message));
-                for call in &message.tool_calls {
-                    blocks.push(json!({
-                        "type": "tool_use",
-                        "id": call.id,
-                        "name": call.function.name,
-                        "input": serde_json::from_str::<Value>(&call.function.arguments)
-                            .unwrap_or_else(|_| json!({})),
+                let assistant = message.role == "assistant";
+                let mut blocks: Vec<_> = if assistant {
+                    message.thinking.iter().map(WireBlock::Thinking).collect()
+                } else {
+                    Vec::new()
+                };
+                blocks.extend(content_blocks(message).into_iter().map(WireBlock::Content));
+                if assistant {
+                    blocks.extend(message.tool_calls.iter().map(|call| {
+                        WireBlock::Content(WireContent::ToolUse {
+                            id: &call.id,
+                            name: &call.function.name,
+                            input: serde_json::from_str(&call.function.arguments)
+                                .unwrap_or_else(|_| json!({})),
+                        })
                     }));
                 }
                 if !blocks.is_empty() {
-                    out.push(json!({ "role": "assistant", "content": blocks }));
+                    out.push(WireMessage {
+                        role: if assistant { "assistant" } else { "user" },
+                        content: WireMessageContent::Blocks(blocks),
+                    });
                 }
             }
             _ => {}
         }
     }
     flush_results(&mut out, &mut tool_results);
-    // 首条必须 user（续接场景历史可能以 assistant 开头）
-    if out.first().and_then(|m| m.get("role")).and_then(Value::as_str) == Some("assistant") {
-        out.insert(0, json!({ "role": "user", "content": "(conversation continues)" }));
+    if out.first().is_some_and(|message| message.role == "assistant") {
+        out.insert(
+            0,
+            WireMessage {
+                role: "user",
+                content: WireMessageContent::Text("(conversation continues)"),
+            },
+        );
     }
-    (system_parts.join("\n\n"), out)
+    out
 }
 
-/// 一条消息的文本 / 图片分段 → Anthropic content blocks（空文本段跳过，
-/// Anthropic 不接受空文本块）。
-fn content_blocks(message: &ChatMessage) -> Vec<Value> {
+#[derive(Serialize)]
+struct WireMessage<'a> {
+    role: &'static str,
+    content: WireMessageContent<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireMessageContent<'a> {
+    Text(&'static str),
+    Blocks(Vec<WireBlock<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireBlock<'a> {
+    Thinking(&'a Value),
+    Content(WireContent<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireContent<'a> {
+    Text { text: Cow<'a, str> },
+    Image { source: ImageSource<'a> },
+    ToolUse { id: &'a str, name: &'a str, input: Value },
+    ToolResult { tool_use_id: &'a str, content: WireToolContent<'a> },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireToolContent<'a> {
+    Text(Cow<'a, str>),
+    Blocks(Vec<WireContent<'a>>),
+}
+
+#[derive(Serialize)]
+struct ImageSource<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'a str,
+    data: &'a str,
+}
+
+fn content_blocks(message: &ChatMessage) -> Vec<WireContent<'_>> {
     message
         .parts
         .iter()
-        .filter(|part| match part {
-            crate::provider::ContentPart::Text(t) => !t.is_empty(),
-            _ => true,
-        })
-        .map(|part| match part {
-            crate::provider::ContentPart::Text(text) => json!({ "type": "text", "text": text }),
-            crate::provider::ContentPart::Image { media_type, data } => json!({
-                "type": "image",
-                "source": { "type": "base64", "media_type": media_type, "data": data },
+        .filter_map(|part| match part {
+            crate::provider::ContentPart::Text(text) if text.is_empty() => None,
+            crate::provider::ContentPart::Text(text) => {
+                Some(WireContent::Text { text: Cow::Borrowed(text) })
+            }
+            crate::provider::ContentPart::Image { media_type, data } => Some(WireContent::Image {
+                source: ImageSource { kind: "base64", media_type, data },
             }),
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn convert_messages(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+    let system = crate::request::system_text(messages, false).unwrap_or_default().into_owned();
+    let out = serde_json::to_value(wire_messages(messages)).unwrap();
+    (system, out.as_array().unwrap().clone())
 }
 
 /// OpenAI 形状的工具定义 → Anthropic 形状；最后一个工具标缓存断点。
@@ -999,8 +1050,8 @@ mod tests {
     fn server_tool_text_goes_back_into_history() {
         let mut m = M::new("assistant", "我查一下");
         m.parts.push(ContentPart::Text("[服务端工具 web_search_tool_result] 1. 甲 — u".into()));
-        let blocks = content_blocks(&m);
-        assert_eq!(blocks.len(), 2);
+        let blocks = serde_json::to_value(content_blocks(&m)).unwrap();
+        assert_eq!(blocks.as_array().unwrap().len(), 2);
         assert_eq!(blocks[0]["text"], "我查一下");
         assert!(blocks[1]["text"].as_str().unwrap().contains("web_search_tool_result"));
     }

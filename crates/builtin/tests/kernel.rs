@@ -2983,6 +2983,62 @@ fn gateway_forwards_the_stream_and_logs_every_attempt() {
 }
 
 #[test]
+fn gateway_preserves_request_bytes_and_stats_for_nonstandard_json() {
+    let payloads = [
+        r#"{"model":"m","messages":[{},{}],"tools":[{}]}"#,
+        r#"{"input":[1,2,3],"messages":null,"model":false,"tools":[]}"#,
+        r#"{"model":"old","model":"new","input":[{}],"tools":null}"#,
+        r#"{"\u006dodel":"escaped","input":"plain input","metadata":false}"#,
+        r#"{"model":"m","unused":1e999}"#,
+        r#"{"model":"m","unused":"\uD800"}"#,
+        r#"{"model":"m","messages":[]} trailing"#,
+        r#"["non-object",{"model":"nested"}]"#,
+    ];
+    let (base, bodies) = serve(payloads.iter().map(|_| happy_stream("forwarded")).collect());
+    let dir = workdir("gateway-stat-shapes");
+    let gateway = claudesktop_builtin::gateway::Gateway::start(dir.clone()).unwrap();
+    let via = claudesktop_builtin::gateway::via_url(&gateway, &base);
+    let (host, path) = via.trim_start_matches("http://").split_once('/').unwrap();
+    for payload in payloads {
+        let mut stream = TcpStream::connect(host).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(stream,
+            "POST /{path}/chat/completions HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len(),
+        ).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("forwarded"));
+    }
+    let logs = gateway_log(&dir, payloads.len());
+    for (index, payload) in payloads.iter().enumerate() {
+        assert_eq!(bodies.lock().unwrap()[index], *payload);
+        let original = serde_json::from_str::<serde_json::Value>(payload).ok();
+        let expected_model =
+            original.as_ref().and_then(|v| v.get("model")).and_then(|v| v.as_str());
+        let expected_messages = original
+            .as_ref()
+            .and_then(|v| v.get("messages").or_else(|| v.get("input")))
+            .and_then(|v| v.as_array())
+            .map(Vec::len);
+        let expected_tools =
+            original.as_ref().and_then(|v| v.get("tools")).and_then(|v| v.as_array()).map(Vec::len);
+        let log = &logs[index];
+        assert_eq!(log["model"].as_str(), expected_model);
+        assert_eq!(log["messages"].as_u64(), expected_messages.map(|n| n as u64));
+        assert_eq!(log["tools"].as_u64(), expected_tools.map(|n| n as u64));
+        assert_eq!(log["body_bytes"], payload.len());
+        let compressed = dir.join(format!("{}.req.json.gz", log["body"].as_str().unwrap()));
+        let mut saved = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(compressed).unwrap())
+            .read_to_string(&mut saved)
+            .unwrap();
+        assert_eq!(saved, *payload);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn gateway_reports_unreachable_endpoints_like_a_direct_connection() {
     // 拿一个空闲端口再放掉：连不上
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

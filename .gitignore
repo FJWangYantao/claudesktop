@@ -8,6 +8,8 @@
 tools/*.png
 # memwatch 的运行输出（逐秒内存打点），数据不进仓库；脚本本身保留
 tools/memwatch.csv
+tools/mem-baseline.csv
+tools/mem-reclaim.csv
 # One-off probes for those shots (kept out of the repo: hard-coded local paths)
 tools/scan.ps1
 tools/shot_one.ps1
@@ -17,6 +19,11 @@ tools/ascii-shot.ps1
 
 # 本机状态（记忆、日志等），不进仓库
 /.claudesktop/
+/.haji/
+/pi-session-*.html
+
+# 临时解包的第三方插件
+/_wb_plugin_check/
 
 # 一次性调研：Claude Code 前端构建产物的静态分析原文（270 KB，无引用）
 /调研报告-Claude-Code前端.md

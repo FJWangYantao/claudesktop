@@ -3,7 +3,7 @@
 use super::ChatApp;
 use super::chrome::CHROME_H;
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
-use super::settings_view::active_thinking;
+use super::settings_view::{active_thinking, thinking_options};
 use super::widgets::Surface;
 use crate::model::PendingImage;
 use crate::settings::KernelChoice;
@@ -114,7 +114,7 @@ impl ChatApp {
         eprintln!("restored mode menu verified before reconnecting");
     }
 
-    /// 思考强度下拉里选了一档：只作用于**这个会话**，不动设置文件里的档案。
+    /// 模型菜单底栏里选了一档：只作用于**这个会话**，不动设置文件里的档案。
     /// 已建立的内核会话下一轮请求起生效；还没建立的等 `Started` 再补（`flush_pending_thinking`）。
     pub(crate) fn choose_thinking(&mut self, level: Option<ThinkingLevel>, cx: &mut Context<Self>) {
         let kernel = self.session_kernel(self.active);
@@ -224,7 +224,7 @@ impl ChatApp {
             .relative()
             .size(px(56.))
             .flex_shrink_0()
-            .rounded_md()
+            .rounded(COMPOSER_INNER_RADIUS)
             .overflow_hidden()
             .border_1()
             .border_color(rgb(LINE))
@@ -268,7 +268,7 @@ impl ChatApp {
             .pl_2()
             .pr_1()
             .h(px(56.))
-            .rounded_md()
+            .rounded(COMPOSER_INNER_RADIUS)
             .border_1()
             .border_color(rgb(LINE))
             .bg(rgb(SAND))
@@ -339,7 +339,7 @@ impl ChatApp {
         let focused =
             window.is_window_active() && self.input.read(cx).focus_handle(cx).is_focused(window);
 
-        // 发送按钮三态：空（淡、不可点）/ 可发送（赤陶）/ 忙（深色停止方块，同 Esc）
+        // 发送按钮三态：空（淡、不可点）/ 可发送（黑底白箭头，Kimi 风格）/ 忙（深色停止方块，同 Esc）
         // 还有图在后台处理时也按「不可点」画
         let can_send = (!self.input.read(cx).value().trim().is_empty()
             || !self.pending.is_empty()
@@ -347,19 +347,21 @@ impl ChatApp {
             && !self.pending.iter().any(|p| p.preparing);
         let send_bg = match (busy, can_send) {
             (true, _) => INK,
-            (false, true) => CORAL,
+            (false, true) => SEND_BG,
             (false, false) => SAND,
         };
         let send = div()
             .id("send")
-            .size(px(28.))
+            .size(px(30.))
             .flex_shrink_0()
-            .rounded_lg()
+            .rounded_full()
             .bg(rgb(send_bg))
             .flex()
             .justify_center()
             .items_center()
-            .when(busy || can_send, |d| d.cursor_pointer())
+            .when(busy || can_send, |d| {
+                d.cursor_pointer().hover(|d| d.bg(rgb(if busy { INK } else { SEND_BG_HOVER })))
+            })
             .tooltip(move |window, cx| {
                 Tooltip::new(match (busy, can_send) {
                     (true, _) => "停止（Esc）；回车把输入排进队列",
@@ -370,12 +372,11 @@ impl ChatApp {
             })
             .child(if busy {
                 // 停止方块取纸色：浅色下是深底白块，深色下是浅底深块
-                div().size(px(9.)).rounded_xs().bg(rgb(PAPER)).into_any_element()
+                div().size(px(9.)).rounded_xs().bg(rgb(SEND_FG)).into_any_element()
             } else {
                 Icon::new(IconAll::ArrowUp)
                     .size_4()
-                    // CORAL 底上的箭头用 ON_ACCENT：有的配色深色版这个底很亮，白箭头看不清
-                    .text_color(rgb(if can_send { ON_ACCENT } else { INK_FAINT }))
+                    .text_color(rgb(if can_send { SEND_FG } else { INK_FAINT }))
                     .into_any_element()
             })
             .on_click(cx.listener(|this, _, window, cx| {
@@ -432,7 +433,6 @@ impl ChatApp {
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
             ))
             .children(self.render_context_gauge())
-            .children(render_thinking_chip(self, &app))
             .child(model_menu_popover(
                 &app,
                 &self.menu_focus,
@@ -445,24 +445,23 @@ impl ChatApp {
             .child(div().pl_1().flex_shrink_0().child(send));
 
         // 一张卡片：附件缩略图、随内容长高的多行输入（至少两行），底边是工具栏。
-        // 静止：细边 + 一层贴地的阴影；悬停边框加深一档（提示整块都能点）；
-        // 聚焦：边框保持 `LINE_STRONG`，外面套三层焦点环（一道纸色缝 + 实边 + 光晕，见 `focus_ring`）。
-        // 鼠标点进来也出环：输入框是这张卡片的主体，点了它就是「正在这里打字」，
-        // 和按钮那种「键盘 Tab 才出环」的语义不同（见 `focus_visible`）。
+        // 静止：极淡细边，无阴影；悬停边框加深一档（提示整块都能点）。
+        // 聚焦：边框保持 `LINE_STRONG`，外面只套一层淡强调色光晕（`composer_focus_shadow`）。
+        // 卡片与内部附件使用同心圆角；鼠标点进来也出聚焦态。
         let card = div()
             .id("composer")
             .v_flex()
             .w_full()
             .bg(rgb(CARD))
             .border_1()
-            .border_color(rgb(if focused { LINE_STRONG } else { LINE }))
+            .border_color(rgb(if focused { LINE_STRONG } else { COMPOSER_LINE }))
             .when(!focused, |d| d.hover(|d| d.border_color(rgb(LINE_STRONG))))
-            .rounded_2xl()
+            .rounded(COMPOSER_RADIUS)
             // 兜底：外面的 chip / 按钮都允许压窄，正常排不下时先缩它们；万一还有排不下的
             // （极端窄 + 超大字号），按卡片边界裁掉，别让按钮飘到卡片外面。
             // 弹层是 deferred 画的（不套这里的 content mask），菜单照常露出卡片
             .overflow_hidden()
-            .shadow(if focused { focus_ring(INK_FAINT) } else { raised_shadow() })
+            .shadow(if focused { composer_focus_shadow() } else { Vec::new() })
             // 发送键离右边和底边都是 8px
             .px_2()
             .pt_1p5()
@@ -567,20 +566,101 @@ impl ChatApp {
             )
     }
 
+    pub(crate) fn authenticate_agent(&mut self, method_id: String, cx: &mut Context<Self>) {
+        let active = self.active;
+        if self.sessions[active].auth.as_ref().is_none_or(|auth| auth.busy) {
+            return;
+        }
+        let Some(kernel) = self.session_kernel(active) else {
+            if let Some(auth) = &mut self.sessions[active].auth {
+                auth.message = "当前内核不可用，无法登录".into();
+            }
+            cx.notify();
+            return;
+        };
+        match kernel.authenticate(&method_id) {
+            Ok(()) => {
+                if let Some(auth) = &mut self.sessions[active].auth {
+                    auth.busy = true;
+                }
+            }
+            Err(err) => {
+                if let Some(auth) = &mut self.sessions[active].auth {
+                    auth.message = format!("登录失败：{err}").into();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_auth_panel(&self, cx: &mut Context<Self>) -> Div {
+        let auth = self.session().auth.as_ref().expect("登录面板状态");
+        let mut methods = div().h_flex().gap_2().flex_wrap();
+        for (i, method) in auth.methods.iter().enumerate() {
+            let id = method.id.clone();
+            methods = methods.child(
+                Self::text_button(("auth-method", i), method.name.clone(), i == 0)
+                    .small()
+                    .loading(auth.busy)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.authenticate_agent(id.clone(), cx);
+                    })),
+            );
+        }
+        div()
+            .v_flex()
+            .gap_2()
+            .p_3()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CARD))
+            .shadow(float_shadow())
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::new(IconAll::Shield).size_4().text_color(rgb(CORAL)))
+                    .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child("需要登录")),
+            )
+            .child(
+                div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(auth.message.clone()),
+            )
+            .child(methods)
+            .child(
+                div()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child("登录由 agent 完成，claudesktop 不读取凭据"),
+            )
+    }
+
     /// 输入框正上方的提问面板（`ask_user`）：一次只问一题，点一个选项就走到下一题，
     /// 最后一题选完直接交给模型——所以没有「就这样」那一排按钮。
     /// 和补全面板一样按输入框上沿量到的位置限高，窗口矮 / 字号大时在面板里滚。
     fn render_question_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        if self.session().auth.is_some() {
+            return Some(self.render_auth_panel(cx));
+        }
         let item_idx = self.session().pending_question()?;
-        let crate::model::ChatItem::Question { questions, .. } =
+        let crate::model::ChatItem::Question { questions, picks, multi_picks, .. } =
             &self.session().transcript[item_idx]
         else {
             return None;
         };
         let cursor = self.session().question_cursor(item_idx)?;
         let question = questions.get(cursor)?;
+        let multi = question.multi_select;
+        let freeform = matches!(
+            question.kind,
+            claudesktop_core::QuestionKind::Text
+                | claudesktop_core::QuestionKind::Number
+                | claudesktop_core::QuestionKind::Integer
+        );
         let total = questions.len();
         let last = cursor + 1 >= total;
+        let is_form = questions.iter().any(|question| question.id.is_some());
         let rem = window.rem_size();
         let max_h = self.composer_top.get().map(|top| {
             let gap = rems(1.).to_pixels(rem);
@@ -649,6 +729,11 @@ impl ChatApp {
         }
         for (o, option) in question.options.iter().enumerate() {
             let key = super::keys::PERMISSION_KEYS.get(o).copied();
+            let selected = if multi {
+                multi_picks.get(cursor).is_some_and(|selected| selected.contains(&o))
+            } else {
+                picks.get(cursor) == Some(&Some(o))
+            };
             rows =
                 rows.child(
                     div()
@@ -666,10 +751,10 @@ impl ChatApp {
                             this.pick_question(item_idx, cursor, o, cx);
                         }))
                         .child(
-                            Icon::new(IconAll::Circle)
+                            Icon::new(if selected { IconAll::Check } else { IconAll::Circle })
                                 .size_3p5()
                                 .flex_shrink_0()
-                                .text_color(rgb(INK_FAINT)),
+                                .text_color(rgb(if selected { CORAL } else { INK_FAINT })),
                         )
                         .child(
                             div()
@@ -713,11 +798,20 @@ impl ChatApp {
             .pb_1p5()
             .text_size(TEXT_META)
             .text_color(rgb(INK_SOFT))
-            .child(div().flex_1().min_w_0().child(if last {
+            .child(div().flex_1().min_w_0().child(if freeform {
+                "在下方输入回答，回车提交"
+            } else if multi {
+                "选完点提交"
+            } else if last {
                 "选一个就交给模型"
             } else {
                 "选一个继续下一题"
             }))
+            .when(multi || (is_form && !freeform && last), |d| {
+                d.child(link("question-submit", if last { "提交" } else { "继续" }).on_click(
+                    cx.listener(move |this, _, _, cx| this.submit_question(item_idx, cx)),
+                ))
+            })
             .child(link("question-self", "自己说").on_click(cx.listener(
                 move |this, _, window, cx| {
                     this.self_answer_question(item_idx, window, cx);
@@ -1075,46 +1169,19 @@ fn model_menu_popover(
     chip: MenuChip,
 ) -> Popover {
     let fetch = handle.clone();
-    menu_popover(id, anchor, rems(17.5), handle, focus, chip, model_menu_items).on_open_change(
-        move |open, _, cx| {
+    menu_popover(id, anchor, rems(22.5), handle, focus, chip, model_menu_items)
+        .on_open_change(move |open, _, cx| {
             if *open {
                 fetch.update(cx, |app, cx| app.fetch_models_for_menu(cx));
             }
-        },
-    )
+        })
+        .default_open(
+            cfg!(feature = "headless-screenshot")
+                && std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("composer-model-menu"),
+        )
 }
 
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
-
-/// 会话级思考档位 chip 的文字：没选过就是「默认」（跟随设置里的档案）。
-/// 显示的是这个模型上实际生效的那一档（换了模型后存着的档位可能被降级，或在认不出的模型上不发）
-fn thinking_chip(app: &ChatApp) -> Option<MenuChip> {
-    if app.session().kernel != KernelChoice::Builtin {
-        return None;
-    }
-    let spec = session_thinking_spec(app);
-    let label = active_thinking(&spec, app.session().thinking).map_or("默认", ThinkingLevel::label);
-    Some(MenuChip::new(IconAll::Brain, label))
-}
-
-/// 会话级思考档位 chip：ACP 内核不画（模型由 agent 自己定）。点开是 `thinking_menu_items`。
-/// 在 `ChatApp` 自己的 render 里调：状态直接从 `this` 读，别 `handle.read(cx)`
-///（实体正在 update，再读一次就是 double lease，一打开窗口就崩）。
-fn render_thinking_chip(this: &ChatApp, handle: &Entity<ChatApp>) -> Option<AnyElement> {
-    let chip = thinking_chip(this)?;
-    Some(
-        menu_popover(
-            "thinking-menu",
-            Anchor::BottomRight,
-            rems(17.5),
-            handle,
-            &this.menu_focus,
-            chip,
-            thinking_menu_items,
-        )
-        .into_any_element(),
-    )
-}
 
 /// 会话当前模型的档位表：能选哪些档、字段怎么发，都以它为准
 pub(crate) fn session_thinking_spec(app: &ChatApp) -> claudesktop_builtin::ThinkingSpec {
@@ -1134,94 +1201,6 @@ pub(crate) fn thinking_wire(level: ThinkingLevel) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "high".into())
-}
-
-/// 思考档位条目：能选哪些档跟当前模型现算，实际生效的那一档打勾。
-/// 认不出的模型只有「默认 / 兜底」：别的档位在它上面什么都不发（见 `apply_thinking`），列出来是误导
-fn thinking_menu_items(
-    app: &ChatApp,
-    handle: &Entity<ChatApp>,
-    popover: &Entity<PopoverState>,
-) -> MenuList {
-    let spec = session_thinking_spec(app);
-    let active = active_thinking(&spec, app.session().thinking);
-    let mut menu = MenuList::new("thinking-menu-list", handle, popover);
-    // 「默认」= 这个会话不覆盖，用设置里给档案配的那一档
-    menu = menu.pick(
-        menu_item(
-            "thinking-default",
-            IconAll::Circle,
-            "默认",
-            "用「设置 · 内核」给这个档案配的那一档",
-            active.is_none(),
-        ),
-        |this, cx| this.choose_thinking(None, cx),
-    );
-    if spec.is_known() {
-        for level in spec.choices() {
-            let level = *level;
-            menu = menu.pick(
-                menu_item(
-                    ("thinking-item", thinking_key(level)),
-                    thinking_icon(level),
-                    level.label(),
-                    thinking_hint(level),
-                    active == Some(level),
-                ),
-                move |this, cx| this.choose_thinking(Some(level), cx),
-            );
-        }
-    } else {
-        // 认不出的模型：只有「兜底」（按通用的 effort 字段发）
-        menu = menu.pick(
-            menu_item(
-                "thinking-fallback",
-                IconAll::Sparkles,
-                ThinkingLevel::Default.label(),
-                "还不知道这个模型认不认，按通用的 effort 字段发",
-                active == Some(ThinkingLevel::Default),
-            ),
-            |this, cx| this.choose_thinking(Some(ThinkingLevel::Default), cx),
-        );
-    }
-    menu
-}
-
-/// 档位 → `MenuList` 的稳定下标（不能用文案，文案会变）
-fn thinking_key(level: ThinkingLevel) -> usize {
-    match level {
-        ThinkingLevel::Off => 0,
-        ThinkingLevel::Minimal => 1,
-        ThinkingLevel::Low => 2,
-        ThinkingLevel::Medium => 3,
-        ThinkingLevel::High => 4,
-        ThinkingLevel::XHigh => 5,
-        ThinkingLevel::Max => 6,
-        ThinkingLevel::Default => 7,
-    }
-}
-
-fn thinking_icon(level: ThinkingLevel) -> IconAll {
-    match level {
-        ThinkingLevel::Off => IconAll::Circle,
-        ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => IconAll::Gauge,
-        ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => IconAll::Zap,
-        ThinkingLevel::Default => IconAll::Sparkles,
-    }
-}
-
-/// 条目第二行的灰色说明：写「这是干什么的」，不写具体档位名（各家叫法不一样，说了反而误导）
-fn thinking_hint(level: ThinkingLevel) -> &'static str {
-    match level {
-        ThinkingLevel::Off => "不思考，最快也最便宜",
-        ThinkingLevel::Minimal => "极短的思考",
-        ThinkingLevel::Low => "简单任务足够",
-        ThinkingLevel::Medium => "日常任务的平衡档",
-        ThinkingLevel::High => "推理充分一些，慢一点",
-        ThinkingLevel::XHigh => "复杂任务用，明显更慢",
-        ThinkingLevel::Max => "最高档，最慢也最贵",
-        ThinkingLevel::Default => "按通用的 effort 字段发",
-    }
 }
 
 /// 权限模式条目：单行图标与名称，当前项打勾。
@@ -1248,7 +1227,7 @@ fn mode_menu_items(
     menu
 }
 
-/// 模型条目：非自研内核给提示；列表 + 刷新入口（刷新不收起面板，看得到进度）。
+/// 模型条目：非自研内核给提示；模型列表滚动，刷新与当前模型的思考档位固定在底部。
 fn model_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
@@ -1258,9 +1237,9 @@ fn model_menu_items(
         div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
     };
     let builtin = app.session().kernel == KernelChoice::Builtin;
-    let mut menu = MenuList::new("model-menu-list", handle, popover).scroll(rems(24.));
+    let mut menu = MenuList::new("model-menu-list", handle, popover).scroll(rems(20.));
     if !builtin {
-        return menu.child(hint("当前内核的模型由 agent 自己决定，这里不能切换".into()));
+        return agent_model_menu(app, menu);
     }
     // 所有来源的模型都列出来（在「设置 · 模型」里勾掉的不进），按来源分组；
     // 挑别家来源的模型会自动切到那家（端点跟着换，见 `choose_model_from`）。
@@ -1323,25 +1302,116 @@ fn model_menu_items(
             "模型都在「设置 · 模型」里关着，去勾几个进来".into()
         }));
     }
-    let handle = handle.clone();
-    menu.child(
-        div()
-            .id("model-refresh")
+    let refresh_handle = handle.clone();
+    let refresh = div()
+        .id("model-refresh")
+        .h_flex()
+        .gap_2()
+        .px_2p5()
+        .py_1p5()
+        .border_t_1()
+        .border_color(rgb(LINE))
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(HOVER)))
+        .text_size(TEXT_SMALL)
+        .text_color(rgb(INK_SOFT))
+        .on_click(move |_, _, cx| {
+            refresh_handle.update(cx, |this, cx| this.fetch_models(false, cx));
+        })
+        .child(Icon::new(IconAll::RefreshCw).size_3p5())
+        .child("刷新模型列表");
+    let mut footer = div().v_flex().child(refresh);
+
+    let spec = session_thinking_spec(app);
+    let active = active_thinking(&spec, app.session().thinking);
+    let mut options = div()
+        .id("model-thinking-options")
+        .h_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_0p5()
+        .overflow_x_scroll();
+    for (i, (level, label)) in thinking_options(&spec).into_iter().enumerate() {
+        let selected = active == level;
+        let row = div()
+            .id(("model-thinking", i))
+            .role(Role::MenuItem)
+            .aria_selected(selected)
             .h_flex()
-            .gap_2()
+            .justify_center()
+            .flex_shrink_0()
+            .px_1p5()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(TEXT_SMALL)
+            .text_color(rgb(if selected { INK } else { INK_SOFT }))
+            .bg(if selected { rgb(SELECTED) } else { rgba(CLEAR) })
+            .when(!selected, |d| d.hover(|d| d.bg(rgb(HOVER))))
+            .child(label);
+        options =
+            options.child(menu.footer_pick(row, move |this, cx| this.choose_thinking(level, cx)));
+    }
+    footer = footer.child(
+        div()
+            .h_flex()
+            .items_center()
+            .gap_1()
             .px_2p5()
-            .py_1p5()
-            .mt_0p5()
+            .py_2()
             .border_t_1()
             .border_color(rgb(LINE))
-            .cursor_pointer()
-            .hover(|d| d.bg(rgb(HOVER)))
-            .text_size(TEXT_SMALL)
-            .text_color(rgb(INK_SOFT))
-            .on_click(move |_, _, cx| {
-                handle.update(cx, |this, cx| this.fetch_models(false, cx));
-            })
-            .child(Icon::new(IconAll::RefreshCw).size_3p5())
-            .child("刷新模型列表"),
-    )
+            .child(
+                div().flex_shrink_0().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("思考"),
+            )
+            .child(options),
+    );
+    menu.footer(footer)
+}
+
+fn agent_model_menu(app: &ChatApp, mut menu: MenuList) -> MenuList {
+    let hint = |text: SharedString| {
+        div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
+    };
+    let Some(config) = app
+        .session()
+        .config_options
+        .iter()
+        .find(|option| option.category == "model" || option.id == "model")
+    else {
+        return menu.child(hint("agent 未上报模型列表，请在 agent 自己的界面里切换".into()));
+    };
+    let mut group = None;
+    for (i, choice) in config.options.iter().enumerate() {
+        if choice.group != group {
+            group = choice.group.clone();
+            if let Some(name) = &group {
+                menu = menu.child(
+                    div()
+                        .px_2p5()
+                        .pt_2()
+                        .pb_0p5()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .child(name.clone()),
+                );
+            }
+        }
+        let active = choice.id == config.current_value;
+        let id = choice.id.clone();
+        menu = menu.pick(
+            menu_item(
+                ("agent-model-item", i),
+                IconAll::Cpu,
+                choice.name.clone(),
+                choice.description.clone().unwrap_or_else(|| choice.id.clone()),
+                active,
+            ),
+            move |this, cx| this.choose_model(id.clone(), cx),
+        );
+    }
+    if config.options.is_empty() {
+        menu = menu.child(hint("agent 未上报模型列表，请在 agent 自己的界面里切换".into()));
+    }
+    menu
 }

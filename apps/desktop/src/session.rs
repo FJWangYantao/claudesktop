@@ -5,7 +5,8 @@ use crate::model::*;
 use crate::settings::KernelChoice;
 use crate::usage::Streamed;
 use claudesktop_core::{
-    DiffView, Kernel, KernelEvent, ModeView, Record, SessionKind, SessionLog, SessionMeta,
+    AvailableCommandView, CompactionView, ConfigOptionView, ContextUsageView, CostView, DiffView,
+    Kernel, KernelEvent, ModeView, Record, SessionKind, SessionLog, SessionMeta,
 };
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -50,6 +51,16 @@ pub struct Session {
     pub modes: Vec<ModeEntry>,
     pub permission_mode: usize, // modes 下标
     pub model_label: SharedString,
+    /// 正在等待用户选择的登录方式；只在内存里，不进入会话日志
+    pub auth: Option<AuthRequestView>,
+    /// ACP 上报的完整配置（模型、思考档位及其他选项）
+    pub config_options: Vec<ConfigOptionView>,
+    /// ACP 上报的斜杠命令 / Skills
+    pub available_commands: Vec<AvailableCommandView>,
+    /// ACP 上报的上下文窗口大小，和本轮 token 分开
+    pub context_size: Option<u64>,
+    /// ACP 上报的会话累计费用，和本轮 token 分开
+    pub context_cost: Option<CostView>,
     /// 自动演示：会话就绪后发送的提示词
     pub autoprompt: Option<claudesktop_core::UserPrompt>,
     /// 会话工作目录（侧栏按它分组；session/new 用它）
@@ -397,6 +408,11 @@ impl Session {
             permission_mode: 0,
             // 演示回放用假模型名；真内核等 Started 上报，没上报就一直显示「默认模型」
             model_label: if is_demo { "GLM-5.3" } else { UNKNOWN_MODEL }.into(),
+            auth: None,
+            config_options: Vec::new(),
+            available_commands: Vec::new(),
+            context_size: None,
+            context_cost: None,
             autoprompt: None,
             cwd,
             kind,
@@ -1193,7 +1209,7 @@ impl Session {
 
     /// 在等用户处理：授权或回答问题（侧栏红点、通知都看这个）
     pub fn waiting_user(&self) -> bool {
-        self.waiting_permission() || self.waiting_question()
+        self.waiting_permission() || self.waiting_question() || self.auth.is_some()
     }
 
     /// 有还没回答的提问
@@ -1279,6 +1295,25 @@ impl Session {
         {
             *state = result;
         }
+    }
+
+    fn apply_acp_compaction(&mut self, compaction: CompactionView) {
+        let state = match compaction.status.as_str() {
+            "completed" => CompactState::Done(compaction.summary.unwrap_or_default().into()),
+            "failed" | "cancelled" => CompactState::Failed(
+                compaction.error.or(compaction.summary).unwrap_or(compaction.status.clone()).into(),
+            ),
+            _ => CompactState::Running,
+        };
+        if let Some(ChatItem::Compaction { state: current, .. }) =
+            self.transcript.iter_mut().find(|item| {
+                matches!(item, ChatItem::Compaction { id: Some(id), .. } if *id == compaction.id)
+            })
+        {
+            *current = state;
+            return;
+        }
+        self.transcript.push(ChatItem::Compaction { id: Some(compaction.id), state, open: false });
     }
 
     /// 第 `ix` 行（失败卡片）所在这一轮在失败前有没有进展（说了话，或者有工具做完了）。
@@ -1554,57 +1589,231 @@ impl Session {
 
     /// 点选提问里第 `q` 题的第 `option` 个选项（还没提交时才动）。
     pub fn pick_question(&mut self, idx: usize, q: usize, option: usize) {
-        let Some(ChatItem::Question { questions, picks, answer: None, .. }) =
-            self.transcript.get_mut(idx)
+        let Some(ChatItem::Question {
+            questions, picks, multi_picks, answered, answer: None, ..
+        }) = self.transcript.get_mut(idx)
         else {
             return;
         };
+        if questions.get(q).is_some_and(|item| item.multi_select && option < item.options.len())
+            && let Some(selected) = multi_picks.get_mut(q)
+        {
+            if let Some(existing) = selected.iter().position(|value| *value == option) {
+                selected.remove(existing);
+            } else {
+                selected.push(option);
+            }
+            return;
+        }
         if questions.get(q).is_some_and(|item| option < item.options.len())
             && let Some(slot) = picks.get_mut(q)
         {
             *slot = Some(option);
+            if let Some(done) = answered.get_mut(q) {
+                *done = true;
+            }
         }
     }
 
     /// 数字键选选项：选第一道还没选的题，都选过了就改最后一题。
     pub fn pick_question_key(&mut self, idx: usize, option: usize) {
-        let Some(ChatItem::Question { questions, picks, answer: None, .. }) =
+        let Some(q) = self.question_cursor(idx) else {
+            return;
+        };
+        self.pick_question(idx, q, option);
+    }
+
+    /// 多选保留当前面板，点「提交 / 继续」后才进入下一项。
+    pub fn confirm_question(&mut self, idx: usize) -> bool {
+        let Some(q) = self.question_cursor(idx) else {
+            return false;
+        };
+        let Some(ChatItem::Question { questions, multi_picks, answered, answer: None, .. }) =
+            self.transcript.get_mut(idx)
+        else {
+            return false;
+        };
+        let Some(question) = questions.get(q).filter(|question| question.multi_select) else {
+            return false;
+        };
+        if question.required && multi_picks.get(q).is_none_or(|selected| selected.is_empty()) {
+            return false;
+        }
+        let Some(done) = answered.get_mut(q) else {
+            return false;
+        };
+        *done = true;
+        true
+    }
+
+    pub fn answer_text_question(&mut self, idx: usize, q: usize, text: String) {
+        let Some(ChatItem::Question { questions, text_answers, answered, answer: None, .. }) =
             self.transcript.get_mut(idx)
         else {
             return;
         };
-        let q = picks.iter().position(|p| p.is_none()).unwrap_or(questions.len().saturating_sub(1));
-        if questions.get(q).is_some_and(|item| option < item.options.len())
-            && let Some(slot) = picks.get_mut(q)
-        {
-            *slot = Some(option);
+        if !questions.get(q).is_some_and(|question| {
+            matches!(
+                question.kind,
+                claudesktop_core::QuestionKind::Text
+                    | claudesktop_core::QuestionKind::Number
+                    | claudesktop_core::QuestionKind::Integer
+            )
+        }) {
+            return;
+        }
+        if let Some(value) = text_answers.get_mut(q) {
+            *value = Some(text);
+        }
+        if let Some(done) = answered.get_mut(q) {
+            *done = true;
         }
     }
 
     /// 每题都选好了才能提交：返回每题选中的下标。
     pub fn question_choices(&self, idx: usize) -> Option<Vec<usize>> {
-        let ChatItem::Question { picks, answer: None, .. } = self.transcript.get(idx)? else {
-            return None;
-        };
-        picks.iter().copied().collect()
-    }
-
-    /// 提问面板当前停在哪一题：第一道还没选的；都选过了就停在最后一题。
-    pub fn question_cursor(&self, idx: usize) -> Option<usize> {
         let ChatItem::Question { questions, picks, answer: None, .. } = self.transcript.get(idx)?
         else {
             return None;
         };
-        Some(picks.iter().position(|p| p.is_none()).unwrap_or(questions.len().saturating_sub(1)))
+        if questions.iter().any(|question| question.multi_select) {
+            return None;
+        }
+        picks.iter().copied().collect()
     }
 
-    /// 面板上的「上一题」：把最近选过的一题退回去重选，再选就顺着往下走。
+    pub fn pending_freeform(&self) -> Option<(usize, usize, claudesktop_core::QuestionKind)> {
+        self.transcript.iter().enumerate().find_map(|(idx, item)| {
+            let ChatItem::Question { questions, answer: None, .. } = item else {
+                return None;
+            };
+            let q = self.question_cursor(idx)?;
+            let question = questions.get(q)?;
+            matches!(
+                question.kind,
+                claudesktop_core::QuestionKind::Text
+                    | claudesktop_core::QuestionKind::Number
+                    | claudesktop_core::QuestionKind::Integer
+            )
+            .then_some((idx, q, question.kind))
+        })
+    }
+
+    pub fn form_answers(&self, idx: usize) -> Option<Vec<claudesktop_core::FormValueView>> {
+        let ChatItem::Question {
+            questions, picks, multi_picks, text_answers, answer: None, ..
+        } = self.transcript.get(idx)?
+        else {
+            return None;
+        };
+        let mut answers = Vec::with_capacity(questions.len());
+        for (q, question) in questions.iter().enumerate() {
+            let id = question.id.clone()?;
+            let option = |index: usize| {
+                let option = question.options.get(index)?;
+                Some(option.value.clone().unwrap_or_else(|| option.label.clone()))
+            };
+            let value = match (question.kind, question.multi_select) {
+                (_, true) => {
+                    let selected = multi_picks.get(q)?;
+                    if question.required && selected.is_empty() {
+                        return None;
+                    }
+                    claudesktop_core::FormValueKind::Strings(
+                        selected.iter().map(|index| option(*index)).collect::<Option<Vec<_>>>()?,
+                    )
+                }
+                (claudesktop_core::QuestionKind::Choice, false) => {
+                    let Some(selected) = picks.get(q).copied().flatten() else {
+                        if question.required {
+                            return None;
+                        }
+                        continue;
+                    };
+                    claudesktop_core::FormValueKind::Text(option(selected)?)
+                }
+                (claudesktop_core::QuestionKind::Boolean, false) => {
+                    let Some(selected) = picks.get(q).copied().flatten() else {
+                        if question.required {
+                            return None;
+                        }
+                        continue;
+                    };
+                    claudesktop_core::FormValueKind::Boolean(selected == 0)
+                }
+                (kind, false) => {
+                    let text = match text_answers.get(q).and_then(|text| text.clone()) {
+                        Some(text) => text,
+                        None if question.required => return None,
+                        None => continue,
+                    };
+                    if question.required && text.trim().is_empty() {
+                        return None;
+                    }
+                    match kind {
+                        claudesktop_core::QuestionKind::Text => {
+                            claudesktop_core::FormValueKind::Text(text)
+                        }
+                        claudesktop_core::QuestionKind::Number => {
+                            if text.trim().is_empty() && !question.required {
+                                continue;
+                            }
+                            let number =
+                                text.trim().parse::<f64>().ok().filter(|n| n.is_finite())?;
+                            claudesktop_core::FormValueKind::Number(number)
+                        }
+                        claudesktop_core::QuestionKind::Integer => {
+                            if text.trim().is_empty() && !question.required {
+                                continue;
+                            }
+                            claudesktop_core::FormValueKind::Integer(text.trim().parse().ok()?)
+                        }
+                        _ => return None,
+                    }
+                }
+            };
+            answers.push(claudesktop_core::FormValueView { id, value });
+        }
+        Some(answers)
+    }
+
+    /// 提问面板当前停在哪一题：第一道还没答完的；都答过了就停在最后一题。
+    pub fn question_cursor(&self, idx: usize) -> Option<usize> {
+        let ChatItem::Question { questions, picks, answered, answer: None, .. } =
+            self.transcript.get(idx)?
+        else {
+            return None;
+        };
+        let last = questions.len().saturating_sub(1);
+        if answered.len() == questions.len() {
+            Some(answered.iter().position(|done| !done).unwrap_or(last))
+        } else {
+            Some(picks.iter().position(|pick| pick.is_none()).unwrap_or(last))
+        }
+    }
+
+    /// 面板上的「上一题」：把最近答过的一题退回去重答，再答就顺着往下走。
     pub fn back_question(&mut self, idx: usize) {
-        let Some(ChatItem::Question { picks, answer: None, .. }) = self.transcript.get_mut(idx)
+        let Some(ChatItem::Question {
+            questions,
+            picks,
+            multi_picks,
+            text_answers,
+            answered,
+            answer: None,
+            ..
+        }) = self.transcript.get_mut(idx)
         else {
             return;
         };
-        if let Some(slot) = picks.iter_mut().rev().find(|p| p.is_some()) {
+        if answered.len() == questions.len() {
+            if let Some(q) = answered.iter().rposition(|done| *done) {
+                answered[q] = false;
+                picks[q] = None;
+                multi_picks[q].clear();
+                text_answers[q] = None;
+            }
+        } else if let Some(slot) = picks.iter_mut().rev().find(|pick| pick.is_some()) {
             *slot = None;
         }
     }
@@ -1882,6 +2091,7 @@ impl Session {
                     arg,
                     result: SharedString::default(),
                     output: SharedString::default(),
+                    content: SharedString::default(),
                     phase: tool_phase(&status),
                     diffs: Vec::new(),
                     expanded: false,
@@ -1923,6 +2133,11 @@ impl Session {
             KernelEvent::ToolCallDiff { id, diff } => {
                 if let Some(card) = self.tool_card(&id) {
                     card.set_diff(diff);
+                }
+            }
+            KernelEvent::ToolCallContent { id, output } => {
+                if let Some(card) = self.tool_card(&id) {
+                    card.content = output.into();
                 }
             }
             // 工具带回来的图片（`read_file` 读到的图、MCP 的多模态结果）：工具行里画缩略图。
@@ -1994,6 +2209,9 @@ impl Session {
                 self.transcript.push(ChatItem::Question {
                     id,
                     picks: vec![None; questions.len()],
+                    multi_picks: vec![Vec::new(); questions.len()],
+                    text_answers: vec![None; questions.len()],
+                    answered: vec![false; questions.len()],
                     questions,
                     answer: None,
                 });
@@ -2001,7 +2219,7 @@ impl Session {
             KernelEvent::Compacting => {
                 self.finish_thinking();
                 self.transcript
-                    .push(ChatItem::Compaction { state: CompactState::Running, open: false });
+                    .push(ChatItem::Compaction { id: None, state: CompactState::Running, open: false });
             }
             KernelEvent::Compacted { summary, context_tokens } => {
                 self.settle_compaction(CompactState::Done(summary.into()));
@@ -2054,6 +2272,45 @@ impl Session {
             | KernelEvent::BackgroundTasks { .. }
             | KernelEvent::MemoryChanged { .. }
             | KernelEvent::MemorySuggested { .. } => {}
+            KernelEvent::AuthRequired { methods, message, .. } => {
+                self.auth = Some(AuthRequestView { methods, message: message.into(), busy: false });
+            }
+            KernelEvent::AuthCompleted { success, message, .. } => {
+                if success {
+                    self.auth = None;
+                } else if let Some(auth) = &mut self.auth {
+                    auth.busy = false;
+                    auth.message = message.into();
+                }
+            }
+            KernelEvent::ConfigOptionsChanged { options } => {
+                let current = options
+                    .iter()
+                    .find(|option| option.category == "model" || option.id == "model")
+                    .map(|option| option.current_value.clone());
+                self.config_options = options;
+                if let Some(model) = current {
+                    self.model_label = model.rsplit('/').next().unwrap_or(&model).to_string().into();
+                }
+            }
+            KernelEvent::CurrentModeChanged { mode_id } => {
+                if let Some(index) = self.modes.iter().position(|mode| mode.id == mode_id) {
+                    self.permission_mode = index;
+                    self.remember_mode();
+                }
+            }
+            KernelEvent::AvailableCommandsChanged { commands } => {
+                self.available_commands = commands;
+            }
+            KernelEvent::ContextUsageUpdated { usage } => {
+                let ContextUsageView { used, size, cost } = usage;
+                self.context_tokens = used;
+                self.context_size = (size > 0).then_some(size);
+                self.context_cost = cost;
+            }
+            KernelEvent::CompactionUpdated { compaction } => {
+                self.apply_acp_compaction(compaction);
+            }
             KernelEvent::TitleGenerated { title } => {
                 // 模型起的标题替换截断版（用户手动改过的不覆盖）
                 if !self.renamed {
@@ -2132,6 +2389,7 @@ impl Session {
                     arg: (*arg).into(),
                     result: SharedString::default(),
                     output: SharedString::default(),
+                    content: SharedString::default(),
                     phase: ToolPhase::Running,
                     diffs: Vec::new(),
                     expanded: false,
@@ -2229,7 +2487,7 @@ pub fn rewind_note(conversation: bool, files: usize, prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claudesktop_core::PermissionOptionView;
+    use claudesktop_core::{ConfigChoiceView, PermissionOptionView};
 
     // 注意：本文件顶层 `use gpui_kit::*` 会把 gpui 的 test 宏带进作用域，
     // 遮蔽内建 #[test]，必须用全路径（原文件其他测试同理）。
@@ -2262,6 +2520,7 @@ mod tests {
             arg: "README.md".into(),
             result: "12 行".into(),
             output: SharedString::default(),
+            content: SharedString::default(),
             phase: ToolPhase::Done,
             diffs: Vec::new(),
             expanded: false,
@@ -2303,6 +2562,7 @@ mod tests {
                 arg: "a.rs".into(),
                 result: "ok".into(),
                 output: SharedString::default(),
+                content: SharedString::default(),
                 phase: ToolPhase::Done,
                 diffs: Vec::new(),
                 expanded: false,
@@ -2504,6 +2764,7 @@ mod tests {
             arg: "src/a.rs".into(),
             result: "120 行".into(),
             output: SharedString::default(),
+            content: SharedString::default(),
             phase: ToolPhase::Done,
             diffs: vec![DiffView {
                 path: "src/a.rs".into(),
@@ -2813,6 +3074,322 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn acp_structured_content_survives_raw_updates_and_replay() {
+        let records = vec![
+            Record::user("读取"),
+            ev(KernelEvent::ToolCallStarted {
+                id: "t1".into(),
+                title: "多模态结果".into(),
+                status: "in_progress".into(),
+                kind: "other".into(),
+                parent: None,
+            }),
+            ev(KernelEvent::ToolCallDiff {
+                id: "t1".into(),
+                diff: claudesktop_core::DiffView::compute("a.rs", Some("旧"), "新"),
+            }),
+            ev(KernelEvent::ToolCallContent { id: "t1".into(), output: "资源正文".into() }),
+            ev(KernelEvent::ToolCallUpdated {
+                id: "t1".into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: Some("原始输出".into()),
+                output: Some("原始预览".into()),
+            }),
+        ];
+        let s = Session::from_records(1, meta(), records, &Default::default());
+        let card = s
+            .transcript
+            .iter()
+            .find_map(|item| match item {
+                ChatItem::Tool(card) => Some(card),
+                _ => None,
+            })
+            .expect("工具卡");
+        assert_eq!(card.content.as_ref(), "资源正文");
+        assert_eq!(card.output.as_ref(), "原始预览");
+        assert_eq!(card.diffs.len(), 1);
+        assert!(card.can_open());
+    }
+
+    #[core::prelude::v1::test]
+    fn acp_session_state_updates_stay_out_of_turn_usage() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        s.apply_event(
+            KernelEvent::Started {
+                token: 1,
+                agent_name: "mock".into(),
+                session_id: "s1".into(),
+                model: Some("model-a".into()),
+                modes: vec![
+                    ModeView {
+                        id: "default".into(), name: "逐项确认".into(), description: None
+                    },
+                    ModeView { id: "plan".into(), name: "计划".into(), description: None },
+                ],
+                current_mode: Some("default".into()),
+                resumed: false,
+            },
+            None,
+        );
+        s.apply_event(
+            KernelEvent::ConfigOptionsChanged {
+                options: vec![ConfigOptionView {
+                    id: "model".into(),
+                    name: "模型".into(),
+                    description: None,
+                    category: "model".into(),
+                    current_value: "model-b".into(),
+                    options: vec![ConfigChoiceView {
+                        id: "model-b".into(),
+                        name: "模型 B".into(),
+                        description: None,
+                        group: Some("快速".into()),
+                    }],
+                }],
+            },
+            None,
+        );
+        s.apply_event(KernelEvent::CurrentModeChanged { mode_id: "plan".into() }, None);
+        s.apply_event(
+            KernelEvent::AvailableCommandsChanged {
+                commands: vec![AvailableCommandView {
+                    name: "skill:review".into(),
+                    description: "审查代码".into(),
+                    requires_input: true,
+                }],
+            },
+            None,
+        );
+        s.apply_event(
+            KernelEvent::ContextUsageUpdated {
+                usage: ContextUsageView {
+                    used: 1200,
+                    size: 10000,
+                    cost: Some(CostView { amount: 0.125, currency: "USD".into() }),
+                },
+            },
+            None,
+        );
+        assert_eq!(s.model_label.as_ref(), "model-b");
+        assert_eq!(s.mode_id(), Some("plan"));
+        assert_eq!(s.config_options[0].options[0].group.as_deref(), Some("快速"));
+        assert!(s.available_commands[0].requires_input);
+        assert_eq!(s.context_tokens, 1200);
+        assert_eq!(s.context_size, Some(10000));
+        assert_eq!(s.context_cost.as_ref().map(|cost| cost.amount), Some(0.125));
+        assert_eq!(s.turn_usage, TurnUsage::default());
+    }
+
+    #[core::prelude::v1::test]
+    fn auth_required_keeps_panel_until_success() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        let methods = vec![claudesktop_core::AuthMethodView {
+            id: "login".into(),
+            name: "Mock 登录".into(),
+            description: None,
+            kind: claudesktop_core::AuthMethodKind::Agent,
+        }];
+        s.apply_event(
+            KernelEvent::AuthRequired { token: 1, methods, message: "需要登录".into() },
+            None,
+        );
+        assert!(s.waiting_user());
+        s.apply_event(
+            KernelEvent::AuthCompleted {
+                method_id: "login".into(),
+                success: false,
+                message: "再试一次".into(),
+            },
+            None,
+        );
+        assert!(s.auth.as_ref().is_some_and(|auth| auth.message.as_ref() == "再试一次"));
+        s.apply_event(
+            KernelEvent::AuthCompleted {
+                method_id: "login".into(),
+                success: true,
+                message: "登录成功".into(),
+            },
+            None,
+        );
+        assert!(s.auth.is_none());
+        assert!(!s.waiting_user());
+    }
+
+    #[core::prelude::v1::test]
+    fn acp_compaction_updates_patch_the_same_row() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        for (status, summary) in [("in_progress", None), ("completed", Some("完整摘要".into()))]
+        {
+            s.apply_event(
+                KernelEvent::CompactionUpdated {
+                    compaction: CompactionView {
+                        id: "compact-1".into(),
+                        status: status.into(),
+                        summary,
+                        error: None,
+                    },
+                },
+                None,
+            );
+        }
+        assert_eq!(s.transcript.len(), 1);
+        assert!(matches!(
+            &s.transcript[0],
+            ChatItem::Compaction { id: Some(id), state: CompactState::Done(summary), .. }
+                if id == "compact-1" && summary.as_ref() == "完整摘要"
+        ));
+        s.apply_event(
+            KernelEvent::CompactionUpdated {
+                compaction: CompactionView {
+                    id: "compact-1".into(),
+                    status: "failed".into(),
+                    summary: None,
+                    error: Some("压缩失败".into()),
+                },
+            },
+            None,
+        );
+        assert_eq!(s.transcript.len(), 1);
+        assert!(matches!(
+            &s.transcript[0],
+            ChatItem::Compaction { state: CompactState::Failed(message), .. }
+                if message.as_ref() == "压缩失败"
+        ));
+    }
+
+    #[core::prelude::v1::test]
+    fn multi_select_and_boolean_form_values_keep_ids_and_types() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        let questions = vec![
+            claudesktop_core::QuestionView {
+                question: "组件".into(),
+                header: None,
+                options: vec![
+                    claudesktop_core::QuestionOptionView {
+                        label: "核心".into(),
+                        description: None,
+                        value: Some("core".into()),
+                    },
+                    claudesktop_core::QuestionOptionView {
+                        label: "界面".into(),
+                        description: None,
+                        value: Some("ui".into()),
+                    },
+                ],
+                id: Some("multi".into()),
+                kind: claudesktop_core::QuestionKind::Choice,
+                multi_select: true,
+                required: true,
+                default_value: None,
+            },
+            claudesktop_core::QuestionView {
+                question: "启用".into(),
+                header: None,
+                options: vec![
+                    claudesktop_core::QuestionOptionView {
+                        label: "是".into(),
+                        description: None,
+                        value: Some("true".into()),
+                    },
+                    claudesktop_core::QuestionOptionView {
+                        label: "否".into(),
+                        description: None,
+                        value: Some("false".into()),
+                    },
+                ],
+                id: Some("flag".into()),
+                kind: claudesktop_core::QuestionKind::Boolean,
+                multi_select: false,
+                required: true,
+                default_value: None,
+            },
+        ];
+        s.apply_event(KernelEvent::UserQuestion { id: 7, tool: None, questions }, None);
+        s.pick_question(0, 0, 0);
+        s.pick_question(0, 0, 1);
+        s.pick_question(0, 1, 0);
+        let answers = s.form_answers(0).expect("表单答案");
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].id, "multi");
+        assert_eq!(answers[1].id, "flag");
+        assert!(matches!(
+            &answers[0].value,
+            claudesktop_core::FormValueKind::Strings(values) if values == &vec!["core".to_string(), "ui".to_string()]
+        ));
+        assert!(matches!(answers[1].value, claudesktop_core::FormValueKind::Boolean(true)));
+    }
+
+    #[core::prelude::v1::test]
+    fn mixed_form_waits_for_every_field_and_preserves_types() {
+        let option = |label: &str, value: &str| claudesktop_core::QuestionOptionView {
+            label: label.into(),
+            description: None,
+            value: Some(value.into()),
+        };
+        let field = |id: &str, kind| claudesktop_core::QuestionView {
+            id: Some(id.into()),
+            question: id.into(),
+            kind,
+            required: true,
+            ..Default::default()
+        };
+        let mut choice = field("choice", claudesktop_core::QuestionKind::Choice);
+        choice.options = vec![option("稳妥", "safe"), option("快速", "fast")];
+        let mut multi = field("multi", claudesktop_core::QuestionKind::Choice);
+        multi.multi_select = true;
+        multi.options = vec![option("核心", "core"), option("界面", "ui")];
+        let mut flag = field("flag", claudesktop_core::QuestionKind::Boolean);
+        flag.options = vec![option("是", "true"), option("否", "false")];
+        let questions = vec![
+            choice,
+            multi,
+            field("name", claudesktop_core::QuestionKind::Text),
+            field("ratio", claudesktop_core::QuestionKind::Number),
+            field("count", claudesktop_core::QuestionKind::Integer),
+            flag,
+        ];
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        s.apply_event(KernelEvent::UserQuestion { id: 8, tool: None, questions }, None);
+
+        s.pick_question(0, 0, 0);
+        assert_eq!(s.question_cursor(0), Some(1));
+        assert!(s.form_answers(0).is_none());
+        s.pick_question(0, 1, 0);
+        s.pick_question(0, 1, 1);
+        assert_eq!(s.question_cursor(0), Some(1));
+        assert!(s.confirm_question(0));
+        assert_eq!(s.question_cursor(0), Some(2));
+        s.answer_text_question(0, 2, "demo".into());
+        assert_eq!(s.question_cursor(0), Some(3));
+        assert!(s.form_answers(0).is_none());
+        s.answer_text_question(0, 3, "3.5".into());
+        s.answer_text_question(0, 4, "3".into());
+        assert_eq!(s.question_cursor(0), Some(5));
+        assert!(s.form_answers(0).is_none());
+        s.pick_question(0, 5, 0);
+
+        let answers = s.form_answers(0).expect("完整表单答案");
+        assert_eq!(answers.len(), 6);
+        assert!(matches!(
+            &answers[0].value,
+            claudesktop_core::FormValueKind::Text(value) if value == "safe"
+        ));
+        assert!(matches!(
+            &answers[1].value,
+            claudesktop_core::FormValueKind::Strings(values)
+                if values == &vec!["core".to_string(), "ui".to_string()]
+        ));
+        assert!(matches!(
+            &answers[2].value,
+            claudesktop_core::FormValueKind::Text(value) if value == "demo"
+        ));
+        assert!(matches!(answers[3].value, claudesktop_core::FormValueKind::Number(3.5)));
+        assert!(matches!(answers[4].value, claudesktop_core::FormValueKind::Integer(3)));
+        assert!(matches!(answers[5].value, claudesktop_core::FormValueKind::Boolean(true)));
+    }
+
+    #[core::prelude::v1::test]
     fn subagent_events_go_to_their_own_task() {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
         s.transcript.push(ChatItem::User {
@@ -2927,6 +3504,7 @@ mod tests {
             arg: "echo hi".into(),
             result: SharedString::default(),
             output: SharedString::default(),
+            content: SharedString::default(),
             phase: ToolPhase::Running,
             diffs: Vec::new(),
             expanded: false,
@@ -3704,12 +4282,15 @@ mod tests {
                         claudesktop_core::QuestionOptionView {
                             label: "重写".into(),
                             description: None,
+                            value: None,
                         },
                         claudesktop_core::QuestionOptionView {
                             label: "保留".into(),
                             description: Some("还有引用".into()),
+                            value: None,
                         },
                     ],
+                    ..Default::default()
                 }],
             })
         };
@@ -3758,9 +4339,18 @@ mod tests {
             question: text.into(),
             header: None,
             options: vec![
-                claudesktop_core::QuestionOptionView { label: "甲".into(), description: None },
-                claudesktop_core::QuestionOptionView { label: "乙".into(), description: None },
+                claudesktop_core::QuestionOptionView {
+                    label: "甲".into(),
+                    description: None,
+                    value: None,
+                },
+                claudesktop_core::QuestionOptionView {
+                    label: "乙".into(),
+                    description: None,
+                    value: None,
+                },
             ],
+            ..Default::default()
         };
         s.apply_event(
             KernelEvent::UserQuestion {

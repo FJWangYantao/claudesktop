@@ -1,7 +1,6 @@
 //! 空会话首页：问候语 + 用量概览（数据来自会话日志，见 usage.rs；卡片、格子、模型行点了进用量页，见 usage_view.rs）。
 
 use super::ChatApp;
-use super::mascot::brand_mark;
 use super::settings_view::{kernel_icon, provider_icon};
 use super::widgets::Surface;
 use crate::model::*;
@@ -23,15 +22,13 @@ const PLACEHOLDER: &str = "描述要做的事，回车发送，Shift+回车换�
 const CHAT_PLACEHOLDER: &str = "有什么想聊的？回车发送，Shift+回车换行";
 
 impl ChatApp {
-    /// 首页问候语：小陶 + 「下午好，WYT」。
+    /// 首页问候语：只保留紧凑的时段问候，不摆放品牌 Logo。
     fn render_greeting(&self) -> Div {
-        div().h_flex().gap_2p5().items_center().child(brand_mark(rems(2.5))).child(
-            div()
-                .text_size(TEXT_TITLE)
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(INK))
-                .child(greeting()),
-        )
+        div()
+            .text_size(TEXT_TITLE)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(INK))
+            .child(greeting())
     }
 
     /// 聊天接不上模型（没配自研内核的端点，只配了 ACP agent）时，按品牌选一个模型服务。

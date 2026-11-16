@@ -1,4 +1,4 @@
-//! 侧栏：贴满窗口左缘的纸色面板，含导航、对话历史、设置与内核状态。
+//! 侧栏：贴满窗口左缘的中性灰面板，含导航、对话历史、设置与内核状态；宽度可拖拽调整。
 //! 对话历史分两区：上面是**项目区**（按工作目录分组，当前项目在前），下面是**任务区**
 //! （[`TASKS_KEY`]：建立时没为它选过文件夹的对话，见 [`Session::task`]），
 //! 最后是「已归档」组。会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
@@ -16,7 +16,6 @@
 //! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
 use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
-use super::mascot::brand_mark;
 use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
@@ -204,8 +203,11 @@ impl ChatApp {
             let motion = cx.theme().motion_tokens();
             (motion.duration_normal, motion.easing_move.clone())
         };
-        let target =
-            if self.sidebar_open { SIDEBAR_W.to_pixels(window.rem_size()) } else { px(0.) };
+        let target = if self.sidebar_open {
+            self.sidebar_width().to_pixels(window.rem_size())
+        } else {
+            px(0.)
+        };
         let width = transition(
             "sidebar-width",
             target,
@@ -222,12 +224,12 @@ impl ChatApp {
             div().w(width).h_full().flex_shrink_0().overflow_hidden().child(
                 div()
                     .relative()
-                    .left(width - SIDEBAR_W.to_pixels(window.rem_size()))
+                    .left(width - self.sidebar_width().to_pixels(window.rem_size()))
                     .h_full()
                     .child(
                         self.sidebar_view
                             .clone()
-                            .cached(StyleRefinement::default().w(SIDEBAR_W).h_full()),
+                            .cached(StyleRefinement::default().w(self.sidebar_width()).h_full()),
                     ),
             )
         })
@@ -248,6 +250,7 @@ impl ChatApp {
             f32::from(root_font_size()).to_bits(),
             crate::theme::palette_index(),
             sans(),
+            self.sidebar_width_rem().to_bits(),
             self.settings.kernel().key(),
         )
             .hash(&mut h);
@@ -650,19 +653,18 @@ impl ChatApp {
             self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
         let usage_open =
             self.settings_open && self.settings_form.tab == super::usage_view::USAGE_TAB;
-        // 品牌：小陶（同 exe 图标、首页问候语）+ 名字。不是按钮，摆在拖拽区里
-        let brand =
-            div().h_flex().items_center().gap_2().pl_1().child(brand_mark(rems(1.25))).child(
-                div()
-                    .text_size(TEXT_BODY)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(INK))
-                    .child("claudesktop"),
-            );
+        // 品牌：极简几何标记 + 名称，摆在拖拽区里
+        let brand = div().pl_2().child(
+            div()
+                .text_size(TEXT_BODY)
+                .font_weight(WEIGHT_STRONG)
+                .text_color(rgb(INK))
+                .child("Kimi Code"),
+        );
         // 贴边的面板：沙色底 + 右侧一条分隔线，占满窗口左缘，靠面差把视觉重心让给主区
         let panel = v_flex()
             .size_full()
-            .bg(rgb(SAND))
+            .bg(rgb(SIDEBAR))
             .border_r_1()
             .border_color(rgb(LINE))
             .overflow_hidden()
@@ -722,8 +724,8 @@ impl ChatApp {
                         div().absolute().left_0().right_0().bottom_0().h(h.to_pixels(rem)).bg(
                             linear_gradient(
                                 180.,
-                                linear_color_stop(Rgba { a: 0., ..rgb(SAND) }, 0.),
-                                linear_color_stop(rgb(SAND), 1.),
+                                linear_color_stop(Rgba { a: 0., ..rgb(SIDEBAR) }, 0.),
+                                linear_color_stop(rgb(SIDEBAR), 1.),
                             )
                             .color_space(ColorSpace::Oklab),
                         )
@@ -768,7 +770,7 @@ impl ChatApp {
             );
 
         // 侧栏占满窗口左缘：全高、无外边距、不浮起
-        div().w(SIDEBAR_W).flex_shrink_0().h_full().child(panel)
+        div().w(self.sidebar_width()).flex_shrink_0().h_full().child(panel)
     }
 
     /// 空间切换（品牌行下面那格）：聊天 | 代码。
@@ -1228,7 +1230,7 @@ impl ChatApp {
                     .whitespace_nowrap()
                     .text_size(TEXT_BODY)
                     .text_color(rgb(INK))
-                    .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                    .when(active, |d| d.font_weight(WEIGHT_OPTION))
                     .child(s.title.clone()),
             )
             // 跑在自己 worktree 里的会话：行尾一个小分支图标（悬停显示分支名）

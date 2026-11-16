@@ -1,8 +1,9 @@
 # claudesktop
 
-Claude 风格的 AI 编程桌面端（Rust + GPUI），Windows 原生，**内核可更换**。
+Kimi Code 工作台风格（默认）与 Claude 暖纸风格（可选）的 AI 编程桌面端（Rust + GPUI），Windows 原生，**内核可更换**。
 
-界面照着 Claude 系的暖纸底 + 赤陶橙做：浮起的圆角侧栏、顶栏兼做窗口拖拽区、
+界面默认采用 Kimi Code 风格的中性灰三层表面与电光蓝，保留 Claude 暖纸配色可选：
+可拖拽侧栏、居中阅读列、同心大圆角输入卡片、黑底发送键，以及右侧文件树 / Diff 辅助面板。
 右对齐的用户气泡、流式 Markdown、工具行与 diff、权限卡片。内核是一个可替换的槽——
 同一个界面下可以挂自研的进程内内核，也可以挂任意 ACP agent（Claude Code、pi 等），
 一个会话绑一个内核，两个内核可以同时在线、并排跑同一个任务。
@@ -183,6 +184,7 @@ tools          # 调试与接入工具（截图脚本、mock agent、mock MCP �
 | [AGENTS.md](./AGENTS.md) | 开发约定：UI 组件惯例、配色与字号规范、动效、快捷键、内核侧注意事项 |
 | [设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md) | Claude 系产品的设计理念与视觉系统，第七章是本项目的落地清单 |
 | [调研报告-Claude前端CSS手法对照.md](./调研报告-Claude前端CSS手法对照.md) | 从 Claude 桌面端构建产物里拆出的 CSS 手法，哪些能搬进 gpui、怎么换算、哪些做不到 |
+| [调研报告-Kimi-Code前端与设计美学.md](./调研报告-Kimi-Code前端与设计美学.md) | 当前默认工作台的布局、配色、字体与几何设计依据 |
 | [调研报告-GPUI-Claude风格桌面Harness.md](./调研报告-GPUI-Claude风格桌面Harness.md) | 立项时的技术调研 |
 | [设计说明-检查点与回退.md](./设计说明-检查点与回退.md) | 回退的粒度、文件被别人改过怎么办 |
 | [设计说明-插件.md](./设计说明-插件.md) | 插件目录格式、钩子、与 Claude Code 的兼容范围 |
@@ -197,7 +199,7 @@ tools          # 调试与接入工具（截图脚本、mock agent、mock MCP �
 | [tools/shot.ps1](./tools/shot.ps1) | 抓窗口截图，改完 UI 后自检渲染（默认 PrintWindow，不抢焦点、不动光标） |
 | [tools/mock-acp-agent.mjs](./tools/mock-acp-agent.mjs) | mock ACP agent，跑内核事件链测试 |
 | [tools/mock-mcp-server.mjs](./tools/mock-mcp-server.mjs) | mock MCP 服务器（`--http` / `--sse` 起远程模式） |
-| [tools/make-icon.mjs](./tools/make-icon.mjs) | 生成 exe 图标和界面里的品牌形象「小陶」（形象定义在 [tools/xiaotao.mjs](./tools/xiaotao.mjs)，需要 `resvg` 命令行） |
+| [tools/make-icon.mjs](./tools/make-icon.mjs) | 生成 exe 图标和历史「小陶」素材；当前界面暂不使用品牌 Logo（历史形象定义在 [tools/xiaotao.mjs](./tools/xiaotao.mjs)，需要 `resvg` 命令行） |
 
 内嵌字体（Inter / Newsreader / JetBrains Mono）均为 SIL OFL，来源见
 [apps/desktop/assets/fonts/README.md](./apps/desktop/assets/fonts/README.md)。

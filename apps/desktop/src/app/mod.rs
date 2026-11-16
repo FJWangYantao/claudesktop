@@ -30,6 +30,7 @@ pub(crate) mod remote_image;
 mod requests_view;
 mod review;
 mod rewind;
+mod right_panel;
 mod search;
 mod settings_kit;
 mod settings_view;
@@ -58,12 +59,15 @@ use claudesktop_core::{
 use content::ContentView;
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
+#[cfg(feature = "headless-screenshot")]
+use gpui_kit::component::input::Position;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use right_panel::{PanelResize, RightPanelState};
 use settings_view::SettingsForm;
 use sidebar::{SharedSpots, SidebarSpinners, SidebarView};
 use std::path::{Path, PathBuf};
@@ -228,6 +232,12 @@ pub struct ChatApp {
     /// 设置页外层和模型清单的滚轮平滑目标
     settings_wheel: Option<WheelScroll>,
     model_wheel: Option<WheelScroll>,
+    /// 侧栏用户拖拽宽度相对默认值的增量（rem）
+    sidebar_width_delta: f32,
+    /// 右侧文件 / Diff 辅助面板
+    right_panel: RightPanelState,
+    /// 正在拖拽调整左 / 右侧面板宽度
+    panel_resizing: Option<PanelResize>,
     /// 侧栏会话列表的滚动位置（底部渐隐跟手，见 `ScrollEdge`）
     sidebar_scroll: ScrollHandle,
     /// macOS 红绿灯上次按哪个根字号摆的（字号变了才重摆，见 `chrome::traffic_light_origin`）
@@ -603,6 +613,9 @@ impl ChatApp {
             settings_scroll: ScrollHandle::new(),
             settings_wheel: None,
             model_wheel: None,
+            sidebar_width_delta: 0.,
+            right_panel: RightPanelState::new(window, cx),
+            panel_resizing: None,
             sidebar_scroll: ScrollHandle::new(),
             #[cfg(target_os = "macos")]
             traffic_lights_rem: None,
@@ -1854,6 +1867,117 @@ impl ChatApp {
         cx.notify();
     }
 
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_agent_completion(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let column = text.chars().count() as u32;
+        self.input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.set_cursor_position(Position::new(0, column), window, cx);
+        });
+        self.focus_input(window, cx);
+        self.update_completion(cx);
+    }
+
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_authenticate_first(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self
+            .session()
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.methods.first())
+            .map(|method| method.id.clone())
+        {
+            self.authenticate_agent(id, cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            for _ in 0..400 {
+                cx.background_executor().timer(Duration::from_millis(50)).await;
+                let done = this
+                    .update(cx, |app, cx| {
+                        let id = app
+                            .session()
+                            .auth
+                            .as_ref()
+                            .and_then(|auth| auth.methods.first())
+                            .map(|method| method.id.clone());
+                        let found = id.is_some();
+                        if let Some(id) = id {
+                            app.authenticate_agent(id, cx);
+                        }
+                        found
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_answer_elicitation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(idx) = self.session().pending_question() else {
+            cx.spawn_in(window, async move |this, cx| {
+                for _ in 0..400 {
+                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                    let done = this
+                        .update_in(cx, |app, window, cx| {
+                            if app.session().pending_question().is_some() {
+                                app.debug_answer_elicitation(window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(true);
+                    if done {
+                        break;
+                    }
+                }
+            })
+            .detach();
+            return;
+        };
+        let questions = match self.session().transcript.get(idx) {
+            Some(ChatItem::Question { questions, .. }) => questions.clone(),
+            _ => return,
+        };
+        for (q, question) in questions.iter().enumerate() {
+            match question.kind {
+                claudesktop_core::QuestionKind::Text
+                | claudesktop_core::QuestionKind::Number
+                | claudesktop_core::QuestionKind::Integer => {
+                    let text = match question.kind {
+                        claudesktop_core::QuestionKind::Number => "3.5",
+                        claudesktop_core::QuestionKind::Integer => "3",
+                        _ => "demo",
+                    };
+                    self.input.update(cx, |state, cx| state.set_value(text, window, cx));
+                    self.submit_freeform_question(window, cx);
+                }
+                claudesktop_core::QuestionKind::Choice
+                | claudesktop_core::QuestionKind::Boolean => {
+                    if !question.options.is_empty() {
+                        self.pick_question(idx, q, 0, cx);
+                    }
+                    if question.multi_select && question.options.len() > 1 {
+                        self.pick_question(idx, q, 1, cx);
+                    }
+                    if question.multi_select || q + 1 == questions.len() {
+                        self.submit_question(idx, cx);
+                    }
+                }
+            }
+        }
+    }
+
     /// 调试钩子：CLAUDESKTOP_OPEN=sample-reply，把 `tools/markdown-sample.md` 作为一轮
     /// 回复摆进当前会话——无头截图验证回复排版用（见「方案-回复排版对比修复.md」）。
     pub(crate) fn debug_sample_reply(&mut self, cx: &mut Context<Self>) {
@@ -1888,6 +2012,7 @@ impl ChatApp {
                     arg: format!("src/module_{i}.rs").into(),
                     result: "120 行".into(),
                     output: SharedString::default(),
+                    content: SharedString::default(),
                     phase: ToolPhase::Done,
                     diffs: Vec::new(),
                     expanded: false,
@@ -1916,6 +2041,7 @@ impl ChatApp {
                 arg: "cargo test".into(),
                 result: SharedString::default(),
                 output: SharedString::default(),
+                content: SharedString::default(),
                 phase: ToolPhase::Running,
                 diffs: Vec::new(),
                 expanded: false,
@@ -2215,17 +2341,17 @@ impl ChatApp {
             .filter(|i| *i < self.sessions.len())
             .unwrap_or(0);
         self.active = idx;
-        // 历史会话直接走 submit_to：由它先续接内核会话
-        if self.sessions[idx].ready || self.sessions[idx].restored {
-            self.submit_to(idx, UserPrompt::text(text), cx);
-        } else {
-            self.sessions[idx].autoprompt = Some(UserPrompt::text(text));
-        }
+        // 新会话和历史会话都走 submit_to：它负责懒启动内核，历史会话先续接再发
+        self.submit_to(idx, UserPrompt::text(text), cx);
         cx.notify();
     }
 
     /// 发出输入框里的内容；这一轮还在跑时先排队（输入框上方的队列），这一轮正常结束后自动发出。
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sessions[self.active].pending_freeform().is_some() {
+            self.submit_freeform_question(window, cx);
+            return;
+        }
         let text = self.input.read(cx).value().to_string();
         if text.trim().is_empty() && self.pending.is_empty() && self.pending_files.is_empty() {
             return;
@@ -2830,10 +2956,85 @@ impl ChatApp {
 
     /// 所有题都选好了才提交（每题选中的下标交给内核），由 [`Self::pick_question`] 自动调。
     pub(crate) fn submit_question(&mut self, item_idx: usize, cx: &mut Context<Self>) {
+        let is_form = match self.sessions[self.active].transcript.get(item_idx) {
+            Some(ChatItem::Question { questions, .. }) => {
+                questions.iter().any(|question| question.id.is_some())
+            }
+            _ => false,
+        };
+        if is_form {
+            let confirmed = self.sessions[self.active].confirm_question(item_idx);
+            if let Some(values) = self.sessions[self.active].form_answers(item_idx) {
+                self.answer_question(
+                    item_idx,
+                    claudesktop_core::QuestionAnswer::Form { values },
+                    cx,
+                );
+            } else if confirmed {
+                cx.notify();
+            } else {
+                self.toast(Notification::warning("还有必填项未完成"), cx);
+            }
+            return;
+        }
         let Some(choices) = self.sessions[self.active].question_choices(item_idx) else {
             return;
         };
         self.answer_question(item_idx, claudesktop_core::QuestionAnswer::Choices { choices }, cx);
+    }
+
+    fn submit_freeform_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((idx, q, kind)) = self.sessions[self.active].pending_freeform() else {
+            return;
+        };
+        let (required, default_value) = match self.sessions[self.active].transcript.get(idx) {
+            Some(ChatItem::Question { questions, .. }) => {
+                let question = questions.get(q);
+                (
+                    question.is_some_and(|question| question.required),
+                    question.and_then(|question| question.default_value.clone()),
+                )
+            }
+            _ => (false, None),
+        };
+        let text = self.input.read(cx).value().trim().to_string();
+        let text = default_value.filter(|_| text.is_empty()).unwrap_or(text);
+        if required && text.is_empty() {
+            self.toast(Notification::warning("这一项还没有填写"), cx);
+            return;
+        }
+        let valid = match kind {
+            claudesktop_core::QuestionKind::Text => true,
+            claudesktop_core::QuestionKind::Number => {
+                text.is_empty() && !required
+                    || text.parse::<f64>().ok().is_some_and(|number| number.is_finite())
+            }
+            claudesktop_core::QuestionKind::Integer => {
+                text.is_empty() && !required || text.parse::<i64>().is_ok()
+            }
+            claudesktop_core::QuestionKind::Choice | claudesktop_core::QuestionKind::Boolean => {
+                return;
+            }
+        };
+        if !valid {
+            self.toast(
+                Notification::warning(if kind == claudesktop_core::QuestionKind::Integer {
+                    "请输入整数"
+                } else {
+                    "请输入数字"
+                }),
+                cx,
+            );
+            return;
+        }
+        self.sessions[self.active].answer_text_question(idx, q, text);
+        self.input.update(cx, |state, cx| state.set_value("", window, cx));
+        if let Some(values) = self.sessions[self.active].form_answers(idx) {
+            self.answer_question(idx, claudesktop_core::QuestionAnswer::Form { values }, cx);
+        } else {
+            cx.notify();
+        }
+        self.focus_input(window, cx);
     }
 
     /// 权限卡上的「拒绝并说明」：按拒绝应答，停下这一轮，请用户在输入框里说要怎么改
@@ -2973,7 +3174,7 @@ impl ChatApp {
         );
         let mut skip_notify = false;
         match event {
-            KernelEvent::Connected { agent_name } => {
+            KernelEvent::Connected { agent_name, .. } => {
                 slot.ready = true;
                 slot.error = false;
                 slot.fatal = None;
@@ -2981,6 +3182,35 @@ impl ChatApp {
                 let short = agent_name.rsplit('/').next().unwrap_or(&agent_name);
                 slot.status = format!("{short} · 已连接").into();
                 self.request_pending_sessions();
+            }
+            KernelEvent::AuthRequired { token, methods, message } => {
+                if let Some(s) =
+                    self.sessions.iter_mut().find(|s| s.kernel == kind && s.token == token)
+                {
+                    s.requested = false;
+                    s.resuming = false;
+                    s.apply_event(KernelEvent::AuthRequired { token, methods, message }, None);
+                }
+            }
+            KernelEvent::AuthCompleted { method_id, success, message } => {
+                for s in self.sessions.iter_mut().filter(|s| s.kernel == kind) {
+                    s.apply_event(
+                        KernelEvent::AuthCompleted {
+                            method_id: method_id.clone(),
+                            success,
+                            message: message.clone(),
+                        },
+                        None,
+                    );
+                }
+                if success {
+                    self.request_pending_sessions();
+                }
+            }
+            KernelEvent::UserQuestion { id, questions, tool } if session.is_none() => {
+                let idx = self.active;
+                self.sessions[idx]
+                    .apply_event(KernelEvent::UserQuestion { id, questions, tool }, None);
             }
             KernelEvent::SessionFailed { token, message } => {
                 if let Some(s) =
@@ -3095,6 +3325,11 @@ impl ChatApp {
                         }
                     }
                     let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
+                    if idx == self.active
+                        && matches!(event, KernelEvent::AvailableCommandsChanged { .. })
+                    {
+                        self.update_completion(cx);
+                    }
                     if matches!(event, KernelEvent::Started { .. }) {
                         self.persist_session_mode(idx, cx);
                     }
@@ -3482,12 +3717,7 @@ impl Render for ChatApp {
             !self.settings_open,
             |d| {
                 d.child(
-                    div()
-                        .max_w(READING_W)
-                        .w_full()
-                        .px_8()
-                        .pb_4()
-                        .pt_2()
+                    self.reading_column(div().pb_4().pt_2())
                         .child(self.render_composer(window, cx)),
                 )
             },
@@ -3504,20 +3734,43 @@ impl Render for ChatApp {
         let mut root = div();
         // 中文回退字体：根上设一次，子元素换 font_family 时继承
         root.text_style().font_fallbacks = Some(cjk_fallbacks());
-        // 不用系统标题栏：侧栏顶到窗口顶，会话区顶栏兼做拖拽区与窗口按钮（见 chrome.rs）
+        // 不用系统标题栏：侧栏顶到窗口顶，会话区与右侧辅助面板各自有顶栏
+        let show_main =
+            !self.right_panel_controls() || !self.right_panel.expanded || self.settings_open;
         let root = root
             .h_flex()
             .size_full()
             .font_family(sans())
-            .text_size(TEXT_LARGE)
+            .text_size(TEXT_BODY)
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
             .relative()
             .when(!self.settings_navigation_only(), |d| {
                 d.children(self.render_sidebar_slot(window, cx))
+                    .child(self.render_sidebar_handle(cx))
             })
-            .child(main)
+            .when(show_main, |d| d.child(main))
             .when(!self.settings_navigation_only(), |d| d.child(self.sidebar_spinners_view.clone()))
+            .children(self.render_right_panel_slot(window, cx))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                let Some(drag) = this.panel_resizing else { return };
+                let rem = window.rem_size();
+                let dx = (event.position.x - drag.start_x) / rem;
+                if drag.right {
+                    this.right_panel.width_delta = drag.start_width - PANEL_DEFAULT_W.0 - dx;
+                } else {
+                    this.sidebar_width_delta = drag.start_width - SIDEBAR_W.0 + dx;
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.panel_resizing.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .children(frame_probe);
         // 快捷键（见 keys.rs）
         self.with_key_actions(root, cx)

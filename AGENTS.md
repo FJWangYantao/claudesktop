@@ -36,6 +36,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   「选的是观感」的条目（如字体）用 `font_menu_item()`（上面灰字名称，下面用该字体本身排一行预览）；
   装进 `MenuList::pick(row, action)`（点了执行并收起，前 9 个自动标键帽、按数字直接选；动作要 `Window` 时用 `pick_in`）；
   不收起面板的内容用 `MenuList::child`；不需要数字快捷键的菜单在加条目前调用 `.without_shortcuts()`。
+  固定在滚动列表下方的内容用 `MenuList::footer`，其中的可选项用 `footer_pick`（点了收起但不占列表的数字快捷键）。
   长列表需要常驻滚动条时用 `.scroll_with_bar(max_h)`（溢出才显示，右侧留位）。默认模型菜单用紧凑单行小字号。
   权限模式菜单宽 10.5rem、行高 1.5rem，用 `.compact()` 去掉条目间距，只留单行图标、名称和对勾，不显示说明和数字键帽，也不绑定数字选择。
   服务商列表和模型页来源菜单只显示单行名称，条目间加细分隔线。面板宽度用 rem。消息下方的小操作按钮（复制 / 编辑 / 重跑）用
@@ -68,7 +69,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   内核重连（`detach_kernel`）时把当前模式重新挂上 `pending_mode`。
   会话模式 ID 存 `SessionMeta.mode`，切换时立即保存，续接的 `Started` 再交给内核；历史会话不套新对话默认值。
   自研会话在连接前就用 `builtin::permission_modes` 补齐菜单（自动是否可用仍看设置）；旧元信息没存模式时保留逐项确认。
-- **向用户提问（`ask_user`）**：在 `Inner::run_tool` 开头拦截，不走 `start_tool` / `authorize`——「自动」模式的分类器
+- **向用户提问（自研 `ask_user`）**：在 `Inner::run_tool` 开头拦截，不走 `start_tool` / `authorize`——「自动」模式的分类器
   不能替用户答，也不发 `ToolCallStarted`（提问不占工具行）。事件是 `KernelEvent::UserQuestion`，应答走
   `Kernel::resolve_question`；`Inner::pending` 按 `Reply` 分权限 / 提问两种。界面在输入框上沿的提问面板
   （`composer.rs` 的 `render_question_panel`）：一次一题，点一个选项就进下一题、最后一题选完自动交给模型
@@ -88,13 +89,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `composer.rs` 里 `mode_menu_items` 的写法。菜单打开时焦点在 `ChatApp::menu_focus`（数字键靠它），
   trigger 不是 `MenuChip` 的菜单自己组 Popover 时套 `menu_panel()`。
 - **按钮**：用 `widgets.rs` 的 helper（都是 gpui-kit `Button`，键盘可达、按下不抢输入框焦点）：
-  文字按钮 `text_button`（primary 赤陶实底 / 默认卡片底细边，`.loading()` 表示进行中），
+  文字按钮 `text_button`（primary 强调色实底 / 默认卡片底细边，`.loading()` 表示进行中），
   透明底图标按钮 `quiet_button`（`Surface::Paper` / `Sand` 决定悬停色，`.small()` / `.xsmall()` 调尺寸，
   `.tooltip(..)` 直接给文字）。只有发送、回到底部这类特殊样式才手写 div；列表行、chip 不算按钮。
   带边框的容器（卡片、权限卡、输入框）里的按钮不再描边（单层边框）：次级用 `SAND` 实底
   （悬停 `SELECTED`），拒绝 / 危险项只留 `RED` 字、悬停出底色（红字在 `SAND` 上只有 4.0:1）。
-- **颜色**：只用 `theme.rs` 的常量（纸底 / 赤陶橙那套），不要内联新的十六进制色值。
-  - `Color` 是语义 token，取值查当前色板（九套配色，设置页「外观 · 配色」切换）；新颜色在 `Palette` 加一项、
+- **颜色**：只用 `theme.rs` 的常量（默认 Kimi 中性灰 + 电光蓝；暖纸 / 赤陶等配色仍可切换），不要内联新的十六进制色值。
+  - `Color` 是语义 token，取值查当前色板（十套配色，设置页「外观 · 配色」切换）；新颜色在 `Palette` 加一项、
     `WARM` 给值，别的色板不写就继承，写了要过 `palette_contrast` 测试。
   - 每个常量是浅色 / 深色一对（`Shade`），界面里写 `rgb(INK)`；这个 `rgb` 是 `theme::rgb`（按当前色板 + 外观取值），
     文件里要 `use crate::theme::rgb;`，否则和 `gpui_kit::*` 里的同名函数冲突。新颜色两种外观都要给值并校对对比度。
@@ -103,16 +104,20 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     `RED` 是前景色（深色下提亮），危险操作的实色按钮底用 `DANGER`。
   - 交互态：纸底 / 卡片上悬停用 `HOVER`，选中态和沙色底上悬停用 `SELECTED`，已选中行里再叠一层用
     `HOVER_STRONG`；不要拿 `LINE` / `PAPER` / 透明度当悬停。
-    整块可点的卡片（输入框）悬停时加深边框而不是换底色：静止 `LINE` → 悬停 `LINE_STRONG` →
-    聚焦再套 `focus_ring(INK_FAINT)`。焦点几乎总在输入框上，「聚焦」要同时看 `window.is_window_active()`，
+    整块可点的卡片（输入框）悬停时加深边框而不是换底色：静止 `COMPOSER_LINE` → 悬停 `LINE_STRONG` →
+    聚焦再套 `composer_focus_shadow()`。焦点几乎总在输入框上，「聚焦」要同时看 `window.is_window_active()`，
     否则切到别的程序后也一直显示聚焦态，悬停态永远看不到。
   - 带文字的主按钮底色用 `CORAL_DEEP`（悬停 `CORAL_DEEP_HOVER`）；`CORAL` 上白字只有 3.1:1，只给图标按钮。
   - `INK_FAINT` 只给占位、禁用、分隔符和装饰（纸底上 2.05:1），承载信息的文字用 `INK_SOFT`。
   - gpui-kit 组件的配色由 `theme::apply_colors` 从色板映射（`Button` 的 primary / secondary / danger 等直接可用）；
     组件颜色不对时先补映射，别在调用处逐个覆盖。派生的 `button_*` 色要和基色一起写。
-- **圆角 / 宽度**：圆角只用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
-  不写 `rounded(px(..))`；阅读列 / 设置页 / 侧栏宽度用 `READING_W` / `FORM_W` / `SIDEBAR_W`。
-  `content_slot()` 铺满主区（保证全窗滚轮和右缘滚动条可用），对话行、首页和输入区各自限宽 `READING_W` 靠左对齐并留 `px_8` 内边距；设置 / 用量页独立布局。
+- **圆角 / 宽度**：常规圆角用 gpui 档位 `rounded_xs` … `rounded_2xl`（各档用途见 `theme.rs`），
+  不写 `rounded(px(..))`；输入卡片和附件用同心的 `COMPOSER_RADIUS` / `COMPOSER_INNER_RADIUS`。
+  阅读列 / 设置页 / 侧栏宽度用 `READING_W` / `FORM_W` / `SIDEBAR_W`。
+  `content_slot()` 铺满主区（保证全窗滚轮和右缘滚动条可用），对话行、首页和输入区经
+  `ChatApp::reading_column` 限宽（760px，宽阅读模式 920px），默认居中，可在设置里切左对齐；设置 / 用量页独立布局。
+  右侧辅助面板在 `app/right_panel.rs`：文件树 / 源码预览 / 逐文件 Diff，可拖拽调宽或展开全宽；
+  文件系统只在展开目录、刷新和选择文件时读取，不在 render 里扫盘。
   `READING_W` / `FORM_W` 是 measure，**保持 px**；`SIDEBAR_W` / `SETTINGS_NAV_W` / `CHROME_H`
   是「框」，是 `Rems`，拿它算加减时要 `.to_pixels(window.rem_size())`（设置页整页宽度用 `theme::settings_page_w()`）。
 - **阴影**：`raised_shadow()`（贴地一档）/ `float_shadow()`（悬浮两层）在 `theme.rs`，σ 已按 CSS 减半；
@@ -145,10 +150,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   不在 `ChatApp` 键上下文下，派发的动作收不到。
 - **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
 - **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
-  - 「进行中」只有两种样子：运行状态行用会动的小陶 `motion::mascot(Mood)`（按状态换表情、几帧轮播，见 `app/mascot.rs`；
-    新状态要配表情就在 `tools/xiaotao.mjs` 的 `MOODS` 加帧、跑 `node tools/make-icon.mjs`，再在 `Mood` 加一项），
-    其余（工具行、侧栏、压缩）一律圆弧转圈 `motion::spinner()`（`canvas` + `PathBuilder` 矢量画）；思考中的扫光用 `shimmer_text()`（按像素分档着色）。
-    内容区里这三个只是占位格（prepaint 记位置），由叠在内容区上的 `motion::LoopOverlay` 画，节拍器只重画它、不重画整页对话；
+  - 「进行中」使用统一的圆弧转圈 `motion::spinner()`（`canvas` + `PathBuilder` 矢量画）和少量线性状态图标；
+    不使用卡通形象或品牌 Logo；左上角标题为「Kimi Code」，运行状态使用线性图标或统一圆弧。
+    思考中的扫光用 `shimmer_text()`（按像素分档着色）。
+    内容区里的转圈和扫光只是占位格（prepaint 记位置），由叠在内容区上的 `motion::LoopOverlay` 画，节拍器只重画它、不重画整页对话；
     内容区以外自己就是小覆盖层的 view（侧栏转圈）用 `spinner_in_place`。
     转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
     动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
@@ -288,7 +293,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 
 - 会话 / 内核逻辑放 `crates/*`（可单测），UI 层保持薄。
 - 调试钩子统一走环境变量（`CLAUDESKTOP_*`），入口集中在 `main.rs`；
-  菜单预览用 `Popover::default_open` 只初始化一次（`CLAUDESKTOP_OPEN=model-menu` 预览默认模型菜单），不改成受控模式。
+  菜单预览用 `Popover::default_open` 只初始化一次（`CLAUDESKTOP_OPEN=model-menu` 预览设置页默认模型菜单，
+  `composer-model-menu` 预览输入框模型菜单及固定思考底栏；`agent-completion` 配合 `CLAUDESKTOP_COMPLETION`
+  预览真实补全面板），不改成受控模式。
   截图用 `--features headless-screenshot` 编译，设 `CLAUDESKTOP_SCREENSHOT=<PNG 路径>`：隐藏窗口离屏渲染后自动退出；`QUIET` 只是不激活，不能代替无头截图。
   正式 exe 的无前台验收可设 `CLAUDESKTOP_HEADLESS=1`（隐藏窗口、每 250ms 离屏绘制，不启用文件控制入口）。
 - 提交信息用英文 conventional commits（见 git log），代码注释用中文。
@@ -330,6 +337,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   每个请求记一行 `gateway/<日期>.jsonl`（按内核会话 + 第几轮归组，首页「请求」页签读它，见 `requests.rs`；费用按设置里的单价表估算，见 `pricing.rs`，分峰谷价的模型在单价行尾写 `x2`，峰时段用 `@peak` 行按本地时间或指定时区判定）。新的请求出口（新 provider、新接口）也要走 `route`，内核里新的请求用途用 `gateway::tag` 标上。
   ACP agent 可选经网关：起进程时设 base URL（`gateway::agent_env`，端点编码在 `/via/` 路径里），轮次靠 `gateway::note_turn`。
   请求体和响应原文另存（`request_bodies.rs`，日志行的 `body` 指过去），「请求」页签每次请求行尾的「原文」打开查看（`app/raw_request.rs`）。
+  请求统计走 `gateway/request_stats.rs`，只保留所需字段、不展开整包 `Value`；跳过正文时仍校验完整 JSON，保留重复键和字段类型容错。
+  Windows 本地网关的已接受连接在 `gateway/socket.rs` 设 1 MiB 接收缓冲，减轻大请求的发送阻塞；设置失败退回系统默认，不能算零内存成本（系统 TCP 缓冲上限每连接比本机默认多约 960 KiB）。
+  内核 / 普通隐藏桌面 A/B 分别用 `tools/gateway-memory-bench.mjs` / `gateway-desktop-bench.mjs`，保存原文的开关单独对照。
+  性能测量加 `node --expose-gc`（只清测试控制进程）；请求校验走旁路 worker 和可转移缓冲池，不阻塞模拟响应。
+  诊断可加 `--observer=idle` 把完整校验移到轮后（内核需带握手入口的测试构建）；解析交替对照用忽略式测试 `compare_parse_latency`，不能替代端到端延迟门槛。
+  模拟端点的 Node 读取水位与内核 TCP 缓冲分开测；`--receive-buffer` + `--tcp-buffer-helper` 只调本次测试端点并逐连接读回验证，改变条件后先做 A/A，旧失败记录保留。`--precise-timers=1` 仅给测试控制进程申请 1ms 定时精度（退出恢复），不改产品进程。
+  独立验收包走 `tools/gateway-validation.mjs`（冻结 Node / exe、逐文件校验、同机仅允许 smoke）；`--comparison=aa` 要求 exe 哈希相同、延迟绝对差 ≤20ms，不套内存收益条件；A/B 的原门槛不变。CI 手动给 `gateway_asset_id` 才切到独立验证。
 - 网页搜索后端在 `crates/builtin/src/websearch.rs`：`SearchBackend`（DeepSeek / Brave / DuckDuckGo，声明顺序就是固定降级顺序）
   按 `SearchConfig::order()` 依次试，失败 / 没配 key 就退到下一个，**实际用了哪个写进结果第一行**（工具行汇总带「降级过」）。
   选择存在数据目录的 `search.json`（`load()` 每次现读，改完即生效，不走 `Kernel::set_*`），**只存选择不存 key**：
@@ -357,9 +371,26 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   激活后 `ChatApp::ensure_history_loaded` 后台重放，读取期间发送进现有队列，磁盘搜索跳转等加载完成再定位。
   `has_user_message` 对未加载占位也为真，别把占位误删成空会话。用量由 `usage::build_index` 在首帧后读
   `usage-cache.json` 并按日志字节偏移补扫追加行；删除会话要换代，迟到的索引结果不能覆盖新轮次。
+- **ACP 工具内容与文件委托**：`content` 和 `rawOutput` 是两条通道，分别落到 `ToolCallContent` 和
+  `ToolCallUpdated`，不能让后到的原始输出覆盖资源文本；图片走 `ToolCallImages` + 资源表，Diff 走
+  `ToolCallDiff` 并持久化。带 Diff 的工具卡也要画结构化内容和图片，图片数量进行高指纹。
+  `fs/read_text_file` 必须实现 `line/limit` 并返回真实错误，写失败不能回成功；图片提示按握手的
+  `promptCapabilities.image` 放行或在发送前明确拒绝。资源链接只展示，不自动请求；实时终端与音频播放尚未实现。
+- **ACP 配置与早到通知**：`config_options` 保留分组和稳定选项 ID，切换走 `session/set_config_option`，
+  模型菜单只显示 agent 上报的选项；`usage_update` 的 used / size / cost 不进本轮 token。
+  `available_commands_update` 接 `/` 补全（Skills 原样发给 agent，不做本地展开），晚到命令要刷新已打开的面板。
+  **在 `Started` 之前到达的通知先在 `AcpShared::early` 缓存，绑定后按序回放**，不能按 sessionId 找不到会话就丢。
+  压缩按 `compactionId` 原位更新。
+- **ACP 登录与结构化提问**：`auth_required` 在输入框上方显示登录面板，Agent 方法走 `authenticate`，成功后重试原会话；
+  Terminal 方法另起进程并等待退出（Windows `start /wait`，Linux `x-terminal-emulator`；macOS 明确报不支持），不读凭据，等待不阻塞其他会话。
+  `elicitation/create` 的 form 模式复用提问面板，但走 `QuestionAnswer::Form`，保留字段 ID 和文本 / 浮点 / 整数 / 布尔 / 字符串数组类型；
+  多选显式确认，文本和数字逐题暂存、校验后整表提交，不能沿用自研 `ask_user` 的 `Choices` 语义。URL 模式与实时终端仍未实现。
 - **外部 agent 延迟与回收**：空白 ACP 会话不启动进程，首次发送存 `autoprompt`，`Started` 后自动发。
   仅当 agent 握手声明 resume / load、所有会话 `Session::idle_detachable`、无后台任务且 10 分钟无活动时，
   `reclaim_idle_processes` 才关闭；builtin 的 MCP 回收走同一个周期入口。
+- **请求历史共享**：`ChatMessage` 按消息共享 `Arc`，修改时写时复制；临时提醒和图片占位只改请求快照。
+  三种 provider 借用历史内容直接序列化，公共出口在 `crates/builtin/src/request.rs`，`extra` 仍最后覆盖。
+  请求内存 A/B 用 `tools/request-memory-bench.mjs` 对比两个 release 测试二进制，结果只代表内核测试进程。
 - **自研历史休眠**（`crates/builtin/src/hibernate.rs`）：默认开启，`CLAUDESKTOP_HIBERNATE=0` 可关闭，
   只把完整 `SessionState.history` 原子写入数据目录 `session-hibernation/`，其余会话状态、`acp_id` 和 `restored` 不变，
   恢复不发 `Started`、不走有损日志续接。界面保留当前 + 最近 2 个温会话，其余闲置 10 分钟后台休眠
@@ -411,11 +442,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   「关」的写法按格式分：有 `toggle` 的发 `disabled`（那几家默认开着思考，不发等于没关），
   纯 effort 的才发 `none`。
   旁路小请求（补全 / 记忆提炼 / 分类器）一律 `suggest::short_thinking(protocol, model)`（按实际协议查表）：能关就关、关不掉取最低一档。
-  **会话级档位**：输入框工具栏的 chip（`composer.rs` 的 `thinking_menu_items`，ACP 内核不显示）改的是
-  `Session::thinking`，经 `Kernel::set_thinking(session, Option<&str>)` 存进内核的 `SessionState`，
-  `run_steps` 每轮开头取一次、覆盖档案里的那份（`None` = 跟随档案；进行中的一轮用开头那档，工具循环中途开 / 关思考 Anthropic 报 400）。
+  **会话级档位**：输入框只保留模型 chip，思考选项并进模型弹层底部的固定横栏（`composer.rs` 的 `model_menu_items`，
+  ACP 内核不显示）；模型列表滚动时刷新入口和横栏不滚。选项改的是 `Session::thinking`，经
+  `Kernel::set_thinking(session, Option<&str>)` 存进内核的 `SessionState`，`run_steps` 每轮开头取一次、
+  覆盖档案里的那份（`None` = 跟随档案；进行中的一轮用开头那档，工具循环中途开 / 关思考 Anthropic 报 400）。
   会话还没建立 / 内核重连（`detach_kernel`）时记在 `Session::pending_thinking`，`Started` 时由 `ChatApp::flush_pending_thinking` 补交。
-  能选哪些档用 `session_thinking_spec` 按**当前模型**现算，高亮 / chip 文字用 `active_thinking`（实际生效的那档）；认不出的模型只给「默认 / 兜底」。
+  能选哪些档用 `session_thinking_spec` 按**当前模型**现算，底栏高亮用 `active_thinking`（实际生效的那档）；认不出的模型只给「默认 / 兜底」。
   加新模型 = 能力表加一条，同时想清楚 `can_disable`（关不掉的那代别给「关」）和 `accepts_temperature`。
 - **worktree 会话**（`crates/core/src/git.rs` + `apps/desktop/src/app/worktree.rs`，见「设计说明-worktree.md」）：
   目录在**数据目录** `worktrees/<仓库名>-<短哈希>/<分支尾段>`，不往用户仓库里塞东西；分支名 `claudesktop/<月日-时分>-<3 位随机>`。

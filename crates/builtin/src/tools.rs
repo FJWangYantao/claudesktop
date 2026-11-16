@@ -859,12 +859,14 @@ pub fn parse_questions(arguments: &str) -> Result<Vec<QuestionView>, String> {
                     .description
                     .map(|d| d.trim().to_string())
                     .filter(|d| !d.is_empty()),
+                value: None,
             });
         }
         out.push(QuestionView {
             question: q.question.trim().to_string(),
             header: q.header.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()),
             options,
+            ..Default::default()
         });
     }
     Ok(out)
@@ -890,6 +892,22 @@ pub fn question_result(questions: &[QuestionView], answer: &QuestionAnswer) -> (
                         .into(),
                     "问了一下（没选）".into(),
                 );
+            }
+            (lines.join("\n"), format!("问了一下：{}", picked.join("；")))
+        }
+        QuestionAnswer::Form { values } => {
+            let mut lines = vec!["The user answered:".to_string()];
+            let mut picked = Vec::new();
+            for answer in values {
+                let text = match &answer.value {
+                    claudesktop_core::FormValueKind::Text(text) => text.clone(),
+                    claudesktop_core::FormValueKind::Number(number) => number.to_string(),
+                    claudesktop_core::FormValueKind::Integer(number) => number.to_string(),
+                    claudesktop_core::FormValueKind::Boolean(value) => value.to_string(),
+                    claudesktop_core::FormValueKind::Strings(values) => values.join(", "),
+                };
+                lines.push(format!("- {} → {}", answer.id, text));
+                picked.push(format!("{} → {}", answer.id, text));
             }
             (lines.join("\n"), format!("问了一下：{}", picked.join("；")))
         }

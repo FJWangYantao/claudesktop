@@ -68,6 +68,8 @@ enum CompletionAction {
     Settings,
     /// 插件的斜杠命令：填进「/名字 」等用户写参数，发出时展开（见 `submit_to`）
     PluginCommand(String),
+    /// ACP agent 的斜杠命令 / Skill：原样发给 agent，不做本地展开
+    AgentCommand(String),
 }
 
 /// 补全的状态：列表、Esc 收起时的输入快照、工作区文件索引。
@@ -113,7 +115,10 @@ impl ChatApp {
         // 已经写完插件命令名、在写参数了：不再弹列表（否则回车会再选一次命令，参数被冲掉）
         if trigger.kind == TriggerKind::Slash
             && trigger.query.contains(char::is_whitespace)
-            && claudesktop_core::plugin::find_command(&self.enabled_plugins(), &text).is_some()
+            && (claudesktop_core::plugin::find_command(&self.enabled_plugins(), &text).is_some()
+                || self.session().available_commands.iter().any(|command| {
+                    trigger.query.split_whitespace().next() == Some(command.name.as_str())
+                }))
         {
             self.completion.open = None;
             self.refresh_composer(cx);
@@ -255,6 +260,24 @@ impl ChatApp {
                 CompletionAction::Settings,
             ),
         ));
+        // ACP agent 自己上报的命令 / Skills：原样发给 agent，不走本地插件展开
+        for command in &s.available_commands {
+            let detail = if command.requires_input {
+                format!("需要参数 · {}", command.description)
+            } else {
+                command.description.clone()
+            };
+            out.push((
+                format!("{} agent", command.name),
+                item(
+                    IconAll::Sparkles,
+                    format!("/{}", command.name),
+                    &detail,
+                    false,
+                    CompletionAction::AgentCommand(command.name.clone()),
+                ),
+            ));
+        }
         // 启用的插件带来的命令：说明后面注上参数提示和来自哪个插件
         for p in self.enabled_plugins() {
             for c in &p.commands {
@@ -288,12 +311,16 @@ impl ChatApp {
         };
         let replacement = match &item.action {
             CompletionAction::Mention(path) => format!("@{path} "),
-            CompletionAction::PluginCommand(name) => format!("/{name} "),
+            CompletionAction::PluginCommand(name) | CompletionAction::AgentCommand(name) => {
+                format!("/{name} ")
+            }
             _ => String::new(),
         };
         self.replace_input_range(c.trigger.range, &replacement, window, cx);
         match item.action {
-            CompletionAction::Mention(_) | CompletionAction::PluginCommand(_) => {}
+            CompletionAction::Mention(_)
+            | CompletionAction::PluginCommand(_)
+            | CompletionAction::AgentCommand(_) => {}
             CompletionAction::NewSession => {
                 self.add_session(cx);
                 self.focus_input(window, cx);

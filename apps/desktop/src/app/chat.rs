@@ -257,7 +257,7 @@ pub(super) fn markdown_style() -> TextViewStyle {
                 1 => TEXT_DISPLAY,
                 2 => TEXT_HEADING,
                 3 => TEXT_LEAD,
-                _ => TEXT_LARGE,
+                _ => TEXT_BODY,
             }
             .to_pixels(crate::theme::root_font_size())
         })
@@ -611,6 +611,10 @@ impl ChatApp {
                     .child(card.result.clone()),
             );
         }
+        // ACP 一个工具可以同时给 diff、文字和图片，不能只画 diff
+        if !card.content.trim().is_empty() || !card.images.is_empty() {
+            col = col.child(self.tool_output(card));
+        }
         let hidden: usize =
             card.diffs.iter().map(|d| d.lines.len().saturating_sub(DIFF_PREVIEW_ROWS)).sum();
         if !verbose && (hidden > 0 || card.expanded) {
@@ -692,7 +696,11 @@ impl ChatApp {
         // 空行给个空格占住行高
         let line =
             |l: &str| div().child(if l.is_empty() { " ".to_string() } else { l.to_string() });
-        let output = card.output.trim_matches('\n');
+        let output = if card.content.trim().is_empty() {
+            card.output.trim_matches('\n')
+        } else {
+            card.content.trim_matches('\n')
+        };
         let running = card.phase == ToolPhase::Running;
         let command =
             card.shows_command().then(|| {
@@ -1477,7 +1485,7 @@ impl ChatApp {
             self.settings.view_mode = ViewMode::Normal;
             self.view_changed(cx);
         }
-        self.reveal_message(self.active, item, cx);
+        self.open_right_diff(item, cx);
     }
 
     /// 一个文件的 diff 卡片；`preview` = 默认露出的行数（None = 全部）。
@@ -2017,13 +2025,13 @@ impl ChatApp {
         } else {
             Some(
                 div()
-                    .max_w(relative(0.85))
-                    .bg(rgb(SAND))
+                    .max_w(relative(0.78))
+                    .bg(rgb(USER_BUBBLE))
                     .text_color(rgb(INK))
-                    .rounded_2xl()
+                    .rounded(COMPOSER_INNER_RADIUS)
                     .px_4()
                     .py_2p5()
-                    .text_size(TEXT_LARGE)
+                    .text_size(TEXT_BODY)
                     .line_height(LEADING)
                     .child(text.clone()),
             )
@@ -2127,7 +2135,7 @@ impl ChatApp {
                 };
                 let copied_at = self.copied_at;
                 let app = cx.entity().downgrade();
-                let body = div().min_w_0().text_size(TEXT_LARGE).line_height(LEADING).child(
+                let body = div().min_w_0().text_size(TEXT_BODY).line_height(LEADING).child(
                     TextView::markdown(("agent", idx), text)
                         .style(markdown_style())
                         .markdown_extensions(crate::app::math::extensions())
@@ -2201,7 +2209,7 @@ impl ChatApp {
                 )
             }
             ChatItem::Failed { message, kind } => self.render_failed(idx, message, *kind, cx),
-            ChatItem::Compaction { state, open } => {
+            ChatItem::Compaction { state, open, .. } => {
                 Self::render_compaction(idx, state, *open, window, cx)
             }
             // 一轮层面的提示（续接、停止…）：和正文左对齐，图标打头

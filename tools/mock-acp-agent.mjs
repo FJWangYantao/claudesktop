@@ -21,12 +21,95 @@ const RESUME_MODE =
   process.argv.find((a) => a.startsWith('--resume='))?.slice('--resume='.length) ??
   process.env.MOCK_RESUME ??
   '';
+const PROMPT_IMAGE = process.argv.includes('--prompt-image') || process.env.MOCK_PROMPT_IMAGE === '1';
+const AUTH_MODE = process.argv.find((a) => a.startsWith('--auth='))?.slice('--auth='.length) ?? process.env.MOCK_AUTH ?? '';
+const REQUIRE_AUTH = process.argv.includes('--require-auth') || process.env.MOCK_REQUIRE_AUTH === '1';
+const AUTH_DELAY = Number(process.argv.find((a) => a.startsWith('--auth-delay='))?.slice('--auth-delay='.length) ?? process.env.MOCK_AUTH_DELAY_MS ?? 0);
+let authenticated = !REQUIRE_AUTH;
+const PIXEL_PNG ='iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAWElEQVR4nGO8Y+P2n2EAAdNAWj7qgNEQGA0BEGAhlE2c5KZRlM32PcoazYZ4ARPDAAOmUQcwjEbBAAOmUQcwjEbBAAOmEe8AxtF+AcNoIhxgwDTqAIYBBgAjBwf7jQE1sAAAAABJRU5ErkJggg==';
 
 // 一条连接上可有多个会话：每个会话各自一个 sessionId，事件按它路由。
 let sessionCount = 0;
 // 会话 → 开会话时客户端交过来的 MCP 服务名
 const mcpServers = new Map();
+const sessionConfigs = new Map();
 let nextId = 0;
+
+function makeConfig(currentModel) {
+  return [
+    {
+      id: 'model',
+      name: '模型',
+      category: 'model',
+      type: 'select',
+      currentValue: currentModel,
+      options: [
+        {
+          group: 'fast',
+          name: '快速',
+          options: [
+            { value: 'model-a', name: '模型 A', description: '默认模型' },
+            { value: 'model-b', name: '模型 B', description: '切换后的模型' },
+          ],
+        },
+        {
+          group: 'careful',
+          name: '深思',
+          options: [{ value: 'model-c', name: '模型 C', description: '外部更新后的模型' }],
+        },
+      ],
+    },
+    {
+      id: 'thinking',
+      name: '思考强度',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: 'high',
+      options: [
+        { value: 'low', name: '低' },
+        { value: 'high', name: '高' },
+      ],
+    },
+  ];
+}
+
+function sessionModes(currentModeId = 'default') {
+  return {
+    currentModeId,
+    availableModes: [
+      { id: 'default', name: '逐项确认', description: '每次工具调用都确认' },
+      { id: 'plan', name: '计划', description: '先规划再执行' },
+    ],
+  };
+}
+
+function advertisedAuthMethods() {
+  const agent = { type: 'agent', id: 'login', name: 'Mock 登录', description: '完成一次模拟登录' };
+  const terminal = { type: 'terminal', id: 'terminal-login', name: '终端登录', args: ['--terminal-login'] };
+  if (AUTH_MODE === 'both') return [agent, terminal];
+  if (AUTH_MODE === 'terminal') return [terminal];
+  return [agent];
+}
+
+function emitStartupUpdates(sid) {
+  update(sid, {
+    sessionUpdate: 'available_commands_update',
+    availableCommands: [
+      { name: 'skill:review', description: '审查代码', input: { hint: '文件或目录' } },
+      { name: 'status', description: '查看会话状态' },
+    ],
+  });
+  update(sid, { sessionUpdate: 'usage_update', used: 1200, size: 10000, cost: { amount: 0.125, currency: 'USD' } });
+  update(sid, { sessionUpdate: 'session_info_update', title: 'Mock 配置会话' });
+  update(sid, { sessionUpdate: 'notice', severity: 'warning', title: 'mock 通知', description: '不会进日志' });
+  update(sid, { sessionUpdate: 'compaction_update', compactionId: 'compact-1', status: 'in_progress' });
+  update(sid, {
+    sessionUpdate: 'compaction_summary_chunk',
+    compactionId: 'compact-1',
+    content: { type: 'text', text: '第一段摘要' },
+  });
+  update(sid, { sessionUpdate: 'compaction_update', compactionId: 'compact-1', status: 'completed' });
+}
 /** @type {Map<number, (result: any) => void>} */
 const pending = new Map();
 
@@ -66,6 +149,102 @@ async function askLlm(sid, text) {
     } catch {}
   }
   return answer || `HTTP ${res.status}`;
+}
+
+async function runElicitTurn(promptId, sid) {
+  const answer = await request('elicitation/create', {
+    sessionId: sid,
+    mode: 'form',
+    message: '选择执行参数',
+    requestedSchema: {
+      type: 'object',
+      required: ['choice', 'multi', 'name', 'count', 'flag'],
+      properties: {
+        choice: {
+          type: 'string',
+          title: '执行方式',
+          oneOf: [
+            { const: 'safe', title: '稳妥' },
+            { const: 'fast', title: '快速' },
+          ],
+        },
+        multi: {
+          type: 'array',
+          title: '组件',
+          items: { type: 'string', enum: ['core', 'ui', 'docs'] },
+        },
+        name: { type: 'string', title: '名称', minLength: 1 },
+        count: { type: 'integer', title: '次数', minimum: 1, maximum: 10 },
+        flag: { type: 'boolean', title: '启用' },
+      },
+    },
+  });
+  update(sid, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: JSON.stringify(answer) },
+  });
+  reply(promptId, { stopReason: 'end_turn' });
+}
+
+async function runContentTurn(promptId, sid) {
+  const toolCallId = `content-${sid}`;
+  update(sid, {
+    sessionUpdate: 'tool_call',
+    toolCallId,
+    title: '读取多模态结果',
+    kind: 'other',
+    status: 'in_progress',
+    content: [
+      { type: 'content', content: { type: 'text', text: '工具正文' } },
+      { type: 'content', content: { type: 'image', data: PIXEL_PNG, mimeType: 'image/png', uri: 'mock://pixel' } },
+      {
+        type: 'content',
+        content: {
+          type: 'resource_link',
+          name: '协议文档',
+          title: 'ACP 文档',
+          uri: 'https://example.com/acp',
+          description: '仅显示，不自动请求',
+        },
+      },
+      {
+        type: 'content',
+        content: {
+          type: 'resource',
+          resource: { uri: 'mock://embedded', text: '嵌入正文', mimeType: 'text/plain' },
+        },
+      },
+      { type: 'diff', path: SELF_PATH, oldText: '旧文本', newText: '新文本' },
+      { type: 'terminal', terminalId: 'terminal-mock' },
+    ],
+  });
+  await sleep(20);
+  update(sid, {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: 'completed',
+    rawOutput: { note: '原始输出不应覆盖结构化内容' },
+  });
+  reply(promptId, { stopReason: 'end_turn' });
+}
+
+async function runReadRange(promptId, sid, path, line, limit) {
+  const result = await request('fs/read_text_file', { sessionId: sid, path, line, limit });
+  const toolCallId = `range-${sid}`;
+  update(sid, {
+    sessionUpdate: 'tool_call',
+    toolCallId,
+    title: '分页读取',
+    kind: 'read',
+    status: result.code ? 'failed' : 'completed',
+  });
+  update(sid, {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: result.code ? 'failed' : 'completed',
+    rawOutput: result,
+  });
+  reply(promptId, { stopReason: 'end_turn' });
 }
 
 async function runTurn(promptId, sid, text) {
@@ -152,21 +331,31 @@ rl.on('line', (line) => {
         protocolVersion: params?.protocolVersion ?? 1,
         // MOCK_RESUME=resume → 声明 sessionCapabilities.resume；=load → 声明 loadSession
         agentCapabilities: {
+          promptCapabilities: { image: PROMPT_IMAGE, audio: false, embeddedContext: true },
           ...(RESUME_MODE === 'load' ? { loadSession: true } : {}),
           ...(RESUME_MODE === 'resume' ? { sessionCapabilities: { resume: {} } } : {}),
         },
-        authMethods: [],
+        authMethods: AUTH_MODE ? advertisedAuthMethods() : [],
         agentInfo: { name: 'mock-agent', title: 'Mock Agent', version: '0.1.0' },
       });
       break;
     case 'authenticate':
-      reply(id, {});
+      setTimeout(() => {
+        authenticated = true;
+        reply(id, {});
+      }, AUTH_DELAY);
       break;
     case 'session/new': {
+      if (REQUIRE_AUTH && !authenticated) {
+        send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'Authentication required' } });
+        break;
+      }
       const sid = `mock-session-${Date.now()}-${++sessionCount}`;
       // 记下客户端交过来的 MCP 服务（插件带的），「mcp?」时回给客户端看
       mcpServers.set(sid, (params?.mcpServers ?? []).map((s) => s.name));
-      reply(id, { sessionId: sid });
+      sessionConfigs.set(sid, makeConfig('model-a'));
+      reply(id, { sessionId: sid, configOptions: sessionConfigs.get(sid), modes: sessionModes() });
+      emitStartupUpdates(sid);
       break;
     }
     case 'session/resume':
@@ -181,11 +370,65 @@ rl.on('line', (line) => {
       reply(id, {});
       break;
     }
+    case 'session/set_config_option': {
+      const sid = params?.sessionId;
+      const config = sessionConfigs.get(sid) ?? makeConfig('model-a');
+      const value = params?.value?.value ?? params?.value;
+      if (params?.configId === 'model') {
+        const model = config.find((option) => option.id === 'model');
+        model.currentValue = value;
+      } else if (params?.configId === 'thinking') {
+        const thinking = config.find((option) => option.id === 'thinking');
+        thinking.currentValue = value;
+      }
+      sessionConfigs.set(sid, config);
+      reply(id, { configOptions: config });
+      break;
+    }
+    case 'session/set_mode': {
+      reply(id, {});
+      update(params?.sessionId, { sessionUpdate: 'current_mode_update', currentModeId: params?.modeId });
+      break;
+    }
     case 'session/prompt': {
       const text = (params?.prompt ?? [])
         .filter((b) => b?.type === 'text')
         .map((b) => b.text)
         .join('');
+      if (text === 'blocks?') {
+        const types = (params?.prompt ?? []).map((b) => b?.type ?? 'unknown').join(',');
+        update(params?.sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `prompt blocks: ${types}` },
+        });
+        reply(id, { stopReason: 'end_turn' });
+        break;
+      }
+      if (text === 'elicit') {
+        runElicitTurn(id, params?.sessionId);
+        break;
+      }
+      if (text === 'external') {
+        const sid = params?.sessionId;
+        const config = sessionConfigs.get(sid) ?? makeConfig('model-a');
+        config.find((option) => option.id === 'model').currentValue = 'model-c';
+        sessionConfigs.set(sid, config);
+        update(sid, { sessionUpdate: 'config_option_update', configOptions: config });
+        reply(id, { stopReason: 'end_turn' });
+        break;
+      }
+      if (text === 'content') {
+        runContentTurn(id, params?.sessionId);
+        break;
+      }
+      if (text.startsWith('range:')) {
+        const parts = text.slice('range:'.length).split(':');
+        const limit = Number(parts.pop());
+        const line = Number(parts.pop());
+        const path = parts.join(':');
+        runReadRange(id, params?.sessionId, path, line, limit);
+        break;
+      }
       if (text === 'mcp?') {
         const names = mcpServers.get(params?.sessionId) ?? [];
         update(params?.sessionId, {
@@ -211,7 +454,15 @@ rl.on('line', (line) => {
         const path = rest.slice(0, cut);
         const content = rest.slice(cut + 1);
         request('fs/write_text_file', { sessionId: params?.sessionId, path, content })
-          .then(() => reply(id, { stopReason: 'end_turn' }));
+          .then((result) => {
+            update(params?.sessionId, {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: 'client-write',
+              status: result.code ? 'failed' : 'completed',
+              rawOutput: result,
+            });
+            reply(id, { stopReason: 'end_turn' });
+          });
         break;
       }
       runTurn(id, params?.sessionId, text).catch((err) => {

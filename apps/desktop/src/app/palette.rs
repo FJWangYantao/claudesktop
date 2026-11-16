@@ -6,8 +6,9 @@
 //! 行内容用 `.child()` 自绘（图标、名称、灰色说明、快捷键 / 对勾），`.label()` / `.keywords()` 只管搜索。
 
 use super::ChatApp;
-use super::keys::{NEW_SESSION_KEY, SHORTCUTS_KEY, TOGGLE_SIDEBAR_KEY};
+use super::keys::{CHANGES_KEY, FILES_KEY, NEW_SESSION_KEY, SHORTCUTS_KEY, TOGGLE_SIDEBAR_KEY};
 use super::project_label;
+use super::right_panel::RightTab;
 use crate::model::ViewMode;
 use crate::settings::{KernelChoice, Space, ThemeChoice};
 use crate::theme::rgb;
@@ -38,6 +39,10 @@ enum PaletteCmd {
     /// 在当前目录的 git 仓库里建一个 worktree，新对话在那里开始
     Worktree,
     OpenSettings,
+    /// 文件树与源码预览
+    Files,
+    /// 逐文件改动
+    Changes,
     /// 用量页
     Usage,
     /// 在资源管理器里打开用量网关的日志目录
@@ -179,6 +184,8 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         Entry::new(IconAll::GitBranch, "在新 worktree 中开始", PaletteCmd::Worktree)
             .desc("从当前分支的最新提交开始，未提交的改动不会带过去"),
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
+        Entry::new(IconAll::FolderTree, "文件树与源码预览", PaletteCmd::Files).key(FILES_KEY),
+        Entry::new(IconAll::FileDiff, "逐文件改动", PaletteCmd::Changes).key(CHANGES_KEY),
         Entry::new(IconAll::ChartColumn, "查看用量", PaletteCmd::Usage),
         Entry::new(IconAll::FolderOpen, "打开用量网关日志", PaletteCmd::GatewayLogs)
             .desc("每个请求一行的 JSONL"),
@@ -405,6 +412,8 @@ impl ChatApp {
                 self.start_in_worktree(cx);
             }
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
+            PaletteCmd::Files => self.toggle_right_panel(RightTab::Files, cx),
+            PaletteCmd::Changes => self.toggle_right_panel(RightTab::Changes, cx),
             PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),
             // 面板的对话框刚关，同一帧里还算开着：等下一帧再开速查

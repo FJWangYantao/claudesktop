@@ -1,8 +1,8 @@
-//! 色板、字体与字号阶梯（Claude 品牌基准：暖纸底 + 赤陶橙）。
+//! 色板、字体与字号阶梯（Kimi 工作台默认：极简中性灰三层表面 + 电光蓝，支持多套切换）。
 
 use gpui_kit::{
-    App, BoxShadow, DefiniteLength, FontFallbacks, FontFeatures, Hsla, Pixels, Rems, Rgba,
-    SharedString, hsla, px, relative, rems,
+    App, BoxShadow, DefiniteLength, FontFallbacks, FontFeatures, FontWeight, Hsla, Pixels, Rems,
+    Rgba, SharedString, hsla, px, relative, rems,
 };
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -29,17 +29,24 @@ const fn s(light: u32, dark: u32) -> Shade {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Color {
     Paper,
+    Sidebar,
     Sand,
     SandActive,
+    UserBubble,
     Card,
     Coral,
     CoralDeep,
     CoralDeepHover,
     OnAccent,
+    AccentSoft,
+    SendBg,
+    SendBgHover,
+    SendFg,
     Ink,
     InkSoft,
     InkFaint,
     Line,
+    ComposerLine,
     LineStrong,
     CodeBg,
     Hover,
@@ -63,17 +70,24 @@ pub enum Color {
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub paper: Shade,
+    pub sidebar: Shade,
     pub sand: Shade,
     pub sand_active: Shade,
+    pub user_bubble: Shade,
     pub card: Shade,
     pub coral: Shade,
     pub coral_deep: Shade,
     pub coral_deep_hover: Shade,
     pub on_accent: Shade,
+    pub accent_soft: Shade,
+    pub send_bg: Shade,
+    pub send_bg_hover: Shade,
+    pub send_fg: Shade,
     pub ink: Shade,
     pub ink_soft: Shade,
     pub ink_faint: Shade,
     pub line: Shade,
+    pub composer_line: Shade,
     pub line_strong: Shade,
     pub code_bg: Shade,
     pub hover: Shade,
@@ -98,17 +112,24 @@ impl Palette {
     pub const fn shade(&self, color: Color) -> Shade {
         match color {
             Color::Paper => self.paper,
+            Color::Sidebar => self.sidebar,
             Color::Sand => self.sand,
             Color::SandActive => self.sand_active,
+            Color::UserBubble => self.user_bubble,
             Color::Card => self.card,
             Color::Coral => self.coral,
             Color::CoralDeep => self.coral_deep,
             Color::CoralDeepHover => self.coral_deep_hover,
             Color::OnAccent => self.on_accent,
+            Color::AccentSoft => self.accent_soft,
+            Color::SendBg => self.send_bg,
+            Color::SendBgHover => self.send_bg_hover,
+            Color::SendFg => self.send_fg,
             Color::Ink => self.ink,
             Color::InkSoft => self.ink_soft,
             Color::InkFaint => self.ink_faint,
             Color::Line => self.line,
+            Color::ComposerLine => self.composer_line,
             Color::LineStrong => self.line_strong,
             Color::CodeBg => self.code_bg,
             Color::Hover => self.hover,
@@ -130,20 +151,67 @@ impl Palette {
     }
 }
 
+/// Kimi 工作台（默认：无冷暖偏色的极简中性灰三层表面 + 电光蓝 + 实黑发送键）
+const KIMI: Palette = Palette {
+    paper: s(0xFFFFFF, 0x121212),
+    sidebar: s(0xF9FBFC, 0x0D0D0D),
+    sand: s(0xF5F5F5, 0x1F1F1F),
+    sand_active: s(0xECECEC, 0x2B2B2B),
+    user_bubble: s(0xF5F5F5, 0x292929),
+    card: s(0xFFFFFF, 0x1F1F1F),
+    coral: s(0x1783FF, 0x1A88FF),
+    coral_deep: s(0x0F6FE0, 0x126EE0),
+    coral_deep_hover: s(0x0B60C7, 0x0D62CC),
+    on_accent: s(0xFFFFFF, 0xFFFFFF),
+    accent_soft: s(0xE8F3FF, 0x152538),
+    send_bg: s(0x1A1A1A, 0xEDEDED),
+    send_bg_hover: s(0x2E2E2E, 0xFFFFFF),
+    send_fg: s(0xFFFFFF, 0x121212),
+    ink: s(0x1A1A1A, 0xD8D8D8),
+    ink_soft: s(0x666666, 0x9E9E9E),
+    ink_faint: s(0x8C8C8C, 0x737373),
+    line: s(0xEAEAEA, 0x262626),
+    composer_line: s(0xDEDEDE, 0x2F2F2F),
+    line_strong: s(0xBFBFBF, 0x3D3D3D),
+    code_bg: s(0xF5F5F5, 0x1F1F1F),
+    hover: s(0xF7F7F7, 0x242424),
+    hover_strong: s(0xE2E2E2, 0x363636),
+    selection: s(0xE8F3FF, 0x1A385C),
+    heat1: s(0xE8F3FF, 0x13263D),
+    heat2: s(0xB8DAFF, 0x183D66),
+    heat3: s(0x6BB0FF, 0x1A5FB4),
+    heat4: s(0x1783FF, 0x3B9AFF),
+    green: s(0x0E7A38, 0x3FB950),
+    red: s(0xC0392B, 0xF85149),
+    danger: s(0xC0392B, 0xDA3633),
+    white: s(0xFFFFFF, 0xFFFFFF),
+    diff_add_bg: s(0xE7F6EE, 0x172A1E),
+    diff_add_fg: s(0x0E7A38, 0x3FB950),
+    diff_del_bg: s(0xFBEAEA, 0x2F191A),
+    diff_del_fg: s(0xC0392B, 0xF85149),
+};
+
 /// 暖纸（Claude 品牌：暖纸底 + 赤陶橙）
 const WARM: Palette = Palette {
     paper: s(0xFAF9F5, 0x262624),
+    sidebar: s(0xF0EEE6, 0x1F1E1D),
     sand: s(0xF0EEE6, 0x1F1E1D),
     sand_active: s(0xE8E3D6, 0x33322F),
+    user_bubble: s(0xF0EEE6, 0x1F1E1D),
     card: s(0xFFFFFF, 0x30302E),
     coral: s(0xD97757, 0xD97757),
     coral_deep: s(0xBF502B, 0xBF502B),
     coral_deep_hover: s(0xAF4928, 0xAF4928),
     on_accent: s(0xFFFFFF, 0xFFFFFF),
+    accent_soft: s(0xF9EBE5, 0x3A2822),
+    send_bg: s(0xBF502B, 0xBF502B),
+    send_bg_hover: s(0xAF4928, 0xAF4928),
+    send_fg: s(0xFFFFFF, 0xFFFFFF),
     ink: s(0x1F1E1D, 0xF5F4EE),
     ink_soft: s(0x6E6B65, 0xBDB9AE),
     ink_faint: s(0xB5B0A4, 0x6E6C66),
     line: s(0xE5E1D5, 0x3D3C38),
+    composer_line: s(0xE5E1D5, 0x3D3C38),
     line_strong: s(0xD3CEC1, 0x55534E),
     code_bg: s(0xEDE9DF, 0x1A1918),
     hover: s(0xF0EEE6, 0x3A3936),
@@ -166,17 +234,24 @@ const WARM: Palette = Palette {
 /// 墨纸（Flexoki：底更黄、墨更黑，青绿强调）
 const FLEXOKI: Palette = Palette {
     paper: s(0xFFFCF0, 0x1C1B1A),
+    sidebar: s(0xF2F0E5, 0x100F0F),
     sand: s(0xF2F0E5, 0x100F0F),
     sand_active: s(0xE6E4D9, 0x343331),
+    user_bubble: s(0xF2F0E5, 0x100F0F),
     card: s(0xFFFFFF, 0x282726),
     coral: s(0x24837B, 0x3AA99F),
     coral_deep: s(0x24837B, 0x3AA99F),
     coral_deep_hover: s(0x1C6C66, 0x5ABDAC),
     on_accent: s(0xFFFFFF, 0x100F0F),
+    accent_soft: s(0xD8F3EC, 0x153431),
+    send_bg: s(0x24837B, 0x3AA99F),
+    send_bg_hover: s(0x1C6C66, 0x5ABDAC),
+    send_fg: s(0xFFFFFF, 0x100F0F),
     ink: s(0x100F0F, 0xCECDC3),
     ink_soft: s(0x64635E, 0xA8A69E),
     ink_faint: s(0xB7B5AC, 0x575653),
     line: s(0xE6E4D9, 0x343331),
+    composer_line: s(0xE6E4D9, 0x343331),
     line_strong: s(0xCECDC3, 0x4D4B48),
     code_bg: s(0xF2F0E5, 0x100F0F),
     hover: s(0xF2F0E5, 0x343331),
@@ -192,17 +267,24 @@ const FLEXOKI: Palette = Palette {
 /// 玫瑰松（Rosé Pine Dawn / Moon：低饱和的玫瑰和紫灰）
 const ROSE_PINE: Palette = Palette {
     paper: s(0xFAF4ED, 0x232136),
+    sidebar: s(0xF2E9E1, 0x1F1D2E),
     sand: s(0xF2E9E1, 0x1F1D2E),
     sand_active: s(0xE9DFD6, 0x393552),
+    user_bubble: s(0xF2E9E1, 0x1F1D2E),
     card: s(0xFFFAF3, 0x2A273F),
     coral: s(0xCF7672, 0xEA9A97),
     coral_deep: s(0x286983, 0xC4A7E7),
     coral_deep_hover: s(0x1F5468, 0xD3BDF0),
     on_accent: s(0xFFFFFF, 0x232136),
+    accent_soft: s(0xF2D9D4, 0x393552),
+    send_bg: s(0x286983, 0xEA9A97),
+    send_bg_hover: s(0x286983, 0xC4A7E7),
+    send_fg: s(0xFFFFFF, 0x232136),
     ink: s(0x575279, 0xE0DEF4),
     ink_soft: s(0x625E7E, 0xA8A4C0),
     ink_faint: s(0x9893A5, 0x6E6A86),
     line: s(0xDFDAD9, 0x44415A),
+    composer_line: s(0xDFDAD9, 0x44415A),
     line_strong: s(0xCECACD, 0x56526E),
     code_bg: s(0xF2E9E1, 0x1F1D2E),
     hover: s(0xF4EDE8, 0x393552),
@@ -218,17 +300,24 @@ const ROSE_PINE: Palette = Palette {
 /// 常青（Everforest：米黄底配灰绿，护眼）
 const EVERFOREST: Palette = Palette {
     paper: s(0xFDF6E3, 0x2D353B),
+    sidebar: s(0xEFEBD4, 0x232A2E),
     sand: s(0xEFEBD4, 0x232A2E),
     sand_active: s(0xE6E2CC, 0x3D484D),
+    user_bubble: s(0xEFEBD4, 0x232A2E),
     card: s(0xFFFBEF, 0x343F44),
     coral: s(0x839700, 0xA7C080),
     coral_deep: s(0x5F7A00, 0xA7C080),
     coral_deep_hover: s(0x506800, 0xB8CE94),
     on_accent: s(0xFFFFFF, 0x2D353B),
+    accent_soft: s(0xEAEDC8, 0x3B473E),
+    send_bg: s(0x5F7A00, 0xA7C080),
+    send_bg_hover: s(0x5F7A00, 0xB8CE94),
+    send_fg: s(0xFFFFFF, 0x2D353B),
     ink: s(0x4F5B62, 0xD3C6AA),
     ink_soft: s(0x56645B, 0xB0BBB2),
     ink_faint: s(0xA6B0A0, 0x7A8478),
     line: s(0xE0DCC7, 0x475258),
+    composer_line: s(0xE0DCC7, 0x475258),
     line_strong: s(0xBDC3AF, 0x56635F),
     code_bg: s(0xF4F0D9, 0x232A2E),
     hover: s(0xF4F0D9, 0x3D484D),
@@ -244,17 +333,24 @@ const EVERFOREST: Palette = Palette {
 /// 北境（Nord：雪白 + 冰蓝，唯一冷色系）
 const NORD: Palette = Palette {
     paper: s(0xECEFF4, 0x2E3440),
+    sidebar: s(0xE5E9F0, 0x272C36),
     sand: s(0xE5E9F0, 0x272C36),
     sand_active: s(0xD8DEE9, 0x3B4252),
+    user_bubble: s(0xE5E9F0, 0x272C36),
     card: s(0xF8F9FB, 0x3B4252),
     coral: s(0x5E81AC, 0x88C0D0),
     coral_deep: s(0x4C6A92, 0x88C0D0),
     coral_deep_hover: s(0x3F5A7D, 0x9DCBD8),
     on_accent: s(0xFFFFFF, 0x2E3440),
+    accent_soft: s(0xCFDCEC, 0x384457),
+    send_bg: s(0x4C6A92, 0x88C0D0),
+    send_bg_hover: s(0x4C6A92, 0x9DCBD8),
+    send_fg: s(0xFFFFFF, 0x2E3440),
     ink: s(0x2E3440, 0xECEFF4),
     ink_soft: s(0x4C566A, 0xB4BCCB),
     ink_faint: s(0x9AA3B5, 0x616E88),
     line: s(0xD8DEE9, 0x434C5E),
+    composer_line: s(0xD8DEE9, 0x434C5E),
     line_strong: s(0xC2CAD8, 0x4C566A),
     code_bg: s(0xE5E9F0, 0x272C36),
     hover: s(0xE5E9F0, 0x434C5E),
@@ -270,17 +366,24 @@ const NORD: Palette = Palette {
 /// 拿铁 / 摩卡（Catppuccin Latte / Mocha：粉彩紫，最活泼）
 const CATPPUCCIN: Palette = Palette {
     paper: s(0xEFF1F5, 0x1E1E2E),
+    sidebar: s(0xE6E9EF, 0x181825),
     sand: s(0xE6E9EF, 0x181825),
     sand_active: s(0xDCE0E8, 0x313244),
+    user_bubble: s(0xE6E9EF, 0x181825),
     card: s(0xFFFFFF, 0x313244),
     coral: s(0x8839EF, 0xCBA6F7),
     coral_deep: s(0x8839EF, 0xCBA6F7),
     coral_deep_hover: s(0x7529D6, 0xD8BCFA),
     on_accent: s(0xFFFFFF, 0x1E1E2E),
+    accent_soft: s(0xDCCBF7, 0x382F4D),
+    send_bg: s(0x7529D6, 0xCBA6F7),
+    send_bg_hover: s(0x7529D6, 0xD8BCFA),
+    send_fg: s(0xFFFFFF, 0x1E1E2E),
     ink: s(0x4C4F69, 0xCDD6F4),
     ink_soft: s(0x5C5F77, 0xBAC2DE),
     ink_faint: s(0x9CA0B0, 0x6C7086),
     line: s(0xCCD0DA, 0x45475A),
+    composer_line: s(0xCCD0DA, 0x45475A),
     line_strong: s(0xBCC0CC, 0x585B70),
     code_bg: s(0xE6E9EF, 0x181825),
     hover: s(0xE6E9EF, 0x45475A),
@@ -294,23 +397,26 @@ const CATPPUCCIN: Palette = Palette {
 };
 
 /// GitHub（Primer 浅色 / 深色：白底、浅灰凹面、蓝链接）
-///
-/// 唯一一套「强调色是蓝」的配色（见「设计指南-Claude风格UI.md」：暖纸刻意避开蓝）。
-/// 浅色纸底和卡片底都是纯白，凹面靠 `sand`（`#f6f8fa`）拉开；强调色取 GitHub 的链接蓝，
-/// 深色版悬停压到 `#1760cf`——原版 `#388bfd` 上白字只有 3.3:1。
 const GITHUB: Palette = Palette {
     paper: s(0xFFFFFF, 0x0D1117),
+    sidebar: s(0xF6F8FA, 0x010409),
     sand: s(0xF6F8FA, 0x010409),
     sand_active: s(0xEAEEF2, 0x161B22),
+    user_bubble: s(0xF6F8FA, 0x161B22),
     card: s(0xFFFFFF, 0x161B22),
     coral: s(0x0969DA, 0x1F6FEB),
     coral_deep: s(0x0969DA, 0x1F6FEB),
     coral_deep_hover: s(0x0550AE, 0x1760CF),
     on_accent: s(0xFFFFFF, 0xFFFFFF),
+    accent_soft: s(0xDDF4FF, 0x0C2D6B),
+    send_bg: s(0x0969DA, 0x1F6FEB),
+    send_bg_hover: s(0x0550AE, 0x1760CF),
+    send_fg: s(0xFFFFFF, 0xFFFFFF),
     ink: s(0x1F2328, 0xE6EDF3),
     ink_soft: s(0x59636E, 0x9198A1),
     ink_faint: s(0x818B98, 0x6E7681),
     line: s(0xD1D9E0, 0x3D444D),
+    composer_line: s(0xD1D9E0, 0x3D444D),
     line_strong: s(0xB7BEC8, 0x515B65),
     code_bg: s(0xF6F8FA, 0x161B22),
     hover: s(0xF6F8FA, 0x1C2128),
@@ -331,22 +437,26 @@ const GITHUB: Palette = Palette {
 };
 
 /// 纯白（只用灰阶：纸底和卡片是纯白，强调色就是墨色本身）
-///
-/// 没有彩色强调：主按钮是近黑实底、浅灰悬停，选中 / 聚焦全用灰阶。
-/// 深色版是纯黑纸底 + 近白按钮底（`ON_ACCENT` 反过来用黑字）。
 const PURE: Palette = Palette {
     paper: s(0xFFFFFF, 0x000000),
+    sidebar: s(0xF2F2F2, 0x0A0A0A),
     sand: s(0xF2F2F2, 0x0A0A0A),
     sand_active: s(0xE6E6E6, 0x141414),
+    user_bubble: s(0xF2F2F2, 0x141414),
     card: s(0xFFFFFF, 0x0A0A0A),
     coral: s(0x1F2328, 0xE6EDF3),
     coral_deep: s(0x1F2328, 0xF0F6FC),
     coral_deep_hover: s(0x32383F, 0xFFFFFF),
     on_accent: s(0xFFFFFF, 0x000000),
+    accent_soft: s(0xEDEDED, 0x1F1F1F),
+    send_bg: s(0x1F2328, 0xE6EDF3),
+    send_bg_hover: s(0x32383F, 0xFFFFFF),
+    send_fg: s(0xFFFFFF, 0x000000),
     ink: s(0x1F2328, 0xEDEDED),
     ink_soft: s(0x575757, 0xA0A0A0),
     ink_faint: s(0x8A8A8A, 0x6E6E6E),
     line: s(0xE5E5E5, 0x262626),
+    composer_line: s(0xE5E5E5, 0x262626),
     line_strong: s(0xC8C8C8, 0x3D3D3D),
     code_bg: s(0xF6F6F6, 0x0A0A0A),
     hover: s(0xF2F2F2, 0x141414),
@@ -360,26 +470,26 @@ const PURE: Palette = Palette {
 };
 
 /// 薰衣草（淡紫玻璃观感：偏紫的纸底、浅紫凹面、紫强调色）
-///
-/// 取自 Kero 主窗口那层「淡紫 + 半透明白」的观感。注意那层紫有大半是玻璃染色叠出来的
-/// （`mygo/plugins/glass` 按背景亮度染色，配合 `Vibrancy` 和背景壁纸），Kero 也没有
-/// 暴露可改的 UI 配色，所以**没有一份可提取的固定色值**——这套是照着观感自建的。
-/// 本仓库没有半透明窗口，只能给不透明近似：底和凹面往紫里压、卡片保持近白，靠这三档拉层次。
-/// 强调色参照 Kero 的紫标签色 `#8257e6`（浅）/ `#b493ff`（深）——`#8257e6` 上白字只有
-/// 4.1:1，所以带文字的按钮底再压一档到 `#6f43d9`。
 const LAVENDER: Palette = Palette {
     paper: s(0xF7F3FC, 0x1A1722),
+    sidebar: s(0xEFE7F8, 0x140F1B),
     sand: s(0xEFE7F8, 0x140F1B),
     sand_active: s(0xE6DBF4, 0x2E2740),
+    user_bubble: s(0xEFE7F8, 0x241F30),
     card: s(0xFDFBFF, 0x241F30),
     coral: s(0x8257E6, 0xB493FF),
     coral_deep: s(0x6F43D9, 0x9B78F0),
     coral_deep_hover: s(0x5E35C7, 0xAF94F5),
     on_accent: s(0xFFFFFF, 0x1A1722),
+    accent_soft: s(0xDCCDF6, 0x31284A),
+    send_bg: s(0x6F43D9, 0xB493FF),
+    send_bg_hover: s(0x6F43D9, 0x9B78F0),
+    send_fg: s(0xFFFFFF, 0x1A1722),
     ink: s(0x2A2340, 0xEDE8F7),
     ink_soft: s(0x635A78, 0xBCB2D0),
     ink_faint: s(0xA79DBB, 0x7A7192),
     line: s(0xE3D9F0, 0x37304A),
+    composer_line: s(0xE3D9F0, 0x37304A),
     line_strong: s(0xCDC0E0, 0x4A4162),
     code_bg: s(0xF0EAF8, 0x140F1B),
     hover: s(0xEFE7F8, 0x2A2438),
@@ -400,8 +510,8 @@ const LAVENDER: Palette = Palette {
 };
 
 /// 顺序和 `settings::ThemeChoice::ALL` 一致（`ThemeChoice::index` 取下标）。
-pub static PALETTES: [Palette; 9] =
-    [WARM, FLEXOKI, ROSE_PINE, EVERFOREST, NORD, CATPPUCCIN, GITHUB, PURE, LAVENDER];
+pub static PALETTES: [Palette; 10] =
+    [KIMI, WARM, FLEXOKI, ROSE_PINE, EVERFOREST, NORD, CATPPUCCIN, GITHUB, PURE, LAVENDER];
 
 static PALETTE: AtomicUsize = AtomicUsize::new(0);
 
@@ -456,11 +566,15 @@ pub fn swatch(index: usize, color: Color) -> Rgba {
 }
 
 // 常量名保留，调用点不用改
-/// 主区底色（纸）
+/// 主区底色
 pub const PAPER: Color = Color::Paper;
-/// 凹下去的面：侧栏、用户气泡、代码块、概览面板、chip（深色下比主区更暗）
+/// 侧栏底色（Kimi 下为浅冷微灰 `#F9FBFC` / 深炭黑 `#0D0D0D`）
+pub const SIDEBAR: Color = Color::Sidebar;
+/// 凹下去的面：代码块、芯片、概览面板、面板内层（深色下比主区更抬升或更深）
 pub const SAND: Color = Color::Sand;
 pub const SAND_ACTIVE: Color = Color::SandActive;
+/// 用户气泡底色（Kimi 下 `#F5F5F5` / `#292929`）
+pub const USER_BUBBLE: Color = Color::UserBubble;
 /// 浮起来的面：输入框、卡片、弹层
 pub const CARD: Color = Color::Card;
 pub const CORAL: Color = Color::Coral;
@@ -471,12 +585,20 @@ pub const CORAL_DEEP: Color = Color::CoralDeep;
 pub const CORAL_DEEP_HOVER: Color = Color::CoralDeepHover;
 /// 主按钮（CORAL_DEEP / CORAL 底）上的文字：有的配色深色版按钮底很亮，白字看不清
 pub const ON_ACCENT: Color = Color::OnAccent;
+/// 淡强调底（焦点外晕 / 激活微标 / 提示条）
+pub const ACCENT_SOFT: Color = Color::AccentSoft;
+/// 输入框发送 / 停止按钮底色、悬停底色、图标色
+pub const SEND_BG: Color = Color::SendBg;
+pub const SEND_BG_HOVER: Color = Color::SendBgHover;
+pub const SEND_FG: Color = Color::SendFg;
 pub const INK: Color = Color::Ink;
 /// 次要文字：说明、元信息、时间（各色板各外观都 ≥ 4.5:1）
 pub const INK_SOFT: Color = Color::InkSoft;
 /// 只给占位、禁用、分隔符和装饰用（纸底上约 2–3:1）——承载信息的文字用 `INK_SOFT`
 pub const INK_FAINT: Color = Color::InkFaint;
 pub const LINE: Color = Color::Line;
+/// 输入框静止描边（Kimi 下 13% 黑，其余配色同 `LINE`）
+pub const COMPOSER_LINE: Color = Color::ComposerLine;
 /// 悬停时加深一档的边框（输入框），介于 `LINE` 和聚焦用的 `INK_FAINT` 之间
 pub const LINE_STRONG: Color = Color::LineStrong;
 pub const GREEN: Color = Color::Green;
@@ -516,12 +638,18 @@ pub const DIFF_DEL_FG: Color = Color::DiffDelFg;
 pub const SELECTION: Color = Color::Selection;
 
 /// 中文回退字体（内嵌字体只含拉丁字形）。按顺序取第一个装了的；都没有时交给系统回退。
-/// 不定死的话 DirectWrite 会按系统区域挑，可能落到宋体或日文字形。
+/// 优先使用 Noto Sans SC（Kimi Code 中文字体）与微软雅黑 UI。
 pub fn cjk_fallbacks() -> FontFallbacks {
     FontFallbacks::from_fonts(
-        ["Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC"]
-            .map(String::from)
-            .to_vec(),
+        [
+            "Noto Sans SC",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "PingFang SC",
+            "Noto Sans CJK SC",
+        ]
+        .map(String::from)
+        .to_vec(),
     )
 }
 
@@ -531,32 +659,33 @@ pub fn tabular_nums() -> FontFeatures {
     FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
 }
 
-// ---------- 字号阶梯 ----------
-// 只用这几档，不要再内联字号。相邻两档至少差 1px，肉眼才分得出层级。
-//
-// 单位是 rem 而不是 px：字号、间距、圆角、图标尺寸全都按窗口的 rem 换算，
-// 所以只要改根字号（见下面的 `set_font_scale` / `apply`），整套界面等比缩放。
-// 1rem = 16 × 缩放倍率，这里的数值就是「标准档下多少 px / 16」。
+// ---------- 字阶与字重阶梯（对齐 Kimi Code 14px 紧凑工作台基准） ----------
+// 只用这几档，不要再内联字号。单位是 rem 而不是 px，随根字号等比缩放。
 
-/// 元信息：时间、分组标题、居中备注、状态行（标准档 12px）
+/// 元信息：时间、分组标题、居中备注、状态行（12px，Kimi `--ui-c1`）
 pub const TEXT_META: Rems = rems(0.75);
-/// 次要文字：说明、提示、chip、diff 头、思考过程正文（13px）
+/// 次要文字：说明、提示、chip、diff 头、思考过程正文（13px，Kimi `b2/b3`）
 pub const TEXT_SMALL: Rems = rems(0.8125);
-/// 界面正文：菜单项、列表标题、工具参数 / 输出、按钮（14px）
+/// 阅读与界面正文：用户消息、助手回复、输入框、菜单项、列表标题（14px，Kimi `--ui-b2` / `--md-b1`）
 pub const TEXT_BODY: Rems = rems(0.875);
-/// 阅读正文：用户消息、助手回复、输入框（15px，也是根视图默认字号）
-pub const TEXT_LARGE: Rems = rems(0.9375);
-/// 次级标题：统计数值、回复里的三级标题（17px）
-pub const TEXT_LEAD: Rems = rems(1.0625);
-/// 分区标题、回复里的二级标题（20px）
+/// 次级标题：统计数值、回复里的三级标题（18px，Kimi `--ui-t1` / `h3`）
+pub const TEXT_LEAD: Rems = rems(1.125);
+/// 分区标题、回复里的二级标题（20px，Kimi `--ui-t0` / `h2`）
 pub const TEXT_HEADING: Rems = rems(1.25);
-/// 回复里的一级标题（24px）
-pub const TEXT_DISPLAY: Rems = rems(1.5);
-/// 页面标题、首页问候（28px）
-pub const TEXT_TITLE: Rems = rems(1.75);
+/// 回复里的一级标题、首页问候（22px，Kimi `h1`）
+pub const TEXT_DISPLAY: Rems = rems(1.375);
+/// 页面大标题（24px，Kimi `--ui-t0` 上限）
+pub const TEXT_TITLE: Rems = rems(1.5);
 
-/// 界面多行文字的行高
-pub const LEADING: DefiniteLength = relative(1.6);
+/// 界面多行文字与 Markdown 正文行高（Kimi `14px × 1.625`）
+pub const LEADING: DefiniteLength = relative(1.625);
+/// 紧凑单行控件与菜单行高
+pub const LEADING_UI: DefiniteLength = relative(1.4);
+
+/// Kimi 微调字重阶梯（Variable Font 下可连续过渡）
+pub const WEIGHT_CAPTION: FontWeight = FontWeight(450.);
+pub const WEIGHT_OPTION: FontWeight = FontWeight(475.);
+pub const WEIGHT_STRONG: FontWeight = FontWeight(525.);
 
 // ---------- 字体设置（设置页可调） ----------
 // 字号只有一个开关：根 em 值。gpui 的间距 / 圆角 / 图标 / 尺寸 helper 全是 rem，
@@ -653,8 +782,8 @@ fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, pal: &Palette, d
     t.background = p(PAPER);
     t.foreground = p(INK);
     t.border = p(LINE);
-    t.input = p(LINE);
-    t.ring = p(INK_FAINT);
+    t.input = p(COMPOSER_LINE);
+    t.ring = p(CORAL);
     t.caret = p(INK);
     t.selection = p(SELECTION);
     t.muted = p(SAND);
@@ -663,9 +792,9 @@ fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, pal: &Palette, d
     t.accent_foreground = p(INK);
     t.popover = p(CARD);
     t.popover_foreground = p(INK);
-    t.link = p(INK);
-    t.link_hover = p(INK_SOFT);
-    t.link_active = p(INK);
+    t.link = p(CORAL_DEEP);
+    t.link_hover = p(CORAL_DEEP_HOVER);
+    t.link_active = p(CORAL_DEEP);
     t.window_border = p(LINE);
 
     // 主按钮：带文字的用 CORAL_DEEP（CORAL 上白字只有 3:1 上下）；文字用 ON_ACCENT
@@ -743,7 +872,7 @@ fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, pal: &Palette, d
     t.scrollbar_thumb_hover = p(INK_SOFT);
 
     // 侧栏 / 分组 / 折叠面板 / 描述列表
-    t.sidebar = p(SAND);
+    t.sidebar = p(SIDEBAR);
     t.sidebar_foreground = p(INK);
     t.sidebar_border = p(LINE);
     t.sidebar_accent = p(SELECTED);
@@ -810,11 +939,13 @@ pub fn raised_shadow() -> Vec<BoxShadow> {
 /// `accent` 传 `INK_FAINT`（输入框这种中性的）/ `CORAL`（按钮、链接）/ `RED`（危险操作）。
 /// ① 的缝取元素**外面**的底色，默认 `PAPER`（输入框放在纸底上）；放在卡片里的元素用
 /// [`focus_ring_on`] 传 `CARD`，否则会看到一道和周围不一样的缝。
+#[allow(dead_code)]
 pub fn focus_ring(accent: Color) -> Vec<BoxShadow> {
     focus_ring_on(accent, PAPER)
 }
 
 /// 同 [`focus_ring`]，缝的颜色（元素外面的底色）自己给（见那里的说明）。
+#[allow(dead_code)]
 pub fn focus_ring_on(accent: Color, gap: Color) -> Vec<BoxShadow> {
     let line = hsla_of(accent);
     vec![
@@ -826,24 +957,40 @@ pub fn focus_ring_on(accent: Color, gap: Color) -> Vec<BoxShadow> {
     ]
 }
 
-/// 状态色（红 / 绿 / 待处理的赤陶）的描边：前景色 40%，直接拿前景色描边会喧宾夺主（原版状态描边一律取浅档）。
+/// 输入卡片聚焦：边框加深，外圈只留一层很淡的强调色光晕。
+pub fn composer_focus_shadow() -> Vec<BoxShadow> {
+    let glow = hsla_of(ACCENT_SOFT);
+    vec![BoxShadow::new(px(0.), px(0.), glow).blur_radius(px(4.)).spread_radius(px(2.))]
+}
+
+/// 状态色（红 / 绿 / 强调色）的描边：前景色 40%，直接拿前景色描边会喧宾夺主。
 pub fn state_line(color: Color) -> Rgba {
     with_alpha(rgb(color), 0.4)
 }
 
-// ---------- 布局宽度 ----------
+// ---------- 布局宽度与输入框几何 ----------
 // 阅读列 / 设置页内容 / 概览面板是「measure」（按一行放多少字定），**保持 px**：
 // 字号放大时列宽不该跟着放大，否则一行字数跟着变。
-// 侧栏、分类导航、顶栏高度是界面的「框」，跟字号缩放（放大后标题和相对时间才不会互挤）。
+// 侧栏、分类导航、顶栏高度和辅助面板是界面的「框」，跟字号缩放。
 
 /// 对话内容与输入框共用容器的最大宽度（含两侧留白）。
 pub const READING_W: Pixels = px(760.);
+/// 宽阅读模式的最大宽度（Kimi `--p-content-wide`）
+pub const READING_WIDE_W: Pixels = px(920.);
 /// 设置页内容最大宽度
 pub const FORM_W: Pixels = px(720.);
 /// 设置页左侧分类导航宽度
 pub const SETTINGS_NAV_W: Rems = rems(11.);
-/// 侧栏宽度（含外圈留白）
-pub const SIDEBAR_W: Rems = rems(15.);
+/// 侧栏默认宽度（Kimi 264px，可拖拽调整）
+pub const SIDEBAR_W: Rems = rems(16.5);
+/// 右侧辅助面板默认宽度（Kimi 460px，可拖拽调整）
+pub const PANEL_DEFAULT_W: Rems = rems(28.75);
+/// 右侧文件树宽度（Kimi 224px）
+pub const FILE_TREE_W: Rems = rems(14.);
+/// 输入卡片外圆角（Kimi 32px 超椭圆的圆角近似：26px）
+pub const COMPOSER_RADIUS: Rems = rems(1.625);
+/// 输入卡片内嵌附件圆角，保持与外圆角同心
+pub const COMPOSER_INNER_RADIUS: Rems = rems(1.25);
 /// 设置页里填数字的小输入框（步数上限这类）
 pub const NUMBER_INPUT_W: Pixels = px(120.);
 
@@ -871,16 +1018,18 @@ mod tests {
         let _g = theme_globals();
         set_palette(0);
         set_dark(false);
+        assert_eq!(rgb(PAPER), gpui_kit::rgb(0xFFFFFF));
+        set_dark(true);
+        assert_eq!(rgb(PAPER), gpui_kit::rgb(0x121212));
+        set_palette(1);
+        set_dark(false);
         assert_eq!(rgb(PAPER), gpui_kit::rgb(0xFAF9F5));
         set_dark(true);
-        assert_eq!(rgb(PAPER), gpui_kit::rgb(0x262624));
-        set_palette(1);
-        assert_eq!(rgb(PAPER), gpui_kit::rgb(0x1C1B1A));
         assert_eq!(rgb(GREEN), gpui_kit::rgb(0x94B07E)); // 状态色继承暖纸
         set_palette(0);
         set_dark(false);
-        // 赤陶橙两边同色
-        assert_eq!(rgb(CORAL), gpui_kit::rgb(0xD97757));
+        // Kimi 品牌电光蓝
+        assert_eq!(rgb(CORAL), gpui_kit::rgb(0x1783FF));
     }
 
     /// 色板顺序要和设置里的选项一一对应（`ThemeChoice::index` 取下标）。
@@ -909,12 +1058,17 @@ mod tests {
             (INK_SOFT, SAND, 4.5),
             (INK_SOFT, CARD, 4.5),
             (INK_SOFT, HOVER, 4.5),
+            (INK_SOFT, SIDEBAR, 4.5),
+            (INK, USER_BUBBLE, 4.5),
             (INK, SELECTED, 4.5),
             (INK, CODE_BG, 4.5),
             (INK, SELECTION, 4.5),
+            (INK, ACCENT_SOFT, 4.5),
             (ON_ACCENT, CORAL_DEEP, 4.5),
             (ON_ACCENT, CORAL_DEEP_HOVER, 4.5),
             (ON_ACCENT, CORAL, 3.0),
+            (SEND_FG, SEND_BG, 4.5),
+            (SEND_FG, SEND_BG_HOVER, 4.5),
         ];
         for (i, pal) in PALETTES.iter().enumerate() {
             for dark in [false, true] {
@@ -936,14 +1090,14 @@ mod tests {
         let _g = theme_globals();
         set_font_scale(1.0);
         assert_eq!(root_font_size(), px(16.));
-        // 字号阶梯本身是 rem：跟着根字号走
-        assert_eq!(TEXT_LARGE.to_pixels(root_font_size()), px(15.));
-        assert_eq!(TEXT_TITLE.to_pixels(root_font_size()), px(28.));
+        // Kimi 字阶：正文 14px，页面标题 24px
+        assert_eq!(TEXT_BODY.to_pixels(root_font_size()), px(14.));
+        assert_eq!(TEXT_TITLE.to_pixels(root_font_size()), px(24.));
 
         set_font_scale(1.25);
         assert_eq!(font_scale(), 1.25);
         assert_eq!(root_font_size(), px(20.));
-        assert_eq!(TEXT_LARGE.to_pixels(root_font_size()), px(18.75));
+        assert_eq!(TEXT_BODY.to_pixels(root_font_size()), px(17.5));
 
         // 越界夹回上下限
         set_font_scale(9.0);
@@ -1002,13 +1156,15 @@ mod tests {
         set_font_scale(scale);
         let rem = root_font_size();
         // 放大后侧栏、导航、顶栏跟着变宽变高
-        assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(240. * scale));
+        assert_eq!(as_rems(SIDEBAR_W).to_pixels(rem), px(264. * scale));
         assert_eq!(as_rems(SETTINGS_NAV_W).to_pixels(rem), px(176. * scale));
+        assert_eq!(as_rems(PANEL_DEFAULT_W).to_pixels(rem), px(460. * scale));
         // 阅读列是 measure：不跟字号走（一行字数的量纲不变）
         assert_eq!(READING_W, px(760.));
+        assert_eq!(READING_WIDE_W, px(920.));
         assert_eq!(FORM_W, px(720.));
         set_font_scale(FONT_SCALE_DEFAULT);
-        assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(240.));
+        assert_eq!(SIDEBAR_W.to_pixels(root_font_size()), px(264.));
     }
 
     /// 焦点环必须是三层（缝 + 实边 + 光晕），都在边框外面，光晕的 σ 是 CSS 值的一半。

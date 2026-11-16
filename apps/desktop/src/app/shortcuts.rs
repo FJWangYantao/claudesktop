@@ -26,6 +26,8 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
             ("快捷键速查", &[SHORTCUTS_KEY]),
             ("在当前空间新建对话", &[NEW_SESSION_KEY]),
             ("显示 / 隐藏侧栏", &[TOGGLE_SIDEBAR_KEY]),
+            ("文件树与源码预览", &[FILES_KEY]),
+            ("逐文件改动", &[CHANGES_KEY]),
             ("下一个会话", &[NEXT_SESSION_KEY]),
             ("上一个会话", &[PREV_SESSION_KEY]),
         ],

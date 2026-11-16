@@ -439,8 +439,12 @@ pub struct Settings {
     pub view_mode: ViewMode,
     /// 外观（跟随系统 / 浅色 / 深色），设置页切换后立即生效并写回
     pub appearance: Appearance,
-    /// 配色（暖纸 / 墨纸 / 玫瑰松 / 常青 / 北境 / 拿铁摩卡），每套都有浅深两版
+    /// 配色（Kimi / 暖纸 / 墨纸 / …），每套都有浅深两版
     pub theme: ThemeChoice,
+    /// 主内容区对齐方式（居中 / 左对齐），设置页切换后立即生效并写回
+    pub content_align: ContentAlign,
+    /// 主内容区是否使用宽阅读列（920px vs 标准 760px），设置页切换后立即生效并写回
+    pub wide_reading: bool,
     /// 侧栏底部列出各内核状态（「自研内核 · 已连接」），设置页切换后立即生效并写回。
     /// 默认不显示（状态另有设置页与侧栏「进行中」可看）；老设置文件里没有这一项时
     /// 容器级 `#[serde(default)]` 会用下面的 `Default` 实现补齐，这里取 `false` 干净利落。
@@ -601,6 +605,8 @@ impl Default for Settings {
             view_mode: ViewMode::default(),
             appearance: Appearance::default(),
             theme: ThemeChoice::default(),
+            content_align: ContentAlign::default(),
+            wide_reading: false,
             sidebar_kernel_status: false,
             workspace: None,
             sidebar_by_date: false,
@@ -710,11 +716,32 @@ impl Appearance {
     }
 }
 
+/// 主内容区对齐方式（Kimi 工作台默认居中，可选切回左对齐）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentAlign {
+    #[default]
+    Center,
+    Left,
+}
+
+impl ContentAlign {
+    pub const ALL: [Self; 2] = [Self::Center, Self::Left];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Center => "居中",
+            Self::Left => "左对齐",
+        }
+    }
+}
+
 /// 配色：顺序和 `theme::PALETTES` 一致
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeChoice {
     #[default]
+    Kimi,
     Warm,
     Flexoki,
     RosePine,
@@ -727,7 +754,8 @@ pub enum ThemeChoice {
 }
 
 impl ThemeChoice {
-    pub const ALL: [ThemeChoice; 9] = [
+    pub const ALL: [ThemeChoice; 10] = [
+        Self::Kimi,
         Self::Warm,
         Self::Flexoki,
         Self::RosePine,
@@ -745,6 +773,7 @@ impl ThemeChoice {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Kimi => "Kimi 工作台",
             Self::Warm => "暖纸",
             Self::Flexoki => "墨纸",
             Self::RosePine => "玫瑰松",
@@ -759,7 +788,8 @@ impl ThemeChoice {
 
     pub fn desc(self) -> &'static str {
         match self {
-            Self::Warm => "Claude 默认，暖纸底和赤陶橙",
+            Self::Kimi => "Kimi 默认，极简中性灰三层表面与电光蓝",
+            Self::Warm => "Claude 经典，暖纸底和赤陶橙",
             Self::Flexoki => "Flexoki · 纸和墨，青绿点缀",
             Self::RosePine => "Rosé Pine · 低饱和的玫瑰和紫灰",
             Self::Everforest => "Everforest · 米黄底配灰绿，护眼",
@@ -773,6 +803,7 @@ impl ThemeChoice {
 
     pub fn parse(v: &str) -> Option<Self> {
         Some(match v.trim().to_ascii_lowercase().as_str() {
+            "kimi" | "kimi_code" => Self::Kimi,
             "warm" => Self::Warm,
             "flexoki" => Self::Flexoki,
             "rose_pine" | "rosepine" => Self::RosePine,
@@ -1328,21 +1359,32 @@ mod tests {
         assert_eq!(b.profiles[0].menu_models(), vec!["mag-a", "shared"]);
     }
 
-    /// 配色：旧设置文件读出默认的暖纸，写盘回读一致。
+    /// 配色：旧设置文件读出默认的 Kimi，写盘回读一致。
     #[core::prelude::v1::test]
     fn theme_choice_default_and_roundtrip() {
         let s: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(s.theme, ThemeChoice::Warm);
+        assert_eq!(s.theme, ThemeChoice::Kimi);
+        assert_eq!(s.content_align, ContentAlign::Center);
+        assert!(!s.wide_reading);
 
         let dir = std::env::temp_dir().join(format!("claudesktop-theme-{}", std::process::id()));
         let path = dir.join("settings.json");
-        let s = Settings { theme: ThemeChoice::RosePine, ..Default::default() };
+        let s = Settings {
+            theme: ThemeChoice::RosePine,
+            content_align: ContentAlign::Left,
+            wide_reading: true,
+            ..Default::default()
+        };
         s.save(&path).unwrap();
-        assert_eq!(Settings::load(Some(&path)).0.theme, ThemeChoice::RosePine);
+        let back = Settings::load(Some(&path)).0;
+        assert_eq!(back.theme, ThemeChoice::RosePine);
+        assert_eq!(back.content_align, ContentAlign::Left);
+        assert!(back.wide_reading);
         // 文件里是 key（snake_case），不是枚举名
         assert!(std::fs::read_to_string(&path).unwrap().contains("\"rose_pine\""));
         let _ = std::fs::remove_dir_all(&dir);
 
+        assert_eq!(ThemeChoice::parse("Kimi"), Some(ThemeChoice::Kimi));
         assert_eq!(ThemeChoice::parse("Nord"), Some(ThemeChoice::Nord));
         assert_eq!(ThemeChoice::parse("rosepine"), Some(ThemeChoice::RosePine));
         assert_eq!(ThemeChoice::parse("GitHub"), Some(ThemeChoice::Github));
@@ -1350,6 +1392,8 @@ mod tests {
         assert_eq!(ThemeChoice::parse("nope"), None);
         // 新加的配色也走一遍 key 往返（顺序和 `theme::PALETTES` 对齐）
         for (t, key) in [
+            (ThemeChoice::Kimi, "kimi"),
+            (ThemeChoice::Warm, "warm"),
             (ThemeChoice::Github, "github"),
             (ThemeChoice::Pure, "pure"),
             (ThemeChoice::Lavender, "lavender"),

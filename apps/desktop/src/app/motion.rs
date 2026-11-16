@@ -1,8 +1,6 @@
-//! 动效：限帧的转圈 / 小陶 / 扫光、展开收起（弹簧 + 高度裁切）、悬停淡入、新内容入场、平滑回到底部。
+//! 动效：限帧的转圈 / 几何状态指示 / 扫光、展开收起（弹簧 + 高度裁切）、悬停淡入、新内容入场、平滑回到底部。
 //!
-//! 「进行中」只有两种样子：通用的圆弧转圈（[`spinner`]，`canvas` + `PathBuilder` 矢量画，不靠旋转图标或换字形：
-//! 小尺寸下旋转的位图发虚、符号字体里各个字形粗细不一）和运行状态行专用的小陶（[`mascot`]，
-//! 按状态换表情、几帧轮着放，见 mascot.rs）。
+//! 「进行中」使用统一的圆弧转圈（[`spinner`]，`canvas` + `PathBuilder` 矢量画）和少量线性状态图标。
 //!
 //! gpui 的动画每一帧都要重画它所在的整个 view（`request_animation_frame` 通知当前 view，
 //! 祖先一并变脏），所以常驻的循环动画（转圈、扫光）不用 `with_animation`：相位按全局时钟算，
@@ -21,6 +19,7 @@ use super::mascot::Mood;
 use crate::settings::MotionPref;
 use crate::theme::rgb;
 use crate::theme::*;
+use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::animation::ease_out_cubic;
 use gpui_kit::base::motion::{Transition, spring, transition};
 use gpui_kit::component::*;
@@ -36,7 +35,7 @@ use std::time::{Duration, Instant};
 const LOOP_INTERVAL: Duration = Duration::from_millis(33);
 /// 帧到来的时刻有抖动：差这么一点也算到了（60Hz 下正好每两帧一拍）
 const TICK_SLACK: Duration = Duration::from_millis(4);
-// 循环动画的节奏：转圈 1 秒一圈，圆弧伸缩和扫光 2 秒一拍（小陶每帧停多久见 `Mood::script`）
+// 循环动画的节奏：转圈 1 秒一圈，圆弧伸缩和扫光 2 秒一拍
 /// 转圈匀速转一圈的时长
 const SPIN_PERIOD: Duration = Duration::from_millis(1000);
 /// 圆弧一伸一缩的周期
@@ -63,7 +62,6 @@ struct LoopSpot {
 
 enum LoopKind {
     Spinner,
-    Mascot(Mood),
     /// 扫光文字：字体字号取占位那份透明文字的样式
     Shimmer {
         text: SharedString,
@@ -111,7 +109,6 @@ impl Render for LoopOverlay {
 
 fn paint_loop_spots(window: &mut Window, cx: &mut App) {
     let spin = (loop_phase(SPIN_PERIOD), 0.2 + 0.45 * pulse(loop_phase(PULSE_PERIOD)));
-    let clock = loop_clock();
     let shimmer = loop_phase(SHIMMER_PERIOD);
     let color = rgb(CORAL);
     LOOP_SPOTS.with_borrow(|spots| {
@@ -119,7 +116,6 @@ fn paint_loop_spots(window: &mut Window, cx: &mut App) {
             let mask = ContentMask { bounds: spot.clip };
             window.with_content_mask(Some(mask), |window| match &spot.kind {
                 LoopKind::Spinner => paint_spinner(spot.bounds, spin.0, spin.1, color, window),
-                LoopKind::Mascot(mood) => paint_mascot(*mood, spot.bounds, clock, window, cx),
                 LoopKind::Shimmer { text, style, base, highlight } => {
                     paint_shimmer(text, style, spot.bounds, shimmer, *base, *highlight, window, cx)
                 }
@@ -208,7 +204,7 @@ pub(super) struct JumpAnim {
     pub last: Instant,
 }
 
-/// 转圈（赤陶色，12px，界面里所有「进行中」共用这一个：工具行、侧栏、压缩上下文）：
+/// 转圈（当前强调色，12px，界面里所有「进行中」共用这一个：工具行、侧栏、压缩上下文）：
 /// 淡色圆环上一段圆头圆弧匀速转，弧长随 [`PULSE_PERIOD`] 一伸一缩，矢量画（不是旋转图标，边缘不发虚）。
 /// 减少动态效果时停成一段静止的四分之三圆弧。
 /// 这里只是占位，由 [`LoopOverlay`] 画，只能用在内容区里；别的地方用 [`spinner_in_place`]。
@@ -292,36 +288,19 @@ fn paint_spinner(bounds: Bounds<Pixels>, start: f32, sweep: f32, color: Rgba, wi
     paint_dot(to, stroke / 2., color, window);
 }
 
-/// 运行状态行的小陶（20px 格子）：按 [`Mood`] 换表情、几帧轮着放，由 [`LoopOverlay`] 画、节拍器重画。
-/// 早先这里是一个呼吸的赤陶圆点（14px 下任何品牌形状都太小，见设计指南第 13 条）；
-/// 换成小陶后格子放大到 20px，每个状态单独画了帧，道具（泡、问号、汗珠）按 20px 加粗。
-/// 减少动态效果时停在最能说明状态的那一帧（[`Mood::rest_frame`]）。
+/// 运行状态的几何指示器：常规工作使用统一的圆弧，需用户处理或特殊状态用线性图标。
 pub(super) fn mascot(mood: Mood) -> Div {
-    let div = div().size_5().flex_shrink_0();
-    if REDUCED.load(Ordering::Relaxed) {
-        return div.child(img(mood.frames()[mood.rest_frame()].clone()).size_full());
-    }
-    div.child(loop_spot(LoopKind::Mascot(mood)).size_full())
-}
-
-/// 小陶的一帧。图是异步解码的：每次都把这个表情的各帧要一遍（解码好前不画、好了覆盖层收到通知），
-/// 该放的那帧还没好就先画已经好的。
-fn paint_mascot(
-    mood: Mood,
-    bounds: Bounds<Pixels>,
-    clock: Duration,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let frames: Vec<_> =
-        mood.frames().iter().map(|f| f.clone().use_render_image(window, cx)).collect();
-    let Some(data) =
-        frames[mood.frame_at(clock)].clone().or_else(|| frames.iter().flatten().next().cloned())
-    else {
-        return;
+    let icon = match mood {
+        Mood::Think | Mood::Talk | Mood::Wake | Mood::Scan => {
+            return div().size_5().flex_shrink_0().flex().justify_center().items_center().child(
+                if REDUCED.load(Ordering::Relaxed) { spinner_in_place() } else { spinner() },
+            );
+        }
+        Mood::Ask => Icon::new(IconAll::CircleAlert).text_color(rgb(CORAL_DEEP)),
+        Mood::Sweat => Icon::new(IconAll::TriangleAlert).text_color(rgb(CORAL)),
+        Mood::Squish => Icon::new(IconAll::ListCollapse).text_color(rgb(INK_SOFT)),
     };
-    // 图集分配失败之类的偶发错误：这一拍不画，下一拍再来
-    let _ = window.paint_image(bounds, bounds, Corners::default(), data, 0, false);
+    div().size_5().flex_shrink_0().flex().justify_center().items_center().child(icon.size_4())
 }
 
 /// 扫光文字（「思考中…」）：`base` 色的字上一道 `highlight` 色的柔和高光从左扫到右，约 30 帧。

@@ -2,10 +2,22 @@
 
 > 状态：**部分实施**（2026-10-21）。第 1 步（`agents.rs`）、第 2 步（多档案 + 迁移 + 内核槽）、
 > 第 3 步（设置页「本机 agent」+ 首页引导 + `last_model` 记忆）已实施；
-> 第 4 步（模型列表经 ACP `config_options`）、第 5 步（登录）、第 6 步（Key 导入）未做。
+> 第 4 步（模型列表经 ACP `config_options`）、第 5 步（登录）已实施；第 6 步（Key 导入）未做。
 > 代码落点：`crates/core/src/agents.rs`（✅ 发现与预设）、`apps/desktop/src/settings.rs`（✅ 多 agent 档案与迁移）、
 > `app/mod.rs`（✅ 内核槽按档案 key 开）、`app/settings_view.rs`（✅「本机 agent」一栏）、
-> `crates/core/src/acp.rs`（登录、模型列表与切换，未动）、`app/composer.rs`（模型下拉认 ACP，未动）、`app/chat.rs`（登录卡片，未动）。
+> `crates/core/src/acp.rs`（✅ 登录、模型列表与切换、form elicitation）、`app/composer.rs`（✅ 模型下拉、登录与提问面板）。
+>
+> ACP 保真第一批（2026-11-16）已完成：`fs/read_text_file` 支持 `line/limit` 和真实错误响应，写失败不再回成功；
+> 图片提示按握手能力放行或明确拒绝。工具 `content` 与 `rawOutput` 分开保存，文本 / 资源 / 图片 / Diff 均可显示，
+> 终端引用和音频有明确降级文案；Diff 已进日志。长输出外置、可点击资源、实时终端、音频播放和其余会话更新仍属后续批次。
+>
+> ACP 第二批（2026-11-16）已完成：模型分组列表与切换、外部配置更新、Skills / 斜杠命令、权限模式同步、
+> 上下文用量与费用、标题、通知和按 ID 更新的压缩。`session/new` 之前到达的通知先缓存，`Started` 绑定后按序回放；
+> `AvailableCommandsChanged` 会刷新已打开的补全。
+>
+> ACP 第三批（2026-11-16）已完成：Agent / Terminal 登录入口、成功后重试原会话，以及 `elicitation` form 的单选、
+> 多选、文本、浮点、整数和布尔字段，答案保留字段 ID 和原始类型。655 项 workspace 测试、Clippy、标准截图构建和两条 mock 无头闭环通过；
+> URL elicitation 尚未实现，真实付费 Harness、真实终端登录和非 Windows 平台未实测。
 
 ## 一、要解决什么
 
@@ -131,16 +143,17 @@ ACP 1.x 的 `initialize` 响应带 `authMethods`，分两种（`agent-client-pro
 - **`Terminal`**：客户端用同一条启动命令再加上 `args` / `env` 开一个**交互式终端**，用户在里面登录，退出码 0 = 成功。
   只有客户端在 `initialize` 里声明了终端登录能力，agent 才会报这种。
 
-流程：
+已实现流程：
 
-1. `acp.rs` 握手后把 `authMethods` 记下来，经 `KernelEvent::Connected` 一并报给界面（新字段 `auth_methods: Vec<AuthMethodView>`）。
-2. `session/new` 失败且错误码是 `auth_required` 时，发新的 `KernelEvent::AuthRequired { token, methods }`，而不是 `SessionFailed`。
-3. 会话里出一张登录卡片（`Session::note` 那一层，不进日志）：标题「OpenCode 需要登录」，每种方法一个按钮。
-   - `Agent` 方法 → `Kernel::authenticate(method_id)`（新增 trait 方法，默认不支持），按钮 `.loading()` 等结果；
-   - `Terminal` 方法 → 开一个系统终端窗口跑那条命令（Windows `cmd /c start "" <命令>`，macOS `open -a Terminal`，
-     Linux 依次试 `x-terminal-emulator` / `gnome-terminal` / `konsole`），等进程退出；
-   - agent 什么都没报、但预设里有 `login` → 同 `Terminal` 的方式跑预设的登录命令。
-4. 成功后自动重试刚才失败的 `session/new`（`Session::queued` 里的消息照常发出）；失败就留着卡片和错误原文。
+1. `acp.rs` 握手后把 `authMethods` 记下来，经 `KernelEvent::Connected.auth_methods` 报给界面。
+2. `session/new` 失败且错误码是 `auth_required` 时，发 `KernelEvent::AuthRequired { token, methods, message }`，而不是 `SessionFailed`。
+3. 输入框上方出现登录面板（`Session::auth`，只在内存里，不进日志），每种方法一个按钮。
+   - `Agent` 方法 → `Kernel::authenticate(method_id)`，按钮 `.loading()` 等 `AuthCompleted`；
+   - `Terminal` 方法 → 开一个系统终端窗口跑原命令加 `args` / `env`，等真实退出码：Windows 是
+     `cmd /c start "" /wait …`，Linux 是 `x-terminal-emulator -e …`；macOS 当前明确报不支持；
+   - 登录等待在连接任务里，不阻塞其他会话；失败保留面板和错误原文。
+4. 成功后自动重试刚才失败的 `session/new`（`Session::queued` 里的消息照常发出）。Agent 方法的 mock 隐藏窗口闭环已通过；
+   真实终端登录尚未实测，预设 `login` 的兜底入口尚未接入。
 
 登录全程 claudesktop 只负责「开窗口 / 发请求 / 等结果」，令牌落在 agent 自己的存储里。
 
@@ -241,11 +254,12 @@ pub struct AgentProfile {
 | 1 | `agents.rs`：预设表 + `discover_in` / `discover` | ✅ 单测：假 PATH、`.cmd` 垫片、版本过旧、缺 Node、版本串解析；实机跑一遍 `cargo test -p claudesktop-core --test discover_agents -- --ignored` |
 | 2 | 设置：`AgentProfile` + 迁移；内核槽按档案 key 开；`KernelChoice::Acp(id)`；会话归属 | ✅ 实现；单测靠 CI |
 | 3 | 设置页「本机 agent」一栏 + 首页引导 + 选过的模型按档案记（`last_model`，`Started` 后 agent 没报就切过去） | ✅ 实现；实机待验（检测、启用、新建会话连上） |
-| 4 | 模型列表与切换（第七节） | 用 `tools/` 里的 mock ACP agent 加 `configOptions`，测 `Started.models`、`set_model`、`ConfigOptionUpdate` |
-| 5 | 登录（第六节） | mock agent 先报 `auth_required` 再接受 `authenticate`；终端方式实机试 |
+| 4 | 模型列表与切换（第七节） | ✅ mock 覆盖配置分组、切换和外部更新；无头菜单已验收 |
+| 5 | 登录（第六节） | ✅ Agent 方法经 mock 完成「拒绝 → 登录 → 自动重试」；终端命令构造有单测，真实终端仍待实机验收 |
 | 6 | API Key 导入（第九节） | 单测：环境变量检测 |
 
-先做 1 → 2 → 3 → 4：已经登录过的用户一键就能用、能切模型；登录流程第 5 步再补。每步单独提交。
+1～5 已实施；第 6 步仍未做。后续按实时终端、子代理、URL elicitation、更多预设和 Computer Use 分批推进，
+每批保留 mock 协议回归与隐藏窗口端到端验收，不用 mock 结果代替真实 Harness / 平台验收。
 
 ## 十四、magpie 网关（sidecar，2026-11-12 定稿）
 

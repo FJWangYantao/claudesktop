@@ -1,0 +1,96 @@
+name: 网关独立验收
+
+on:
+  workflow_call:
+    inputs:
+      asset_id:
+        type: string
+        required: true
+      sha256:
+        type: string
+        required: true
+      scope:
+        type: string
+        default: all
+      comparison_set:
+        type: string
+        default: combined
+      condition:
+        type: string
+        default: reference
+  workflow_dispatch:
+    inputs:
+      asset_id:
+        description: 同仓库诊断草稿中的验收包资产 ID
+        type: string
+        required: true
+      sha256:
+        description: 已核对的验收包 ZIP SHA256
+        type: string
+        required: true
+      scope:
+        description: 验证范围（完整验收选择 all）
+        type: choice
+        options: [all, kernel, desktop]
+        default: all
+      comparison_set:
+        description: combined 为原组合，parser 只比较统计解析
+        type: choice
+        options: [combined, parser]
+        default: combined
+      condition:
+        description: reference 保留原端点条件
+        type: choice
+        options: [reference, calibrated]
+        default: reference
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gateway-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Windows A/A 与 A/B
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: 下载并校验固定验收包
+        shell: pwsh
+        env:
+          ASSET_ID: ${{ inputs.asset_id }}
+          ZIP_SHA256: ${{ inputs.sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:ASSET_ID -notmatch '^[1-9][0-9]*$') { throw '资产 ID 无效' }
+          if ($env:ZIP_SHA256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'SHA256 无效' }
+          $archive = Join-Path $env:RUNNER_TEMP 'gateway-validation.zip'
+          $headers = @{Authorization="Bearer $env:GH_TOKEN"; Accept='application/octet-stream'; 'X-GitHub-Api-Version'='2022-11-28'}
+          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/assets/$env:ASSET_ID"
+          Invoke-WebRequest -Uri $uri -Headers $headers -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $env:ZIP_SHA256) { throw '验收包校验失败' }
+          Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $env:RUNNER_TEMP 'gateway-validation')
+
+      - name: 校准通过后运行完整对照
+        shell: pwsh
+        env:
+          VALIDATION_SCOPE: ${{ inputs.scope }}
+          VALIDATION_SET: ${{ inputs.comparison_set }}
+          VALIDATION_CONDITION: ${{ inputs.condition }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'gateway-validation'
+          & "$root/runtime/node.exe" "$root/tools/gateway-validation.mjs" run "--scope=$env:VALIDATION_SCOPE" "--set=$env:VALIDATION_SET" "--condition=$env:VALIDATION_CONDITION" '--out=.claudesktop/bench/independent-validation'
+          exit $LASTEXITCODE
+
+      - name: 保存原始结果与失败记录
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-validation-${{ inputs.scope }}-${{ inputs.comparison_set }}-${{ inputs.condition }}
+          path: ${{ runner.temp }}/gateway-validation/.claudesktop/bench/independent-validation/
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14

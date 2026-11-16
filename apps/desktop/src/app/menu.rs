@@ -164,6 +164,7 @@ pub(super) struct MenuList {
     popover: Entity<PopoverState>,
     body: Stateful<Div>,
     header: Option<AnyElement>,
+    footer: Option<AnyElement>,
     picks: Vec<Pick>,
     shortcuts: bool,
     scrollbar: bool,
@@ -182,6 +183,7 @@ impl MenuList {
             popover: popover.clone(),
             body: div().id(id).v_flex().gap_0p5(),
             header: None,
+            footer: None,
             picks: Vec::new(),
             shortcuts: true,
             scrollbar: false,
@@ -244,6 +246,19 @@ impl MenuList {
         self
     }
 
+    /// 固定底栏里的可选条目：点了执行动作并收起，但不占模型列表的数字快捷键。
+    pub(super) fn footer_pick(
+        &self,
+        row: Stateful<Div>,
+        action: impl Fn(&mut ChatApp, &mut Context<ChatApp>) + 'static,
+    ) -> Stateful<Div> {
+        let (handle, popover) = (self.handle.clone(), self.popover.clone());
+        row.on_click(move |_, window, cx| {
+            handle.update(cx, |this, cx| action(this, cx));
+            popover.update(cx, |s, cx| s.dismiss(window, cx));
+        })
+    }
+
     pub(super) fn child(mut self, child: impl IntoElement) -> Self {
         self.body = self.body.child(child);
         self
@@ -254,9 +269,16 @@ impl MenuList {
         self
     }
 
+    /// 固定在滚动列表下方的内容，不随条目一起滚动。
+    pub(super) fn footer(mut self, footer: impl IntoElement) -> Self {
+        self.footer = Some(footer.into_any_element());
+        self
+    }
+
     /// 收尾：外层挂上 `focus`（面板打开时焦点在这里），数字键选对应条目。
     pub(super) fn finish(self, focus: &FocusHandle, window: &mut Window, cx: &mut App) -> Div {
         let picks = self.picks;
+        let has_footer = self.footer.is_some();
         let body = if self.scrollbar {
             let scroll = window
                 .use_keyed_state((self.id, "scroll"), cx, |_, _| ScrollHandle::new())
@@ -275,9 +297,10 @@ impl MenuList {
             .child(
                 div()
                     .v_flex()
-                    .gap_1()
+                    .when(!has_footer, |d| d.gap_1())
                     .when_some(self.header, |d, header| d.child(header))
-                    .child(body),
+                    .child(body)
+                    .when_some(self.footer, |d, footer| d.child(footer)),
             )
             .on_key_down(move |event, window, cx| {
                 let keys = &event.keystroke;

@@ -32,7 +32,7 @@ impl ChatApp {
         }
         let window = match s.kernel {
             KernelChoice::Builtin => self.settings.builtin.context_window(&s.model_label),
-            _ => None,
+            _ => s.context_size,
         };
         Some(usage::context_gauge(s.context_tokens, window))
     }
@@ -48,6 +48,7 @@ impl ChatApp {
             _ => INK_SOFT,
         };
         let cache_hit = self.session().cache_hit;
+        let cost = self.session().context_cost.clone();
         let card_gauge = gauge.clone();
         let trigger = div()
             .h_flex()
@@ -70,13 +71,19 @@ impl ChatApp {
                     .open_delay(std::time::Duration::from_millis(220))
                     .close_delay(std::time::Duration::from_millis(160))
                     .trigger(trigger)
-                    .content(move |_, _, _| Self::context_card(card_gauge.clone(), cache_hit)),
+                    .content(move |_, _, _| {
+                        Self::context_card(card_gauge.clone(), cache_hit, cost.clone())
+                    }),
             ),
         )
     }
 
     /// 悬停展开的用量卡：标题 + 进度条 + 具体数字，底部一句「到八成会怎样」。
-    fn context_card(gauge: ContextGauge, cache_hit: Option<u32>) -> Div {
+    fn context_card(
+        gauge: ContextGauge,
+        cache_hit: Option<u32>,
+        cost: Option<claudesktop_core::CostView>,
+    ) -> Div {
         let tone = tone(gauge.percent);
         let mut rows = div().v_flex().gap_1p5().w_full();
         if let Some(window) = gauge.window {
@@ -97,6 +104,9 @@ impl ChatApp {
         }
         if let Some(hit) = cache_hit {
             rows = rows.child(row("上一轮命中缓存", format!("{hit}%")));
+        }
+        if let Some(cost) = cost {
+            rows = rows.child(row("会话累计费用", format!("{:.4} {}", cost.amount, cost.currency)));
         }
         let caption = if gauge.window.is_some() {
             format!(

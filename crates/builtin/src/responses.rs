@@ -18,7 +18,9 @@ use crate::provider::{
     StreamOutcome, ToolCall, Usage, debug_http, error_message, finish_stream, get_json,
     parse_model_list, post_sse_with_retry, read_sse,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
 /// 设置页里的协议标识（`ProviderProfile::protocol` 的字符串形式）。
 pub const PROTOCOL_NAME: &str = "responses";
@@ -70,7 +72,7 @@ impl ChatProvider for ResponsesProvider {
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
         let route = self.endpoint("/responses");
-        let body = request_body(model, messages, tools, &self.config.params).to_string();
+        let body = serde_json::to_string(&wire_body(model, messages, tools, &self.config.params))?;
         let headers = self.auth_header().into_iter().collect::<Vec<_>>();
         let reader =
             post_sse_with_retry(&self.agent, &route, &headers, &body, should_stop, on_event)?;
@@ -98,31 +100,22 @@ impl ChatProvider for ResponsesProvider {
 }
 
 /// 请求体：统一消息形状 → Responses 的 `instructions` + `input`。
-pub(crate) fn request_body(
+fn wire_body<'a>(
     model: &str,
-    messages: &[ChatMessage],
+    messages: &'a [ChatMessage],
     tools: &[Value],
-    params: &RequestParams,
-) -> Value {
-    // 系统消息合成 instructions（多条按空行拼）
-    let mut instructions: Vec<String> = Vec::new();
-    let mut input: Vec<Value> = Vec::new();
+    params: &'a RequestParams,
+) -> impl Serialize + 'a {
+    let mut input = Vec::new();
     for message in messages {
         match message.role.as_str() {
-            "system" => {
-                if let Some(text) = message.text().filter(|t| !t.trim().is_empty()) {
-                    instructions.push(text);
-                }
-            }
+            "system" => {}
             "tool" => {
-                // 工具结果：`function_call_output`，文本平铺；图片按 input_image 追加成一条 user 消息
-                let text = message.text().unwrap_or_default();
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "output": text,
-                }));
-                let images: Vec<Value> = message
+                input.push(InputItem::FunctionCallOutput {
+                    call_id: message.tool_call_id.as_deref().unwrap_or_default(),
+                    output: message.text_ref().unwrap_or_default(),
+                });
+                let images: Vec<_> = message
                     .parts
                     .iter()
                     .filter_map(|part| match part {
@@ -133,59 +126,43 @@ pub(crate) fn request_body(
                     })
                     .collect();
                 if !images.is_empty() {
-                    input.push(json!({
-                        "type": "message",
-                        "role": "user",
-                        "content": images,
-                    }));
+                    input.push(InputItem::Message { role: "user", content: images });
                 }
             }
             "assistant" => {
-                if let Some(text) = message.text().filter(|t| !t.is_empty()) {
-                    input.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }],
-                    }));
+                if let Some(text) = message.text_ref().filter(|text| !text.is_empty()) {
+                    input.push(InputItem::Message {
+                        role: "assistant",
+                        content: vec![InputContent::OutputText { text }],
+                    });
                 }
-                for call in &message.tool_calls {
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": call.id,
-                        "name": call.function.name,
-                        "arguments": call.function.arguments,
-                    }));
-                }
+                input.extend(message.tool_calls.iter().map(|call| InputItem::FunctionCall {
+                    call_id: &call.id,
+                    name: &call.function.name,
+                    arguments: &call.function.arguments,
+                }));
             }
             _ => {
-                // user（可能带图片）
-                let mut content: Vec<Value> = Vec::new();
-                for part in &message.parts {
-                    match part {
-                        ContentPart::Text(text) if !text.is_empty() => content.push(json!({
-                            "type": "input_text",
-                            "text": text,
-                        })),
-                        ContentPart::Image { media_type, data } => {
-                            content.push(image_item(media_type, data));
+                let content: Vec<_> = message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text(text) if !text.is_empty() => {
+                            Some(InputContent::InputText { text })
                         }
-                        _ => {}
-                    }
-                }
+                        ContentPart::Image { media_type, data } => {
+                            Some(image_item(media_type, data))
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 if !content.is_empty() {
-                    input.push(json!({
-                        "type": "message",
-                        "role": message.role,
-                        "content": content,
-                    }));
+                    input.push(InputItem::Message { role: &message.role, content });
                 }
             }
         }
     }
-    let mut body = json!({ "model": model, "input": input, "stream": true });
-    if !instructions.is_empty() {
-        body["instructions"] = Value::String(instructions.join("\n\n"));
-    }
+    let mut body = json!({ "model": model, "stream": true });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.iter().map(flatten_tool).collect());
     }
@@ -193,17 +170,37 @@ pub(crate) fn request_body(
         body["temperature"] = json!(t);
     }
     if let Some(n) = params.max_tokens {
-        // Responses 叫 max_output_tokens
         body["max_output_tokens"] = json!(n);
     }
-    // 思考强度：`reasoning:{effort, summary}`（档位来自能力表，见 `provider::thinking_spec`）
     crate::provider::apply_thinking(&mut body, crate::provider::Protocol::Responses, model, params);
-    if let Some(extra) = params.extra.as_object() {
-        for (key, value) in extra {
-            body[key] = value.clone();
-        }
-    }
-    body
+    crate::request::RequestBody::new(body, &params.extra, "input", input)
+        .with_system("instructions", crate::request::system_text(messages, true))
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum InputItem<'a> {
+    Message { role: &'a str, content: Vec<InputContent<'a>> },
+    FunctionCallOutput { call_id: &'a str, output: Cow<'a, str> },
+    FunctionCall { call_id: &'a str, name: &'a str, arguments: &'a str },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum InputContent<'a> {
+    InputText { text: &'a str },
+    OutputText { text: Cow<'a, str> },
+    InputImage { image_url: crate::request::DataUrl<'a> },
+}
+
+#[cfg(test)]
+pub(crate) fn request_body(
+    model: &str,
+    messages: &[ChatMessage],
+    tools: &[Value],
+    params: &RequestParams,
+) -> Value {
+    serde_json::to_value(wire_body(model, messages, tools, params)).unwrap()
 }
 
 /// Chat Completions 形状的工具定义（`{"type":"function","function":{…}}`）→ Responses 的平形状。
@@ -220,11 +217,8 @@ fn flatten_tool(tool: &Value) -> Value {
     out
 }
 
-fn image_item(media_type: &str, data: &str) -> Value {
-    json!({
-        "type": "input_image",
-        "image_url": format!("data:{media_type};base64,{data}"),
-    })
+fn image_item<'a>(media_type: &'a str, data: &'a str) -> InputContent<'a> {
+    InputContent::InputImage { image_url: crate::request::DataUrl { media_type, data } }
 }
 
 /// 一个流式事件（只解析我们关心的几种）。

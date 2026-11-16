@@ -180,6 +180,7 @@ mod tests {
             arg: "image.png".into(),
             result: "已读取".into(),
             output: "完整输出".into(),
+            content: SharedString::default(),
             phase: ToolPhase::Done,
             diffs: Vec::new(),
             expanded: true,
