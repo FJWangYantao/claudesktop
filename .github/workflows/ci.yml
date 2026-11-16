@@ -5,6 +5,30 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+    inputs:
+      gateway_asset_id:
+        description: 独立网关验收包资产 ID（留空则运行常规 CI）
+        type: string
+        required: false
+      gateway_sha256:
+        description: 独立验收包 ZIP SHA256
+        type: string
+        required: false
+      gateway_scope:
+        description: 独立验收范围
+        type: choice
+        options: [all, kernel, desktop]
+        default: all
+      gateway_set:
+        description: combined 为原组合，parser 只隔离统计解析
+        type: choice
+        options: [combined, parser]
+        default: combined
+      gateway_condition:
+        description: 独立验收的端点条件
+        type: choice
+        options: [reference, calibrated]
+        default: reference
 
 # 同一分支的新提交取消上一次未跑完的任务
 concurrency:
@@ -18,6 +42,7 @@ env:
 
 jobs:
   check:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.gateway_asset_id == '' }}
     name: fmt + clippy + test
     # GPUI 依赖 Windows / macOS 的原生层，Linux 需要额外的 X11/Wayland 依赖，先用 Windows
     runs-on: windows-latest
@@ -39,3 +64,15 @@ jobs:
 
       - name: 测试
         run: cargo test --workspace
+
+  gateway-validation:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.gateway_asset_id != '' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/gateway-validation.yml
+    with:
+      asset_id: ${{ inputs.gateway_asset_id }}
+      sha256: ${{ inputs.gateway_sha256 }}
+      scope: ${{ inputs.gateway_scope }}
+      comparison_set: ${{ inputs.gateway_set }}
+      condition: ${{ inputs.gateway_condition }}
