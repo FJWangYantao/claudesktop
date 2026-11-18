@@ -342,7 +342,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 用量网关在 `crates/builtin/src/gateway.rs`：provider 经 `gateway::route` 发请求，开着（`ProviderConfig::gateway`）就转给本地网关、
   每个请求记一行 `gateway/<日期>.jsonl`（按内核会话 + 第几轮归组，首页「请求」页签读它，见 `requests.rs`；费用按设置里的单价表估算，见 `pricing.rs`，分峰谷价的模型在单价行尾写 `x2`，峰时段用 `@peak` 行按本地时间或指定时区判定）。新的请求出口（新 provider、新接口）也要走 `route`，内核里新的请求用途用 `gateway::tag` 标上。
   ACP agent 可选经网关：起进程时设 base URL（`gateway::agent_env`，端点编码在 `/via/` 路径里），轮次靠 `gateway::note_turn`。
-  请求体和响应原文另存（`request_bodies.rs`，日志行的 `body` 指过去），「请求」页签每次请求行尾的「原文」打开查看（`app/raw_request.rs`）。
+  请求体和响应原文另存（`request_bodies.rs`，日志行 `body` 指过去），在用量「请求明细」的行尾点「原文」（`app/raw_request.rs`）。
+  请求与返回分开读，返回首次切入才加载；小正文用只读 `Editor`，大正文在后台建字节索引，分块后用变高列表按视口排版。
+  分块不改原文，查找按完整正文的字节位置跳转，复制与导出取全文；切页释放列表测量状态并保留位置。
   请求统计走 `gateway/request_stats.rs`，只保留所需字段、不展开整包 `Value`；跳过正文时仍校验完整 JSON，保留重复键和字段类型容错。
   Windows 本地网关的已接受连接在 `gateway/socket.rs` 设 1 MiB 接收缓冲，减轻大请求的发送阻塞；设置失败退回系统默认，不能算零内存成本（系统 TCP 缓冲上限每连接比本机默认多约 960 KiB）。
   内核 / 普通隐藏桌面 A/B 分别用 `tools/gateway-memory-bench.mjs` / `gateway-desktop-bench.mjs`，保存原文的开关单独对照。

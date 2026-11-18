@@ -1,5 +1,5 @@
 //! 网关存下的请求原文：每个请求发给服务商的请求体（系统提示词、消息、工具定义）和收到的响应
-//! （流式响应就是原样的 SSE），首页「请求」页签里点开一次请求就能看。
+//! （流式响应就是原样的 SSE），用量页的「请求明细」里点「原文」查看。
 //!
 //! ```text
 //! gateway/bodies/<日期>/<发出时刻>-<序号>.req.json.gz   请求体（原样）
@@ -70,25 +70,84 @@ pub struct Saved {
     pub truncated: bool,
 }
 
-/// 按日志里的 ID 读原文。
-pub fn load(dir: &Path, id: &str) -> Result<Saved, String> {
-    // ID 是我们自己写的，但日志文件用户能改：别让它指到 gateway/ 外面
-    if !id.starts_with(DIR) || id.split('/').any(|p| p == ".." || p.is_empty()) {
-        return Err("原文的位置不对".into());
+#[derive(Clone)]
+pub struct Source(PathBuf);
+
+pub struct Request {
+    pub text: String,
+    pub formatted: bool,
+}
+
+pub struct Response {
+    pub text: String,
+    pub truncated: bool,
+}
+
+impl Source {
+    /// 同一份日志上的请求与响应可单独读取。
+    pub fn new(dir: &Path, id: &str) -> Result<Self, String> {
+        let mut parts = id.split('/');
+        if parts.next() != Some(DIR)
+            || !parts.all(|part| {
+                !part.is_empty() && part != "." && part != ".." && !part.contains(['\\', ':'])
+            })
+            || !id.contains('/')
+        {
+            return Err("原文的位置不对".into());
+        }
+        Ok(Self(dir.join(id)))
     }
-    let base = dir.join(id);
-    let request = read_gz(&with_suffix(&base, ".req.json.gz"))
-        .map_err(|_| "原文已经清理掉了（只留最近 7 天）".to_string())?;
-    let request = match serde_json::from_slice::<serde_json::Value>(&request) {
-        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_default(),
-        Err(_) => String::from_utf8_lossy(&request).into_owned(),
-    };
-    let response = read_gz(&with_suffix(&base, ".resp.gz")).unwrap_or_default();
-    Ok(Saved {
-        request,
-        truncated: response.len() >= RESPONSE_MAX,
-        response: String::from_utf8_lossy(&response).into_owned(),
-    })
+
+    pub fn request(&self) -> Result<Request, String> {
+        let bytes = read_gz(&with_suffix(&self.0, ".req.json.gz"))
+            .map_err(|_| "原文已经清理掉了（只留最近 7 天）".to_string())?;
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Ok(text) = serde_json::to_string_pretty(&value)
+        {
+            return Ok(Request { text, formatted: true });
+        }
+        Ok(Request { text: decode_text(bytes), formatted: false })
+    }
+
+    pub fn response(&self) -> Response {
+        let bytes = read_gz(&with_suffix(&self.0, ".resp.gz")).unwrap_or_default();
+        let truncated = bytes.len() >= RESPONSE_MAX;
+        Response { text: decode_text(bytes), truncated }
+    }
+}
+
+fn decode_text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
+/// 按日志里的 ID 读完整原文。
+pub fn load(dir: &Path, id: &str) -> Result<Saved, String> {
+    let source = Source::new(dir, id)?;
+    let request = source.request()?.text;
+    let Response { text: response, truncated } = source.response();
+    Ok(Saved { request, response, truncated })
+}
+
+pub fn find(text: &str, query: &str, before: bool, from: usize) -> Option<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return None;
+    }
+    let from = from.min(text.len());
+    let pattern = regex::bytes::RegexBuilder::new(&regex::escape(query))
+        .unicode(false)
+        .case_insensitive(true)
+        .build()
+        .ok()?;
+    if before {
+        pattern
+            .find_iter(&text.as_bytes()[..from])
+            .last()
+            .or_else(|| pattern.find_iter(text.as_bytes()).last())
+    } else {
+        pattern.find_at(text.as_bytes(), from).or_else(|| pattern.find(text.as_bytes()))
+    }
+    .map(|hit| hit.range())
 }
 
 /// 删掉过期的（按日期目录），总量还超就从最旧的日期删（当天的不删）。
@@ -155,6 +214,42 @@ fn read_gz(path: &Path) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_and_request_are_read_independently() {
+        let dir = std::env::temp_dir().join(format!("cd-bodies-split-{}", std::process::id()));
+        let today = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let id = save(&dir, today, 1, b"bad JSON \xff", &vec![b'a'; RESPONSE_MAX]).unwrap();
+        let source = Source::new(&dir, &id).unwrap();
+        let response_path = with_suffix(&source.0, ".resp.gz");
+        let saved = std::fs::read(&response_path).unwrap();
+        std::fs::remove_file(&response_path).unwrap();
+        let request = source.request().unwrap();
+        assert_eq!(request.text, "bad JSON \u{fffd}");
+        assert!(!request.formatted);
+        assert!(source.response().text.is_empty());
+        std::fs::write(&response_path, saved).unwrap();
+        std::fs::remove_file(with_suffix(&source.0, ".req.json.gz")).unwrap();
+        assert!(source.request().is_err());
+        let response = source.response();
+        assert!(response.truncated);
+        assert_eq!(response.text.as_bytes(), vec![b'a'; RESPONSE_MAX]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_wraps_and_matches_literal_utf8_by_byte_offset() {
+        let text = "头 Aa[界] 尾 aa[界]";
+        let first = text.find("Aa[").unwrap();
+        let last = text.find("aa[").unwrap();
+        let query = "AA[界]";
+        assert_eq!(find(text, query, false, 0), Some(first..first + query.len()));
+        assert_eq!(find(text, query, false, first + query.len()), Some(last..text.len()));
+        assert_eq!(find(text, query, false, text.len()), Some(first..first + query.len()));
+        assert_eq!(find(text, query, true, last), Some(first..first + query.len()));
+        assert_eq!(find(text, query, true, first), Some(last..text.len()));
+        assert_eq!(find(text, "缺", false, 0), None);
+    }
 
     #[test]
     fn saves_loads_and_prunes() {

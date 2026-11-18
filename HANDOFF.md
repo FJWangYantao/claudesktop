@@ -116,6 +116,21 @@
   `verify-01` 验证第 161 行在拖宽、全宽与 125% 字号下保留约 20.16% 的行内位置；实时替换重测行高，回退清掉预览。`capture-01` 用窗口消息滚到三种布局的末行和截断提示，`normal-01` 用普通 release 核对打开、返回和切文件。fmt、Clippy、663 项测试及普通 release 构建通过，探针插桩已移除。
   工作区根目录运行 `node .claudesktop/bench/diff-body/run.mjs <新目录> probe-01 ab` 复跑。用 `build-probe.mjs <新构建名>` 另建探针，原基线与 `probe-01` 保持冻结。
 
+- **请求原文弹窗基线（`6580825`）**：从侧栏「用量」滚到「请求明细」，展开一轮再点「原文」。
+  `.claudesktop/bench/raw-request/baseline-01/summary.json` 有五组各三轮，15 个隐藏进程共 30 次打开、75 次绘制。1 / 12 / 32 MiB 合成请求配 128 KiB SSE，另测 12 MiB 配空响应和 2 MiB 截断响应。
+  1 / 12 / 32 MiB 请求点击到首次内容绘制的中位分别为 0.99 / 10.37 / 26.85 秒，打开峰值私有内存比打开前多 40.28 / 412.91 / 1069.90 MiB。关 3 秒后的增量为 3.36 / 7.26 / 14.09 MiB。
+  32 MiB 样本的后台解压和排版中位合计 102.49ms，请求编辑器初始化 120.04ms，从原文视图 `render` 到内容绘制 26.53 秒。首次切到 2 MiB 截断响应的帧工作为 264.46ms，切回已显示的「请求」约 8ms。
+  `capture-01` 有空与截断响应的离屏图，`normal-04` 的普通 release 验过打开 / 切页 / 关闭 / 重开。普通 exe 的 UI Automation 要在打开用量页之前激活；探针 stderr 用共享读写句柄读，避免等待已经写出的标记。截图构建走控制入口的 `quit`，直接发 `WM_CLOSE` 会碰到绘制定时器的 `window not found`。
+  `wrap-ablation-01` 用同一个诊断 exe 交替三轮，只切换请求页软换行。12 MiB 样本首帧中位数 9551.56 → 205.67ms，首次帧工作 9344.88 → 47.51ms，私有内存峰值增量 413.67 → 93.21 MiB。gpui-base 首次获得换行宽度时会测量整个文档；关闭换行也会量最长行，后续须加入超长单行夹具。
+  探针在忽略目录的独立源码副本构建。工作区根目录运行 `node .claudesktop/bench/raw-request/run.mjs <新目录> probe-01 baseline` 复跑；软换行对照用 `probe-wrap ablation 12m`。同目录 `verify.mjs` 核对原文 gzip、帧序列与汇总。
+- **请求原文按页读取与视口排版验收**。`.claudesktop/bench/raw-request/ab-02/comparison.json` 有六组各三对，36 个隐藏进程和 180 次绘制校验。
+  12 / 32 MiB 点击到首帧中位 8787.87 / 22693.31 → 244.74 / 244.16ms，首次绘制工作 8510.00 / 22411.90 → 26.45 / 35.11ms。两个请求样本的首次绘制各构造 7 个正文块，峰值私有内存增量 413.85 / 1070.81 → 62.82 / 158.20 MiB，关后 3 秒增量 7.23 / 14.14 → 3.33 / 3.76 MiB。
+  2 MiB 截断响应首切绘制 217.18 → 16.60ms。16 KiB 小请求保留编辑器，首次绘制中位 96.71 → 75.12ms，点击到画面 331.60 → 359.57ms（含隐藏窗口等帧）。仅打开请求时未开始读响应，第二次切到已查看页复用正文。
+  `edge-02` 搜索到 12 MiB Base64 单行末尾，切页恢复位置，复制数据和导出文件的 SHA256 均与全文一致。用诊断副本接管剪贴板和系统打开动作。`race-02` 验证加载时关闭并快速切页，`missing-01` / `empty-01` 核对缺失和空响应，普通版在 `final-normal-01` 的小请求与 `final-normal-02` 的 32 MiB 请求完成主窗口操作。
+  保留 `ab-01` 的早期窗口尺寸失败。启动稳定后重新读客户区和 DPI，`--resume=ab-01` 复用完成的配对，补跑最后三组完整配对。隐藏窗口需要立即刷新关闭按钮的命中区时发 `WM_GPUI_FORCE_UPDATE_WINDOW`。空响应的禁用观感用离屏图核对，普通版 UI Automation 的 `IsEnabled` 断言在该路径不一致。
+  fmt、all-targets release Clippy 和普通 release 构建通过。工作区测试首次在既有的资源缓存并行断言失败，完整重跑 667 通过 / 13 忽略。普通 exe 位于本节 `release-02/claudesktop.exe`，探针与源码哈希见 `candidate-01/build.json`。
+  复跑 `node .claudesktop/bench/raw-request/run.mjs <新目录> candidate-01 ab tiny 1m 12m 32m 12m-empty 12m-cut`，再用同目录 `verify-candidate.mjs <新目录> candidate-01` 复核。
+
 - **连接中的自研会话回收显示数据不能整对象换占位**：`from_records` 会清内核绑定，也丢工具图片和本轮文本附件。
   新路径在 `session/cache.rs` 只搬 `transcript` / `subagents`，以原子临时快照保存；保留同一个 `Session`、模式、队列和界面状态。
   后台任务按 token + 快照的 `Arc` 身份接回，删除中的会话不会被迟到结果复活；写失败把原数据交回，读失败保留快照、不降级成日志续接。

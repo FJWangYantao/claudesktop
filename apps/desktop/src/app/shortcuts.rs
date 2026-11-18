@@ -42,7 +42,14 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
             ("切换视图（摘要 / 标准 / 详细）", &[CYCLE_VIEW_KEY]),
         ],
     ),
-    ("界面", &[("放大 / 缩小", &[ZOOM_IN_KEY, ZOOM_OUT_KEY]), ("恢复标准大小", &[ZOOM_RESET_KEY])]),
+    (
+        "界面",
+        &[
+            ("放大 / 缩小", &[ZOOM_IN_KEY, ZOOM_OUT_KEY]),
+            ("恢复标准大小", &[ZOOM_RESET_KEY]),
+            ("请求原文内查找", &[RAW_FIND_KEY]),
+        ],
+    ),
     (
         "输入框",
         &[

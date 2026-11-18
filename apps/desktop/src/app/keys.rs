@@ -14,6 +14,7 @@ use gpui_kit::*;
 
 /// 根视图的键上下文名。
 pub(super) const CONTEXT: &str = "ChatApp";
+pub(super) const RAW_REQUEST_CONTEXT: &str = "RawRequest";
 
 actions!(
     claudesktop,
@@ -66,6 +67,7 @@ pub(super) const PALETTE_KEY: &str = "secondary-k";
 pub(super) const FILES_KEY: &str = "ctrl-shift-f";
 pub(super) const CHANGES_KEY: &str = "ctrl-shift-d";
 pub(super) const SHORTCUTS_KEY: &str = "secondary-/";
+pub(super) const RAW_FIND_KEY: &str = "secondary-f";
 /// 停止 / 循环权限模式 / 前后切会话
 pub(super) const STOP_KEY: &str = "escape";
 pub(super) const CYCLE_MODE_KEY: &str = "shift-tab";
@@ -106,6 +108,11 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(FILES_KEY, ToggleFiles, Some(CONTEXT)),
         KeyBinding::new(CHANGES_KEY, ToggleChanges, Some(CONTEXT)),
         KeyBinding::new(SHORTCUTS_KEY, ShowShortcuts, Some(CONTEXT)),
+        KeyBinding::new(
+            RAW_FIND_KEY,
+            gpui_kit::component::input::Search,
+            Some(RAW_REQUEST_CONTEXT),
+        ),
         KeyBinding::new(NEXT_SESSION_KEY, NextSession, Some(CONTEXT)),
         KeyBinding::new(PREV_SESSION_KEY, PrevSession, Some(CONTEXT)),
         KeyBinding::new(CYCLE_VIEW_KEY, CycleView, Some(CONTEXT)),
