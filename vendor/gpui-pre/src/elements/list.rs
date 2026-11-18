@@ -16,7 +16,7 @@ use crate::{
 use collections::VecDeque;
 use refineable::Refineable as _;
 use std::{cell::RefCell, ops::Range, rc::Rc};
-use sum_tree::{Bias, Dimensions, SumTree};
+use sum_tree::{Bias, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
@@ -30,6 +30,7 @@ pub fn list(
         render_item: Box::new(render_item),
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
+        estimated_item_height: None,
     }
 }
 
@@ -39,12 +40,21 @@ pub struct List {
     render_item: Box<RenderItemFn>,
     style: StyleRefinement,
     sizing_behavior: ListSizingBehavior,
+    estimated_item_height: Option<Pixels>,
 }
 
 impl List {
     /// Set the sizing behavior for the list.
     pub fn with_sizing_behavior(mut self, behavior: ListSizingBehavior) -> Self {
         self.sizing_behavior = behavior;
+        self
+    }
+
+    // claudesktop patch
+    /// Give unmeasured rows a height estimate. Reflow preserves the scroll-top item
+    /// and the fractional offset within it as real heights are measured.
+    pub fn with_estimated_item_height(mut self, height: Pixels) -> Self {
+        self.estimated_item_height = Some(height);
         self
     }
 }
@@ -73,6 +83,7 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    estimated_item_height: Option<Pixels>,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,6 +336,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            estimated_item_height: None,
         })));
         this.splice(0..0, item_count);
         this
@@ -423,33 +435,7 @@ impl ListState {
                         item_ix: scroll_top.item_ix,
                         offset: scroll_top.offset_in_item,
                     }),
-                    ScrollAnchor::Proportional => {
-                        // If the scroll-top item falls within the remeasured range,
-                        // store a fractional offset so the layout can restore the
-                        // proportional scroll position after the item is re-rendered
-                        // at its new height.
-                        let mut cursor = state.items.cursor::<Count>(());
-                        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
-
-                        cursor
-                            .item()
-                            .and_then(|item| {
-                                item.size().map(|size| {
-                                    let fraction = if size.height.0 > 0.0 {
-                                        (scroll_top.offset_in_item.0 / size.height.0)
-                                            .clamp(0.0, 1.0)
-                                    } else {
-                                        0.0
-                                    };
-
-                                    PendingScroll::Proportional(PendingScrollFraction {
-                                        item_ix: scroll_top.item_ix,
-                                        fraction,
-                                    })
-                                })
-                            })
-                            .or_else(|| state.pending_scroll.clone())
-                    }
+                    ScrollAnchor::Proportional => state.proportional_scroll(scroll_top),
                 };
             }
         }
@@ -601,13 +587,7 @@ impl ListState {
     /// always show the bottom of the last item — even when that item is still
     /// growing (e.g. during streaming).
     pub fn scroll_to_end(&self) {
-        let state = &mut *self.0.borrow_mut();
-        let item_count = state.items.summary().count;
-        state.pending_scroll = None;
-        state.logical_scroll_top = Some(ListOffset {
-            item_ix: item_count,
-            offset_in_item: px(0.),
-        });
+        self.0.borrow_mut().scroll_to_end();
     }
 
     /// Set the follow mode for the list. In `Tail` mode, the list
@@ -717,16 +697,13 @@ impl ListState {
             return None;
         }
 
-        let mut cursor = state.items.cursor::<Dimensions<Count, Height>>(());
+        // claudesktop patch: 以视口顶部为起点累加，避免超长列表的绝对坐标相减丢失精度。
+        let mut cursor = state.items.cursor::<Count>(());
         cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
-
-        let scroll_top = cursor.start().1.0 + scroll_top.offset_in_item;
-
-        cursor.seek_forward(&Count(ix), Bias::Right);
+        let Height(relative_top) = cursor.summary(&Count(ix), Bias::Right);
         if let Some(&ListItem::Measured { size, .. }) = cursor.item() {
-            let &Dimensions(Count(count), Height(top), _) = cursor.start();
-            if count == ix {
-                let top = bounds.top() + top - scroll_top;
+            if cursor.start().0 == ix {
+                let top = bounds.top() + relative_top - scroll_top.offset_in_item;
                 return Some(Bounds::from_corners(
                     point(bounds.left(), top),
                     point(bounds.right(), top + size.height),
@@ -842,6 +819,34 @@ impl ListState {
 }
 
 impl StateInner {
+    fn scroll_to_end(&mut self) {
+        self.pending_scroll = None;
+        self.logical_scroll_top = Some(ListOffset {
+            item_ix: self.items.summary().count,
+            offset_in_item: px(0.),
+        });
+    }
+
+    fn proportional_scroll(&self, scroll_top: ListOffset) -> Option<PendingScroll> {
+        let mut cursor = self.items.cursor::<Count>(());
+        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
+        cursor
+            .item()
+            .and_then(ListItem::size)
+            .map(|size| {
+                let fraction = if size.height > px(0.) {
+                    (scroll_top.offset_in_item / size.height).clamp(0., 1.)
+                } else {
+                    0.
+                };
+                PendingScroll::Proportional(PendingScrollFraction {
+                    item_ix: scroll_top.item_ix,
+                    fraction,
+                })
+            })
+            .or_else(|| self.pending_scroll.clone())
+    }
+
     /// Re-anchor a pending scroll adjustment from a remeasure onto a newly set
     /// scroll position, so it clamps to the remeasured item's new height on
     /// the next layout instead of reverting the scroll.
@@ -913,13 +918,19 @@ impl StateInner {
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
-            .max(px(0.))
-            .min(scroll_max);
+        let target = self.scroll_top(scroll_top) - delta.y;
+        let new_scroll_top = target.max(px(0.)).min(scroll_max);
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.pending_scroll = None;
             self.logical_scroll_top = None;
+        } else if self.estimated_item_height.is_some()
+            && scroll_max > px(0.)
+            && delta.y < px(0.)
+            && target > scroll_max
+        {
+            // claudesktop patch: 越过估算的底部时，从末项反向实测到视口填满。
+            self.scroll_to_end();
         } else {
             let (start, ..) =
                 self.items
@@ -1540,20 +1551,31 @@ impl Element for List {
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        // If the width of the list has changed, invalidate all cached item heights
-        if state
+        let width_changed = state
             .last_layout_bounds
-            .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
-        {
+            .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width);
+        // claudesktop patch: 重排后用估算高度继续滚动，也覆盖等宽的字号变化。
+        if width_changed || state.estimated_item_height != self.estimated_item_height {
+            if self.estimated_item_height.is_some()
+                && let Some(top) = state.logical_scroll_top
+            {
+                state.pending_scroll =
+                    state.proportional_scroll(top).or(Some(PendingScroll::Absolute {
+                        item_ix: top.item_ix,
+                        offset: top.offset_in_item,
+                    }));
+            }
+            let size_hint = self.estimated_item_height.map(|height| size(px(0.), height));
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint,
                     focus_handle: item.focus_handle(),
                 }),
                 (),
             );
 
             state.items = new_items;
+            state.estimated_item_height = self.estimated_item_height;
             state.measuring_behavior.reset();
         }
 

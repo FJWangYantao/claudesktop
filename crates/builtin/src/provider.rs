@@ -890,6 +890,29 @@ pub enum ContentPart {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec(Arc<Value>);
+
+impl From<Value> for ToolSpec {
+    fn from(value: Value) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl Deref for ToolSpec {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for ToolSpec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
 /// 发给 provider 的一条消息。内部表示协议无关，序列化成 OpenAI 形状
 /// （单段文本 → `content` 为字符串，兼容所有网关；带图片 → 分段数组）。
 /// 克隆共享消息内容，修改时才复制这一条，避免每次请求重拷完整历史。
@@ -1212,7 +1235,7 @@ pub trait ChatProvider: Send + Sync {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        tools: &[Value],
+        tools: &[ToolSpec],
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome>;

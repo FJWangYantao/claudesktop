@@ -32,6 +32,13 @@ const sizes = (args.sizes || 'long').split(',');
 const saves = (args.save || 'on,off').split(',');
 const receiver = args.receiver || 'iterator';
 const observationMode = args.observer || 'background';
+const mcpTools = Number(args['mcp-tools'] || 0);
+const loadout = args['loaded-tools'] || 'all';
+const windowLayout = args['window-layout'] || 'current';
+assert(['current', 'legacy'].includes(windowLayout));
+assert(Number.isInteger(mcpTools) && mcpTools >= 0 && mcpTools <= 1000);
+assert(['none', 'small', 'all'].includes(loadout));
+const loadedTools = loadout === 'all' ? mcpTools : loadout === 'small' ? Math.min(mcpTools, 3) : 0;
 const highWaterMark = args['high-water-mark'] ? Number(args['high-water-mark']) : null;
 const receiveBuffer = args['receive-buffer'] === undefined ? null : Number(args['receive-buffer']);
 assert(highWaterMark === null || (Number.isInteger(highWaterMark) && highWaterMark >= 16384 && highWaterMark <= 4 * 1024 * 1024));
@@ -112,6 +119,9 @@ function seed(size) {
     records.push(event('agent_message_chunk', { text: `seed answer ${i}` }));
     records.push(event('turn_ended', { stop_reason: 'end_turn' }));
   }
+  if (loadedTools > 0) records.push({
+    t: 'tool_loadout', names: Array.from({ length: loadedTools }, (_, index) => `mcp__bench__schema_${String(index).padStart(4, '0')}`),
+  });
   return records.map(record => JSON.stringify(record)).join('\n') + '\n';
 }
 function response(protocol, index) {
@@ -167,7 +177,11 @@ const server = createServer(highWaterMark === null ? {} : { highWaterMark }, asy
     if (main && run.size === 'long') assert(length >= 10 * 1024 * 1024, 'Long history was not present in the actual request.');
     const index = main ? run.requests.length : 2;
     (main ? run.requests : run.side_requests).push(observed);
-    observer.inspect(receiveBuffer, length, observed, main);
+    observer.inspect(receiveBuffer, length, observed, main,
+      main && index > 0 ? {
+        imageRgba: [100, 120, 140, 255],
+        ...(run.protocol === 'anthropic' ? { signature: 'desktop-signature' } : {}),
+      } : undefined);
     await delay(40);
     const body = response(run.protocol, index);
     observed.response_hash = hash(body);
@@ -224,6 +238,10 @@ async function run(version, round, protocol, size, save) {
     notifications: false, suggestions: false, memory_suggest: false,
     gateway_bodies: save === 'on',
   }));
+  if (mcpTools > 0) await writeFile(path.join(data, 'mcp.json'), JSON.stringify({ mcpServers: { bench: {
+    command: process.execPath, args: [path.join(root, 'tools/mock-mcp-server.mjs')],
+    env: { MOCK_MCP_SCHEMA_TOOLS: String(mcpTools), MOCK_MCP_SCHEMA_FIELDS: '64' },
+  } } }));
   const state = { protocol, size, requests: [], side_requests: [] };
   active.set(id, state);
   const stdout = createWriteStream(path.join(directory, 'stdout.log'));
@@ -243,7 +261,7 @@ async function run(version, round, protocol, size, save) {
   child.stdout.pipe(stdout); child.stderr.pipe(stderr);
   const closed = new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', resolve); });
   const driverLog = createWriteStream(path.join(directory, 'driver.log'));
-  const driver = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'tools/gateway-desktop-driver.ps1'), '-ProcessId', String(child.pid), '-Directory', directory], {
+  const driver = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'tools/gateway-desktop-driver.ps1'), '-ProcessId', String(child.pid), '-Directory', directory, '-Layout', windowLayout], {
     windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   });
   driver.stdout.pipe(driverLog); driver.stderr.pipe(driverLog);
@@ -293,6 +311,9 @@ async function run(version, round, protocol, size, save) {
       }, `desktop turn ${turn}`);
       if (turn === 0) {
         await waitFor(async () => state.side_requests.length === 1 && (await logs()).some(log => log.purpose === 'title'), 'title request');
+        if (mcpTools > 0) await waitFor(async () =>
+          (await readFile(path.join(directory, 'stderr.log'), 'utf8')).includes('[perf] mcp_connect:bench:'),
+        'large MCP connection');
         if (args['product-affinity']) productAffinity = await setAffinity(child.pid, args['product-affinity']);
       }
       await command('status');
@@ -305,12 +326,14 @@ async function run(version, round, protocol, size, save) {
     assert.equal(await Promise.race([closed, delay(10_000).then(() => 'timeout')]), 0);
     assert.equal(await driverClosed, 0, 'Inspect driver.log');
   } catch (error) {
+    await writeFile(path.join(directory, 'error.txt'), String(error.stack || error));
     await cp(data, path.join(directory, 'failed-data'), { recursive: true });
     await writeFile(path.join(directory, 'requests.json'), JSON.stringify(state.requests, null, 2));
     throw error;
   } finally {
     if (child.exitCode === null) child.kill();
     if (driver.exitCode === null) driver.kill();
+    await Promise.race([Promise.allSettled([closed, driverClosed]), delay(5000)]);
     active.delete(id);
     await Promise.all([stdout, stderr, driverLog].map(stream => new Promise(resolve => stream.end(resolve))));
   }
@@ -321,6 +344,7 @@ async function run(version, round, protocol, size, save) {
   assert.equal(state.requests.length, (turns + 1) * 3);
   assert.equal(measuredLogs.length, (turns + 1) * 3);
   assert.equal(sends.length, turns);
+  assert(state.requests.slice(3).every(request => request.stats.mcp_tools === loadedTools), 'Wrong desktop MCP loadout');
   for (const [index, log] of measuredLogs.entries()) {
     const observed = state.requests[index];
     assert.equal(log.model, observed.stats.model);
@@ -351,7 +375,7 @@ async function run(version, round, protocol, size, save) {
   const activeSamples = samples.filter(row => row.phase === 'active');
   assert(activeSamples.length > 0);
   const result = {
-    version, round, protocol, size, save, pid: child.pid,
+    version, round, protocol, size, save, mcp_tools: mcpTools, loaded_tools: loadedTools, pid: child.pid,
     warmup_turns: 1, measured_turns: turns,
     profile_records: profile.length,
     profile_variant: profile[0]?.variant ?? null,
@@ -412,7 +436,7 @@ try {
     pair.passed = pairPassed(pair, comparison);
     pairs.push(pair);
   }
-  const summary = { comparison, executable_sha256: executableHashes, versions, rounds, turns, profiling: args.profile === '1', receiver, high_water_mark: highWaterMark, endpoint_receive_buffer: receiveBuffer, controller_timer_ms: controllerTimer, tcp_buffer_helper: args['tcp-buffer-helper'] ?? null, observer: `pooled-${observationMode}`, control_affinity: controlAffinity, requested_product_affinity: args['product-affinity'] ?? null, observer_gc: typeof globalThis.gc === 'function', runs, pairs, passed: versions.candidate ? pairs.every(pair => pair.passed) : null };
+  const summary = { comparison, executable_sha256: executableHashes, versions, rounds, turns, mcp_tools: mcpTools, loaded_tools: loadedTools, window_send_method: `button-${windowLayout}`, profiling: args.profile === '1', receiver, high_water_mark: highWaterMark, endpoint_receive_buffer: receiveBuffer, controller_timer_ms: controllerTimer, tcp_buffer_helper: args['tcp-buffer-helper'] ?? null, observer: `pooled-${observationMode}`, control_affinity: controlAffinity, requested_product_affinity: args['product-affinity'] ?? null, observer_gc: typeof globalThis.gc === 'function', runs, pairs, passed: versions.candidate ? pairs.every(pair => pair.passed) : null };
   await writeFile(path.join(output, 'summary.json'), JSON.stringify(summary, null, 2));
   console.log(JSON.stringify({ passed: summary.passed, pairs }, null, 2));
   if (summary.passed === false) process.exitCode = 1;
@@ -420,5 +444,5 @@ try {
   server.closeAllConnections();
   await new Promise(resolve => server.close(resolve));
   await observer?.close();
-  await rm(fixture, { recursive: true, force: true });
+  await rm(fixture, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }

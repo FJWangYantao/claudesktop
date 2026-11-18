@@ -201,18 +201,44 @@ fn real_request_memory() {
     );
     config.rules_path = None;
     config.user_instructions = None;
-    config.mcp_config = None;
+    config.mcp_config = std::env::var_os("CLAUDESKTOP_REQUEST_BENCH_MCP_CONFIG").map(PathBuf::from);
     config.memory_path = None;
     config.session_titles = false;
     config.hibernation_dir = None;
     config.max_steps = 5;
     let kernel = BuiltinKernel::spawn(config, sink).unwrap();
+    let mcp_tool_count = std::env::var("CLAUDESKTOP_REQUEST_BENCH_MCP_TOOLS")
+        .ok()
+        .map(|count| count.parse::<usize>().unwrap())
+        .unwrap_or(0);
+    let loaded_count = std::env::var("CLAUDESKTOP_REQUEST_BENCH_LOADED_TOOLS")
+        .ok()
+        .map(|count| count.parse::<usize>().unwrap())
+        .unwrap_or(0);
+    assert!(loaded_count <= mcp_tool_count);
+    if mcp_tool_count > 0 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if kernel.inner.mcp.status().iter().any(|server| {
+                server.name == "bench"
+                    && server.state == claudesktop_core::McpState::Ready
+                    && server.tools == mcp_tool_count + 4
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "大型 MCP 未连接完成");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     kernel.new_session(1, SessionSpec::default()).unwrap();
     let sid = kernel.inner.sessions.lock().unwrap().keys().next().unwrap().clone();
     let history_bytes = {
         let mut sessions = kernel.inner.sessions.lock().unwrap();
         let state = sessions.get_mut(&sid).unwrap();
         state.mode = MODE_BYPASS.into();
+        state.loaded_tools = (0..loaded_count)
+            .map(|index| crate::mcp::function_name("bench", &format!("schema_{index:04}")))
+            .collect();
         state.history = if long { history(48, 256 * 1024) } else { history(2, 512) };
         hibernate::estimated_bytes(&state.history)
     };
@@ -281,6 +307,7 @@ fn real_request_memory() {
         serde_json::to_vec_pretty(&json!({
             "protocol": protocol_name, "size": if long { "long" } else { "short" },
             "history_bytes": history_bytes, "before": before, "after": after,
+            "mcp_tool_count": mcp_tool_count, "loaded_tool_count": loaded_count,
             "samples": samples, "turns": turns, "request_ready": request_ready,
             "session": sid, "gateway_writes": gateway_writes, "gateway_logs": gateway_logs,
         }))

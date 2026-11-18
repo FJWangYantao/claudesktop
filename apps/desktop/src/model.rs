@@ -6,6 +6,7 @@ use claudesktop_core::{
 };
 use gpui_kit::SharedString;
 use gpui_kit::assets::IconName as IconAll;
+use std::collections::HashMap;
 use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
@@ -307,12 +308,28 @@ pub fn plan_progress(rows: &[PlanRow]) -> (usize, usize, Option<&PlanRow>) {
     (done, rows.len(), current)
 }
 
+fn path_key(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
 /// 同一个文件的两条路径：Windows 上大小写和分隔符都不保证统一（`C:\a\B.rs` / `c:/a/b.rs`）。
 pub(crate) fn same_path(a: &str, b: &str) -> bool {
-    fn norm(p: &str) -> String {
-        p.replace('\\', "/").to_lowercase()
+    a == b || path_key(a) == path_key(b)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiffLocation {
+    pub item: usize,
+    pub diff: usize,
+}
+
+impl DiffLocation {
+    pub fn resolve(self, transcript: &[ChatItem]) -> Option<&DiffView> {
+        match transcript.get(self.item)? {
+            ChatItem::Tool(card) if card.phase == ToolPhase::Done => card.diffs.get(self.diff),
+            _ => None,
+        }
     }
-    a == b || norm(a) == norm(b)
 }
 
 /// 一轮里改过的一个文件（回复末尾改动卡片里的一行）。
@@ -321,39 +338,37 @@ pub struct TurnFile {
     pub path: String,
     pub added: u32,
     pub removed: u32,
-    /// 这一轮新建的
     pub created: bool,
-    /// 最后一次改它的工具行（点了跳过去）
-    pub item: usize,
+    pub(crate) location: DiffLocation,
 }
 
 /// `items`（一轮的对话行，下标从 `offset` 起算）里改过的文件：按第一次出现的顺序，
-/// 同一文件改了几次就把增删行数加起来（`created` 取最后一次：先建后改就成了普通修改）。
+/// 同一文件改了几次就把增删行数加起来（`created` 和预览取最后一次）。
 /// 没改成的（失败、还在等授权）不算。
-/// 同一个文件的路径大小写可能不一样（Windows 上工具回报的路径不保证规范），按忽略大小写合并。
 pub fn turn_files(items: &[ChatItem], offset: usize) -> Vec<TurnFile> {
     let mut files: Vec<TurnFile> = Vec::new();
+    let mut by_path: HashMap<String, usize> = HashMap::new();
     for (i, item) in items.iter().enumerate() {
         let ChatItem::Tool(card) = item else { continue };
         if card.phase != ToolPhase::Done {
             continue;
         }
-        for diff in &card.diffs {
-            match files.iter_mut().find(|f| same_path(&f.path, &diff.path)) {
-                Some(f) => {
-                    f.added += diff.added;
-                    f.removed += diff.removed;
-                    // 后面又整份写过一次就不算「新文件」了（`created` 只认最后一次的状态）
-                    f.created = diff.created;
-                    f.item = offset + i;
-                }
-                None => files.push(TurnFile {
+        for (j, diff) in card.diffs.iter().enumerate() {
+            let location = DiffLocation { item: offset + i, diff: j };
+            let index = *by_path.entry(path_key(&diff.path)).or_insert(files.len());
+            if let Some(file) = files.get_mut(index) {
+                file.added += diff.added;
+                file.removed += diff.removed;
+                file.created = diff.created;
+                file.location = location;
+            } else {
+                files.push(TurnFile {
                     path: diff.path.clone(),
                     added: diff.added,
                     removed: diff.removed,
                     created: diff.created,
-                    item: offset + i,
-                }),
+                    location,
+                });
             }
         }
     }
@@ -1561,7 +1576,7 @@ mod tests {
         let files = turn_files(&items, 10);
         let got: Vec<_> = files
             .iter()
-            .map(|f| (f.path.as_str(), f.added, f.removed, f.created, f.item))
+            .map(|f| (f.path.as_str(), f.added, f.removed, f.created, f.location.item))
             .collect();
         assert_eq!(got, [("a.rs", 5, 1, false, 13), ("new.rs", 9, 0, true, 11)]);
     }

@@ -14,6 +14,7 @@
 //! - 工具定义按配置指纹缓存；启动命中缓存时不连接，首次调用再连，空闲 10 分钟后断开。
 
 use crate::mcp_http::{self, Http, Sink};
+use crate::provider::ToolSpec;
 use crate::tools::{OutputImage, ToolOutput};
 use claudesktop_core::{McpServerView, McpState};
 use serde::{Deserialize, Serialize};
@@ -328,10 +329,45 @@ pub fn is_mcp_tool(name: &str) -> bool {
     name.starts_with(TOOL_PREFIX)
 }
 
+struct RegisteredTool {
+    name: String,
+    description: String,
+    read_only: bool,
+    spec: ToolSpec,
+}
+
+impl RegisteredTool {
+    fn new(server: &str, tool: McpTool) -> Self {
+        let mut spec = json!({
+            "type": "function",
+            "function": {
+                "name": function_name(server, &tool.name),
+                "description": format!("[MCP 服务器 {server}] {}", tool.description),
+            },
+        });
+        spec["function"]["parameters"] = tool.input_schema;
+        Self {
+            name: tool.name,
+            description: tool.description,
+            read_only: tool.read_only,
+            spec: spec.into(),
+        }
+    }
+
+    fn cached(&self) -> McpTool {
+        McpTool {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.spec["function"]["parameters"].clone(),
+            read_only: self.read_only,
+        }
+    }
+}
+
 struct Server {
     config: ServerConfig,
     state: Mutex<McpState>,
-    tools: Mutex<Vec<McpTool>>,
+    tools: Mutex<Vec<RegisteredTool>>,
     client: Mutex<Option<Arc<Client>>>,
     last_used: Mutex<Instant>,
     active_calls: AtomicUsize,
@@ -452,6 +488,10 @@ impl McpHub {
                         (None, false, Some(tools)) => (McpState::Idle, tools),
                         (None, false, None) => (McpState::Connecting, Vec::new()),
                     };
+                    let tools = tools
+                        .into_iter()
+                        .map(|tool| RegisteredTool::new(&config.name, tool))
+                        .collect();
                     Arc::new(Server {
                         config,
                         state: Mutex::new(state),
@@ -578,7 +618,7 @@ impl McpHub {
             server.config.name.clone(),
             CachedTools {
                 fingerprint: fingerprint(&server.config),
-                tools: server.tools.lock().unwrap().clone(),
+                tools: server.tools.lock().unwrap().iter().map(RegisteredTool::cached).collect(),
             },
         );
         let Some(parent) = path.parent() else { return };
@@ -654,43 +694,64 @@ impl McpHub {
 
     /// 交给模型的工具定义（OpenAI `tools` 格式）；`writable = false`（Plan 模式）只给只读的；
     /// `exclude` 是这个项目停用的服务器名（项目级配置 `mcpDisabled`），它们的工具不给。
-    pub fn specs(&self, writable: bool, exclude: &[String]) -> Vec<Value> {
-        let mut specs = Vec::new();
+    pub fn specs(&self, writable: bool, exclude: &[String]) -> Vec<ToolSpec> {
+        self.specs_for(writable, exclude, |_| true)
+    }
+
+    pub fn specs_for(
+        &self,
+        writable: bool,
+        exclude: &[String],
+        mut include: impl FnMut(&str) -> bool,
+    ) -> Vec<ToolSpec> {
+        self.select(writable, exclude, |tool| {
+            include(tool.spec["function"]["name"].as_str().unwrap_or_default())
+                .then(|| tool.spec.clone())
+        })
+    }
+
+    pub fn descriptions(&self, writable: bool, exclude: &[String]) -> Vec<(String, String)> {
+        self.select(writable, exclude, |tool| {
+            Some((
+                tool.spec["function"]["name"].as_str().unwrap_or_default().to_string(),
+                tool.spec["function"]["description"].as_str().unwrap_or_default().to_string(),
+            ))
+        })
+    }
+
+    fn select<T>(
+        &self,
+        writable: bool,
+        exclude: &[String],
+        mut choose: impl FnMut(&RegisteredTool) -> Option<T>,
+    ) -> Vec<T> {
+        let mut selected = Vec::new();
         for server in self.servers.lock().unwrap().iter() {
             if !matches!(
                 *server.state.lock().unwrap(),
                 McpState::Ready | McpState::Idle | McpState::Connecting
-            ) {
+            ) || exclude.iter().any(|name| name == &server.config.name)
+            {
                 continue;
             }
-            if exclude.iter().any(|e| e == &server.config.name) {
-                continue;
-            }
-            for tool in server.tools.lock().unwrap().iter().filter(|t| writable || t.read_only) {
-                let description =
-                    format!("[MCP 服务器 {}] {}", server.config.name, tool.description);
-                specs.push(json!({
-                    "type": "function",
-                    "function": {
-                        "name": function_name(&server.config.name, &tool.name),
-                        "description": description,
-                        "parameters": tool.input_schema,
-                    },
-                }));
+            for tool in
+                server.tools.lock().unwrap().iter().filter(|tool| writable || tool.read_only)
+            {
+                if let Some(value) = choose(tool) {
+                    selected.push(value);
+                }
             }
         }
-        specs
+        selected
     }
 
-    /// 函数名 → (服务器名, 工具)；没有这个工具（服务器没连上、名字不对）时为 None。
-    pub fn lookup(&self, function: &str) -> Option<(String, McpTool)> {
+    /// 函数名 → (服务器名, 原工具名, 只读标记)。
+    pub fn lookup(&self, function: &str) -> Option<(String, String, bool)> {
         self.servers.lock().unwrap().iter().find_map(|server| {
-            let name = &server.config.name;
-            let tools = server.tools.lock().unwrap();
-            tools
-                .iter()
-                .find(|t| function_name(name, &t.name) == function)
-                .map(|t| (name.clone(), t.clone()))
+            server.tools.lock().unwrap().iter().find_map(|tool| {
+                (tool.spec["function"]["name"] == function)
+                    .then(|| (server.config.name.clone(), tool.name.clone(), tool.read_only))
+            })
         })
     }
 
@@ -921,7 +982,7 @@ fn establish(
                     && let Ok(tools) = list_tools(&client)
                     && hub.generation.load(Ordering::SeqCst) == generation
                 {
-                    *server.tools.lock().unwrap() = tools;
+                    server.replace_tools(tools);
                     hub.save_cached_tools(&server);
                     hub.report();
                 }
@@ -998,9 +1059,14 @@ fn establish(
 }
 
 impl Server {
+    fn replace_tools(&self, tools: Vec<McpTool>) {
+        *self.tools.lock().unwrap() =
+            tools.into_iter().map(|tool| RegisteredTool::new(&self.config.name, tool)).collect();
+    }
+
     /// 连上了：换上新连接和工具。
     fn ready(&self, client: Arc<Client>, tools: Vec<McpTool>) {
-        *self.tools.lock().unwrap() = tools;
+        self.replace_tools(tools);
         *self.client.lock().unwrap() = Some(client);
         *self.last_used.lock().unwrap() = Instant::now();
         *self.state.lock().unwrap() = McpState::Ready;
@@ -1559,6 +1625,58 @@ mod tests {
         server.active_calls.fetch_sub(1, Ordering::SeqCst);
         hub.reclaim_idle();
         assert_eq!(*server.state.lock().unwrap(), McpState::Idle);
+    }
+
+    #[test]
+    fn selected_specs_share_schemas_and_survive_list_replacement() {
+        let schema = json!({"type":"object", "properties":{
+            "payload":{"type":"string", "description":"schema content".repeat(4096)}
+        }});
+        let tool = |name: &str, read_only| McpTool {
+            name: name.into(),
+            description: format!("{name} description"),
+            input_schema: schema.clone(),
+            read_only,
+        };
+        let server = Arc::new(Server {
+            config: ServerConfig { name: "local".into(), ..Default::default() },
+            state: Mutex::new(McpState::Idle),
+            tools: Mutex::new(Vec::new()),
+            client: Mutex::new(None),
+            last_used: Mutex::new(Instant::now()),
+            active_calls: AtomicUsize::new(0),
+        });
+        server.replace_tools(vec![tool("read", true), tool("write", false)]);
+        let hub = McpHub::new(None, PathBuf::from("."), |_| {});
+        hub.servers.lock().unwrap().push(server.clone());
+        let first = hub.specs(true, &[]);
+        let again = hub.specs_for(true, &[], |name| name == "mcp__local__read");
+        assert_eq!(again.len(), 1);
+        assert!(std::ptr::eq(
+            &first[0]["function"]["parameters"],
+            &again[0]["function"]["parameters"]
+        ));
+        assert_eq!(hub.specs(false, &[]).len(), 1);
+        assert!(hub.specs_for(true, &[], |_| false).is_empty());
+        assert!(hub.specs(true, &["local".into()]).is_empty());
+        assert_eq!(
+            hub.descriptions(false, &[]),
+            vec![("mcp__local__read".into(), "[MCP 服务器 local] read description".into())]
+        );
+        assert_eq!(hub.lookup("mcp__local__write"), Some(("local".into(), "write".into(), false)));
+        assert_eq!(server.tools.lock().unwrap()[0].cached(), tool("read", true));
+        let mut changed = tool("read", true);
+        changed.input_schema = json!({"type":"object", "properties":{"new":{"type":"boolean"}}});
+        server.replace_tools(vec![changed]);
+        assert_eq!(first[0]["function"]["parameters"], schema);
+        let current = hub.specs(true, &[]);
+        assert_eq!(current[0]["function"]["parameters"]["properties"]["new"]["type"], "boolean");
+        assert!(!std::ptr::eq(&*first[0], &*current[0]));
+        assert!(hub.lookup("mcp__local__write").is_none());
+        *server.state.lock().unwrap() = McpState::Failed("disconnected".into());
+        assert!(hub.specs(true, &[]).is_empty());
+        hub.stop();
+        assert_eq!(first[0]["function"]["parameters"], schema);
     }
 
     #[test]

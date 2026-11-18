@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][int]$ProcessId,
-    [Parameter(Mandatory=$true)][string]$Directory
+    [Parameter(Mandatory=$true)][string]$Directory,
+    [ValidateSet('current','legacy')][string]$Layout = 'current'
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -55,16 +56,18 @@ public static class GatewayBenchWindow {
         System.Threading.Thread.Sleep(30);
         SendMessageW(hwnd, 0x202, IntPtr.Zero, position);
     }
-    public static long Send(IntPtr hwnd, string text) {
+    public static long Send(IntPtr hwnd, string text, bool legacy) {
         FocusInput(hwnd);
         System.Threading.Thread.Sleep(300);
         foreach (char unit in text) SendMessageW(hwnd, 0x102, new IntPtr(unit), IntPtr.Zero);
         Rect rect;
         if (!GetClientRect(hwnd, out rect)) throw new Exception("GetClientRect failed");
         double scale = GetDpiForWindow(hwnd) / 96.0;
-        double logicalWidth = rect.Right / scale;
-        int x = (int)((240 + Math.Min(760, logicalWidth - 240) - 55) * scale);
-        int y = rect.Bottom - (int)(38 * scale);
+        double width = rect.Right / scale;
+        double reading = Math.Min(760, width - 270);
+        double right = (width + 270 + reading) / 2;
+        int x = (int)((legacy ? 240 + Math.Min(760, width - 240) - 55 : right - 56) * scale);
+        int y = rect.Bottom - (int)((legacy ? 38 : 40) * scale);
         IntPtr position = new IntPtr((y << 16) | (x & 0xffff));
         long sent = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         SendMessageW(hwnd, 0x200, IntPtr.Zero, position);
@@ -117,7 +120,7 @@ try {
             $sent = $null
             switch ([string]$command.action) {
                 'status' {}
-                'send' { $sent = [GatewayBenchWindow]::Send($window, [string]$command.text) }
+                'send' { $sent = [GatewayBenchWindow]::Send($window, [string]$command.text, ($Layout -eq 'legacy')) }
                 'close' { [void][GatewayBenchWindow]::PostMessageW($window, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) }
                 default { throw ('Unknown action: ' + [string]$command.action) }
             }

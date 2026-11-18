@@ -8,7 +8,7 @@
 use crate::gateway::Route;
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, RequestParams, StreamEvent, StreamOutcome, ToolCall,
-    Usage, debug_http, error_message, finish_stream, get_json, parse_model_list,
+    ToolSpec, Usage, debug_http, error_message, finish_stream, get_json, parse_model_list,
     post_sse_with_retry, read_sse,
 };
 use serde_json::Value;
@@ -50,7 +50,7 @@ impl ChatProvider for OpenAiProvider {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        tools: &[Value],
+        tools: &[ToolSpec],
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
@@ -94,19 +94,20 @@ impl ChatProvider for OpenAiProvider {
 fn request_body<'a>(
     model: &str,
     messages: &'a [ChatMessage],
-    tools: &[Value],
+    tools: &'a [ToolSpec],
     params: &'a RequestParams,
-) -> crate::request::RequestBody<'a, &'a [ChatMessage]> {
+) -> impl serde::Serialize + 'a {
     let mut body = serde_json::json!({
         "model": model,
         "stream": true,
         "stream_options": { "include_usage": true },
     });
     if !tools.is_empty() {
-        body["tools"] = Value::from(tools.to_vec());
+        body["tools"] = Value::Null;
     }
     apply_params(&mut body, model, params);
     crate::request::RequestBody::new(body, &params.extra, "messages", messages)
+        .with_tools((!tools.is_empty()).then_some(tools))
 }
 
 fn apply_params(body: &mut Value, model: &str, params: &RequestParams) {

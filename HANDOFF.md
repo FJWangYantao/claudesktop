@@ -83,6 +83,38 @@
 - **右侧面板首次打开不要先选文件再初始化会话**（2026-11-16）：`RightPanelState::sync_session` 首次绑定会清空文件树和预览；
   截图 / 调试入口先调用 `sync_session`，再 `open_file` / `open_right_diff`，否则画面只剩未选择状态。
   正常用户点击发生在绑定之后，不受影响。
+- **右侧文件树基线**：`.claudesktop/bench/file-tree-baseline/baseline-01/aggregate.json` 记录 100 文件、单层 1 万文件和 10×1000 文件各 3 次隐藏 release 运行。视口约 27 行；后两种每次滚动分别构造 10000 / 10010 行，滚动 p95 三轮中位 412.90 / 292.05ms，单层根目录读盘加排序约 8ms。先测虚拟列表，再量缓存回收收益。
+  单层 / 分层的进程私有字节峰值三轮中位为 495.94 / 486.13 MiB，关闭 3 秒后为 403.71 / 393.97 MiB；仍持有的目录数据估算只有 2.98 / 2.78 MiB。峰值含整进程，不能按差值给具体分配器归因。
+  筛选探针用 `InputState::replace_all` 走 `InputEvent::Change`，`set_value` 不发事件。原 60 秒看门狗截断第三轮分层组；保留失败目录，只补未完成组，改为 150 秒，样本数和测量逻辑相同。临时探针补丁已撤下，普通 exe 已恢复并核对哈希。
+- **文件树虚拟化验收**：`.claudesktop/bench/file-tree-baseline/paired-01/comparison.json` 的 9 对全部达标。单层 / 全展开分层每滚动帧 10000 / 10010 → 29 行，三轮滚动 p95 中位 455.87 / 431.21 → 1.97 / 2.15ms，桌面进程私有内存峰值 495.20 / 485.51 → 159.11 / 159.24 MiB。索引容量 384 KiB。百文件同版本单对 p95 差 2.53ms，未通过预设 2ms 校准；保留 `aa-small-01`，正式对照三对小目录的实测均无倒退，精确小差值受本机抖动影响。
+  普通 release 的隐藏窗口经鼠标和字符消息操作，UI Automation 验证输入框状态。`window-capture-02` 离屏图补验目录名、滚动、预览与切换会话后的文件归属；UI Automation 不返回这些普通文件行的文本。格式、Clippy、660 项工作区测试与普通 release 构建通过。
+- **源码预览基线**：`.claudesktop/bench/source-preview-baseline/baseline-01/aggregate.json` 有 5 组各 3 轮、每轮 60 次滚动。256 KiB / 8192 短行的读取、打开和滚动 p95 三轮中位分别为 0.44 / 606.15 / 485.45ms；每帧构造全部 8192 行。私有字节峰值较打开前多 271.68 MiB，关闭 3 秒后仍多 242.67 MiB。这是进程级测量，预览保留的文本只有 256 KiB。
+  320 个长行在 345 / 453 / 779 逻辑像素宽下，每行实排 22 / 17 / 9 排，优先试按实际高度虚拟化。普通版隐藏窗口通过 13 个交互步骤；`smoke-capture-01` 离屏图覆盖换行、回到首行、截断、截断处 UTF-8、CRLF 空行、二进制和文件消失。
+  独立计时区间转成浮点毫秒后相加有舍入误差；允许 1µs 容差，首次并排组原始样本保留，补跑后完成三轮。临时探针补丁已撤下并核对普通 exe 哈希。
+- **预览变高列表的末尾要按实际行高排**：`List` 重排会丢掉旧高度；估算高度让未测行仍参与滚动，只有视口附近实测。
+  滚动跨过估算的底部时，改走 `scroll_to_end` 从末项反向排，才能一次到截断提示。26 万空行的坐标计算从视口顶部累加，避免大坐标相减令末项位置断言失真。
+- **源码预览虚拟化验收**：`.claudesktop/bench/source-preview-baseline/ab-01/comparison.json`，5 组各 3 对、1800 次滚动、24 项检查通过。
+  8192 行每滚动帧构造 8192 → 37 行，首帧 610.32 → 7.98ms，滚动 p95 433.49 → 2.12ms，进程私有内存峰值增量 271.48 → 6.26 MiB。
+  `verify-02` 验证第 161 行在拖宽、全宽和字号变化时保留 41.36% 行内锚点。262144 空行与单行 256 KiB 均可到末尾；空行极端样本单次峰值增量 52.65 MiB。
+  `smoke-virtual-normal-02` 普通版 13 步交互通过，`smoke-virtual-capture-02` 核对截断、回首行、CRLF 和错误提示。fmt、Clippy、661 项 workspace 测试及普通 release 构建通过。
+- **右侧改动面板基线**：`.claudesktop/bench/diff-panel-baseline/baseline-01/aggregate.json`，5 组各 3 轮，720 次确认位移的滚动。千文件窄面板首帧 138.17ms、滚动 p95 114.76ms、每帧构造千行，进程私有内存峰值增量 68.82 MiB。滚动汇总中位 59.04ms；点选后又为查预览重算一遍。单文件 400 行短 / 长 Diff 的滚动 p95 为 34.71 / 35.86ms，点选首帧 43.72 / 156.64ms。
+  `window-capture-02` 复现同一工具改两文件时，点清单第二行无响应，点对话改动卡第二行则显示第一份 Diff；全宽会同时高亮两行。`window-large-03` 的同一滚轮操作在窄面板移动到第 17 号文件，在并排和全宽时首行仍是 0 号，两个布局的滚动时延待功能修复后补测。
+  GPUI 会在分发抬键前补画脏帧。测快捷键打开时先采按键到首帧，再发抬键；第一次快查把两次场景构建算成一帧的记录留在 `smoke-01`。探针补丁已撤下，普通 exe 哈希未变。
+- **改动清单的布局与回退夹具**：并排和全宽的左列用纵向 flex 限住清单视口。`uniform_list` 的行要显式 `.w_full()`，否则点击和高亮只覆盖文字，增删数贴着文件名。
+  走对话回退的历史夹具把元信息 `agent` 写成 `builtin:diff-fixture`。`builtin` 会按旧格式识别为 ACP，只允许还原文件。看回退日志的 `conversation` 字段可区分两种路径。
+  GPUI 滚轮先累加偏移，布局时才夹到上下限。验证大步滚到表尾时要先绘制一帧，或用 `candidate-large-02` 的窗口消息和离屏图核对末行及其 Diff。
+- **改动清单虚拟化验收**：`.claudesktop/bench/diff-panel-baseline/candidate-ab-02/comparison.json` 记录三轮交替对照、42 个独立进程和 2340 次有位移校验的滚轮事件。
+  窄栏千文件每滚动帧 1000 → 27 行，首帧 135.55 → 9.78ms，滚动 p95 229.61 → 5.20ms，私有内存峰值增量 68.43 → 3.63 MiB。并排／全宽带预览时的最慢一轮滚动 p95 为 7.74／2.81ms。
+  三种布局都能点开第 1000 个文件。`candidate-normal-02` 验证第二行右端可点，`candidate-verify-02/1-selection-candidate` 确认同工具多文件和回退，`candidate-history-02` 核对同路径两轮预览与切会话。fmt、Clippy、662 项测试及普通 release 构建通过。
+  该批 400 行短／长 Diff 正文的滚动 p95 中位 64.82／65.50ms。清单已退出窄栏预览的渲染路径，当时正文仍构造整份 Diff。
+  工作区根目录运行 `node .claudesktop/bench/diff-panel-baseline/compare-candidates.mjs <新目录> ab` 复跑，脚本核对两份冻结探针和该批候选源码哈希。
+- **改动正文虚拟化**复用源码预览的变高列表。共享 Diff 行与卡片表头，正文行内样式直接设在行上，列表单独量行时不会继承卡片的字体样式。
+  正文剩余高度由 flex 确定，表头固定，截断提示作为末行。关闭或切页释放已测行高，保留定位和滚动位置；实时替换同一份 Diff 时按修订号失效高度。
+  `.claudesktop/bench/diff-body/ab-01/comparison.json` 冻结清单优化版为基线，三轮交替有 30 个独立进程、2520 次有位移校验的滚轮事件。用的是同一份历史夹具，1280×820 逻辑像素、字号 100%、动画关闭。
+  400 短／长行的正文首帧三轮中位 41.52／135.62 → 9.26／9.11ms，滚动 p95 中位 55.93／59.73 → 8.26／7.75ms，每帧最多构造 400 → 34／5 行。候选三轮最慢的滚动 p95 分别为 11.40／7.85ms，长行首帧最慢 10.61ms。
+  桌面进程私有内存峰值增量 19.38／24.22 → 5.25／4.03 MiB，关面板 3 秒后 14.55／19.43 → 2.37／1.37 MiB。千文件三布局继续每帧至多 27 文件行，最慢清单滚动 p95 7.01ms；窄栏该场景峰值增量中位 3.67 → 4.36 MiB。
+  `verify-01` 验证第 161 行在拖宽、全宽与 125% 字号下保留约 20.16% 的行内位置；实时替换重测行高，回退清掉预览。`capture-01` 用窗口消息滚到三种布局的末行和截断提示，`normal-01` 用普通 release 核对打开、返回和切文件。fmt、Clippy、663 项测试及普通 release 构建通过，探针插桩已移除。
+  工作区根目录运行 `node .claudesktop/bench/diff-body/run.mjs <新目录> probe-01 ab` 复跑。用 `build-probe.mjs <新构建名>` 另建探针，原基线与 `probe-01` 保持冻结。
 
 - **连接中的自研会话回收显示数据不能整对象换占位**：`from_records` 会清内核绑定，也丢工具图片和本轮文本附件。
   新路径在 `session/cache.rs` 只搬 `transcript` / `subagents`，以原子临时快照保存；保留同一个 `Session`、模式、队列和界面状态。
@@ -226,6 +258,21 @@
   **新的 chip 里放长度不由我们定的文字（项目名 / 模型名 / 分支名）时记得 `.shrink()`。**
 
 ## 内核 / 工具
+
+- **工具定义共享（2026-11-17，固定测量条件下验收通过）**：`ToolSpec` 用 `Arc<Value>` 持定义；MCP 清单更换时替换整份定义，请求只克隆引用，搜索只取名字 / 说明，调用目标不带 schema 副本。三个 provider 借用工具字段序列化。
+  `serde_json` 在本仓库启用了保留插入顺序：Anthropic 工具原顺序是 name → input_schema → description → cache_control，Responses 是 type → name → description → parameters → strict；工具在请求顶层也要占回原来的字段位置。首轮字节断言抓到顺序差异，修复后内核 release 196 项单测通过。
+  大型 MCP 基准在 `request-memory-bench.mjs` 加 `--mcp-tools=0,200 --loaded-tools=none,small,all`，默认把 JSON / SHA 校验移到轮后，保留 20ms 发送 / 整轮门槛；A/A 要求同一 exe 哈希且看绝对差。原文只归一化隔离 cwd 后按字节校验，同时核对完整 JSON。
+  `tool-memory/smoke-01` 和 `cache-path-check-01` 的请求成功，但夹具额外依赖的 C 盘临时目录 mcp-tools.json 未出现；同夹具的旧基线 `cache-baseline-check-01` 也如此，未确定磁盘缓存未生成的原因。schema 体积改为测试前从模拟 MCP 的真实 tools/list 应答采集，不依赖缓存文件。
+  `smoke-02` 已过三协议 × 未加载 / 加载 3 个 / 加载 200 个共 540 次真实请求，实际 MCP 清单 204 项、schema 序列化字节 3500336；旧基线与候选 OpenAI 全加载的 60 次请求，JSON 和归一化隔离 cwd 后的原文字节均一致。本批与编译并行，只算功能快查，性能值不用于收益结论。
+  普通桌面夹具也支持 `--mcp-tools=200 --loaded-tools=all`；从日志重放已加载清单，预热后等 MCP 连接再测。`desktop-normal-03` 的第 16 次 Enter 未触发新用户消息 / 请求，保留失败；最终用 `--window-layout=current` 按居中阅读列 / 264px 侧栏 + 6px 手柄计算发送按钮位置，`legacy` 保留旧左对齐坐标。只向指定隐藏窗口发鼠标消息，发送方式记录在 summary 中，旧结果不能与新驱动直接拼接。
+  图片要核对像素：read_file 会把 PNG 重新编码，不能要求发给模型的 base64 和源 PNG 字节相同。接收端解析实际三协议的图片结构，校验 1×1 夹具的 RGBA（100/120/140/255）；Anthropic 另断言原思考签名，`desktop-normal-02` 的错误字节断言失败保留。
+  本轮工作区 release 659 项通过、13 项忽略，fmt / all-targets release Clippy（-D warnings）和普通 release 构建通过。普通 exe 为 `D:/t3/release/claudesktop.exe`，SHA256 `efdff176f9b7e6e67f4db2bea2e2a9bae118a3dc48590267f3d1ff26c4e5796f`；`desktop-normal-04` 三协议成功 189 次主请求 + 3 次标题，186 次图片像素与 62 次签名校验，保存原文请求 / 响应校验完整，窗口始终隐藏且正常退出。单版本快查的性能状态为 null。
+  `aa-01` 同一 exe 三协议 × 三轮的 1080 次请求内容均一致，但仅 1/9 对延迟达标，最大绝对发送 / 整轮 p95 差为 53 / 51.010ms，A/B 未启动。原始失败保留。
+  用现有 Node v22.22.1 SDK 编译本次测试端点探针（`tool-memory/tcp-buffer-helper.cc`），真实连接读回 SO_RCVBUF 65536 → 1048576，控制 Node 请求 1ms 定时并在退出释放；只改夹具条件，未动产品发送路径。`aa-02` 固定条件后 9/9 通过，1080 请求，最大绝对发送 / 整轮 p95 差 7 / 4.9039ms，每个接收缓冲都实读验证。
+  `ab-02` 三协议 × 零 MCP / 200 项 MCP 的未加载、加载 3 个、加载 200 个 × 交替三轮，共 36 对 / 4320 次真实请求全部达标；2160 次成对 JSON 与仅归一化隔离 cwd 的字节校验全部一致。全矩阵最差额外发送 / 整轮 p95 为 +1 / +1.0283ms，峰值比最高 1.02212，候选末轮闲置 PB 增长最差 2.137 MiB。
+  200 项全加载的内核 PB 峰值三轮中位：OpenAI 53.078 → 37.816 MiB、Anthropic 50.672 → 36.641、Responses 51.805 → 35.188；两中位差为 15.262 / 14.031 / 16.617 MiB，全加载 9 对每对均降（至少 13.480 MiB）。每组 60 请求的 CPU 中位分别为 1781.25 → 500 / 1656.25 → 546.875 / 1687.5 → 453.125ms。
+  未加载和只加载 3 个的峰值并非每对都降，最差各多 0.621 / 0.676 MiB；零 MCP 的 OpenAI / Responses CPU 中位各多 31.25 / 15.625ms（60 请求，Windows 计量步长 15.625ms），不宣称所有场景 CPU 都下降。数据只代表短历史 + 合成大型 schema 的内核测试进程，MCP 服务与桌面 UI 另计，不与此前历史 / 网关节省量相加；本次通过不替代旧网关原条件的桌面总验收。
+  共用 Cargo target 的测试 exe 名字相同，候选构建会覆盖基线：基线必须先归档校验。本轮冻结 SHA 为基线 `fc84f666ee216278d4c9625bb614c55d2881ba82d19d5e2e2a8bc34e21c46192`、候选 `6d09f1d5be61241473bb79bb87b232332c69dcf773124045fe831455ea0a7774`；实际运行副本位于 `D:/t3/tool-memory/{baseline,candidate}/claudesktop.exe`，与归档字节一致。`verified-results.json` 和 `comparison-controlled-receipt.json` 记录复核结果，源码与两边测试夹具哈希复核一致。
 
 - **ACP 通知可能早于 `Started`**：agent 会在 `session/new` 响应到达前先推命令 / 用量 / 压缩，
   此时界面还没有 `acp_id`，直接按 sessionId 找会话会全丢。先在 `AcpShared::early` 缓存，`Started` 绑定后按序回放；

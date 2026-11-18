@@ -8,7 +8,7 @@
 
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, ProviderConfig, RequestParams, StreamEvent,
-    StreamOutcome, ToolCall, debug_http, finish_stream, get_json, parse_model_list,
+    StreamOutcome, ToolCall, ToolSpec, debug_http, finish_stream, get_json, parse_model_list,
     post_sse_with_retry, read_sse,
 };
 use serde::Serialize;
@@ -62,7 +62,7 @@ impl ChatProvider for AnthropicProvider {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        tools: &[Value],
+        tools: &[ToolSpec],
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
@@ -161,7 +161,7 @@ fn server_tool_spec(name: &str) -> Option<Value> {
 fn request_body<'a>(
     model: &str,
     messages: &'a [ChatMessage],
-    tools: &[Value],
+    tools: &'a [ToolSpec],
     params: &'a RequestParams,
 ) -> impl Serialize + 'a {
     let mut body = json!({
@@ -171,10 +171,14 @@ fn request_body<'a>(
     });
     let server: Vec<Value> =
         params.server_tools.iter().filter_map(|n| server_tool_spec(n)).collect();
-    if !tools.is_empty() || !server.is_empty() {
-        let Value::Array(mut all) = convert_tools(tools) else { unreachable!() };
-        all.extend(server);
-        body["tools"] = Value::Array(all);
+    let wire_tools =
+        (!tools.is_empty() || !server.is_empty()).then_some(crate::request::WireTools {
+            client: tools,
+            server,
+            protocol: crate::provider::Protocol::Anthropic,
+        });
+    if wire_tools.is_some() {
+        body["tools"] = Value::Null;
     }
     if let Some(t) = params.temperature {
         body["temperature"] = json!(t);
@@ -186,6 +190,7 @@ fn request_body<'a>(
         });
     crate::request::RequestBody::new(body, &params.extra, "messages", wire_messages(messages))
         .with_system("system", system)
+        .with_tools(wire_tools)
 }
 
 #[derive(Serialize)]
@@ -203,7 +208,8 @@ fn build_body(
     tools: &[Value],
     params: &RequestParams,
 ) -> Value {
-    serde_json::to_value(request_body(model, messages, tools, params)).unwrap()
+    let tools: Vec<_> = tools.iter().cloned().map(ToolSpec::from).collect();
+    serde_json::to_value(request_body(model, messages, &tools, params)).unwrap()
 }
 
 /// 把统一消息形状翻译成 Anthropic messages：
@@ -358,29 +364,15 @@ pub(crate) fn convert_messages(messages: &[ChatMessage]) -> (String, Vec<Value>)
     (system, out.as_array().unwrap().clone())
 }
 
-/// OpenAI 形状的工具定义 → Anthropic 形状；最后一个工具标缓存断点。
-pub(crate) fn convert_tools(tools: &[Value]) -> Value {
-    let n = tools.len();
-    Value::Array(
-        tools
-            .iter()
-            .enumerate()
-            .map(|(i, tool)| {
-                let function = &tool["function"];
-                let mut converted = json!({
-                    "name": function["name"],
-                    "input_schema": function["parameters"],
-                });
-                if let Some(desc) = function.get("description").filter(|d| !d.is_null()) {
-                    converted["description"] = desc.clone();
-                }
-                if i + 1 == n {
-                    converted["cache_control"] = json!({ "type": "ephemeral" });
-                }
-                converted
-            })
-            .collect(),
-    )
+#[cfg(test)]
+fn convert_tools(tools: &[Value]) -> Value {
+    let tools: Vec<_> = tools.iter().cloned().map(ToolSpec::from).collect();
+    serde_json::to_value(crate::request::WireTools {
+        client: &tools,
+        server: Vec::new(),
+        protocol: crate::provider::Protocol::Anthropic,
+    })
+    .unwrap()
 }
 
 /// 按 content block 下标累积的 tool_use（id / name 在 block 开始时给出，

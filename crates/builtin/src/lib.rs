@@ -55,8 +55,8 @@ pub use responses::ResponsesProvider;
 pub use provider::{
     ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, Protocol, ProviderConfig,
     RequestParams, StreamEvent, StreamOutcome, ThinkingFormat, ThinkingLevel, ThinkingSpec,
-    ToolCall, Usage, apply_thinking, parse_thinking_level, resolve_level, thinking_budget_for,
-    thinking_spec,
+    ToolCall, ToolSpec, Usage, apply_thinking, parse_thinking_level, resolve_level,
+    thinking_budget_for, thinking_spec,
 };
 
 /// 列出端点提供的模型（阻塞，设置页在后台线程调用）。
@@ -1335,19 +1335,26 @@ impl Inner {
                 .unwrap_or_default()
         };
         let writable = self.mode(session) != MODE_PLAN;
-        let mut specs = tools::specs(writable);
-        specs.extend(self.mcp.specs(writable, &disabled));
-        specs.push(subagent::spec(&self.agents(plugin_scope.as_deref())));
-        let loaded = self.loaded_tools(session);
-        specs
-            .into_iter()
-            .filter(|spec| tools::exposure(subagent::spec_name(spec)) == tools::Exposure::Deferred)
-            .filter(|spec| !loaded.iter().any(|name| name == subagent::spec_name(spec)))
+        let mut candidates: Vec<_> = tools::specs(writable)
+            .iter()
             .map(|spec| {
-                let name = subagent::spec_name(&spec).to_string();
-                let description = spec["function"]["description"].as_str().unwrap_or_default();
-                (name, description.to_string())
+                (
+                    subagent::spec_name(spec).to_string(),
+                    spec["function"]["description"].as_str().unwrap_or_default().to_string(),
+                )
             })
+            .collect();
+        candidates.extend(self.mcp.descriptions(writable, &disabled));
+        let task = subagent::spec(&self.agents(plugin_scope.as_deref()));
+        candidates.push((
+            subagent::TASK.to_string(),
+            task["function"]["description"].as_str().unwrap_or_default().to_string(),
+        ));
+        let loaded = self.loaded_tools(session);
+        candidates
+            .into_iter()
+            .filter(|(name, _)| tools::exposure(name) == tools::Exposure::Deferred)
+            .filter(|(name, _)| !loaded.contains(name))
             .collect()
     }
 
@@ -1723,13 +1730,13 @@ impl Inner {
 
     /// 模型调的 MCP 工具 → 动作；服务器没连上或没有这个工具时的错误回给模型。
     fn mcp_action(&self, name: &str, arguments: &str) -> Result<Action, String> {
-        let (server, tool) = self.mcp.lookup(name).ok_or_else(|| {
+        let (server, tool, read_only) = self.mcp.lookup(name).ok_or_else(|| {
             format!("Unknown tool `{name}` (its MCP server may have disconnected)")
         })?;
         let args = if arguments.trim().is_empty() { "{}" } else { arguments };
         let arguments: serde_json::Value =
             serde_json::from_str(args).map_err(|e| format!("Invalid arguments for {name}: {e}"))?;
-        Ok(Action::Mcp { server, tool: tool.name, arguments, read_only: tool.read_only })
+        Ok(Action::Mcp { server, tool, arguments, read_only })
     }
 
     /// 授权、执行，并报告结果。
@@ -3126,17 +3133,23 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         let specs = if let Some(web) = inner.chat_web_of(session) {
             tools::chat_specs(web)
         } else {
+            let loaded = inner.loaded_tools(session);
+            let include = |name: &str| match &agent {
+                Some(agent) => subagent::allows(agent, name),
+                None => {
+                    tools::exposure(name) == tools::Exposure::Direct
+                        || loaded.iter().any(|tool| tool == name)
+                }
+            };
             let mut specs = tools::specs(mode != MODE_PLAN);
-            specs.extend(inner.mcp.specs(mode != MODE_PLAN, &disabled));
-            match &agent {
-                // 主会话能派子任务；子会话按角色的工具清单筛（不嵌套）
-                None => specs.push(subagent::spec(&inner.agents(plugin_scope.as_deref()))),
-                Some(agent) => specs.retain(|s| subagent::allows(agent, subagent::spec_name(s))),
-            }
-            // 工具分层（见 `tools::exposure`）只作用于主会话：子会话按角色白名单本来就窄，
-            // 而且它看不到界面，不该再让它多走一步去搜工具
             if agent.is_none() {
-                specs = tools::for_model(specs, &inner.loaded_tools(session));
+                specs = tools::for_model(specs, &loaded);
+            } else {
+                specs.retain(|spec| include(subagent::spec_name(spec)));
+            }
+            specs.extend(inner.mcp.specs_for(mode != MODE_PLAN, &disabled, include));
+            if agent.is_none() && include(subagent::TASK) {
+                specs.push(subagent::spec(&inner.agents(plugin_scope.as_deref())).into());
             }
             specs
         };

@@ -15,7 +15,7 @@
 use crate::gateway::Route;
 use crate::provider::{
     ChatMessage, ChatProvider, ContentPart, FunctionCall, ModelInfo, RequestParams, StreamEvent,
-    StreamOutcome, ToolCall, Usage, debug_http, error_message, finish_stream, get_json,
+    StreamOutcome, ToolCall, ToolSpec, Usage, debug_http, error_message, finish_stream, get_json,
     parse_model_list, post_sse_with_retry, read_sse,
 };
 use serde::Serialize;
@@ -67,7 +67,7 @@ impl ChatProvider for ResponsesProvider {
         &self,
         model: &str,
         messages: &[ChatMessage],
-        tools: &[Value],
+        tools: &[ToolSpec],
         should_stop: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(StreamEvent),
     ) -> anyhow::Result<StreamOutcome> {
@@ -103,7 +103,7 @@ impl ChatProvider for ResponsesProvider {
 fn wire_body<'a>(
     model: &str,
     messages: &'a [ChatMessage],
-    tools: &[Value],
+    tools: &'a [ToolSpec],
     params: &'a RequestParams,
 ) -> impl Serialize + 'a {
     let mut input = Vec::new();
@@ -163,8 +163,13 @@ fn wire_body<'a>(
         }
     }
     let mut body = json!({ "model": model, "stream": true });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.iter().map(flatten_tool).collect());
+    let wire_tools = (!tools.is_empty()).then_some(crate::request::WireTools {
+        client: tools,
+        server: Vec::new(),
+        protocol: crate::provider::Protocol::Responses,
+    });
+    if wire_tools.is_some() {
+        body["tools"] = Value::Null;
     }
     if let Some(t) = params.temperature {
         body["temperature"] = json!(t);
@@ -175,6 +180,7 @@ fn wire_body<'a>(
     crate::provider::apply_thinking(&mut body, crate::provider::Protocol::Responses, model, params);
     crate::request::RequestBody::new(body, &params.extra, "input", input)
         .with_system("instructions", crate::request::system_text(messages, true))
+        .with_tools(wire_tools)
 }
 
 #[derive(Serialize)]
@@ -200,21 +206,8 @@ pub(crate) fn request_body(
     tools: &[Value],
     params: &RequestParams,
 ) -> Value {
-    serde_json::to_value(wire_body(model, messages, tools, params)).unwrap()
-}
-
-/// Chat Completions 形状的工具定义（`{"type":"function","function":{…}}`）→ Responses 的平形状。
-fn flatten_tool(tool: &Value) -> Value {
-    let Some(function) = tool.get("function") else {
-        return tool.clone();
-    };
-    let mut out = json!({ "type": "function" });
-    for key in ["name", "description", "parameters", "strict"] {
-        if let Some(value) = function.get(key) {
-            out[key] = value.clone();
-        }
-    }
-    out
+    let tools: Vec<_> = tools.iter().cloned().map(ToolSpec::from).collect();
+    serde_json::to_value(wire_body(model, messages, &tools, params)).unwrap()
 }
 
 fn image_item<'a>(media_type: &'a str, data: &'a str) -> InputContent<'a> {

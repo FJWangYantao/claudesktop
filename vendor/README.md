@@ -17,6 +17,9 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
   `LineWrapper` 的按行数截断、`LineLayout::compute_wrap_boundaries`（普通文字元素用）。
   测试在 `apps/desktop/src/app/chat.rs` 的 `cjk_wrap_follows_kinsoku`（用 `NoopTextSystem` 驱动真的 `LineWrapper`），
   升级后补丁没打上它会挂。
+- **变高列表重排时保留滚动锚点和估算高度**（`src/elements/list.rs` 的 `List::with_estimated_item_height`）：
+  源码预览用估算高度让未测量行参与滚动范围。宽度或估算高度变化时，保住视口顶部条目和行内比例，再按需测量实际高度。
+  滚动越过估算范围时从实际末项向上排。`bounds_for_item` 从视口顶部累加高度，以免大坐标相减丢失精度。
 
 ## markdown 1.0.0
 

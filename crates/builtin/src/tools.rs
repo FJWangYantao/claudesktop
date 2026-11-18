@@ -3,6 +3,7 @@
 //!
 //! 给模型看的说明与结果用英文（与系统提示词一致），给 UI 的摘要用中文。
 
+use crate::provider::ToolSpec;
 use claudesktop_core::memory::MAX_TEXT_CHARS;
 use claudesktop_core::{
     DiffHunk, DiffView, PermissionHunks, PlanEntryView, QuestionAnswer, QuestionView,
@@ -13,7 +14,7 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 const READ_FILE: &str = "read_file";
@@ -275,7 +276,7 @@ pub fn exposure(name: &str) -> Exposure {
 
 /// 按 exposure 筛掉这次请求不该声明的工具定义。`loaded` 是本会话已经通过 `tool_search`
 /// 加载的名字（`SessionState::loaded_tools`）。
-pub fn for_model(specs: Vec<Value>, loaded: &[String]) -> Vec<Value> {
+pub fn for_model(specs: Vec<ToolSpec>, loaded: &[String]) -> Vec<ToolSpec> {
     if specs.iter().all(|spec| exposure(spec_name(spec)) == Exposure::Direct) {
         return specs;
     }
@@ -294,7 +295,14 @@ fn spec_name(spec: &Value) -> &str {
 }
 
 /// 发给 provider 的工具定义（OpenAI `tools`）；`writable = false`（Plan 模式）只给只读工具。
-pub fn specs(writable: bool) -> Vec<Value> {
+pub fn specs(writable: bool) -> Vec<ToolSpec> {
+    static SPECS: [OnceLock<Vec<ToolSpec>>; 2] = [const { OnceLock::new() }; 2];
+    SPECS[writable as usize]
+        .get_or_init(|| build_specs(writable).into_iter().map(ToolSpec::from).collect())
+        .clone()
+}
+
+fn build_specs(writable: bool) -> Vec<Value> {
     let f = |name: &str, description: String, parameters: Value| {
         json!({
             "type": "function",
@@ -632,7 +640,14 @@ pub fn specs(writable: bool) -> Vec<Value> {
 
 /// 聊天会话的工具定义：只有联网（`web` 开着时）和记忆（只全局）。
 /// 不给工作目录那套：聊天改不了文件、跑不了命令。
-pub fn chat_specs(web: bool) -> Vec<Value> {
+pub fn chat_specs(web: bool) -> Vec<ToolSpec> {
+    static SPECS: [OnceLock<Vec<ToolSpec>>; 2] = [const { OnceLock::new() }; 2];
+    SPECS[web as usize]
+        .get_or_init(|| build_chat_specs(web).into_iter().map(ToolSpec::from).collect())
+        .clone()
+}
+
+fn build_chat_specs(web: bool) -> Vec<Value> {
     let f = |name: &str, description: String, parameters: Value| {
         json!({
             "type": "function",
@@ -3573,11 +3588,33 @@ y
         assert!(parse_tool_search("nope").is_err());
     }
 
+    #[test]
+    fn fixed_specs_share_definitions_without_mixing_permission_modes() {
+        for writable in [false, true] {
+            let first = specs(writable);
+            let next = specs(writable);
+            assert!(first.iter().zip(&next).all(|(a, b)| std::ptr::eq(&**a, &**b)));
+            assert_eq!(
+                serde_json::to_value(&first).unwrap(),
+                serde_json::to_value(build_specs(writable)).unwrap()
+            );
+        }
+        for web in [false, true] {
+            let first = chat_specs(web);
+            let next = chat_specs(web);
+            assert!(first.iter().zip(&next).all(|(a, b)| std::ptr::eq(&**a, &**b)));
+            assert_eq!(
+                serde_json::to_value(&first).unwrap(),
+                serde_json::to_value(build_chat_specs(web)).unwrap()
+            );
+        }
+    }
+
     /// `for_model`：`Direct` 恒在，`Deferred` 只在 `loaded` 里时出现，`loaded` 里不存在
     /// 的名字不影响结果。
     #[test]
     fn for_model_keeps_direct_and_loaded_only() {
-        let names = |list: Vec<Value>| -> Vec<String> {
+        let names = |list: Vec<ToolSpec>| -> Vec<String> {
             list.iter().map(|spec| spec_name(spec).to_string()).collect()
         };
         let direct = names(for_model(specs(true), &[]));
@@ -3603,7 +3640,7 @@ y
             "function": { "name": "mcp__github__search_issues", "description": "d", "parameters": {} }
         });
         let mut all = specs(true);
-        all.push(mcp);
+        all.push(mcp.into());
         let has = |loaded: &[String]| -> bool {
             for_model(all.clone(), loaded)
                 .iter()

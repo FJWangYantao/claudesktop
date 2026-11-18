@@ -36,6 +36,8 @@ pub struct Session {
     /// 可以发提示词：Started 已到，或演示回放模式
     pub ready: bool,
     pub transcript: Vec<ChatItem>,
+    pub(crate) diff_revision: u64,
+    pub(crate) diff_epoch: u64,
     pub busy: bool,
     /// 这一轮是手动压缩上下文（没有用户消息；结束时不记用时用量，不钉上一轮的计划）
     pub compact_turn: bool,
@@ -393,6 +395,8 @@ impl Session {
             requested: false,
             ready: is_demo,
             transcript: Vec::new(),
+            diff_revision: 0,
+            diff_epoch: 0,
             busy: false,
             compact_turn: false,
             cancel_token: 0,
@@ -1892,7 +1896,11 @@ impl Session {
     /// 回退对话：对话截到第 `idx` 行之前（那条用户消息起都不要了），挂在这些行上的状态一并清掉。
     pub fn truncate_to(&mut self, idx: usize) {
         self.stream_pending.clear();
-        self.transcript.truncate(idx);
+        if idx < self.transcript.len() {
+            self.transcript.truncate(idx);
+            self.diff_revision += 1;
+            self.diff_epoch += 1;
+        }
         self.turn_summaries.retain(|&i, _| i < idx);
         self.open_groups.retain(|&i| i < idx);
         self.plan_folded = false;
@@ -2106,6 +2114,7 @@ impl Session {
                 }
             }
             KernelEvent::ToolCallUpdated { id, title, status, raw_output, output } => {
+                let mut changed_diffs = false;
                 if let Some(card) = self.tool_card(&id) {
                     if let Some(title) = title {
                         let (name, arg) = tool_label(&card.kind, &title);
@@ -2113,7 +2122,10 @@ impl Session {
                         card.arg = arg;
                     }
                     if let Some(status) = status {
-                        card.phase = tool_phase(&status);
+                        let phase = tool_phase(&status);
+                        changed_diffs = !card.diffs.is_empty()
+                            && (card.phase == ToolPhase::Done) != (phase == ToolPhase::Done);
+                        card.phase = phase;
                     }
                     if let Some(raw) = raw_output {
                         card.result = summarize_output(&raw).into();
@@ -2121,6 +2133,9 @@ impl Session {
                     if let Some(output) = output {
                         card.output = output.into();
                     }
+                }
+                if changed_diffs {
+                    self.diff_revision += 1;
                 }
             }
             KernelEvent::ToolCallProgress { id, output } => {
@@ -2133,6 +2148,9 @@ impl Session {
             KernelEvent::ToolCallDiff { id, diff } => {
                 if let Some(card) = self.tool_card(&id) {
                     card.set_diff(diff);
+                    if card.phase == ToolPhase::Done {
+                        self.diff_revision += 1;
+                    }
                 }
             }
             KernelEvent::ToolCallContent { id, output } => {
@@ -2400,6 +2418,9 @@ impl Session {
             }
             MockAction::ToolDone(result) => {
                 if let Some(ChatItem::Tool(card)) = self.transcript.last_mut() {
+                    if card.phase != ToolPhase::Done && !card.diffs.is_empty() {
+                        self.diff_revision += 1;
+                    }
                     card.result = (*result).into();
                     card.phase = ToolPhase::Done;
                 }
@@ -2407,6 +2428,9 @@ impl Session {
             MockAction::Diff(path, old, new) => {
                 if let Some(ChatItem::Tool(card)) = self.transcript.last_mut() {
                     card.set_diff(DiffView::compute(*path, Some(old), new));
+                    if card.phase == ToolPhase::Done {
+                        self.diff_revision += 1;
+                    }
                 }
             }
             MockAction::BeginPlan => {

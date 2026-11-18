@@ -1371,12 +1371,13 @@ impl ChatApp {
             });
 
         let cwd = s.cwd.clone();
+        let origin = (s.token, s.diff_epoch);
         let total = files.len();
         let open = s.changes_open.contains(&idx);
         let shown = if open || total <= CHANGES_PREVIEW + 1 { total } else { CHANGES_PREVIEW };
         let faded = undo.is_some_and(|u| u.all);
         let rows = files.into_iter().take(shown).enumerate().map(|(n, f)| {
-            let item = f.item;
+            let location = f.location;
             let (name, dir) =
                 split_path(&claudesktop_core::review::display_path(&f.path, Some(&cwd)));
             div()
@@ -1423,7 +1424,12 @@ impl ChatApp {
                         .group_hover("changes-file", |d| d.opacity(1.))
                         .child(Icon::new(IconAll::ChevronRight).size_3().text_color(rgb(INK_SOFT))),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.reveal_change(item, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let session = this.session();
+                    if (session.token, session.diff_epoch) == origin {
+                        this.reveal_change(location, cx);
+                    }
+                }))
         });
         let more = (shown < total || (open && total > CHANGES_PREVIEW + 1)).then(|| {
             let text = if open {
@@ -1480,12 +1486,12 @@ impl ChatApp {
     /// 从改动卡片跳到某个文件的 diff：摘要视图里 diff 卡片是收起的。
     /// 只在内存里换回标准视图——这是「为看一眼」的临时切换，不能当成偏好写回设置文件
     /// （见 [`Self::set_view_mode`]）。
-    fn reveal_change(&mut self, item: usize, cx: &mut Context<Self>) {
+    fn reveal_change(&mut self, location: DiffLocation, cx: &mut Context<Self>) {
         if self.settings.view_mode == ViewMode::Summary {
             self.settings.view_mode = ViewMode::Normal;
             self.view_changed(cx);
         }
-        self.open_right_diff(item, cx);
+        self.open_right_diff(location, cx);
     }
 
     /// 一个文件的 diff 卡片；`preview` = 默认露出的行数（None = 全部）。
@@ -1498,30 +1504,25 @@ impl ChatApp {
         rest: Option<(ElementId, f32)>,
         tool: Option<(&ToolCard, f32)>,
     ) -> Div {
-        let line_el = diff_line;
         let shown = preview.map_or(diff.lines.len(), |n| n.min(diff.lines.len()));
-        let truncated = diff.truncated.then(|| {
-            div()
-                .px_3()
-                .py_1()
-                .font_family(sans())
-                .text_color(rgb(INK_SOFT))
-                .child("改动过大，其余部分未显示")
-        });
-        let mut body = div()
-            .v_flex()
-            .py_1()
-            .font_family(MONO)
-            .text_size(TEXT_SMALL)
-            .line_height(LEADING)
-            .children(diff.lines[..shown].iter().map(line_el));
+        let truncated = diff.truncated.then(diff_truncated);
+        let mut body = div().v_flex().py_1().children(diff.lines[..shown].iter().map(diff_line));
         let hidden = &diff.lines[shown..];
         if hidden.is_empty() {
             body = body.children(truncated);
         } else if let Some((id, progress)) = rest.filter(|(_, p)| *p > 0.) {
-            let more = div().v_flex().children(hidden.iter().map(line_el)).children(truncated);
+            let more = div().v_flex().children(hidden.iter().map(diff_line)).children(truncated);
             body = body.child(Reveal::new(id, progress, more));
         }
+        Self::diff_card(diff, cwd, tool, body)
+    }
+
+    pub(super) fn diff_card(
+        diff: &DiffView,
+        cwd: &Path,
+        tool: Option<(&ToolCard, f32)>,
+        body: impl IntoElement,
+    ) -> Div {
         let icon = match tool {
             Some((card, settle)) => tool_status_icon(card, settle),
             None => {
@@ -1532,6 +1533,7 @@ impl ChatApp {
             split_path(&claudesktop_core::review::display_path(&diff.path, Some(cwd)));
         let header = div()
             .h_flex()
+            .flex_shrink_0()
             .items_center()
             .gap_2()
             .px_2()
@@ -2246,10 +2248,22 @@ fn new_file_tag() -> Div {
 /// 改动卡片先列几个文件（多一个时直接全列，不为一行折叠）
 const CHANGES_PREVIEW: usize = 5;
 
+pub(super) fn diff_truncated() -> Div {
+    div()
+        .px_3()
+        .py_1()
+        .font_family(sans())
+        .text_size(TEXT_SMALL)
+        .line_height(LEADING)
+        .text_color(rgb(INK_SOFT))
+        .child("改动过大，其余部分未显示")
+}
+
 /// diff 的一行：行号、+/- 标记、内容；`'~'` 是两个 hunk 之间省略的部分。
 pub(super) fn diff_line(line: &claudesktop_core::DiffLineView) -> Div {
+    let row = div().font_family(MONO).text_size(TEXT_SMALL).line_height(LEADING);
     if line.tag == '~' {
-        return div()
+        return row
             .h(px(18.))
             .pl(px(40.))
             .text_size(TEXT_META)
@@ -2262,8 +2276,7 @@ pub(super) fn diff_line(line: &claudesktop_core::DiffLineView) -> Div {
         '-' => (Some(DIFF_DEL_BG), DIFF_DEL_FG),
         _ => (None, INK_SOFT),
     };
-    div()
-        .h_flex()
+    row.h_flex()
         .items_start()
         .when_some(bg, |d, c| d.bg(rgb(c)))
         .child(

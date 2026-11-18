@@ -67,10 +67,11 @@ export class GatewayObserver {
   errors = [];
   checks = [];
 
-  constructor(cwd, mode = 'background') {
+  constructor(cwd, mode = 'background', { rawOnly = true } = {}) {
     assert(['background', 'idle'].includes(mode));
     this.cwd = cwd;
     this.mode = mode;
+    this.rawOnly = rawOnly;
     this.poolSize = mode === 'idle' ? 4 : 3;
     this.#buffers = Array.from({ length: this.poolSize }, () => Buffer.allocUnsafe(32 * 1024 * 1024));
     if (mode === 'background') this.#start();
@@ -146,20 +147,20 @@ export class GatewayObserver {
     };
   }
 
-  inspect(buffer, length, observation, main) {
+  inspect(buffer, length, observation, main, expectations) {
     if (this.mode === 'idle') {
-      this.#queued.push({ buffer, length, observation, main });
+      this.#queued.push({ buffer, length, observation, main, expectations });
     } else {
-      this.#inspect(buffer, length, observation, main);
+      this.#inspect(buffer, length, observation, main, expectations);
     }
   }
 
-  #inspect(buffer, length, observation, main) {
+  #inspect(buffer, length, observation, main, expectations) {
     const id = ++this.#next;
     const bytes = buffer.subarray(0, length);
     const promise = new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      this.#worker.postMessage({ id, bytes, cwd: this.cwd, raw_only: true, return_buffer: true }, [bytes.buffer]);
+      this.#worker.postMessage({ id, bytes, cwd: this.cwd, raw_only: this.rawOnly, return_buffer: true, expectations }, [bytes.buffer]);
     }).then(result => {
       if (main !== undefined) assert.equal(result.stats.tools !== null, main, 'Fixture request kind differs from full JSON validation.');
       Object.assign(observation, result);
@@ -171,7 +172,7 @@ export class GatewayObserver {
     if (this.#queued.length) {
       this.#start();
       for (const job of this.#queued.splice(0)) {
-        this.#inspect(job.buffer, job.length, job.observation, job.main);
+        this.#inspect(job.buffer, job.length, job.observation, job.main, job.expectations);
       }
     }
     try {

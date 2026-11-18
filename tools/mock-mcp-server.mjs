@@ -27,8 +27,28 @@ import http from 'node:http';
 import readline from 'node:readline';
 import crypto from 'node:crypto';
 
+const schemaCount = Number(process.env.MOCK_MCP_SCHEMA_TOOLS || 0);
+const schemaFields = Number(process.env.MOCK_MCP_SCHEMA_FIELDS || 64);
+if (!Number.isInteger(schemaCount) || schemaCount < 0 || schemaCount > 1000
+  || !Number.isInteger(schemaFields) || schemaFields < 1 || schemaFields > 256) {
+  throw new Error('Invalid synthetic MCP schema dimensions.');
+}
+const schemaTools = Array.from({ length: schemaCount }, (_, index) => ({
+  name: `schema_${String(index).padStart(4, '0')}`,
+  description: `Synthetic schema tool ${index}`,
+  inputSchema: {
+    type: 'object',
+    properties: Object.fromEntries(Array.from({ length: schemaFields }, (_, field) => [
+      `field_${field}`, { type: 'string', description: `Tool ${index} field ${field}. ` + 'escaped " text \\ value. '.repeat(8) },
+    ])),
+    required: ['field_0'],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: index % 2 === 0 },
+}));
 let extra = false;
 const tools = () => [
+  ...schemaTools,
   {
     name: 'echo',
     description: 'Echo the text back',

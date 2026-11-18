@@ -116,8 +116,12 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   阅读列 / 设置页 / 侧栏宽度用 `READING_W` / `FORM_W` / `SIDEBAR_W`。
   `content_slot()` 铺满主区（保证全窗滚轮和右缘滚动条可用），对话行、首页和输入区经
   `ChatApp::reading_column` 限宽（760px，宽阅读模式 920px），默认居中，可在设置里切左对齐；设置 / 用量页独立布局。
-  右侧辅助面板在 `app/right_panel.rs`：文件树 / 源码预览 / 逐文件 Diff，可拖拽调宽或展开全宽；
-  文件系统只在展开目录、刷新和选择文件时读取，不在 render 里扫盘。
+  右侧辅助面板在 `app/right_panel.rs`：文件树 / 源码预览 / 逐文件 Diff，可拖拽调宽或展开全宽。
+  文件树在目录、展开或筛选变化时重建扁平索引，固定行高用 `uniform_list` 按视口构造。目录在面板绑定会话、刷新或首次展开时读取。
+  源码预览只索引前 256 KiB 解码后的源码行，变高 `List` 按视口测量实际换行，宽度或字号变化保留顶部行及行内比例。
+  改动清单也用 `uniform_list`，按归一化路径合并完成的改动，按 `Session::diff_revision` 更新并在面板隐藏时释放。
+  清单指向每个文件的最后一份 Diff，对话改动卡指向该轮的那份；定位用工具行和 Diff 下标，回退后旧定位失效。
+  右侧 Diff 正文用变高 `List` 借用该定位的行，表头固定，截断提示是末行。修订变化重测，隐藏时释放列表，只保留定位与滚动位置。
   `READING_W` / `FORM_W` 是 measure，**保持 px**；`SIDEBAR_W` / `SETTINGS_NAV_W` / `CHROME_H`
   是「框」，是 `Rems`，拿它算加减时要 `.to_pixels(window.rem_size())`（设置页整页宽度用 `theme::settings_page_w()`）。
 - **阴影**：`raised_shadow()`（贴地一档）/ `float_shadow()`（悬浮两层）在 `theme.rs`，σ 已按 CSS 减半；
@@ -321,6 +325,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   本地命令走 stdio，远程的 Streamable HTTP / 旧版 SSE 在 `mcp_http.rs`；连上过又断了的自动退避重连）。
   首次连接把工具定义按配置 / 插件版本指纹缓存到 `mcp-tools.json`；启动命中缓存时显示「按需连接」，
   先把工具给模型，首次调用再连接；手动刷新仍强制重连。10 分钟无调用且无进行中的调用时断开，缓存保留。
+  工具定义用 `provider::ToolSpec` 共享；MCP 清单更新替换定义，进行中的请求保留原快照。`specs_for` 先按会话清单筛选再取引用，搜索用 `descriptions`，不复制 schema。
+  三种 provider 借用工具定义序列化，保留字段顺序、Anthropic 缓存断点、Responses 的 `strict` 和 `extra.tools` 覆盖。
   工具以 `mcp__服务器__工具` 交给模型、走 `Action::Mcp` 和正常的权限流程，
   状态经 `KernelEvent::McpStatus` 到设置页「MCP」（`app/mcp_view.rs`）。改 MCP 用 `tools/mock-mcp-server.mjs` 测（`--http` / `--sse` 起远程模式，测试在 `tests/mcp.rs`）。
 - 设置页「MCP」「插件」分「已安装 / 推荐」两栏带搜索（`app/catalog_view.rs`），推荐的内容在 `crates/core/src/catalog.rs`：

@@ -100,6 +100,7 @@ impl Session {
         self.measured_busy = false;
         self.history_loaded = false;
         self.history_loading = true;
+        self.diff_revision += 1;
         self.display_snapshot = Some(snapshot);
         DisplayData {
             transcript: std::mem::take(&mut self.transcript),
@@ -110,6 +111,7 @@ impl Session {
     pub fn restore_display(&mut self, mut data: DisplayData) {
         data.transcript.append(&mut self.transcript);
         self.transcript = data.transcript;
+        self.diff_revision += 1;
         self.subagents = data.subagents;
         self.display_snapshot = None;
         self.history_loaded = true;

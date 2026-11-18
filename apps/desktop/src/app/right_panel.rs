@@ -1,13 +1,14 @@
 //! 右侧辅助面板：文件树 / 源码预览与逐文件 Diff。
 //!
-//! 文件系统只在展开目录、刷新和选择文件时读取，渲染帧不扫盘。面板宽度与左侧栏一样可拖拽，
-//! 展开为全宽时隐藏对话列；窄面板一次显示树或预览，宽面板并排显示。
+//! 清单和预览只构造视口附近的行。目录在面板绑定会话、刷新或首次展开时读取。
+//! 展开为全宽时隐藏对话列；窄面板一次显示清单或预览，宽面板并排显示。
 
 use super::ChatApp;
+use super::chat::{diff_line, diff_truncated};
 use super::chrome::{CHROME_H, drag_area, window_controls};
 use super::menu::diff_stat;
 use super::widgets::Surface;
-use crate::model::{ChatItem, TurnFile, same_path, turn_files};
+use crate::model::{DiffLocation, TurnFile, same_path, turn_files};
 use crate::session::Session;
 use crate::settings::ContentAlign;
 use crate::theme::rgb;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 const PREVIEW_LIMIT: usize = 256 * 1024;
 const MAX_DEPTH: usize = 8;
+const FILE_ROW_H: Rems = rems(1.75);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum RightTab {
@@ -48,18 +50,205 @@ impl RightTab {
     }
 }
 
-#[derive(Clone)]
 struct FileNode {
     name: SharedString,
     path: PathBuf,
     directory: bool,
 }
 
+#[derive(Clone, Copy)]
+struct FileRow {
+    directory: usize,
+    item: usize,
+    depth: usize,
+}
+
+#[derive(Default)]
+struct FileTree {
+    directory_ids: HashMap<PathBuf, usize>,
+    directories: Vec<Vec<FileNode>>,
+    expanded: HashSet<PathBuf>,
+    rows: Vec<FileRow>,
+    query: String,
+}
+
+impl FileTree {
+    fn load_dir(&mut self, dir: &Path) {
+        if self.directory_ids.contains_key(dir) {
+            return;
+        }
+        let mut nodes: Vec<FileNode> = std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let kind = entry.file_type().ok()?;
+                Some(FileNode {
+                    name: entry.file_name().to_string_lossy().into_owned().into(),
+                    directory: kind.is_dir(),
+                    path: entry.path(),
+                })
+            })
+            .collect();
+        nodes.sort_by_key(|node| (!node.directory, node.name.to_string().to_lowercase()));
+        self.directory_ids.insert(dir.to_path_buf(), self.directories.len());
+        self.directories.push(nodes);
+    }
+
+    fn rebuild(&mut self, root: &Path) {
+        let mut rows = std::mem::take(&mut self.rows);
+        rows.clear();
+        self.append_rows(root, 0, &mut rows);
+        self.rows = rows;
+    }
+
+    fn append_rows(&self, dir: &Path, depth: usize, rows: &mut Vec<FileRow>) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        let Some(&directory) = self.directory_ids.get(dir) else { return };
+        for item in 0..self.directories[directory].len() {
+            let node = &self.directories[directory][item];
+            if !self.query.is_empty() && !node.name.to_lowercase().contains(&self.query) {
+                continue;
+            }
+            rows.push(FileRow { directory, item, depth });
+            if node.directory && self.expanded.contains(&node.path) {
+                self.append_rows(&node.path, depth + 1, rows);
+            }
+        }
+    }
+
+    fn node(&self, row: FileRow) -> &FileNode {
+        &self.directories[row.directory][row.item]
+    }
+
+    fn position(&self, path: &Path) -> Option<usize> {
+        self.rows.iter().position(|&row| self.node(row).path == path)
+    }
+
+    fn is_empty_dir(&self, dir: &Path) -> bool {
+        self.directory_ids.get(dir).is_some_and(|&id| self.directories[id].is_empty())
+    }
+}
+
+#[derive(Default)]
 struct FilePreview {
     path: PathBuf,
     text: String,
+    line_starts: Vec<u32>,
     truncated: bool,
     error: Option<String>,
+    list: Option<ListState>,
+    scroll_top: ListOffset,
+}
+
+impl FilePreview {
+    fn set_text(&mut self, text: String) {
+        let mut start = 0;
+        self.line_starts = text
+            .split_inclusive('\n')
+            .map(|line| {
+                let offset = start;
+                start += line.len();
+                offset as u32
+            })
+            .collect();
+        self.text = text;
+    }
+
+    fn line(&self, index: usize) -> Option<&str> {
+        let start = *self.line_starts.get(index)? as usize;
+        let end = self.line_starts.get(index + 1).map_or(self.text.len(), |&n| n as usize);
+        let raw = &self.text[start..end];
+        Some(raw.strip_suffix('\n').map_or(raw, |line| line.strip_suffix('\r').unwrap_or(line)))
+    }
+
+    fn list(&mut self, rem: Pixels) -> ListState {
+        let count = self.line_starts.len() + usize::from(self.truncated);
+        self.list
+            .get_or_insert_with(|| {
+                let list = ListState::new(count, ListAlignment::Top, rems(8.).to_pixels(rem));
+                list.scroll_to(self.scroll_top);
+                list
+            })
+            .clone()
+    }
+
+    fn release_list(&mut self) {
+        if let Some(list) = self.list.take() {
+            self.scroll_top = list.logical_scroll_top();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DiffSelection {
+    location: DiffLocation,
+    epoch: u64,
+}
+
+impl DiffSelection {
+    fn resolve(self, session: &Session) -> Option<&DiffView> {
+        if self.epoch != session.diff_epoch {
+            return None;
+        }
+        self.location.resolve(&session.transcript)
+    }
+}
+
+struct DiffPreview {
+    selection: DiffSelection,
+    list: Option<ListState>,
+    scroll_top: ListOffset,
+    revision: u64,
+}
+
+impl DiffPreview {
+    fn new(selection: DiffSelection) -> Self {
+        Self { selection, list: None, scroll_top: ListOffset::default(), revision: 0 }
+    }
+
+    fn list(&mut self, count: usize, revision: u64, rem: Pixels) -> ListState {
+        if let Some(list) = &self.list
+            && list.item_count() == count
+        {
+            if self.revision != revision {
+                list.remeasure();
+                self.revision = revision;
+            }
+            return list.clone();
+        }
+        self.release_list();
+        let list = ListState::new(count, ListAlignment::Top, rems(8.).to_pixels(rem));
+        list.scroll_to(self.scroll_top);
+        self.revision = revision;
+        self.list = Some(list.clone());
+        list
+    }
+
+    fn release_list(&mut self) {
+        if let Some(list) = self.list.take() {
+            self.scroll_top = list.logical_scroll_top();
+        }
+    }
+}
+
+struct ChangedFiles {
+    revision: u64,
+    rows: Vec<TurnFile>,
+}
+
+impl ChangedFiles {
+    fn sync(cache: &mut Option<Self>, session: &Session) {
+        if cache.as_ref().is_none_or(|files| files.revision != session.diff_revision) {
+            *cache = Some(Self {
+                revision: session.diff_revision,
+                rows: turn_files(&session.transcript, 0),
+            });
+        }
+    }
 }
 
 pub(super) struct RightPanelState {
@@ -69,17 +258,14 @@ pub(super) struct RightPanelState {
     pub width_delta: f32,
     seen_token: Option<u64>,
     root: PathBuf,
-    entries: HashMap<PathBuf, Vec<FileNode>>,
-    expanded_dirs: HashSet<PathBuf>,
+    file_tree: FileTree,
     selected_file: Option<PathBuf>,
     preview: Option<FilePreview>,
-    diff_selected: Option<usize>,
+    diff_preview: Option<DiffPreview>,
+    changed_files: Option<ChangedFiles>,
     filter_input: Entity<InputState>,
-    query: String,
-    file_scroll: ScrollHandle,
-    preview_scroll: ScrollHandle,
-    diff_list_scroll: ScrollHandle,
-    diff_scroll: ScrollHandle,
+    file_scroll: UniformListScrollHandle,
+    diff_list_scroll: UniformListScrollHandle,
 }
 
 impl RightPanelState {
@@ -88,11 +274,16 @@ impl RightPanelState {
         cx.subscribe_in(
             &filter_input,
             window,
-            |this: &mut ChatApp, _, event: &InputEvent, _, cx| {
+            |this: &mut ChatApp, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
-                    let query = this.right_panel.filter_input.read(cx).value().to_string();
-                    this.right_panel.query = query;
-                    cx.notify();
+                    let query = this.right_panel.filter_input.read(cx).value();
+                    let panel = &mut this.right_panel;
+                    let query = query.trim().to_lowercase();
+                    if panel.file_tree.query != query {
+                        panel.file_tree.query = query;
+                        panel.rebuild_file_rows(window.rem_size(), None);
+                        cx.notify();
+                    }
                 }
             },
         )
@@ -104,17 +295,14 @@ impl RightPanelState {
             width_delta: 0.,
             seen_token: None,
             root: PathBuf::new(),
-            entries: HashMap::new(),
-            expanded_dirs: HashSet::new(),
+            file_tree: FileTree::default(),
             selected_file: None,
             preview: None,
-            diff_selected: None,
+            diff_preview: None,
+            changed_files: None,
             filter_input,
-            query: String::new(),
-            file_scroll: ScrollHandle::new(),
-            preview_scroll: ScrollHandle::new(),
-            diff_list_scroll: ScrollHandle::new(),
-            diff_scroll: ScrollHandle::new(),
+            file_scroll: UniformListScrollHandle::new(),
+            diff_list_scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -132,42 +320,50 @@ impl RightPanelState {
     }
 
     fn refresh(&mut self) {
-        self.entries.clear();
-        self.expanded_dirs.clear();
+        self.file_tree =
+            FileTree { query: std::mem::take(&mut self.file_tree.query), ..FileTree::default() };
         self.selected_file = None;
         self.preview = None;
-        self.diff_selected = None;
-        self.load_dir(&self.root.clone());
+        self.diff_preview = None;
+        self.changed_files = None;
+        self.diff_list_scroll.0.borrow().base_handle.set_offset(point(px(0.), px(0.)));
+        self.file_scroll.0.borrow().base_handle.set_offset(point(px(0.), px(0.)));
+        self.file_tree.load_dir(&self.root);
+        self.file_tree.rebuild(&self.root);
     }
 
-    fn load_dir(&mut self, dir: &Path) {
-        if self.entries.contains_key(dir) {
-            return;
-        }
-        let mut nodes: Vec<FileNode> = std::fs::read_dir(dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let kind = entry.file_type().ok()?;
-                let path = entry.path();
-                Some(FileNode {
-                    name: entry.file_name().to_string_lossy().into_owned().into(),
-                    directory: kind.is_dir(),
-                    path,
-                })
+    fn rebuild_file_rows(&mut self, rem_size: Pixels, collapsed: Option<&Path>) {
+        let scroll = self.file_scroll.0.borrow().base_handle.clone();
+        let row_height = FILE_ROW_H.to_pixels(rem_size);
+        let row_offset = (-scroll.offset().y / row_height).max(0.);
+        let anchor = if row_offset > 0. {
+            self.file_tree
+                .rows
+                .get(row_offset as usize)
+                .map(|&row| self.file_tree.node(row).path.clone())
+        } else {
+            None
+        };
+        self.file_tree.rebuild(&self.root);
+        let offset = anchor
+            .as_deref()
+            .and_then(|path| self.file_tree.position(path))
+            .map(|index| index as f32 + row_offset.fract())
+            .or_else(|| {
+                collapsed.and_then(|path| self.file_tree.position(path)).map(|index| index as f32)
             })
-            .collect();
-        nodes.sort_by_key(|node| (!node.directory, node.name.to_string().to_lowercase()));
-        self.entries.insert(dir.to_path_buf(), nodes);
+            .unwrap_or(0.);
+        scroll.set_offset(point(px(0.), -row_height * offset));
     }
 
-    fn toggle_entry(&mut self, path: PathBuf, directory: bool) {
+    fn toggle_entry(&mut self, path: PathBuf, directory: bool, rem_size: Pixels) {
         if directory {
-            self.load_dir(&path);
-            if !self.expanded_dirs.remove(&path) {
-                self.expanded_dirs.insert(path);
+            if self.file_tree.expanded.remove(&path) {
+                self.rebuild_file_rows(rem_size, Some(&path));
+            } else {
+                self.file_tree.load_dir(&path);
+                self.file_tree.expanded.insert(path);
+                self.rebuild_file_rows(rem_size, None);
             }
         } else {
             self.open_file(path);
@@ -176,24 +372,13 @@ impl RightPanelState {
 
     fn open_file(&mut self, path: PathBuf) {
         let preview = read_preview(&path);
-        self.preview_scroll.set_offset(point(px(0.), px(0.)));
         self.selected_file = Some(path);
         self.preview = Some(preview);
-    }
-
-    fn matches(&self, node: &FileNode) -> bool {
-        let query = self.query.trim().to_lowercase();
-        query.is_empty() || node.name.to_string().to_lowercase().contains(&query)
     }
 }
 
 fn read_preview(path: &Path) -> FilePreview {
-    let mut result = FilePreview {
-        path: path.to_path_buf(),
-        text: String::new(),
-        truncated: false,
-        error: None,
-    };
+    let mut result = FilePreview { path: path.to_path_buf(), ..FilePreview::default() };
     let read = (|| -> std::io::Result<()> {
         let file = std::fs::File::open(path)?;
         let mut bytes = Vec::new();
@@ -203,7 +388,9 @@ fn read_preview(path: &Path) -> FilePreview {
         if bytes.contains(&0) {
             result.error = Some("这是二进制文件，不能按文本预览".into());
         } else {
-            result.text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+            result.set_text(text);
         }
         Ok(())
     })();
@@ -257,11 +444,20 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(super) fn open_right_diff(&mut self, item: usize, cx: &mut Context<Self>) {
+    pub(super) fn open_right_diff(&mut self, location: DiffLocation, cx: &mut Context<Self>) {
+        let session = &self.sessions[self.active];
+        let selection = DiffSelection { location, epoch: session.diff_epoch };
+        if selection.resolve(session).is_none() {
+            return;
+        }
         self.settings_open = false;
-        self.right_panel.open = true;
-        self.right_panel.tab = RightTab::Changes;
-        self.right_panel.diff_selected = Some(item);
+        let panel = &mut self.right_panel;
+        panel.sync_session(session.token, &session.cwd);
+        panel.open = true;
+        panel.tab = RightTab::Changes;
+        if panel.diff_preview.as_ref().is_none_or(|preview| preview.selection != selection) {
+            panel.diff_preview = Some(DiffPreview::new(selection));
+        }
         cx.notify();
     }
 
@@ -312,15 +508,28 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
-        if !self.right_panel.open || self.settings_open || self.session().is_chat() {
+        let visible = self.right_panel_controls();
+        let showing_preview = visible
+            && self.right_panel.tab == RightTab::Files
+            && (self.panel_split() || self.right_panel.selected_file.is_some());
+        if !showing_preview && let Some(preview) = &mut self.right_panel.preview {
+            preview.release_list();
+        }
+        if !visible || self.right_panel.tab != RightTab::Changes {
+            self.right_panel.changed_files = None;
+            if let Some(preview) = &mut self.right_panel.diff_preview {
+                preview.release_list();
+            }
+        }
+        if !visible {
             return None;
         }
-        let (token, cwd) = (self.session().token, self.session().cwd.clone());
-        self.right_panel.sync_session(token, &cwd);
+        let session = &self.sessions[self.active];
+        self.right_panel.sync_session(session.token, &session.cwd);
         let expanded = self.right_panel.expanded;
         let body = match self.right_panel.tab {
-            RightTab::Files => self.render_file_workspace(cx),
-            RightTab::Changes => self.render_diff_workspace(cx),
+            RightTab::Files => self.render_file_workspace(window, cx),
+            RightTab::Changes => self.render_diff_workspace(window, cx),
         };
         let header = self.render_right_header(window, cx);
         Some(
@@ -421,10 +630,10 @@ impl ChatApp {
         self.right_panel.expanded || self.right_panel.width_rem() >= 36.
     }
 
-    fn render_file_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
-        let tree = self.render_file_tree(cx);
-        let preview = self.render_file_preview(cx);
+    fn render_file_workspace(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         if self.panel_split() {
+            let tree = self.render_file_tree(cx);
+            let preview = self.render_file_preview(window, cx);
             div()
                 .h_flex()
                 .flex_1()
@@ -441,9 +650,9 @@ impl ChatApp {
                 .child(div().flex_1().min_w_0().h_full().child(preview))
                 .into_any_element()
         } else if self.right_panel.selected_file.is_some() {
-            preview
+            self.render_file_preview(window, cx)
         } else {
-            tree.into_any_element()
+            self.render_file_tree(cx).into_any_element()
         }
     }
 
@@ -462,95 +671,85 @@ impl ChatApp {
                         .small(),
                 ),
         );
-        let mut rows = div().v_flex().p_1();
-        let root = self.right_panel.root.clone();
-        if let Some(nodes) = self.right_panel.entries.get(&root) {
-            rows = rows.children(self.render_tree_nodes(&root, nodes, 0, cx));
-        }
-        if self.right_panel.entries.get(&root).is_some_and(Vec::is_empty) {
-            rows = rows.child(panel_note("这个目录是空的"));
-        }
-        div().v_flex().h_full().min_h_0().child(search).child(
-            div()
-                .id("right-file-tree")
+        let panel = &self.right_panel;
+        let count = panel.file_tree.rows.len();
+        let body = div().v_flex().flex_1().min_h_0().p_1();
+        let body = if count == 0 {
+            body.when(panel.file_tree.is_empty_dir(&panel.root), |d| {
+                d.child(panel_note("这个目录是空的"))
+            })
+        } else {
+            let app = cx.entity();
+            body.child(
+                uniform_list("right-file-tree", count, move |range, _, cx| {
+                    app.update(cx, |app, cx| {
+                        app.right_panel.file_tree.rows[range]
+                            .iter()
+                            .map(|&row| app.render_file_row(row, cx))
+                            .collect()
+                    })
+                })
+                .track_scroll(&panel.file_scroll)
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.right_panel.file_scroll)
-                .child(rows),
-        )
+                .w_full(),
+            )
+        };
+        div().v_flex().h_full().min_h_0().child(search.flex_shrink_0()).child(body)
     }
 
-    fn render_tree_nodes(
-        &self,
-        parent: &Path,
-        nodes: &[FileNode],
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> Vec<Stateful<Div>> {
-        let mut out = Vec::new();
-        if depth > MAX_DEPTH {
-            return out;
-        }
-        for node in nodes.iter().filter(|node| self.right_panel.matches(node)) {
-            let expanded = self.right_panel.expanded_dirs.contains(&node.path);
-            let selected = self.right_panel.selected_file.as_ref() == Some(&node.path);
-            let path = node.path.clone();
-            let directory = node.directory;
-            let row = div()
-                .id(ElementId::Name(format!("right-node-{}", node.path.display()).into()))
-                .h_flex()
-                .items_center()
-                .gap_1()
-                .h(rems(1.75))
-                .pr_2()
-                .pl(rems(0.5 + depth as f32 * 0.875))
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(TEXT_SMALL)
-                .line_height(LEADING_UI)
-                .bg(if selected { rgb(SELECTED) } else { rgba(CLEAR) })
-                .when(!selected, |d| d.hover(|d| d.bg(rgb(HOVER))))
-                .child(
-                    Icon::new(if directory {
-                        if expanded { IconAll::ChevronDown } else { IconAll::ChevronRight }
-                    } else {
-                        IconAll::FileText
-                    })
-                    .size_3p5()
-                    .flex_shrink_0()
-                    .text_color(rgb(INK_SOFT)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_color(rgb(INK))
-                        .child(node.name.clone()),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.right_panel.toggle_entry(path.clone(), directory);
-                    cx.notify();
-                }));
-            out.push(row);
-            if directory && expanded {
-                let child_path = parent.join(node.name.as_ref());
-                if let Some(children) = self.right_panel.entries.get(&child_path) {
-                    out.extend(self.render_tree_nodes(&child_path, children, depth + 1, cx));
-                }
-            }
-        }
-        out
+    fn render_file_row(&self, row: FileRow, cx: &mut Context<Self>) -> Stateful<Div> {
+        let panel = &self.right_panel;
+        let node = panel.file_tree.node(row);
+        let expanded = node.directory && panel.file_tree.expanded.contains(&node.path);
+        let selected = panel.selected_file.as_ref() == Some(&node.path);
+        let path = node.path.clone();
+        let directory = node.directory;
+        div()
+            .id(ElementId::Name(format!("right-node-{}", node.path.display()).into()))
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .h(FILE_ROW_H)
+            .pr_2()
+            .pl(rems(0.5 + row.depth as f32 * 0.875))
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(TEXT_SMALL)
+            .line_height(LEADING_UI)
+            .bg(if selected { rgb(SELECTED) } else { rgba(CLEAR) })
+            .when(!selected, |d| d.hover(|d| d.bg(rgb(HOVER))))
+            .child(
+                Icon::new(if directory {
+                    if expanded { IconAll::ChevronDown } else { IconAll::ChevronRight }
+                } else {
+                    IconAll::FileText
+                })
+                .size_3p5()
+                .flex_shrink_0()
+                .text_color(rgb(INK_SOFT)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_color(rgb(INK))
+                    .child(node.name.clone()),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.right_panel.toggle_entry(path.clone(), directory, window.rem_size());
+                cx.notify();
+            }))
     }
 
-    fn render_file_preview(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(preview) = &self.right_panel.preview else {
+    fn render_file_preview(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let split = self.panel_split();
+        let Some(preview) = &mut self.right_panel.preview else {
             return panel_note("选择一个文件查看内容").into_any_element();
         };
-        let split = self.panel_split();
         let header = div()
             .h_flex()
             .items_center()
@@ -583,59 +782,69 @@ impl ChatApp {
                     .text_color(rgb(INK_SOFT))
                     .child(preview.path.display().to_string()),
             );
-        let body: AnyElement = if let Some(error) = &preview.error {
+        let body = if let Some(error) = &preview.error {
             panel_note(error).into_any_element()
         } else {
-            let mut lines = div().v_flex().py_2();
-            for (n, line) in preview.text.lines().enumerate() {
-                lines = lines.child(
-                    div()
-                        .h_flex()
-                        .items_start()
-                        .text_size(TEXT_SMALL)
-                        .font_family(MONO)
-                        .line_height(LEADING)
-                        .child(
-                            div()
-                                .w(px(44.))
-                                .flex_shrink_0()
-                                .pr_2()
-                                .text_right()
-                                .text_color(rgb(INK_FAINT))
-                                .child((n + 1).to_string()),
-                        )
-                        .child(div().flex_1().min_w_0().pr_3().text_color(rgb(INK)).child(
-                            if line.is_empty() { " ".to_string() } else { line.to_string() },
-                        )),
-                );
-            }
-            if preview.truncated {
-                lines = lines.child(panel_note("只显示前 256 KiB"));
-            }
-            div()
-                .id("right-file-preview")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.right_panel.preview_scroll)
-                .child(lines)
-                .into_any_element()
+            let rem = window.rem_size();
+            let font_size = TEXT_SMALL.to_pixels(rem);
+            let row_height = LEADING.to_pixels(font_size.into(), rem);
+            let digits = preview.line_starts.len().checked_ilog10().unwrap_or(0) + 1;
+            let gutter = px(44.).max(font_size * (0.6 * digits as f32) + rems(0.5).to_pixels(rem));
+            list(
+                preview.list(rem),
+                cx.processor(move |this, index, _, _| {
+                    let Some(preview) = &this.right_panel.preview else {
+                        return div().into_any_element();
+                    };
+                    if let Some(line) = preview.line(index) {
+                        preview_row(index, line, gutter)
+                            .when(index == 0, |row| row.pt_2())
+                            .when(
+                                !preview.truncated && index + 1 == preview.line_starts.len(),
+                                |row| row.pb_2(),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .w_full()
+                            .pb_2()
+                            .child(panel_note("只显示前 256 KiB"))
+                            .into_any_element()
+                    }
+                }),
+            )
+            .with_estimated_item_height(row_height)
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
         };
         div().v_flex().h_full().min_h_0().child(header).child(body).into_any_element()
     }
 
-    fn render_diff_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
-        let list = self.render_diff_list(cx);
-        let preview = self.render_diff_preview(cx);
-        if self.panel_split() {
+    fn render_diff_workspace(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let session = &self.sessions[self.active];
+        let panel = &mut self.right_panel;
+        if panel
+            .diff_preview
+            .as_ref()
+            .is_some_and(|preview| preview.selection.resolve(session).is_none())
+        {
+            panel.diff_preview = None;
+        }
+        let split = self.panel_split();
+        if split {
+            let list = self.render_diff_list(cx);
+            let preview = self.render_diff_preview(window, cx);
             div()
                 .h_flex()
                 .flex_1()
                 .min_h_0()
                 .child(
                     div()
+                        .v_flex()
                         .w(FILE_TREE_W)
                         .h_full()
+                        .min_h_0()
                         .flex_shrink_0()
                         .border_r_1()
                         .border_color(rgb(LINE))
@@ -643,76 +852,145 @@ impl ChatApp {
                 )
                 .child(div().flex_1().min_w_0().h_full().child(preview))
                 .into_any_element()
-        } else if self.right_panel.diff_selected.is_some() {
-            preview.into_any_element()
+        } else if self.right_panel.diff_preview.is_some() {
+            self.render_diff_preview(window, cx).into_any_element()
         } else {
-            list
+            self.render_diff_list(cx)
         }
     }
 
-    fn render_diff_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let files = turn_files(&self.session().transcript, 0);
-        if files.is_empty() {
+    fn render_diff_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let session = &self.sessions[self.active];
+        let panel = &mut self.right_panel;
+        ChangedFiles::sync(&mut panel.changed_files, session);
+        let count = panel.changed_files.as_ref().map_or(0, |files| files.rows.len());
+        if count == 0 {
             return panel_note("这个会话还没有文件改动").into_any_element();
         }
-        let cwd = self.session().cwd.clone();
-        let rows = files.into_iter().map(|file| {
-            let item = file.item;
-            let path = claudesktop_core::review::display_path(&file.path, Some(&cwd));
-            let selected = self.right_panel.diff_selected == Some(item);
-            div()
-                .id(("right-diff-file", item))
-                .h_flex()
-                .items_center()
-                .gap_2()
-                .h(rems(2.))
-                .px_3()
-                .cursor_pointer()
-                .bg(if selected { rgb(SELECTED) } else { rgba(CLEAR) })
-                .when(!selected, |d| d.hover(|d| d.bg(rgb(HOVER))))
-                .child(
-                    Icon::new(if file.created { IconAll::FilePlus } else { IconAll::FileText })
-                        .size_3p5()
-                        .text_color(rgb(INK_SOFT)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK))
-                        .child(path),
-                )
-                .child(diff_stat(file.added, file.removed))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.right_panel.diff_selected = Some(item);
-                    cx.notify();
-                }))
-        });
+        let app = cx.entity();
         div()
-            .id("right-diff-list")
+            .v_flex()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.right_panel.diff_list_scroll)
-            .child(div().v_flex().py_1().children(rows))
+            .py_1()
+            .child(
+                uniform_list("right-diff-list", count, move |range, _, cx| {
+                    app.update(cx, |app, cx| {
+                        let session = app.session();
+                        let panel = &app.right_panel;
+                        let selected = panel
+                            .diff_preview
+                            .as_ref()
+                            .and_then(|preview| preview.selection.resolve(session));
+                        let files = panel.changed_files.as_ref().unwrap();
+                        files.rows[range]
+                            .iter()
+                            .map(|file| {
+                                let selected =
+                                    selected.is_some_and(|diff| same_path(&diff.path, &file.path));
+                                app.render_diff_file(file, selected, cx)
+                            })
+                            .collect()
+                    })
+                })
+                .track_scroll(&panel.diff_list_scroll)
+                .flex_1()
+                .min_h_0()
+                .w_full(),
+            )
             .into_any_element()
     }
 
-    fn render_diff_preview(&self, cx: &mut Context<Self>) -> Div {
-        let Some(item) = self.right_panel.diff_selected else {
+    fn render_diff_file(
+        &self,
+        file: &TurnFile,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let session = self.session();
+        let origin = (session.token, session.diff_epoch);
+        let location = file.location;
+        let path = claudesktop_core::review::display_path(&file.path, Some(&session.cwd));
+        div()
+            .id(ElementId::Name(format!("right-diff-file-{}", file.path).into()))
+            .h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .h(rems(2.))
+            .px_3()
+            .cursor_pointer()
+            .bg(if selected { rgb(SELECTED) } else { rgba(CLEAR) })
+            .when(!selected, |d| d.hover(|d| d.bg(rgb(HOVER))))
+            .child(
+                Icon::new(if file.created { IconAll::FilePlus } else { IconAll::FileText })
+                    .size_3p5()
+                    .text_color(rgb(INK_SOFT)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK))
+                    .child(path),
+            )
+            .child(diff_stat(file.added, file.removed))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let session = this.session();
+                if (session.token, session.diff_epoch) == origin {
+                    this.open_right_diff(location, cx);
+                }
+            }))
+    }
+
+    fn render_diff_preview(&mut self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let split = self.panel_split();
+        let session = &self.sessions[self.active];
+        let Some(preview) = &mut self.right_panel.diff_preview else {
             return panel_note("选择一个文件查看 Diff");
         };
-        let session = self.session();
-        let Some((card, diff)) = find_diff(session, item) else {
-            return panel_note("这份 Diff 已不在当前会话里");
+        let selection = preview.selection;
+        let Some(diff) = selection.resolve(session) else {
+            return panel_note("选择一个文件查看 Diff");
         };
+        let count = diff.lines.len() + usize::from(diff.truncated);
+        let body = if count == 0 {
+            preview.release_list();
+            preview.scroll_top = ListOffset::default();
+            div().py_1().into_any_element()
+        } else {
+            let rem = window.rem_size();
+            let row_height = LEADING.to_pixels(TEXT_SMALL.to_pixels(rem).into(), rem);
+            let state = preview.list(count, session.diff_revision, rem);
+            let app = cx.entity();
+            let token = session.token;
+            list(state, move |index, _, cx| {
+                let session = app.read(cx).session();
+                if session.token == token
+                    && let Some(diff) = selection.resolve(session)
+                {
+                    if let Some(line) = diff.lines.get(index) {
+                        return diff_line(line).w_full().into_any_element();
+                    }
+                    if diff.truncated && index == diff.lines.len() {
+                        return diff_truncated().w_full().into_any_element();
+                    }
+                }
+                div().into_any_element()
+            })
+            .with_estimated_item_height(row_height)
+            .flex_1()
+            .min_h_0()
+            .py_1()
+            .into_any_element()
+        };
+        let card = Self::diff_card(diff, &session.cwd, None, body)
+            .when(count > 0, |card| card.flex_1().min_h_0());
         let path = diff.path.clone();
-        let cwd = session.cwd.clone();
-        let split = self.panel_split();
         let header = div()
             .h_flex()
             .items_center()
@@ -728,7 +1006,7 @@ impl ChatApp {
                         .small()
                         .tooltip("返回文件列表")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.right_panel.diff_selected = None;
+                            this.right_panel.diff_preview = None;
                             cx.notify();
                         })),
                 )
@@ -745,16 +1023,12 @@ impl ChatApp {
                     .text_color(rgb(INK_SOFT))
                     .child(path),
             );
-        let _ = card;
-        div().v_flex().h_full().min_h_0().child(header).child(
-            div()
-                .id("right-diff-preview")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&self.right_panel.diff_scroll)
-                .child(div().p_3().child(Self::render_diff(diff, &cwd, None, None, None))),
-        )
+        div()
+            .v_flex()
+            .h_full()
+            .min_h_0()
+            .child(header)
+            .child(div().id("right-diff-preview").v_flex().flex_1().min_h_0().p_3().child(card))
     }
     #[cfg(feature = "headless-screenshot")]
     pub(crate) fn debug_right_panel(&mut self, preview: &str, cx: &mut Context<Self>) {
@@ -762,30 +1036,17 @@ impl ChatApp {
         self.right_panel.sync_session(token, &cwd);
         match preview {
             "changes" => {
-                let item = self.session().transcript.len();
-                let diff = DiffView::compute(
+                use crate::demo::MockAction;
+                let session = &mut self.sessions[self.active];
+                let item = session.transcript.len();
+                session.apply_mock(&MockAction::BeginTool("Edit", "src/main.rs"));
+                session.apply_mock(&MockAction::Diff(
                     "src/main.rs",
-                    Some("fn main() {\n    println!(\"old\");\n}\n"),
+                    "fn main() {\n    println!(\"old\");\n}\n",
                     "fn main() {\n    println!(\"new\");\n    println!(\"ready\");\n}\n",
-                );
-                self.sessions[self.active].transcript.push(ChatItem::Tool(
-                    crate::model::ToolCard {
-                        id: None,
-                        kind: "edit".into(),
-                        name: "Edit".into(),
-                        arg: "src/main.rs".into(),
-                        result: "已更新".into(),
-                        output: SharedString::default(),
-                        content: SharedString::default(),
-                        phase: crate::model::ToolPhase::Done,
-                        diffs: vec![diff],
-                        expanded: false,
-                        task: false,
-                        grant: None,
-                        images: Vec::new(),
-                    },
                 ));
-                self.open_right_diff(item, cx);
+                session.apply_mock(&MockAction::ToolDone("已更新"));
+                self.open_right_diff(DiffLocation { item, diff: 0 }, cx);
             }
             "expanded" => {
                 let path = self.session().cwd.join("apps/desktop/src/main.rs");
@@ -808,12 +1069,29 @@ impl ChatApp {
     }
 }
 
-fn find_diff(session: &Session, item: usize) -> Option<(&crate::model::ToolCard, &DiffView)> {
-    let ChatItem::Tool(card) = session.transcript.get(item)? else {
-        return None;
-    };
-    let file: TurnFile = turn_files(&session.transcript, 0).into_iter().find(|f| f.item == item)?;
-    card.diffs.iter().find(|diff| same_path(&diff.path, &file.path)).map(|diff| (card, diff))
+fn preview_row(index: usize, line: &str, gutter: Pixels) -> Div {
+    div()
+        .w_full()
+        .h_flex()
+        .items_start()
+        .text_size(TEXT_SMALL)
+        .font_family(MONO)
+        .line_height(LEADING)
+        .child(
+            div()
+                .w(gutter)
+                .flex_shrink_0()
+                .pr_2()
+                .text_right()
+                .whitespace_nowrap()
+                .text_color(rgb(INK_FAINT))
+                .child((index + 1).to_string()),
+        )
+        .child(div().flex_1().min_w_0().pr_3().text_color(rgb(INK)).child(if line.is_empty() {
+            SharedString::from(" ")
+        } else {
+            line.to_string().into()
+        }))
 }
 
 fn panel_note(text: impl Into<SharedString>) -> Div {
@@ -829,6 +1107,147 @@ fn panel_note(text: impl Into<SharedString>) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::KernelChoice;
+    use claudesktop_core::KernelEvent;
+
+    #[core::prelude::v1::test]
+    fn changed_files_track_completed_diffs_and_reject_truncated_locations() {
+        let mut session = Session::new(1, KernelChoice::Builtin, PathBuf::from("project"));
+        let mut cache = None;
+        let start = |session: &mut Session, id: &str| {
+            session.apply_event(
+                KernelEvent::ToolCallStarted {
+                    id: id.into(),
+                    title: "Edit".into(),
+                    status: "in_progress".into(),
+                    kind: "edit".into(),
+                    parent: None,
+                },
+                None,
+            );
+        };
+        let update = |session: &mut Session, id: &str, status: &str| {
+            session.apply_event(
+                KernelEvent::ToolCallUpdated {
+                    id: id.into(),
+                    title: None,
+                    status: Some(status.into()),
+                    raw_output: None,
+                    output: None,
+                },
+                None,
+            );
+        };
+        let edit = |session: &mut Session, id: &str, path: &str, text: &str| {
+            session.apply_event(
+                KernelEvent::ToolCallDiff {
+                    id: id.into(),
+                    diff: DiffView::compute(path, Some("old\n"), text),
+                },
+                None,
+            );
+        };
+        ChangedFiles::sync(&mut cache, &session);
+        start(&mut session, "first");
+        edit(&mut session, "first", "src/a.rs", "alpha\n");
+        edit(&mut session, "first", "src/b.rs", "beta\n");
+        ChangedFiles::sync(&mut cache, &session);
+        assert!(cache.as_ref().unwrap().rows.is_empty());
+        update(&mut session, "first", "completed");
+        ChangedFiles::sync(&mut cache, &session);
+        let rows = &cache.as_ref().unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].location.item, rows[1].location.item);
+        let earlier = DiffSelection { location: rows[1].location, epoch: session.diff_epoch };
+        assert_eq!(earlier.resolve(&session).unwrap().path, "src/b.rs");
+
+        start(&mut session, "later");
+        update(&mut session, "later", "completed");
+        edit(&mut session, "later", "src\\B.rs", "latest\n");
+        ChangedFiles::sync(&mut cache, &session);
+        let rows = &cache.as_ref().unwrap().rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!((&*rows[1].path, rows[1].added, rows[1].removed), ("src/b.rs", 2, 2));
+        let latest = DiffSelection { location: rows[1].location, epoch: session.diff_epoch };
+        assert_eq!(latest.resolve(&session).unwrap().lines.last().unwrap().text, "latest");
+        assert_eq!(earlier.resolve(&session).unwrap().lines.last().unwrap().text, "beta");
+        update(&mut session, "later", "failed");
+        ChangedFiles::sync(&mut cache, &session);
+        assert_eq!(cache.as_ref().unwrap().rows[1].location, earlier.location);
+        assert!(latest.resolve(&session).is_none());
+
+        session.truncate_to(latest.location.item);
+        start(&mut session, "replacement");
+        update(&mut session, "replacement", "completed");
+        edit(&mut session, "replacement", "replacement.rs", "replacement\n");
+        ChangedFiles::sync(&mut cache, &session);
+        let rows = &cache.as_ref().unwrap().rows;
+        assert_eq!(rows[2].location, latest.location);
+        assert_eq!(rows[2].path, "replacement.rs");
+        assert!(latest.resolve(&session).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn diff_preview_preserves_scroll_across_list_invalidation() {
+        let selection = DiffSelection { location: DiffLocation { item: 1, diff: 0 }, epoch: 0 };
+        let mut preview = DiffPreview::new(selection);
+        let list = preview.list(400, 1, px(16.));
+        list.scroll_to(ListOffset { item_ix: 230, offset_in_item: px(60.) });
+
+        let refreshed = preview.list(400, 2, px(16.));
+        assert_eq!(refreshed.logical_scroll_top().item_ix, 230);
+        assert_eq!(refreshed.logical_scroll_top().offset_in_item, px(60.));
+        preview.release_list();
+        assert!(preview.list.is_none());
+
+        let reopened = preview.list(400, 2, px(16.));
+        assert_eq!(reopened.logical_scroll_top().item_ix, 230);
+        assert_eq!(reopened.logical_scroll_top().offset_in_item, px(60.));
+        let shortened = preview.list(16, 3, px(16.));
+        assert_eq!(shortened.item_count(), 16);
+        assert_eq!(shortened.logical_scroll_top().item_ix, 16);
+        assert_eq!(shortened.logical_scroll_top().offset_in_item, px(0.));
+    }
+
+    #[core::prelude::v1::test]
+    fn file_tree_rows_follow_expansion_and_filter() {
+        let root = PathBuf::from("project");
+        let branch = root.join("Sources");
+        let file = branch.join("Sources.rs");
+        let node = |path: &Path, directory| FileNode {
+            name: path.file_name().unwrap().to_string_lossy().into_owned().into(),
+            path: path.to_path_buf(),
+            directory,
+        };
+        let mut tree = FileTree {
+            directory_ids: HashMap::from([(root.clone(), 0), (branch.clone(), 1)]),
+            directories: vec![
+                vec![node(&branch, true), node(&root.join("alpha.txt"), false)],
+                vec![node(&file, false)],
+            ],
+            ..FileTree::default()
+        };
+        tree.rebuild(&root);
+        assert_eq!(tree.rows.len(), 2);
+        assert_eq!(tree.position(&file), None);
+        tree.expanded.insert(branch.clone());
+        tree.rebuild(&root);
+        assert_eq!(tree.position(&file), Some(1));
+        assert_eq!(tree.rows[1].depth, 1);
+        tree.query = "sources".into();
+        tree.rebuild(&root);
+        assert_eq!(tree.rows.len(), 2);
+        tree.query = "sources.rs".into();
+        tree.rebuild(&root);
+        assert!(tree.rows.is_empty());
+        tree.query.clear();
+        tree.rebuild(&root);
+        assert_eq!(tree.rows.len(), 3);
+        tree.expanded.remove(&branch);
+        tree.rebuild(&root);
+        assert_eq!(tree.rows.len(), 2);
+        assert_eq!(tree.directories.len(), 2);
+    }
 
     #[core::prelude::v1::test]
     fn file_preview_reads_text_and_rejects_binary() {
@@ -837,12 +1256,32 @@ mod tests {
         let text = dir.join("sample.rs");
         std::fs::write(&text, "fn main() {}\n").unwrap();
         let preview = read_preview(&text);
-        assert_eq!(preview.text, "fn main() {}\n");
+        assert_eq!(preview.line(0), Some("fn main() {}"));
+        assert_eq!(preview.line(1), None);
         assert!(preview.error.is_none());
         assert!(!preview.truncated);
         let binary = dir.join("sample.bin");
         std::fs::write(&binary, [1, 0, 2]).unwrap();
         assert!(read_preview(&binary).error.is_some());
+        assert!(read_preview(&dir.join("missing.txt")).error.is_some());
+        let mut bytes = vec![b'x'; PREVIEW_LIMIT - 2];
+        bytes.extend_from_slice("🙂\n".as_bytes());
+        std::fs::write(&text, bytes).unwrap();
+        let preview = read_preview(&text);
+        assert!(preview.truncated);
+        assert!(preview.line(0).unwrap().ends_with('\u{fffd}'));
+        assert_eq!(preview.line(1), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[core::prelude::v1::test]
+    fn file_preview_line_index_matches_str_lines() {
+        let mut preview = FilePreview::default();
+        for text in ["", "\n", "\n\n", "\r", "\r\n", "甲\r\n\r\n🙂\n乙\r", "a\rb\n"] {
+            preview.set_text(text.into());
+            let lines: Vec<_> =
+                (0..preview.line_starts.len()).map(|i| preview.line(i).unwrap()).collect();
+            assert!(lines.into_iter().eq(text.lines()), "{text:?}");
+        }
     }
 }

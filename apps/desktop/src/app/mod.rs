@@ -1618,6 +1618,8 @@ impl ChatApp {
                         let Some(meta) = app.sessions[idx].meta.clone() else { return };
                         let reveal = app.sessions[idx].pending_reveal_turn;
                         let mut loaded = Session::from_records(token, meta, records, &app.settings);
+                        loaded.diff_revision = app.sessions[idx].diff_revision + 1;
+                        loaded.diff_epoch = app.sessions[idx].diff_epoch + 1;
                         loaded.pending_reveal_turn = reveal;
                         loaded.queued = std::mem::take(&mut app.sessions[idx].queued);
                         loaded.compact_queued = app.sessions[idx].compact_queued;
