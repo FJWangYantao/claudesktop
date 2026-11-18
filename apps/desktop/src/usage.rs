@@ -7,7 +7,7 @@ use claudesktop_core::{Record, SessionMeta, SessionStore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 /// 窗口用到这个比例，自研内核就会在下次请求前自动压缩（和内核同一个数，见
 /// [`claudesktop_builtin::AUTO_COMPACT_PERCENT`]）。
@@ -110,6 +110,7 @@ pub fn build_index(store: &SessionStore, metas: &[SessionMeta]) -> Vec<TurnStat>
         .filter(|cache| cache.version == 1)
         .unwrap_or_default();
     let mut all = Vec::new();
+    let mut line = Vec::new();
     for meta in metas {
         let path = store.log_path(&meta.id);
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -123,21 +124,23 @@ pub fn build_index(store: &SessionStore, metas: &[SessionMeta]) -> Vec<TurnStat>
             let read = (|| -> std::io::Result<()> {
                 let mut file = File::open(&path)?;
                 file.seek(SeekFrom::Start(entry.offset))?;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                let mut consumed = 0usize;
-                for line in bytes.split_inclusive(|b| *b == b'\n') {
+                let mut reader = BufReader::new(file.take(len - entry.offset));
+                loop {
+                    line.clear();
+                    let consumed = reader.read_until(b'\n', &mut line)?;
                     if !line.ends_with(b"\n") {
                         break;
                     }
-                    consumed += line.len();
-                    if let Ok(line) = std::str::from_utf8(line)
+                    entry.offset += consumed as u64;
+                    if line.starts_with(b"{\"t\":\"event\",") {
+                        continue;
+                    }
+                    if let Ok(line) = std::str::from_utf8(&line)
                         && let Ok(record) = serde_json::from_str::<Record>(line)
                     {
                         entry.apply(meta, &record);
                     }
                 }
-                entry.offset += consumed as u64;
                 Ok(())
             })();
             if let Err(err) = read {
@@ -707,6 +710,49 @@ mod tests {
         assert_eq!(complete[1].at_ms, 20);
         drop(log);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[core::prelude::v1::test]
+    fn index_resumes_partial_lines_and_rebuilds_truncated_logs() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "claudesktop-usage-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let store = SessionStore::open(root.join("sessions")).unwrap();
+        let (meta, log) =
+            store.create("测试", std::path::PathBuf::from("."), "builtin:http://x/v1#m").unwrap();
+        drop(log);
+        let path = store.log_path(&meta.id);
+        let metas = store.list();
+        let records = [user(), turn(10, Some("模型"), 5)];
+        let event = Record::Event {
+            event: claudesktop_core::KernelEvent::AgentMessageChunk { text: "x".repeat(64 * 1024) },
+        };
+        let mut prefix = serde_json::to_vec(&event).unwrap();
+        prefix.extend_from_slice(b"\n{\"t\":\"user\",\"text\":\"\xff\"}\n");
+        let mut complete = serde_json::to_vec(&records[0]).unwrap();
+        complete.push(b'\n');
+        prefix.extend_from_slice(&complete);
+        let turn = serde_json::to_vec(&records[1]).unwrap();
+        let split = turn.iter().position(|b| *b >= 128).unwrap() + 1;
+        prefix.extend_from_slice(&turn[..split]);
+        std::fs::write(&path, &prefix).unwrap();
+        assert_eq!(build_index(&store, &metas), collect(&meta, &records[..1]));
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&turn[split..]).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        assert_eq!(build_index(&store, &metas), collect(&meta, &records));
+
+        std::fs::write(&path, &complete).unwrap();
+        assert_eq!(build_index(&store, &metas), collect(&meta, &records[..1]));
+        store.delete(&meta.id).unwrap();
+        assert!(build_index(&store, &store.list()).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[core::prelude::v1::test]

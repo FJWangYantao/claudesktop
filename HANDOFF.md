@@ -130,6 +130,28 @@
   保留 `ab-01` 的早期窗口尺寸失败。启动稳定后重新读客户区和 DPI，`--resume=ab-01` 复用完成的配对，补跑最后三组完整配对。隐藏窗口需要立即刷新关闭按钮的命中区时发 `WM_GPUI_FORCE_UPDATE_WINDOW`。空响应的禁用观感用离屏图核对，普通版 UI Automation 的 `IsEnabled` 断言在该路径不一致。
   fmt、all-targets release Clippy 和普通 release 构建通过。工作区测试首次在既有的资源缓存并行断言失败，完整重跑 667 通过 / 13 忽略。普通 exe 位于本节 `release-02/claudesktop.exe`，探针与源码哈希见 `candidate-01/build.json`。
   复跑 `node .claudesktop/bench/raw-request/run.mjs <新目录> candidate-01 ab tiny 1m 12m 32m 12m-empty 12m-cut`，再用同目录 `verify-candidate.mjs <新目录> candidate-01` 复核。
+- **请求原文峰值分段（`75f9af1`）**：`raw-request/stages-02/stages.json` 记录 32 MiB 多行、Base64 单行各三次真实窗口打开。
+  两组的解压缓冲容量都到 64 MiB，解压阶段峰值增量中位为 97.26 / 97.28 MiB，JSON 解析后为 101.54 / 97.28 MiB，排版后为 158.30 / 193.49 MiB；行索引容量均为 1.5 MiB。峰值来自 Windows `PeakPagefileUsage`。
+  分段打点同时标记请求和返回的索引分配。128 KiB SSE 有 4163 行，也走大正文列表；`stages-01` 首次校验漏算它的两个标记，修正序列后重测。
+- **请求原文复用解压缓冲**：同一解析器成功后清空解压缓冲，由 `to_writer_pretty` 写回，释放 `Value` 后收紧缓冲容量。无效 JSON 仍退回原始文本。
+  `.claudesktop/bench/raw-request/peak-ab-01/peak-verification.json` 有五组各三对，30 个隐藏进程和 150 次绘制校验。12 MiB、32 MiB 多行、32 MiB 单行的打开峰值增量中位为 62.84 → 33.76、158.28 → 101.53、193.51 → 97.26 MiB，两种 32 MiB 样本每对均降。
+  32 MiB 多行 / 单行后台加载中位为 75.13 → 65.82 / 67.90 → 60.24ms，首次绘制工作为 15.99 → 25.59 / 12.49 → 11.78ms。定时绘制的多行点击到首屏为 254.33 → 322.69ms，其中等待绘制的中位为 158.67 → 230.15ms。各阶段中位不能相加推导总中位。
+  `peak-prompt-01/prompt-verification.json` 在后台加载完成后立即驱动隐藏窗口绘制，两种样本各三对，峰值依然逐对下降。点击到首屏中位为 104.91 → 107.11 / 99.47 → 103.29ms，最慢一对多行增加 19.97ms。以 `ab --against=candidate-01 --prompt-paint 32m 32m-line` 复跑。
+  `peak-edge-01` 真实窗口查找到单行末尾（字节 33554463..33554487）并验证切页位置，复制和导出各 33554548 字节，SHA256 与完整排版一致。诊断版把剪贴板写到夹具目录，未启动外部编辑器。`peak-normal-01` 用普通 exe 验证小正文和两种 32 MiB 正文的窗口操作。
+  fmt、全工作区 release Clippy（-D warnings）、普通 release 构建和 668 项测试通过（13 项忽略）。原始记录和普通 exe 在 `peak-release-01/`，SHA256 `9a78f54947bc603292270e2e3f8fb301451d6a515387056c2fa216183dcd9c84`。
+  复跑 `node .claudesktop/bench/raw-request/run.mjs <新目录> peak-probe-01 ab --against=candidate-01 tiny 1m 12m 32m 32m-line`，再用同目录 `verify-peak.mjs <新目录> candidate-01 peak-probe-01` 复核。
+- **大原文缓冲容量与解析峰值**：以 `peak-probe-01` 的缓冲复用版作基线。`capacity-baseline-stages-01` 的两种 32 MiB 输入仍把解压容量撑到 64 MiB。
+  gzip 尾部大小只作有界预留提示，解压器继续检查内容和校验值。仅改预留的 `capacity-ab-02` 单行峰值降 32.9%，多行降 11.7%。多行剩余峰值来自同时持有原文和完整解析树。
+  逐项预算内使用借用的数组元素，逐项解析并写入有界排版缓冲。形状、嵌套或输出超预算时回退完整解析。`capacity-ab-03` 多行峰值降 34.5%，首屏中位却慢 27.37ms，其中一对慢 53.58ms。保留该批，后续只遍历一次 `messages` / `input` / `tools` 数组。
+  `capacity-aa-01` 用同一 exe 校准首屏，最坏配对绝对差 70.68ms。分段时延帮助定位，最终验收仍看首屏配对门槛。
+  `capacity-ab-05/capacity-verification.json` 含五组各三对，均通过绘制和字节数核对。32 MiB 多行和单行的打开峰值增量中位为 101.50 → 66.55、97.27 → 65.24 MiB。首屏中位差 +9.93 / -4.60ms，多行一对 +36.83ms 超过 +20ms 门槛。16 KiB / 1 MiB / 12 MiB 的后台加载和首绘中位差均在 +10ms 内。
+  `--wake-on-load` 仅在测试驱动把等待后台完成的轮询改为 2ms。`capacity-aa-02` 校准通过，但 `capacity-ab-06` 多行一对 +71.09ms，后台、绘制和等待分别多 37.86 / 23.03 / 10.21ms。保留未达标记录。
+  `--pin-bench-cpus` 仅给测试 PID 固定性能核，应用逻辑 4–11，驱动 0–1，每个采样读回核对。`capacity-aa-03` 最大绝对首屏差 6.91ms。相同条件的 `capacity-ab-07/capacity-verification.json` 六对全部达标：两种 32 MiB 输入的峰值增量中位 101.45 → 66.52、97.23 → 65.27 MiB，首屏中位分别多 9.27 / 1.40ms，最慢配对多 15.85ms。
+  在同一机器用 `node .claudesktop/bench/raw-request/run.mjs <新目录> capacity-probe-05 ab --against=peak-probe-01 --prompt-paint --wake-on-load --pin-bench-cpus 32m 32m-line` 复跑，接着运行同目录 `verify-capacity.mjs <新目录>`。
+  `capacity-normal-05` 验证普通版打开、切页、关闭、重开。`capacity-edge-05` 验证两种大原文文末查找、切页锚点和全文复制 / 导出哈希。`capacity-race-05` 验证加载中关闭与快速切页。
+  普通 release、fmt、全工作区 release Clippy 和 672 项测试通过，13 项忽略。普通 exe 位于 `capacity-release-05/claudesktop.exe`，SHA256 `d4afa6938c57b68fbe1010ce3cd4db04356debad138c4ef2828ed3faceb8612a`。
+- **用量索引按行补扫**：`.claudesktop/bench/usage-stream-01/final-ab-01/summary.json` 用 12 个普通隐藏进程验证约 48 MiB 的首次扫描、再追加约 12 MiB 后重启。每对缓存偏移、轮次和用量统计一致。
+  首次索引的私有内存峰值中位 206.54 → 158.30 MiB，索引 42.51 → 21.54ms。追加后重启为 169.74 → 159.16 MiB、12.34 → 6.33ms。进程读取量基本持平，追加仅补读新字节。首次扫描的启动首帧中位 291.40 → 325.17ms，未观察到首帧加快。
 
 - **连接中的自研会话回收显示数据不能整对象换占位**：`from_records` 会清内核绑定，也丢工具图片和本轮文本附件。
   新路径在 `session/cache.rs` 只搬 `transcript` / `subagents`，以原子临时快照保存；保留同一个 `Session`、模式、队列和界面状态。

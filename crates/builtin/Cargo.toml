@@ -9,7 +9,7 @@ description = "In-process agent kernel: OpenAI-compatible provider, streaming, t
 claudesktop-core = { path = "../core" }
 anyhow = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 ureq = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ignore = "0.4"

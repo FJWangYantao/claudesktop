@@ -343,7 +343,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   每个请求记一行 `gateway/<日期>.jsonl`（按内核会话 + 第几轮归组，首页「请求」页签读它，见 `requests.rs`；费用按设置里的单价表估算，见 `pricing.rs`，分峰谷价的模型在单价行尾写 `x2`，峰时段用 `@peak` 行按本地时间或指定时区判定）。新的请求出口（新 provider、新接口）也要走 `route`，内核里新的请求用途用 `gateway::tag` 标上。
   ACP agent 可选经网关：起进程时设 base URL（`gateway::agent_env`，端点编码在 `/via/` 路径里），轮次靠 `gateway::note_turn`。
   请求体和响应原文另存（`request_bodies.rs`，日志行 `body` 指过去），在用量「请求明细」的行尾点「原文」（`app/raw_request.rs`）。
-  请求与返回分开读，返回首次切入才加载；小正文用只读 `Editor`，大正文在后台建字节索引，分块后用变高列表按视口排版。
+  请求与返回分开读，返回首次切入才加载。请求按 gzip 尾部的有界大小提示预留缓冲。大请求可按顶层数组逐项排版，复杂形状走整包解析并复用解压缓冲。
+  小正文用只读 `Editor`，大正文在后台建字节索引，分块后用变高列表按视口排版。
   分块不改原文，查找按完整正文的字节位置跳转，复制与导出取全文；切页释放列表测量状态并保留位置。
   请求统计走 `gateway/request_stats.rs`，只保留所需字段、不展开整包 `Value`；跳过正文时仍校验完整 JSON，保留重复键和字段类型容错。
   Windows 本地网关的已接受连接在 `gateway/socket.rs` 设 1 MiB 接收缓冲，减轻大请求的发送阻塞；设置失败退回系统默认，不能算零内存成本（系统 TCP 缓冲上限每连接比本机默认多约 960 KiB）。
@@ -377,8 +378,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   压缩时内核把当前清单附在摘要后面（`tools::summary_with_todos`），不靠总结的模型抄。
 - **历史与用量按需读取**：启动时 `Session::placeholder` 只给最近 100 个会话建元信息占位，首屏不读 jsonl；
   激活后 `ChatApp::ensure_history_loaded` 后台重放，读取期间发送进现有队列，磁盘搜索跳转等加载完成再定位。
-  `has_user_message` 对未加载占位也为真，别把占位误删成空会话。用量由 `usage::build_index` 在首帧后读
-  `usage-cache.json` 并按日志字节偏移补扫追加行；删除会话要换代，迟到的索引结果不能覆盖新轮次。
+  `has_user_message` 对未加载占位也为真，别把占位误删成空会话。用量由 `usage::build_index` 在后台读
+  `usage-cache.json`，复用行缓冲按偏移补扫，末尾半行留待下次；当前格式的 `event` 行按标签跳过。删除会话要换代，迟到的索引结果不能覆盖新轮次。
 - **ACP 工具内容与文件委托**：`content` 和 `rawOutput` 是两条通道，分别落到 `ToolCallContent` 和
   `ToolCallUpdated`，不能让后到的原始输出覆盖资源文本；图片走 `ToolCallImages` + 资源表，Diff 走
   `ToolCallDiff` 并持久化。带 Diff 的工具卡也要画结构化内容和图片，图片数量进行高指纹。

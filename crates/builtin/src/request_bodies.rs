@@ -10,11 +10,13 @@
 //! 每次请求都带着整段历史，体积涨得快：gzip 压缩，比请求日志留得短（[`KEEP_DAYS`] 天 / [`KEEP_BYTES`]）。
 //! 设置里可以关掉（[`set_enabled`]），关了只是不再存，已经存的照样能看。
 
+mod large_json;
+
 use chrono::NaiveDate;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use std::io::{Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -25,6 +27,9 @@ pub(crate) const RESPONSE_MAX: usize = 2 << 20;
 /// 原文留多少天 / 最多多大
 const KEEP_DAYS: i64 = 7;
 const KEEP_BYTES: u64 = 500 << 20;
+const MIN_REQUEST_SIZE_HINT: usize = 128 << 10;
+const MAX_REQUEST_SIZE_HINT: usize = 64 << 20;
+const REQUEST_HEADROOM_DIVISOR: usize = 32;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 /// 同一毫秒里的几个请求靠它分开
@@ -99,14 +104,36 @@ impl Source {
     }
 
     pub fn request(&self) -> Result<Request, String> {
-        let bytes = read_gz(&with_suffix(&self.0, ".req.json.gz"))
-            .map_err(|_| "原文已经清理掉了（只留最近 7 天）".to_string())?;
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-            && let Ok(text) = serde_json::to_string_pretty(&value)
-        {
+        let path = with_suffix(&self.0, ".req.json.gz");
+        let read =
+            || read_request_gz(&path).map_err(|_| "原文已经清理掉了（只留最近 7 天）".to_string());
+        let mut bytes = read()?;
+        if let Some(text) = large_json::format(&bytes) {
             return Ok(Request { text, formatted: true });
         }
-        Ok(Request { text: decode_text(bytes), formatted: false })
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(Request { text: decode_text(bytes), formatted: false });
+        };
+        bytes.clear();
+        let mut overflow = Vec::new();
+        let writer = PrettyBuffer { bytes: &mut bytes, overflow: &mut overflow };
+        let formatted = serde_json::to_writer_pretty(writer, &value).is_ok();
+        drop(value);
+        if !formatted {
+            drop((bytes, overflow));
+            return Ok(Request { text: decode_text(read()?), formatted: false });
+        }
+        if !overflow.is_empty() {
+            bytes.reserve_exact(overflow.len());
+            bytes.append(&mut overflow);
+            drop(overflow);
+        }
+        if bytes.len() < MIN_REQUEST_SIZE_HINT
+            || bytes.capacity() - bytes.len() > bytes.len() / REQUEST_HEADROOM_DIVISOR
+        {
+            bytes.shrink_to_fit();
+        }
+        Ok(Request { text: decode_text(bytes), formatted: true })
     }
 
     pub fn response(&self) -> Response {
@@ -205,10 +232,54 @@ fn write_gz(path: &Path, data: &[u8]) -> std::io::Result<()> {
     encoder.finish().map(drop)
 }
 
-fn read_gz(path: &Path) -> std::io::Result<Vec<u8>> {
+fn read_gz(path: &Path) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     GzDecoder::new(std::fs::File::open(path)?).read_to_end(&mut out)?;
     Ok(out)
+}
+
+fn read_request_gz(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut footer = [0; 4];
+    let size_hint = file
+        .seek(SeekFrom::End(-4))
+        .and_then(|_| file.read_exact(&mut footer))
+        .ok()
+        .map(|()| u32::from_le_bytes(footer) as usize)
+        .filter(|size| (MIN_REQUEST_SIZE_HINT..=MAX_REQUEST_SIZE_HINT).contains(size));
+    file.rewind()?;
+    let mut decoder = GzDecoder::new(file);
+    let mut bytes = Vec::new();
+    if let Some(size_hint) = size_hint {
+        let mut prefix = [0; 8192];
+        let count = decoder.read(&mut prefix)?;
+        if count == prefix.len() {
+            bytes.reserve_exact(size_hint + size_hint / REQUEST_HEADROOM_DIVISOR);
+        }
+        bytes.extend_from_slice(&prefix[..count]);
+    }
+    decoder.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+struct PrettyBuffer<'a> {
+    bytes: &'a mut Vec<u8>,
+    overflow: &'a mut Vec<u8>,
+}
+
+impl Write for PrettyBuffer<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let take = buf.len().min(self.bytes.capacity() - self.bytes.len());
+        self.bytes.extend_from_slice(&buf[..take]);
+        if take != buf.len() {
+            self.overflow.extend_from_slice(&buf[take..]);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +305,71 @@ mod tests {
         let response = source.response();
         assert!(response.truncated);
         assert_eq!(response.text.as_bytes(), vec![b'a'; RESPONSE_MAX]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn request_format_matches_value_pretty_print() {
+        let dir = std::env::temp_dir().join(format!("cd-bodies-format-{}", std::process::id()));
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let cases: &[(&[u8], bool)] = &[
+            (
+                r#"{"z":1,"a":{"界":"\uD83D\uDE00","\u754c":"😀","q":"\t\u0000\n"},"z":3,"n":[true,null,1e-4]}"#
+                    .as_bytes(),
+                true,
+            ),
+            (b" \r\n true \n", true),
+            (b"[1] trailing", false),
+            (b"1e9999", false),
+            (br#""\uD800""#, false),
+        ];
+        for &(input, formatted) in cases {
+            let id = save(&dir, date, 1, input, b"").unwrap();
+            let request = Source::new(&dir, &id).unwrap().request().unwrap();
+            assert_eq!(request.formatted, formatted);
+            let expected = if formatted {
+                let value: serde_json::Value = serde_json::from_slice(input).unwrap();
+                serde_json::to_string_pretty(&value).unwrap()
+            } else {
+                String::from_utf8_lossy(input).into_owned()
+            };
+            assert_eq!(request.text, expected);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn request_size_hint_keeps_padding_and_validates_gzip() {
+        let dir = std::env::temp_dir().join(format!("cd-bodies-size-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("body.gz");
+        let input = vec![b'a'; 1 << 20];
+        write_gz(&path, &input).unwrap();
+        let bytes = read_request_gz(&path).unwrap();
+        assert_eq!(bytes, input);
+        assert!(bytes.capacity() < input.len() + input.len() / 16);
+
+        let mut encoded = std::fs::read(&path).unwrap();
+        let footer = encoded.len() - 4;
+        encoded[footer..].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, encoded).unwrap();
+        assert!(read_request_gz(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn request_pretty_print_can_exceed_buffer_padding() {
+        let dir = std::env::temp_dir().join(format!("cd-bodies-overflow-{}", std::process::id()));
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let input = format!("[{}0]", "0,".repeat(MIN_REQUEST_SIZE_HINT / 2));
+        let id = save(&dir, date, 1, input.as_bytes(), b"").unwrap();
+        let source = Source::new(&dir, &id).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let expected = serde_json::to_string_pretty(&value).unwrap();
+        assert!(expected.len() > 2 * input.len());
+        let request = source.request().unwrap();
+        assert!(request.formatted);
+        assert_eq!(request.text, expected);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
