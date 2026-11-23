@@ -33,6 +33,10 @@ on:
         description: 构建并上传 Windows release 桌面端 exe（供无本地 SDK 时实机验收）
         type: boolean
         default: false
+      headless_screenshot:
+        description: 启用 headless-screenshot 特性（供无头截图 / window_probe 验收）
+        type: boolean
+        default: false
 
 # 同一分支的新提交取消上一次未跑完的任务
 concurrency:
@@ -96,7 +100,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: 构建桌面端 release
-        run: cargo build --release -p claudesktop --locked
+        env:
+          RUSTFLAGS: ""
+        shell: pwsh
+        run: |
+          if ("${{ inputs.headless_screenshot }}" -eq "true") {
+            cargo build --release -p claudesktop --locked --features headless-screenshot
+          } else {
+            cargo build --release -p claudesktop --locked
+          }
 
       - name: 上传 exe 产物
         uses: actions/upload-artifact@v4
