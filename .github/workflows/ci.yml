@@ -29,10 +29,14 @@ on:
         type: choice
         options: [reference, calibrated]
         default: reference
+      build_desktop:
+        description: 构建并上传 Windows release 桌面端 exe（供无本地 SDK 时实机验收）
+        type: boolean
+        default: false
 
 # 同一分支的新提交取消上一次未跑完的任务
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -42,7 +46,7 @@ env:
 
 jobs:
   check:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.gateway_asset_id == '' }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.gateway_asset_id == '' && !inputs.build_desktop) }}
     name: fmt + clippy + test
     # GPUI 依赖 Windows / macOS 的原生层，Linux 需要额外的 X11/Wayland 依赖，先用 Windows
     runs-on: windows-latest
@@ -76,3 +80,27 @@ jobs:
       scope: ${{ inputs.gateway_scope }}
       comparison_set: ${{ inputs.gateway_set }}
       condition: ${{ inputs.gateway_condition }}
+
+  build-desktop:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_desktop }}
+    name: Windows release exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建桌面端 release
+        run: cargo build --release -p claudesktop --locked
+
+      - name: 上传 exe 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudesktop-windows-x64
+          path: target/release/claudesktop.exe
+          retention-days: 7
