@@ -292,43 +292,30 @@ const STREAM_FLUSH_MAX: std::time::Duration = std::time::Duration::from_millis(2
 const STREAM_FLUSH_RAMP: usize = 8 * 1024;
 const STREAM_FLUSH_LONG: usize = 64 * 1024;
 
-/// 滚轮一格从起手到走完的时长（`F` 曲线在它之后恒为 1）
-const WHEEL_GLIDE: Duration = Duration::from_millis(112);
-/// 曲线两端各用这么久加减速，中间匀速
-const WHEEL_RAMP: Duration = Duration::from_millis(16);
+/// 对话平滑滚动的时间常数（指数阻尼缓出：单格约 230ms 柔停，快起长缓出、连滚无缝衔接）
+const WHEEL_TAU: f32 = 0.068;
 /// 一帧最多走的像素：卡顿帧（进了高行要排版）不许一步跨出去，宁可多滑几帧
 const WHEEL_STEP_MAX: Pixels = px(48.);
-/// 曲线已经到期、欠量还剩下不到这么多时就算走完（限速截断后的零头不值得再排一帧）。
-/// **曲线还在走的时候绝不能套用**：前几毫秒的增量本来就远小于它，清零会把这段位移永久丢掉。
-const WHEEL_SETTLE: f32 = 0.5;
-/// 曲线全到期后余量一直走不出去（列表还没量出那段，或正好在边界）最多再等这么久；
+/// 剩不到这么多像素时当前帧顺手走完，不留亚像素尾巴多排一帧（也不丢位移）
+const WHEEL_SETTLE: Pixels = px(0.5);
+/// 余量一直走不出去（列表还没量出那段，或正好在边界）最多再等这么久；
 /// 超过就丢掉，不会一直排帧。
 const WHEEL_HOLD: Duration = Duration::from_millis(400);
-/// 两帧之间隔了这么久说明列表压根没在画（去了设置页 / 最小化）：这期间的曲线全部作废，
+/// 两帧之间隔了这么久说明列表压根没在画（去了设置页 / 最小化）：这期间的余量全部作废，
 /// 回来时不能把几秒前的滚轮一次性补上。
 const WHEEL_STALE: Duration = Duration::from_millis(500);
 
-/// 一次离散滚轮输入：什么时候到的、带符号多少像素（正值向下）。
-#[derive(Clone, Copy, Debug)]
-struct WheelEvent {
-    at: Instant,
-    delta: Pixels,
-}
-
-/// 对话的滚轮平滑状态：每次离散输入排成一条 `WHEEL_GLIDE` 长的加减速曲线，
-/// 每帧按曲线从「上次采样」到「现在」的增量累进 `due`，再从欠量里取一步交给列表。
+/// 对话的滚轮平滑状态：只存用户还要滚多少像素（`remaining`），每帧按真实帧间隔走
+/// $1 - e^{-\Delta t / \tau}$ 的比例。
 ///
-/// 和旧写法（记住滚动条的绝对目标、每帧用读数逼近）的区别在于这里**只存用户还要走多少**：
+/// 和旧写法（记住滚动条的绝对目标、每帧用读数逼近）的区别在于这里**完全不依赖滚动条读数**：
 /// 上方行补量会抬高滚动条读数，但欠量只由输入和已走的距离决定，补量不会凭空造出位移；
-/// 连滚几格也不会因为「先走一半再拿当前位置和目标比」丢掉上一格的余量。
-/// 同向输入追加，各自沿曲线继续；反向输入清空旧方向的事件和欠量，从这次输入重新起步。
+/// 同向连滚直接累加剩余位移、速度无缝衔接；反向输入清空旧余量，从新方向重新起步。
 #[derive(Clone, Debug, Default)]
 pub struct WheelInput {
-    /// 还没走完的输入（到期就清掉）
-    events: Vec<WheelEvent>,
-    /// 曲线已经到期、但受 `WHEEL_STEP_MAX` 限速还没走完的像素
-    due: Pixels,
-    /// 上一次采样的时刻（曲线的积分起点）
+    /// 用户还要滚多少像素（正 = 向下，负 = 向上）
+    remaining: Pixels,
+    /// 上一次采样（或新串起步）的时刻
     last: Option<Instant>,
     /// 还欠着却一步都走不出去是从什么时候开始的（超过 `WHEEL_HOLD` 就认定到边界）
     stalled_at: Option<Instant>,
@@ -341,7 +328,7 @@ impl WheelInput {
         w
     }
 
-    /// 追加一次输入。方向和已有的一致就排队，反了就整条重来（不带旧余量）。
+    /// 追加一次输入。方向和已有的一致就累进剩余位移，反了（或已走完 / 隔太久）就整条重来。
     pub fn push(&mut self, now: Instant, delta: Pixels) {
         if delta == px(0.) {
             return;
@@ -351,78 +338,61 @@ impl WheelInput {
         // 免得 `advance` 的过期判定把刚推入的这一格也一起清掉
         let stale =
             self.last.is_some_and(|last| now.saturating_duration_since(last) >= WHEEL_STALE);
-        // 上一串已经走干净：这条重新起曲线，从此刻积分（不然新输入会拿旧的采样时刻，
-        // 第一帧一步跨出整段）
-        let fresh = self.events.is_empty() && self.due == px(0.);
-        let old_down = self.events.last().map_or(self.due > px(0.), |e| e.delta > px(0.));
+        let fresh = self.remaining == px(0.);
+        let old_down = self.remaining > px(0.);
         if fresh || stale || old_down != down {
-            // 新的一串 / 换了方向 / 隔了太久：旧方向的事件和欠量都作废
-            self.events.clear();
-            self.due = px(0.);
+            // 新的一串 / 换了方向 / 隔了太久：旧方向的余量作废，从此刻起算
+            self.remaining = delta;
             self.last = Some(now);
+        } else {
+            // 同向连滚：保留上一次采样时刻继续积分，当前帧直接平滑衔接新速度
+            self.remaining += delta;
         }
         // 新的输入重新给足等待窗口：卡顿期同向再滚一格不该沿用旧的计时
         self.stalled_at = None;
-        self.events.push(WheelEvent { at: now, delta });
     }
 
-    /// 推进到 `now`：把这段区间里每条曲线的增量并进欠量、清掉到期的事件，
-    /// 返回这一帧该走的距离（已按 `WHEEL_STEP_MAX` 限速，正 = 向下）。
+    /// 推进到 `now`：按这段间隔的指数衰减比例取出这一帧该走的距离（已按 `WHEEL_STEP_MAX` 限速）。
     /// 采样时间和当前时间都从外面传，测试可以注入固定时刻。
     ///
-    /// 两帧间隔太久（去了设置页、窗口最小化）时整串作废：曲线是「手指还在动」的模拟，
-    /// 隔了几秒回来再补上就是凭空滚一大截。
+    /// 两帧间隔太久（去了设置页、窗口最小化）时作废：隔了几秒回来不能把之前的滚轮补上。
     pub fn advance(&mut self, now: Instant) -> Pixels {
         let last = self.last.replace(now).unwrap_or(now);
-        if now.saturating_duration_since(last) >= WHEEL_STALE {
-            self.events.clear();
-            self.due = px(0.);
-            self.stalled_at = None;
+        let elapsed = now.saturating_duration_since(last);
+        if elapsed >= WHEEL_STALE {
+            self.clear();
             return px(0.);
         }
-        if last != now {
-            for e in &self.events {
-                let progressed = curve(now.saturating_duration_since(e.at))
-                    - curve(last.saturating_duration_since(e.at));
-                self.due += e.delta * progressed;
-            }
+        if self.remaining == px(0.) || elapsed.is_zero() {
+            return px(0.);
         }
-        self.events.retain(|e| now.saturating_duration_since(e.at) < WHEEL_GLIDE);
-        // 注意：这里**不能**按 WHEEL_SETTLE 清零。曲线起步的前几毫秒增量远小于半像素
-        // （60px 一格在 5ms 内不到 0.5px），高刷 / 紧邻重绘时每帧都被清掉就整格丢失。
-        self.due.clamp(-WHEEL_STEP_MAX, WHEEL_STEP_MAX)
+        let raw = self.remaining * (1. - (-elapsed.as_secs_f32() / WHEEL_TAU).exp());
+        // 走完这一步剩不到半像素时顺手带完，既不丢亚像素位移，也不为尾巴多排一帧
+        let step = if (self.remaining - raw).abs() < WHEEL_SETTLE { self.remaining } else { raw };
+        step.clamp(-WHEEL_STEP_MAX, WHEEL_STEP_MAX)
     }
 
     /// 记账：实际走了 `applied`（边界裁剪之后）。一步都没走成时开始计「卡住」的时长，
     /// 走成了就清零。
     pub fn consume(&mut self, applied: Pixels, now: Instant) {
-        self.due -= applied;
+        self.remaining -= applied;
         if applied != px(0.) {
             self.stalled_at = None;
-            // 曲线已到期时，限速截断留下的零头顺手收掉，不为半像素再排一帧
-            if self.events.is_empty() && self.due.abs() < px(WHEEL_SETTLE) {
-                self.due = px(0.);
-            }
-        } else if self.due != px(0.) {
+        } else if self.remaining != px(0.) {
             self.stalled_at.get_or_insert(now);
         }
     }
 
     /// 全部作废（切页、定位、列表重置、太长时间没画）。
     pub fn clear(&mut self) {
-        self.events.clear();
-        self.due = px(0.);
+        self.remaining = px(0.);
         self.stalled_at = None;
     }
 
-    /// 这个方向已经到头：朝这个方向的事件和欠量作废，别每帧空转。
+    /// 这个方向已经到头：朝这个方向的余量作废，别每帧空转。
     pub fn block(&mut self, down: bool) {
-        self.events.retain(|e| (e.delta > px(0.)) != down);
-        if self.due != px(0.) && (self.due > px(0.)) == down {
-            self.due = px(0.);
-        }
-        if self.due == px(0.) {
-            self.stalled_at = None;
+        if self.remaining != px(0.) && (self.remaining > px(0.)) == down {
+            self.clear();
         }
     }
 
@@ -431,38 +401,20 @@ impl WheelInput {
         self.stalled_at.is_some_and(|at| now.saturating_duration_since(at) >= WHEEL_HOLD)
     }
 
-    /// 曲线全到期、欠量也走完了：不再排帧。
+    /// 欠量走完了（或卡住超时）：不再排帧。
     pub fn is_done(&self, now: Instant) -> bool {
-        self.events.is_empty() && (self.due == px(0.) || self.expired(now))
+        self.remaining == px(0.) || self.expired(now)
     }
 
     /// 还有多少欠量（只在测试里看）。
     #[cfg(test)]
-    pub fn due(&self) -> Pixels {
-        self.due
+    pub fn remaining(&self) -> Pixels {
+        self.remaining
     }
 
-    /// 这一串在往哪个方向走（`Some(true)` 向下），还没起步时是 `None`。
+    /// 这一串在往哪个方向走（`Some(true)` 向下），走完了是 `None`。
     pub fn direction(&self) -> Option<bool> {
-        self.events
-            .last()
-            .map(|e| e.delta > px(0.))
-            .or_else(|| (self.due != px(0.)).then_some(self.due > px(0.)))
-    }
-}
-
-/// 滚轮速度曲线归一化到 0…1：前 [`WHEEL_RAMP`] 二次加速、中间匀速、最后 [`WHEEL_RAMP`] 二次减速。
-/// 面积正好是 1，所以一条输入走完的位移就是它自己的像素数。
-fn curve(t: Duration) -> f32 {
-    let d = WHEEL_GLIDE.as_secs_f32();
-    let r = WHEEL_RAMP.as_secs_f32();
-    let t = t.as_secs_f32().clamp(0., d);
-    if t < r {
-        t * t / (2. * r * (d - r))
-    } else if t <= d - r {
-        (t - r / 2.) / (d - r)
-    } else {
-        1. - (d - t) * (d - t) / (2. * r * (d - r))
+        (self.remaining != px(0.)).then_some(self.remaining > px(0.))
     }
 }
 
@@ -2706,123 +2658,105 @@ mod tests {
             .collect()
     }
 
-    /// 曲线归一化：从 0 单调爬到 1，匀速段的中点正好是 0.5，一条输入走完的位移就是它自己的像素数。
+    /// 单格 84px 在 1/60s 帧下：首帧快起（约 18.3px），随后逐帧单调衰减滑停，总位移精确守恒。
     #[core::prelude::v1::test]
-    fn wheel_curve_climbs_to_one() {
-        assert_eq!(curve(Duration::ZERO), 0.);
-        assert!((curve(WHEEL_GLIDE / 2) - 0.5).abs() < 1e-5, "中点 {}", curve(WHEEL_GLIDE / 2));
-        assert_eq!(curve(WHEEL_GLIDE), 1.);
-        assert_eq!(curve(WHEEL_GLIDE + Duration::from_millis(50)), 1.);
-        // 单调不减
-        let mut prev = 0.;
-        for i in 0..=112 {
-            let f = curve(Duration::from_millis(i));
-            assert!(f >= prev - 1e-6, "{i}ms 回退");
-            prev = f;
-        }
-    }
-
-    /// 单格 60px 在 16ms 帧下分成七帧：起步 5、匀速 10×5 帧、收尾 5。
-    #[core::prelude::v1::test]
-    fn wheel_single_notch_steps_at_60hz() {
+    fn wheel_single_notch_eases_out_at_60hz() {
         let start = Instant::now();
-        let mut w = WheelInput::new(start, px(60.));
-        let steps = run_wheel(&mut w, start, Duration::from_millis(16), 8);
-        let rounded: Vec<i32> = steps.iter().map(|s| s.round() as i32).collect();
-        assert_eq!(&rounded[..7], &[5, 10, 10, 10, 10, 10, 5]);
-        assert_eq!(steps.iter().sum::<f32>().round() as i32, 60);
+        let mut w = WheelInput::new(start, px(84.));
+        let steps = run_wheel(&mut w, start, Duration::from_secs_f32(1. / 60.), 30);
+        // 84 * (1 - exp(-(1/60) / 0.068)) ≈ 18.26
+        assert!((steps[0] - 18.26).abs() < 0.2, "首帧 {:?}", steps[0]);
+        assert!(steps[0] > steps[1] && steps[1] > steps[2] && steps[2] > steps[3]);
         assert!(steps.iter().all(|s| *s >= 0.), "全程同向");
-        assert!(w.is_done(start + Duration::from_millis(200)));
+        assert!((steps.iter().sum::<f32>() - 84.).abs() < 0.05);
+        assert!(w.is_done(start + Duration::from_millis(500)));
     }
 
-    /// 1/60 秒一帧时匀速段只有四帧，第 6 帧（100ms）已经进减速段。
-    #[core::prelude::v1::test]
-    fn wheel_single_notch_at_exact_60hz_tick() {
-        let start = Instant::now();
-        let mut w = WheelInput::new(start, px(60.));
-        let tick = Duration::from_secs_f32(1. / 60.);
-        let steps = run_wheel(&mut w, start, tick, 8);
-        assert!((steps[0] - 5.42).abs() < 0.05, "首帧 {:?}", steps[0]);
-        for (i, s) in steps.iter().enumerate().take(5).skip(1) {
-            assert!((*s - 10.42).abs() < 0.05, "第 {i} 帧 {s:?}");
-        }
-        assert!((steps[5] - 10.10).abs() < 0.05, "减速首帧 {:?}", steps[5]);
-        assert!((steps[6] - 2.81).abs() < 0.05, "末帧 {:?}", steps[6]);
-        assert!((steps.iter().sum::<f32>() - 60.).abs() < 0.01);
-    }
-
-    /// 60 / 120 / 144 / 240 Hz 下，单格和同向四格的总位移都是输入本身的像素数。
-    /// 高刷时单帧增量远小于半像素（240Hz 起步帧只有 0.34px），不能按「太小」清掉。
+    /// 60 / 120 / 144 / 240 Hz 下，单格（84）和正反四格（±336）的总位移都严格等于输入。
     #[core::prelude::v1::test]
     fn wheel_distance_matches_input_at_any_refresh_rate() {
         for hz in [60u32, 120, 144, 240] {
             let frame = Duration::from_secs_f32(1. / hz as f32);
+            let frames = (hz as usize).max(30);
             let start = Instant::now();
-            let mut one = WheelInput::new(start, px(60.));
-            let total: f32 =
-                run_wheel(&mut one, start, frame, (hz as usize / 3).max(8)).iter().sum();
-            assert!((total - 60.).abs() <= 0.5, "{hz}Hz 单格走了 {total}");
+            let mut one = WheelInput::new(start, px(84.));
+            let total: f32 = run_wheel(&mut one, start, frame, frames).iter().sum();
+            assert!((total - 84.).abs() <= 0.1, "{hz}Hz 单格走了 {total}");
 
-            let mut four = WheelInput::new(start, px(60.));
+            let mut four = WheelInput::new(start, px(84.));
             for _ in 0..3 {
-                four.push(start, px(60.));
+                four.push(start, px(84.));
             }
-            let steps = run_wheel(&mut four, start, frame, (hz as usize / 3).max(8));
+            let steps = run_wheel(&mut four, start, frame, frames);
             let total: f32 = steps.iter().sum();
-            assert!((total - 240.).abs() <= 1., "{hz}Hz 四格走了 {total}");
+            assert!((total - 336.).abs() <= 0.1, "{hz}Hz 四格走了 {total}");
             assert!(steps.iter().all(|s| *s >= 0.), "{hz}Hz 出现反向帧");
+
+            let mut up = WheelInput::new(start, px(-84.));
+            for _ in 0..3 {
+                up.push(start, px(-84.));
+            }
+            let steps = run_wheel(&mut up, start, frame, frames);
+            let total: f32 = steps.iter().sum();
+            assert!((total + 336.).abs() <= 0.1, "{hz}Hz 上滚四格走了 {total}");
+            assert!(steps.iter().all(|s| *s <= 0.), "{hz}Hz 上滚出现反向帧");
         }
     }
 
-    /// 极小步长（高分辨率滚轮 / 低缩放）：每帧增量都不到半像素，也必须完整走完。
+    /// 极小步长（10px）：高刷每帧增量也很小，照样完整走完不丢位移。
     #[core::prelude::v1::test]
     fn wheel_tiny_step_survives_sub_pixel_frames() {
         for hz in [60u32, 240] {
             let frame = Duration::from_secs_f32(1. / hz as f32);
             let start = Instant::now();
             let mut w = WheelInput::new(start, px(10.));
-            let total: f32 = run_wheel(&mut w, start, frame, (hz as usize / 3).max(8)).iter().sum();
-            assert!((total - 10.).abs() <= 0.2, "{hz}Hz 10px 只走了 {total}");
+            let total: f32 = run_wheel(&mut w, start, frame, (hz as usize).max(30)).iter().sum();
+            assert!((total - 10.).abs() <= 0.05, "{hz}Hz 10px 只走了 {total}");
         }
     }
 
-    /// 紧邻首帧（1ms、4ms）：曲线刚起步，不能因为增量小就把这一段丢掉。
+    /// 紧邻首帧（1ms、2ms、4ms）：快起指数模型 1ms 即可跨出 1.2px（不被 1px 尾随阈值拽回），总量守恒。
     #[core::prelude::v1::test]
     fn wheel_adjacent_first_frames_keep_their_share() {
         for dt in [1u64, 2, 4] {
             let start = Instant::now();
-            let mut w = WheelInput::new(start, px(60.));
+            let mut w = WheelInput::new(start, px(84.));
             let mut total = px(0.);
-            // 前几帧都很短，之后按 16ms 走完
-            let mut at = start;
-            for _ in 0..4 {
+            let mut at = start + Duration::from_millis(dt);
+            let first = w.advance(at);
+            w.consume(first, at);
+            total += first;
+            if dt == 1 {
+                assert!(first > px(1.), "1ms 首帧应大于 1px 防被尾随拉回：{first:?}");
+            }
+            for _ in 0..3 {
                 at += Duration::from_millis(dt);
                 let step = w.advance(at);
                 w.consume(step, at);
                 total += step;
             }
-            for _ in 0..12 {
+            for _ in 0..30 {
                 at += Duration::from_millis(16);
                 let step = w.advance(at);
                 w.consume(step, at);
                 total += step;
             }
-            assert!((total.as_f32() - 60.).abs() <= 0.5, "dt={dt}ms 总计 {total:?}");
+            assert!((total.as_f32() - 84.).abs() <= 0.1, "dt={dt}ms 总计 {total:?}");
         }
     }
 
-    /// 同向错峰输入（0 / 20 / 50ms 各一格）各自沿曲线走完，总计仍是 180。
+    /// 同向错峰输入（0 / 20 / 50ms 各一格 84px）直接累进余量，总计仍是 252。
     #[core::prelude::v1::test]
     fn wheel_staggered_same_direction_inputs_add_up() {
         let start = Instant::now();
-        let mut w = WheelInput::new(start, px(60.));
+        let mut w = WheelInput::new(start, px(84.));
         let marks = [Duration::ZERO, Duration::from_millis(20), Duration::from_millis(50)];
         let mut pushed = 1;
         let mut total = px(0.);
-        for i in 1..=14 {
+        for i in 1..=35 {
             let at = start + Duration::from_millis(16) * i;
             while pushed < marks.len() && start + marks[pushed] <= at {
-                w.push(start + marks[pushed], px(60.));
+                w.push(start + marks[pushed], px(84.));
                 pushed += 1;
             }
             let step = w.advance(at);
@@ -2831,10 +2765,10 @@ mod tests {
             assert!(step >= px(0.), "出现反向帧：{step:?}");
         }
         assert_eq!(pushed, marks.len());
-        assert!((total.as_f32() - 180.).abs() <= 1.5, "总计 {total:?}");
+        assert!((total.as_f32() - 252.).abs() <= 0.1, "总计 {total:?}");
     }
 
-    /// 长帧（100ms 空档）：单帧不超过 48px，剩下的下一帧走完。
+    /// 长帧（100ms 空档）：单帧不超过 48px，剩下的随后平顺走完。
     #[core::prelude::v1::test]
     fn wheel_long_frame_is_capped_and_finished_next() {
         let start = Instant::now();
@@ -2842,19 +2776,16 @@ mod tests {
         let first = w.advance(start + Duration::from_millis(100));
         assert!(first <= px(48.), "单帧 {first:?} 超过上限");
         w.consume(first, start + Duration::from_millis(100));
-        let rest = w.advance(start + Duration::from_millis(116));
-        assert!(rest <= px(48.));
-        // 曲线已到期，欠量继续走
-        let mut total = first + rest;
-        let mut at = start + Duration::from_millis(116);
-        w.consume(rest, at);
-        for _ in 0..40 {
+        let mut total = first;
+        let mut at = start + Duration::from_millis(100);
+        for _ in 0..50 {
             at += Duration::from_millis(16);
             let step = w.advance(at);
+            assert!(step <= px(48.), "限速帧超上限 {step:?}");
             w.consume(step, at);
             total += step;
         }
-        assert!((total.as_f32() - 600.).abs() <= 1., "总计 {total:?}");
+        assert!((total.as_f32() - 600.).abs() <= 0.1, "总计 {total:?}");
         assert!(w.is_done(at));
     }
 
@@ -2865,51 +2796,51 @@ mod tests {
         let mut w = WheelInput::new(start, px(240.));
         let later = start + WHEEL_STALE;
         assert_eq!(w.advance(later), px(0.));
-        assert_eq!(w.due(), px(0.));
+        assert_eq!(w.remaining(), px(0.));
         assert!(w.is_done(later));
         // 之后的输入照常走
-        w.push(later, px(60.));
-        let total: f32 = run_wheel(&mut w, later, Duration::from_millis(16), 8).iter().sum();
-        assert!((total - 60.).abs() <= 0.5, "恢复后的输入只走了 {total}");
+        w.push(later, px(84.));
+        let total: f32 = run_wheel(&mut w, later, Duration::from_millis(16), 30).iter().sum();
+        assert!((total - 84.).abs() <= 0.1, "恢复后的输入只走了 {total}");
     }
 
-    /// 同向输入各自沿曲线继续，反向输入清空旧方向和欠量。
+    /// 同向输入累进余量，反向输入清空旧方向余量。
     #[core::prelude::v1::test]
     fn wheel_reverse_clears_pending_distance() {
         let start = Instant::now();
-        let mut w = WheelInput::new(start, px(60.));
+        let mut w = WheelInput::new(start, px(84.));
         let s1 = w.advance(start + Duration::from_millis(16));
         w.consume(s1, start + Duration::from_millis(16));
         // 还没走完就往回滚一格
-        w.push(start + Duration::from_millis(16), px(-60.));
-        assert_eq!(w.due(), px(0.), "反向时旧欠量应当清空");
+        w.push(start + Duration::from_millis(16), px(-84.));
+        assert_eq!(w.remaining(), px(-84.), "反向时旧欠量应当清空并重置为新输入");
         let back = w.advance(start + Duration::from_millis(32));
-        assert!(back <= px(0.), "换向后第一帧就朝新方向：{back:?}");
+        assert!(back < px(0.), "换向后第一帧就朝新方向：{back:?}");
         w.consume(back, start + Duration::from_millis(32));
-        // 走完这一格的总位移正好是 -60（不带上一格剩下的）
+        // 走完这一格的总位移正好是 -84（不带上一格剩下的）
         let mut total = back;
         let mut at = start + Duration::from_millis(32);
-        for _ in 0..12 {
+        for _ in 0..30 {
             at += Duration::from_millis(16);
             let step = w.advance(at);
             w.consume(step, at);
             total += step;
         }
-        assert!((total.as_f32() + 60.).abs() < 1., "换向后总位移 {total:?}");
+        assert!((total.as_f32() + 84.).abs() <= 0.1, "换向后总位移 {total:?}");
     }
 
     /// 到边界：朝外的欠量作废，不再排帧；一直走不出去时在 WHEEL_HOLD 之后丢掉。
     #[core::prelude::v1::test]
     fn wheel_stops_at_boundary_or_after_hold() {
         let start = Instant::now();
-        let mut w = WheelInput::new(start, px(-60.));
+        let mut w = WheelInput::new(start, px(-84.));
         let at = start + Duration::from_millis(16);
         let step = w.advance(at);
         // 顶部：一步也没走（`apply_relative` 返回 0，于是判到头），朝这个方向的余量作废
         assert!(step < px(0.));
         w.consume(px(0.), at);
         w.block(step > px(0.));
-        assert_eq!(w.due(), px(0.));
+        assert_eq!(w.remaining(), px(0.));
         let mut now = at;
         for _ in 0..30 {
             now += Duration::from_millis(16);
@@ -2942,7 +2873,7 @@ mod tests {
             w.consume(px(0.), now);
         }
         assert!(!w.expired(now));
-        w.push(now, px(60.));
+        w.push(now, px(84.));
         // 刚推入时不该已经过期
         assert!(!w.expired(now));
         assert!(!w.expired(now + WHEEL_HOLD / 2));
@@ -2955,9 +2886,9 @@ mod tests {
         let mut w = WheelInput::new(start, px(240.));
         // 期间一帧都没画（去了设置页 / 最小化），回来时同向再推一格
         let back = start + Duration::from_secs(3);
-        w.push(back, px(60.));
-        let total: f32 = run_wheel(&mut w, back, Duration::from_millis(16), 8).iter().sum();
-        assert!((total - 60.).abs() <= 0.5, "恢复后的这一格走了 {total}");
+        w.push(back, px(84.));
+        let total: f32 = run_wheel(&mut w, back, Duration::from_millis(16), 30).iter().sum();
+        assert!((total - 84.).abs() <= 0.1, "恢复后的这一格走了 {total}");
     }
 
     /// 渐隐跟着滚动位置收放：滚不动时两条都不画（不然最后一行会被底下那条盖住一截）。

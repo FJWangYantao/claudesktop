@@ -167,9 +167,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     （`RowLayout::member`）统一处理。悬停才出现的操作用 `hover_opacity`；刚出现的内容用 `entering`。
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
   - 对话列表的滚轮在 `content.rs` 的 capture 阶段截住，走 `ChatApp::wheel_by` / `step_wheel`
-    （gpui `List` 自己一格硬跳 60px）。平滑状态是 `session.rs` 的 `WheelInput`：**只存「用户还要滚多少」**
-    （每次离散输入一条 112ms 加减速曲线的剩余量），不存滚动条的绝对目标——绝对目标会被上方补量的行高
-    改变含义（见 HANDOFF）。同向追加、反向清空，一帧最多 48px，到边界把朝外的余量作废。
+    （gpui `List` 自己一格硬跳）。平滑状态是 `session.rs` 的 `WheelInput`：**只存「用户还要滚多少」**
+    （离散输入每格 `84px`，按 `τ=68ms` 相对指数阻尼缓出，剩不到半像素时顺手带完不丢位移），
+    不存滚动条的绝对目标——绝对目标会被上方补量的行高改变含义（见 HANDOFF）。同向累加、反向清空，
+    一帧最多 48px，到边界把朝外的余量作废。
     设置页外层和模型清单另走 `settings_wheel_by` / `step_settings_wheel`（指数逼近的 `WheelScroll`），
     按指针位置和边界选择内层或外层，切分类 / 来源要清掉对应的 `*_wheel`。新的程序化滚动（跳转、跟随底部）
     也要清掉对应滚动状态，否则两边抢。

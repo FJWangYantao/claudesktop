@@ -320,11 +320,11 @@ impl ChatApp {
         let clear = Rgba { a: 0., ..paper };
         let (fade_top, fade_bottom) = self.sessions[active].scroll_edge().heights();
         let rem = window.rem_size();
-        // 滚轮平滑：capture 阶段截住滚轮记成目标（见 `ChatApp::wheel_by`），列表自己在 bubble 阶段
-        // 一格硬跳 60px 的处理就不跑了。只有横向（Shift+滚轮）时放行。
+        // 滚轮平滑：capture 阶段截住滚轮累计相对位移（见 `ChatApp::wheel_by`），列表自己在 bubble 阶段
+        // 一格硬跳的处理就不跑了。只有横向（Shift+滚轮）时放行。
         // 命中区不挡悬停；弹层、对话框盖在上面时 `should_handle_scroll` 为 false，不抢它们的滚轮
         let app = cx.entity().downgrade();
-        let line = rems(1.25).to_pixels(window.rem_size());
+        let line = rems(1.75).to_pixels(window.rem_size());
         let wheel = canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
             move |_, hitbox, window, _| {

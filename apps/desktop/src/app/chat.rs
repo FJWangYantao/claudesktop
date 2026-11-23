@@ -248,7 +248,7 @@ pub(super) fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
 /// 回复 / 思考共用的 Markdown 样式。
 pub(super) fn markdown_style() -> TextViewStyle {
     TextViewStyle::default()
-        .paragraph_gap(rems(0.875))
+        .paragraph_gap(rems(1.25))
         // 标题接口只收 Pixels，所以按当前缩放换算一次
         // 正文 15px：一级 24 / 二级 20 / 三级 17，四级起和正文同大、只靠加粗分（相邻两档拉开 3px 以上，
         // 长回复扫一眼能看出分节）。标题上方的段间距由组件按标题字号算，字号拉开留白也跟着变大
@@ -520,7 +520,7 @@ impl ChatApp {
             // 字号 / 颜色要设在 TextView 自己身上（它按主题取默认值，不继承外层）
             let body = div().pt_1().pl(STEP_INDENT).child(
                 TextView::markdown(("think-md", idx), text)
-                    .style(markdown_style().paragraph_gap(rems(0.5)))
+                    .style(markdown_style().paragraph_gap(rems(0.75)))
                     .markdown_extensions(crate::app::math::extensions())
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
@@ -1794,8 +1794,8 @@ impl ChatApp {
         window.request_animation_frame();
     }
 
-    /// 滚轮往末尾滚了 `delta`（正 = 往下，负 = 往上）：每一次离散输入排成一条
-    /// [`WheelInput`] 曲线，由 [`Self::step_wheel`] 每帧从曲线里取增量交给列表。
+    /// 滚轮往末尾滚了 `delta`（正 = 往下，负 = 往上）：把离散输入累计到
+    /// [`WheelInput`] 的相对余量里，由 [`Self::step_wheel`] 每帧按 `68ms` 指数阻尼缓出交给列表。
     /// 只记「用户还要滚多少」，不再记滚动条的绝对目标——上方行补量抬高读数时不会
     /// 凭空多走一段（见 HANDOFF 里「绝对像素目标在补量行高后失效」）。
     /// 触控板的精确位移本来就连续，和「减少动态效果」时一样直接滚到位。
@@ -1815,7 +1815,7 @@ impl ChatApp {
         } else {
             match &mut s.wheel {
                 Some(w) => w.push(now, delta),
-                // 曲线从这里起算，位移从二次加速段一点点放出来（起步慢、中间匀速）
+                // 新的一串从此刻起算，首帧即按经过的帧时间比例快速起步并柔缓滑停
                 None => s.wheel = Some(WheelInput::new(now, delta)),
             }
         }
@@ -1824,8 +1824,8 @@ impl ChatApp {
     }
 
     /// 滚轮平滑的一帧（`render_content` 里 `sync_list` 之后调，定位先完成再推进当帧滚轮）：
-    /// 从曲线里取这一段该走的距离，按当前布局裁掉越界部分，剩下的欠量下一帧继续。
-    /// 只要还有事件或欠量，每帧只追加一次动画请求。
+    /// 按帧间隔从剩余位移里按指数衰减取出这一步，按当前布局裁掉越界部分，剩下的下一帧继续。
+    /// 只要还有余量，每帧只追加一次动画请求。
     pub(super) fn step_wheel(&mut self, window: &mut Window) {
         let now = Instant::now();
         let s = &mut self.sessions[self.active];
@@ -1837,7 +1837,7 @@ impl ChatApp {
             return;
         }
         // 还在往上走就每帧再压一次跟随：列表在「离底不到 1px」时会自动重新跟随，
-        // 而曲线起步那几毫秒的位移还不到 1px，流式追加会把视口拽回底部
+        // 若紧邻重绘或小步长导致首帧位移不到 1px，流式追加会把视口拽回底部
         if w.direction().is_some_and(|down| !down) {
             s.list.pause_following_tail();
         }
@@ -2127,10 +2127,12 @@ impl ChatApp {
                 };
                 let copied_at = self.copied_at;
                 let app = cx.entity().downgrade();
-                let body = div().min_w_0().text_size(TEXT_BODY).line_height(LEADING).child(
+                let body = div().min_w_0().child(
                     TextView::markdown(("agent", idx), text)
                         .style(markdown_style())
                         .markdown_extensions(crate::app::math::extensions())
+                        .text_size(TEXT_BODY)
+                        .line_height(LEADING)
                         .stream_fade(true)
                         .code_block_actions(move |block, window, cx| {
                             let start = block.span.map(|span| span.start).unwrap_or(0);

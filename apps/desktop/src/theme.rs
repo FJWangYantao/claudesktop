@@ -677,8 +677,8 @@ pub const TEXT_DISPLAY: Rems = rems(1.375);
 /// 页面大标题（24px，Kimi `--ui-t0` 上限）
 pub const TEXT_TITLE: Rems = rems(1.5);
 
-/// 界面多行文字与 Markdown 正文行高（Kimi `14px × 1.625`）
-pub const LEADING: DefiniteLength = relative(1.625);
+/// 界面多行文字与 Markdown 正文行高（`14px × 1.48 ≈ 20.7px`）
+pub const LEADING: DefiniteLength = relative(1.48);
 /// 紧凑单行控件与菜单行高
 pub const LEADING_UI: DefiniteLength = relative(1.4);
 
