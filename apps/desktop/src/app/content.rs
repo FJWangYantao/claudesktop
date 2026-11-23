@@ -175,6 +175,8 @@ impl ChatApp {
     /// 内容区：设置页、首页（问候 + 用量概览）或当前会话的对话列表。
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.settings_open {
+            // 对话这会儿没在画：滚轮余量作废，别等关了设置再补上几秒前的那几格
+            self.sessions[self.active].wheel = None;
             self.step_settings_wheel(window);
             return v_flex().size_full().child(self.render_settings(window, cx)).into_any_element();
         }
@@ -208,12 +210,15 @@ impl ChatApp {
         // 点开了子任务：详情页占内容区；那个子任务已经不在了（回退过）就回到对话
         if let Some(task) = self.sessions[active].viewing_task.clone() {
             if let Some(page) = self.render_task_page(&task, window, cx) {
+                // 对话这会儿没在画，滚轮余量作废
+                self.sessions[active].wheel = None;
                 return page;
             }
             self.sessions[active].viewing_task = None;
         }
         // 审查这一轮的改动：同样占内容区；会话换了、发了新消息、又跑起来了就回到对话
         if self.review_open() {
+            self.sessions[active].wheel = None;
             return self.render_review_page(cx);
         }
         self.review = None;

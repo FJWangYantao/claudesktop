@@ -1811,11 +1811,11 @@ impl ChatApp {
         }
         if direct {
             s.wheel = None;
-            let _ = apply_relative(&s.list, delta);
+            let _ = apply_relative(&s.list, delta, false);
         } else {
             match &mut s.wheel {
                 Some(w) => w.push(now, delta),
-                // 新的一串从此刻算起，第一帧就有位移，不是从零起步
+                // 曲线从这里起算，位移从二次加速段一点点放出来（起步慢、中间匀速）
                 None => s.wheel = Some(WheelInput::new(now, delta)),
             }
         }
@@ -1836,15 +1836,28 @@ impl ChatApp {
         if s.list.is_scrollbar_dragging() {
             return;
         }
+        // 还在往上走就每帧再压一次跟随：列表在「离底不到 1px」时会自动重新跟随，
+        // 而曲线起步那几毫秒的位移还不到 1px，流式追加会把视口拽回底部
+        if w.direction().is_some_and(|down| !down) {
+            s.list.pause_following_tail();
+        }
         let step = w.advance(now);
         if step != px(0.) {
-            let (applied, edge) = apply_relative(&s.list, step);
-            w.consume(applied);
-            // 这个方向到头了：朝外的欠量作废，别每帧空转。
+            let (applied, edge) = apply_relative(&s.list, step, true);
+            // 先记账再 `block`：`block` 会把欠量清零，反过来相减会留下负的余量
+            w.consume(applied, now);
+            // 这个方向真到头了：朝外的欠量作废，别每帧空转。
             // 位移方向永远和输入一致，不会有回弹帧
             if edge {
                 w.block(step > px(0.));
             }
+        } else {
+            // 一步也没走成：由它开始计「卡住」的时长（列表还没量出这段距离 / 正好在边界）
+            w.consume(px(0.), now);
+        }
+        if w.expired(now) {
+            // 等太久了还是走不出去：丢掉余量，别再排帧
+            w.clear();
         }
         if w.is_done(now) {
             return;
@@ -2293,19 +2306,25 @@ fn distance_to_end(list: &ListState) -> Pixels {
     (max_scroll(list) - scroll_top(list)).max(px(0.))
 }
 
-/// 把 `delta` 交给列表做相对滚动，返回实际消费的像素和「这个方向是不是到头了」。
+/// 把 `delta` 交给列表做相对滚动，返回实际消费的像素和「这个方向是不是真到头了」。
 ///
 /// 列表自己的 `scroll_by` 只夹顶部，底部靠布局夹——布局会把落点收回末行，但那样
 /// 「这一步走没走到」就无从判断。所以这里用同一份布局读数先裁一次：
+///
 /// - 跟着末尾时往下没有可走的距离，直接判到底（列表继续跟随）。
-/// - 否则先把逻辑位置归位到可滚范围内：跟随时它记在末尾之后（多出一个视口），
-///   直接 `scroll_by` 上去会先拿「溢出量」抵掉一段，表现为开始滚动前要空滑好几帧。
-///   归位在屏幕上是同一位置，不算用户位移。
-/// - 往下：只有列表量完了（`is_scrolled_to_end` 有确定答案）才按可滚范围裁；
-///   还在按未测行排的时候不裁，交给布局，免得把用户还能滚的距离误判成到头。
+/// - 跟随时逻辑位置记在末尾之后（多出一个视口），往上先归位到可滚范围：屏幕上同一位置。
+///   不归位的话 `scroll_by` 会先拿这段「溢出」抵掉，表现为开滚前空滑几帧。
+/// - 往上：位置读数到 0 但 `logical_scroll_top().item_ix > 0`，说明上方还有没量出来的行
+///   （折叠后为零高的前缀行、刚跳转过来），这不是到顶：只走得到本帧能走的部分，
+///   `edge` 留 `false`，让布局把上方量出来、下面的帧继续（等不动了由 `WHEEL_HOLD` 收尾）。
+/// - 往下：列表说得出「到底没有」（全都量过）才按可滚范围裁；说不出（还有未测行，
+///   总高偏小）时不裁，交给布局，免得把用户还能滚的距离误判成到头（动画路径另限一屏）。
+///
+/// `animate` 只给动画路径用：未测行在场时一步最多走一屏，免得一口气跨过整片零高的行
+/// 直接跳到末尾。触控板的连续位移本身就是用户直接给的，不缩它。
 ///
 /// 单步永远在本帧请求量和 0 之间，不会有反方向的补偿帧。
-fn apply_relative(list: &ListState, delta: Pixels) -> (Pixels, bool) {
+fn apply_relative(list: &ListState, delta: Pixels, animate: bool) -> (Pixels, bool) {
     let down = delta > px(0.);
     if down && list.is_following_tail() {
         return (px(0.), true);
@@ -2315,24 +2334,29 @@ fn apply_relative(list: &ListState, delta: Pixels) -> (Pixels, bool) {
     if max <= px(0.) {
         return (px(0.), true);
     }
-    if scroll_top(list) > max + px(0.5) {
+    let screen = list.viewport_bounds().size.height.max(px(1.));
+    // 上方还有没量出来的行：顶部读数为 0 也不代表到顶
+    let unmetered_above = list.logical_scroll_top().item_ix > 0;
+    if !down && scroll_top(list) > max + px(0.5) {
         list.scroll_by(max - scroll_top(list));
     }
-    let top = scroll_top(list).clamp(px(0.), max);
-    let applied = if down {
+    let top = scroll_top(list).max(px(0.));
+    let limit = |d: Pixels| if animate { d.clamp(-screen, screen) } else { d };
+    let (applied, edge) = if down {
         if list.is_scrolled_to_end().is_some() {
-            ((top + delta).min(max) - top).max(px(0.))
+            let applied = limit((top + delta).min(max) - top).max(px(0.));
+            (applied, applied != delta || list.is_scrolled_to_end() == Some(true))
         } else {
-            delta
+            (limit(delta), false)
         }
     } else {
-        ((top + delta).max(px(0.)) - top).min(px(0.))
+        // 上方读数到 0 但不在第 0 行：先按一屏走，等布局把上方量出来（不然整格距离会被判成「到顶」丢掉）
+        let applied = limit(delta.max(-top));
+        (applied, top + applied <= px(0.5) && !unmetered_above)
     };
     if applied != px(0.) {
         list.scroll_by(applied);
     }
-    let edge = applied != delta
-        || if down { list.is_scrolled_to_end() == Some(true) } else { top + applied <= px(0.5) };
     (applied, edge)
 }
 
