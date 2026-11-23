@@ -3,7 +3,7 @@
 use crate::provider::{ChatMessage, ContentPart, FunctionCall, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -18,8 +18,8 @@ pub(crate) struct SnapshotLocation {
 
 pub(crate) struct WriteOutcome {
     pub location: SnapshotLocation,
-    pub serialize: Duration,
-    pub write: Duration,
+    pub encode_write: Duration,
+    pub commit: Duration,
 }
 
 pub(crate) struct ReadOutcome {
@@ -30,18 +30,18 @@ pub(crate) struct ReadOutcome {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Snapshot {
+struct Snapshot<Session, Messages> {
     version: u32,
-    session: String,
+    session: Session,
     generation: u64,
-    messages: Vec<MessageSnapshot>,
+    messages: Messages,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MessageSnapshot {
     role: String,
-    parts: Vec<PartSnapshot>,
+    parts: Vec<PartSnapshot<String>>,
     tool_calls: Vec<ToolCallSnapshot>,
     tool_call_id: Option<String>,
     thinking: Vec<Value>,
@@ -50,12 +50,12 @@ struct MessageSnapshot {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-enum PartSnapshot {
-    Text(String),
-    Image { media_type: String, data: String },
+enum PartSnapshot<Text> {
+    Text(Text),
+    Image { media_type: Text, data: Text },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolCallSnapshot {
     id: String,
@@ -64,45 +64,50 @@ struct ToolCallSnapshot {
     function: FunctionSnapshot,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FunctionSnapshot {
     name: String,
     arguments: String,
 }
 
-impl MessageSnapshot {
-    fn from_message(message: &ChatMessage) -> Self {
-        Self {
-            role: message.role.clone(),
-            parts: message
-                .parts
-                .iter()
-                .map(|part| match part {
-                    ContentPart::Text(text) => PartSnapshot::Text(text.clone()),
-                    ContentPart::Image { media_type, data } => {
-                        PartSnapshot::Image { media_type: media_type.clone(), data: data.clone() }
-                    }
-                })
-                .collect(),
-            tool_calls: message
-                .tool_calls
-                .iter()
-                .map(|call| ToolCallSnapshot {
-                    id: call.id.clone(),
-                    kind: call.kind.clone(),
-                    function: FunctionSnapshot {
-                        name: call.function.name.clone(),
-                        arguments: call.function.arguments.clone(),
-                    },
-                })
-                .collect(),
-            tool_call_id: message.tool_call_id.clone(),
-            thinking: message.thinking.clone(),
-            tool_images: message.tool_images,
-        }
-    }
+#[derive(Serialize)]
+struct MessageSnapshotRef<'a> {
+    role: &'a str,
+    #[serde(serialize_with = "serialize_parts")]
+    parts: &'a [ContentPart],
+    tool_calls: &'a [ToolCall],
+    tool_call_id: Option<&'a str>,
+    thinking: &'a [Value],
+    tool_images: bool,
+}
 
+fn serialize_parts<S: serde::Serializer>(
+    parts: &[ContentPart],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(parts.iter().map(|part| match part {
+        ContentPart::Text(text) => PartSnapshot::Text(text),
+        ContentPart::Image { media_type, data } => PartSnapshot::Image { media_type, data },
+    }))
+}
+
+struct SnapshotMessages<'a>(&'a [ChatMessage]);
+
+impl Serialize for SnapshotMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|message| MessageSnapshotRef {
+            role: &message.role,
+            parts: &message.parts,
+            tool_calls: &message.tool_calls,
+            tool_call_id: message.tool_call_id.as_deref(),
+            thinking: &message.thinking,
+            tool_images: message.tool_images,
+        }))
+    }
+}
+
+impl MessageSnapshot {
     fn into_message(self) -> ChatMessage {
         ChatMessage::from_data(crate::provider::ChatMessageData {
             role: self.role,
@@ -135,18 +140,8 @@ impl MessageSnapshot {
     }
 }
 
-fn encode(session: &str, generation: u64, messages: &[ChatMessage]) -> anyhow::Result<Vec<u8>> {
-    let snapshot = Snapshot {
-        version: VERSION,
-        session: session.to_string(),
-        generation,
-        messages: messages.iter().map(MessageSnapshot::from_message).collect(),
-    };
-    serde_json::to_vec(&snapshot).map_err(Into::into)
-}
-
 fn decode(bytes: &[u8], session: &str, generation: u64) -> anyhow::Result<Vec<ChatMessage>> {
-    let snapshot: Snapshot = serde_json::from_slice(bytes)
+    let snapshot: Snapshot<String, Vec<MessageSnapshot>> = serde_json::from_slice(bytes)
         .map_err(|err| anyhow::anyhow!("历史快照不是完整有效的 JSON：{err}"))?;
     anyhow::ensure!(snapshot.version == VERSION, "不支持的历史快照版本 {}", snapshot.version);
     anyhow::ensure!(snapshot.session == session, "历史快照属于另一个会话");
@@ -160,32 +155,34 @@ pub(crate) fn write(
     generation: u64,
     messages: &[ChatMessage],
 ) -> anyhow::Result<WriteOutcome> {
-    let serialize_started = Instant::now();
-    let bytes = encode(session, generation, messages)?;
-    let serialize = serialize_started.elapsed();
-    let write_started = Instant::now();
+    let snapshot =
+        Snapshot { version: VERSION, session, generation, messages: SnapshotMessages(messages) };
     std::fs::create_dir_all(root)?;
     let base = format!("{session}-{generation}");
     let final_path = root.join(format!("{base}.json"));
     let temporary_path = root.join(format!("{base}.tmp"));
-    let result = (|| -> anyhow::Result<()> {
-        let mut file =
-            std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary_path)?;
+    let result = (|| -> anyhow::Result<WriteOutcome> {
+        let encode_started = Instant::now();
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        serde_json::to_writer(&mut writer, &snapshot)?;
+        writer.flush()?;
+        let encode_write = encode_started.elapsed();
+        let commit_started = Instant::now();
+        let bytes = usize::try_from(writer.get_ref().metadata()?.len())?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
         std::fs::rename(&temporary_path, &final_path)?;
-        Ok(())
+        Ok(WriteOutcome {
+            location: SnapshotLocation { path: final_path, generation, bytes },
+            encode_write,
+            commit: commit_started.elapsed(),
+        })
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary_path);
     }
-    result?;
-    Ok(WriteOutcome {
-        location: SnapshotLocation { path: final_path, generation, bytes: bytes.len() },
-        serialize,
-        write: write_started.elapsed(),
-    })
+    result
 }
 
 pub(crate) fn read(session: &str, location: &SnapshotLocation) -> anyhow::Result<ReadOutcome> {
@@ -423,10 +420,10 @@ impl super::Inner {
                 };
                 if dormant {
                     eprintln!(
-                        "[perf] session_hibernate bytes={} serialize_ms={} write_ms={} total_ms={}",
+                        "[perf] session_hibernate bytes={} encode_write_ms={} commit_ms={} total_ms={}",
                         location.bytes,
-                        outcome.serialize.as_secs_f64() * 1000.,
-                        outcome.write.as_secs_f64() * 1000.,
+                        outcome.encode_write.as_secs_f64() * 1000.,
+                        outcome.commit.as_secs_f64() * 1000.,
                         total_started.elapsed().as_secs_f64() * 1000.
                     );
                 } else {
@@ -564,11 +561,18 @@ mod tests {
         vec![user, assistant, tool, ChatMessage::new("assistant", "完成")]
     }
 
+    const V1_FIXTURE: &str = concat!(
+        r#"{"version":1,"session":"builtin-test","generation":1,"messages":["#,
+        r#"{"role":"user","parts":[{"Text":"先看图，再调用工具。"},{"Image":{"media_type":"image/png","data":"QUJD"}},{"Text":"分段顺序也要保留"}],"tool_calls":[],"tool_call_id":null,"thinking":[],"tool_images":false},"#,
+        r#"{"role":"assistant","parts":[{"Text":"准备读取"}],"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"notes.txt\",\"optional\":null}"}}],"tool_call_id":null,"thinking":[{"type":"thinking","thinking":"完整思考","signature":"sig-1"},{"type":"redacted_thinking","data":"opaque-signature"}],"tool_images":false},"#,
+        r#"{"role":"tool","parts":[{"Text":"完整工具输出\n第二行"},{"Image":{"media_type":"image/jpeg","data":"REVG"}}],"tool_calls":[],"tool_call_id":"call-1","thinking":[],"tool_images":true},"#,
+        r#"{"role":"assistant","parts":[{"Text":"完成"}],"tool_calls":[],"tool_call_id":null,"thinking":[],"tool_images":false}]}"#,
+    );
+
     #[test]
-    fn round_trip_preserves_every_field_and_provider_messages() {
+    fn reads_v1_snapshot_and_preserves_provider_messages() {
         let original = full_history();
-        let bytes = encode("builtin-1-1", 7, &original).unwrap();
-        let restored = decode(&bytes, "builtin-1-1", 7).unwrap();
+        let restored = decode(V1_FIXTURE.as_bytes(), "builtin-test", 1).unwrap();
         assert_eq!(restored, original);
         assert_eq!(
             serde_json::to_value(&restored).unwrap(),
@@ -582,26 +586,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn atomic_write_and_read_round_trip() {
+    fn test_root() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let root = std::env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "claudesktop-hibernate-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        ))
+    }
+
+    #[test]
+    fn atomic_write_and_read_round_trip() {
+        let root = test_root();
         let original = full_history();
-        let written = write(&root, "builtin-test-1", 1, &original).unwrap();
-        let outcome = read("builtin-test-1", &written.location).unwrap();
+        let written = write(&root, "builtin-test", 1, &original).unwrap();
+        let outcome = read("builtin-test", &written.location).unwrap();
         assert_eq!(outcome.messages, original);
-        assert!(!root.join("builtin-test-1-1.tmp").exists());
+        assert!(!root.join("builtin-test-1.tmp").exists());
 
         let bytes = std::fs::read(&written.location.path).unwrap();
+        assert_eq!(written.location.bytes, bytes.len());
+        assert_eq!(bytes, V1_FIXTURE.as_bytes());
         std::fs::write(&written.location.path, &bytes[..bytes.len() / 2]).unwrap();
-        assert!(read("builtin-test-1", &written.location).is_err());
+        assert!(read("builtin-test", &written.location).is_err());
         assert!(written.location.path.exists(), "读取失败不能删掉原快照");
         remove(&written.location);
-        let _ = std::fs::remove_dir_all(root);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn failed_write_cleans_only_its_own_temporary_file() {
+        let root = test_root();
+        std::fs::create_dir(&root).unwrap();
+        let temporary = root.join("builtin-test-1.tmp");
+        std::fs::write(&temporary, b"existing").unwrap();
+        let messages = full_history();
+        assert!(write(&root, "builtin-test", 1, &messages).is_err());
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"existing");
+
+        std::fs::remove_file(&temporary).unwrap();
+        let destination = root.join("builtin-test-1.json");
+        std::fs::create_dir(&destination).unwrap();
+        assert!(write(&root, "builtin-test", 1, &messages).is_err());
+        assert!(!temporary.exists());
+        assert!(destination.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[derive(Debug, Default, Clone, Copy)]

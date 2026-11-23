@@ -132,7 +132,7 @@ fn live_agent_through_gateway_and_resume() {
     let ours: Vec<_> =
         first.iter().filter(|e| e.session.as_deref() == Some(sid.as_str())).collect();
     assert!(!ours.is_empty(), "网关日志里没有对上这个会话的请求");
-    assert!(ours.iter().all(|e| e.purpose == "acp" && e.turn == Some(1)));
+    assert!(ours.iter().all(|e| e.purpose.as_ref() == "acp" && e.turn == Some(1)));
     assert!(ours.iter().any(|e| e.status == 200 && e.output > 0));
 
     // 第二轮：新起一个 agent 进程续接，看上下文还在不在

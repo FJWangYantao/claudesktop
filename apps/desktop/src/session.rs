@@ -530,7 +530,7 @@ impl Session {
         // 最新一轮每个文件最后一次写盘时处于「已撤回」的块（agent 写的清空），恢复改动卡片的撤回状态
         let mut reverted_now: HashMap<String, bool> = HashMap::new();
         // 回退过的轮次不显示（日志只追加，读的时候折算）
-        for record in claudesktop_core::effective(&records) {
+        for record in claudesktop_core::into_effective(records) {
             match record {
                 Record::User { text, images, .. } => {
                     s.review_pending = false;

@@ -1,15 +1,14 @@
 //! 历史会话全文搜索：扫磁盘上的会话日志（内存里只恢复最近的一百个，更早的搜不到）。
 //!
-//! 日志是 JSONL，每行一条 [`Record`]。这里不恢复整个会话（不重建对话、不读 blob），
-//! 只把用户消息和助手回复的文字抽出来匹配，命中后给「会话 ID + 从第几条用户消息开始 +
-//! 一小段上下文」。界面按这个结果恢复那个会话再跳过去。
+//! 日志逐行读取，只保留用户消息的短标题和少量命中。后续回退可以撤掉暂存的命中，
+//! 界面按有效结果恢复会话并跳到对应轮次。
 //!
 //! 扫描放在后台线程里跑（见桌面端 `search.rs`）：几百个会话、每个几千条记录时
 //! 逐个读文件要几十到几百毫秒，不能占 UI 线程。
 
 use crate::KernelEvent;
-use crate::store::{Record, effective};
-use std::path::Path;
+use crate::store::{Record, iter_log};
+use std::{borrow::Borrow, path::Path};
 
 /// 一个会话最多列几条、整次搜索最多列几条
 pub const PER_SESSION: usize = 3;
@@ -47,19 +46,16 @@ pub fn search_logs(
     }
     let mut hits = Vec::new();
     for (session, path) in files {
-        let Ok(records) = crate::store::read_log(&path) else {
-            continue;
-        };
-        let found = search_records(&session, &records, &needle, &mut hits);
-        if found > 0 && hits.len() >= MAX_HITS {
+        let Ok(records) = iter_log(&path) else { continue };
+        collect_hits(&session, records, &needle, &mut hits);
+        if hits.len() >= MAX_HITS {
             break;
         }
     }
-    hits.truncate(MAX_HITS);
     hits
 }
 
-/// 在已读出的记录里搜（单测直接用它）。`hits` 里已有的也算进上限。
+/// 在已读出的记录里搜。`hits` 里已有的也算进上限。
 /// 返回这个会话命中了几条。
 pub fn search_records(
     session: &str,
@@ -67,48 +63,51 @@ pub fn search_records(
     needle_lower: &str,
     hits: &mut Vec<HistoryHit>,
 ) -> usize {
-    let mut found = 0;
-    let mut turn = 0;
-    // 这一轮的用户消息（摘要里的 `prompt` 和「第几轮」都用它）
-    let mut prompt = String::new();
-    for record in effective(records) {
-        match &record {
+    collect_hits(session, records, needle_lower, hits)
+}
+
+fn collect_hits(
+    session: &str,
+    records: impl IntoIterator<Item = impl Borrow<Record>>,
+    needle_lower: &str,
+    hits: &mut Vec<HistoryHit>,
+) -> usize {
+    let limit = PER_SESSION.min(MAX_HITS.saturating_sub(hits.len()));
+    let mut found: Vec<(usize, HistoryHit)> = Vec::with_capacity(limit);
+    let mut prompts = Vec::new();
+    for record in records {
+        let (text, from_user) = match record.borrow() {
             Record::User { text, .. } => {
-                prompt = first_line(text);
-                if let Some(snippet) = snippet(text, needle_lower) {
-                    hits.push(HistoryHit {
-                        session: session.to_string(),
-                        turn,
-                        from_user: true,
-                        snippet,
-                        prompt: prompt.clone(),
-                    });
-                    found += 1;
-                    if found >= PER_SESSION || hits.len() >= MAX_HITS {
-                        return found;
-                    }
-                }
-                turn += 1;
+                prompts.push(first_line(text));
+                (text, true)
             }
-            Record::Event { event: KernelEvent::AgentMessageChunk { text } } => {
-                if let Some(snippet) = snippet(text, needle_lower) {
-                    hits.push(HistoryHit {
-                        session: session.to_string(),
-                        turn: turn.saturating_sub(1),
-                        from_user: false,
-                        snippet,
-                        prompt: prompt.clone(),
-                    });
-                    found += 1;
-                    if found >= PER_SESSION || hits.len() >= MAX_HITS {
-                        return found;
-                    }
-                }
+            Record::Event { event: KernelEvent::AgentMessageChunk { text } } => (text, false),
+            Record::Rewind { turn, conversation: true, .. } if *turn < prompts.len() => {
+                prompts.truncate(*turn);
+                found.truncate(found.partition_point(|(user_count, _)| user_count <= turn));
+                continue;
             }
-            _ => {}
+            _ => continue,
+        };
+        if found.len() < limit
+            && let Some(snippet) = snippet(text, needle_lower)
+        {
+            let user_count = prompts.len();
+            found.push((
+                user_count,
+                HistoryHit {
+                    session: session.to_string(),
+                    turn: user_count.saturating_sub(1),
+                    from_user,
+                    snippet,
+                    prompt: prompts.last().cloned().unwrap_or_default(),
+                },
+            ));
         }
     }
-    found
+    let count = found.len();
+    hits.extend(found.into_iter().map(|(_, hit)| hit));
+    count
 }
 
 /// `text` 里有 `needle`（已转小写）就摘出命中处附近的一段：前面留几个字，空白压成一个空格，
@@ -118,15 +117,15 @@ fn snippet(text: &str, needle: &str) -> Option<String> {
     let at = lower.find(needle)?;
     // 少数字符转小写后字节数会变，偏移对不上就从头摘
     let at = if lower.len() == text.len() && text.is_char_boundary(at) { at } else { 0 };
-    let before: Vec<char> = text[..at].chars().collect();
-    let start = before.len().saturating_sub(SNIPPET_BEFORE);
-    let head: String = before[start..].iter().collect();
-    let piece: String = head.chars().chain(text[at..].chars()).take(SNIPPET_LEN).collect();
-    let mut out = piece.split_whitespace().collect::<Vec<_>>().join(" ");
+    let start =
+        text[..at].char_indices().rev().nth(SNIPPET_BEFORE - 1).map_or(0, |(start, _)| start);
+    let tail = &text[start..];
+    let end = tail.char_indices().nth(SNIPPET_LEN).map_or(tail.len(), |(end, _)| end);
+    let mut out = tail[..end].split_whitespace().collect::<Vec<_>>().join(" ");
     if start > 0 {
         out.insert(0, '…');
     }
-    if text.chars().count().saturating_sub(start) > SNIPPET_LEN {
+    if end < tail.len() {
         out.push('…');
     }
     Some(out)
@@ -134,10 +133,14 @@ fn snippet(text: &str, needle: &str) -> Option<String> {
 
 /// 第一行（压成一行、截短）：列表里当标题线索用。
 fn first_line(text: &str) -> String {
-    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-    let mut out: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    if out.chars().count() > 40 {
-        out = out.chars().take(40).collect::<String>() + "…";
+    let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default();
+    let mut words = line.split_whitespace();
+    let Some(first) = words.next() else { return String::new() };
+    let mut chars =
+        first.chars().chain(words.flat_map(|word| std::iter::once(' ').chain(word.chars())));
+    let mut out: String = chars.by_ref().take(40).collect();
+    if chars.next().is_some() {
+        out.push('…');
     }
     out
 }
@@ -230,6 +233,44 @@ mod tests {
         let mut hits = Vec::new();
         search_records("s", &records, "needle", &mut hits);
         assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn disk_search_replaces_rewound_hits_and_keeps_the_previous_prompt() {
+        let records = [
+            agent("NEEDLE before first turn"),
+            user("第一轮"),
+            user("needle discarded user"),
+            agent("needle discarded assistant"),
+            Record::Rewind { turn: 1, conversation: true, files: 0, prompt: "旧".into() },
+            agent("needle after rewind"),
+            user("下一轮 needle"),
+            Record::Rewind { turn: 0, conversation: false, files: 1, prompt: "文件".into() },
+            agent("needle beyond limit"),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("cd-history-search-{}.jsonl", std::process::id()));
+        let mut log = String::new();
+        for record in &records {
+            log.push_str(&serde_json::to_string(record).unwrap());
+            log.push('\n');
+        }
+        log.push_str(r#"{"t":"rewind","turn":0"#);
+        std::fs::write(&path, log).unwrap();
+        let hits = search_logs([("s".into(), path.clone())], "Needle");
+        std::fs::remove_file(path).unwrap();
+        let actual: Vec<_> = hits
+            .iter()
+            .map(|hit| (hit.turn, hit.from_user, hit.prompt.as_str(), hit.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (0, false, "", "NEEDLE before first turn"),
+                (0, false, "第一轮", "needle after rewind"),
+                (1, true, "下一轮 needle", "下一轮 needle"),
+            ]
+        );
     }
 
     #[test]

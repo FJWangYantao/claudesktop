@@ -247,29 +247,28 @@ pub fn is_peak(peaks: &[PeakWindow], at_ms: u64) -> bool {
     peaks.iter().any(|w| w.contains(at))
 }
 
-/// 这个模型的这次请求是不是峰价；不分峰谷的模型是 None。
-pub fn peak_of(p: &Price, peaks: &[PeakWindow], r: &RequestLog) -> Option<bool> {
-    p.factor().map(|_| is_peak(peaks, r.at_ms))
-}
-
-/// 这次请求的倍率（谷价 1、峰价 `peak_factor`）。
-fn factor(p: &Price, peaks: &[PeakWindow], at_ms: u64) -> f64 {
-    match p.factor() {
-        Some(f) if is_peak(peaks, at_ms) => f,
-        _ => 1.0,
-    }
+#[derive(Clone, Copy)]
+pub struct Charge {
+    pub currency: Currency,
+    pub amount: f64,
+    pub peak: bool,
+    saved: f64,
 }
 
 /// 一次请求的费用。`input` 含缓存命中的部分（网关日志的口径）。
-pub fn request_cost(p: &Price, r: &RequestLog, peaks: &[PeakWindow]) -> f64 {
+pub fn charge(p: &Price, r: &RequestLog, peaks: &[PeakWindow]) -> Charge {
     let cached = r.cache_read.min(r.input);
     let fresh = r.input - cached;
-    let f = factor(p, peaks, r.at_ms);
-    (fresh as f64 * p.input
-        + cached as f64 * p.cache_read.unwrap_or(p.input)
-        + r.output as f64 * p.output)
-        * f
-        / 1e6
+    let cache_price = p.cache_read.unwrap_or(p.input);
+    let f = p.factor().filter(|_| is_peak(peaks, r.at_ms)).unwrap_or(1.0);
+    Charge {
+        currency: p.currency,
+        amount: (fresh as f64 * p.input + cached as f64 * cache_price + r.output as f64 * p.output)
+            * f
+            / 1e6,
+        saved: (cached as f64 * (p.input - cache_price) * f / 1e6).max(0.0),
+        peak: f > 1.0,
+    }
 }
 
 /// 一批请求的估算费用：两种币种分开加，另记缓存省下的钱、按峰价算的请求数和对不上单价的模型。
@@ -300,27 +299,25 @@ impl Cost {
             if r.input == 0 && r.output == 0 {
                 continue;
             }
-            let Some(p) = find(prices, model) else {
-                if !cost.unpriced.iter().any(|m| m == model) {
-                    cost.unpriced.push(model.to_string());
-                }
-                continue;
-            };
-            let f = factor(p, peaks, r.at_ms);
-            if f > 1.0 {
-                cost.peak += 1;
-            }
-            let saved =
-                r.cache_read.min(r.input) as f64 * (p.input - p.cache_read.unwrap_or(p.input)) * f
-                    / 1e6;
-            let (total, saved_total) = match p.currency {
-                Currency::Usd => (&mut cost.usd, &mut cost.saved_usd),
-                Currency::Cny => (&mut cost.cny, &mut cost.saved_cny),
-            };
-            *total += request_cost(p, r, peaks);
-            *saved_total += saved.max(0.0);
+            cost.add(model, find(prices, model).map(|p| charge(p, r, peaks)));
         }
         cost
+    }
+
+    pub fn add(&mut self, model: &str, charge: Option<Charge>) {
+        let Some(charge) = charge else {
+            if !self.unpriced.iter().any(|m| m == model) {
+                self.unpriced.push(model.to_string());
+            }
+            return;
+        };
+        let (total, saved) = match charge.currency {
+            Currency::Usd => (&mut self.usd, &mut self.saved_usd),
+            Currency::Cny => (&mut self.cny, &mut self.saved_cny),
+        };
+        *total += charge.amount;
+        *saved += charge.saved;
+        self.peak += usize::from(charge.peak);
     }
 
     /// `$1.23` / `¥0.45` / `$1.23 + ¥0.45`；都没有时 None。
@@ -588,14 +585,14 @@ mod tests {
         off.at_ms = at("2026-10-19 20:00");
         let mut sunday = peak.clone();
         sunday.at_ms = at("2026-10-25 10:00");
-        assert_eq!(request_cost(p, &peak, &peaks), 2.0);
-        assert_eq!(request_cost(p, &off, &peaks), 1.0);
-        assert_eq!(request_cost(p, &sunday, &peaks), 1.0);
-        assert_eq!(peak_of(p, &peaks, &peak), Some(true));
-        assert_eq!(peak_of(p, &peaks, &off), Some(false));
-        // 不分峰谷的模型：没有峰谷标记，倍率 1
+        assert_eq!(charge(p, &peak, &peaks).amount, 2.0);
+        assert_eq!(charge(p, &off, &peaks).amount, 1.0);
+        assert_eq!(charge(p, &sunday, &peaks).amount, 1.0);
+        assert!(charge(p, &peak, &peaks).peak);
+        assert!(!charge(p, &off, &peaks).peak);
+        // 不分峰谷的模型：没有峰价标记，倍率 1
         let other = find(&prices, "claude-sonnet-5").unwrap();
-        assert_eq!(peak_of(other, &peaks, &peak), None);
+        assert!(!charge(other, &peak, &peaks).peak);
         let mixed = vec![peak.clone(), off.clone()];
         let cost = Cost::of(&prices, &peaks, &mixed);
         assert_eq!(cost.peak, 1);
@@ -607,8 +604,8 @@ mod tests {
             ranges: vec![(12 * 60 + 30, 13 * 60 + 30)],
             utc_offset: Some(480),
         }];
-        assert_eq!(request_cost(p, &peak, &evening), 2.0);
-        assert_eq!(request_cost(p, &off, &evening), 1.0);
+        assert_eq!(charge(p, &peak, &evening).amount, 2.0);
+        assert_eq!(charge(p, &off, &evening).amount, 1.0);
     }
 
     #[test]

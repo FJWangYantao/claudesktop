@@ -1,6 +1,6 @@
-//! 首页用量卡片的「请求」页签：用量网关记下的每个请求，按「会话的第几轮」归组（归组与汇总见 `requests.rs`）。
+//! 用量页的「请求明细」：用量网关记下的请求按「会话的第几轮」归组（归组与汇总见 `requests.rs`）。
 //!
-//! 日志在切到这个页签、换时间范围、点刷新时在后台读；点一轮展开看里面的每次请求（左边一条时间轴，
+//! 日志在打开用量、换时间范围、点刷新时在后台读；点一轮展开看里面的每次请求（左边一条时间轴，
 //! 看出每次请求落在这一轮的哪一段）。费用按设置里的模型单价估算（`pricing.rs`）。
 //! 自研内核的请求都经过网关；ACP agent 的要在设置里打开「经过用量网关」、agent 认 base URL 才有。
 
@@ -9,19 +9,23 @@ use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::widgets::Surface;
 use crate::model::StatCard;
 use crate::pricing::{self, Cost, PeakWindow, Price};
-use crate::requests::{self, SessionRef, TurnRow};
+use crate::requests::{self, Groups, SessionRef, TurnKey, TurnRow};
 use crate::theme::rgb;
 use crate::theme::*;
 use crate::usage;
-use claudesktop_builtin::gateway::{self, RequestLog};
+use claudesktop_builtin::gateway::{self, LogChange, LogCursor, RequestLog};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const REQUEST_CACHE_BUDGET: usize = 16 * 1024 * 1024;
+const REQUEST_CACHE_IDLE: Duration = Duration::from_secs(30);
 
 /// 先列多少轮；「显示更多」每次再多列这么多（首页整页滚动，不另开滚动框）
 const PAGE_ROWS: usize = 20;
@@ -33,14 +37,17 @@ const OVERSCAN: Pixels = px(200.);
 #[derive(Default)]
 pub(super) struct RequestsView {
     /// 读到的日志；None = 还没读
-    logs: Option<Arc<Vec<RequestLog>>>,
+    logs: Option<Vec<RequestLog>>,
+    groups: Groups,
+    cursor: LogCursor,
     /// 读的是哪个时间范围（`overview_range`）
     loaded_range: Option<usize>,
-    loading: bool,
-    /// 已经约好过一会儿重读（跑着的轮又发完一个请求，见 `refresh_requests_soon`）
-    reload_soon: bool,
+    loading: Option<Task<()>>,
+    needs_reload: bool,
+    reload_timer: Option<Task<()>>,
+    hidden_since: Option<Instant>,
     /// 点开的轮（`TurnRow::key`）
-    open: HashSet<(String, u64)>,
+    open: HashSet<TurnKey>,
     /// 只看某个模型 / 某个会话（`Session::token`）/ 某一天（`usage::day_of`，用量页的筛选）
     pub(super) model: Option<String>,
     pub(super) session: Option<u64>,
@@ -53,6 +60,32 @@ pub(super) struct RequestsView {
     window: Rc<RefCell<ListWindow>>,
 }
 
+impl RequestsView {
+    fn reclaim_hidden(&mut self, now: Instant) -> Option<(usize, usize)> {
+        let logs = self.logs.as_ref()?;
+        let bytes = logs.capacity() * size_of::<RequestLog>()
+            + self.groups.rows.capacity() * size_of::<TurnRow>();
+        if bytes < REQUEST_CACHE_BUDGET {
+            return None;
+        }
+        let hidden_since = *self.hidden_since.get_or_insert(now);
+        if now.saturating_duration_since(hidden_since) < REQUEST_CACHE_IDLE
+            || self.loading.is_some()
+        {
+            return None;
+        }
+        let rows = logs.len();
+        self.logs = None;
+        self.groups = Groups::default();
+        self.cursor = LogCursor::default();
+        self.derived.get_mut().take();
+        *self.window.borrow_mut() = ListWindow::default();
+        self.reload_timer = None;
+        self.needs_reload = true;
+        Some((rows, bytes))
+    }
+}
+
 /// 列表的窗口化：首页整页滚动、列表在页面中间，用不了自带滚动框的虚拟列表，
 /// 所以按首页的滚动位置算出视口附近是哪几轮，只排这几轮，上下用空白占住其余的高度
 /// （「显示更多」点了几次之后，几百轮全排一遍，滚一格要上百毫秒）。
@@ -60,21 +93,59 @@ pub(super) struct RequestsView {
 struct ListWindow {
     /// 列表顶端在滚动内容里的 y（画过一帧才知道）
     top: Option<Pixels>,
+    /// 加载占位的 y。只用它判断列表是否还在视口及预排区下方。
+    loading_top: Option<Pixels>,
+    embedded: bool,
     /// 量高度时的列表宽度（变了量过的高度全作废）
     width: Pixels,
     /// 画过的轮的高度：[收起时, 展开时]
-    heights: HashMap<(String, u64), [Option<Pixels>; 2]>,
+    heights: HashMap<TurnKey, [Option<Pixels>; 2]>,
     /// 没画过的收起的轮按这个估（画过的收起的轮的高度）
     estimate: Option<Pixels>,
 }
 
 impl ListWindow {
+    fn select_page(&mut self, embedded: bool) {
+        if self.embedded != embedded {
+            self.embedded = embedded;
+            self.top = None;
+            self.loading_top = None;
+        }
+    }
+
+    fn measure_top(
+        state: Rc<RefCell<Self>>,
+        scroll: ScrollHandle,
+        loading: bool,
+    ) -> impl IntoElement {
+        canvas(
+            move |bounds, window, _| {
+                let top = bounds.origin.y - scroll.bounds().origin.y - scroll.offset().y;
+                let mut w = state.borrow_mut();
+                if loading {
+                    w.loading_top = Some(top);
+                } else {
+                    w.loading_top = None;
+                    if w.top.is_none_or(|t| (t - top).abs() > px(0.5)) {
+                        w.top = Some(top);
+                        window.request_animation_frame();
+                    }
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .w_full()
+        .h(px(0.))
+    }
+
     /// 一轮的高度：量过的，或者估一个（展开的按每次请求一行估）。
     fn height(&self, row: &TurnRow, open: bool, line: Pixels) -> Pixels {
         let measured = self.heights.get(&row.key).and_then(|h| h[open as usize]);
         let collapsed = self.estimate.unwrap_or(line * 3.5);
         measured.unwrap_or(if open {
-            collapsed + line * row.requests.len() as f32 * 1.6
+            collapsed + line * row.request_count() as f32 * 1.6
         } else {
             collapsed
         })
@@ -83,10 +154,7 @@ impl ListWindow {
 
 /// 「请求」页签按当前日志、筛选和单价算好的数据（用量页的费用也从这里取）。
 pub(super) struct Derived {
-    /// 算的是哪一份日志（重读日志才换）
-    logs: Arc<Vec<RequestLog>>,
     key: DerivedKey,
-    rows: Vec<TurnRow>,
     /// 筛选的候选：模型按出现次数，会话按最近
     models: Vec<String>,
     sessions: Vec<SessionRef>,
@@ -115,20 +183,45 @@ struct DerivedKey {
 impl ChatApp {
     /// 用量页或首页「请求」页签正开着（请求日志只在它开着时才值得读）。
     pub(super) fn requests_shown(&self) -> bool {
-        if self.settings_open {
-            self.settings_form.tab == super::usage_view::USAGE_TAB
-        } else {
-            self.overview_tab == 2
+        self.settings.usage_gateway
+            && if self.settings_open {
+                self.settings_form.tab == super::usage_view::USAGE_TAB
+            } else {
+                let session = self.session();
+                self.overview_tab == 2
+                    && self.space() == crate::settings::Space::Code
+                    && session.history_loaded
+                    && session.blocks_error.is_none()
+                    && !session.has_user_message()
+                    && !self.settings.needs_setup()
+            }
+    }
+
+    pub(super) fn maintain_requests(&mut self, cx: &mut Context<Self>) {
+        if self.requests_view.logs.is_none() && self.requests_view.hidden_since.is_none() {
+            return;
+        }
+        if self.requests_shown() {
+            if self.requests_view.hidden_since.is_some() {
+                self.sync_requests(cx);
+            }
+        } else if let Some((rows, bytes)) = self.requests_view.reclaim_hidden(Instant::now())
+            && std::env::var_os("CLAUDESKTOP_MEM_REPORT").is_some()
+        {
+            eprintln!("[mem] request_cache_evict rows={rows} estimated_bytes={bytes}");
         }
     }
 
     /// 在首页「请求」页签上或用量页开着、日志还没按当前范围读过：在后台读。
     pub(super) fn sync_requests(&mut self, cx: &mut Context<Self>) {
         // 用量页整页都要（费用、缓存命中也从请求日志算）
-        let shown = self.requests_shown();
-        let v = &self.requests_view;
-        if shown && !v.loading && v.loaded_range != Some(self.overview_range) {
-            self.load_requests(cx);
+        if !self.requests_shown() {
+            return;
+        }
+        let v = &mut self.requests_view;
+        v.hidden_since = None;
+        if v.loading.is_none() && (v.needs_reload || v.loaded_range != Some(self.overview_range)) {
+            self.load_requests(false, cx);
         }
     }
 
@@ -137,7 +230,11 @@ impl ChatApp {
         if self.settings_open { &self.settings_scroll } else { &self.home_scroll }
     }
 
-    fn load_requests(&mut self, cx: &mut Context<Self>) {
+    fn load_requests(&mut self, from_start: bool, cx: &mut Context<Self>) {
+        let v = &mut self.requests_view;
+        if v.loading.is_some() {
+            return;
+        }
         let Some(dir) = gateway::default_dir() else {
             return;
         };
@@ -148,48 +245,77 @@ impl ChatApp {
             _ => None,
         };
         let since = days.map(|d: u64| super::now_ms().saturating_sub(d * 86_400_000));
-        self.requests_view.loading = true;
-        cx.spawn(async move |this, cx| {
-            let logs = cx
-                .background_executor()
-                .spawn(async move { gateway::read_logs(&dir, since) })
-                .await;
+        let cursor = if !from_start && v.loaded_range == Some(range) {
+            v.cursor.clone()
+        } else {
+            LogCursor::default()
+        };
+        v.needs_reload = false;
+        v.loading = Some(cx.spawn(async move |this, cx| {
+            let update =
+                cx.background_executor().spawn(async move { cursor.read(&dir, since) }).await;
             let _ = this.update(cx, |app, cx| {
                 let v = &mut app.requests_view;
-                v.logs = Some(Arc::new(logs));
-                // 同一范围重读（跑着的轮刷新）不收起已经展开的「显示更多」
-                if v.loaded_range != Some(range) {
-                    v.more = 0;
+                v.loading = None;
+                if app.overview_range != range {
+                    v.needs_reload = true;
+                    app.sync_requests(cx);
+                    cx.notify();
+                    return;
                 }
-                v.loaded_range = Some(range);
-                v.loading = false;
+                let queued = v.needs_reload;
+                let logs = v.logs.get_or_insert_with(Vec::new);
+                match update {
+                    Ok(update) => {
+                        let (cursor, change) = update.apply(logs);
+                        v.cursor = cursor;
+                        match change {
+                            LogChange::Unchanged => {}
+                            LogChange::Appended { start } => v.groups.extend(logs, start),
+                            LogChange::Rebuilt => {
+                                v.groups = Groups::default();
+                                v.groups.extend(logs, 0);
+                            }
+                        }
+                        if change != LogChange::Unchanged {
+                            v.derived.get_mut().take();
+                            v.window.borrow_mut().heights.clear();
+                        }
+                        if v.loaded_range != Some(range) {
+                            v.more = 0;
+                        }
+                        v.loaded_range = Some(range);
+                    }
+                    Err(err) => {
+                        v.needs_reload = true;
+                        app.toast(Notification::error(format!("读取请求记录失败：{err}")), cx);
+                    }
+                }
+                if queued {
+                    app.sync_requests(cx);
+                }
                 cx.notify();
             });
-        })
-        .detach();
+        }));
     }
 
-    /// 网关又记下了请求（跑着的轮报了用量、一轮结束）：过一会儿重读日志。
-    /// 页面开着就读，没开着记成过期，下次打开再读；一轮里请求一个接一个，攒 2 秒读一次。
+    /// 网关又记下了请求（跑着的轮报了用量、一轮结束）：合批补读，页面没开就等下次打开。
     pub(super) fn refresh_requests_soon(&mut self, cx: &mut Context<Self>) {
         let v = &mut self.requests_view;
-        if !self.settings.usage_gateway || v.logs.is_none() || v.reload_soon {
+        if !self.settings.usage_gateway
+            || (v.logs.is_none() && v.loading.is_none())
+            || v.reload_timer.is_some()
+        {
             return;
         }
-        v.reload_soon = true;
-        cx.spawn(async move |this, cx| {
+        v.reload_timer = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
             let _ = this.update(cx, |app, cx| {
-                app.requests_view.reload_soon = false;
-                // 上一次还没读完：读完会把范围记成已读，这次的就丢了，所以再约一次
-                if app.requests_view.loading {
-                    return app.refresh_requests_soon(cx);
-                }
-                app.requests_view.loaded_range = None;
+                app.requests_view.reload_timer = None;
+                app.requests_view.needs_reload = true;
                 app.sync_requests(cx);
             });
-        })
-        .detach();
+        }));
     }
 
     /// 压测钩子：灌 `n` 轮假请求（每轮 3 次，几个会话和模型轮着来）；`all` = 全部列出来，否则只列第一页。
@@ -203,7 +329,7 @@ impl ChatApp {
                     at_ms: now.saturating_sub((n as u64 - turn) * 60_000) + k * 4_000,
                     req_id: Some(turn * 3 + k),
                     attempt: Some(1),
-                    session: Some(format!("stress-{}", turn % 7)),
+                    session: Some(format!("stress-{}", turn % 7).into()),
                     turn: Some(turn),
                     purpose: "turn".into(),
                     protocol: "openai".into(),
@@ -222,8 +348,11 @@ impl ChatApp {
                 });
             }
         }
+        let mut groups = Groups::default();
+        groups.extend(&logs, 0);
         self.requests_view = RequestsView {
-            logs: Some(Arc::new(logs)),
+            logs: Some(logs),
+            groups,
             loaded_range: Some(self.overview_range),
             more: if all { n / PAGE_ROWS } else { 0 },
             ..Default::default()
@@ -232,7 +361,7 @@ impl ChatApp {
 
     /// 归组、筛选、汇总的结果，输入没变就用上次的（滚一格都要重画，日志多时每帧重算很贵）。
     /// `day`：只看那天（用量页的筛选；首页「请求」页签不按天筛）。
-    fn derived_requests(&self, logs: &Arc<Vec<RequestLog>>, day: Option<i64>) -> Rc<Derived> {
+    fn derived_requests(&self, logs: &[RequestLog], day: Option<i64>) -> Rc<Derived> {
         let v = &self.requests_view;
         let key = DerivedKey {
             names: self.request_names(),
@@ -243,70 +372,48 @@ impl ChatApp {
             peaks: self.settings.price_peaks(),
         };
         if let Some(d) = v.derived.borrow().as_ref()
-            && Arc::ptr_eq(&d.logs, logs)
             && d.key == key
         {
             return d.clone();
         }
-        let rows = requests::group(logs, &key.names);
-        // 筛选的候选：模型按出现次数，会话按最近
-        let mut models: Vec<(String, usize)> = Vec::new();
-        let mut sessions: Vec<SessionRef> = Vec::new();
-        for row in &rows {
-            if let Some(m) = &row.model {
-                match models.iter_mut().find(|(n, _)| n == m) {
-                    Some((_, c)) => *c += 1,
-                    None => models.push((m.clone(), 1)),
-                }
+        v.derived.borrow_mut().take();
+        let mut model_counts = HashMap::<&str, usize>::new();
+        let mut session_tokens = HashSet::new();
+        let mut sessions = Vec::new();
+        let mut shown = Vec::new();
+        let offset = key.day.map(|_| usage::local_offset_secs());
+        for (i, row) in v.groups.newest_first() {
+            let model = row.model(logs);
+            let session = row.session(&key.names);
+            if let Some(model) = model {
+                *model_counts.entry(model).or_default() += 1;
             }
-            if let Some(s) = &row.session
-                && !sessions.iter().any(|x| x.token == s.token)
+            if let Some(session) = session
+                && session_tokens.insert(session.token)
             {
-                sessions.push(s.clone());
+                sessions.push(session.clone());
+            }
+            if key.model.as_deref().is_none_or(|m| Some(m) == model)
+                && key.session.is_none_or(|t| session.is_some_and(|s| s.token == t))
+                && key
+                    .day
+                    .zip(offset)
+                    .is_none_or(|(day, offset)| usage::day_of(row.at_ms, offset) == day)
+            {
+                shown.push(i);
             }
         }
-        models.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let shown: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| key.model.as_ref().is_none_or(|m| r.model.as_ref() == Some(m)))
-            .filter(|(_, r)| {
-                key.session.is_none_or(|t| r.session.as_ref().is_some_and(|s| s.token == t))
-            })
-            .filter(|(_, r)| {
-                key.day.is_none_or(|d| usage::day_of(r.at_ms, usage::local_offset_secs()) == d)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        let shown_rows: Vec<&TurnRow> = shown.iter().map(|&i| &rows[i]).collect();
-        let sum = requests::summarize(&shown_rows);
-        let cost = Cost::of(&key.prices, &key.peaks, shown_rows.iter().flat_map(|r| &r.requests));
-        let mut by_model: HashMap<&str, Vec<&RequestLog>> = HashMap::new();
-        let mut by_session: HashMap<u64, Vec<&RequestLog>> = HashMap::new();
-        for row in &shown_rows {
-            for r in &row.requests {
-                if let Some(m) = &r.model {
-                    by_model.entry(m).or_default().push(r);
-                }
-                if let Some(s) = &row.session {
-                    by_session.entry(s.token).or_default().push(r);
-                }
-            }
-        }
-        let model_cost = by_model
-            .into_iter()
-            .map(|(m, logs)| (m.to_string(), Cost::of(&key.prices, &key.peaks, logs)))
-            .collect();
-        let session_cost = by_session
-            .into_iter()
-            .map(|(t, logs)| (t, Cost::of(&key.prices, &key.peaks, logs)))
-            .collect();
+        let mut models: Vec<_> = model_counts.into_iter().collect();
+        models.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let shown_rows: Vec<&TurnRow> = shown.iter().map(|&i| &v.groups.rows[i]).collect();
+        let sum = requests::summarize(&shown_rows, logs);
+        let requests::Costs { total: cost, models: model_cost, sessions: session_cost } =
+            requests::costs(&shown_rows, logs, &key.names, &key.prices, &key.peaks);
         let (cache_read, input) =
             shown_rows.iter().fold((0, 0), |(c, i), r| (c + r.cache_read, i + r.input));
         let cache_hit = usage::cache_hit_percent(cache_read, input);
         let d = Rc::new(Derived {
-            logs: logs.clone(),
-            models: models.into_iter().map(|(m, _)| m).collect(),
+            models: models.into_iter().map(|(m, _)| m.to_owned()).collect(),
             sessions,
             shown,
             sum,
@@ -314,7 +421,6 @@ impl ChatApp {
             model_cost,
             session_cost,
             cache_hit,
-            rows,
             key,
         });
         *v.derived.borrow_mut() = Some(d.clone());
@@ -339,8 +445,8 @@ impl ChatApp {
         if !self.settings.usage_gateway {
             return None;
         }
-        let logs = self.requests_view.logs.clone()?;
-        Some(self.derived_requests(&logs, self.requests_view.day))
+        let logs = self.requests_view.logs.as_deref()?;
+        Some(self.derived_requests(logs, self.requests_view.day))
     }
 
     /// 请求列表。`embedded` = 用量页里的那份：筛选跟着整页走、总数在页顶，这里不再画筛选菜单和统计卡。
@@ -354,13 +460,16 @@ impl ChatApp {
             ));
         }
         let v = &self.requests_view;
-        let Some(logs) = v.logs.clone() else {
-            return div().child(hint("正在读取请求记录…"));
+        v.window.borrow_mut().select_page(embedded);
+        let Some(logs) = v.logs.as_deref() else {
+            return div()
+                .relative()
+                .child(ListWindow::measure_top(v.window.clone(), self.list_scroll().clone(), true))
+                .child(hint("正在读取请求记录…"));
         };
-        let d = self.derived_requests(&logs, if embedded { v.day } else { None });
-        let shown: Vec<&TurnRow> = d.shown.iter().map(|&i| &d.rows[i]).collect();
+        let d = self.derived_requests(logs, if embedded { v.day } else { None });
+        let shown = &d.shown;
         let (sum, cost) = (&d.sum, &d.cost);
-        let (prices, peaks) = (&d.key.prices, &d.key.peaks);
         let (models, sessions) = (d.models.clone(), d.sessions.clone());
 
         let model_label = v.model.clone().unwrap_or_else(|| "全部模型".into());
@@ -469,9 +578,9 @@ impl ChatApp {
                 Self::quiet_button("req-refresh", IconAll::RefreshCw, Surface::Sand, cx)
                     .small()
                     .tooltip("重新读取")
-                    .loading(v.loading)
+                    .loading(v.loading.is_some())
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.load_requests(cx);
+                        this.load_requests(true, cx);
                         cx.notify();
                     })),
             );
@@ -527,7 +636,7 @@ impl ChatApp {
             ));
         }
         let limit = PAGE_ROWS * (v.more + 1);
-        list = self.request_rows(list, &shown[..shown.len().min(limit)], prices, peaks, cx);
+        list = self.request_rows(list, &shown[..shown.len().min(limit)], &d, logs, cx);
         if shown.len() > limit {
             list = list.child(
                 div().h_flex().justify_center().pt_1().child(
@@ -575,11 +684,12 @@ impl ChatApp {
     fn request_rows(
         &self,
         list: Div,
-        rows: &[&TurnRow],
-        prices: &[Price],
-        peaks: &[PeakWindow],
+        shown: &[usize],
+        data: &Derived,
+        logs: &[RequestLog],
         cx: &mut Context<Self>,
     ) -> Div {
+        let rows = &self.requests_view.groups.rows;
         let state = self.requests_view.window.clone();
         let rem = crate::theme::root_font_size();
         let (gap, line) = (rems(0.375).to_pixels(rem), TEXT_SMALL.to_pixels(rem));
@@ -589,65 +699,53 @@ impl ChatApp {
         // 否则这一帧按越界的位置算，视口里一片空白
         let max = scroll.max_offset().y.max(px(0.));
         let scrolled = (-scroll.offset().y).clamp(px(0.), max);
-        // 视口在列表里的范围；还没画过（不知道列表在哪）就先排一屏
-        let (lo, hi) = match state.borrow().top {
-            Some(top) if viewport > px(0.) => {
-                (scrolled - top - OVERSCAN, scrolled - top + viewport + OVERSCAN)
+        let bottom = scrolled + viewport + OVERSCAN;
+        let (lo, hi) = {
+            let w = state.borrow();
+            match w.top.filter(|_| viewport > px(0.)) {
+                Some(top) => (scrolled - top - OVERSCAN, bottom - top),
+                None if viewport > px(0.) && w.loading_top.is_some_and(|top| top > bottom) => {
+                    (px(0.), px(-1.))
+                }
+                None => (px(0.), viewport.max(px(900.)) + OVERSCAN),
             }
-            _ => (px(0.), viewport.max(px(900.)) + OVERSCAN),
         };
         // 每轮占「高 + 行距」：before 是第一个排出来的那轮之前的，after 是最后一个之后的
-        let (mut first, mut last) = (rows.len(), rows.len());
+        let (mut first, mut last) = (shown.len(), shown.len());
         let (mut before, mut after, mut y) = (px(0.), px(0.), px(0.));
         {
             let w = state.borrow();
-            for (i, row) in rows.iter().enumerate() {
+            for (i, &index) in shown.iter().enumerate() {
+                let row = &rows[index];
                 let h = w.height(row, self.requests_view.open.contains(&row.key), line);
-                if first == rows.len() && y + h >= lo {
+                if first == shown.len() && y + h >= lo {
                     first = i;
                     before = y;
                 }
-                if first < rows.len() && last == rows.len() && y > hi {
+                if first < shown.len() && last == shown.len() && y > hi {
                     last = i;
                 }
-                if last < rows.len() {
+                if last < shown.len() {
                     after += h + gap;
                 }
                 y += h + gap;
             }
         }
-        let keys: Vec<((String, u64), bool)> = rows[first..last]
+        let keys: Vec<(TurnKey, bool)> = shown[first..last]
             .iter()
+            .map(|&i| &rows[i])
             .map(|r| (r.key.clone(), self.requests_view.open.contains(&r.key)))
             .collect();
         // list 里排在这几轮前面的子元素：量位置的 canvas、上面的空白
         let skip = 1 + usize::from(before > gap);
-        let top_state = state.clone();
-        // 量列表顶端在滚动内容里的位置（上面的统计卡片变高时会变）；绝对定位，不占行距
-        let probe = canvas(
-            move |bounds, window, _| {
-                let top = bounds.origin.y - scroll.bounds().origin.y - scroll.offset().y;
-                let mut w = top_state.borrow_mut();
-                if w.top.is_none_or(|t| (t - top).abs() > px(0.5)) {
-                    w.top = Some(top);
-                    window.request_animation_frame();
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .w_full()
-        .h(px(0.));
         list.relative()
-            .child(probe)
+            .child(ListWindow::measure_top(state.clone(), scroll, false))
             // 空白和相邻的那轮之间还有一个行距，空白本身少算一个
             .when(before > gap, |d| d.child(div().flex_none().h(before - gap)))
             .children(
-                rows[first..last]
+                shown[first..last]
                     .iter()
-                    .enumerate()
-                    .map(|(k, row)| self.request_turn(first + k, row, prices, peaks, cx)),
+                    .map(|&i| self.request_turn(i, &rows[i], &data.key, logs, cx)),
             )
             .when(after > gap, |d| d.child(div().flex_none().h(after - gap)))
             // 量排出来的几轮的高度；和估的不一样就再排一帧
@@ -682,29 +780,32 @@ impl ChatApp {
         &self,
         i: usize,
         row: &TurnRow,
-        prices: &[Price],
-        peaks: &[PeakWindow],
+        key: &DerivedKey,
+        logs: &[RequestLog],
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let (prices, peaks) = (&key.prices, &key.peaks);
         let open = self.requests_view.open.contains(&row.key);
-        let title = match &row.session {
+        let session = row.session(&key.names);
+        let purpose = row.purpose(logs);
+        let title = match session {
             Some(s) => s.title.clone(),
-            None if row.purpose == "models" => "列出模型".into(),
+            None if purpose == "models" => "列出模型".into(),
             None if row.key.1 > 0 && !row.key.0.contains('#') => "已删除的会话".into(),
-            None => requests::purpose_label(&row.purpose).into(),
+            None => requests::purpose_label(purpose).into(),
         };
-        let mut parts = vec![format!("{} 次请求", row.requests.len())];
+        let mut parts = vec![format!("{} 次请求", row.request_count())];
         if row.input > 0 {
             parts.push(format!("累计输入 {}", usage::compact(row.input)));
         }
         // 只有一次请求时上下文就等于累计输入，不重复说
-        if row.context > 0 && row.requests.len() > 1 {
+        if row.context > 0 && row.request_count() > 1 {
             parts.push(format!("上下文 {}", usage::compact(row.context)));
         }
         if row.output > 0 {
             parts.push(format!("输出 {}", usage::compact(row.output)));
         }
-        if let Some(c) = Cost::of(prices, peaks, &row.requests).label() {
+        if let Some(c) = Cost::of(prices, peaks, row.requests(logs)).label() {
             parts.push(format!("约 {c}"));
         }
         parts.push(format!("用时 {}", requests::ms_label(row.elapsed_ms)));
@@ -755,7 +856,7 @@ impl ChatApp {
                             .text_color(rgb(INK))
                             .child(title),
                     )
-                    .when_some(row.model.clone(), |d, m| {
+                    .when_some(row.model(logs), |d, m| {
                         d.child(
                             div()
                                 .flex_shrink_0()
@@ -766,7 +867,7 @@ impl ChatApp {
                                 .font_family(MONO)
                                 .text_size(TEXT_META)
                                 .text_color(rgb(INK_SOFT))
-                                .child(m),
+                                .child(SharedString::from(m.to_owned())),
                         )
                     })
                     .child(
@@ -775,7 +876,7 @@ impl ChatApp {
                             .text_size(TEXT_SMALL)
                             .text_color(rgb(INK_SOFT))
                             .font_features(tabular_nums())
-                            .child(match &row.session {
+                            .child(match session {
                                 // 同一个会话的几轮靠「第几轮」分开
                                 Some(_) => {
                                     format!("第 {} 轮 · {}", row.key.1, time_label(row.at_ms))
@@ -794,10 +895,11 @@ impl ChatApp {
             });
         if open {
             let mut detail = div().v_flex().gap_0p5().pt_1().pl(rems(1.25));
-            for (k, r) in row.requests.iter().enumerate() {
+            let mut previous = None;
+            for (k, r) in row.requests(logs).enumerate() {
                 // 存了原文的：行尾一个「原文」，点开看发出去的请求体和返回（别让卡片跟着收起）
-                let raw = r.body.is_some().then(|| {
-                    let log = r.clone();
+                let raw = r.body.as_ref().map(|id| {
+                    let (id, model, at_ms) = (id.clone(), r.model.clone(), r.at_ms);
                     Self::quiet_button(
                         ("req-raw", i * 1000 + k),
                         IconAll::Braces,
@@ -809,7 +911,7 @@ impl ChatApp {
                     .px_1p5()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.open_raw_request(&log, window, cx);
+                        this.open_raw_request(&id, model.as_deref(), at_ms, window, cx);
                     }))
                 });
                 detail = detail.child(
@@ -818,15 +920,15 @@ impl ChatApp {
                         .items_start()
                         .gap_2()
                         .child(timeline_bar(row, r))
-                        .child(div().flex_1().min_w_0().child(request_line(
-                            k,
-                            r,
-                            &row.requests[..k],
-                            prices,
-                            peaks,
-                        )))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(request_line(k, r, previous, prices, peaks)),
+                        )
                         .children(raw.map(|b| div().flex_none().mt(rems(-0.125)).child(b))),
                 );
+                previous = Some(r);
             }
             card = card.child(detail);
         }
@@ -843,7 +945,7 @@ fn timeline_bar(row: &TurnRow, r: &RequestLog) -> Div {
         INK_FAINT
     } else if requests::failed(r) {
         RED
-    } else if r.purpose == "subagent" {
+    } else if r.purpose.as_ref() == "subagent" {
         ChatApp::heat_color(2)
     } else {
         ChatApp::heat_color(4)
@@ -865,7 +967,7 @@ fn timeline_bar(row: &TurnRow, r: &RequestLog) -> Div {
 fn request_line(
     k: usize,
     r: &RequestLog,
-    before: &[RequestLog],
+    previous: Option<&RequestLog>,
     prices: &[Price],
     peaks: &[PeakWindow],
 ) -> Div {
@@ -885,22 +987,19 @@ fn request_line(
         };
         parts.push(format!("↑ {}{cached} ↓ {}", usage::compact(r.input), usage::compact(r.output)));
     }
-    if let Some(m) = r.model.as_deref()
+    if (r.input > 0 || r.output > 0)
+        && let Some(m) = r.model.as_deref()
         && let Some(p) = pricing::find(prices, m)
-        && (r.input > 0 || r.output > 0)
     {
-        let cost = pricing::request_cost(p, r, peaks);
-        let peak = match pricing::peak_of(p, peaks, r) {
-            Some(true) => "（峰价）",
-            _ => "",
-        };
-        parts.push(format!("约 {}{peak}", pricing::money(cost, p.currency)));
+        let charge = pricing::charge(p, r, peaks);
+        let peak = if charge.peak { "（峰价）" } else { "" };
+        parts.push(format!("约 {}{peak}", pricing::money(charge.amount, charge.currency)));
     }
     // 模型中途换过才标出来
     if let Some(m) = &r.model
-        && before.last().is_some_and(|p| p.model.as_ref() != Some(m))
+        && previous.is_some_and(|p| p.model.as_ref() != Some(m))
     {
-        parts.push(m.clone());
+        parts.push(m.to_string());
     }
     let mut parts: Vec<(String, Color)> = parts.into_iter().map(|p| (p, INK_SOFT)).collect();
     if r.cancelled {
@@ -950,4 +1049,50 @@ pub(super) fn time_label(ms: u64) -> String {
     chrono::DateTime::from_timestamp_millis(ms as i64)
         .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn hidden_large_cache_is_dropped_without_discarding_view_state() {
+        let mut logs = Vec::with_capacity(REQUEST_CACHE_BUDGET.div_ceil(size_of::<RequestLog>()));
+        logs.push(RequestLog::default());
+        let key = ("session".into(), 1);
+        let mut view = RequestsView {
+            logs: Some(logs),
+            loaded_range: Some(2),
+            day: Some(1),
+            model: Some("example".into()),
+            session: Some(7),
+            more: 2,
+            open: HashSet::from([key.clone()]),
+            ..Default::default()
+        };
+        view.groups.extend(view.logs.as_deref().unwrap(), 0);
+        view.window.borrow_mut().heights.insert(key.clone(), [Some(px(10.)), None]);
+        let now = Instant::now();
+        assert!(view.reclaim_hidden(now).is_none());
+        assert!(view.reclaim_hidden(now + REQUEST_CACHE_IDLE - Duration::from_secs(1)).is_none());
+        assert_eq!(view.reclaim_hidden(now + REQUEST_CACHE_IDLE).unwrap().0, 1);
+        assert!(view.logs.is_none() && view.groups.rows.is_empty());
+        assert!(view.window.borrow().heights.is_empty() && view.needs_reload);
+        assert_eq!(
+            (view.loaded_range, view.day, view.session, view.more),
+            (Some(2), Some(1), Some(7), 2)
+        );
+        assert_eq!(view.model.as_deref(), Some("example"));
+        assert!(view.open.contains(&key));
+    }
+
+    #[core::prelude::v1::test]
+    fn hidden_small_cache_stays_available() {
+        let mut view =
+            RequestsView { logs: Some(vec![RequestLog::default()]), ..Default::default() };
+        let now = Instant::now();
+        assert!(view.reclaim_hidden(now).is_none());
+        assert!(view.reclaim_hidden(now + REQUEST_CACHE_IDLE).is_none());
+        assert_eq!(view.logs.unwrap().len(), 1);
+    }
 }

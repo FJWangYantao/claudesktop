@@ -475,6 +475,7 @@ impl ChatApp {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update(cx, |app, cx| {
                     ticks += 1;
+                    app.maintain_requests(cx);
                     if ticks.is_multiple_of(30) {
                         app.reclaim_idle_processes(cx);
                         if std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_none() {
@@ -1249,8 +1250,7 @@ impl ChatApp {
         };
         // 先折算回退（回退掉的轮次不能在新会话里复活），再只抄对话本身：
         // 文件改动 / 检查点 / 回退不抄（新目录里没有那些文件，抄过去回退会乱）
-        let records: Vec<Record> =
-            claudesktop_core::effective(&records).into_iter().filter(copyable).collect();
+        let records = claudesktop_core::into_effective(records).into_iter().filter(copyable);
         let title = format!("{}（接着聊）", self.sessions[src].title);
         let kind = self.settings.kernel_for_space(Space::Code);
         let agent_cmd = self.slot(&kind.key()).map(|s| s.agent_cmd.clone()).unwrap_or_default();

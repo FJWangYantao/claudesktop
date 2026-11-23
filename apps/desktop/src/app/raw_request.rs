@@ -6,7 +6,6 @@ use self::document::{Document, Text};
 use super::{ChatApp, keys, settings_kit::seg_control_in, widgets::Surface};
 use crate::theme::rgb;
 use crate::theme::*;
-use claudesktop_builtin::gateway::RequestLog;
 use claudesktop_builtin::request_bodies::{self, Source};
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{
@@ -600,14 +599,16 @@ impl Render for RawRequest {
 impl ChatApp {
     pub(super) fn open_raw_request(
         &mut self,
-        log: &RequestLog,
+        id: &str,
+        model: Option<&str>,
+        at_ms: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if window.has_active_dialog(cx) {
             return;
         }
-        let (Some(id), Some(dir)) = (&log.body, claudesktop_builtin::gateway::default_dir()) else {
+        let Some(dir) = claudesktop_builtin::gateway::default_dir() else {
             return;
         };
         let source = match Source::new(&dir, id) {
@@ -619,10 +620,11 @@ impl ChatApp {
         };
         let name = id.rsplit('/').next().unwrap_or("request").to_string();
         let view = cx.new(|cx| RawRequest::new(source, name, cx));
-        let mut title = vec!["请求原文".to_string()];
-        title.extend(log.model.clone());
-        title.push(super::requests_view::time_label(log.at_ms));
-        let title = title.join(" · ");
+        let time = super::requests_view::time_label(at_ms);
+        let title = match model {
+            Some(model) => format!("请求原文 · {model} · {time}"),
+            None => format!("请求原文 · {time}"),
+        };
         let content = view.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog

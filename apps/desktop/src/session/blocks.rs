@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 
 const LARGE_TEXT: usize = 256 * 1024;
@@ -208,35 +208,51 @@ impl Session {
             return Ok(0);
         }
         let result = (|| {
-            let mut full = std::collections::HashMap::new();
+            let mut full = HashMap::with_capacity(self.blocks.external.len());
             for hash in &self.blocks.external {
-                full.insert(hash.clone(), self.blocks.read(hash)?);
+                full.insert(hash.as_str(), (self.blocks.read(hash)?, 0usize));
             }
-            let mut restored = 0;
-            let mut restore = |text: &mut String| {
-                let Some((hash, len)) = marker(text) else { return };
-                let Some(content) = full.get(hash) else { return };
-                if content.len() == len {
-                    *text = content.clone();
-                    restored += 1;
-                }
-            };
-            for item in &mut self.transcript {
-                for_each_text(item, &mut restore);
+            let mut checked = 0;
+            for item in self
+                .transcript
+                .iter_mut()
+                .chain(self.subagents.values_mut().flat_map(|run| &mut run.items))
+            {
+                for_each_text(item, &mut |text| {
+                    if let Some((hash, len)) = marker(text)
+                        && let Some((content, references)) = full.get_mut(hash)
+                        && content.len() == len
+                    {
+                        *references += 1;
+                        checked += 1;
+                    }
+                });
             }
-            for run in self.subagents.values_mut() {
-                for item in &mut run.items {
-                    for_each_text(item, &mut restore);
-                }
-            }
-            if restored != self.blocks.entries {
+            if checked != self.blocks.entries {
                 return Err(format!(
-                    "块引用数量不符：应有 {}，恢复了 {restored}",
+                    "块引用数量不符：应有 {}，找到 {checked}",
                     self.blocks.entries
                 ));
             }
+            for item in self
+                .transcript
+                .iter_mut()
+                .chain(self.subagents.values_mut().flat_map(|run| &mut run.items))
+            {
+                for_each_text(item, &mut |text| {
+                    if let Some((hash, len)) = marker(text)
+                        && let Some((content, remaining)) = full.get_mut(hash)
+                        && content.len() == len
+                        && *remaining > 0
+                    {
+                        *remaining -= 1;
+                        *text =
+                            if *remaining == 0 { std::mem::take(content) } else { content.clone() };
+                    }
+                });
+            }
             self.blocks.clear();
-            Ok(restored)
+            Ok(checked)
         })();
         match result {
             Ok(count) => {
@@ -351,6 +367,33 @@ mod tests {
         assert!(path.exists());
         drop(session);
         assert!(!root.exists());
+    }
+
+    #[core::prelude::v1::test]
+    fn invalid_block_reference_keeps_all_previews_for_retry() {
+        let mut session = live(root());
+        let original = "长文".repeat(200_000);
+        session.transcript.push(ChatItem::Agent(original.clone()));
+        session.transcript.push(ChatItem::Agent(original.clone()));
+        assert_eq!(session.externalize_completed().unwrap(), 2);
+        let ChatItem::Agent(text) = &mut session.transcript[2] else { unreachable!() };
+        let valid = text.clone();
+        let (hash, len) = marker(text).unwrap();
+        *text = format!("{MARK}{hash}:{}\n", len - 1);
+
+        let corrupt = serde_json::to_value(&session.transcript).unwrap();
+        assert!(session.restore_all_blocks().is_err());
+        assert_eq!(serde_json::to_value(&session.transcript).unwrap(), corrupt);
+        assert_eq!(session.block_stats().entries, 2);
+
+        session.transcript[2] = ChatItem::Agent(valid);
+        assert_eq!(session.restore_all_blocks().unwrap(), 2);
+        assert!(
+            session.transcript[1..]
+                .iter()
+                .all(|item| { matches!(item, ChatItem::Agent(text) if text == &original) })
+        );
+        assert!(!session.has_external_blocks());
     }
 
     #[core::prelude::v1::test]

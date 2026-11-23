@@ -40,7 +40,7 @@ pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
 pub use store::{
     Record, SessionKind, SessionLog, SessionMeta, SessionStore, WorktreeMeta, default_data_dir,
-    effective, read_log,
+    effective, into_effective, iter_effective, read_log,
 };
 
 pub use plugin::Plugin;

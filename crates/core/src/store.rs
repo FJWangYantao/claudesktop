@@ -12,6 +12,7 @@ use crate::KernelEvent;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -215,15 +216,25 @@ impl Record {
 }
 
 /// 读一个日志文件的全部记录；末尾半行（写到一半崩溃）及无法解析的行跳过。
-/// 目录里那些按会话 ID 找不着的（历史搜索要扫全部）直接给路径。
 pub fn read_log(path: &Path) -> io::Result<Vec<Record>> {
-    let file = File::open(path)?;
-    Ok(BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(&l).ok())
-        .collect())
+    Ok(iter_log(path)?.collect())
+}
+
+pub(crate) fn iter_log(path: &Path) -> io::Result<impl Iterator<Item = Record>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = String::new();
+    Ok(std::iter::from_fn(move || {
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
+            if let Ok(record) = serde_json::from_str(&line) {
+                return Some(record);
+            }
+        }
+    })
+    .fuse())
 }
 
 /// 会话存储目录。
@@ -433,24 +444,59 @@ impl Drop for SessionLog {
     }
 }
 
-/// 折算回退：返回仍然有效的记录。遇到回退对话的 `Rewind` 时，把已收下的记录截到第 `turn` 条
-/// 用户消息之前，`Rewind` 本身留着（重放时显示成备注）。日志只追加，读的时候才折算。
+/// 折算回退并复制有效记录。可借用时用 [`iter_effective`]，已有所有权时用 [`into_effective`]。
 pub fn effective(records: &[Record]) -> Vec<Record> {
-    let mut out: Vec<Record> = Vec::with_capacity(records.len());
-    for record in records {
-        if let Record::Rewind { turn, conversation: true, .. } = record
-            && let Some(cut) = out
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| matches!(r, Record::User { .. }))
-                .nth(*turn)
-                .map(|(i, _)| i)
-        {
-            out.truncate(cut);
-        }
-        out.push(record.clone());
+    iter_effective(records).cloned().collect()
+}
+
+/// 按原顺序借用折算回退后的记录，保留有效的回退备注。
+pub fn iter_effective(records: &[Record]) -> impl Iterator<Item = &Record> {
+    effective_ranges(records).into_iter().flat_map(|range| &records[range])
+}
+
+/// 在原有缓冲里保留有效记录，移动正文、工具结果和附件路径。
+pub fn into_effective(mut records: Vec<Record>) -> Vec<Record> {
+    let mut ranges = effective_ranges(&records).into_iter();
+    let mut range = ranges.next().unwrap();
+    if range == (0..records.len()) {
+        return records;
     }
-    out
+    let mut index = 0;
+    records.retain(|_| {
+        if index == range.end {
+            range = ranges.next().unwrap();
+        }
+        let keep = range.contains(&index);
+        index += 1;
+        keep
+    });
+    records
+}
+
+fn effective_ranges(records: &[Record]) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut turns = Vec::new();
+    let mut start = 0;
+    for (index, record) in records.iter().enumerate() {
+        match record {
+            Record::User { .. } => turns.push(index),
+            Record::Rewind { turn, conversation: true, .. } => {
+                let Some(&cut) = turns.get(*turn) else { continue };
+                turns.truncate(*turn);
+                ranges.truncate(ranges.partition_point(|range| range.start < cut));
+                if let Some(last) = ranges.last_mut() {
+                    last.end = last.end.min(cut);
+                }
+                if start < cut {
+                    ranges.push(start..cut);
+                }
+                start = index;
+            }
+            _ => {}
+        }
+    }
+    ranges.push(start..records.len());
+    ranges
 }
 
 fn is_chunk(event: &KernelEvent) -> bool {
@@ -582,6 +628,46 @@ mod tests {
                 sub("t1", "案", false),
             ]
         );
+    }
+
+    #[test]
+    fn folds_repeated_rewinds_without_copying_surviving_records() {
+        let rewind = |turn, conversation| Record::Rewind {
+            turn,
+            conversation,
+            files: 0,
+            prompt: format!("回退到 {turn}"),
+        };
+        let image = Record::User {
+            text: "看图".into(),
+            images: vec!["saved.png".into()],
+            sent: Some("看上传的图片".into()),
+        };
+        let records = vec![
+            chunk("开始"),
+            image,
+            Record::user("第二轮"),
+            Record::user("第三轮"),
+            rewind(2, true),
+            Record::user("第三轮再问"),
+            rewind(1, true),
+            Record::user("第二轮再问"),
+            rewind(0, false),
+            rewind(9, true),
+        ];
+        let keep = [0, 1, 6, 7, 8, 9];
+        let borrowed: Vec<_> = iter_effective(&records).collect();
+        for (&index, record) in keep.iter().zip(&borrowed) {
+            assert!(std::ptr::eq(&records[index], *record));
+        }
+        assert_eq!(borrowed.len(), keep.len());
+        let expected: Vec<_> = borrowed.into_iter().cloned().collect();
+        let Record::User { images, .. } = &records[1] else { unreachable!() };
+        let image_ptr = images[0].as_ptr();
+        let records = into_effective(records);
+        assert_eq!(records, expected);
+        let Record::User { images, .. } = &records[1] else { unreachable!() };
+        assert_eq!(images[0].as_ptr(), image_ptr);
     }
 
     #[test]

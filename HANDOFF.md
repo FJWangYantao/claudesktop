@@ -152,6 +152,39 @@
   普通 release、fmt、全工作区 release Clippy 和 672 项测试通过，13 项忽略。普通 exe 位于 `capacity-release-05/claudesktop.exe`，SHA256 `d4afa6938c57b68fbe1010ce3cd4db04356debad138c4ef2828ed3faceb8612a`。
 - **用量索引按行补扫**：`.claudesktop/bench/usage-stream-01/final-ab-01/summary.json` 用 12 个普通隐藏进程验证约 48 MiB 的首次扫描、再追加约 12 MiB 后重启。每对缓存偏移、轮次和用量统计一致。
   首次索引的私有内存峰值中位 206.54 → 158.30 MiB，索引 42.51 → 21.54ms。追加后重启为 169.74 → 159.16 MiB、12.34 → 6.33ms。进程读取量基本持平，追加仅补读新字节。首次扫描的启动首帧中位 291.40 → 325.17ms，未观察到首帧加快。
+- **历史重放与磁盘搜索**：`.claudesktop/bench/history-replay-01/ab-01/summary.json` 记录同一约 48 MiB 日志的三轮交替 A/B，12 个隐藏进程。重放峰值私有内存增量中位 123.63 → 58.08 MiB，搜索 100.54 → 0.26 MiB。日志读取到重放完成为 96.21 → 83.77ms，磁盘扫描为 79.26 → 26.68ms。
+  搜索峰值在选中命中前读取，从命令面板输入并确认后核对实际跳转。两边 12 次有效对话内容指纹相同，包含回退、短回复、长思考与附件。`normal-02` 的普通版验过有效历史、展开提示词和原图进请求，新回复追加到原会话。fmt、全工作区 release Clippy（-D warnings）、普通 release 构建及 674 项测试通过，13 项忽略。
+  用同一 Cargo 源码副本构建 A/B 时，复制源码后刷新修改时间，避免 Cargo 把候选 core 错判为 Fresh（`after-stale`）。`normal-01` 在系统临时数据目录收到请求但等不到日志追加。改用本轮输出下的数据目录后通过，未改系统权限。搜索扫到上限后仍读完当前日志，后续回退可能移除暂存命中。
+  复跑 `node .claudesktop/bench/history-replay-01/run.mjs <新目录> ab`，使用该目录冻结的两个探针。
+- **请求明细补读与费用汇总**。同一时间范围内按文件身份、字节偏移和尾部校验补读。尾部半行等下次，旧文件有变或手动重新读取时全读。费用一次遍历更新总额、模型和会话，每种模型只匹配一次单价。
+  `.claudesktop/bench/request-log-memory-01/append-ab-01/summary.json` 有小、大两组各三轮交替对照。约 40 MiB 的样本追加一条时只解析 1 条，进程读量中位 41583020 → 480 字节，读盘 177.30 → 0.62ms，费用汇总 1506.53 → 13.60ms。刷新开始到绘制为 1825.04 → 278.69ms，前置的 2 秒合批另计。首开峰值增量中位 86.94 → 88.18 MiB。
+  `first-append-ab-01/summary.json` 隔离前面的范围切换后，单次追加峰值增量三轮中位 97.62 → ≤11.74 MiB。候选三轮都未超过进程的既有高水位，采样中位 7.06 MiB 只代表下界。`live-append-03` 用真实回环对话核对自动补读和新增费用。首轮结束还会发 `GET /v1/models?limit=1000`，所以这个夹具会新增对话和列模型两条，列模型费用为零。
+  fmt、全工作区 release Clippy（-D warnings）、678 项测试和普通 release 构建通过，13 项忽略。`raw-request/request-log-normal-01` 用普通版隐藏窗口验证点开明细和原文、切换请求与返回并重开。普通 exe 归档在 `request-log-memory-01/release-01/`。
+  复跑 `node .claudesktop/bench/request-log-memory-01/run.mjs <新目录> indexed append small,large 3 6`。隔离首次追加用 `indexed append large 3 1 --append-only`，真实回环用 `append append edge 1 0 --append-only --live`。
+- **请求明细字符串共享与增量归组**。补读保留已有下标，按发出时间把新请求并进涉及的回合，时间相同保留文件行顺序。连续请求用下标区间，交错请求用下标清单。文件替换或范围到期重建归组。费用和首字中位数仍按筛选结果汇总。
+  `.claudesktop/bench/request-log-memory-01/grouped-ab-01/summary.json` 是 41,581,587 字节、96,004 条日志的三轮交替对照。首开私有内存峰值增量中位 88.16 → 66.22 MiB，解析完成时的私有内存增量 66.09 → 44.68 MiB，归组阶段再增 20.31 → 9.19 MiB。全量读取与解析 167.61 → 213.22ms，首次绘制 404.29 → 356.86ms。单条追加归组 19.43 → 0.010ms，刷新到绘制 232.65 → 220.86ms，18 次追加均未超过打开或切换范围时的峰值。
+  `grouped-first-01/summary.json` 隔离范围切换后仍只读约 480 字节。首次追加的峰值未刷新历史高点，两版采样下界中位 7.23 → 1.71 MiB，历史高点给出的上界 11.42 → 14.88 MiB。上下界交叠，无法确定真实峰值变化。
+  `grouped-late-01` 对照了迟到、同刻、筛选、各类费用和原文关联。`grouped-manual-01` 在隐藏窗口点重新读取后核对同文件改写。`grouped-live-01` 由真实回环网关自动补读两条并核对费用。普通版隐藏窗口原文交互见 `raw-request/request-log-normal-02`，exe 在 `request-log-memory-01/release-02/`。fmt、全工作区 release Clippy（-D warnings）、679 项测试和普通 release 构建通过，13 项忽略。
+  复跑沿用 `request-log-memory-01/run.mjs`，用 `<新目录> append grouped large 3 6`，隔离首次追加用 `<新目录> append grouped large 3 1 --append-only`。两版 `derived` 探针的计时起点不同，比较归组用 `group_ms`，端到端用 `paint_ms`。
+- **请求日志借用解析**。`LogRecord` 共用日志格式，读取时短字符串先从 JSON 行缓冲借用查表，未命中才创建 `Arc<str>`。转义交给 Serde 解码。范围过滤在共享前，旧 JSONL、损坏行和偏移检查规则照旧。
+  `.claudesktop/bench/request-log-memory-01/borrowed-ab-01/summary.json` 的三轮交替对照（同一 41,581,587 字节样本）首开读取解析中位 412.93 → 276.18ms，首次绘制 766.97 → 599.38ms，私有内存峰值增量 67.27 → 63.61 MiB。`borrowed-first-01` 的隔离追加对照首开读取解析 303.78 → 195.53ms，首次绘制 393.60 → 381.65ms，峰值 65.27 → 66.43 MiB，首次追加仍读 480 字节。之前的约 170ms 绝对目标本次未达，三套同条件对照的首开读取解析缩短 33% 至 36%。`borrowed-pinned-01` 只绑定本次探针进程的性能核，466.01 → 295.98ms，结果另记。`parse-profile-01.json` 是包含释放开销的隔离诊断，部分采样与编译重叠，验收以桌面对照为准。
+  `borrowed-edge-01` 对照乱序、筛选、手动重读，`borrowed-live-01` 核对真实回环追加和费用。fmt、全工作区 release Clippy（-D warnings）、680 项测试及普通 release 构建通过，13 项忽略。普通版隐藏窗口原文验收在 `raw-request/request-log-normal-03`，exe 在 `request-log-memory-01/release-03/`。归档脚本匹配 Cargo 错误时须锚定行首，宽泛的 `error:` 会匹配成功的 `json_error::tests`。
+  复跑用 `node .claudesktop/bench/request-log-memory-01/run.mjs <新目录> grouped borrowed large 3 6`；隔离首次追加用 `grouped borrowed large 3 1 --append-only`。
+- **请求日志读取缓冲与相邻文本复用**。按剩余字节分配至多 64 KiB 读缓冲，短字符串和上一条保留记录的同一字段相同时直接复用。`profile-02/results.json` 的拆测里解码约 95ms，查表及共享约 36ms，顺序样本排序不到 1ms。直接分割读缓冲和保留 `read_until` 的收益相近，采用后者。
+  同一约 40 MiB 日志（96004 条）三套各三轮对照，`buffered-first-01`、`buffered-ab-01`、`buffered-paint-ab-01` 的首开读解析中位分别为 151.82 → 132.00、146.30 → 134.83、151.27 → 135.40ms。9 对都更快，候选最慢 140.04ms。首开峰值增量中位 65.32—66.27 MiB，首次追加仍读 480 字节，未刷新历史峰值。
+  按 250ms 离屏定时器绘制的两组首绘中位分别多 19.61 / 24.68ms。后台提交后由驱动立即请求绘制的三轮中位 220.67 → 206.81ms；`buffered-paint-aa-01` 同版最大配对首绘差 28.10ms，首绘收益仍待确认。补测用 `borrowed buffered large 3 0 --append-only --prompt-paint --pin-bench-cpus`，只绑定本次探针及驱动 PID。
+  `buffered-edge-01` 对照迟到、同刻、筛选与手动重读，`buffered-live-01` 核对回环对话的两条网关增量与费用。fmt、全工作区 release Clippy（-D warnings）、680 项测试和普通 release 构建通过，13 项忽略。`raw-request/request-log-normal-04` 完成普通版请求原文交互，exe 在 `request-log-memory-01/release-04/`，SHA256 `7fa097397916136be8dd70ecf09366f8e86997047d249df8a99386a07be340ab`。
+- **请求明细首帧跳过屏外行**。加载占位时量起点，若还在视口和预排区下方，数据到齐的首帧先用估算高度占位。首帧已接近视口时正常排行，列表自己的 prepaint 更新实际起点。用量页与首页请求页签切换时重新量起点。
+  `request-log-memory-01/frame-profile-01` 在后台提交后直接离屏绘制，未先画加载帧时，首帧会排 20 个屏外行，布局至内容 prepaint 中位 33.60ms。`frame-ab-01` 两版都先画加载帧，再在提交后直接绘制。约 1 / 40 MiB 样本各三对，首帧均为 20 → 0 行。40 MiB 布局 15.75 → 3.12ms，读解析以外 42.32 → 28.95ms，读取开始到首绘 186.32 → 165.13ms。1 MiB 首绘 70.48 → 61.38ms。`frame-aa-01` 的同版布局最大配对差 6.03ms，首绘差 38.38ms（主要在读解析）；按同组布局衡量收益。
+  大日志首开私有内存峰值增量中位 66.70 → 66.90 MiB，单条追加继续读 480 字节。`frame-scroll-01` 切范围再滚入明细后截图逐字节一致，`frame-visible-03` 组合高窗与空会话统计夹具验证首帧在屏内的首行。高窗会被工作区限制实际客户区，单设尺寸的 `frame-visible-01` 只覆盖了接近视口的场景，`frame-visible-02` 的默认窗口也未达到可见断言。`frame-edge-01`、`frame-live-01` 覆盖迟到、筛选、手动重读及真实回环网关追加。
+  fmt、全工作区 release Clippy（-D warnings）、680 项测试和普通 release 构建通过，13 项忽略。普通 exe 在 `request-log-memory-01/release-05/`，SHA256 `84c0956dd4c81b4216e74e66104b3353f9d332749b2e9f7f8ddad2eb56da94d6`，`raw-request/request-log-normal-05` 验过展开、原文请求与返回切换、关闭和重开。
+  复跑 `node .claudesktop/bench/request-log-memory-01/run.mjs <新目录> frame-baseline frame-candidate small,large 3 1 --append-only --draw-on-commit --draw-loading --pin-bench-cpus`，用同目录 `frame-results.mjs <结果目录>` 看配对数据。
+- **请求明细离页回收**。请求与归组数组容量合计达到 16 MiB 时，离页约 30 秒后释放明细、归组、游标和排版缓存。快速返回与小日志复用缓存。返回时按选定范围后台重读。
+  `.claudesktop/bench/request-cache-01/ab-01/comparison.json` 用约 40 MiB、96,004 条日志做三轮交替普通隐藏窗口对照。离页 33 / 35 / 37 秒采样，进程 PB 中位 170.54 → 122.05 MiB，WS 113.13 → 76.18 MiB。快速返回中位 98 → 116ms，过回收期返回 115 → 337ms（点开到界面可操作，含离屏绘制与采样）。部分运行与验证构建并行，小差值受负载影响。
+  `smoke-range-02` 用 7 天范围核对重读从 64,004 增至 64,005 条；`smoke-small-01` 的 2,404 条样本离页后继续复用。`expand-03` 核对应用模型筛选后，同一展开轮重开仍显示两处原文入口。首次窗口驱动的原子改名遇短暂 `EPERM`，只重试测试命令文件。普通 release 候选在 `request-cache-01/release/claudesktop.exe`，SHA256 `5b8c80c4922176ec71c4f8a8d5c85094ac7e0aa603ed1c74de7a1d2664b83431`。
+  自动模式写入集成测试的临时目录不能放项目 `.claudesktop/` 内，否则会命中保护目录。改回默认临时目录后 683 项 workspace release 测试与 Clippy 通过（13 项忽略）。
+- **温会话恢复减少大文本复制**。读取时校验内容哈希及全部引用长度，校验通过后每个块最后一处引用接收原缓冲。引用错误时保持所有预览，修复后可重试。
+  `request-cache-01/warm-smoke-01` 用三个温会话和本地端点验证 50 次请求、24 次界面指纹和 38 次历史核对；坏块时消息留队、修复后只发送一次，退出清理通过。此轮恢复 p95 6.406ms，属于单版快查。
 
 - **连接中的自研会话回收显示数据不能整对象换占位**：`from_records` 会清内核绑定，也丢工具图片和本轮文本附件。
   新路径在 `session/cache.rs` 只搬 `transcript` / `subagents`，以原子临时快照保存；保留同一个 `Session`、模式、队列和界面状态。
@@ -447,6 +480,15 @@
 - **自研历史休眠别只看 `TurnEnded`**（2026-11-14）：标题生成 / 记忆提炼在这之后仍读历史，靠 `history_activity`
   阻止搬空；事件一到就立刻 `hibernate_session` 可能什么都不做（不是状态机坏了）。竞态测试先完成一次休眠 +
   唤醒把这段活动放完，再等 `transitioning_sessions == 1`，才是真的 `Spilling`。Windows 原子重命名前先 `drop(File)`。
+- **自研历史快照流式写盘**：按条借用历史，通过 64 KiB 缓冲写 v1 JSON。失败时只删除本次成功创建的临时文件；
+  `create_new` 失败要保留原路径。`encode_write_ms` 合计编码和缓冲写出，`commit_ms` 含同步及改名。
+  `.claudesktop/bench/snapshot-stream-01/normal-02/` 用普通 release 的隐藏窗口走定时双层休眠、无损继续和重启续接。夹具的不透明 PNG 经 `read_file` 重编码成 JPEG，按实际媒体类型验图，再比对唤醒前后的请求内容。`normal-01` 保留初次误判记录。
+  v1 文件字节兼容、写入期间关闭 / 发送、读写失败恢复及 675 项 release 测试通过（13 项忽略），fmt、Clippy 和普通构建通过。
+  `snapshot-stream-01/verified-write.json` 复核 50 / 200 会话各三对，双方均开内核休眠，界面回收关闭，732 份成对快照消息字节及 2250 对请求指纹相同。取首批落盘结束的 Windows 高水位减落盘前 PB，三轮中位 62.45 → ≤10.42、72.80 → ≤16.22 MiB。候选未刷新写盘前高水位，只能报上界。
+  200 会话单文件写入 p95 中位 118.69 → 221.23ms，首批完成 433 → 377ms，其中一对慢 185ms。六对切回等 200ms 再发送，唤醒 p95 最高 4.71ms，发送额外等待 p95 最大 +8.42ms。单独看全流程峰值，50 会话有一对多 5.03 MiB。
+- **快照流式读取试验**：`snapshot-stream-01/read-isolated-01` 在同一诊断 exe 中比较 `from_slice` 和 64 KiB `BufReader` + `from_reader`，内核和界面各三个样本，每个七对。24.85 MiB 多条快照的内核峰值增量中位 50.71 → 26.86 MiB，读取 p95 22.75 → 174.45ms。界面为 39.93 → 16.39 MiB、28.08 → 83.73ms。
+  含 24 MiB 单字段时，`from_reader` 的字符串暂存缓冲使两层峰值都上升。84 次读取内容一致，10 种损坏或归属不符的输入两边均拒绝。50 会话各单对实际唤醒 p95 为内核 3.98 → 29.04ms、界面 6.18 → 6.54ms。产品保留整包读取。
+  首次界面对照的采样器读 `phase.txt` 遇共享冲突退出。诊断夹具改用临时文件加改名，采样遇短暂 I/O 冲突时沿用上个阶段，`display-read-desktop-02` 通过。两层数据在 `verified-read.json`，读盘试验只编入诊断副本。
 - **自研历史休眠的内核合成测试（2026-11-14，release，50 会话 × 约 2.25 MiB × 3 轮）**：仅测试进程的 PB
   中位数 117.3 → 2.0 MiB、WS 120.2 → 7.3 MiB，不能当桌面应用总占用。唤醒 p95 5.16ms；
   0.002ms 只是驻留后再次 wake，不是真实发送延迟。118.5 MiB 峰值每 5 会话才采一次，不能据此认定峰值门槛通过。

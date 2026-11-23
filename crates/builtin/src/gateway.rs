@@ -20,9 +20,12 @@
 //! 网关从路径里取回真实端点，用途记成 `acp`。会话从请求体里认（Claude Code 在 `metadata.user_id`
 //! 里带会话 ID，和 ACP 会话 ID 一致，见 [`agent_session`]），第几轮由界面发消息时登记（[`note_turn`]）。
 
+mod logs;
 mod request_stats;
 #[cfg(windows)]
 mod socket;
+
+pub use logs::{LogChange, LogCursor, LogUpdate, read_logs};
 
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -141,7 +144,7 @@ impl Gateway {
             let _ = respond(&mut client, 400, &[], b"missing upstream");
             return;
         };
-        entry.host = host_of(&upstream);
+        entry.host = host_of(&upstream).into();
         let url = format!("{}{path}", upstream.trim_end_matches('/'));
         let headers = request.headers.iter().filter(|(name, _)| forwarded(name));
         let result = match request.method.as_str() {
@@ -198,7 +201,7 @@ impl Gateway {
             }
         }
         head.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
-        let mut stats = StreamStats::new(entry.protocol == "anthropic");
+        let mut stats = StreamStats::new(entry.protocol.as_ref() == "anthropic");
         let mut error_body = Vec::new();
         // 存原文用的响应（开着才攒，最多 RESPONSE_MAX）
         let keep =
@@ -253,12 +256,12 @@ impl Gateway {
         #[cfg(all(test, windows))]
         let parse_started = Instant::now();
         if let Ok(stats) = request_stats::parse(body) {
-            entry.model = stats.model;
+            entry.model = stats.model.map(Arc::from);
             if entry.session.is_none()
                 && let Some(session) = stats.user_id.as_deref().and_then(agent_session)
             {
                 entry.turn = turn_of(&session);
-                entry.session = Some(session);
+                entry.session = Some(session.into());
             }
             entry.messages = stats.messages;
             entry.tools = stats.tools;
@@ -397,9 +400,11 @@ impl Drop for TagGuard {
 }
 
 /// 日志里的一行（也是界面读日志时拿到的样子，见 [`read_logs`]）。
+pub type RequestLog = LogRecord<Arc<str>>;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct RequestLog {
+pub struct LogRecord<S> {
     /// 发出的时刻（Unix 毫秒）
     pub at_ms: u64,
     /// provider 的一次请求（重试共用）和第几次尝试
@@ -409,19 +414,19 @@ pub struct RequestLog {
     pub attempt: Option<u32>,
     /// 内核会话 ID（子任务是 `主会话/调用 ID`）
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
+    pub session: Option<S>,
     /// 会话里的第几轮（同一轮的请求归到一起）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn: Option<u64>,
     /// turn / subagent / compact / models / other
-    pub purpose: String,
+    pub purpose: S,
     /// openai / anthropic
-    pub protocol: String,
+    pub protocol: S,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    pub host: String,
-    pub path: String,
-    pub method: String,
+    pub model: Option<S>,
+    pub host: S,
+    pub path: S,
+    pub method: S,
     pub body_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<usize>,
@@ -441,7 +446,7 @@ pub struct RequestLog {
     pub reasoning: u64,
     pub cache_read: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<S>,
     pub cancelled: bool,
     /// 存下的原文（见 [`crate::request_bodies`]）；没存为 None
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -454,7 +459,7 @@ impl RequestLog {
         // 外部 agent 的路径去掉编码的端点那一段
         let path = upstream_of(request).map_or_else(|| request.path.clone(), |(_, p)| p);
         let path = path.split('?').next().unwrap_or_default().to_string();
-        let purpose = request.header(PURPOSE).map(str::to_string).unwrap_or_else(|| {
+        let purpose = request.header(PURPOSE).map(Arc::from).unwrap_or_else(|| {
             if path.ends_with("/models") {
                 "models"
             } else if via {
@@ -462,13 +467,13 @@ impl RequestLog {
             } else {
                 "other"
             }
-            .to_string()
+            .into()
         });
         RequestLog {
             at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
             req_id: request.header(REQUEST).and_then(|v| v.parse().ok()),
             attempt: request.header(ATTEMPT).and_then(|v| v.parse().ok()),
-            session: request.header(SESSION).map(str::to_string),
+            session: request.header(SESSION).map(Arc::from),
             purpose,
             turn: request.header(TURN).and_then(|v| v.parse().ok()),
             protocol: if path.ends_with("/messages") {
@@ -479,9 +484,9 @@ impl RequestLog {
                 "openai"
             }
             .into(),
-            method: request.method.clone(),
+            method: request.method.as_str().into(),
             body_bytes: request.body.len(),
-            path,
+            path: path.into(),
             ..RequestLog::default()
         }
     }
@@ -609,7 +614,7 @@ impl StreamStats {
         entry.output = self.output;
         entry.reasoning = self.reasoning;
         entry.cache_read = self.cache_read;
-        entry.finish_reason = self.finish_reason.clone();
+        entry.finish_reason = self.finish_reason.as_deref().map(Arc::from);
     }
 }
 
@@ -743,41 +748,6 @@ fn host_of(url: &str) -> String {
 
 fn millis(d: Duration) -> u64 {
     d.as_millis() as u64
-}
-
-/// 读 `since_ms` 之后（None = 全部）的请求日志，按时间从早到晚。读坏的行跳过。
-pub fn read_logs(dir: &Path, since_ms: Option<u64>) -> Vec<RequestLog> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    // 按文件名的日期先筛一遍（多留一天，时区边上的不丢）
-    let since_day = since_ms.and_then(|ms| {
-        chrono::DateTime::from_timestamp_millis(ms as i64)
-            .map(|t| t.with_timezone(&Local).date_naive() - chrono::Duration::days(1))
-    });
-    let mut files: Vec<(NaiveDate, PathBuf)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            (path.extension()? == "jsonl").then_some(())?;
-            let date = NaiveDate::parse_from_str(path.file_stem()?.to_str()?, "%Y-%m-%d").ok()?;
-            since_day.is_none_or(|d| date >= d).then_some((date, path))
-        })
-        .collect();
-    files.sort();
-    let mut logs: Vec<RequestLog> = files
-        .iter()
-        .flat_map(|(_, path)| {
-            std::fs::read_to_string(path)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| serde_json::from_str::<RequestLog>(line).ok())
-                .collect::<Vec<_>>()
-        })
-        .filter(|log| since_ms.is_none_or(|ms| log.at_ms >= ms))
-        .collect();
-    logs.sort_by_key(|log| log.at_ms);
-    logs
 }
 
 /// 删掉全部请求日志，返回删了几个文件。
@@ -916,12 +886,21 @@ mod tests {
         std::fs::write(dir.join(format!("{}.jsonl", day(old))), line(old) + "\n").unwrap();
         std::fs::write(
             dir.join(format!("{}.jsonl", day(new))),
-            format!("{}\nnot json\n{}\n", line(new + 5), line(new)),
+            [
+                line(new + 5).as_bytes(),
+                b"\r\nnot json\n\xff\n",
+                line(new).replace("\"turn\"", "\"first\"").as_bytes(),
+                b"\n",
+                line(new).replace("\"turn\"", "\"second\"").as_bytes(),
+                b"\n{\"at_ms\":",
+            ]
+            .concat(),
         )
         .unwrap();
         let all = read_logs(&dir, None);
-        assert_eq!(all.iter().map(|l| l.at_ms).collect::<Vec<_>>(), [old, new, new + 5]);
-        assert_eq!(read_logs(&dir, Some(new)).len(), 2);
+        assert_eq!(all.iter().map(|l| l.at_ms).collect::<Vec<_>>(), [old, new, new, new + 5]);
+        assert_eq!((&all[1].purpose[..], &all[2].purpose[..]), ("first", "second"));
+        assert_eq!(read_logs(&dir, Some(new)), all[1..]);
         assert_eq!(clear_logs(&dir).unwrap(), 2);
         assert!(read_logs(&dir, None).is_empty());
         let _ = std::fs::remove_dir_all(&dir);

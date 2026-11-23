@@ -306,7 +306,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - Windows 分发包统一走 `tools/package-windows.ps1`（校对 exe 版本 / x64、压缩包内容和两份 SHA256）；`v*` tag 生成 Release 草稿，下载产物验收后再发布。
 - 本文件会整份进自研内核的系统提示词（`crates/builtin/src/instructions.rs`，每次请求都带），新增内容保持精炼。
 - 新增要进日志的 `KernelEvent` 时，同时想清楚 `Record::worth_keeping`、`history::rebuild`（续接时进不进上下文）
-  和 `Session::apply_event`（重放时怎么显示）三处。读日志一律先过 `claudesktop_core::effective`（折算回退）。
+  和 `Session::apply_event`（重放时怎么显示）三处。重放日志先折算回退，有所有权用 `into_effective` 原地保留，借用时用 `iter_effective`。
 - **magpie 网关**（`crates/builtin/src/magpie.rs`，「设计说明-本机agent.md」第十四、十五节）：把本机订阅/key
   汇成 `http://127.0.0.1:<port>/v1` 的 Anthropic 端点，自研内核当普通档案用（`settings.rs` 的 `magpie_profile`，
   `ProviderProfile.magpie` 标记自动建的）。「设置 · 内核」页是**本机内核清单**（对齐 magpie 的 Agents 页）：
@@ -365,8 +365,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 用量：首页概览（`app/overview.rs`）的统计卡、热力图格子、模型行和右上角箭头都跳到用量页（`app/usage_view.rs`，
   一整页不分页签：总数、趋势、模型 / 会话排行、时段、请求明细，时间范围和首页共用；画在设置页的位置上但不带分类导航）。
   点一天 / 一个模型 / 一个会话是给整页加筛选（存在 `RequestsView` 的 `day` / `model` / `session`），汇总在 `usage.rs` 的 `board`；
-  费用、缓存命中从网关日志算（`request_costs`）。跑着的轮也要算进去：读用量统计用 `ChatApp::usage_stats`，不直接读 `usage`；
-  网关日志在报用量、一轮结束时自动重读（`refresh_requests_soon`）。新的用量入口一律走 `ChatApp::open_usage`。
+  费用、缓存命中从网关日志算（`request_costs`）；`requests::costs` 每种模型匹配一次单价，一次遍历更新总额、模型和会话。
+  跑着的轮也要算进去：读用量统计用 `ChatApp::usage_stats`，不直接读 `usage`。网关日志在报用量、一轮结束时合批按偏移补读（`refresh_requests_soon`），
+  日志删改、切时间范围或点「重新读取」时全读。补读保留旧下标，`requests::Groups` 只更新涉及的回合，按发出时间排列（允许迟到）。
+  连续的请求下标存为区间。日志逐行读取，缓冲按剩余字节分配至多 64 KiB。解码时借用 JSON 行里的短字符串，
+  和上一条保留记录的同一字段相同就复用，否则查有界共享表。加载占位时量请求明细的位置，若仍在视口和预排区下方，首帧仅占位；
+  列表排出来后测实际位置与行高，首页和用量页切换时重新量位置。请求与归组两个数组占用合计达到 16 MiB 时，离页约 30 秒后释放明细缓存。
+  保留范围、筛选和展开键，返回按当前范围后台全读。新的用量入口一律走 `ChatApp::open_usage`。
 - 子 agent 在 `crates/builtin/src/subagent.rs`：`task` 工具开子会话（ID `主会话/调用 ID`），和主会话共用 `run_steps`；
   内置角色 `general-purpose` / `explore`（只读），何时派写在主会话提示词（`subagent::DELEGATION`）；子会话模型按「角色写的 → 设置 `subagent_model` → 跟主会话」取。
   子会话的事件经 `subagent::forward` 转到主会话（工具行带 `parent`，回复 / 思考换成 `SubagentChunk`，
@@ -377,7 +382,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   还有没做完的项、连续 `TODO_REMIND_STEPS` 步没更新时，在那次请求的最后一条消息上临时挂提醒（不进历史，`todo_nudge`）；
   压缩时内核把当前清单附在摘要后面（`tools::summary_with_todos`），不靠总结的模型抄。
 - **历史与用量按需读取**：启动时 `Session::placeholder` 只给最近 100 个会话建元信息占位，首屏不读 jsonl；
-  激活后 `ChatApp::ensure_history_loaded` 后台重放，读取期间发送进现有队列，磁盘搜索跳转等加载完成再定位。
+  激活后 `ChatApp::ensure_history_loaded` 后台读日志，界面移动有效记录重放，读取期间发送进现有队列。
+  磁盘搜索逐行扫描，只留短标题和有限命中，遇回退撤销失效命中，跳转等加载完成再定位。
   `has_user_message` 对未加载占位也为真，别把占位误删成空会话。用量由 `usage::build_index` 在后台读
   `usage-cache.json`，复用行缓冲按偏移补扫，末尾半行留待下次；当前格式的 `event` 行按标签跳过。删除会话要换代，迟到的索引结果不能覆盖新轮次。
 - **ACP 工具内容与文件委托**：`content` 和 `rawOutput` 是两条通道，分别落到 `ToolCallContent` 和
@@ -401,8 +407,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   三种 provider 借用历史内容直接序列化，公共出口在 `crates/builtin/src/request.rs`，`extra` 仍最后覆盖。
   请求内存 A/B 用 `tools/request-memory-bench.mjs` 对比两个 release 测试二进制，结果只代表内核测试进程。
 - **自研历史休眠**（`crates/builtin/src/hibernate.rs`）：默认开启，`CLAUDESKTOP_HIBERNATE=0` 可关闭，
-  只把完整 `SessionState.history` 原子写入数据目录 `session-hibernation/`，其余会话状态、`acp_id` 和 `restored` 不变，
-  恢复不发 `Started`、不走有损日志续接。界面保留当前 + 最近 2 个温会话，其余闲置 10 分钟后台休眠
+  借用 `SessionState.history` 逐条写入 64 KiB 缓冲的临时文件，保留 v1 JSON 格式，刷写、同步并关闭句柄后原子改名到 `session-hibernation/`。
+  恢复保留会话状态、`acp_id` 和 `restored`，不发 `Started`。界面保留当前 + 最近 2 个温会话，其余闲置 10 分钟后台休眠
   （压测可用 `CLAUDESKTOP_HIBERNATE_IDLE_SECS` 改阈值），激活后台 `wake_session`，发送在内核线程兜底恢复。
   发送 / 压缩 / 回退 / 关闭共用每会话 `history_io`，轮末标题和记忆提炼另算 `history_activity`；磁盘 I/O 不持全局会话锁。
   界面显示数据另由 `session/cache.rs` 无损暂存到 `display-cache/`（正文、子任务、工具图片和文本附件），
@@ -414,7 +420,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `app/image_cache.rs` 按全部解码帧字节限制非钉住部分 64 MiB，渲染引用和加载中项钉住，淘汰逐窗口 `drop_image`，开关
   `CLAUDESKTOP_DISABLE_IMAGE_RECLAIM`。公式节点只存哈希 / 尺寸 / 源码，`core::math` 按实际字节 4 MiB LRU，
   开关 `CLAUDESKTOP_DISABLE_MATH_RECLAIM`。非活动且空闲会话的单项 256 KiB 以上回复 / 思考 / 启动信息 / diff /
-  文本附件由 `session/blocks.rs` 外置，预览 4 KiB；激活先校验恢复、发送兜底、冷休眠先还原成原快照，
+  文本附件由 `session/blocks.rs` 外置，预览 4 KiB；激活先校验全部块和引用，再把正文搬到最后一处引用。发送兜底恢复，冷休眠先还原成原快照。
   读失败保留块与错误并留队，开关 `CLAUDESKTOP_DISABLE_WARM_RECLAIM`。压测 `tools/hibernate-bench.mjs`
   有 `--sample=render|math|warm` 和对应 `--compare=image|math|warm`，原始结果与每阶段分类账都存 `.claudesktop/bench/`。
 - 流式文本合批上屏（`Session::stream_pending` / `STREAM_FLUSH`）：chunk 先进缓冲，短消息每 50ms 并进正文一次，

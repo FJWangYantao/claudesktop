@@ -76,7 +76,7 @@ impl ChatApp {
         if let Some(log) = &mut s.log {
             let _ = log.flush();
         }
-        store.load(&meta.id).ok().map(|records| claudesktop_core::effective(&records))
+        store.load(&meta.id).ok().map(claudesktop_core::into_effective)
     }
 
     #[cfg(feature = "headless-screenshot")]
