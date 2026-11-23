@@ -184,7 +184,8 @@ pub(super) const JUMP_TAU: f32 = 0.06;
 /// 平滑回到底部最多滑这么久，之后直接交给自动跟随（流式输出时底部一直在长）
 pub(super) const JUMP_MAX: Duration = Duration::from_millis(500);
 
-/// 滚轮平滑：剩下的距离每过这么久衰减到 1/e（比回到底部干脆，滚轮要跟手）
+/// 设置页 / 模型清单的平滑滚动：剩下的距离每过这么久衰减到 1/e。
+/// （对话列表不用这套，走 `session::WheelInput` 的 112ms 曲线）
 pub(super) const WHEEL_TAU: f32 = 0.05;
 /// 一串滚轮最后一格之后最多再滑这么久（正常 4 倍 TAU 就到了，这是兜底）
 pub(super) const WHEEL_MAX: Duration = Duration::from_millis(600);
@@ -192,8 +193,7 @@ pub(super) const WHEEL_MAX: Duration = Duration::from_millis(600);
 pub(super) const WHEEL_INSTANT: f32 = 0.5;
 /// 平滑目标最多领先当前位置这么多：连滚几格时欠账有上限，停下后不会还自己滑一大段
 pub(super) const WHEEL_MAX_LEAD: Pixels = px(120.);
-/// 平滑一帧最多走这么多：卡顿帧（进了高行要排版）不许一步跨出剩余距离的大半，
-/// 宁可多滑几帧，不能「瞬移」——否则滚动途中会突然跳一大截
+/// 设置页一帧最多走这么多：卡顿帧不许一步跨出剩余距离的大半
 pub(super) const WHEEL_MAX_STEP: Pixels = px(48.);
 
 /// 「回到底部」的平滑滚动进行中：哪个会话、何时开始、上一帧的时刻。

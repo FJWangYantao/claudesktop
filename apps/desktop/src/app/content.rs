@@ -56,7 +56,7 @@ impl ChatApp {
             .child(self.loop_overlay.clone())
     }
 
-    /// 设置页的普通滚动区也走对话那套滚轮曲线；模型清单有独立的内层滚动区。
+    /// 设置页 / 模型清单的平滑滚动（指数逼近，参数见 `motion::WHEEL_*`）；模型清单有独立的内层滚动区。
     pub(super) fn settings_wheel_by(
         &mut self,
         delta: Pixels,
@@ -260,10 +260,11 @@ impl ChatApp {
         }
 
         self.step_jump_to_bottom(window);
-        self.step_wheel(window);
         // 虚拟列表：只布局 / 绘制视口附近的行；最后一行是运行状态行（见 Session::sync_list）
         let view = self.settings.view_mode;
         self.sessions[active].sync_list(view);
+        // 滚轮在列表状态（行数、定位）都更新完之后才推进这一帧，免得和跳转、补行抢
+        self.step_wheel(window);
         let state = self.sessions[active].list.clone();
         let scroll = list(
             state,

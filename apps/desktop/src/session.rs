@@ -12,7 +12,7 @@ use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(crate) mod blocks;
 pub(crate) mod cache;
@@ -175,8 +175,8 @@ pub struct Session {
     pub stopping: bool,
     /// 下次同步列表时滚到这一行（从搜索结果跳过来）
     pub reveal: Option<usize>,
-    /// 滚轮平滑滚动进行中（见 `ChatApp::step_wheel`）；跳转、回到底部时清掉，免得两边抢
-    pub wheel: Option<WheelScroll>,
+    /// 滚轮平滑滚动进行中（见 [`WheelInput`]）；跳转、回到底部时清掉，免得两边抢
+    pub wheel: Option<WheelInput>,
     /// 刚在权限卡上「拒绝并说明」或提问面板「自己说」：输入框的占位文字提示，用户输入或发送时清掉
     pub steering: Option<&'static str>,
     /// 最近一轮输入命中提示缓存的比例（%）；端点没报告时为 None
@@ -292,7 +292,155 @@ const STREAM_FLUSH_MAX: std::time::Duration = std::time::Duration::from_millis(2
 const STREAM_FLUSH_RAMP: usize = 8 * 1024;
 const STREAM_FLUSH_LONG: usize = 64 * 1024;
 
-/// 滚轮平滑滚动：滚轮只推进 `target`（离列表顶部的像素），实际位置每帧往它逼近一步。
+/// 滚轮一格从起手到走完的时长（`F` 曲线在它之后恒为 1）
+const WHEEL_GLIDE: Duration = Duration::from_millis(112);
+/// 曲线两端各用这么久加减速，中间匀速
+const WHEEL_RAMP: Duration = Duration::from_millis(16);
+/// 一帧最多走的像素：卡顿帧（进了高行要排版）不许一步跨出去，宁可多滑几帧
+const WHEEL_STEP_MAX: Pixels = px(48.);
+/// 欠量小于这么多就算走完（亚像素的尾巴不值得再排一帧）
+const WHEEL_SETTLE: f32 = 0.5;
+/// 曲线全到期后余量最多再等这么久：底部还在按估算行高排时先留着，等真实布局把距离放出来；
+/// 列表一直排不出这段高度（真到头了）就在这之后丢掉，不会一直排帧。
+const WHEEL_HOLD: Duration = Duration::from_millis(400);
+
+/// 一次离散滚轮输入：什么时候到的、带符号多少像素（正值向下）。
+#[derive(Clone, Copy, Debug)]
+struct WheelEvent {
+    at: Instant,
+    delta: Pixels,
+}
+
+/// 对话的滚轮平滑状态：每次离散输入排成一条 `WHEEL_GLIDE` 长的加减速曲线，
+/// 每帧按曲线从「上次采样」到「现在」的增量累进 `due`，再从欠量里取一步交给列表。
+///
+/// 和旧写法（记住滚动条的绝对目标、每帧用读数逼近）的区别在于这里**只存用户还要走多少**：
+/// 上方行补量会抬高滚动条读数，但欠量只由输入和已走的距离决定，补量不会凭空造出位移；
+/// 连滚几格也不会因为「先走一半再拿当前位置和目标比」丢掉上一格的余量。
+/// 同向输入追加，各自沿曲线继续；反向输入清空旧方向的事件和欠量，从这次输入重新起步。
+#[derive(Clone, Debug, Default)]
+pub struct WheelInput {
+    /// 还没走完的输入（到期就清掉）
+    events: Vec<WheelEvent>,
+    /// 曲线已经到期、但受 `WHEEL_STEP_MAX` 限速还没走完的像素
+    due: Pixels,
+    /// 上一次采样的时刻（曲线的积分起点）
+    last: Option<Instant>,
+    /// 曲线全到期时还欠着的时刻（超过 `WHEEL_HOLD` 就认定到边界，余量作废）
+    stalled_at: Option<Instant>,
+}
+
+impl WheelInput {
+    pub fn new(now: Instant, delta: Pixels) -> Self {
+        let mut w = Self::default();
+        w.push(now, delta);
+        w
+    }
+
+    /// 追加一次输入。方向和已有的一致就排队，反了就整条重来（不带旧余量）。
+    pub fn push(&mut self, now: Instant, delta: Pixels) {
+        if delta == px(0.) {
+            return;
+        }
+        let down = delta > px(0.);
+        // 上一串已经走干净：这条重新起曲线，从此刻积分（不然新输入会拿旧的采样时刻，
+        // 第一帧一步跨出整段）
+        let fresh = self.events.is_empty() && self.due == px(0.);
+        let old_down =
+            self.events.last().map(|e| e.delta > px(0.)).unwrap_or_else(|| self.due > px(0.));
+        if fresh || old_down != down {
+            // 新的一串 / 换了方向：旧方向的事件和欠量都作废
+            self.events.clear();
+            self.due = px(0.);
+            self.last = Some(now);
+            self.stalled_at = None;
+        }
+        self.events.push(WheelEvent { at: now, delta });
+    }
+
+    /// 推进到 `now`：把这段区间里每条曲线的增量并进欠量、清掉到期的事件，
+    /// 返回这一帧该走的距离（已按 `WHEEL_STEP_MAX` 限速，正 = 向下）。
+    /// 采样时间和当前时间都从外面传，测试可以注入固定时刻。
+    pub fn advance(&mut self, now: Instant) -> Pixels {
+        let last = self.last.replace(now).unwrap_or(now);
+        if last != now {
+            for e in &self.events {
+                let progressed = curve(now.saturating_duration_since(e.at))
+                    - curve(last.saturating_duration_since(e.at));
+                self.due += e.delta * progressed;
+            }
+        }
+        self.events.retain(|e| now.saturating_duration_since(e.at) < WHEEL_GLIDE);
+        // 亚像素的尾巴直接归零：不留一个每帧都在反方向的零头
+        if self.due.abs() < px(WHEEL_SETTLE) {
+            self.due = px(0.);
+        }
+        // 曲线走完了还欠着：可能只是限速没走完，也可能底部还在按估算行高排（见「HOLD」）。
+        // 真在走的时候 `consume` 会把它清掉，只有连续走不动才开始计时
+        if self.events.is_empty() && self.due != px(0.) {
+            self.stalled_at.get_or_insert(now);
+        } else if self.due == px(0.) {
+            self.stalled_at = None;
+        }
+        self.due.clamp(-WHEEL_STEP_MAX, WHEEL_STEP_MAX)
+    }
+
+    /// 记账：实际走了 `applied`（边界裁剪之后）。还在走就不算「卡住」，
+    /// 只有一直一步都走不出去才开始算 [`WHEEL_HOLD`]（限速走完不属于卡住）。
+    pub fn consume(&mut self, applied: Pixels) {
+        self.due -= applied;
+        if self.due.abs() < px(WHEEL_SETTLE) {
+            self.due = px(0.);
+        }
+        if applied != px(0.) {
+            self.stalled_at = None;
+        }
+    }
+
+    /// 这个方向已经到头：朝这个方向的事件和欠量作废，别每帧空转。
+    pub fn block(&mut self, down: bool) {
+        self.events.retain(|e| (e.delta > px(0.)) != down);
+        if (self.due > px(0.)) == down {
+            self.due = px(0.);
+        }
+        if self.due == px(0.) {
+            self.stalled_at = None;
+        }
+    }
+
+    /// 欠量已经等了太久还没走完（列表放不出这段距离）：丢掉，别一直排帧。
+    pub fn expired(&self, now: Instant) -> bool {
+        self.stalled_at.is_some_and(|at| now.saturating_duration_since(at) >= WHEEL_HOLD)
+    }
+
+    /// 曲线全到期、欠量也走完了：不再排帧。
+    pub fn is_done(&self, now: Instant) -> bool {
+        self.events.is_empty() && (self.due == px(0.) || self.expired(now))
+    }
+
+    /// 还有多少欠量（只在测试里看）。
+    #[cfg(test)]
+    pub fn due(&self) -> Pixels {
+        self.due
+    }
+}
+
+/// 滚轮速度曲线归一化到 0…1：前 [`WHEEL_RAMP`] 二次加速、中间匀速、最后 [`WHEEL_RAMP`] 二次减速。
+/// 面积正好是 1，所以一条输入走完的位移就是它自己的像素数。
+fn curve(t: Duration) -> f32 {
+    let d = WHEEL_GLIDE.as_secs_f32();
+    let r = WHEEL_RAMP.as_secs_f32();
+    let t = t.as_secs_f32().clamp(0., d);
+    if t < r {
+        t * t / (2. * r * (d - r))
+    } else if t <= d - r {
+        (t - r / 2.) / (d - r)
+    } else {
+        1. - (d - t) * (d - t) / (2. * r * (d - r))
+    }
+}
+
+/// 设置页 / 模型清单的平滑滚动：滚轮只推进 `target`（离列表顶部的像素），实际位置每帧往它逼近一步。
 #[derive(Clone, Copy, Debug)]
 pub struct WheelScroll {
     pub target: Pixels,
@@ -720,6 +868,8 @@ impl Session {
             self.list.remeasure_items(n..n + 1);
         }
         if let Some((offset, following)) = self.display_scroll.take() {
+            // 会话恢复的位置说了算：滚轮剩下的余量作废
+            self.wheel = None;
             if following {
                 self.list.scroll_to_end();
             } else {
@@ -2515,6 +2665,146 @@ mod tests {
 
     // 注意：本文件顶层 `use gpui_kit::*` 会把 gpui 的 test 宏带进作用域，
     // 遮蔽内建 #[test]，必须用全路径（原文件其他测试同理）。
+
+    /// 模拟一段时间里的逐帧推进：返回每帧的步长（每帧都实际走完）。
+    fn run_wheel(w: &mut WheelInput, start: Instant, tick: Duration, frames: usize) -> Vec<f32> {
+        (1..=frames)
+            .map(|i| {
+                let step = w.advance(start + tick * i as u32).as_f32();
+                w.consume(px(step));
+                step
+            })
+            .collect()
+    }
+
+    /// 曲线归一化：从 0 单调爬到 1，匀速段的中点正好是 0.5，一条输入走完的位移就是它自己的像素数。
+    #[core::prelude::v1::test]
+    fn wheel_curve_climbs_to_one() {
+        assert_eq!(curve(Duration::ZERO), 0.);
+        assert!((curve(WHEEL_GLIDE / 2) - 0.5).abs() < 1e-5, "中点 {}", curve(WHEEL_GLIDE / 2));
+        assert_eq!(curve(WHEEL_GLIDE), 1.);
+        assert_eq!(curve(WHEEL_GLIDE + Duration::from_millis(50)), 1.);
+        // 单调不减，且变速段光滑（相邻 1ms 差值不跳变超过匀速段）
+        let mut prev = 0.;
+        for i in 0..=112 {
+            let f = curve(Duration::from_millis(i));
+            assert!(f >= prev - 1e-6, "{i}ms 回退");
+            prev = f;
+        }
+    }
+
+    /// 单格 60px 在 16ms 帧下分成七帧，步长约 5、10、10、10、10、10、5。
+    #[core::prelude::v1::test]
+    fn wheel_single_notch_steps_at_60hz() {
+        let start = Instant::now();
+        let mut w = WheelInput::new(start, px(60.));
+        let steps = run_wheel(&mut w, start, Duration::from_millis(16), 8);
+        let first: Vec<i32> = steps[..7].iter().map(|s| s.round() as i32).collect();
+        assert_eq!(first, vec![5, 10, 10, 10, 10, 10, 5]);
+        assert_eq!(steps.iter().sum::<f32>().round() as i32, 60);
+        assert!(steps.iter().all(|s| *s >= 0.), "全程同向");
+        assert!(w.is_done(start + Duration::from_millis(200)));
+    }
+
+    /// 60 / 120 / 144 Hz 下，单格和同向四格的总位移都是输入本身的像素数。
+    #[core::prelude::v1::test]
+    fn wheel_distance_matches_input_at_any_refresh_rate() {
+        for hz in [60u32, 120, 144] {
+            let frame = Duration::from_secs_f32(1. / hz as f32);
+            let start = Instant::now();
+            let mut one = WheelInput::new(start, px(60.));
+            let total: f32 =
+                run_wheel(&mut one, start, frame, (hz as usize / 4).max(8)).iter().sum();
+            assert!((total - 60.).abs() <= 0.5, "{hz}Hz 单格走了 {total}");
+
+            let mut four = WheelInput::new(start, px(60.));
+            for _ in 0..3 {
+                four.push(start, px(60.));
+            }
+            let steps = run_wheel(&mut four, start, frame, (hz as usize / 4).max(8));
+            let total: f32 = steps.iter().sum();
+            assert!((total - 240.).abs() <= 1., "{hz}Hz 四格走了 {total}");
+            assert!(steps.iter().all(|s| *s >= 0.), "{hz}Hz 出现反向帧");
+        }
+    }
+
+    /// 长帧（100ms 空档）：单帧不超过 48px，剩下的下一帧走完。
+    #[core::prelude::v1::test]
+    fn wheel_long_frame_is_capped_and_finished_next() {
+        let start = Instant::now();
+        let mut w = WheelInput::new(start, px(600.));
+        let first = w.advance(start + Duration::from_millis(100));
+        assert!(first <= px(48.), "单帧 {first:?} 超过上限");
+        w.consume(first);
+        let rest = w.advance(start + Duration::from_millis(116));
+        assert!(rest <= px(48.));
+        // 曲线已到期，欠量继续走
+        let mut total = first + rest;
+        let mut at = start + Duration::from_millis(116);
+        for _ in 0..40 {
+            at += Duration::from_millis(16);
+            let step = w.advance(at);
+            w.consume(step);
+            total += step;
+        }
+        assert!((total.as_f32() - 600.).abs() <= 1., "总计 {total:?}");
+        assert!(w.is_done(at));
+    }
+
+    /// 同向输入各自沿曲线继续，反向输入清空旧方向和欠量。
+    #[core::prelude::v1::test]
+    fn wheel_reverse_clears_pending_distance() {
+        let start = Instant::now();
+        let mut w = WheelInput::new(start, px(60.));
+        let s1 = w.advance(start + Duration::from_millis(16));
+        w.consume(s1);
+        // 还没走完就往回滚一格
+        w.push(start + Duration::from_millis(16), px(-60.));
+        assert_eq!(w.due(), px(0.), "反向时旧欠量应当清空");
+        let back = w.advance(start + Duration::from_millis(32));
+        assert!(back <= px(0.), "换向后第一帧就朝新方向：{back:?}");
+        w.consume(back);
+        // 走完这一格的总位移正好是 -60（不带上一格剩下的）
+        let mut total = back;
+        let mut at = start + Duration::from_millis(32);
+        for _ in 0..12 {
+            at += Duration::from_millis(16);
+            let step = w.advance(at);
+            w.consume(step);
+            total += step;
+        }
+        assert!((total.as_f32() + 60.).abs() < 1., "换向后总位移 {total:?}");
+    }
+
+    /// 到边界：朝外的欠量作废，不再排帧；列表一直放不出距离时也在 WHEEL_HOLD 之后停。
+    #[core::prelude::v1::test]
+    fn wheel_stops_at_boundary_or_after_hold() {
+        let start = Instant::now();
+        let mut w = WheelInput::new(start, px(-60.));
+        let step = w.advance(start + Duration::from_millis(16));
+        // 顶部：一步也没走（`apply_relative` 返回 0，于是判到头），朝这个方向的余量作废
+        assert!(step < px(0.));
+        w.block(step > px(0.));
+        assert_eq!(w.due(), px(0.));
+        let mut at = start + Duration::from_millis(16);
+        for _ in 0..30 {
+            at += Duration::from_millis(16);
+            assert_eq!(w.advance(at), px(0.));
+        }
+        assert!(w.is_done(at));
+
+        // 欠量走不完（列表还没量出这段高度）：等到 WHEEL_HOLD 之后收掉
+        let mut w = WheelInput::new(start, px(600.));
+        let mut at = start;
+        for _ in 0..10 {
+            at += Duration::from_millis(16);
+            w.advance(at);
+        }
+        assert!(!w.is_done(at), "刚等一会儿不该放弃");
+        let later = at + WHEEL_HOLD;
+        assert!(w.expired(later) && w.is_done(later), "等太久应当放弃余量");
+    }
+
     /// 渐隐跟着滚动位置收放：滚不动时两条都不画（不然最后一行会被底下那条盖住一截）。
     #[core::prelude::v1::test]
     fn scroll_edge_hides_fades_at_the_ends() {
@@ -2532,6 +2822,7 @@ mod tests {
     #[core::prelude::v1::test]
     fn markdown_export_covers_item_kinds() {
         let mut s = Session::new(1, KernelChoice::Demo, PathBuf::from("C:/proj"));
+
         s.title = "测试会话".into();
         s.note("一条备注");
         let user =
