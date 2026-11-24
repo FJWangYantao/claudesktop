@@ -40,6 +40,8 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
             ("回答提问 / 权限卡上的第 n 项", &PERMISSION_KEYS),
             ("切换权限模式", &[CYCLE_MODE_KEY]),
             ("切换视图（摘要 / 标准 / 详细）", &[CYCLE_VIEW_KEY]),
+            ("向上 / 向下翻一页", &[PAGE_UP_KEY, PAGE_DOWN_KEY]),
+            ("跳到对话开头 / 回到底部", &[SCROLL_TOP_KEY, SCROLL_BOTTOM_KEY]),
         ],
     ),
     (

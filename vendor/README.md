@@ -20,6 +20,11 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
 - **变高列表重排时保留滚动锚点和估算高度**（`src/elements/list.rs` 的 `List::with_estimated_item_height`）：
   源码预览用估算高度让未测量行参与滚动范围。宽度或估算高度变化时，保住视口顶部条目和行内比例，再按需测量实际高度。
   滚动越过估算范围时从实际末项向上排。`bounds_for_item` 从视口顶部累加高度，以免大坐标相减丢失精度。
+- **对话列表的行高估高与跟随判定辅助**（`src/elements/list.rs`，2026-11 scroll polish）：
+  `splice_with_hints` / `remeasure_with_hints` 让新行和整表重估一次带上估高（滚动条、底部判定第一帧就准）；
+  宽度变化时保留每行原有的 `size_hint`；`set_auto_reengage(false)` 关掉「离底 1px 自动重贴」，
+  由 `Session::sync_follow` 按几何 + 方向接管；`is_tail_measured` 改为「视口顶到末尾全部实测」，
+  避免中间某段估高偏小时提前判定到底。
 
 ## markdown 1.0.0
 

@@ -199,6 +199,12 @@ impl Session {
             self.blocks_error = Some(format!("保存大块显示数据失败：{error}"));
             return Err(error);
         }
+        if count > 0 {
+            // 正文已换成 4 KiB 预览：拆块副本没有意义且会占着整篇正文的内存，释放掉；
+            // 下一帧按新正文重算行划分（`rows_sig = None`）
+            self.agent_parts.clear();
+            self.rows_sig = None;
+        }
         Ok(count)
     }
 
@@ -257,6 +263,8 @@ impl Session {
         match result {
             Ok(count) => {
                 self.blocks_error = None;
+                // 正文整段回来了：行划分（拆块）要按恢复后的正文重算
+                self.rows_sig = None;
                 Ok(count)
             }
             Err(error) => {

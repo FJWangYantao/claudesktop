@@ -144,9 +144,31 @@ fn state_of(url: &str) -> State {
     table().lock().map_or(State::Idle, |t| t.get(url).cloned().unwrap_or(State::Idle))
 }
 
+/// 图片状态变了多少次（占位 ↔ 加载中 ↔ 真图 ↔ 失败）。真图和占位卡高度差很多，
+/// 行高指纹混入它，图片就绪那一帧列表才会重测这一行（见 `Session::row_key`）。
+static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn revision() -> u64 {
+    REVISION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn state_kind(state: &State) -> u8 {
+    match state {
+        State::Idle => 0,
+        State::Loading => 1,
+        State::Ready(_) => 2,
+        State::Failed(_) => 3,
+    }
+}
+
 fn set_state(url: &str, state: State) {
     if let Ok(mut table) = table().lock() {
+        let changed = table.get(url).map(state_kind) != Some(state_kind(&state));
         table.insert(url.to_string(), state);
+        drop(table);
+        if changed {
+            REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

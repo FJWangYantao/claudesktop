@@ -25,7 +25,8 @@ use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, MoveDown, MoveLeft, MoveRight, MoveUp, Position,
+    Enter, Escape, IndentInline, MoveDown, MoveLeft, MovePageDown, MovePageUp, MoveRight, MoveUp,
+    Position,
 };
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -380,6 +381,20 @@ impl ChatApp {
         )
         .capture_action(cx.listener(|this, _: &MoveLeft, window, cx| this.on_arrow(-1, window, cx)))
         .capture_action(cx.listener(|this, _: &MoveRight, window, cx| this.on_arrow(1, window, cx)))
+        // PageUp / PageDown：输入框为空时翻对话（输入框自己把它们绑成了 MovePageUp / Down，
+        // 有草稿时照常按输入框翻自己的全文）
+        .capture_action(cx.listener(|this, _: &MovePageUp, _, cx| {
+            if this.input.read(cx).value().trim().is_empty() && !this.settings_open {
+                cx.stop_propagation();
+                this.scroll_page(-1, cx);
+            }
+        }))
+        .capture_action(cx.listener(|this, _: &MovePageDown, _, cx| {
+            if this.input.read(cx).value().trim().is_empty() && !this.settings_open {
+                cx.stop_propagation();
+                this.scroll_page(1, cx);
+            }
+        }))
         // Alt+← / Alt+→：在光标处重新展开 / 收起列表（键位绑在 keys.rs）
         .capture_action(cx.listener(|this, _: &ExpandCompletion, _, cx| this.expand_completion(cx)))
         .capture_action(

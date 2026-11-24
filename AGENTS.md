@@ -57,11 +57,16 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   分组规则在 `Session::compute_layout`）；
   行高受别的状态影响时（如"是不是回合末尾"），把那个状态并进 `Session::row_key`（或 `RowLayout`），否则虚拟列表不会重测。
   权限请求带工具调用 ID，应答后结果并进那一行（`ToolCard::grant`，见 `Session::merge_permission`），权限行不再画。
+  超过 4 KiB 的已完成回复在 `Session::rows` 里拆成多个虚拟行（`Row::Part`）：**列表下标 ≠ 记录下标**，
+  `measured` / 列表用行下标、`layout` / `transcript` 用记录下标，换算走 `Session::row_of`；
+  元素 id 用行下标，`reveal` / `pin` / 闪烁 / 搜索定位传记录下标。拆块规则在 `split_markdown`，由 `rebuild_rows` 在记录形态变化时重算，流式中不拆。
 - **权限模式「自动」**（`crates/builtin/src/auto.rs`）：由一次独立的模型调用（分类器）代替用户审批。
   `authorize` 里 `Access::Read` 和工作目录内的编辑**不进分类器**（省一个往返），其余走
   「硬熔断（`tools::hard_block`：删关键路径、写受保护文件）→ 已保存规则 → 分类器」。
   分类器只喂用户说过的话 + 要执行的动作，**剥掉助手文本和工具结果**（防自我说服、防注入）；
   判不出来一律按拒绝。拒绝的理由连同「别换个马甲重试」回给模型，它自己决定换路子还是问用户。
+  放行**不发事件**（不刷「已自动批准」）；拦下的理由并进那条失败的工具行（`Verdict::AutoDeny` →
+  `ToolOutput::fail`），不另发 `Notice`——用户看到的就是这一行。
   连续 3 次 / 累计 20 次拒绝就停下来等用户（用户再发消息就重新计数）。分类器看的用户消息续接 / 回退时从日志重建（`history::Rebuilt::user_messages`）。没在设置里配好时这个模式不出现在模式列表里。
   设置里开着时，**新建的对话默认就是「自动」**（`ChatApp::new_session` → `Session::default_to`）：
   会话还没连上内核时先把这一项补进模式表（`model::auto_mode_entry`）并选中，`Started` 时走
@@ -161,10 +166,14 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     内容区以外自己就是小覆盖层的 view（侧栏转圈）用 `spinner_in_place`。
     转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
     动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
-    motion 版相位按全局时钟算，由节拍器每两帧重画一次（约 30 帧）。
+    motion 版相位按全局时钟算，节拍器按 60 帧（16ms）跑；圆弧扫过固定 `SPIN_SWEEP`（0.30），
+    不再做粗细 / 长度脉动，看着是匀速转，帧率变化也不改观感。相位锚在上一帧实际画出的时刻
+    （`LAST_LOOP_PAINT`），节拍器晚到也不会漂。
   - 展开 / 收起：`reveal_progress(id, open, ..)` 拿弹簧进度，内容 `progress > 0` 时包进 `Reveal::new(id, progress, ..)`；
-    和标题之间的空隙算进内容（`pt_1` 而不是外层 `gap`），收到底才不剩一截。过程组里的步骤在列表那层
-    （`RowLayout::member`）统一处理。悬停才出现的操作用 `hover_opacity`；刚出现的内容用 `entering`。
+    列表里的一步**即使进度已是 1.0 也一直挂着 `Reveal`**（它要量过一次高度，收起首帧才不按 0 高塌一下）；
+    自动收起（新行涌入、正文到达）用 `reveal_progress_when(.., animate=false)` 直接落位，
+    只有用户手动点过的组（`Session::animated_group`）才播弹簧。
+    悬停才出现的操作用 `hover_opacity`；刚出现的内容用 `entering`。
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
   - 对话列表的滚轮在 `content.rs` 的 capture 阶段截住，走 `ChatApp::wheel_by` / `step_wheel`
     （gpui `List` 自己一格硬跳）。平滑状态是 `session.rs` 的 `WheelInput`：**只存「用户还要滚多少」**
@@ -174,6 +183,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     设置页外层和模型清单另走 `settings_wheel_by` / `step_settings_wheel`（指数逼近的 `WheelScroll`），
     按指针位置和边界选择内层或外层，切分类 / 来源要清掉对应的 `*_wheel`。新的程序化滚动（跳转、跟随底部）
     也要清掉对应滚动状态，否则两边抢。
+    展开的工具输出自带限高滚动区：每次内容区渲染把它的区域和句柄登记进 `ChatApp::tool_scroll_regions`，
+    滚轮落在上面且还能滚时 `scroll_tool_output` 在 capture 阶段就把这一格滚掉并照常拦下事件
+    （只放行不拦会双滚动：`overflow_y_scroll` 和列表的 bubble 监听器都会各滚一次）。
 - **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
   下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
   `SessionMeta::task`），最后是「已归档」。判定在 `ChatApp::new_session`（`is_project_dir`：

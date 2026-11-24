@@ -4,7 +4,7 @@
 //! 连续的几步收进可折叠的组（分组规则在 `Session::compute_layout`）。
 
 use super::ChatApp;
-use super::menu::diff_stat;
+use super::menu::{MenuList, diff_stat, menu_item, menu_panel};
 use super::motion::{self, Reveal};
 use super::rewind::file_name;
 use super::widgets::Surface;
@@ -19,6 +19,8 @@ use gpui_kit::base::motion::{Presence, Transition};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::Position;
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
@@ -29,7 +31,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 同组相邻两步之间的行距
-const STEP_GAP: Rems = rems(0.375);
+pub(super) const STEP_GAP: Rems = rems(0.375);
+/// 已定型正文的渲染缓存条数（见 `reading_markdown`）
+const MARKDOWN_CACHE_LEN: usize = 256;
+
+thread_local! {
+    /// (原文哈希, 原文, 渲染结果)
+    static MARKDOWN_CACHE: std::cell::RefCell<Vec<(u64, String, SharedString)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 /// 块与块之间的行距
 pub(super) const BLOCK_GAP: Rems = rems(1.);
 /// 步骤行左侧的图标格宽度；组内细线对着它的中线。
@@ -201,6 +211,10 @@ pub(super) fn text_tip(text: &str, window: &mut Window, cx: &mut App) -> AnyView
 /// 拒绝时结果里已经写了「已拒绝」就不重复。
 fn grant_badge(id: impl Into<ElementId>, card: &ToolCard) -> Option<Stateful<Div>> {
     let grant = card.grant.as_ref()?;
+    // 自动放行保持安静：不画徽章（失败的工具行自己会说明被拦下的原因）
+    if grant.kind == GrantKind::Auto {
+        return None;
+    }
     if grant.kind == GrantKind::Denied && card.result.contains("拒绝") {
         return None;
     }
@@ -384,15 +398,58 @@ impl ChatApp {
             } else {
                 body
             };
-            col = col.child(if reveal < 1. {
+            col = col.child(if layout.member {
+                // 展开着也一直挂着（即使进度已是 1.0）：Reveal 要量过一次高度，收起的第一帧才不会按 0 高塌一下
                 Reveal::new(("step-body", ix), reveal, body).into_any_element()
             } else {
                 body.into_any_element()
             });
         }
+        // 这一轮没有正文回复（被打断，或者只跑了工具）：回合末尾的改动卡片和用时挂在最后一步下面。
+        // 作为顶层的兄弟节点，不跟组内步骤缩进，也不受 `Reveal` 收起裁切的影响
+        if !matches!(item, ChatItem::Agent(_))
+            && self.session().is_turn_fallback_tail(ix, self.settings.view_mode)
+        {
+            let (latest, meta, tip, files) = {
+                let s = self.session();
+                let latest =
+                    !s.transcript[ix + 1..].iter().any(|i| matches!(i, ChatItem::User { .. }));
+                let summary = s.turn_summary(ix);
+                (
+                    latest,
+                    summary.and_then(super::status::turn_meta),
+                    summary.and_then(|t| super::status::turn_meta_tooltip(&t.usage)),
+                    s.turn_files(ix),
+                )
+            };
+            if !files.is_empty() {
+                col =
+                    col.child(div().pt_3().child(self.render_changes_card(ix, files, latest, cx)));
+            }
+            if let Some(meta) = meta {
+                let row = div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .pt_1()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .font_features(tabular_nums());
+                col = col.child(match tip {
+                    Some(tip) => row
+                        .id(("fallback-meta", ix))
+                        .tooltip(move |window, cx| text_tip(&tip, window, cx))
+                        .child(meta)
+                        .into_any_element(),
+                    None => row.child(meta).into_any_element(),
+                });
+            }
+        }
         // 用户消息和回合末尾正文下面已经挂着操作行，块间距收成 STEP_GAP，避免每轮留出过多空白
         let gap = if matches!(item, ChatItem::User { .. })
             || (matches!(item, ChatItem::Agent(_)) && self.session().is_turn_end(ix))
+            || (!matches!(item, ChatItem::Agent(_))
+                && self.session().is_turn_fallback_tail(ix, self.settings.view_mode))
         {
             if layout.tight { Rems::ZERO } else { STEP_GAP }
         } else {
@@ -416,8 +473,11 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let s = self.session();
-        let (summary, failed) =
-            group_summary(s.transcript[ix..group.end].iter().filter(|i| i.has_content()));
+        let (summary, failed) = group_summary(
+            s.transcript[ix..group.end]
+                .iter()
+                .filter(|i| i.has_content() && i.visible_in(self.settings.view_mode)),
+        );
         let toggle = self.settings.view_mode != ViewMode::Verbose;
         div()
             .id(("step-group", ix))
@@ -432,12 +492,17 @@ impl ChatApp {
                 d.cursor_pointer().hover(|d| d.text_color(rgb(INK))).on_click(cx.listener(
                     move |this, _, _, cx| {
                         let active = this.active;
+                        this.sessions[active].pin_row(ix);
                         this.sessions[active].toggle_group(ix);
                         cx.notify();
                     },
                 ))
             })
-            .child(icon_cell(Icon::new(IconAll::ListChecks).size_3p5()))
+            .child(icon_cell(if group.live {
+                Icon::new(IconAll::Activity).size_3p5().text_color(rgb(CORAL))
+            } else {
+                Icon::new(IconAll::ListChecks).size_3p5()
+            }))
             .child(
                 div()
                     .min_w_0()
@@ -479,12 +544,13 @@ impl ChatApp {
         let has_text = !text.trim().is_empty();
         let toggle = !verbose && has_text;
         let open = (open || verbose) && has_text;
-        let header = step_line(Icon::new(IconAll::Brain).size_3p5().text_color(rgb(INK_SOFT)))
+        let header = step_line(Icon::new(IconAll::Sparkles).size_3p5().text_color(rgb(INK_SOFT)))
             .id(("think-toggle", idx))
             .when(toggle, |d| d.role(Role::Button).aria_expanded(open))
             .when(toggle, |d| {
                 d.cursor_pointer().hover(|d| d.text_color(rgb(INK))).on_click(cx.listener(
                     move |this, _, _, cx| {
+                        this.sessions[this.active].pin_row(idx);
                         if let Some(ChatItem::Thinking { open, .. }) =
                             this.sessions[this.active].transcript.get_mut(idx)
                         {
@@ -546,6 +612,7 @@ impl ChatApp {
             .when(!verbose, |d| {
                 d.cursor_pointer().hover(|d| d.text_color(rgb(INK))).on_click(cx.listener(
                     move |this, _, _, cx| {
+                        this.sessions[this.active].pin_row(idx);
                         if let Some(ChatItem::Info { open, .. }) =
                             this.sessions[this.active].transcript.get_mut(idx)
                         {
@@ -598,8 +665,13 @@ impl ChatApp {
         let mut col = div().v_flex().gap_2();
         for (k, diff) in card.diffs.iter().enumerate() {
             let rest = (ElementId::from(("diff-rest", idx * 64 + k)), rest);
-            col =
-                col.child(Self::render_diff(diff, cwd, preview, Some(rest), Some((card, settle))));
+            col = col.child(Self::render_diff(
+                diff,
+                cwd,
+                preview,
+                Some(rest),
+                Some((idx * 1024 + k, card, settle)),
+            ));
         }
         // diff 已经说明了改了什么；结果摘要只在失败时有用（为什么没改成）
         if card.phase == ToolPhase::Failed && !card.result.is_empty() {
@@ -613,7 +685,7 @@ impl ChatApp {
         }
         // ACP 一个工具可以同时给 diff、文字和图片，不能只画 diff
         if !card.content.trim().is_empty() || !card.images.is_empty() {
-            col = col.child(self.tool_output(card));
+            col = col.child(self.tool_output(idx, card, window, cx));
         }
         let hidden: usize =
             card.diffs.iter().map(|d| d.lines.len().saturating_sub(DIFF_PREVIEW_ROWS)).sum();
@@ -632,6 +704,7 @@ impl ChatApp {
                     .text_color(rgb(INK_SOFT))
                     .hover(|d| d.text_color(rgb(INK)))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sessions[this.active].pin_row(idx);
                         if let Some(ChatItem::Tool(card)) =
                             this.sessions[this.active].transcript.get_mut(idx)
                         {
@@ -664,6 +737,7 @@ impl ChatApp {
                 d.cursor_pointer()
                     .hover(|d| d.text_color(rgb(INK)))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sessions[this.active].pin_row(idx);
                         if let Some(ChatItem::Tool(card)) =
                             this.sessions[this.active].transcript.get_mut(idx)
                         {
@@ -685,14 +759,28 @@ impl ChatApp {
         let mut col = div().v_flex().child(line);
         let progress = motion::reveal_progress(("tool", idx), open, window, cx);
         if progress > 0. && has_output {
-            col = col.child(Reveal::new(("tool-body", idx), progress, self.tool_output(card)));
+            col = col.child(Reveal::new(
+                ("tool-body", idx),
+                progress,
+                self.tool_output(idx, card, window, cx),
+            ));
         }
         col
     }
 
     /// 工具行点开后的内容（等宽、卡片底），缩进到工具名下面；和标题之间的空隙算在里面。
-    /// 命令先列完整命令（`$` 开头，折行），下面是输出（跑着时是到目前为止的最后几行）。
-    pub(super) fn tool_output(&self, card: &ToolCard) -> Div {
+    /// 命令先列完整命令（`$` 开头，折行），下面是输出（跑着时是到目前为止的最后几行），
+    /// 命令和输出各挂一个「复制」；输出超过一屏高就在卡片里滚，别把整段都铺进对话流。
+    pub(super) fn tool_output(
+        &self,
+        idx: usize,
+        card: &ToolCard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        // 复制按钮的状态按「哪条消息的哪个块」记：命令和输出各占一个不会和代码块撞的编号
+        const CMD_BLOCK: usize = usize::MAX;
+        const OUT_BLOCK: usize = usize::MAX - 1;
         // 空行给个空格占住行高
         let line =
             |l: &str| div().child(if l.is_empty() { " ".to_string() } else { l.to_string() });
@@ -702,24 +790,39 @@ impl ChatApp {
             card.content.trim_matches('\n')
         };
         let running = card.phase == ToolPhase::Running;
-        let command =
-            card.shows_command().then(|| {
-                let lines: Vec<&str> = card.arg.trim().lines().collect();
-                let shown = lines.len().min(COMMAND_PREVIEW_LINES);
-                div()
-                    .v_flex()
-                    .text_color(rgb(INK))
-                    .children(lines[..shown].iter().enumerate().map(|(i, l)| {
-                        line(&if i == 0 { format!("$ {l}") } else { (*l).to_string() })
-                    }))
-                    .when(lines.len() > shown, |d| {
-                        d.child(
-                            div()
-                                .text_color(rgb(INK_SOFT))
-                                .child(format!("… 其余 {} 行未显示", lines.len() - shown)),
-                        )
-                    })
-            });
+        let command = card.shows_command().then(|| {
+            let lines: Vec<&str> = card.arg.trim().lines().collect();
+            let shown = lines.len().min(COMMAND_PREVIEW_LINES);
+            div()
+                .v_flex()
+                .text_color(rgb(INK))
+                .child(
+                    div()
+                        .h_flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().v_flex().children(
+                            lines[..shown].iter().enumerate().map(|(i, l)| {
+                                line(&if i == 0 { format!("$ {l}") } else { (*l).to_string() })
+                            }),
+                        ))
+                        .child(self.tool_copy(
+                            ("tool-copy-cmd", idx),
+                            (idx, CMD_BLOCK),
+                            card.arg.trim().to_string(),
+                            "复制命令",
+                            window,
+                            cx,
+                        )),
+                )
+                .when(lines.len() > shown, |d| {
+                    d.child(
+                        div()
+                            .text_color(rgb(INK_SOFT))
+                            .child(format!("… 其余 {} 行未显示", lines.len() - shown)),
+                    )
+                })
+        });
         let has_command = command.is_some();
         // 工具带回来的图片（`read_file` 读到的图、MCP 的多模态结果）：点开看大图
         let thumbs = (!card.images.is_empty()).then(|| {
@@ -743,6 +846,57 @@ impl ChatApp {
                 }),
             )
         });
+        let output_body = (!output.is_empty()).then(|| {
+            let text = output.to_string();
+            // 长输出在卡片里滚：对话列表的滚轮捕获层会截走竖向滚轮，所以把区域和句柄登记给
+            // `ChatApp`，指针在上面时让它先滚（见 `content.rs` 的滚轮处理）
+            let scroll = window
+                .use_keyed_state(("tool-out-scroll", idx), cx, |_, _| ScrollHandle::new())
+                .read(cx)
+                .clone();
+            let regions = self.tool_scroll_regions.clone();
+            let paint_handle = scroll.clone();
+            div()
+                .v_flex()
+                // 命令和输出之间一条细线；只有输出时不用画
+                .when(has_command, |d| d.border_t_1().border_color(rgb(LINE)).pt_2())
+                .child(
+                    div()
+                        .relative()
+                        .child(
+                            div()
+                                .id(("tool-out-scroll", idx))
+                                .max_h(rems(18.))
+                                .overflow_y_scroll()
+                                .track_scroll(&scroll)
+                                // 常显的滚动条占右侧一条：文字别铺到它底下
+                                .pr_4()
+                                .child(div().v_flex().children(output.lines().map(line))),
+                        )
+                        .child(
+                            canvas(
+                                move |bounds, window, _| {
+                                    // 只登记真正露在视口里的那部分：卡片滚出去一半时，
+                                    // 被裁掉的那半不还能命中滚轮
+                                    let visible = bounds.intersect(&window.content_mask().bounds);
+                                    regions.borrow_mut().push((visible, paint_handle.clone(), idx))
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
+                        .child(Scrollbar::vertical(&scroll).mode(ScrollbarMode::Always)),
+                )
+                .child(div().h_flex().justify_end().child(self.tool_copy(
+                    ("tool-copy-out", idx),
+                    (idx, OUT_BLOCK),
+                    text,
+                    "复制输出",
+                    window,
+                    cx,
+                )))
+        });
         div().pt_1().pl(STEP_INDENT).child(
             div()
                 .v_flex()
@@ -759,13 +913,83 @@ impl ChatApp {
                 .text_color(rgb(INK_SOFT))
                 .children(command)
                 .children(thumbs)
-                .when(!output.is_empty(), |d| {
-                    d.child(div().v_flex().children(output.lines().map(line)))
-                })
+                .children(output_body)
                 .when(has_command && output.is_empty() && running, |d| {
-                    d.child(div().text_color(rgb(INK_FAINT)).child("运行中，还没有输出…"))
+                    d.child(div().text_color(rgb(INK_SOFT)).child("运行中，还没有输出…"))
                 }),
         )
+    }
+
+    /// 指针落在工具输出上：在 capture 阶段直接把这一格滚掉。返回 `None` 表示内层吃掉了，
+    /// 返回 `Some(剩余)` 表示该交给外层列表（没有任何内层命中，或者这一格粘滞期已过、内层已在尽头）。
+    ///
+    /// 滚到底之后有 250ms 的粘滞期：同一行继续滚仍然吞掉，不穿透到外层（`overscroll-behavior: contain`
+    /// 的等价物）；停顿之后再滚才交还。交还时调用方仍要 `stop_propagation()`，否则
+    /// `overflow_y_scroll` 和列表的 bubble 监听器都会再滚一次。
+    pub(super) fn scroll_tool_output(
+        &mut self,
+        pos: Point<Pixels>,
+        dy: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Option<Pixels> {
+        /// 内层到达尽头之后的粘滞时长
+        const NESTED_LOCK: Duration = Duration::from_millis(250);
+        let now = Instant::now();
+        let hit = self.tool_scroll_regions.borrow().iter().find_map(|(bounds, handle, idx)| {
+            bounds.contains(&pos).then(|| (handle.clone(), *idx))
+        });
+        let Some((handle, idx)) = hit else {
+            return Some(dy);
+        };
+        // 滚到底的路上别越界：越界后滚轮还要还给外层列表
+        let offset = handle.offset().y;
+        let max = handle.max_offset().y.max(px(0.));
+        let next = (offset + dy).max(-max).min(px(0.));
+        if next != offset {
+            handle.set_offset(point(handle.offset().x, next));
+            // 外层平滑滚动的余量作废：这一格给了内层，别再补到对话上
+            self.sessions[self.active].wheel = None;
+            self.nested_scroll_lock = Some((idx, now + NESTED_LOCK));
+            self.content_view.update(cx, |_, cx| cx.notify());
+            // 这一格已经消费在内层（含刚撞到边界的那一格），整格吞掉；
+            // 余量留给下一次输入，等粘滞期过了再交还外层，别在边界处先弹一下再卡住
+            return None;
+        }
+        if let Some((locked, until)) = self.nested_scroll_lock
+            && locked == idx
+            && now < until
+        {
+            // 还在同一次连续滚动里：吞掉，粘滞期跟着续
+            self.nested_scroll_lock = Some((idx, now + NESTED_LOCK));
+            return None;
+        }
+        self.nested_scroll_lock = None;
+        Some(dy)
+    }
+
+    /// 工具输出里的「复制」：和消息下方的复制共用同一份「刚复制了什么」状态。
+    /// `at` 是（这一条消息的下标, 块编号）。
+    fn tool_copy(
+        &self,
+        id: impl Into<ElementId>,
+        at: (usize, usize),
+        text: String,
+        tip: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let (idx, block) = at;
+        let copied = self.copied == Some((self.session().token, idx, Some(block)));
+        let (icon, tip) = if copied { (IconAll::Check, "已复制") } else { (IconAll::Copy, tip) };
+        let pop =
+            self.copied_at.filter(|_| copied).and_then(|t| motion::enter(t.elapsed(), window, cx));
+        Self::quiet_button(id, icon, Surface::Sand, cx)
+            .xsmall()
+            .tooltip(tip)
+            .when_some(pop, |b, (opacity, _)| b.opacity(opacity))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.copy_to_clipboard(idx, Some(block), text.clone(), cx);
+            }))
     }
 
     /// 不带 diff 的工具：一行，名称稍深、参数等宽、结果摘要接在后面（都单行省略，悬停看全文）。
@@ -1125,7 +1349,7 @@ impl ChatApp {
                                 div()
                                     .text_size(TEXT_BODY)
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("要允许这一步吗？"),
+                                    .child(permission_prompt(title)),
                             ),
                     )
                     .child(
@@ -1170,15 +1394,15 @@ impl ChatApp {
         match picked {
             Some(picked) => {
                 step_line(Icon::new(IconAll::MessageSquare).size_3p5().text_color(rgb(INK_SOFT)))
-                    .child(div().flex_shrink_0().child("问了一下"))
+                    .child(div().flex_shrink_0().child("已回答"))
                     .child(ellipsis(("question-title", idx), first))
-                    .child(div().flex_shrink_0().child(format!("· {picked}")))
+                    .child(ellipsis(("question-picked", idx), format!("· {picked}").into()))
             }
             // 还没答：面板挂在输入框上方，这里只说一句去哪选
             None => step_line(Icon::new(IconAll::MessageSquare).size_3p5().text_color(rgb(CORAL)))
-                .child(div().flex_shrink_0().child("想问你"))
+                .child(div().flex_shrink_0().child("等待回答"))
                 .child(ellipsis(("question-title", idx), first))
-                .child(div().flex_shrink_0().text_color(rgb(INK_SOFT)).child("· 在下面选")),
+                .child(div().flex_shrink_0().text_color(rgb(INK_SOFT)).child("· 请在下方选择")),
         }
     }
 
@@ -1456,6 +1680,7 @@ impl ChatApp {
                 .child(text)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let active = this.active;
+                    this.sessions[active].pin_last_row(idx);
                     let s = &mut this.sessions[active];
                     if !s.changes_open.remove(&idx) {
                         s.changes_open.insert(idx);
@@ -1496,13 +1721,14 @@ impl ChatApp {
 
     /// 一个文件的 diff 卡片；`preview` = 默认露出的行数（None = 全部）。
     /// 超出的部分由 `rest`（元素 id, 展开进度）决定：进度 > 0 时按进度裁切着画出来。
-    /// `tool`（工具, 结果图标的入场进度）给了时表头带上工具的状态图标和名称（兼当工具行）。
+    /// `tool`（行号 / diff 编号, 工具, 结果图标的入场进度）给了时表头带上工具的状态图标和名称（兼当工具行）；
+    /// 编号同时用来给授权标记起元素 id——同一条路径可能在不同的行里各出现一次，不带行号会撞。
     pub(super) fn render_diff(
         diff: &DiffView,
         cwd: &Path,
         preview: Option<usize>,
         rest: Option<(ElementId, f32)>,
-        tool: Option<(&ToolCard, f32)>,
+        tool: Option<(usize, &ToolCard, f32)>,
     ) -> Div {
         let shown = preview.map_or(diff.lines.len(), |n| n.min(diff.lines.len()));
         let truncated = diff.truncated.then(diff_truncated);
@@ -1520,11 +1746,11 @@ impl ChatApp {
     pub(super) fn diff_card(
         diff: &DiffView,
         cwd: &Path,
-        tool: Option<(&ToolCard, f32)>,
+        tool: Option<(usize, &ToolCard, f32)>,
         body: impl IntoElement,
     ) -> Div {
         let icon = match tool {
-            Some((card, settle)) => tool_status_icon(card, settle),
+            Some((_, card, settle)) => tool_status_icon(card, settle),
             None => {
                 Icon::new(IconAll::FileText).size_3p5().text_color(rgb(INK_SOFT)).into_any_element()
             }
@@ -1544,7 +1770,7 @@ impl ChatApp {
             .text_size(TEXT_SMALL)
             .text_color(rgb(INK_SOFT))
             .child(icon_cell(icon))
-            .children(tool.map(|(card, _)| {
+            .children(tool.map(|(_, card, _)| {
                 div()
                     .flex_shrink_0()
                     .font_weight(FontWeight::MEDIUM)
@@ -1563,9 +1789,7 @@ impl ChatApp {
                     .children(dir),
             )
             .when(diff.created, |d| d.child(new_file_tag()))
-            .children(tool.and_then(|(card, _)| {
-                grant_badge(ElementId::Name(format!("diff-grant-{}", diff.path).into()), card)
-            }))
+            .children(tool.and_then(|(key, card, _)| grant_badge(("diff-grant", key), card)))
             .child(
                 div()
                     .flex_shrink_0()
@@ -1755,10 +1979,13 @@ impl ChatApp {
     pub(super) fn start_jump_to_bottom(&mut self, cx: &mut Context<Self>) {
         let s = &mut self.sessions[self.active];
         s.wheel = None;
+        s.release_pin();
+        // 用户自己点了「回到底部」：发消息后的强跟随窗口作废，按普通跳转走
+        s.drop_force_follow();
         let remaining = distance_to_end(&s.list);
         if cx.reduce_motion() || remaining <= px(1.) {
             s.follow_tail();
-            cx.notify();
+            self.content_view.update(cx, |_, cx| cx.notify());
             return;
         }
         let viewport = s.list.viewport_bounds().size.height;
@@ -1767,31 +1994,65 @@ impl ChatApp {
         }
         let now = Instant::now();
         self.jump = Some(motion::JumpAnim { token: s.token, started: now, last: now });
-        cx.notify();
+        self.content_view.update(cx, |_, cx| cx.notify());
     }
 
-    /// 平滑回到底部的一帧（`render` 开头调）：剩下的距离按指数衰减地滑过去，
-    /// 够近了或走了太久就交给自动跟随。切走会话、用户自己滚到底了就停。
+    /// 平滑回到底部的一帧（`render` 开头调）：固定 320ms cubic-out 滑过去，
+    /// 到底或走完时长就交给自动跟随。切走会话、用户自己滚 / 拖滚动条了就停。
     pub(super) fn step_jump_to_bottom(&mut self, window: &mut Window) {
         let Some(mut anim) = self.jump.take() else {
             return;
         };
         let s = &mut self.sessions[self.active];
-        if anim.token != s.token || s.list.is_following_tail() {
-            return;
-        }
-        let remaining = distance_to_end(&s.list);
-        if remaining <= px(1.) || anim.started.elapsed() > motion::JUMP_MAX {
-            s.follow_tail();
+        if anim.token != s.token || s.list.is_following_tail() || s.list.is_scrollbar_dragging() {
             return;
         }
         let now = Instant::now();
-        let dt = (now - anim.last).as_secs_f32();
+        let elapsed = now.saturating_duration_since(anim.started);
+        let dt = now.saturating_duration_since(anim.last);
         anim.last = now;
-        let k = 1. - (-dt / motion::JUMP_TAU).exp();
-        s.list.scroll_by((remaining * k).max(px(1.)).min(remaining));
+        let remaining = distance_to_end(&s.list);
+        if remaining <= px(1.) || elapsed >= motion::JUMP_DURATION {
+            s.follow_tail();
+            return;
+        }
+        let k = motion::jump_step(elapsed, dt);
+        // 每帧至少走半像素，别在长距离末尾拖出几十个亚像素帧
+        let step = (remaining * k).max(px(0.5)).min(remaining);
+        s.list.scroll_by(step);
         self.jump = Some(anim);
         window.request_animation_frame();
+    }
+
+    /// 键盘翻页：折算成一页高度的滚轮输入，和滚轮共用同一套阻尼（两套手感会立刻被察觉）。
+    pub(super) fn scroll_page(&mut self, direction: isize, cx: &mut Context<Self>) {
+        if self.settings_open {
+            cx.propagate();
+            return;
+        }
+        let viewport = self.session().list.viewport_bounds().size.height;
+        if viewport <= px(0.) || direction == 0 {
+            cx.propagate();
+            return;
+        }
+        self.wheel_by(viewport * 0.85 * direction as f32, false, cx);
+    }
+
+    /// Ctrl+Home：回到这段对话的开头（停止跟底，不播放长距离动画）。
+    pub(super) fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
+        if self.settings_open {
+            cx.propagate();
+            return;
+        }
+        self.jump = None;
+        let s = &mut self.sessions[self.active];
+        s.release_pin();
+        s.wheel = None;
+        s.note_input(false);
+        s.list.pause_following_tail();
+        s.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        s.quiet_follow(Duration::from_millis(700));
+        self.content_view.update(cx, |_, cx| cx.notify());
     }
 
     /// 滚轮往末尾滚了 `delta`（正 = 往下，负 = 往上）：把离散输入累计到
@@ -1805,7 +2066,11 @@ impl ChatApp {
         let now = Instant::now();
         let direct = precise || cx.reduce_motion();
         let s = &mut self.sessions[self.active];
-        // 往上翻就当场离开底部：不然流式追加会把位置拉回末尾
+        // 用户自己滚了：展开 / 收起时钉住的那一行不用再补偿
+        s.release_pin();
+        // 往上翻就当场离开底部：不然流式追加会把位置拉回末尾。
+        // 方向记进跟随状态机——只有「往下滚回距底 80px 内」才重新吸附
+        s.note_input(delta > px(0.));
         if delta < px(0.) {
             s.list.pause_following_tail();
         }
@@ -1835,11 +2100,6 @@ impl ChatApp {
         // 用户拖滚动条：平滑让位，别两边抢（拖动结束也不会接着滑）
         if s.list.is_scrollbar_dragging() {
             return;
-        }
-        // 还在往上走就每帧再压一次跟随：列表在「离底不到 1px」时会自动重新跟随，
-        // 若紧邻重绘或小步长导致首帧位移不到 1px，流式追加会把视口拽回底部
-        if w.direction().is_some_and(|down| !down) {
-            s.list.pause_following_tail();
         }
         let step = w.advance(now);
         if step != px(0.) {
@@ -1875,7 +2135,13 @@ impl ChatApp {
         };
         if next != self.hovered_msg {
             self.hovered_msg = next;
-            cx.notify();
+            // 只有消息行自己的淡入淡出要用它：不通知整窗（侧栏、输入框不必跟着重画）。
+            // 滚动 / 拖滚动条时内容区每帧都在重画，悬停变化等下一帧顺带画出来即可，
+            // 不再额外通知（一帧能收几十次 hover 事件）
+            let scrolling = self.scrolling_until.is_some_and(|until| Instant::now() < until);
+            if !scrolling {
+                self.content_view.update(cx, |_, cx| cx.notify());
+            }
         }
     }
 
@@ -1965,14 +2231,17 @@ impl ChatApp {
         // 只给配置过的内核：启用的每一条 agent 档案都是候选（新会话在它上面开）
         let acp_agents: Vec<KernelChoice> =
             self.settings.acp.agents.iter().map(|a| KernelChoice::Acp(a.id.clone())).collect();
-        let others = std::iter::once(KernelChoice::Builtin).chain(acp_agents).filter(|k| {
-            *k != current
-                && match k {
-                    KernelChoice::Builtin => self.settings.builtin.is_configured(),
-                    KernelChoice::Acp(_) => true,
-                    KernelChoice::Demo => false,
-                }
-        });
+        let others: Vec<KernelChoice> = std::iter::once(KernelChoice::Builtin)
+            .chain(acp_agents)
+            .filter(|k| {
+                *k != current
+                    && match k {
+                        KernelChoice::Builtin => self.settings.builtin.is_configured(),
+                        KernelChoice::Acp(_) => true,
+                        KernelChoice::Demo => false,
+                    }
+            })
+            .collect();
         let edit_tip = if images.is_empty() {
             "放回输入框，改完重新发送"
         } else {
@@ -1997,10 +2266,12 @@ impl ChatApp {
                     ),
             )
             .child(self.rewind_action(idx, cx));
-        for (n, kind) in others.into_iter().enumerate() {
+        // 只有一个别的内核就直接给按钮；多了收进菜单，别把操作行排成一串按钮
+        if others.len() == 1 {
+            let kind = others[0].clone();
             actions = actions.child(
                 Self::message_action(
-                    ("rerun", idx * 4 + n),
+                    ("rerun", idx * 4),
                     IconAll::RefreshCw,
                     format!("在「{}」上重跑", kind.label(&self.settings.acp)),
                     cx,
@@ -2009,6 +2280,43 @@ impl ChatApp {
                     let kind = kind.clone();
                     this.rerun_on(idx, kind, cx)
                 })),
+            );
+        } else if others.len() > 1 {
+            let kinds = others;
+            let handle = cx.entity();
+            let focus = self.menu_focus.clone();
+            let trigger = Self::message_action(
+                ("rerun-menu-btn", idx),
+                IconAll::RefreshCw,
+                "在其他内核上重跑",
+                cx,
+            );
+            actions = actions.child(
+                menu_panel(Popover::new(("rerun-menu", idx)), &self.menu_focus)
+                    .anchor(Anchor::TopRight)
+                    .w(rems(16.))
+                    .trigger(trigger)
+                    .content(move |_, window, cx| {
+                        let popover = cx.entity();
+                        let app = handle.read(cx);
+                        let mut list = MenuList::new(("rerun-menu-list", idx), &handle, &popover)
+                            .without_shortcuts();
+                        for (n, kind) in kinds.iter().enumerate() {
+                            let kind = kind.clone();
+                            let label = format!("在「{}」上重跑", kind.label(&app.settings.acp));
+                            list = list.pick(
+                                menu_item(
+                                    ("rerun-item", idx * 8 + n),
+                                    IconAll::RefreshCw,
+                                    label,
+                                    "",
+                                    false,
+                                ),
+                                move |this, cx| this.rerun_on(idx, kind.clone(), cx),
+                            );
+                        }
+                        list.finish(&focus, window, cx)
+                    }),
             );
         }
         // 气泡：有文字才画文本气泡，图片另起一行缩略图（丢了文件就跳过）。
@@ -2115,93 +2423,7 @@ impl ChatApp {
                 Self::render_question(idx, questions, answer)
             }
             ChatItem::Plan(rows) => Self::render_plan(rows, layout.compact),
-            ChatItem::Agent(text) => {
-                let s = self.session();
-                let streaming = s.busy && idx + 1 == s.transcript.len();
-                let text = reading_markdown(text, streaming);
-                // 代码块右上角：语言名 + 「复制」（点完短暂变对勾，和消息下方的复制同一套状态）
-                let token = s.token;
-                let copied_block = match self.copied {
-                    Some((t, i, block)) if t == token && i == idx => block,
-                    _ => None,
-                };
-                let copied_at = self.copied_at;
-                let app = cx.entity().downgrade();
-                let body = div().min_w_0().child(
-                    TextView::markdown(("agent", idx), text)
-                        .style(markdown_style())
-                        .markdown_extensions(crate::app::math::extensions())
-                        .text_size(TEXT_BODY)
-                        .line_height(LEADING)
-                        .stream_fade(true)
-                        .code_block_actions(move |block, window, cx| {
-                            let start = block.span.map(|span| span.start).unwrap_or(0);
-                            let code = block.code();
-                            let app = app.clone();
-                            code_block_header(
-                                block.lang(),
-                                copied_at.filter(|_| copied_block == Some(start)),
-                                move |_, _, cx| {
-                                    let _ = app.update(cx, |this, cx| {
-                                        this.copy_to_clipboard(
-                                            idx,
-                                            Some(start),
-                                            code.to_string(),
-                                            cx,
-                                        )
-                                    });
-                                },
-                                window,
-                                cx,
-                            )
-                        }),
-                );
-                if !s.is_turn_end(idx) {
-                    return body;
-                }
-                // 一轮回复的末尾挂「复制」和这一轮的用时 / 用量：最后一轮常显，
-                // 更早的悬停才淡入（只改透明度，不挤布局）
-                let latest =
-                    !s.transcript[idx + 1..].iter().any(|i| matches!(i, ChatItem::User { .. }));
-                let hovered = self.hovered_msg == Some(idx);
-                let fade = (!latest)
-                    .then(|| motion::hover_opacity(("agent-actions", idx), hovered, window, cx));
-                let meta = s.turn_summary(idx).and_then(super::status::turn_meta);
-                let files = s.turn_files(idx);
-                let has_files = !files.is_empty();
-                let actions = div()
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .pt_1()
-                    .child(self.copy_action(("copy-agent", idx), idx, window, cx, |s, idx| {
-                        s.turn_text(idx)
-                    }))
-                    .children(meta.map(|m| {
-                        // 和运行中的状态行同一套数字字形，一轮结束换过来时不变样
-                        div()
-                            .text_size(TEXT_META)
-                            .text_color(rgb(INK_SOFT))
-                            .font_features(tabular_nums())
-                            .child(m)
-                    }))
-                    .when_some(fade, |d, opacity| d.opacity(opacity));
-                // 这一轮改过文件：正文和操作行之间一张改动卡片（常显，不跟着悬停淡入淡出）
-                let changes = has_files
-                    .then(|| div().pt_3().child(self.render_changes_card(idx, files, latest, cx)));
-                div().child(
-                    div()
-                        .id(("agent-msg", idx))
-                        .v_flex()
-                        .min_w_0()
-                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            this.set_hovered_msg(idx, *hovered, cx)
-                        }))
-                        .child(body)
-                        .children(changes)
-                        .child(actions),
-                )
-            }
+            ChatItem::Agent(text) => self.render_agent(idx, None, text, window, cx),
             ChatItem::Failed { message, kind } => self.render_failed(idx, message, *kind, cx),
             ChatItem::Compaction { state, open, .. } => {
                 Self::render_compaction(idx, state, *open, window, cx)
@@ -2212,6 +2434,125 @@ impl ChatApp {
                     .child(div().flex_1().min_w_0().child(text.clone()))
             }
         }
+    }
+
+    /// 拆开的大回复里的第 `part` 块。
+    pub(super) fn render_agent_part(
+        &self,
+        idx: usize,
+        part: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let s = self.session();
+        let Some(text) = s.part_text(idx, part) else { return div() };
+        self.render_agent(idx, Some(part), &text, window, cx)
+    }
+
+    /// 一条回复的 Markdown 正文（[`ChatItem::Agent`]）。`part` = 很大的已完成回复被拆到时
+    /// 这一块的下标（见 `session::Row`）；整条画时是 None。
+    pub(super) fn render_agent(
+        &self,
+        idx: usize,
+        part: Option<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let s = self.session();
+        // 正在流式写的是最后一条记录，这时不拆块（`Row::Whole`）
+        let streaming = part.is_none() && s.busy && idx + 1 == s.transcript.len();
+        // 元素 id 用显示行下标：拆开的每一块都不一样，整条时等于记录下标
+        let key = s.row_of(idx) + part.unwrap_or(0);
+        let last = part.is_none_or(|p| s.part_count(idx).is_some_and(|count| p + 1 == count));
+        let text = reading_markdown(text, streaming);
+        // 代码块右上角：语言名 + 「复制」（点完短暂变对勾，和消息下方的复制同一套状态）。
+        // 拆开的大回复里每块的 span 都从 0 起，加上这块在整条回复里的起始字节才是唯一标识
+        let base = part.map_or(0, |p| s.part_start(idx, p));
+        let token = s.token;
+        let copied_block = match self.copied {
+            Some((t, i, block)) if t == token && i == idx => block,
+            _ => None,
+        };
+        let copied_at = self.copied_at;
+        let app = cx.entity().downgrade();
+        let body = div().min_w_0().child(
+            TextView::markdown(("agent", key), text)
+                .style(markdown_style())
+                .markdown_extensions(crate::app::math::extensions())
+                .text_size(TEXT_BODY)
+                .line_height(LEADING)
+                .stream_fade(streaming)
+                .code_block_actions(move |block, window, cx| {
+                    let start = base + block.span.map(|span| span.start).unwrap_or(0);
+                    let code = block.code();
+                    let app = app.clone();
+                    code_block_header(
+                        block.lang(),
+                        copied_at.filter(|_| copied_block == Some(start)),
+                        move |_, _, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.copy_to_clipboard(idx, Some(start), code.to_string(), cx)
+                            });
+                        },
+                        window,
+                        cx,
+                    )
+                }),
+        );
+        if !last || !s.is_turn_end(idx) {
+            return body;
+        }
+        // 一轮回复的末尾挂「复制」和这一轮的用时 / 用量：最后一轮常显，
+        // 更早的悬停才淡入（只改透明度，不挤布局）
+        let latest = !s.transcript[idx + 1..].iter().any(|i| matches!(i, ChatItem::User { .. }));
+        let hovered = self.hovered_msg == Some(idx);
+        let fade =
+            (!latest).then(|| motion::hover_opacity(("agent-actions", key), hovered, window, cx));
+        let summary = s.turn_summary(idx);
+        let meta = summary.and_then(super::status::turn_meta);
+        let meta_tip = summary.and_then(|t| super::status::turn_meta_tooltip(&t.usage));
+        let files = s.turn_files(idx);
+        let has_files = !files.is_empty();
+        let actions = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .pt_1()
+            .child(
+                self.copy_action(("copy-agent", key), idx, window, cx, |s, idx| s.turn_text(idx)),
+            )
+            .children(meta.map(|m| {
+                // 和运行中的状态行同一套数字字形，一轮结束换过来时不变样
+                let cell = div()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .font_features(tabular_nums());
+                match meta_tip {
+                    Some(tip) => cell
+                        .id(("agent-meta", key))
+                        .tooltip(move |window, cx| text_tip(&tip, window, cx))
+                        .child(m)
+                        .into_any_element(),
+                    None => cell.child(m).into_any_element(),
+                }
+            }))
+            .when_some(fade, |d, opacity| d.opacity(opacity));
+        // 这一轮改过文件：正文和操作行之间一张改动卡片（常显，不跟着悬停淡入淡出）
+        let changes =
+            has_files.then(|| div().pt_3().child(self.render_changes_card(idx, files, latest, cx)));
+        div().child(
+            div()
+                .id(("agent-msg", key))
+                .v_flex()
+                .min_w_0()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.set_hovered_msg(idx, *hovered, cx)
+                }))
+                .child(body)
+                .children(changes)
+                .child(actions),
+        )
     }
 }
 
@@ -2341,7 +2682,8 @@ fn apply_relative(list: &ListState, delta: Pixels) -> (Pixels, bool) {
         list.scroll_by(applied);
     }
     let edge = if down {
-        list.is_scrolled_to_end() == Some(true)
+        // 估高把「底部」提前了：末尾真测到才算到底，否则欠量会在估高误差里被吞掉
+        list.is_scrolled_to_end() == Some(true) && list.is_tail_measured()
     } else {
         scroll_top(list) <= px(0.5) && list.logical_scroll_top().item_ix == 0
     };
@@ -2351,9 +2693,46 @@ fn apply_relative(list: &ListState, delta: Pixels) -> (Pixels, bool) {
 /// 回复 / 思考 / 摘要交给 `TextView` 前的整理：流式中补齐半截标记，把 `\( … \)` / `\[ … \]` 这类
 /// 写法统一成 `$…$`（代码里不动，见 `math::normalize_markup`），再收掉全角标点旁的空格。
 pub(super) fn reading_markdown(text: &str, streaming: bool) -> SharedString {
+    // 不流式的正文已经定型：计时器、悬停、滚动都会让它重画，每帧重算规范化没有意义
+    if !streaming && let Some(hit) = markdown_cache_get(text) {
+        return hit;
+    }
+    let original = text;
     let text = if streaming { close_dangling_markup(text) } else { Cow::Borrowed(text) };
     let text = claudesktop_core::math::normalize_markup(&text);
-    SharedString::from(tidy_cjk_spacing(&text).into_owned())
+    let out: SharedString = tidy_cjk_spacing(&text).into_owned().into();
+    if !streaming {
+        markdown_cache_put(original, out.clone());
+    }
+    out
+}
+
+/// 已定型正文的渲染缓存（按原文哈希落格、原串比对）：有界 256 条，满了换掉最旧的一条。
+fn markdown_cache_get(text: &str) -> Option<SharedString> {
+    let hash = hash_text(text);
+    MARKDOWN_CACHE
+        .with_borrow(|cache| cache.iter().find(|e| e.0 == hash && e.1 == text).map(|e| e.2.clone()))
+}
+
+fn markdown_cache_put(text: &str, out: SharedString) {
+    let hash = hash_text(text);
+    MARKDOWN_CACHE.with_borrow_mut(|cache| {
+        if let Some(e) = cache.iter_mut().find(|e| e.0 == hash && e.1 == text) {
+            e.2 = out;
+            return;
+        }
+        if cache.len() >= MARKDOWN_CACHE_LEN {
+            cache.remove(0);
+        }
+        cache.push((hash, text.to_string(), out));
+    });
+}
+
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 /// 流式输出停在半截标记上时（`` `foo `` 或没收尾的 ``` 围栏、`**粗体`），渲染前临时补齐，
@@ -2515,6 +2894,30 @@ fn close_dangling_bold(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// 权限卡的标题：按动作类型说清楚要允许什么，别一律「这一步」。
+/// 标题是内核给的工具名 / 命令原文，只能按关键词粗分；认不出就退回落款。
+fn permission_prompt(title: &str) -> &'static str {
+    let t = title.to_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| t.contains(k));
+    // 以「运行命令 / shell」开头的先归命令：参数里的 edit / remove 是文件名，不是动作。
+    // 只有命令里真带了删除 / 下载动作（`rm `、`curl`…）才落到下面两档
+    let command_head = has(&["运行命令", "shell", "bash", "terminal", "执行"])
+        && !has(&["rm ", "rmdir", "curl", "wget", "delete"]);
+    if command_head {
+        "要允许运行这条命令吗？"
+    } else if has(&["删除", "移除", "rm ", "rmdir", "delete", "remove", "unlink"]) {
+        "要允许删除文件吗？"
+    } else if has(&["http", "fetch", "curl", "wget", "网络", "网页", "web"]) {
+        "要允许访问网络吗？"
+    } else if has(&["命令", "command", "run "]) {
+        "要允许运行这条命令吗？"
+    } else if has(&["写入", "修改", "编辑", "write", "edit", "patch", "replace"]) {
+        "要允许修改这个文件吗？"
+    } else {
+        "要允许这一步吗？"
+    }
+}
+
 /// 权限请求的标题：内核常把命令写成行内代码（`` `ls -la` ``），这里本来就用等宽字，去掉包着的反引号。
 fn plain_title(title: &SharedString) -> SharedString {
     let trimmed = title.trim();
@@ -2527,6 +2930,35 @@ fn plain_title(title: &SharedString) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[core::prelude::v1::test]
+    fn permission_prompt_recognizes_actions() {
+        assert_eq!(permission_prompt("要删除 build/"), "要允许删除文件吗？");
+        assert_eq!(permission_prompt("Write src/main.rs"), "要允许修改这个文件吗？");
+        assert_eq!(permission_prompt("Fetch https://example.com"), "要允许访问网络吗？");
+        assert_eq!(permission_prompt("运行命令 `cargo test`"), "要允许运行这条命令吗？");
+        // 命令参数里的 edit / remove / web 是文件名，不是动作
+        assert_eq!(permission_prompt("运行命令 `cargo test edit_test`"), "要允许运行这条命令吗？");
+        assert_eq!(
+            permission_prompt("运行命令 `cargo test remove_test`"),
+            "要允许运行这条命令吗？"
+        );
+        assert_eq!(permission_prompt("运行命令 `cargo test web_test`"), "要允许运行这条命令吗？");
+        // 命令里真带了删除 / 下载动作才换说法
+        assert_eq!(permission_prompt("运行命令 `rm -rf build`"), "要允许删除文件吗？");
+        assert_eq!(permission_prompt("Bash"), "要允许运行这条命令吗？");
+        assert_eq!(permission_prompt("mcp__custom__tool"), "要允许这一步吗？");
+    }
+
+    #[core::prelude::v1::test]
+    fn reading_markdown_caches_settled_text() {
+        let first = reading_markdown("正文里**有**标记", false);
+        let second = reading_markdown("正文里**有**标记", false);
+        // 定型后同一段文字命中缓存（拿到同一份），结果不变
+        assert_eq!(first, second);
+        // 流式的不进缓存，补齐半截标记后才对
+        assert_eq!(reading_markdown("`abc", true).to_string(), "`abc`");
+    }
 
     #[core::prelude::v1::test]
     fn dangling_code_is_closed_while_streaming() {

@@ -121,6 +121,10 @@ impl SessionStress {
     }
 }
 
+/// 展开着的工具输出滚动区（窗口坐标 + 句柄），供滚轮判定用（见 `chat.rs` 的 `scroll_tool_output`）
+type ToolScrollRegions =
+    std::rc::Rc<std::cell::RefCell<Vec<(Bounds<Pixels>, ScrollHandle, usize)>>>;
+
 pub struct ChatApp {
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
@@ -185,6 +189,8 @@ pub struct ChatApp {
     copied_at: Option<Instant>,
     /// 鼠标停在对话里第几条消息上（当前会话；消息下方的操作按钮淡入淡出）
     hovered_msg: Option<usize>,
+    /// 滚动进行中的截止时刻：这期间悬停变化不再单独通知内容区（每帧本来就在重画）
+    scrolling_until: Option<Instant>,
     /// 「回到底部」的平滑滚动进行中（见 `chat.rs` 的 `step_jump_to_bottom`）
     jump: Option<motion::JumpAnim>,
     /// 所有会话的每轮统计（首页用量概览）
@@ -195,6 +201,12 @@ pub struct ChatApp {
     pub(crate) frame_log: Option<Vec<std::time::Instant>>,
     /// 压测钩子：每帧从 render 开始到整棵树画完用了多少毫秒（只在记 `frame_log` 时记）
     frame_work: std::rc::Rc<std::cell::RefCell<Vec<f64>>>,
+    /// 对话里展开着的工具输出滚动区（窗口坐标 + 句柄 + 行号）：指针在上面时滚轮先滚它，
+    /// 别被对话列表的滚轮捕获层整段截走（见 `content.rs`）
+    tool_scroll_regions: ToolScrollRegions,
+    /// 内层滚动到尽头之后的粘滞期：同一工具行、250ms 内继续滚不穿透到外层列表
+    /// （`overflow` 的等价物，见 `ChatApp::scroll_tool_output`）
+    nested_scroll_lock: Option<(usize, Instant)>,
     /// 压测钩子：`CLAUDESKTOP_STRESS_SESSIONS` 的逐会话激活状态机（每秒 tick 推进一步）
     session_stress: Option<SessionStress>,
     /// 窗口在前台：激活且没最小化（不在前台时才发系统通知，见 `notify.rs`）
@@ -588,12 +600,15 @@ impl ChatApp {
             copied: None,
             copied_at: None,
             hovered_msg: None,
+            scrolling_until: None,
             jump: None,
             usage: Vec::new(),
             usage_index_generation: 0,
             usage_indexing: false,
             frame_log: None,
             frame_work: Default::default(),
+            tool_scroll_regions: Default::default(),
+            nested_scroll_lock: None,
             window_active: true,
             notified: Vec::new(),
             window_handle: window.window_handle(),
@@ -1617,10 +1632,24 @@ impl ChatApp {
                     Ok(records) => {
                         let Some(meta) = app.sessions[idx].meta.clone() else { return };
                         let reveal = app.sessions[idx].pending_reveal_turn;
+                        let old = &app.sessions[idx];
+                        // 冷回收时留下的显示状态（滚动位置、展开的组）跟着新读出来的会话走
+                        let display_scroll = old.display_scroll;
+                        let follow = old.follow;
+                        let open_groups = old.open_groups.clone();
+                        let folded_live_groups = old.folded_live_groups.clone();
+                        let changes_open = old.changes_open.clone();
+                        let plan_folded = old.plan_folded;
                         let mut loaded = Session::from_records(token, meta, records, &app.settings);
                         loaded.diff_revision = app.sessions[idx].diff_revision + 1;
                         loaded.diff_epoch = app.sessions[idx].diff_epoch + 1;
                         loaded.pending_reveal_turn = reveal;
+                        loaded.display_scroll = display_scroll;
+                        loaded.follow = follow;
+                        loaded.open_groups = open_groups;
+                        loaded.folded_live_groups = folded_live_groups;
+                        loaded.changes_open = changes_open;
+                        loaded.plan_folded = plan_folded;
                         loaded.queued = std::mem::take(&mut app.sessions[idx].queued);
                         loaded.compact_queued = app.sessions[idx].compact_queued;
                         app.sessions[idx] = loaded;
@@ -1693,6 +1722,7 @@ impl ChatApp {
         }
         self.last_active[Self::space_slot(space)] = Some(self.sessions[i].token);
         self.sessions[i].wheel = None;
+        self.sessions[i].release_pin();
         self.ensure_history_loaded(i, cx);
         self.wake_kernel_session(i, cx);
         // worktree 目录被用户删了 / 换了电脑：切过来时试着重新检出接上（见 worktree.rs）
@@ -2890,6 +2920,8 @@ impl ChatApp {
         let active = self.active;
         let kernel = self.session_kernel(active);
         self.sessions[active].resolve_permission(item_idx, choice, kernel.as_ref());
+        // 接着跑的这一轮跟着到底，和发消息一致
+        self.sessions[active].follow_tail();
         if let Some(ChatItem::Permission { id, resolved: Some(label), .. }) =
             self.sessions[active].transcript.get(item_idx)
         {
@@ -2933,6 +2965,8 @@ impl ChatApp {
         let active = self.active;
         let kernel = self.session_kernel(active);
         self.sessions[active].resolve_question(item_idx, answer, kernel.as_ref());
+        // 答完提问模型接着跑：和发消息一样回到底部
+        self.sessions[active].follow_tail();
         if let Some(ChatItem::Question { id, answer: Some(answer), .. }) =
             self.sessions[active].transcript.get(item_idx)
         {
@@ -3174,6 +3208,11 @@ impl ChatApp {
             event,
             KernelEvent::AgentMessageChunk { .. } | KernelEvent::AgentThoughtChunk { .. }
         );
+        // 工具进度（命令每 0.5 秒报一次）：输出没画在屏幕上时不必整窗重绘
+        let progress_id = match &event {
+            KernelEvent::ToolCallProgress { id, .. } => Some(id.clone()),
+            _ => None,
+        };
         let mut skip_notify = false;
         match event {
             KernelEvent::Connected { agent_name, .. } => {
@@ -3403,17 +3442,16 @@ impl ChatApp {
                             self.dispatch_queued(idx, cx);
                         }
                     }
-                    // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
-                    if matches!(event, KernelEvent::Started { .. }) {
-                        self.flush_pending_thinking(idx, kernel.as_deref());
-                        self.flush_pending_web(idx, kernel.as_deref());
-                        if !self.queued_compaction(idx) {
-                            self.dispatch_queued(idx, cx);
-                        }
-                    }
                     // 流式 chunk 只是进了合批缓冲、还没并进正文时不重画
-                    // （界面按 STREAM_FLUSH 的节奏出字）；并进过的那一拍照常重画
-                    skip_notify = is_chunk && !self.sessions[idx].take_stream_dirty();
+                    // （界面按 STREAM_FLUSH 的节奏出字）；并进过的那一拍照常重画。
+                    // 折叠着的工具行收到进度也不重画：内容照常写进卡片，展开就能看到最新的
+                    let hidden_progress = progress_id.as_deref().is_some_and(|id| {
+                        !(idx == self.active
+                            && self.sessions[idx]
+                                .is_tool_output_visible(id, self.settings.view_mode))
+                    });
+                    skip_notify =
+                        is_chunk && !self.sessions[idx].take_stream_dirty() || hidden_progress;
                 }
             }
         }

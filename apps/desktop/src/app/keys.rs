@@ -56,6 +56,12 @@ actions!(
         ExpandCompletion,
         /// 输入框：收起 `/` `@` 补全，不填入（Alt+→）
         CollapseCompletion,
+        /// 对话向上 / 向下翻一页（和滚轮同一套阻尼）
+        ScrollPageUp,
+        ScrollPageDown,
+        /// 跳到对话开头 / 回到底部
+        ScrollToTop,
+        ScrollToBottom,
     ]
 );
 
@@ -85,6 +91,13 @@ pub(super) const PERMISSION_KEYS: [&str; 4] = ["alt-1", "alt-2", "alt-3", "alt-4
 /// （`MoveUp` / `MoveDown`），在 `complete_view.rs` 的 `capture_action` 里接管，
 /// 所以这里只是速查表用的文案常量，**不进 `bind()`**。
 pub(super) const INPUT_HISTORY_KEYS: [&str; 2] = ["up", "down"];
+/// 对话翻页 / 跳到开头与底部。PageUp / PageDown 在输入框为空时由 `complete_view.rs` 截走
+/// （输入框自己绑了 `MovePageUp` / `MovePageDown`），这里同时绑一遍给焦点不在输入框时用。
+pub(super) const PAGE_UP_KEY: &str = "pageup";
+pub(super) const PAGE_DOWN_KEY: &str = "pagedown";
+/// 输入框把 Home / End 绑成了行首 / 行尾，带 Ctrl 的才空出来
+pub(super) const SCROLL_TOP_KEY: &str = "secondary-home";
+pub(super) const SCROLL_BOTTOM_KEY: &str = "secondary-end";
 /// 输入框里展开 / 收起 `/` `@` 补全（在输入框卡片上处理，见 `complete_view.rs`）。
 /// 不用裸 ← / →（那是移光标），也不用 Ctrl+← / →（输入框自己绑了按词移动）；
 /// macOS 上 Alt+← / → 被输入框占了按词移动，退到 Ctrl+Alt+← / →
@@ -128,6 +141,11 @@ pub(crate) fn bind(cx: &mut App) {
         // 补全列表的展开 / 收起：只在输入框卡片上处理（`complete_view.rs` 的 capture）
         KeyBinding::new(EXPAND_COMPLETION_KEY, ExpandCompletion, Some(CONTEXT)),
         KeyBinding::new(COLLAPSE_COMPLETION_KEY, CollapseCompletion, Some(CONTEXT)),
+        // 对话翻页 / 跳到开头与底部
+        KeyBinding::new(PAGE_UP_KEY, ScrollPageUp, Some(CONTEXT)),
+        KeyBinding::new(PAGE_DOWN_KEY, ScrollPageDown, Some(CONTEXT)),
+        KeyBinding::new(SCROLL_TOP_KEY, ScrollToTop, Some(CONTEXT)),
+        KeyBinding::new(SCROLL_BOTTOM_KEY, ScrollToBottom, Some(CONTEXT)),
     ]);
 }
 
@@ -190,6 +208,10 @@ impl ChatApp {
             .on_action(cx.listener(|this, _: &AnswerPermission2, w, cx| this.answer_key(1, w, cx)))
             .on_action(cx.listener(|this, _: &AnswerPermission3, w, cx| this.answer_key(2, w, cx)))
             .on_action(cx.listener(|this, _: &AnswerPermission4, w, cx| this.answer_key(3, w, cx)))
+            .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| this.scroll_page(-1, cx)))
+            .on_action(cx.listener(|this, _: &ScrollPageDown, _, cx| this.scroll_page(1, cx)))
+            .on_action(cx.listener(|this, _: &ScrollToTop, _, cx| this.scroll_to_top(cx)))
+            .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| this.start_jump_to_bottom(cx)))
     }
 
     /// Alt+数字：按下权限卡上的第 `n` 个按钮（最早一条待定的请求；按钮顺序见 `chat.rs` 的

@@ -47,8 +47,25 @@ pub struct Session {
     pub list: ListState,
     /// 每行上次测量时的指纹（[`Session::row_key`]）
     pub measured: Vec<u64>,
+    /// 列表里的每一行画哪条记录（[`Row`]）；很大的已完成回复拆成多行后，行数和记录数不一样。
+    /// 和 `measured`、`layout` 的下标口径：`rows` / `measured` 用行下标，`layout` / `transcript`
+    /// 用记录下标（用 [`Session::row_of`] 换算）
+    pub rows: Vec<Row>,
+    /// 大回复的拆块结果（记录下标 → 各块文本）
+    agent_parts: HashMap<usize, std::rc::Rc<[SharedString]>>,
+    /// 每条记录的第一行在 `rows` 里的下标（换算用，和 `transcript` 等长）
+    row_start: Vec<usize>,
+    /// 上次拆块时的记录形态（条数、是否在跑、末尾回复多长）：没变就不重拆
+    rows_sig: Option<(usize, bool, usize)>,
+    /// 行划分变了、列表重建之后要恢复的阅读位置：(视口顶那一行, 行内偏移, 是否贴底)
+    rows_restore: Option<(Option<Row>, Pixels, bool)>,
     /// 列表末尾的运行状态行上次测量时是否在忙（忙时有一行，不忙时高度为 0）
     measured_busy: bool,
+    /// 本帧的排版度量（列宽、rem）：变了就按新字号 / 列宽重估所有行高并重测。
+    /// 由内容区每帧交进来（见 [`Session::set_list_metrics`]）。
+    metrics: Option<ListMetrics>,
+    /// 上次已按它重估过的度量
+    applied_metrics: Option<ListMetrics>,
     /// 当前可选模式：自研内核按设置补齐，ACP 在 Started 后换成 agent 上报的。
     pub modes: Vec<ModeEntry>,
     pub permission_mode: usize, // modes 下标
@@ -103,7 +120,7 @@ pub struct Session {
     pub(crate) display_snapshot: Option<Arc<cache::DisplaySnapshot>>,
     pub(crate) blocks: blocks::BlockCache,
     pub blocks_error: Option<String>,
-    display_scroll: Option<(ListOffset, bool)>,
+    pub(crate) display_scroll: Option<(ListOffset, bool)>,
     cached_user_count: usize,
     pub(crate) deferred_events: Vec<(String, claudesktop_core::RoutedEvent)>,
     /// 从磁盘搜索跳过来时，等日志加载完再定位到第几轮
@@ -150,6 +167,12 @@ pub struct Session {
     pub layout: Vec<RowLayout>,
     /// 用户点开的过程组（按组第一行的下标）
     pub open_groups: HashSet<usize>,
+    /// 用户主动收起的「活跃且只有几步」的过程组（按组第一行的下标）：
+    /// 这类组默认展开，点一下收起来（见 `Session::compute_layout`）
+    pub folded_live_groups: HashSet<usize>,
+    /// 最近一次用户手动点了组头的那一组：只有它播展开 / 收起的弹簧过渡。
+    /// 新行涌入、正文到达导致的自动收起不播（否则每出一行列表都抖一下）
+    pub animated_group: Option<usize>,
     /// 每轮的用时和用量（按这一轮用户消息的下标），挂在这一轮回复末尾
     pub turn_summaries: HashMap<usize, TurnSummary>,
     /// 输入框上方的计划收成一行
@@ -177,6 +200,10 @@ pub struct Session {
     pub reveal: Option<usize>,
     /// 滚轮平滑滚动进行中（见 [`WheelInput`]）；跳转、回到底部时清掉，免得两边抢
     pub wheel: Option<WheelInput>,
+    /// 跟随状态机（滞回 + 方向 + 强制跟随窗口，见 [`ScrollFollow`]）
+    pub follow: ScrollFollow,
+    /// 展开 / 收起卡片时把被点的那一行钉在屏幕原位（GPUI 版的 `pinNode`）
+    pub pin: Option<RowPin>,
     /// 刚在权限卡上「拒绝并说明」或提问面板「自己说」：输入框的占位文字提示，用户输入或发送时清掉
     pub steering: Option<&'static str>,
     /// 最近一轮输入命中提示缓存的比例（%）；端点没报告时为 None
@@ -411,11 +438,6 @@ impl WheelInput {
     pub fn remaining(&self) -> Pixels {
         self.remaining
     }
-
-    /// 这一串在往哪个方向走（`Some(true)` 向下），走完了是 `None`。
-    pub fn direction(&self) -> Option<bool> {
-        (self.remaining != px(0.)).then_some(self.remaining > px(0.))
-    }
 }
 
 /// 设置页 / 模型清单的平滑滚动：滚轮只推进 `target`（离列表顶部的像素），实际位置每帧往它逼近一步。
@@ -441,6 +463,8 @@ pub struct RowLayout {
     pub tight: bool,
     /// 属于一个多步过程组（不管这会儿露不露出来）：展开 / 收起时按弹簧进度裁切
     pub member: bool,
+    /// 这一行属于哪个过程组（组第一行的下标）；不在组里是 None
+    pub group_start: Option<usize>,
     /// 计划正钉在输入框上方：这里只留一行进度
     pub compact: bool,
 }
@@ -454,6 +478,8 @@ pub struct StepGroup {
     pub live: bool,
     /// 展开看全部步骤（用户点开过，或详细视图）
     pub open: bool,
+    /// 在这一组里，活跃且只有几步（不超过 `LIVE_TAIL`）：默认展开，点组头收起
+    pub live_small: bool,
 }
 
 /// 一轮的用时和用量（回复末尾显示）。
@@ -496,9 +522,411 @@ pub enum Activity {
 fn new_list_state() -> ListState {
     // overdraw：视口外多渲染的高度，滚动时少一点空白。
     // 初始 1 行 = 末尾的运行状态行（对话记录的行都插在它前面）
-    let state = ListState::new(1, ListAlignment::Top, px(600.));
+    let state = ListState::new(1, ListAlignment::Top, px(840.));
+    // 列表自己「离底 1px 就重新跟随」的隐式吸附交给 `Session::sync_follow` 按几何 + 方向判定
+    state.set_auto_reengage(false);
     state.set_follow_mode(FollowMode::Tail);
     state
+}
+
+/// 给未测行估高用的排版度量。
+///
+/// 估高只影响**还没量过的行**：滚动条长度、`distance_to_end`、冷会话跳转落点。
+/// 真实高度量到之后逐行替换，估得偏一点只会让滚动条先粗后准，不会串位。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ListMetrics {
+    /// 对话列的内宽（阅读列限宽之后、去掉左右内边距之前）
+    pub column_w: Pixels,
+    /// 窗口 rem（字号缩放后）
+    pub rem: Pixels,
+    /// 字体族版本号（`theme::font_revision`）：换字体不改字号 / 列宽，但字宽变了，估高同样过期
+    pub font_rev: u64,
+    /// 列宽是不是按真实视口量出来的。窄窗口第一帧还没量到列表宽度，只能先按限宽铺：
+    /// 第二帧拿到真实宽度时不算「用户改了列宽」，别因此清掉滚轮余量。
+    pub measured: bool,
+}
+
+impl ListMetrics {
+    fn body_line(self) -> Pixels {
+        crate::theme::TEXT_BODY.to_pixels(self.rem) * 1.48
+    }
+
+    fn small_line(self) -> Pixels {
+        crate::theme::TEXT_SMALL.to_pixels(self.rem) * 1.45
+    }
+
+    /// 一行文字实际可用的宽度（阅读列左右各 2rem 内边距）
+    fn inner_w(self) -> Pixels {
+        (self.column_w - rems(4.).to_pixels(self.rem)).max(rems(8.).to_pixels(self.rem))
+    }
+
+    /// 折叠的一行步骤（工具 / 思考 / 信息）的高度
+    fn line_row(self) -> Pixels {
+        self.small_line().max(rems(1.75).to_pixels(self.rem))
+    }
+
+    /// 块间距（和 `ChatApp` 的 `BLOCK_GAP` 一致）
+    fn block_gap(self) -> Pixels {
+        rems(1.).to_pixels(self.rem)
+    }
+}
+
+/// 纯文本按可用宽度折行后的高度估计（CJK 按一个字宽、ASCII 按约 0.55 个字宽）。
+/// 只看前 16K 字符，超长正文按长度比例外推，避免在界面线程上扫完整条回复。
+fn estimate_text_height(text: &str, font: Pixels, leading: f32, inner: Pixels) -> Pixels {
+    const SCAN: usize = 16 * 1024;
+    if text.is_empty() || inner <= px(0.) {
+        return px(0.);
+    }
+    let latin = f32::from(font) * 0.55;
+    let wide = f32::from(font);
+    let inner = f32::from(inner);
+    let mut width = 0f32;
+    let mut lines = 1f32;
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    for ch in text.chars() {
+        if scanned >= SCAN {
+            truncated = true;
+            break;
+        }
+        scanned += ch.len_utf8();
+        match ch {
+            '\n' => {
+                lines += 1.;
+                width = 0.;
+            }
+            '\r' => {}
+            _ => {
+                let w = if ch.is_ascii() { latin } else { wide };
+                if width > 0. && width + w > inner {
+                    lines += 1.;
+                    width = w;
+                } else {
+                    width += w;
+                }
+            }
+        }
+    }
+    if truncated {
+        let ratio = text.len() as f32 / scanned.max(1) as f32;
+        lines *= ratio;
+    }
+    px(lines * f32::from(font) * leading)
+}
+
+/// 虚拟列表的一行画哪条记录。
+///
+/// 绝大多数记录一行；很大的**已完成**回复按块拆成多个虚拟行（[`split_markdown`]），
+/// 这样滚动 / 排版只碰视口附近的那一块，不用每帧把整篇长 Markdown 排完再裁。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Row {
+    /// 整条记录一行
+    Whole(usize),
+    /// 拆开的大回复：记录 `src` 的第 `part` 块
+    Part { src: usize, part: usize },
+}
+
+impl Row {
+    /// 这一行属于哪条记录。
+    pub fn src(self) -> usize {
+        match self {
+            Row::Whole(i) => i,
+            Row::Part { src, .. } => src,
+        }
+    }
+}
+
+/// 超过这个长度的已完成回复才拆块。
+const CHUNK_MIN: usize = 4096;
+/// 每块的目标长度（在行边界上断，实际按段落 / 代码块 / 表格行找断点）
+const CHUNK_BUDGET: usize = 2048;
+
+/// 代码围栏行：返回（围栏字符，连续个数，后面的信息串）。三个以上的 ` 或 ~ 才算。
+fn fence_run(t: &str) -> Option<(char, usize, &str)> {
+    let ch = t.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let len = t.chars().take_while(|&c| c == ch).count();
+    (len >= 3).then(|| (ch, len, &t[len..]))
+}
+
+/// 把一段 Markdown 拆成多块。尽量在空行（段落之间）断；断在代码块中间就补上围栏收尾、
+/// 下一块重新打开（带语言名）；断在表格中间就重复表头两行，每块单独渲染还是同一张表。
+/// 拆不出两块时返回单元素，调用方照常整行画。
+pub fn split_markdown(text: &str) -> Vec<String> {
+    if text.len() < CHUNK_MIN {
+        return vec![text.to_string()];
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    // 打开中的代码围栏：(字符, 连续个数, 首行)。只有同字符、长度不短于它、后面没有别的内容才算收尾
+    let mut fence: Option<(char, usize, String)> = None;
+    let mut in_table = false;
+    // 表格的表头 + 分隔行（重开用）
+    let mut table_head: Option<String> = None;
+    let mut table_rows = 0usize;
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = lines[idx];
+        let t = line.trim_start();
+        let run = fence_run(t);
+        let pipe = t.starts_with('|');
+        // 先判断这一行是不是收尾围栏（按打开时的字符和长度），再更新状态
+        let closing = match (&fence, run) {
+            (Some((ch, len, _)), Some((c, n, rest))) => {
+                c == *ch && n >= *len && rest.trim().is_empty()
+            }
+            _ => false,
+        };
+        if fence.is_none()
+            && let Some((c, n, _)) = run
+        {
+            fence = Some((c, n, line.trim_end().to_string()));
+        }
+        if fence.is_none() {
+            if pipe && !in_table {
+                in_table = true;
+                table_head = Some(String::new());
+                table_rows = 0;
+            } else if !pipe {
+                in_table = false;
+                table_head = None;
+            }
+            if in_table && table_rows < 2 {
+                table_rows += 1;
+                if let Some(head) = &mut table_head {
+                    head.push_str(line);
+                }
+            }
+        }
+        cur.push_str(line);
+        if closing {
+            fence = None;
+        }
+        idx += 1;
+        if cur.len() < CHUNK_BUDGET {
+            continue;
+        }
+        let next_line = lines.get(idx).copied().unwrap_or("");
+        let next = next_line.trim_start();
+        let next_run = fence_run(next);
+        // 下一行是收尾围栏：和这一块一起收进来，别把孤立的围栏丢到下一块开头
+        let next_closes = match (&fence, next_run) {
+            (Some((ch, len, _)), Some((c, n, rest))) => {
+                c == *ch && n >= *len && rest.trim().is_empty()
+            }
+            _ => false,
+        };
+        let next_block = next.starts_with('#') || next_run.is_some();
+        // 干净的断点：空行 / 下一个块开始，且不在代码块里
+        if fence.is_none() && (line.trim().is_empty() || next_block) {
+            out.push(std::mem::take(&mut cur));
+            continue;
+        }
+        // 表格：一行一行断；后面还是表格行才重复表头，表格到此为止就干净收尾
+        if in_table && fence.is_none() && table_rows >= 2 {
+            out.push(std::mem::take(&mut cur));
+            if next.starts_with('|')
+                && let Some(head) = &table_head
+            {
+                cur.push_str(head);
+            }
+            continue;
+        }
+        // 代码块 / 长段落：翻倍才硬断；代码块补围栏收尾、下一块重开
+        if cur.len() < CHUNK_BUDGET * 2 {
+            continue;
+        }
+        if let Some((ch, len, open)) = &fence {
+            if next_closes {
+                cur.push_str(next_line);
+                idx += 1;
+                fence = None;
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            if !cur.ends_with('\n') {
+                cur.push('\n');
+            }
+            // 收尾用和打开时同样的字符、不短于打开时的长度
+            cur.push_str(&ch.to_string().repeat(*len));
+            cur.push('\n');
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(open);
+            cur.push('\n');
+        } else {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.len() < 2 {
+        return vec![text.to_string()];
+    }
+    out
+}
+
+impl Session {
+    /// 内容区每帧交进排版度量；和上次不同时 `sync_list` 会按新字号 / 列宽重估并重测所有行。
+    pub fn set_list_metrics(&mut self, metrics: ListMetrics) {
+        self.metrics = Some(metrics);
+    }
+
+    /// 给第 `i` **行**估高（未测行先按它排；列表量到真实高度后自动替换）。
+    /// 折叠 / 当前视图不显示的行按 0 高算——这和实际测量结果一致，不是瞎猜。
+    fn estimate_row_height(&self, i: usize, m: ListMetrics, view: ViewMode) -> Pixels {
+        let Some(row) = self.rows.get(i).copied() else { return px(0.) };
+        if let Row::Part { src, part } = row {
+            // 拆开的大回复：只估这一块，最后一块下面才是回合末尾的操作行
+            let Some(chunks) = self.agent_parts.get(&src) else { return px(0.) };
+            let mut h = estimate_text_height(
+                &chunks[part],
+                crate::theme::TEXT_BODY.to_pixels(m.rem),
+                1.48,
+                m.inner_w(),
+            );
+            if part + 1 == chunks.len() && self.is_turn_end(src) {
+                h += rems(2.).to_pixels(m.rem) + m.block_gap();
+            }
+            return h.max(px(1.));
+        }
+        let i = row.src();
+        let Some(item) = self.transcript.get(i) else { return px(0.) };
+        let layout = self.layout.get(i).copied().unwrap_or_default();
+        let mut h = px(0.);
+        if layout.head.is_some() {
+            h += m.line_row();
+            if layout.body || layout.tight {
+                h += rems(0.375).to_pixels(m.rem);
+            }
+        }
+        // 这一行自己有没有东西画；合并进工具行的权限请求、当前视图看不见的行都是 0
+        let visible_body = layout.body
+            || (!matches!(item, ChatItem::Agent(_))
+                && self.is_turn_fallback_tail(i, view)
+                && item.has_content());
+        if !visible_body {
+            return h;
+        }
+        let inner = m.inner_w();
+        let body = m.body_line();
+        match item {
+            ChatItem::User { text, images, .. } => {
+                h += estimate_text_height(
+                    text,
+                    crate::theme::TEXT_BODY.to_pixels(m.rem),
+                    1.48,
+                    inner,
+                );
+                h += rems(0.75).to_pixels(m.rem) * 2.; // 气泡内边距
+                h += px(96.) * images.len() as f32;
+                if self.is_turn_end(i) || layout.tight {
+                    h += m.block_gap();
+                }
+            }
+            ChatItem::Agent(text) => {
+                h += estimate_text_height(
+                    text,
+                    crate::theme::TEXT_BODY.to_pixels(m.rem),
+                    1.48,
+                    inner,
+                );
+                // 回合末尾的复制 / 重新生成那一行
+                if self.is_turn_end(i) {
+                    h += rems(2.).to_pixels(m.rem);
+                }
+            }
+            ChatItem::Thinking { text, open, .. } => {
+                h += m.line_row();
+                if (*open || view == ViewMode::Verbose) && !text.trim().is_empty() {
+                    h += rems(0.25).to_pixels(m.rem)
+                        + estimate_text_height(
+                            text,
+                            crate::theme::TEXT_SMALL.to_pixels(m.rem),
+                            1.48,
+                            inner,
+                        );
+                }
+            }
+            ChatItem::Info { text, open } => {
+                h += m.line_row();
+                if *open || view == ViewMode::Verbose {
+                    h += rems(0.25).to_pixels(m.rem)
+                        + estimate_text_height(text, m.small_line(), 1.48, inner);
+                }
+            }
+            ChatItem::Tool(card) => {
+                h += m.line_row();
+                if !card.diffs.is_empty() {
+                    let rows: usize = card.diffs.iter().map(|d| d.lines.len()).sum();
+                    let shown = if card.expanded || view == ViewMode::Verbose {
+                        rows
+                    } else {
+                        rows.min(8 * card.diffs.len())
+                    };
+                    h += m.small_line() * shown as f32 * 0.5
+                        + m.small_line() * card.diffs.len() as f32 * 1.6;
+                }
+                if card.expanded || view == ViewMode::Verbose {
+                    let text =
+                        if card.content.trim().is_empty() { &card.output } else { &card.content };
+                    let est = estimate_text_height(
+                        text,
+                        crate::theme::TEXT_SMALL.to_pixels(m.rem),
+                        1.48,
+                        inner,
+                    )
+                    .min(rems(18.).to_pixels(m.rem));
+                    h += est + rems(1.25).to_pixels(m.rem);
+                }
+            }
+            ChatItem::Permission { options, hunks, .. } => {
+                let hunk_lines: usize = hunks
+                    .as_ref()
+                    .map(|h| h.files.iter().flat_map(|f| &f.hunks).map(|x| x.lines.len()).sum())
+                    .unwrap_or(0);
+                h += m.line_row()
+                    + m.small_line() * options.len() as f32 * 1.6
+                    + m.small_line() * hunk_lines.min(12) as f32;
+            }
+            ChatItem::Question { questions, .. } => {
+                let options: usize = questions.iter().map(|q| q.options.len()).sum();
+                h += m.line_row()
+                    + m.small_line() * 2. * questions.len() as f32
+                    + m.small_line() * options as f32 * 1.6;
+            }
+            ChatItem::Plan(rows) => {
+                let shown = if layout.compact { 1 } else { rows.len() };
+                h += m.line_row() + body * shown as f32;
+            }
+            ChatItem::Failed { .. } => h += rems(5.).to_pixels(m.rem),
+            ChatItem::Compaction { state, open, .. } => {
+                h += m.line_row();
+                if *open && let CompactState::Done(text) | CompactState::Failed(text) = state {
+                    h += estimate_text_height(text, m.small_line(), 1.48, inner);
+                }
+            }
+            ChatItem::Note(text) => {
+                h += estimate_text_height(
+                    text,
+                    crate::theme::TEXT_SMALL.to_pixels(m.rem),
+                    1.48,
+                    inner,
+                ) * 0.8;
+            }
+            ChatItem::AutoApproved { .. } => h += m.line_row(),
+        }
+        if (layout.body || layout.head.is_some()) && !layout.tight {
+            h += m.block_gap();
+        } else if layout.body {
+            h += rems(0.375).to_pixels(m.rem);
+        }
+        h.max(px(1.))
+    }
 }
 
 impl Session {
@@ -528,7 +956,14 @@ impl Session {
             cancel_token: 0,
             list: new_list_state(),
             measured: Vec::new(),
+            rows: Vec::new(),
+            agent_parts: HashMap::new(),
+            row_start: Vec::new(),
+            rows_sig: None,
+            rows_restore: None,
             measured_busy: false,
+            metrics: None,
+            applied_metrics: None,
             modes: if kind == SessionKind::Chat {
                 // 聊天没有工具要批，也就没有权限模式（Started 报的也是空表）
                 Vec::new()
@@ -588,6 +1023,8 @@ impl Session {
             title_generated: false,
             layout: Vec::new(),
             open_groups: HashSet::new(),
+            folded_live_groups: HashSet::new(),
+            animated_group: None,
             turn_summaries: HashMap::new(),
             plan_folded: false,
             context_tokens: 0,
@@ -599,6 +1036,8 @@ impl Session {
             compact_queued: false,
             reveal: None,
             wheel: None,
+            follow: ScrollFollow::default(),
+            pin: None,
             stopping: false,
             steering: None,
             cache_hit: None,
@@ -817,7 +1256,48 @@ impl Session {
             self.seen_seq = self.content_seq;
         }
         self.layout = self.compute_layout(view);
-        let n = self.transcript.len();
+        // 大回复拆块只跟记录形态有关（条数 / 是否在跑 / 末尾回复多长），和视图模式无关
+        let sig = self.rows_signature();
+        if self.rows_sig != Some(sig) {
+            self.rows_sig = Some(sig);
+            let anchor = self.list.logical_scroll_top();
+            let following = self.list.is_following_tail();
+            let anchor_row = self.rows.get(anchor.item_ix).copied();
+            if self.rebuild_rows() {
+                self.reset_rows(anchor_row, anchor.offset_in_item, following);
+            }
+        }
+        let n = self.rows.len();
+        // 字号 / 列宽变了：屏外缓存的行高全部过期，按新度量重估 + 重测。
+        // 视口顶那一行按比例保留（`remeasure_with_hints` 走 proportional 锚点）
+        if let Some(m) = self.metrics
+            && self.applied_metrics != Some(m)
+        {
+            let prev = self.applied_metrics;
+            self.applied_metrics = Some(m);
+            // `measured` 只影响滚轮余量要不要作废，不改变行高：只有列宽 / 字号 / 字体真变了才重排重测
+            let layout_changed = prev.is_none_or(|p| {
+                p.column_w != m.column_w || p.rem != m.rem || p.font_rev != m.font_rev
+            });
+            if layout_changed {
+                if n > 0 {
+                    let hints: Vec<Pixels> =
+                        (0..n).map(|i| self.estimate_row_height(i, m, view)).collect();
+                    self.list.remeasure_with_hints(0..n, hints);
+                }
+                // 末尾的运行状态行跟着字号变
+                self.list.remeasure_items(n..n + 1);
+                self.measured_busy = self.status_visible();
+                // 滚轮余量只在「用户真改了列宽 / 字号」时作废（相对像素在重排后仍然有效）。
+                // 窄窗口第 1 帧按限宽铺、第 2 帧才有真实宽度，那一次不算用户改动。
+                let real_width_change =
+                    prev.is_some_and(|p| p.measured && m.measured && p.column_w != m.column_w);
+                let type_change = prev.is_some_and(|p| p.rem != m.rem || p.font_rev != m.font_rev);
+                if real_width_change || type_change {
+                    self.wheel = None;
+                }
+            }
+        }
         if n < self.measured.len() {
             // 记录只会变长；万一变短就整体重来
             self.list.reset(1);
@@ -838,30 +1318,149 @@ impl Session {
                 let f = self.row_key(i, view);
                 self.measured.push(f);
             }
-            // 插在状态行前面
-            self.list.splice(old..old, n - old);
+            // 插在状态行前面；新行先给估高，滚动条和底部判定第一帧就有意义
+            let hints = match self.applied_metrics {
+                Some(m) => (old..n).map(|i| self.estimate_row_height(i, m, view)).collect(),
+                None => vec![px(0.); n - old],
+            };
+            self.list.splice_with_hints(old..old, hints);
         }
-        // 状态行在忙或续接中时出现（见 `render_turn_status`）
-        let status = self.busy || self.resuming;
+        // 状态行在忙 / 续接 / 建 worktree 时出现（见 `render_turn_status`）
+        let status = self.status_visible();
         if status != self.measured_busy {
             self.measured_busy = status;
             self.list.remeasure_items(n..n + 1);
         }
+        // 行划分刚重建过：行都塞进去了，把阅读位置放回去
+        if let Some((anchor_row, offset, following)) = self.rows_restore.take() {
+            if following {
+                self.list.scroll_to_end();
+            } else if let Some(ix) = anchor_row.map(|row| self.row_after_rebuild(row)) {
+                self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: offset });
+            }
+        }
         if let Some((offset, following)) = self.display_scroll.take() {
             // 会话恢复的位置说了算：滚轮剩下的余量作废
             self.wheel = None;
+            self.follow.force_until = None;
             if following {
                 self.list.scroll_to_end();
             } else {
                 self.list.scroll_to(offset);
+                self.quiet_follow(FOLLOW_QUIET);
             }
         }
-        // 行数到位之后再滚，否则会被截到末尾；再往上让一点，别让顶上的渐隐盖住这一行
-        if let Some(ix) = self.reveal.take().filter(|&ix| ix < n) {
+        // 行数到位之后再滚，否则会被截到末尾；再往上让一点，别让顶上的渐隐盖住这一行。
+        // 未测行现在带估高，`scroll_by` 不会再被一串 0 高行推到最后一行
+        if let Some(ix) = self.reveal.take().filter(|&ix| ix < self.transcript.len()) {
             self.wheel = None;
-            self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
+            self.follow.force_until = None;
+            let row = self.row_of(ix);
+            self.list.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
             self.list.scroll_by(-px(24.));
+            self.quiet_follow(FOLLOW_QUIET);
         }
+    }
+
+    /// 记录形态的指纹（见 [`Session::rebuild_rows`] 的触发条件）。
+    /// 流式写时末尾回复每帧都在变长，那段长度不计入（`busy` 期间恒为 0），
+    /// 一轮结束、正文定稿时才因为 `busy` 翻转和长度变化重算一次。
+    fn rows_signature(&self) -> (usize, bool, usize) {
+        let last = if self.busy {
+            0
+        } else {
+            match self.transcript.last() {
+                Some(ChatItem::Agent(text)) => text.len(),
+                _ => 0,
+            }
+        };
+        (self.transcript.len(), self.busy, last)
+    }
+
+    /// 按当前记录重算每行画什么（[`Row`]），大回复在这里拆块。返回行划分是否变了。
+    fn rebuild_rows(&mut self) -> bool {
+        let n = self.transcript.len();
+        let mut rows = Vec::with_capacity(n);
+        let mut parts = HashMap::new();
+        let mut starts = Vec::with_capacity(n);
+        for i in 0..n {
+            starts.push(rows.len());
+            // 正在流式写的那条不拆（每来一个 chunk 都要重排，拆了反而白花功夫）
+            let split = match &self.transcript[i] {
+                ChatItem::Agent(text) if !(self.busy && i + 1 == n) && text.len() >= CHUNK_MIN => {
+                    split_markdown(text)
+                }
+                _ => Vec::new(),
+            };
+            if split.len() > 1 {
+                let chunks: std::rc::Rc<[SharedString]> =
+                    split.into_iter().map(SharedString::from).collect();
+                for part in 0..chunks.len() {
+                    rows.push(Row::Part { src: i, part });
+                }
+                parts.insert(i, chunks);
+            } else {
+                rows.push(Row::Whole(i));
+            }
+        }
+        let changed = rows != self.rows;
+        self.rows = rows;
+        self.agent_parts = parts;
+        self.row_start = starts;
+        changed
+    }
+
+    /// 行划分变了（大回复开始 / 结束时）：列表整体重建，行由本帧的补行逻辑重新塞进去。
+    /// 阅读位置记在 `rows_restore` 里，等这一帧的行都到位再恢复。
+    fn reset_rows(&mut self, anchor: Option<Row>, offset: Pixels, following: bool) {
+        self.list.reset(1);
+        self.measured.clear();
+        self.wheel = None;
+        self.pin = None;
+        self.follow.force_until = None;
+        self.rows_restore = Some((anchor, offset, following));
+        // 强制下一段重测状态行（重建后它也是未测的）
+        self.measured_busy = !self.status_visible();
+    }
+
+    /// 旧行划分里的某一行，在重建后的行划分里对应的下标。
+    /// 某条记录拆块数变了时夹到它现在的最后一块；记录被回退掉了就夹到最后一行。
+    fn row_after_rebuild(&self, row: Row) -> usize {
+        let ix = match row {
+            Row::Whole(src) => self.row_of(src),
+            Row::Part { src, part } => {
+                let start = self.row_of(src);
+                let count = self.part_count(src).unwrap_or(1);
+                start + part.min(count.saturating_sub(1))
+            }
+        };
+        ix.min(self.rows.len().saturating_sub(1))
+    }
+
+    /// 记录 `ix` 的第一行在列表里的下标（大回复拆块后一条记录占多行）。
+    pub fn row_of(&self, ix: usize) -> usize {
+        self.row_start.get(ix).copied().unwrap_or(ix)
+    }
+
+    /// 记录 `ix` 的第 `part` 块文本（大回复拆块时用）。
+    pub fn part_text(&self, ix: usize, part: usize) -> Option<SharedString> {
+        self.agent_parts.get(&ix).and_then(|c| c.get(part)).cloned()
+    }
+
+    /// 第 `part` 块在整条回复里的起始字节。拆开后每块的代码块 span 都从 0 起，
+    /// 「刚复制了哪个代码块」要用这个偏移拼出唯一标识。
+    pub fn part_start(&self, ix: usize, part: usize) -> usize {
+        self.agent_parts.get(&ix).map_or(0, |c| c.iter().take(part).map(|s| s.len()).sum())
+    }
+
+    /// 记录 `ix` 被拆成了几块（没拆是 None）。
+    pub fn part_count(&self, ix: usize) -> Option<usize> {
+        self.agent_parts.get(&ix).map(|c| c.len())
+    }
+
+    /// 列表末尾那一行运行状态行显不显示。
+    fn status_visible(&self) -> bool {
+        self.busy || self.resuming || self.worktree_busy.is_some()
     }
 }
 
@@ -906,12 +1505,190 @@ impl ScrollEdge {
     }
 }
 
+/// 连续渐隐高度：贴边时对应那条收成 0，离开 `ramp` 距离后到满格（`FADE_TOP` / `FADE_BOTTOM`）。
+/// 比 [`ScrollEdge`] 的四档细，滚动时渐隐跟着位置连续长 / 消，不再一眼看出跳档。
+pub fn edge_fades(top: Pixels, remaining: Pixels, rem: Pixels) -> (Pixels, Pixels) {
+    // 内容不满一屏（两头都到头）：两条都不画
+    if top <= px(1.) && remaining <= px(1.) {
+        return (px(0.), px(0.));
+    }
+    let ramp = (rem * 2.5).max(px(1.));
+    let up = (top / ramp).clamp(0., 1.);
+    let down = (remaining / ramp).clamp(0., 1.);
+    (FADE_TOP.to_pixels(rem) * up, FADE_BOTTOM.to_pixels(rem) * down)
+}
+
 impl Session {
-    /// 对话列表滚到哪一档（见 [`ScrollEdge`]）。
-    pub fn scroll_edge(&self) -> ScrollEdge {
+    /// 上下两条渐隐的高度（连续，见 [`edge_fades`]）。
+    pub fn scroll_fades(&self, rem: Pixels) -> (Pixels, Pixels) {
         let offset = self.list.scroll_px_offset_for_scrollbar().y;
         let max = self.list.max_offset_for_scrollbar().y.max(px(0.));
-        ScrollEdge::of(-offset, max + offset)
+        edge_fades(-offset, max + offset, rem)
+    }
+}
+
+/// 跟随判定的滞回带：距底这么多以内、并且是往下滚回来的，就重新吸附。
+const FOLLOW_ATTACH: Pixels = px(80.);
+/// 距底超过视口的这个比例（至少 240px）才认为「翻走了」。
+const FOLLOW_DETACH_VIEWPORT: f32 = 0.5;
+const FOLLOW_DETACH_MIN: Pixels = px(240.);
+/// 程序化滚动 / 跳转之后这段时间不改跟随状态（自己造成的位移不算用户操作）。
+const FOLLOW_QUIET: Duration = Duration::from_millis(700);
+/// 发送 / 应答之后这段强跟随，抵御输入框骤缩、行高补量引起的瞬时抖动。
+const FOLLOW_FORCE: Duration = Duration::from_millis(800);
+
+/// 对话列表的跟随状态机（几何 + 方向驱动，见 [`Session::sync_follow`]）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollFollow {
+    /// 「回到底部」按钮显不显示：进入脱离带才置位，回到吸附带才清掉，中间带保持
+    pub away: bool,
+    quiet_until: Option<Instant>,
+    force_until: Option<Instant>,
+    /// 最近一次用户输入的方向（Some(true) = 向下）；只有向下滚回底部才自动吸附
+    last_input_down: Option<bool>,
+}
+
+/// 展开 / 收起卡片时钉住标题行：把被点行的屏幕 Y 记住，之后几帧按偏差反向补偿。
+/// 跟底态点开一张卡片，内容在下面长高，不钉住的话视口会被拽到末尾、卡片飞出屏幕。
+#[derive(Clone, Copy, Debug)]
+pub struct RowPin {
+    pub ix: usize,
+    /// 点下时这一行的窗口坐标顶部
+    pub screen_top: Pixels,
+    pub until: Instant,
+}
+
+/// 弹簧展开 / 收起的时长上限，覆盖整个过渡
+const PIN_WINDOW: Duration = Duration::from_millis(300);
+
+impl Session {
+    /// 用户点开 / 收起某一行之前调用：停止跟底并记住这一行的屏幕位置。
+    pub fn pin_row(&mut self, ix: usize) {
+        self.pin_at_row(self.row_of(ix));
+    }
+
+    /// 钉住记录 `ix` 的**最后一行**：改动卡片挂在拆块回复的最后一块上，钉第一块会钉到屏幕外。
+    pub fn pin_last_row(&mut self, ix: usize) {
+        let row = self.row_of(ix) + self.part_count(ix).map_or(0, |count| count - 1);
+        self.pin_at_row(row);
+    }
+
+    fn pin_at_row(&mut self, row: usize) {
+        self.list.pause_following_tail();
+        // 用户主动点开卡片：强跟随窗口作废，否则松手后几帧里还会被拽回底部
+        self.follow.force_until = None;
+        self.follow.away = self.follow.away || self.distance_to_end() > FOLLOW_ATTACH;
+        if let Some(bounds) = self.list.bounds_for_item(row) {
+            self.pin = Some(RowPin {
+                ix: row,
+                screen_top: bounds.top(),
+                until: Instant::now() + PIN_WINDOW,
+            });
+        }
+    }
+
+    /// 每帧在列表定位之后调用：把被钉住的行拉回原位。
+    /// 返回 true 表示这一帧之后还要再排一帧——点击后的第一帧量到的还是展开前的位置，
+    /// 必须等 `prepaint` 把新高度排出来，下一帧才补得上（没有弹簧动画时也一样）。
+    pub fn step_pin(&mut self, now: Instant) -> bool {
+        let Some(pin) = self.pin else { return false };
+        if now >= pin.until || self.list.is_scrollbar_dragging() || self.wheel.is_some() {
+            self.pin = None;
+            return false;
+        }
+        let Some(bounds) = self.list.bounds_for_item(pin.ix) else {
+            self.pin = None;
+            return false;
+        };
+        let dy = bounds.top() - pin.screen_top;
+        if dy.abs() > px(0.5) {
+            self.list.scroll_by(dy);
+        }
+        // 钉住窗口内一直排帧：偏差这一帧可能还是 0（布局还没量到新高度）
+        true
+    }
+
+    /// 用户自己开始滚动 / 换会话：钉住状态作废。
+    pub fn release_pin(&mut self) {
+        self.pin = None;
+    }
+}
+
+impl Session {
+    pub fn note_input(&mut self, down: bool) {
+        self.follow.last_input_down = Some(down);
+        if !down {
+            // 用户自己往上翻了：发消息后的强跟随窗口当场作废，别跟用户抢
+            self.follow.force_until = None;
+        }
+    }
+
+    /// 用户自己开始滚动 / 跳转 / 点开卡片：作废强跟随窗口。
+    pub fn drop_force_follow(&mut self) {
+        self.follow.force_until = None;
+    }
+
+    /// 程序化定位（搜索跳转、显示恢复）之后的一小段安静期，别被自动吸附拉走。
+    pub fn quiet_follow(&mut self, duration: Duration) {
+        self.follow.quiet_until = Some(Instant::now() + duration);
+    }
+
+    /// 每帧在列表定位推进之后调用：按距底距离和输入方向决定吸附 / 脱离，中间带保持原状。
+    ///
+    /// 按钮显隐（`away`）和自动吸附是两件事：前者只按几何滞回更新，滚轮还在缓出、正拖
+    /// 滚动条时也要立刻变（否则连续翻页要等 200 多毫秒才冒出按钮）；吸附才要求方向向下、
+    /// 静止、尾部已实测。
+    pub fn sync_follow(&mut self, now: Instant, moving: bool) {
+        let dragging = self.list.is_scrollbar_dragging();
+        // 用户正拖着滚动条：强跟随作废，跟随判定让位，别把人拽回去
+        if dragging {
+            self.follow.force_until = None;
+        } else if let Some(until) = self.follow.force_until
+            && now < until
+        {
+            if !self.list.is_following_tail() {
+                self.list.set_follow_mode(FollowMode::Tail);
+            }
+            self.follow.away = false;
+            return;
+        }
+        if self.list.is_following_tail() {
+            self.follow.away = false;
+            return;
+        }
+        let remaining = self.distance_to_end();
+        let viewport = self.list.viewport_bounds().size.height;
+        let detach = (viewport * FOLLOW_DETACH_VIEWPORT).max(FOLLOW_DETACH_MIN);
+        // 先按几何滞回定按钮显隐：不要求静止，也不要求方向
+        if remaining <= FOLLOW_ATTACH {
+            self.follow.away = false;
+        } else if remaining > detach {
+            self.follow.away = true;
+        }
+        let settling = moving
+            || self.wheel.is_some()
+            || self.follow.quiet_until.is_some_and(|until| now < until);
+        if dragging || settling {
+            return;
+        }
+        let tail_known = self.list.is_tail_measured();
+        if remaining <= FOLLOW_ATTACH
+            && (self.follow.last_input_down == Some(true) || remaining <= px(1.))
+            && (tail_known || remaining <= px(1.))
+        {
+            self.list.set_follow_mode(FollowMode::Tail);
+            self.follow.away = false;
+            self.follow.quiet_until = Some(now + FOLLOW_QUIET);
+        } else if remaining > detach {
+            self.list.pause_following_tail();
+        }
+    }
+
+    /// 距列表末尾还有多少像素（按当前已量 + 估算的高度算）。
+    pub fn distance_to_end(&self) -> Pixels {
+        let offset = self.list.scroll_px_offset_for_scrollbar().y;
+        let max = self.list.max_offset_for_scrollbar().y.max(px(0.));
+        (max + offset).max(px(0.))
     }
 }
 
@@ -922,21 +1699,65 @@ pub fn scroll_handle_edge(handle: &ScrollHandle) -> ScrollEdge {
     ScrollEdge::of(-offset, max + offset)
 }
 
+/// 某个 `ScrollHandle` 的连续渐隐高度（首页这类普通滚动区用它，见 [`edge_fades`]）。
+pub fn scroll_handle_fades(handle: &ScrollHandle, rem: Pixels) -> (Pixels, Pixels) {
+    let offset = handle.offset().y;
+    let max = handle.max_offset().y.max(px(0.));
+    edge_fades(-offset, max + offset, rem)
+}
+
 impl Session {
-    /// 一行的测量指纹：内容指纹 + 视图模式 + 会不会跟着状态改行高（回合末尾的回复下面多一行
-    /// 操作、失败卡片的按钮组会多出「继续」）+ 分组结果（组头、折叠、行距）。
+    /// 一行（显示行，见 [`Row`]）的测量指纹：内容指纹 + 视图模式 + 会不会跟着状态改行高
+    /// （回合末尾的回复下面多一行操作、失败卡片的按钮组会多出「继续」）+ 分组结果
+    /// （组头、折叠、行距）。
     fn row_key(&self, i: usize, view: ViewMode) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        let Some(row) = self.rows.get(i).copied() else { return 0 };
+        if let Row::Part { src, part } = row {
+            // 拆开的大回复：块文本 + 这一块是不是最后一块（操作行 / 改动卡片挂在最后一块上）
+            let len = self.agent_parts.get(&src).map_or(0, |c| c[part].len());
+            let last = self.agent_parts.get(&src).is_some_and(|c| part + 1 == c.len());
+            (2u8, src, part, len, view, self.transcript[src].fingerprint()).hash(&mut h);
+            // 这一块里有远程图片：加载完成 / 失败会换高度，状态版本号也要进指纹
+            if self
+                .agent_parts
+                .get(&src)
+                .is_some_and(|c| c[part].contains("http://") || c[part].contains("https://"))
+            {
+                crate::app::remote_image::revision().hash(&mut h);
+            }
+            if last {
+                let tail = self.is_turn_end(src);
+                (tail, self.changes_open.contains(&src), self.latest_undo()).hash(&mut h);
+            }
+            return h.finish();
+        }
+        let i = row.src();
         let layout = self.layout.get(i).copied().unwrap_or_default();
+        // 回合末尾（改动卡 / 用时）：和「失败卡片是不是最新一次」分开记——
+        // 合成一个 || 的话，下一轮发出后按钮消失了哈希却没变，虚高的一行不会重测
+        let tail = self.is_turn_end(i) || self.is_turn_fallback_tail(i, view);
         let live = if matches!(self.transcript[i], ChatItem::Failed { .. }) {
-            (self.failure_is_latest(i), self.failure_resume(i))
+            (self.failure_is_latest(i), self.failure_resume(i), tail)
         } else {
-            (self.is_turn_end(i), false)
+            (tail, false, tail)
         };
         (self.transcript[i].fingerprint(), view, live, layout).hash(&mut h);
+        // 展开着的工具行会随流式输出长高（折叠态只看有没有输出，见 `ChatItem::fingerprint`）
+        if let ChatItem::Tool(c) = &self.transcript[i]
+            && (c.expanded || view == ViewMode::Verbose)
+        {
+            c.output.len().hash(&mut h);
+        }
+        // 回复里的远程图片：加载完成 / 失败会换高度，状态版本号进指纹才会重测那一行
+        if let ChatItem::Agent(text) = &self.transcript[i]
+            && (text.contains("http://") || text.contains("https://"))
+        {
+            crate::app::remote_image::revision().hash(&mut h);
+        }
         // 回复末尾的改动卡片：展开了全部文件、撤回过，高度和按钮都会变
-        if live.0 {
+        if tail {
             (self.changes_open.contains(&i), self.latest_undo()).hash(&mut h);
         }
         h.finish()
@@ -966,24 +1787,33 @@ impl Session {
             if view == ViewMode::Summary {
                 continue;
             }
-            let steps: Vec<usize> = (start..i).filter(|&k| t[k].has_content()).collect();
+            let steps: Vec<usize> =
+                (start..i).filter(|&k| t[k].visible_in(view) && t[k].has_content()).collect();
             match steps.len() {
                 0 => {}
                 1 => out[steps[0]].body = true,
                 n => {
                     let live = self.busy && last_text.is_none_or(|p| p < start);
-                    let open = view == ViewMode::Verbose || self.open_groups.contains(&start);
+                    // 活跃的小组默认全展开：刚开始的几步没有「尾巴」可藏，点一下能收起来
+                    let live_small = live && view != ViewMode::Verbose && n <= LIVE_TAIL;
+                    let open = if live_small {
+                        !self.folded_live_groups.contains(&start)
+                    } else {
+                        view == ViewMode::Verbose || self.open_groups.contains(&start)
+                    };
                     let shown = if open {
                         &steps[..]
-                    } else if live {
+                    } else if live && !live_small {
+                        // 进行中的长组收起时露出最后几步（尾巴），点组头看全部
                         &steps[n.saturating_sub(LIVE_TAIL)..]
                     } else {
                         &[]
                     };
-                    out[start].head = Some(StepGroup { end: i, live, open });
+                    out[start].head = Some(StepGroup { end: i, live, open, live_small });
                     out[start].tight = !shown.is_empty();
                     for &s in &steps {
                         out[s].member = true;
+                        out[s].group_start = Some(start);
                     }
                     for (k, &s) in shown.iter().enumerate() {
                         out[s].body = true;
@@ -996,9 +1826,16 @@ impl Session {
         out
     }
 
-    /// 展开 / 收起从 `start` 开始的过程组。
+    /// 展开 / 收起从 `start` 开始的过程组。活跃的小组（`live_small`）默认展开，
+    /// 收起状态另存一份，免得和用户点开的旧组混在一起。
     pub fn toggle_group(&mut self, start: usize) {
-        if !self.open_groups.remove(&start) {
+        self.animated_group = Some(start);
+        let live_small = self.layout.get(start).and_then(|l| l.head).is_some_and(|h| h.live_small);
+        if live_small {
+            if !self.folded_live_groups.remove(&start) {
+                self.folded_live_groups.insert(start);
+            }
+        } else if !self.open_groups.remove(&start) {
             self.open_groups.insert(start);
         }
     }
@@ -1101,6 +1938,89 @@ impl Session {
         }
     }
 
+    /// 这一轮没有正文回复（被打断，或者只跑了工具）时，把回合末尾挂在这一行上：
+    /// 它之后没有别的要画、有内容的行，这一轮也已经结束。
+    pub fn is_turn_fallback_tail(&self, ix: usize, view: ViewMode) -> bool {
+        let t = &self.transcript;
+        let Some(item) = t.get(ix) else { return false };
+        // 用户气泡、正文有自己的末尾；当前视图看不见的行（如 `AutoApproved`）不能当锚点
+        if matches!(item, ChatItem::User { .. } | ChatItem::Agent(_))
+            || !item.visible_in(view)
+            || !item.has_content()
+        {
+            return false;
+        }
+        let start =
+            t[..ix].iter().rposition(|i| matches!(i, ChatItem::User { .. })).map_or(0, |p| p + 1);
+        let end = t[ix + 1..]
+            .iter()
+            .position(|i| matches!(i, ChatItem::User { .. }))
+            .map_or(t.len(), |p| ix + 1 + p);
+        if end == t.len() && self.busy {
+            return false;
+        }
+        if t[start..end].iter().any(|i| matches!(i, ChatItem::Agent(_))) {
+            return false;
+        }
+        !t[ix + 1..end].iter().any(|i| i.visible_in(view) && i.has_content())
+    }
+
+    /// 最新一轮的末尾：优先带正文的那一行，没有正文就退到这一轮最后一个可见步骤。
+    pub fn latest_turn_anchor(&self, view: ViewMode) -> Option<usize> {
+        (0..self.transcript.len())
+            .rev()
+            .find(|&i| self.is_turn_end(i) || self.is_turn_fallback_tail(i, view))
+    }
+
+    /// 某个工具行的输出这会儿真的画在屏幕上（展开、行可见）：用来跳过看不见的进度重绘。
+    pub fn is_tool_output_visible(&self, id: &str, view: ViewMode) -> bool {
+        if let Some(ix) = self
+            .transcript
+            .iter()
+            .position(|i| matches!(i, ChatItem::Tool(c) if c.id.as_deref() == Some(id)))
+        {
+            let ChatItem::Tool(card) = &self.transcript[ix] else { return false };
+            // 详细视图里工具行总是展开的，不用 `expanded` 也画
+            return (card.expanded || view == ViewMode::Verbose)
+                && self.transcript[ix].visible_in(view)
+                && self.layout.get(ix).is_some_and(|l| l.body);
+        }
+        // 子任务详情页里的工具行单独记在 `subagents` 里，页开着并且这条展开了才算看得见
+        let Some(task) = self.viewing_task.as_deref() else { return false };
+        self.subagents.get(task).is_some_and(|run| {
+            run.items.iter().any(|i| {
+                matches!(
+                    i,
+                    ChatItem::Tool(c) if c.id.as_deref() == Some(id) && c.expanded
+                )
+            })
+        })
+    }
+
+    /// 屏幕上有没有正在转的过程行（运行中的工具 / 压缩），状态条据此避免再画一个转圈。
+    /// 思考中的扫光不是转圈（见 `render_thinking`），不算。
+    pub fn has_visible_running_spinner(&self) -> bool {
+        let subagent =
+            self.viewing_task.as_deref().and_then(|task| self.subagents.get(task)).is_some_and(
+                |run| {
+                    run.items
+                        .iter()
+                        .any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Running))
+                },
+            );
+        subagent
+            || self.transcript.iter().enumerate().any(|(i, item)| {
+                if !self.layout.get(i).is_some_and(|l| l.body) {
+                    return false;
+                }
+                match item {
+                    ChatItem::Tool(c) => c.phase == ToolPhase::Running,
+                    ChatItem::Compaction { state, .. } => matches!(state, CompactState::Running),
+                    _ => false,
+                }
+            })
+    }
+
     /// 对话里最后一条用户消息是第几条（从 0 数）。
     pub fn latest_turn(&self) -> Option<usize> {
         self.transcript.iter().filter(|i| matches!(i, ChatItem::User { .. })).count().checked_sub(1)
@@ -1144,11 +2064,16 @@ impl Session {
         self.display_scroll = None;
         self.wheel = None;
         self.list.set_follow_mode(FollowMode::Tail);
+        let now = Instant::now();
+        self.follow.away = false;
+        self.follow.quiet_until = Some(now + FOLLOW_QUIET);
+        self.follow.force_until = Some(now + FOLLOW_FORCE);
     }
 
-    /// 往上翻过、离开了底部（列表不再自动跟随）：显示「回到底部」按钮
+    /// 往上翻过、离开了底部（列表不再自动跟随）：显示「回到底部」按钮。
+    /// 用滞回状态（见 [`ScrollFollow`]），不是逐帧拿几何距离判——否则按钮会一直闪。
     pub fn scrolled_away(&self) -> bool {
-        !self.list.is_following_tail() && self.list.is_scrolled_to_end() == Some(false)
+        self.follow.away && !self.list.is_following_tail()
     }
 
     /// 离开底部之后又来了新内容（「回到底部」按钮上带个点）
@@ -1226,8 +2151,21 @@ impl Session {
     pub fn evict_to_placeholder(&mut self, settings: &crate::settings::Settings) {
         let Some(meta) = self.meta.clone() else { return };
         let reveal = self.pending_reveal_turn.take();
+        // 显示状态不跟着正文释放：下一次读到日志后仍回到原来的位置和展开状态
+        let scroll = Some((self.list.logical_scroll_top(), self.list.is_following_tail()));
+        let follow = self.follow;
+        let open_groups = std::mem::take(&mut self.open_groups);
+        let folded_live_groups = std::mem::take(&mut self.folded_live_groups);
+        let changes_open = std::mem::take(&mut self.changes_open);
+        let plan_folded = self.plan_folded;
         let mut cold = Self::placeholder(self.token, meta, settings);
         cold.pending_reveal_turn = reveal;
+        cold.display_scroll = scroll;
+        cold.follow = follow;
+        cold.open_groups = open_groups;
+        cold.folded_live_groups = folded_live_groups;
+        cold.changes_open = changes_open;
+        cold.plan_folded = plan_folded;
         // 正在看的子任务详情页是内存态：重开时回到对话本身
         cold.viewing_task = None;
         *self = cold;
@@ -1241,6 +2179,8 @@ impl Session {
         }
         out.other += self.layout.len() * std::mem::size_of::<RowLayout>()
             + self.measured.len() * std::mem::size_of::<u64>()
+            // 拆块后的文本是复制出来的（渲染要整块 &str），大回复会多占一份
+            + self.agent_parts.values().map(|c| c.iter().map(|s| s.len()).sum::<usize>()).sum::<usize>()
             + self
                 .subagents
                 .values()
@@ -1369,6 +2309,9 @@ impl Session {
         self.retry = None;
         self.turn_streamed.clear();
         self.turn_started = Some(Instant::now());
+        // 上一轮留下的组折叠状态（按行下标）对新一轮没有意义
+        self.folded_live_groups.clear();
+        self.animated_group = None;
     }
 
     /// 本轮此刻的活动：等授权 > 等自动重试 > 正在输出正文（且没有工具在跑）> 其余都算「工作中」。
@@ -2033,6 +2976,10 @@ impl Session {
         }
         self.turn_summaries.retain(|&i, _| i < idx);
         self.open_groups.retain(|&i| i < idx);
+        self.folded_live_groups.retain(|&i| i < idx);
+        if self.animated_group.is_some_and(|i| i >= idx) {
+            self.animated_group = None;
+        }
         self.plan_folded = false;
         // 上下文变短了，用量等下一轮第一步请求完内核再报
         self.context_tokens = 0;
@@ -2112,6 +3059,8 @@ impl Session {
         event: KernelEvent,
         kernel: Option<&Arc<dyn Kernel>>,
     ) -> Option<claudesktop_core::UserPrompt> {
+        let rows_before = self.transcript.len();
+        let turn_ended = matches!(event, KernelEvent::TurnEnded { .. });
         if Record::worth_keeping(&event) {
             self.content_seq += 1;
         }
@@ -2490,6 +3439,11 @@ impl Session {
                     self.context_tokens = context_tokens;
                 }
             }
+        }
+        // 真的多了行（新步骤涌入）或这一轮结束，上一次手动点开的组才不再播弹簧；
+        // 流式 chunk 只是把正文补长，不能把展开 / 收起的弹簧动画中途掐断
+        if self.transcript.len() != rows_before || turn_ended {
+            self.animated_group = None;
         }
         None
     }
@@ -2903,6 +3857,160 @@ mod tests {
         assert_eq!(ScrollEdge::Bottom.heights(), (FADE_TOP, Rems::ZERO));
         assert_eq!(ScrollEdge::of(px(40.), px(40.)), ScrollEdge::Middle);
         assert_eq!(ScrollEdge::Middle.heights(), (FADE_TOP, FADE_BOTTOM));
+    }
+
+    #[core::prelude::v1::test]
+    fn edge_fades_ramp_with_distance() {
+        let rem = px(16.);
+        // 不满一屏：两条都不画
+        assert_eq!(edge_fades(px(0.), px(0.), rem), (px(0.), px(0.)));
+        // 贴顶：顶上那条 0，底下满格
+        let (top, bottom) = edge_fades(px(0.), px(1000.), rem);
+        assert_eq!(top, px(0.));
+        assert_eq!(bottom, FADE_BOTTOM.to_pixels(rem));
+        // 中间：顶上那条按距离连续长高，不到满格
+        let (top, _) = edge_fades(px(12.), px(1000.), rem);
+        assert!(top > px(1.) && top < FADE_TOP.to_pixels(rem));
+        // 贴底：底下那条 0
+        let (_, bottom) = edge_fades(px(1000.), px(0.), rem);
+        assert_eq!(bottom, px(0.));
+    }
+
+    #[core::prelude::v1::test]
+    fn split_markdown_breaks_at_paragraphs() {
+        let para = "这是一段很长的说明文字，用来把回复撑过长回复的阈值。".repeat(12);
+        let text: String = (0..12).map(|_| format!("{para}\n\n")).collect();
+        let chunks = split_markdown(&text);
+        assert!(chunks.len() > 1, "{}", chunks.len());
+        assert!(chunks.iter().all(|c| !c.is_empty()));
+        // 空行处断，拼回去和原文一字不差
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[core::prelude::v1::test]
+    fn split_markdown_reopens_code_fences() {
+        let code: String = (0..400).map(|_| "let value = compute(1);\n").collect();
+        let text = format!("# 示例\n\n```rust\n{code}```\n");
+        let chunks = split_markdown(&text);
+        assert!(chunks.len() > 1);
+        // 每块的围栏行成对（断在代码块里时补了收尾、下一块重开）
+        for chunk in &chunks {
+            let fences = chunk.lines().filter(|l| l.trim_start().starts_with("```")).count();
+            assert_eq!(fences % 2, 0, "围栏没配平：{chunk:?}");
+        }
+        assert!(chunks.iter().all(|c| c.contains("let value")));
+    }
+
+    #[core::prelude::v1::test]
+    fn split_markdown_repeats_table_header() {
+        let head = "| 名称 | 说明 |\n| --- | --- |\n";
+        let rows: String = (0..600).map(|i| format!("| 行 {i} | 说明文字 |\n")).collect();
+        let text = format!("{head}{rows}");
+        let chunks = split_markdown(&text);
+        assert!(chunks.len() > 1);
+        for chunk in chunks.iter().skip(1) {
+            assert!(chunk.starts_with(head), "表格块缺表头：{chunk:?}");
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn split_markdown_has_no_ghost_header_blocks() {
+        let head = "| a | b |\n| --- | --- |\n";
+        let rows: String = (0..500).map(|i| format!("| {i} | x |\n")).collect();
+        let text = format!("{head}{rows}\n收尾段落。\n");
+        let chunks = split_markdown(&text);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            if chunk.starts_with(head) {
+                assert!(chunk.len() > head.len() + 2, "只有表头没有表格行的块：{chunk:?}");
+            }
+        }
+        // 表格后面的正文没有被空表头隔开
+        assert!(chunks.iter().any(|c| c.contains("收尾段落")));
+    }
+
+    #[core::prelude::v1::test]
+    fn split_markdown_matches_fence_char_and_length() {
+        // 4 个反引号开的块里，3 个反引号的行不能当收尾
+        let inner: String = (0..400).map(|_| "```\nlet x = 1;\n").collect();
+        let text = format!("````markdown\n{inner}````\n");
+        let chunks = split_markdown(&text);
+        assert!(chunks.len() > 1);
+        let fences = |c: &str| c.lines().filter(|l| l.trim_start().starts_with("````")).count();
+        for chunk in &chunks {
+            assert_eq!(fences(chunk) % 2, 0, "4 反引号围栏没配平：{chunk:?}");
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn user_input_cancels_force_follow() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.follow_tail();
+        assert!(s.follow.force_until.is_some());
+        // 往上滚（以及 Ctrl+Home 走的 note_input(false)）当场作废
+        s.note_input(false);
+        assert!(s.follow.force_until.is_none());
+        s.follow_tail();
+        s.pin_row(0);
+        assert!(s.follow.force_until.is_none());
+        s.follow_tail();
+        s.drop_force_follow();
+        assert!(s.follow.force_until.is_none());
+    }
+
+    /// 按钮显隐只按几何滞回：滚轮余量还在、也没有向下的输入方向时，
+    /// 只要已经回到距底 80px 内，「回到底部」也要立刻消失（拖滚动条回底部同理）。
+    #[core::prelude::v1::test]
+    fn away_clears_near_bottom_while_wheel_is_settling() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.list.pause_following_tail();
+        s.follow.away = true;
+        // 未布局时距底按 0 算；余量是往上翻，且 last_input_down 不是 Some(true)
+        let now = Instant::now();
+        s.wheel = Some(WheelInput::new(now, -px(10.)));
+        s.sync_follow(now, false);
+        assert!(!s.follow.away, "距底 80px 内按钮要消失");
+        // 只清按钮，不自动吸附（没有向下的输入方向）
+        assert!(!s.list.is_following_tail());
+    }
+
+    #[core::prelude::v1::test]
+    fn large_finished_reply_splits_into_rows() {
+        let para = "拆块之后每行只排自己那一块，滚动时不用整篇重排。".repeat(10);
+        let text: String = (0..20).map(|_| format!("{para}\n\n")).collect();
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.transcript.push(ChatItem::Agent(text.clone()));
+        s.transcript.push(ChatItem::Agent("短回复不拆".into()));
+        s.sync_list(ViewMode::Normal);
+        let parts = s.part_count(0).expect("大回复要拆块");
+        assert!(parts > 1);
+        assert_eq!(s.rows.len(), parts + 1, "第二条整条一行");
+        assert_eq!(s.row_of(0), 0);
+        assert_eq!(s.row_of(1), parts);
+        assert_eq!(s.list.item_count(), parts + 2, "末尾还有运行状态行");
+        assert_eq!(s.measured.len(), s.rows.len());
+        // 记录下标仍能在 `layout` 里查（渲染用）
+        assert_eq!(s.layout.len(), 2);
+        let joined: String =
+            (0..parts).filter_map(|p| s.part_text(0, p)).map(|t| t.to_string()).collect();
+        assert_eq!(joined, text);
+    }
+
+    #[core::prelude::v1::test]
+    fn streaming_reply_is_not_split() {
+        let para = "流式写的时候每来一个 chunk 都要重排，拆了反而白花功夫。".repeat(10);
+        let text: String = (0..20).map(|_| format!("{para}\n\n")).collect();
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.transcript.push(ChatItem::Agent(text));
+        s.busy = true;
+        s.sync_list(ViewMode::Normal);
+        assert_eq!(s.part_count(0), None);
+        assert_eq!(s.rows.len(), 1);
+        // 这一轮结束：同一段文本开始拆块，行数跟着变
+        s.busy = false;
+        s.sync_list(ViewMode::Normal);
+        assert!(s.part_count(0).is_some_and(|n| n > 1));
+        assert_eq!(s.rows.len(), s.part_count(0).unwrap());
     }
 
     #[core::prelude::v1::test]
@@ -4538,7 +5646,7 @@ mod tests {
             None,
         );
         // 编辑还没 diff 时算一步，和前面连成一组
-        assert_eq!(s.compute_layout(ViewMode::Normal)[1].head.unwrap().end, 4);
+        assert_eq!(s.compute_layout(ViewMode::Verbose)[1].head.unwrap().end, 4);
         s.apply_event(
             KernelEvent::ToolCallDiff {
                 id: "e".into(),
@@ -4555,12 +5663,17 @@ mod tests {
             None,
         );
         s.apply_event(read("c"), None);
-        let l = s.compute_layout(ViewMode::Normal);
+        // 自动批准的行只在「详细」视图里画（`visible_in`），分组也按可见性算
+        let l = s.compute_layout(ViewMode::Verbose);
         // 带 diff 的编辑单独成行，把前后断成两组
         assert_eq!(l[1].head.unwrap().end, 3);
         assert!(l[3].body && l[3].head.is_none());
         assert_eq!(l[4].head.unwrap().end, 6);
         assert!(matches!(s.transcript[4], ChatItem::AutoApproved { .. }));
+        // 正式视图里那一行不画，也不会凭空制造一个空组
+        let l = s.compute_layout(ViewMode::Normal);
+        assert!(!l[4].body && l[4].head.is_none());
+        assert!(l[5].body);
     }
 
     /// 带工具 ID 的权限请求：应答后结果标在工具行上，这一行不再画，也不把前后的步骤拆成两组；
@@ -4633,6 +5746,74 @@ mod tests {
                 .enumerate()
                 .any(|(i, r)| r.body && matches!(s.transcript[i], ChatItem::Permission { .. }))
         );
+    }
+
+    #[core::prelude::v1::test]
+    fn live_small_group_starts_open_and_folds_by_click() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.begin_turn();
+        s.apply_event(read("a"), None);
+        s.apply_event(read("b"), None);
+        s.sync_list(ViewMode::Normal);
+        let head = s.layout[1].head.expect("两步就有组头");
+        assert!(head.live && head.live_small && head.open);
+        assert!(s.layout[1].body && s.layout[2].body);
+        // 点一下收起：活跃小组走 `folded_live_groups`
+        s.toggle_group(1);
+        s.sync_list(ViewMode::Normal);
+        assert!(!s.layout[1].body && !s.layout[2].body);
+        assert!(s.open_groups.is_empty() && s.folded_live_groups.contains(&1));
+        s.toggle_group(1);
+        s.sync_list(ViewMode::Normal);
+        assert!(s.layout[1].body && s.layout[2].body);
+
+        // 步骤超过 LIVE_TAIL 之后回到「露出尾巴、点开看全部」
+        for event in [read("c"), read("d")] {
+            s.apply_event(event, None);
+        }
+        s.sync_list(ViewMode::Normal);
+        let head = s.layout[1].head.expect("组头还在");
+        assert!(!head.live_small && !head.open);
+        assert!(!s.layout[1].body && s.layout[3].body && s.layout[4].body);
+    }
+
+    /// 这一轮没有正文回复时，回合末尾（改动卡 / 用时）挂在最后一步上。
+    #[core::prelude::v1::test]
+    fn turn_without_reply_anchors_on_the_last_step() {
+        let s = Session::from_records(
+            7,
+            meta(),
+            vec![
+                Record::user("跑一下"),
+                ev(read("a")),
+                ev(read("b")),
+                ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+            ],
+            &Default::default(),
+        );
+        assert!(!s.is_turn_fallback_tail(1, ViewMode::Normal));
+        assert!(s.is_turn_fallback_tail(2, ViewMode::Normal));
+        assert_eq!(s.latest_turn_anchor(ViewMode::Normal), Some(2));
+
+        // 有正文回复的回合仍按正文那一行算
+        let s = Session::from_records(
+            7,
+            meta(),
+            vec![
+                Record::user("跑一下"),
+                ev(read("a")),
+                ev(KernelEvent::AgentMessageChunk { text: "好了".into() }),
+                ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+            ],
+            &Default::default(),
+        );
+        assert!(!s.is_turn_fallback_tail(1, ViewMode::Normal));
+        assert_eq!(s.latest_turn_anchor(ViewMode::Normal), Some(2));
     }
 
     #[core::prelude::v1::test]

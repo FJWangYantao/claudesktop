@@ -5,6 +5,9 @@
 
 ## 构建 / 测试
 
+- **`CLAUDESKTOP_STRESS` 报完统计不会自己退出**（2026-11-24）：busy 模式 5 秒后 `stress_report()` 打完就留在前台（只有 `CLAUDESKTOP_STRESS_SESSIONS` 那条会定时退出）。脚本里跑要设 `CLAUDESKTOP_STRESS_OUT=<文件>`（默认写 stderr），`Start-Process -PassThru` 起进程、等够时间再 `Stop-Process`，否则管道一直挂着看不到结果。同一台机器上还开着正式实例时数字会被抢 CPU，最好先关。
+- **Windows SDK 的 Lib / Include 曾被掏空，`setup.exe modify --add` 不修**（2026-11-24，已修复）：现象是编译卡在 `LNK1181 无法打开输入文件 kernel32.lib`，`C:\Program Files (x86)\Windows Kits\10\` 只剩 `bin` / `Redist` / `DesignTime`。此时 `vswhere -requires Microsoft.VisualStudio.Component.Windows11SDK.26100` 仍返回安装路径，`modify --add` 6 秒退出 0（组件登记着，MSI 的 `Lib`/`Include` 文件没了）。正确做法是跑 `setup.exe repair --installPath ...\2022\BuildTools --quiet --norestart`：它会先自更新 installer，再在后台进程里重装缺的 MSI；父进程立刻返回，要以 `Get-Process setup` 是否退出为准。修复后 `Windows Kits\10\Lib\10.0.26100.0\um\x64\kernel32.lib` 回来，`cargo check` 通过。
+- **Windows 沙箱里的 exe 可带低完整性标签，离开沙箱双击也不一定恢复**（2026-11-24）：滚轮候选从 Explorer 启动后，进程令牌仍为 `S-1-16-4096`。用该进程的令牌只请求目录的 `FILE_ADD_FILE`，用户目录、桌面、文档和默认会话目录均返回 Windows 错误 5，低完整性的工作区可写。排查导出弹窗和历史不落盘，先核对实际运行的 exe、令牌完整性和目标目录；版本号相同不代表是同一构建。给用户验收时，从发布 ZIP 用资源管理器重新解压到普通用户目录，不复用沙箱解压的 exe，也不改目录权限。
 - **磁盘余量不足时截图构建可能报 `LNK1318: LIMIT (12)`**：本轮临时 PDB 已 503 MiB，删除后普通链接仍失败；
   曾只为截图 exe 加 `cargo rustc … -- -C link-arg=/DEBUG:NONE` 临时通过。清理旧临时 target 释放约 16 GiB 后，
   标准 `cargo build -p claudesktop --features headless-screenshot` 重新通过；最终验收用标准构建，不能用早期绕过结果代替。
@@ -76,6 +79,11 @@
   那条路本机已全部证伪（INCLUDE/LIB/并发内存都不是原因）。
 
 ## UI / gpui
+
+- **`Reveal` 必须一直挂着，自动收起不能播弹簧**（2026-11-24）：只在 `reveal < 1.0` 时包 `Reveal`，展开期间它的高度从没量过（`height == None`），一收起第一帧按 0 排，整页塌一下再弹回。列表里 `layout.member` 的行一律挂 `Reveal::new(..)`，进度 1.0 也挂。反过来，自动收起（新行涌入、正文到达、`apply_event`）得走 `reveal_progress_when(.., animate=false)`（内部 `Spring::with_travel(false)`，直接落位、不请求帧），否则每出一行列表高度都一涨一缩。只有用户点过的组（`Session::animated_group`）才播。
+- **折叠态工具的 `ToolCallProgress` 会每 500ms 重排整页**（2026-11-24）：`run_shell` 跑着时每 0.5 秒报一次最新几行，原来每次进 `apply_event` 都改 `ToolCard.output` 并 `cx.notify()`——那条工具收在折叠组里看不见，却让虚拟列表重测行高、内容区整页重排，还把滚动的转圈画了一帧就重置。现在两条一起：`ChatApp` 收到进度先按 `is_tool_output_visible` 判断这条展开着没有，不可见就不通知；`ChatItem::fingerprint` 不再把 `output.len()` 编进去（改在 `Session::row_key` 里只对**展开中**的工具行算长度），折叠行的指纹不随输出变。
+- **内层滚动区不能在 capture 阶段「放行」，要自己滚掉**（2026-11-24）：展开的工具输出靠 `overflow_y_scroll` 自己滚，`div` 的内置处理**不调用** `stop_propagation`，同一条 `ScrollWheelEvent` 会继续走 bubble 到外层对话 `List`，两边各滚一次（双滚动、整页跟着硬跳）。正确做法是在 capture 阶段按指针命中的句柄直接 `set_offset`，并**照常** `cx.stop_propagation()`；登记命中区时要和 `window.content_mask().bounds` 求交，卡片被视口裁掉的那半不能再命中。
+- **60 FPS 的循环动画要锚在「上一帧真正画出的时刻」**（2026-11-24）：：`LoopOverlay` 从 30 帧提到 60 帧（`LOOP_INTERVAL = 16ms`）后，相位若按「计划时刻」推，计时器晚到会累积漂移、转圈一顿一顿。现在 `paint_loop_spots` 每次画完记 `LAST_LOOP_PAINT`，`wait_for_tick` 取它和本次唤醒时刻的较大者当锚。圆弧扫过固定 `SPIN_SWEEP`（0.30），不做脉冲——相位和形状都只跟时钟走。
 
 - **对话滚动的卡感要分别量位移和绘制耗时**（2026-11-24）：当前 60px 一格先走 30px，按 16ms 帧间隔计算，显示步长约为 38、6、4、3px。隐藏窗口用 100 轮短对话实测，应用内 300 帧整窗重绘的 p95 为 2.99–4.41ms（三次）。在末条回复加一张 256 行四列表后，p95 为 26.44–27.16ms，两次都超过 60Hz 的 16.7ms 预算；直接滚动也有 23.59ms。同样的表格数据拆成同一条回复里的 8 块仍有 25.91ms，分到 8 条回复后降为 8.09–8.29ms。外层按消息虚拟化，可见消息里的表格由 `gpui-base::text` 整表构造。查普通文本的顿挫先看单格位移分布；查复杂回复再看一帧构造的块和表格行数。复现脚本、截图与逐帧数据在 `.claudesktop/bench/wheel-stutter-20261124/`。
 - **对话滚轮的绝对像素目标会在补量行高后失效**（2026-11-24）：`wheel_by` 保存滚动条的绝对目标，`step_wheel` 用下一帧的滚动条读数计算剩余距离。GPUI 给未测行记 0 高，补量视口上方的行会抬高该读数，顶端仍可停在同一条消息。每帧限速只能压低单步位移。从底部向上连滚四格，100 轮历史的隐藏窗口中直接滚动走 240 个逻辑像素，首次平滑走约 525，预先滚过再回底仅走 150。后者还暴露了连滚时即时位移消耗上一格余量的问题。修复时应按输入累计带方向的剩余位移，换向清余量，并对照同一消息的实际屏幕位置。复现脚本和离屏帧位于 `.claudesktop/bench/wheel-root-20261124/`。
@@ -548,3 +556,20 @@
   另外不要带 BOM。Windows 上 `.bat` 会被套一层 `cmd.exe` 跑，路径里不能有 `" % ^ ! & | < >`。
 - **REA + ADB**：`REA_ADB_PATH` 同样要绝对路径；不给就在 PATH 里找。本机用 SDK 自带那份
   `E:\Android\Sdk\platform-tools\adb.exe`（37.0.1），只探测客户端版本，不碰设备。
+- **对话列表的行下标和记录下标是两套**（2026-11 滚动手感改造）：`Session::rows` 把很大的已完成回复
+  拆成多个虚拟行之后，`list` / `measured` 用**行下标**，`layout` / `transcript` / `is_turn_end` 仍是
+  **记录下标**；两者用 `Session::row_of(ix)` 换算。新代码碰列表下标前先想清楚在哪一套里：
+  `reveal`、`pin_row`、闪烁（`with_flash`）、搜索结果跳转都传记录下标、内部换算；
+  元素 id（`("agent", key)`、`("agent-msg", key)`）用行下标，否则拆开的几块 id 撞车。
+- **重建行划分要自己记锚点**：`ListState::reset` 会清掉 `logical_scroll_top`（跟随中的用户会直接落回顶部）。
+  先在旧 `rows` 里把视口顶的记录下标和 `offset_in_item` 记下来，重建后行都塞进去（`splice_with_hints`）
+  再 `scroll_to` 回去；顺手 `wheel = None`、`pin = None`。`reset(1)` 之后**不要**再 `reset(n+1)` 再补行，
+  会变成 2n+1 行——补行走 `sync_list` 里已有的新增分支。
+- **拆 Markdown 的围栏状态**：判断「关闭围栏」必须看**读这一行之前**围栏是否已经打开，
+  在 push 之后再置 `fence = None`；先置后 push 会把开围栏那一行当成关围栏，整段代码块被当成普通文本切。
+  表格同理：空行要结束表格，否则空行后的一行表格会被当成「还在表里」而不补表头。
+  拆块文本是复制出来的（`Rc<[SharedString]>`），`retained_breakdown` 里已经计入这份额外内存。
+- **跟随判定不能只看 `is_scrolled_to_end()`**：列表有未测 / 估高行时它返回 `None`，一帧内判断不了。
+  `sync_follow` 用距底像素 + 最近输入方向 + `is_tail_measured()`；向上任何一格就 `pause_following_tail`
+  （流式追加会抢位置），向下回到 80px 内且尾行已测才重新 `FollowMode::Tail`，中间带保持原状。
+  程序化定位（reveal、恢复位置）后要 `quiet_follow(700ms)`，否则会被自动吸附拉走。

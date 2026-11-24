@@ -4,7 +4,7 @@
 //!
 //! gpui 的动画每一帧都要重画它所在的整个 view（`request_animation_frame` 通知当前 view，
 //! 祖先一并变脏），所以常驻的循环动画（转圈、扫光）不用 `with_animation`：相位按全局时钟算，
-//! 由一个共用的节拍器每隔约 33ms（60Hz 下每两帧）让画着它们的 view 重画一次（[`request_loop_tick`]）。
+//! 由一个共用的节拍器每隔约 16ms（60Hz 下一帧）让画着它们的 view 重画一次（[`request_loop_tick`]）。
 //! 内容区（对话、设置页、子任务详情）里的循环动画也不画在内容区里：每拍重画内容区就是重排整页对话，
 //! 长回复、代码块多了一拍十几毫秒，跑着的时候转圈就掉帧。内容区里只放占位格、记下位置，
 //! 由叠在内容区上面的小 view [`LoopOverlay`] 画，节拍器只重画它（侧栏同理，见 sidebar.rs 文件头）。
@@ -31,15 +31,15 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// 循环动画两次重画之间至少隔这么久（约 30 帧）
-const LOOP_INTERVAL: Duration = Duration::from_millis(33);
-/// 帧到来的时刻有抖动：差这么一点也算到了（60Hz 下正好每两帧一拍）
-const TICK_SLACK: Duration = Duration::from_millis(4);
-// 循环动画的节奏：转圈 1 秒一圈，圆弧伸缩和扫光 2 秒一拍
+/// 循环动画两次重画之间至少隔这么久（约 60 帧）
+const LOOP_INTERVAL: Duration = Duration::from_millis(16);
+/// 帧到来的时刻有抖动：差这么一点也算到了
+const TICK_SLACK: Duration = Duration::from_millis(2);
+// 循环动画的节奏：转圈 0.9 秒一圈，扫光 2 秒一拍
 /// 转圈匀速转一圈的时长
-const SPIN_PERIOD: Duration = Duration::from_millis(1000);
-/// 圆弧一伸一缩的周期
-const PULSE_PERIOD: Duration = Duration::from_millis(2000);
+const SPIN_PERIOD: Duration = Duration::from_millis(900);
+/// 转圈圆弧的固定长度（圈数的比例）：匀速转，不再一伸一缩（忽快忽慢看着像掉帧）
+const SPIN_SWEEP: f32 = 0.30;
 /// 扫光扫一遍的时长
 const SHIMMER_PERIOD: Duration = Duration::from_millis(2000);
 
@@ -51,6 +51,8 @@ thread_local! {
     static TICK_VIEWS: RefCell<Vec<EntityId>> = const { RefCell::new(Vec::new()) };
     /// 内容区这一遍记下的循环动画位置（内容区重画时清空重记，复用缓存时照旧有效）
     static LOOP_SPOTS: RefCell<Vec<LoopSpot>> = const { RefCell::new(Vec::new()) };
+    /// 最近一次真正画出循环动画的时刻：节拍按它算间隔，外部重画（打字、滚动）不会把拍子挤短
+    static LAST_LOOP_PAINT: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }
 
 /// 内容区里的一个循环动画：画什么、画在哪、裁到哪（窗口坐标）。
@@ -108,14 +110,19 @@ impl Render for LoopOverlay {
 }
 
 fn paint_loop_spots(window: &mut Window, cx: &mut App) {
-    let spin = (loop_phase(SPIN_PERIOD), 0.2 + 0.45 * pulse(loop_phase(PULSE_PERIOD)));
+    let spin = loop_phase(SPIN_PERIOD);
     let shimmer = loop_phase(SHIMMER_PERIOD);
     let color = rgb(CORAL);
     LOOP_SPOTS.with_borrow(|spots| {
+        if spots.is_empty() {
+            return;
+        }
+        // 记「这一帧真画了循环动画」：空画（只有别处的转圈）不算，免得打字刷新把节拍挤短
+        LAST_LOOP_PAINT.with_borrow_mut(|last| *last = Some(Instant::now()));
         for spot in spots {
             let mask = ContentMask { bounds: spot.clip };
             window.with_content_mask(Some(mask), |window| match &spot.kind {
-                LoopKind::Spinner => paint_spinner(spot.bounds, spin.0, spin.1, color, window),
+                LoopKind::Spinner => paint_spinner(spot.bounds, spin, SPIN_SWEEP, color, window),
                 LoopKind::Shimmer { text, style, base, highlight } => {
                     paint_shimmer(text, style, spot.bounds, shimmer, *base, *highlight, window, cx)
                 }
@@ -158,7 +165,9 @@ fn request_loop_tick(window: &mut Window) {
 
 fn wait_for_tick(since: Instant, window: &Window) {
     window.on_next_frame(move |window, cx| {
-        if since.elapsed() + TICK_SLACK >= LOOP_INTERVAL {
+        // 从上一帧真正画出来算起：外部原因多画的那几帧不会把一拍挤短
+        let anchor = LAST_LOOP_PAINT.with(|c| c.borrow().map_or(since, |t| t.max(since)));
+        if anchor.elapsed() + TICK_SLACK >= LOOP_INTERVAL {
             for view in TICK_VIEWS.take() {
                 cx.notify(view);
             }
@@ -179,10 +188,20 @@ const ENTER_RISE: Pixels = px(8.);
 /// 悬停反馈的时长（原版 `--cds-dur-fast`）：比一次性过渡快得多，鼠标划过就该出来
 const HOVER_DURATION: Duration = Duration::from_millis(60);
 
-/// 平滑回到底部：剩下的距离每过这么久衰减到 1/e（约 4 倍时长基本到底）
-pub(super) const JUMP_TAU: f32 = 0.06;
-/// 平滑回到底部最多滑这么久，之后直接交给自动跟随（流式输出时底部一直在长）
-pub(super) const JUMP_MAX: Duration = Duration::from_millis(500);
+/// 平滑回到底部：固定 320ms 的 cubic-out（比指数衰减更容易感知「到了」），
+/// 每帧的目标按实时剩余距离算——流式输出边滑边长高也不会二次跳。
+pub(super) const JUMP_DURATION: Duration = Duration::from_millis(320);
+
+/// 这一帧应走掉剩余距离的比例：在固定时长里按 ease-out-cubic 推进，
+/// 剩余距离变化（内容还在长）不会改变总时长。
+/// `elapsed` 是本帧**终点**时刻（`now - started`），区间是上一帧终点到本帧终点。
+pub(super) fn jump_step(elapsed: Duration, dt: Duration) -> f32 {
+    let total = JUMP_DURATION.as_secs_f32();
+    let prev = elapsed.saturating_sub(dt);
+    let q0 = ease_out_cubic((prev.as_secs_f32() / total).min(1.));
+    let q1 = ease_out_cubic((elapsed.as_secs_f32() / total).min(1.));
+    if q1 >= 1. || 1. - q0 <= f32::EPSILON { 1. } else { ((q1 - q0) / (1. - q0)).clamp(0., 1.) }
+}
 
 /// 设置页 / 模型清单的平滑滚动：剩下的距离每过这么久衰减到 1/e。
 /// （对话列表不用这套，走 `session::WheelInput` 的相对指数阻尼缓出）
@@ -205,7 +224,7 @@ pub(super) struct JumpAnim {
 }
 
 /// 转圈（当前强调色，12px，界面里所有「进行中」共用这一个：工具行、侧栏、压缩上下文）：
-/// 淡色圆环上一段圆头圆弧匀速转，弧长随 [`PULSE_PERIOD`] 一伸一缩，矢量画（不是旋转图标，边缘不发虚）。
+/// 淡色圆环上一段固定长度的圆头圆弧匀速转，矢量画（不是旋转图标，边缘不发虚）。
 /// 减少动态效果时停成一段静止的四分之三圆弧。
 /// 这里只是占位，由 [`LoopOverlay`] 画，只能用在内容区里；别的地方用 [`spinner_in_place`]。
 pub(super) fn spinner() -> Div {
@@ -219,12 +238,6 @@ pub(super) fn spinner() -> Div {
 /// 就地画的转圈（[`spinner`] 在内容区里只是占位）：给自己就是小覆盖层的 view 用（侧栏转圈）。
 pub(super) fn spinner_in_place() -> Div {
     let reduced = REDUCED.load(Ordering::Relaxed);
-    // 起点和弧长都按圈数算
-    let (start, sweep) = if reduced {
-        (0., 0.75)
-    } else {
-        (loop_phase(SPIN_PERIOD), 0.2 + 0.45 * pulse(loop_phase(PULSE_PERIOD)))
-    };
     let color = rgb(CORAL);
     div().size_3().flex_shrink_0().child(
         canvas(
@@ -233,15 +246,19 @@ pub(super) fn spinner_in_place() -> Div {
                     request_loop_tick(window);
                 }
             },
-            move |bounds, _, window, _| paint_spinner(bounds, start, sweep, color, window),
+            move |bounds, _, window, _| {
+                // 相位取绘制那一刻，而不是 render 时：否则外部重画会把相位钉在旧值上跳一帧
+                let (start, sweep) = if reduced {
+                    (0., 0.75)
+                } else {
+                    LAST_LOOP_PAINT.with_borrow_mut(|last| *last = Some(Instant::now()));
+                    (loop_phase(SPIN_PERIOD), SPIN_SWEEP)
+                };
+                paint_spinner(bounds, start, sweep, color, window)
+            },
         )
         .size_full(),
     )
-}
-
-/// 0..1 的相位变成 0→1→0 的平滑起伏（余弦）。
-fn pulse(phase: f32) -> f32 {
-    0.5 - 0.5 * (phase * TAU).cos()
 }
 
 /// 圆周上第 `turns` 圈处的点（0 = 正上方，顺时针）。
@@ -402,6 +419,19 @@ pub(super) fn reveal_progress(
     cx: &mut App,
 ) -> f32 {
     let policy = cx.theme().motion_tokens().spring_control;
+    spring((id.into(), "reveal"), if open { 1f32 } else { 0. }, policy, window, cx)
+}
+
+/// 同 [`reveal_progress`]，但 `animate` 为假时直接落位目标值、不排动画帧。
+/// 新行涌入、正文到达导致的自动收起用它：0ms 切换，列表高度不抖。
+pub(super) fn reveal_progress_when(
+    id: impl Into<ElementId>,
+    open: bool,
+    animate: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> f32 {
+    let policy = cx.theme().motion_tokens().spring_control.with_travel(animate);
     spring((id.into(), "reveal"), if open { 1f32 } else { 0. }, policy, window, cx)
 }
 

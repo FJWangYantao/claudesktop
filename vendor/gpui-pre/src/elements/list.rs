@@ -84,6 +84,11 @@ struct StateInner {
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
     estimated_item_height: Option<Pixels>,
+    // claudesktop patch
+    /// 布局后「离底 1px 内自动重新跟随」的隐式吸附。
+    /// 对话列表关掉它，交给自己按几何距离 + 方向判定（见 `Session::sync_follow`）：
+    /// 1px 的窗口会让「往上翻一点」和「往下滚回来」都很难受。
+    auto_reengage: bool,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -337,6 +342,7 @@ impl ListState {
             pending_scroll: None,
             follow_state: FollowState::default(),
             estimated_item_height: None,
+            auto_reengage: true,
         })));
         this.splice(0..0, item_count);
         this
@@ -425,6 +431,86 @@ impl ListState {
         self.remeasure_items_with_scroll_anchor(range, ScrollAnchor::Absolute);
     }
 
+    // claudesktop patch
+    /// Invalidate a range and give every row a fresh height estimate at the same time.
+    /// Used when the text metrics change (font scale, column width): the whole list is stale,
+    /// and the estimates keep the scrollbar and bottom detection sane while rows are re-measured.
+    /// The scroll-top row keeps its proportional position.
+    pub fn remeasure_with_hints(
+        &self,
+        range: Range<usize>,
+        hints: impl IntoIterator<Item = Pixels>,
+    ) {
+        let state = &mut *self.0.borrow_mut();
+        let count = state.items.summary().count;
+        let start = range.start.min(count);
+        let end = range.end.min(count);
+        if start >= end {
+            return;
+        }
+
+        if let Some(scroll_top) = state.logical_scroll_top {
+            if (start..end).contains(&scroll_top.item_ix) {
+                state.pending_scroll = state.proportional_scroll(scroll_top).or(Some(
+                    PendingScroll::Absolute {
+                        item_ix: scroll_top.item_ix,
+                        offset: scroll_top.offset_in_item,
+                    },
+                ));
+            }
+        }
+
+        let mut hints = hints.into_iter();
+        let new_items = {
+            let mut cursor = state.items.cursor::<Count>(());
+            let mut new_items = cursor.slice(&Count(start), Bias::Right);
+            let invalidated = cursor.slice(&Count(end), Bias::Right);
+            new_items.extend(
+                invalidated.iter().map(|item| {
+                    let height = hints
+                        .next()
+                        .unwrap_or_else(|| item.size_hint().map_or(px(0.), |s| s.height));
+                    ListItem::Unmeasured {
+                        size_hint: Some(size(px(0.), height)),
+                        focus_handle: item.focus_handle(),
+                    }
+                }),
+                (),
+            );
+            new_items.append(cursor.suffix(), ());
+            new_items
+        };
+        state.items = new_items;
+        state.measuring_behavior.reset();
+    }
+
+    /// Whether the last row has been measured (as opposed to only estimated).
+    ///
+    /// `is_scrolled_to_end` can answer from estimates; callers that act on "we are at the
+    /// bottom" (jump button, wheel edge) should also require this, otherwise an underestimated
+    /// tail makes the list believe it bottomed out before the real end.
+    pub fn is_tail_measured(&self) -> bool {
+        let state = self.0.borrow();
+        let count = state.items.summary().count;
+        if count == 0 {
+            return true;
+        }
+        // 从视口顶到末尾都要实测过:否则中间某段估高偏小时,滚动会在半路撞上估算的 max。
+        // 没有逻辑顶时按对齐方式取（Top = 0，Bottom = 末尾），和列表内部口径一致。
+        let start = state.logical_scroll_top().item_ix.min(count - 1);
+        let mut cursor = state.items.cursor::<Count>(());
+        cursor.seek(&Count(start), Bias::Right);
+        let summary: ListItemSummary = cursor.summary(&Count(count), Bias::Right);
+        summary.unrendered_count == 0
+    }
+
+    // claudesktop patch
+    /// Toggle the layout-time "snap back to the tail when within 1px of the bottom".
+    /// Chat lists turn it off and drive attach/detach themselves (see `Session::sync_follow`).
+    pub fn set_auto_reengage(&self, on: bool) {
+        self.0.borrow_mut().auto_reengage = on;
+    }
+
     fn remeasure_items_with_scroll_anchor(&self, range: Range<usize>, scroll_anchor: ScrollAnchor) {
         let state = &mut *self.0.borrow_mut();
 
@@ -499,6 +585,33 @@ impl ListState {
         old_range: Range<usize>,
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
     ) {
+        self.splice_items(
+            old_range,
+            focus_handles
+                .into_iter()
+                .map(|focus_handle| ListItem::Unmeasured { size_hint: None, focus_handle }),
+        );
+    }
+
+    // claudesktop patch
+    /// Like [`Self::splice`], but gives every new row a height estimate. The summary height
+    /// (and therefore the scrollbar and bottom detection) is meaningful from the first frame,
+    /// while rows are still measured for real as they enter the viewport.
+    pub fn splice_with_hints(
+        &self,
+        old_range: Range<usize>,
+        hints: impl IntoIterator<Item = Pixels>,
+    ) {
+        self.splice_items(
+            old_range,
+            hints.into_iter().map(|height| ListItem::Unmeasured {
+                size_hint: Some(size(px(0.), height)),
+                focus_handle: None,
+            }),
+        );
+    }
+
+    fn splice_items(&self, old_range: Range<usize>, items: impl IntoIterator<Item = ListItem>) {
         let state = &mut *self.0.borrow_mut();
 
         let mut old_items = state.items.cursor::<Count>(());
@@ -507,12 +620,9 @@ impl ListState {
 
         let mut spliced_count = 0;
         new_items.extend(
-            focus_handles.into_iter().map(|focus_handle| {
+            items.into_iter().map(|item| {
                 spliced_count += 1;
-                ListItem::Unmeasured {
-                    size_hint: None,
-                    focus_handle,
-                }
+                item
             }),
             (),
         );
@@ -1219,7 +1329,7 @@ impl StateInner {
         // If follow_tail mode is on but the user scrolled away
         // (is_following is false), check whether the current scroll
         // position has returned to the bottom.
-        if self.follow_state.has_stopped_following() {
+        if self.auto_reengage && self.follow_state.has_stopped_following() {
             let padding = self.last_padding.unwrap_or_default();
             let total_height = self.items.summary().height + padding.top + padding.bottom;
             let scroll_offset = self.scroll_top(&scroll_top);
@@ -1565,10 +1675,11 @@ impl Element for List {
                         offset: top.offset_in_item,
                     }));
             }
-            let size_hint = self.estimated_item_height.map(|height| size(px(0.), height));
+            let fallback_hint = self.estimated_item_height.map(|height| size(px(0.), height));
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint,
+                    // claudesktop patch: 每一行的估计优先保留，只有没有估计的行才退回统一估值
+                    size_hint: item.size_hint().or(fallback_hint),
                     focus_handle: item.focus_handle(),
                 }),
                 (),

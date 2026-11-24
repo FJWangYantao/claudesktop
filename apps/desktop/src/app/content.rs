@@ -11,12 +11,14 @@
 use super::widgets::edge_fade;
 use super::{ChatApp, motion};
 use crate::model::ChatItem;
-use crate::session::{WheelScroll, scroll_handle_edge};
+use crate::session::{ListMetrics, Row, WheelScroll, scroll_handle_fades};
 use crate::theme::rgb;
 use crate::theme::*;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::time::Instant;
 
 /// 内容区的缓存 view：内容全由 `ChatApp::render_content` 画，这里只是把它隔成一块单独重画的区域。
 pub(crate) struct ContentView {
@@ -174,6 +176,8 @@ impl ChatApp {
 
     /// 内容区：设置页、首页（问候 + 用量概览）或当前会话的对话列表。
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // 这一帧重新登记工具输出的滚动区（列表只画视口附近的行，登记也跟着来）
+        self.tool_scroll_regions.borrow_mut().clear();
         if self.settings_open {
             // 对话这会儿没在画：滚轮余量作废，别等关了设置再补上几秒前的那几格
             self.sessions[self.active].wheel = None;
@@ -252,14 +256,14 @@ impl ChatApp {
                 )
                 .child(self.home_w.probe())
                 .child({
-                    // 上下渐隐跟手：贴顶时顶上那条收成 0，贴底时底下那条收成 0
-                    let (top, bottom) = scroll_handle_edge(&self.home_scroll).heights();
+                    // 上下渐隐跟手，按距边距离连续收放（贴顶 / 贴底时对应那条收成 0）
                     let rem = window.rem_size();
+                    let (top, bottom) = scroll_handle_fades(&self.home_scroll, rem);
                     div()
                         .absolute()
                         .inset_0()
-                        .child(edge_fade(top.to_pixels(rem), paper, clear).top_0())
-                        .child(edge_fade(bottom.to_pixels(rem), clear, paper).bottom_0())
+                        .child(edge_fade(top, paper, clear).top_0())
+                        .child(edge_fade(bottom, clear, paper).bottom_0())
                 })
                 .into_any_element();
         }
@@ -267,44 +271,106 @@ impl ChatApp {
         self.step_jump_to_bottom(window);
         // 虚拟列表：只布局 / 绘制视口附近的行；最后一行是运行状态行（见 Session::sync_list）
         let view = self.settings.view_mode;
+        // 未测行的估高按当前列宽 / 字号算：窗口变窄、换字号、切宽阅读时整表按新度量重估
+        let list_w = self.sessions[active].list.viewport_bounds().size.width;
+        let target = if self.settings.wide_reading { READING_WIDE_W } else { READING_W };
+        let column_w = if list_w > px(0.) { list_w.min(target) } else { target };
+        self.sessions[active].set_list_metrics(ListMetrics {
+            column_w,
+            rem: window.rem_size(),
+            font_rev: crate::theme::font_revision(),
+            measured: list_w > px(0.),
+        });
         self.sessions[active].sync_list(view);
         // 滚轮在列表状态（行数、定位）都更新完之后才推进这一帧，免得和跳转、补行抢
         self.step_wheel(window);
+        // 展开 / 收起卡片：把被点的那一行钉回屏幕原位（按上一帧布局量到的偏差补偿）
+        if self.sessions[active].step_pin(Instant::now()) {
+            window.request_animation_frame();
+        }
+        // 跟随判定放到最后：这一帧的位移都落位了，再按几何 + 方向决定吸附 / 脱离
+        let moving = self.jump.is_some();
+        self.sessions[active].sync_follow(Instant::now(), moving);
+        // 这一帧还在滚（平滑余量 / 回底动画 / 正拖着滚动条）：悬停变化不再单独通知内容区
+        if self.jump.is_some()
+            || self.sessions[active].wheel.is_some()
+            || self.sessions[active].list.is_scrollbar_dragging()
+        {
+            self.scrolling_until = Some(Instant::now() + std::time::Duration::from_millis(120));
+        }
         let state = self.sessions[active].list.clone();
+        let scrollbar_state = state.clone();
         let scroll = list(
             state,
-            cx.processor(|this, ix: usize, window, cx| {
+            cx.processor(move |this, ix: usize, window, cx| {
                 let s = &this.sessions[this.active];
-                let n = s.transcript.len();
                 let row = this.reading_column(div());
-                // 过程组里的一步：展开 / 收起走弹簧，收起没走完之前照样画、按进度裁切
-                // （每帧都要问一次进度，状态才留得住）
-                let reveal = match s.layout.get(ix) {
-                    Some(layout) if layout.member => {
-                        motion::reveal_progress(("step", ix), layout.body, window, cx)
-                    }
-                    _ => 1.,
-                };
-                let content = match (s.transcript.get(ix), s.layout.get(ix)) {
-                    // 收起的组内步骤、当前视图不显示的行：零高度（分组结果在测量指纹里，变了就重测）
-                    (Some(_), Some(layout))
-                        if !layout.body
-                            && layout.head.is_none()
-                            && (!layout.member || reveal <= 0.) =>
-                    {
-                        div()
-                    }
-                    (Some(item), Some(&layout)) => {
-                        let body = this.render_row(ix, item, layout, reveal, window, cx);
-                        // 刚从搜索结果 / 改动列表跳过来的那条：闪一下（见 search.rs）。
-                        // diff 卡片自己有底色盖不住，改成描边；描边不框进卡片下面的行距
-                        let card = matches!(item, ChatItem::Tool(c) if !c.diffs.is_empty())
-                            .then(|| ChatApp::row_gap(layout));
-                        let body =
-                            this.with_flash(div().relative().child(body), ix, card, window, cx);
+                let content = match s.rows.get(ix).copied() {
+                    // 拆开的大回复的一块（见 `session::Row`）：块内没有分组和展开裁切，
+                    // 只有第一块带顶部留白，最后一块挂操作行 / 改动卡片
+                    Some(Row::Part { src, part }) => {
+                        let body = this.render_agent_part(src, part, window, cx);
+                        // 最后一块留出和普通回合末尾一样的下边距
+                        let tail = s.part_count(src).is_some_and(|count| part + 1 == count);
+                        let body = if part == 0 {
+                            this.with_flash(div().relative(), src, None, window, cx).child(body)
+                        } else {
+                            div().relative().child(body)
+                        };
+                        let body = if tail { body.pb(super::chat::STEP_GAP) } else { body };
                         row.pt(px(if ix == 0 { 16. } else { 0. })).child(body)
                     }
-                    (None, _) if ix == n => row.pb_12().children(this.render_turn_status()),
+                    Some(Row::Whole(source)) => {
+                        // 过程组里的一步：展开 / 收起走弹簧，收起没走完之前照样画、按进度裁切
+                        // （每帧都要问一次进度，状态才留得住）
+                        let reveal = match s.layout.get(source) {
+                            Some(layout) if layout.member => {
+                                // 只有用户手动点过的那一组播弹簧；自动收起（新行涌入、正文到达）直接落位，
+                                // 否则每出一行列表高度都一涨一缩
+                                let animate = layout
+                                    .group_start
+                                    .is_some_and(|start| s.animated_group == Some(start));
+                                motion::reveal_progress_when(
+                                    ("step", source),
+                                    layout.body,
+                                    animate,
+                                    window,
+                                    cx,
+                                )
+                            }
+                            _ => 1.,
+                        };
+                        match (s.transcript.get(source), s.layout.get(source)) {
+                            // 收起的组内步骤、当前视图不显示的行：零高度（分组结果在测量指纹里，变了就重测）。
+                            // 没有正文回复的回合末尾（改动卡 / 用时）不算收起：它挂在 row 这一层，得画出来
+                            (Some(_), Some(layout))
+                                if !layout.body
+                                    && layout.head.is_none()
+                                    && (!layout.member || reveal <= 0.)
+                                    && !s.is_turn_fallback_tail(source, view) =>
+                            {
+                                div()
+                            }
+                            (Some(item), Some(&layout)) => {
+                                let body =
+                                    this.render_row(source, item, layout, reveal, window, cx);
+                                // 刚从搜索结果 / 改动列表跳过来的那条：闪一下（见 search.rs）。
+                                // diff 卡片自己有底色盖不住，改成描边；描边不框进卡片下面的行距
+                                let card = matches!(item, ChatItem::Tool(c) if !c.diffs.is_empty())
+                                    .then(|| ChatApp::row_gap(layout));
+                                let body = this.with_flash(
+                                    div().relative().child(body),
+                                    source,
+                                    card,
+                                    window,
+                                    cx,
+                                );
+                                row.pt(px(if ix == 0 { 16. } else { 0. })).child(body)
+                            }
+                            _ => row,
+                        }
+                    }
+                    None if ix == s.rows.len() => row.pb_12().children(this.render_turn_status()),
                     _ => row,
                 };
                 div().w_full().child(content).into_any_element()
@@ -318,8 +384,8 @@ impl ChatApp {
         // 覆盖层不挂事件，不挡点击和滚轮
         let paper = rgb(PAPER);
         let clear = Rgba { a: 0., ..paper };
-        let (fade_top, fade_bottom) = self.sessions[active].scroll_edge().heights();
         let rem = window.rem_size();
+        let (fade_top, fade_bottom) = self.sessions[active].scroll_fades(rem);
         // 滚轮平滑：capture 阶段截住滚轮累计相对位移（见 `ChatApp::wheel_by`），列表自己在 bubble 阶段
         // 一格硬跳的处理就不跑了。只有横向（Shift+滚轮）时放行。
         // 命中区不挡悬停；弹层、对话框盖在上面时 `should_handle_scroll` 为 false，不抢它们的滚轮
@@ -339,8 +405,21 @@ impl ChatApp {
                     }
                     let precise = event.delta.precise()
                         || std::env::var_os("CLAUDESKTOP_WHEEL").is_some_and(|v| v == "direct");
-                    app.update(cx, |this, cx| this.wheel_by(-dy, precise, cx)).ok();
-                    cx.stop_propagation();
+                    // 指针在展开的工具输出上、那个框还能往这个方向滚：capture 阶段就把它滚掉，
+                    // 外层对话列表不再接这一格（放给 bubble 的话列表也会跟着硬跳一次）
+                    let pos = event.position;
+                    let handled = app
+                        .update(cx, |this, cx| {
+                            // 内层滚到底之后，余量交给外层；没交还就是内层吃掉（见 `scroll_tool_output`）
+                            if let Some(rest) = this.scroll_tool_output(pos, dy, cx) {
+                                this.wheel_by(-rest, precise, cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if handled {
+                        cx.stop_propagation();
+                    }
                 });
             },
         )
@@ -354,8 +433,11 @@ impl ChatApp {
             .v_flex()
             .child(scroll)
             .child(wheel)
-            .child(edge_fade(fade_top.to_pixels(rem), paper, clear).top_0())
-            .child(edge_fade(fade_bottom.to_pixels(rem), clear, paper).bottom_0())
+            // 滚动 / 悬停浮现的滚动条：叠在内容之上（不挤占阅读列宽度），
+            // 拖动时列表内部冻结总高，拖到底自动恢复跟随（见 `ListState::set_offset_from_scrollbar`）
+            .child(Scrollbar::vertical(&scrollbar_state).mode(ScrollbarMode::Scrolling))
+            .child(edge_fade(fade_top, paper, clear).top_0())
+            .child(edge_fade(fade_bottom, clear, paper).bottom_0())
             .children(self.render_jump_to_bottom(window, cx))
             .into_any_element()
     }

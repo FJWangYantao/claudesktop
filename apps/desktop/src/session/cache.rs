@@ -95,9 +95,15 @@ impl Session {
         self.list = new_list_state();
         self.measured = Vec::new();
         self.layout = Vec::new();
+        // 记录搬走了：下一帧按空记录重算行划分（拆块的文本副本也一并释放）
+        self.rows_sig = None;
+        self.rows.clear();
+        self.row_start.clear();
+        self.agent_parts.clear();
         self.stream_pending = String::new();
         self.wheel = None;
         self.measured_busy = false;
+        self.animated_group = None;
         self.history_loaded = false;
         self.history_loading = true;
         self.diff_revision += 1;

@@ -6,7 +6,7 @@ use gpui_kit::{
 };
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // ---------- 色板 ----------
 // `Color` 是语义 token（不是色值）：界面里照旧写 `rgb(INK)`，取值查当前色板 + 当前明暗
@@ -705,6 +705,8 @@ pub const FONT_SCALE_DEFAULT: f32 = 1.0;
 static FONT_SCALE_MILLI: AtomicU32 = AtomicU32::new((FONT_SCALE_DEFAULT * 1000.) as u32);
 /// 界面字体族；None = 内嵌的 Inter。
 static FONT_FAMILY: RwLock<Option<SharedString>> = RwLock::new(None);
+/// 字体族的版本号：改一次加一，界面上按字体度量缓存的东西（列表估高）拿它判断失效。
+static FONT_REVISION: AtomicU64 = AtomicU64::new(0);
 /// 系统已装字体族（进程内只枚举一次）。
 static INSTALLED_FONTS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -726,6 +728,12 @@ pub fn set_font_family(cx: &App, family: Option<SharedString>) {
     if let Ok(mut slot) = FONT_FAMILY.write() {
         *slot = checked;
     }
+    FONT_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 字体族版本号（见 [`set_font_family`]）：变了说明按字体度量缓存的东西都过期了。
+pub fn font_revision() -> u64 {
+    FONT_REVISION.load(Ordering::Relaxed)
 }
 
 /// 系统已装字体族（枚举一次要上百毫秒，全进程缓存）。
@@ -892,6 +900,7 @@ fn set_font_family_raw(family: Option<SharedString>) {
     if let Ok(mut slot) = FONT_FAMILY.write() {
         *slot = family;
     }
+    FONT_REVISION.fetch_add(1, Ordering::Relaxed);
 }
 
 // ---------- 圆角 ----------
