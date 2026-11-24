@@ -384,6 +384,7 @@ fn main() {
                                 });
                             }
                             if std::env::var_os("CLAUDESKTOP_STRESS").is_some() {
+                                let retained = std::env::var_os("CLAUDESKTOP_STRESS_RETAINED").is_some();
                                 let mut work = Vec::new();
                                 for step in 0..300 {
                                     let _ = cx.update(|window, cx| {
@@ -398,7 +399,9 @@ fn main() {
                                             cx,
                                         );
                                         let start = std::time::Instant::now();
-                                        window.refresh();
+                                        if !retained {
+                                            window.refresh();
+                                        }
                                         window.draw(cx).clear(cx);
                                         work.push(start.elapsed().as_secs_f64() * 1000.);
                                     });

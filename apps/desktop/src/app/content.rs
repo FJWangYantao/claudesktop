@@ -18,7 +18,9 @@ use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+pub(super) const MESSAGE_HOVER_SETTLE: Duration = Duration::from_millis(120);
 
 /// 内容区的缓存 view：内容全由 `ChatApp::render_content` 画，这里只是把它隔成一块单独重画的区域。
 pub(crate) struct ContentView {
@@ -174,6 +176,12 @@ impl ChatApp {
         }
     }
 
+    fn transcript_scroll_active(&self) -> bool {
+        self.jump.is_some()
+            || self.session().wheel.is_some()
+            || self.session().list.is_scrollbar_dragging()
+    }
+
     /// 内容区：设置页、首页（问候 + 用量概览）或当前会话的对话列表。
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // 这一帧重新登记工具输出的滚动区（列表只画视口附近的行，登记也跟着来）
@@ -268,7 +276,11 @@ impl ChatApp {
                 .into_any_element();
         }
 
-        self.step_jump_to_bottom(window);
+        let settling = window.is_settling_cached_scroll();
+        let mut moved_this_frame = false;
+        if !settling {
+            moved_this_frame |= self.step_jump_to_bottom(window);
+        }
         // 虚拟列表：只布局 / 绘制视口附近的行；最后一行是运行状态行（见 Session::sync_list）
         let view = self.settings.view_mode;
         // 未测行的估高按当前列宽 / 字号算：窗口变窄、换字号、切宽阅读时整表按新度量重估
@@ -283,7 +295,9 @@ impl ChatApp {
         });
         self.sessions[active].sync_list(view);
         // 滚轮在列表状态（行数、定位）都更新完之后才推进这一帧，免得和跳转、补行抢
-        self.step_wheel(window, cx);
+        if !settling {
+            moved_this_frame |= self.step_wheel(window, cx);
+        }
         // 展开 / 收起卡片：把被点的那一行钉回屏幕原位（按上一帧布局量到的偏差补偿）
         if self.sessions[active].step_pin(Instant::now()) {
             window.request_animation_frame();
@@ -305,11 +319,32 @@ impl ChatApp {
             }
         }
         // 这一帧还在滚（平滑余量 / 回底动画 / 正拖着滚动条）：悬停变化不再单独通知内容区
-        if self.jump.is_some()
-            || self.sessions[active].wheel.is_some()
-            || self.sessions[active].list.is_scrollbar_dragging()
-        {
-            self.scrolling_until = Some(Instant::now() + std::time::Duration::from_millis(120));
+        let scroll_active = self.transcript_scroll_active();
+        // 最后一步也沿用正文快照，输入事件仍可触发静态重排。
+        self.transcript_scrolling = (moved_this_frame || scroll_active) && !settling;
+        if !settling {
+            if scroll_active || moved_this_frame {
+                self.scrolling_until = Some(Instant::now() + MESSAGE_HOVER_SETTLE);
+            }
+            if scroll_active {
+                self.hover_settle_task = None;
+            } else if let (None, Some(until)) = (&self.hover_settle_task, self.scrolling_until) {
+                // 即使此刻悬停在空白处，指针也可能在等待期间进入一条消息。
+                let delay = until.saturating_duration_since(Instant::now());
+                self.hover_settle_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.hover_settle_task = None;
+                        if !this.transcript_scroll_active() {
+                            this.transcript_scrolling = false;
+                            this.scrolling_until = None;
+                            if this.hovered_msg.is_some() {
+                                this.content_view.update(cx, |_, cx| cx.notify());
+                            }
+                        }
+                    });
+                }));
+            }
         }
         let state = self.sessions[active].list.clone();
         let scrollbar_state = state.clone();
@@ -403,10 +438,26 @@ impl ChatApp {
         // 一格硬跳的处理就不跑了。只有横向（Shift+滚轮）时放行。
         // 命中区不挡悬停；弹层、对话框盖在上面时 `should_handle_scroll` 为 false，不抢它们的滚轮
         let app = cx.entity().downgrade();
-        let line = rems(1.75).to_pixels(window.rem_size());
+        let line = rems(2.).to_pixels(window.rem_size());
         let wheel = canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
             move |_, hitbox, window, _| {
+                let click_area = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+                let on_click = app.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                    if phase.capture() && click_area.contains(&event.position) {
+                        let _ = on_click.update(cx, |this, cx| {
+                            this.hover_settle_task = None;
+                            let cooling_down = this.scrolling_until.take().is_some();
+                            let wheel = this.sessions[this.active].wheel.take().is_some();
+                            let jump = this.jump.take().is_some();
+                            if wheel || jump || cooling_down {
+                                this.transcript_scrolling = false;
+                                this.content_view.update(cx, |_, cx| cx.notify());
+                            }
+                        });
+                    }
+                });
                 window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                     if !phase.capture() || !hitbox.should_handle_scroll(window) {
                         return;

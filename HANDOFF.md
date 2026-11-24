@@ -5,6 +5,7 @@
 
 ## 构建 / 测试
 
+- **D 盘满时可复用 Release 缓存换盘续编**（2026-11-25）：`gpui-component` 写 `.rlib` 报 Windows 错误 112 后，用 `robocopy /E /COPY:DAT /DCOPY:DAT` 把 `target/release` 复制到可写临时目录的 `release` 子目录（跳过锁文件、`*.rcgu.o` 和旧的桌面 exe / PDB），再用 `cargo build --release -p claudesktop --locked --offline --target-dir <临时目录>`。本次复用了已编好的依赖，普通 Release 构建通过，旧的 `target/release/claudesktop.exe` 仍是上一次的产物。
 - **`CLAUDESKTOP_STRESS` 报完统计不会自己退出**（2026-11-24）：busy 模式 5 秒后 `stress_report()` 打完就留在前台（只有 `CLAUDESKTOP_STRESS_SESSIONS` 那条会定时退出）。脚本里跑要设 `CLAUDESKTOP_STRESS_OUT=<文件>`（默认写 stderr），`Start-Process -PassThru` 起进程、等够时间再 `Stop-Process`，否则管道一直挂着看不到结果。同一台机器上还开着正式实例时数字会被抢 CPU，最好先关。
 - **Windows SDK 的 Lib / Include 曾被掏空，`setup.exe modify --add` 不修**（2026-11-24，已修复）：现象是编译卡在 `LNK1181 无法打开输入文件 kernel32.lib`，`C:\Program Files (x86)\Windows Kits\10\` 只剩 `bin` / `Redist` / `DesignTime`。此时 `vswhere -requires Microsoft.VisualStudio.Component.Windows11SDK.26100` 仍返回安装路径，`modify --add` 6 秒退出 0（组件登记着，MSI 的 `Lib`/`Include` 文件没了）。正确做法是跑 `setup.exe repair --installPath ...\2022\BuildTools --quiet --norestart`：它会先自更新 installer，再在后台进程里重装缺的 MSI；父进程立刻返回，要以 `Get-Process setup` 是否退出为准。修复后 `Windows Kits\10\Lib\10.0.26100.0\um\x64\kernel32.lib` 回来，`cargo check` 通过。
 - **Windows 沙箱里的 exe 可带低完整性标签，离开沙箱双击也不一定恢复**（2026-11-24）：滚轮候选从 Explorer 启动后，进程令牌仍为 `S-1-16-4096`。用该进程的令牌只请求目录的 `FILE_ADD_FILE`，用户目录、桌面、文档和默认会话目录均返回 Windows 错误 5，低完整性的工作区可写。排查导出弹窗和历史不落盘，先核对实际运行的 exe、令牌完整性和目标目录；版本号相同不代表是同一构建。给用户验收时，从发布 ZIP 用资源管理器重新解压到普通用户目录，不复用沙箱解压的 exe，也不改目录权限。
@@ -96,6 +97,56 @@
   ③**量化 + 误差扩散**：每帧步长取 `round(want * scale) / scale`，小数余量沿当前方向累加到下一帧，总位移严格守恒；高刷尾段攒不够一个物理像素就返回 0 等下一帧。配合 `vendor/gpui-pre` 里 `prepaint_items` 把绘制起点也钉到物理像素网格，整屏文字在所有滚动帧里相位恒定。
   ④**连滚接速度而不是接距离**：同向追加输入时把当前 `vel` 归一化成新段的起手斜率（`x1 = min(0.85 / slope, 0.42)`，保证严格单调无过冲），所以连滚没有「一格格一冲」的节奏；被限速 / 部分截断时按实际速度重锚剩余距离，平滑脱离 48px 上限。
 - **距底 80px 内松手不再瞬移吸底**（2026-11-24）：旧 `sync_follow` 在「距底 ≤ 80px + 正在往下滚 + 尾部已实测」时直接 `set_follow_mode(Tail)`，用户滚到距底 40–60px 一松手视口就跳到底。现在 `ScrollFollow` 多两个字段：`armed`（已进吸附带待命）+ `armed_seq`（进入待命那一刻的 `content_seq`）。停在 1..=80px 之间只置 `armed`、视口原地不动；真来了新内容（`content_seq > armed_seq`）才 `sync_follow` 返回 `true`，由 `content.rs` 起一个 `motion::JumpAnim` 平滑滑回底部（减少动态效果时直接 `follow_tail()`）。`sync_list` 同步把 `armed` 也算进「都看到了」，所以待命期间不出未读红点。用户自己往上翻 / 拖滚动条 / 重定位 / `follow_tail` 都会清掉 `armed`。判定本身抽成纯函数 `follow_step`，单测直接覆盖六种几何组合。
+
+- **正文滚动快照要跟着帧状态接力**（2026-11-24）：`cached_scroll` 从未被外层视口裁切的正文快照按物理像素平移，
+  每帧再应用当前视口。图元和 hitbox 的基准坐标不累加。普通 `ContentView::cached` 下的临时 `refreshing` 与
+  `Window::refresh()` 的整窗刷新分开处理，否则每个滚动帧都会错过正文缓存。滚停按真实位置 prepaint，鼠标按下或横滚前
+  同步重建输入回调捕获的绝对坐标。后台 Markdown 解析由 `TextViewState` 观察器使缓存失效。会话休眠、回收正文或重建行划分时清理正文实体缓存。
+- **第三版滚轮**（2026-11-24）：默认 3 行走 96px，Impulse 单格 210ms，积到 480px 时逐步增加到 320ms。
+  静止控制点为 `(0.22, 0.24)` 和 `(0.25, 1)`，连续输入继承起手速度。Windows 绘制锁内在绘制前校验失效区，给绘制期间新到的 VSync 保留失效标记。
+- **当前滚轮曲线与落定帧**（2026-11-24）：Chromium 在 2024 年移除了 Impulse，156 的鼠标滚轮参考曲线为
+  `EASE_IN_OUT + INVERSE_DELTA`。默认一格 96px、200ms，欠量从 120px 增至 480px 时默认段长线性缩至 100ms。
+  旧控制点横坐标 `x1 > x2` 会在中慢速连滚时放大速度起伏。固定横坐标 0.42/0.58，继承速度过大时缩短段长以压住 `y1`，
+  单周期限速 6000px/s、单帧至多 48px。[Chromium 移除 Impulse 的提交](https://chromium.googlesource.com/chromium/src/+/890cc838a079823dac40fd37b9e4edc1c73cc9f4)
+  - 最后一步会清空平滑状态，但这一帧依然移动过。回底和滚轮推进报告当帧是否移动，`transcript_scrolling` 继续复用快照。
+    指针点击、释放或纯横滚前同步重建布局。悬停落点继续记录，停稳 120ms 后再淡入，触控板和拖动滚动条也进同一段静默期。
+  - `WM_PAINT` 投递差会在 180Hz 下把单周期误算成两个。每窗独立保存最后一个 `DwmFlush` 时间戳，仅在绘制回调内读取。
+    隐藏窗口、计时器回退及其他平台用墙钟，量化的二帧阈值为 1.75 个周期。GPUI profiler 仍单独保留首个信号。
+  - 180Hz / 150% DPI 的步进模拟中，单格用 35 帧，峰值后无零位移帧。120ms / 160ms 连滚的稳态步长峰谷比为
+    1.60× / 2.33×。10 格每 35ms 输入一次，最后一格后 157ms 停稳。
+  - `paced_180.py` 本轮 A/B 的 `rest` 最大耗时（short / many / code）为 6.58 / 6.38 / 4.26 → 4.15 / 6.48 / 2.60ms。
+    原脚本在停输入后等待 800ms 并截图才采 `rest`，不能定位最后一个移动帧。在 `up` 与截图间补 60 帧无输入采样后，
+    该段 p95 为 6.01 / 6.34 / 3.92 → 2.68 / 4.08 / 3.51ms。`rest` 峰值仍未稳定在约 2ms。
+    原始数据在 `.claudesktop/bench/wheel-stutter-20261124/vsync-hover-*/frames.json`。180Hz 前台呈现和实际点选仍需实机核对。
+  - 普通及无头 release 构建通过，桌面 253 项测试通过。Windows VSync 三项测试用 `claudesktop/headless-screenshot` 提供
+    GPUI 的 test-support。GPUI 隔离套件的 profiler 和缓存测试通过，弹簧重定向用例在本次构建和改动前二进制中同样失败。
+- **滚动压测要走正常缓存路径**：旧 `draw_bench.py` 强制 `Window::refresh()` 并清理继承的 `CLAUDESKTOP_*` 环境变量。
+  通过进程启动选项传 `CLAUDESKTOP_STRESS_RETAINED=1` 才能测平移缓存。`draw_retained_ab.py` 都用这一路径跑 Step 2 和候选，
+  `paced_180.py` 用无头窗口的 180Hz 消息节拍辅助测交互。手动离屏 draw 数字不包含真实显示器的 Present/VSync 交付。
+  vendored GPUI 的原始测试需要未随 crate 带来的上游夹具。滚动测试在同源码隔离副本里取出那几组不相干的测试并关闭离线不可解析的
+  可选上游基准依赖，见 `.claudesktop/bench/wheel-stutter-20261124/translate-gpui-tests.log`。
+
+- **行级快照与第三版滚轮的实测**：144 DPI、1920×1230 隐藏窗口，release 每场景三对，每轮 300 帧。
+  下列 p50 / p95 是三轮各自百分位的中位数，单位 ms。Step 2 → 最终版，代码 1.41 / 3.09 → 0.73 / 0.97，
+  多消息表格 2.40 / 4.31 → 1.25 / 1.77，离底表格 2.44 / 4.64 → 1.24 / 1.82，短消息 1.68 / 2.42 → 1.67 / 2.47，
+  大量历史 1.72 / 2.55 → 1.52 / 2.15。短消息和大量历史的 p50 仍超过 1.20ms。
+  180Hz 节拍下，代码/表格消息处理 p95 最高 3.08 / 3.75ms，最大 9.87 / 14.27ms。路径见
+  `.claudesktop/bench/wheel-stutter-20261124/translate-final-ab.json` 和 `translate-final-paced180-*/frames.json`。
+  桌面 249 项和 GPUI 隔离滚动测试 21 项通过。完整工作区套件受回环 socket 错误 10013 阻挡，
+  单独执行 core 已编译的测试另有 5 个插件 hook / 本地仓库用例失败，移到无 `#` 的可写临时目录重试结果相同。
+  当前 gpui-base 代码块默认折行，普通长代码没有水平滚动条，水平裁切使用 Scene 测试验证。
+  180Hz 前台呈现、与 Kimi Code 并排体感、正文选择/链接和实际切 DPI 仍待实机核对。
+
+- **顶行切换和触控板斜向输入**（2026-11-24）：列表保留连续的逻辑 Y 坐标，逐项把绘制坐标对齐物理像素，
+  自动滚动用绘制坐标反推偏移。半像素统一往正方向取整，跨零点时也能按整数物理像素平移。
+  触控板输入只在有横移且纵移为零时同步重建布局，因为对话区会截住含纵移的滚轮事件。
+  新测试在旧版复现 150% DPI 半像素位置偏差和斜向输入强制重画。日志在
+  `.claudesktop/bench/wheel-stutter-20261124/phase-fix-regressions-before.log`。
+  修复后 GPUI 滚动 22 项和桌面端 249 项通过。同机 144 DPI、每场景三对各 300 帧，三轮中位 p50/p95（ms）
+  短消息 1.54/2.04 → 1.46/1.91，大量历史 1.38/1.80 → 1.36/1.87。两组 p50 仍超过 1.20ms。
+  GPUI 的 Taffy 测量边界本身也有物理像素取整，半像素跳位的复现不能推断整屏正文都在重排。
+  原始数据见 `phase-fix-ab.json`。同目录 `phase-fix-paced180-*/frames.json` 记录 180Hz 节拍离屏测试。
+  复制 vendor 代码到测试副本后要更新目标文件的修改时间。保留较旧时间戳会让 Cargo 判定 Fresh，误跑上一轮的测试可执行文件。
 
 - **隐藏窗口的鼠标消息坐标要用物理像素**（2026-11-16）：PowerShell 默认 DPI 不感知时 `GetClientRect` 可能报 1280×820，
   而同帧离屏截图是 1920×1230，按这个假比例换算会点空。窗口驱动先 `SetProcessDPIAware()` 再取客户区 / DPI，
@@ -323,6 +374,7 @@
   没并进的 chunk 连 `cx.notify()` 都跳过。另外 `flush_stream` 不分思考 / 正文一次全并，
   正文 chunk  handler 里「先收尾思考」不能直接调它（会把正文缓冲也提前并掉，合批失效），
   要先看 `stream_pending_thought`。
+- **PowerShell 5.1 的 `Start-Process -PassThru` 可能拿不到退出码**：截图已生成且 `WaitForExit` 返回真，`ExitCode` 仍可能为空。验收同时要核对退出码时，用 `[Diagnostics.Process]::Start(ProcessStartInfo)` 启动并等待。
 - **压测只收尾自己启动的 PID**：Git Bash 的 `$!` 可能是包装进程，不要按 `claudesktop.exe` 名称整批杀进程。
   用 Node `spawn` 取得真实 PID 并等待退出（新休眠验收脚本已如此处理）；未退出的实例会占住 exe，导致下次链接失败。
 - **压测数字本身有 ±0.5ms 漂移**（机器负载、热状态）：滚动 p50 同一基线不同时间跑出 2.56→3.94ms。
@@ -348,6 +400,8 @@
   **新的 chip 里放长度不由我们定的文字（项目名 / 模型名 / 分支名）时记得 `.shrink()`。**
 
 ## 内核 / 工具
+
+- **`ask_user` 确认要进入自动分类器的上下文**（2026-11-25）。此前主模型收到了工具返回的答案，分类器只读对话消息，用户点了同意后仍会被拦。实时应答和日志重放共用 `auto::UserInput::question_answer`，只提交选中的答案及其题目和描述。沙箱内回环 HTTP 测试报 Windows 10013，可用 `cargo test -p claudesktop-builtin --lib auto`，进程内模拟分类器会检查当前回合、续接和回退的请求内容。
 
 - **提示词里禁止「工具前旁白」会把阶段汇报也一起压掉**（2026-11-24）：10-23 的提速改动加了「don't narrate what you are about to do before a tool call」，
   同一模型在重度轮次里的中间汇报从每轮 8.4 次掉到 1.0 次，93% 的中间请求正文为空，最长连续 33 分钟不出声。

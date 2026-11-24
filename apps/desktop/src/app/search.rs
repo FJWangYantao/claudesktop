@@ -330,7 +330,7 @@ mod tests {
 
     fn session(rows: Vec<ChatItem>) -> Session {
         let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
-        s.transcript = rows;
+        *s.transcript = rows;
         s
     }
 

@@ -63,11 +63,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **权限模式「自动」**（`crates/builtin/src/auto.rs`）：由一次独立的模型调用（分类器）代替用户审批。
   `authorize` 里 `Access::Read` 和工作目录内的编辑**不进分类器**（省一个往返），其余走
   「硬熔断（`tools::hard_block`：删关键路径、写受保护文件）→ 已保存规则 → 分类器」。
-  分类器只喂用户说过的话 + 要执行的动作，**剥掉助手文本和工具结果**（防自我说服、防注入）；
+  分类器读取用户消息、提交的提问答案和待执行动作。答案带对应题目与实际选中的文案，标明题目和选项来自模型，
+  其它助手文本和工具结果剥掉（防自我说服、防注入）；
   判不出来一律按拒绝。拒绝的理由连同「别换个马甲重试」回给模型，它自己决定换路子还是问用户。
   放行**不发事件**（不刷「已自动批准」）；拦下的理由并进那条失败的工具行（`Verdict::AutoDeny` →
   `ToolOutput::fail`），不另发 `Notice`——用户看到的就是这一行。
-  连续 3 次 / 累计 20 次拒绝就停下来等用户（用户再发消息就重新计数）。分类器看的用户消息续接 / 回退时从日志重建（`history::Rebuilt::user_messages`）。没在设置里配好时这个模式不出现在模式列表里。
+  连续 3 次 / 累计 20 次拒绝就停下来等用户（用户发消息或提交答案后恢复判定）。续接 / 回退时从有效日志重建
+  分类器看的输入（`history::Rebuilt::user_inputs`）。没在设置里配好时这个模式不出现在模式列表里。
   设置里开着时，**新建的对话默认就是「自动」**（`ChatApp::new_session` → `Session::default_to`）：
   会话还没连上内核时先把这一项补进模式表（`model::auto_mode_entry`）并选中，`Started` 时走
   `Session::pending_mode` 交给内核（内核不认就退回它报的那个）；用户在下拉里改了就以此为准，
@@ -177,10 +179,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     悬停才出现的操作用 `hover_opacity`；刚出现的内容用 `entering`。
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
   - 对话列表的滚轮在 `content.rs` 的 capture 阶段截住，走 `ChatApp::wheel_by` / `step_wheel`
-    （gpui `List` 自己一格硬跳）。平滑状态是 `session.rs` 的 `WheelInput`：**只存「用户还要滚多少」**
-    （离散输入每格 `84px`，按 `τ=68ms` 相对指数阻尼缓出，剩不到半像素时顺手带完不丢位移），
-    不存滚动条的绝对目标——绝对目标会被上方补量的行高改变含义（见 HANDOFF）。同向累加、反向清空，
-    一帧最多 48px，到边界把朝外的余量作废。
+    （gpui `List` 自己一格硬跳）。`session::WheelInput` 按剩余位移推进，补量上方行高后滚动距离不变。
+    默认根字号下 Windows 三行一格走 96px。同向累加并继承速度，反向清空，到边界作废朝外的余量。
+    Chromium 156 的滚轮参考是 `EASE_IN_OUT + INVERSE_DELTA`，Impulse 已移除。横向控制点固定为 0.42 和 0.58，
+    用缩短时长约束继承速度。允许 `x1 > x2` 会在连滚时放大速度起伏。段长默认 100–200ms，单帧最多 48px。
+    Windows 优先用 `Window::frame_vsync_at()`，合成器同周期内的额外重画跳过。没有时间戳时用墙钟滞回量化。
+    最后一步仍标记为 `transcript_scrolling`，避免落定时一帧重排整屏正文。精确输入前静态重排命中区，
+    消息操作栏在停稳 120ms 后从当前光标位置淡入（见 HANDOFF）。
     设置页外层和模型清单另走 `settings_wheel_by` / `step_settings_wheel`（指数逼近的 `WheelScroll`），
     按指针位置和边界选择内层或外层，切分类 / 来源要清掉对应的 `*_wheel`。新的程序化滚动（跳转、跟随底部）
     也要清掉对应滚动状态，否则两边抢。

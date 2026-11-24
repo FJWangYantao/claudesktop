@@ -2,7 +2,7 @@
 
 use super::ChatApp;
 use super::chrome::CHROME_H;
-use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::menu::{MenuChip, MenuList, menu_item, menu_popover, menu_text_item};
 use super::settings_view::{active_thinking, thinking_options};
 use super::widgets::Surface;
 use crate::model::PendingImage;
@@ -1169,7 +1169,7 @@ fn model_menu_popover(
     chip: MenuChip,
 ) -> Popover {
     let fetch = handle.clone();
-    menu_popover(id, anchor, rems(22.5), handle, focus, chip, model_menu_items)
+    menu_popover(id, anchor, rems(16.), handle, focus, chip, model_menu_items)
         .on_open_change(move |open, _, cx| {
             if *open {
                 fetch.update(cx, |app, cx| app.fetch_models_for_menu(cx));
@@ -1227,7 +1227,41 @@ fn mode_menu_items(
     menu
 }
 
-/// 模型条目：非自研内核给提示；模型列表滚动，刷新与当前模型的思考档位固定在底部。
+fn model_menu_group(name: impl Into<SharedString>) -> Div {
+    div()
+        .flex_shrink_0()
+        .px_2p5()
+        .pt_1()
+        .overflow_hidden()
+        .text_ellipsis()
+        .whitespace_nowrap()
+        .text_size(TEXT_META)
+        .text_color(rgb(INK_SOFT))
+        .child(name.into())
+}
+
+fn model_menu_row(
+    id: impl Into<ElementId>,
+    name: impl Into<SharedString>,
+    active: bool,
+    detail: Option<String>,
+) -> Stateful<Div> {
+    let name = name.into();
+    menu_text_item(id, name.clone(), active)
+        .h(rems(1.625))
+        .flex_shrink_0()
+        .py_0()
+        .line_height(relative(1.25))
+        .tooltip(move |window, cx| {
+            let tip = match &detail {
+                Some(detail) => format!("{name}\n{detail}"),
+                None => name.to_string(),
+            };
+            super::chat::text_tip(&tip, window, cx)
+        })
+}
+
+/// 模型列表滚动，刷新与当前模型的思考档位固定在底部；外部内核使用上报的选项。
 fn model_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
@@ -1237,7 +1271,10 @@ fn model_menu_items(
         div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
     };
     let builtin = app.session().kernel == KernelChoice::Builtin;
-    let mut menu = MenuList::new("model-menu-list", handle, popover).scroll(rems(20.));
+    let mut menu = MenuList::new("model-menu-list", handle, popover)
+        .hide_shortcut_hints()
+        .compact()
+        .scroll(rems(13.));
     if !builtin {
         return agent_model_menu(app, menu);
     }
@@ -1253,42 +1290,13 @@ fn model_menu_items(
         }
         any = true;
         if multi {
-            menu = menu.child(
-                div()
-                    .px_2p5()
-                    .pt_2()
-                    .pb_0p5()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .child(p.display_name().to_string()),
-            );
+            menu = menu.child(model_menu_group(p.display_name().to_string()));
         }
         for (i, model) in models.iter().enumerate() {
             let active = pi == app.settings.builtin.active && current.as_ref() == model.as_str();
             let m = (*model).clone();
             menu = menu.pick(
-                div()
-                    .id(("model-item", pi * 10000 + i))
-                    .h_flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2p5()
-                    .py_1p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(HOVER)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(TEXT_BODY)
-                            .font_family(MONO)
-                            .text_color(rgb(INK))
-                            .child(m.clone()),
-                    )
-                    .when(active, |d| {
-                        d.child(Icon::new(IconAll::Check).size_4().text_color(rgb(CORAL)))
-                    }),
+                model_menu_row(("model-item", pi * 10000 + i), m.clone(), active, None),
                 move |this, cx| this.choose_model_from(pi, m.clone(), cx),
             );
         }
@@ -1306,9 +1314,9 @@ fn model_menu_items(
     let refresh = div()
         .id("model-refresh")
         .h_flex()
-        .gap_2()
+        .gap_1p5()
         .px_2p5()
-        .py_1p5()
+        .py_1()
         .border_t_1()
         .border_color(rgb(LINE))
         .cursor_pointer()
@@ -1324,13 +1332,7 @@ fn model_menu_items(
 
     let spec = session_thinking_spec(app);
     let active = active_thinking(&spec, app.session().thinking);
-    let mut options = div()
-        .id("model-thinking-options")
-        .h_flex()
-        .flex_1()
-        .min_w_0()
-        .gap_0p5()
-        .overflow_x_scroll();
+    let mut options = div().h_flex().flex_1().min_w_0().flex_wrap().gap_0p5();
     for (i, (level, label)) in thinking_options(&spec).into_iter().enumerate() {
         let selected = active == level;
         let row = div()
@@ -1341,7 +1343,7 @@ fn model_menu_items(
             .justify_center()
             .flex_shrink_0()
             .px_1p5()
-            .py_1()
+            .py_0p5()
             .rounded_md()
             .cursor_pointer()
             .text_size(TEXT_SMALL)
@@ -1358,7 +1360,7 @@ fn model_menu_items(
             .items_center()
             .gap_1()
             .px_2p5()
-            .py_2()
+            .py_1()
             .border_t_1()
             .border_color(rgb(LINE))
             .child(
@@ -1386,26 +1388,17 @@ fn agent_model_menu(app: &ChatApp, mut menu: MenuList) -> MenuList {
         if choice.group != group {
             group = choice.group.clone();
             if let Some(name) = &group {
-                menu = menu.child(
-                    div()
-                        .px_2p5()
-                        .pt_2()
-                        .pb_0p5()
-                        .text_size(TEXT_META)
-                        .text_color(rgb(INK_SOFT))
-                        .child(name.clone()),
-                );
+                menu = menu.child(model_menu_group(name.clone()));
             }
         }
         let active = choice.id == config.current_value;
         let id = choice.id.clone();
         menu = menu.pick(
-            menu_item(
+            model_menu_row(
                 ("agent-model-item", i),
-                IconAll::Cpu,
                 choice.name.clone(),
-                choice.description.clone().unwrap_or_else(|| choice.id.clone()),
                 active,
+                Some(choice.description.clone().unwrap_or_else(|| choice.id.clone())),
             ),
             move |this, cx| this.choose_model(id.clone(), cx),
         );

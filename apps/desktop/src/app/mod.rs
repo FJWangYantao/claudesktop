@@ -1,6 +1,7 @@
 //! 应用根视图 `ChatApp`：会话管理、内核事件分发与整体布局。
 //! 各区域的渲染拆在子模块里（都是 `impl ChatApp`）。
 
+pub(crate) mod body_cache;
 mod catalog_view;
 mod chat;
 mod chrome;
@@ -191,6 +192,8 @@ pub struct ChatApp {
     hovered_msg: Option<usize>,
     /// 滚动进行中的截止时刻：这期间悬停变化不再单独通知内容区（每帧本来就在重画）
     scrolling_until: Option<Instant>,
+    hover_settle_task: Option<Task<()>>,
+    transcript_scrolling: bool,
     /// 「回到底部」的平滑滚动进行中（见 `chat.rs` 的 `step_jump_to_bottom`）
     jump: Option<motion::JumpAnim>,
     /// 所有会话的每轮统计（首页用量概览）
@@ -601,6 +604,8 @@ impl ChatApp {
             copied_at: None,
             hovered_msg: None,
             scrolling_until: None,
+            hover_settle_task: None,
+            transcript_scrolling: false,
             jump: None,
             usage: Vec::new(),
             usage_index_generation: 0,

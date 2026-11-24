@@ -97,6 +97,8 @@ impl Session {
         self.layout = Vec::new();
         // 记录搬走了：下一帧按空记录重算行划分（拆块的文本副本也一并释放）
         self.rows_sig = None;
+        self.last_sync = None;
+        self.body_cache.clear();
         self.rows.clear();
         self.row_start.clear();
         self.agent_parts.clear();
@@ -109,14 +111,14 @@ impl Session {
         self.diff_revision += 1;
         self.display_snapshot = Some(snapshot);
         DisplayData {
-            transcript: std::mem::take(&mut self.transcript),
+            transcript: std::mem::take(&mut self.transcript.items),
             subagents: std::mem::take(&mut self.subagents),
         }
     }
 
     pub fn restore_display(&mut self, mut data: DisplayData) {
         data.transcript.append(&mut self.transcript);
-        self.transcript = data.transcript;
+        *self.transcript = data.transcript;
         self.diff_revision += 1;
         self.subagents = data.subagents;
         self.display_snapshot = None;

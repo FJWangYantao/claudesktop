@@ -178,7 +178,7 @@ impl Session {
         }
         let mut count = 0;
         let mut failure = None;
-        for item in &mut self.transcript {
+        for item in self.transcript.iter_mut() {
             for_each_text(item, &mut |text| match self.blocks.externalize(text) {
                 Ok(true) => count += 1,
                 Ok(false) => {}
@@ -193,6 +193,9 @@ impl Session {
                     Err(error) => failure = Some(error),
                 });
             }
+        }
+        if count > 0 {
+            self.body_cache.clear();
         }
         let result = if let Some(error) = failure { Err(error) } else { Ok(count) };
         if let Err(error) = result {

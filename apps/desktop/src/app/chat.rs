@@ -4,6 +4,7 @@
 //! 连续的几步收进可折叠的组（分组规则在 `Session::compute_layout`）。
 
 use super::ChatApp;
+use super::body_cache::{AgentBodyView, BodyKind, CodeCopy};
 use super::menu::{MenuList, diff_stat, menu_item, menu_panel};
 use super::motion::{self, Reveal};
 use super::rewind::file_name;
@@ -21,7 +22,7 @@ use gpui_kit::component::input::Position;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
-use gpui_kit::component::text::{TextView, TextViewStyle};
+use gpui_kit::component::text::TextViewStyle;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -261,6 +262,32 @@ pub(super) fn tool_status_icon(card: &ToolCard, settle: f32) -> AnyElement {
 
 /// 回复 / 思考共用的 Markdown 样式。
 pub(super) fn markdown_style() -> TextViewStyle {
+    markdown_styles(false)
+}
+
+pub(super) fn think_markdown_style() -> TextViewStyle {
+    markdown_styles(true)
+}
+
+fn markdown_styles(thinking: bool) -> TextViewStyle {
+    type StyleKey = (u32, usize, bool);
+    thread_local! {
+        static STYLES: std::cell::RefCell<Option<(StyleKey, TextViewStyle, TextViewStyle)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let key = (f32::from(root_font_size()).to_bits(), palette_index(), is_dark());
+    STYLES.with_borrow_mut(|cache| {
+        if cache.as_ref().is_none_or(|(cached, _, _)| *cached != key) {
+            let style = build_markdown_style();
+            let think = style.clone().paragraph_gap(rems(0.75));
+            *cache = Some((key, style, think));
+        }
+        let (_, agent, think) = cache.as_ref().unwrap();
+        if thinking { think.clone() } else { agent.clone() }
+    })
+}
+
+fn build_markdown_style() -> TextViewStyle {
     TextViewStyle::default()
         .paragraph_gap(rems(1.25))
         // 标题接口只收 Pixels，所以按当前缩放换算一次
@@ -285,7 +312,7 @@ pub(super) fn markdown_style() -> TextViewStyle {
 
 /// 代码块右上角的一组：语言名（有的话）+ 「复制」按钮。
 /// 叠在代码块的沙色底上，按钮悬停用 `SELECTED`。
-fn code_block_header(
+pub(super) fn code_block_header(
     lang: Option<SharedString>,
     copied: Option<Instant>,
     on_copy: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -532,6 +559,7 @@ impl ChatApp {
     /// 流式时扫光「思考中…」；`verbose`（详细视图）时总是展开、不给开关。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_thinking(
+        &self,
         idx: usize,
         text: &str,
         streaming: bool,
@@ -582,16 +610,15 @@ impl ChatApp {
         // 和标题之间的空隙算在正文里，收到底时不剩一截
         let progress = motion::reveal_progress(("think", idx), open, window, cx);
         if progress > 0. && has_text {
-            let text = reading_markdown(text.trim(), streaming);
-            // 字号 / 颜色要设在 TextView 自己身上（它按主题取默认值，不继承外层）
-            let body = div().pt_1().pl(STEP_INDENT).child(
-                TextView::markdown(("think-md", idx), text)
-                    .style(markdown_style().paragraph_gap(rems(0.75)))
-                    .markdown_extensions(crate::app::math::extensions())
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK_SOFT))
-                    .line_height(LEADING),
-            );
+            let body = div().pt_1().pl(STEP_INDENT).child(self.markdown_body(
+                idx,
+                BodyKind::Think,
+                text,
+                streaming,
+                None,
+                window,
+                cx,
+            ));
             col = col.child(Reveal::new(("think-body", idx), progress, body));
         }
         col
@@ -1037,6 +1064,7 @@ impl ChatApp {
 
     /// 上下文压缩：两侧细线、中间一行字，标出「从这里往前的对话换成了摘要」；完成后点一下展开摘要。
     fn render_compaction(
+        &self,
         idx: usize,
         state: &CompactState,
         open: bool,
@@ -1098,17 +1126,15 @@ impl ChatApp {
                     .border_1()
                     .border_color(rgb(LINE))
                     .bg(rgb(CARD))
-                    .child(
-                        TextView::markdown(
-                            ("compaction-summary", idx),
-                            reading_markdown(summary, false),
-                        )
-                        .style(markdown_style())
-                        .markdown_extensions(crate::app::math::extensions())
-                        .text_size(TEXT_BODY)
-                        .text_color(rgb(INK))
-                        .line_height(LEADING),
-                    ),
+                    .child(self.markdown_body(
+                        idx,
+                        BodyKind::Compaction,
+                        summary,
+                        false,
+                        None,
+                        window,
+                        cx,
+                    )),
             );
             col = col.child(Reveal::new(("compaction-body", idx), progress, body));
         }
@@ -1682,9 +1708,7 @@ impl ChatApp {
                     let active = this.active;
                     this.sessions[active].pin_last_row(idx);
                     let s = &mut this.sessions[active];
-                    if !s.changes_open.remove(&idx) {
-                        s.changes_open.insert(idx);
-                    }
+                    s.toggle_changes(idx);
                     cx.notify();
                 }))
         });
@@ -1999,13 +2023,13 @@ impl ChatApp {
 
     /// 平滑回到底部的一帧（`render` 开头调）：固定 320ms cubic-out 滑过去，
     /// 到底或走完时长就交给自动跟随。切走会话、用户自己滚 / 拖滚动条了就停。
-    pub(super) fn step_jump_to_bottom(&mut self, window: &mut Window) {
+    pub(super) fn step_jump_to_bottom(&mut self, window: &mut Window) -> bool {
         let Some(mut anim) = self.jump.take() else {
-            return;
+            return false;
         };
         let s = &mut self.sessions[self.active];
         if anim.token != s.token || s.list.is_following_tail() || s.list.is_scrollbar_dragging() {
-            return;
+            return false;
         }
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(anim.started);
@@ -2014,7 +2038,7 @@ impl ChatApp {
         let remaining = distance_to_end(&s.list);
         if remaining <= px(1.) || elapsed >= motion::JUMP_DURATION {
             s.follow_tail();
-            return;
+            return true;
         }
         let k = motion::jump_step(elapsed, dt);
         // 每帧至少走半像素，别在长距离末尾拖出几十个亚像素帧
@@ -2022,6 +2046,7 @@ impl ChatApp {
         s.list.scroll_by(step);
         self.jump = Some(anim);
         window.request_animation_frame();
+        true
     }
 
     /// 键盘翻页：折算成一页高度的滚轮输入，和滚轮共用同一套阻尼（两套手感会立刻被察觉）。
@@ -2057,12 +2082,13 @@ impl ChatApp {
 
     /// 滚轮往末尾滚了 `delta`（正 = 往下，负 = 往上）：把离散输入累计到
     /// [`WheelInput`] 的相对余量里，由 [`Self::step_wheel`] 每帧沿 $C^1$ 三次贝塞尔曲线
-    /// 推进（段时长约 135–180ms，按显示器刷新周期节拍对齐）交给列表。
+    /// 推进（默认段长 100–200ms，连滚可再缩短）交给列表。
     /// 只记「用户还要滚多少」，不再记滚动条的绝对目标——上方行补量抬高读数时不会
     /// 凭空多走一段（见 HANDOFF 里「绝对像素目标在补量行高后失效」）。
     /// 触控板的精确位移本来就连续，和「减少动态效果」时一样直接滚到位。
     /// 只通知内容区：滚动不影响输入区。
     pub(super) fn wheel_by(&mut self, delta: Pixels, precise: bool, cx: &mut Context<Self>) {
+        self.hover_settle_task = None;
         self.jump = None;
         let now = Instant::now();
         let direct = precise || cx.reduce_motion();
@@ -2077,7 +2103,10 @@ impl ChatApp {
         }
         if direct {
             s.wheel = None;
-            let _ = apply_relative(&s.list, delta);
+            let (applied, _) = apply_relative(&s.list, delta);
+            if applied != px(0.) {
+                self.scrolling_until = Some(now + super::content::MESSAGE_HOVER_SETTLE);
+            }
         } else {
             match &mut s.wheel {
                 Some(w) => w.push(now, delta),
@@ -2093,21 +2122,23 @@ impl ChatApp {
     /// 滚轮平滑的一帧（`render_content` 里 `sync_list` 之后调，定位先完成再推进当帧滚轮）：
     /// 按显示器刷新周期推进一段 $C^1$ 贝塞尔曲线，按物理像素取整后交给列表，
     /// 再按当前布局裁掉越界部分，剩下的下一帧继续。只要还有余量，每帧只追加一次动画请求。
-    pub(super) fn step_wheel(&mut self, window: &mut Window, cx: &App) {
-        let now = Instant::now();
-        let frame_dt = window.refresh_interval(cx).unwrap_or(crate::session::DEFAULT_FRAME_DT);
-        let scale = window.scale_factor();
+    pub(super) fn step_wheel(&mut self, window: &mut Window, cx: &App) -> bool {
         let s = &mut self.sessions[self.active];
         let Some(mut w) = s.wheel.take() else {
-            return;
+            return false;
         };
         // 用户拖滚动条：平滑让位，别两边抢（拖动结束也不会接着滑）
         if s.list.is_scrollbar_dragging() {
-            return;
+            return false;
         }
-        let step = w.advance(now, frame_dt, scale);
+        let now = Instant::now();
+        let frame_dt = window.refresh_interval(cx).unwrap_or(crate::session::DEFAULT_FRAME_DT);
+        let scale = window.scale_factor();
+        let step = w.advance(now, window.frame_vsync_at(), frame_dt, scale);
+        let mut moved = false;
         if step != px(0.) {
             let (applied, edge) = apply_relative(&s.list, step);
+            moved = applied != px(0.);
             // 先记账再 `block`：`block` 会把欠量清零，反过来相减会留下负的余量。
             // `applied == 0`（一步没走成）由 `consume` 重锚曲线并开始计「卡住」的时长
             w.consume(applied, now);
@@ -2122,10 +2153,16 @@ impl ChatApp {
             w.clear();
         }
         if w.is_done(now) {
-            return;
+            return moved;
         }
         s.wheel = Some(w);
         window.request_animation_frame();
+        moved
+    }
+
+    fn message_hover_suppressed(&self) -> bool {
+        self.transcript_scrolling
+            || self.scrolling_until.is_some_and(|until| Instant::now() < until)
     }
 
     /// 鼠标进出对话里的一条消息（下方操作按钮的淡入淡出跟着它）。
@@ -2139,11 +2176,8 @@ impl ChatApp {
         };
         if next != self.hovered_msg {
             self.hovered_msg = next;
-            // 只有消息行自己的淡入淡出要用它：不通知整窗（侧栏、输入框不必跟着重画）。
-            // 滚动 / 拖滚动条时内容区每帧都在重画，悬停变化等下一帧顺带画出来即可，
-            // 不再额外通知（一帧能收几十次 hover 事件）
-            let scrolling = self.scrolling_until.is_some_and(|until| Instant::now() < until);
-            if !scrolling {
+            // 滚动时继续记录指针落点，等停稳再更新操作按钮。
+            if !self.message_hover_suppressed() {
                 self.content_view.update(cx, |_, cx| cx.notify());
             }
         }
@@ -2227,7 +2261,7 @@ impl ChatApp {
         let rewinding = self.rewind.as_ref().is_some_and(|p| p.item() == idx);
         let fade = motion::hover_opacity(
             ("user-actions", idx),
-            self.hovered_msg == Some(idx) || rewinding,
+            (!self.message_hover_suppressed() && self.hovered_msg == Some(idx)) || rewinding,
             window,
             cx,
         );
@@ -2390,16 +2424,9 @@ impl ChatApp {
         let verbose = self.settings.view_mode == ViewMode::Verbose;
         match item {
             ChatItem::User { text, images, .. } => self.render_user(idx, text, images, window, cx),
-            ChatItem::Thinking { text, streaming, open, elapsed_ms, .. } => Self::render_thinking(
-                idx,
-                text,
-                *streaming,
-                *open,
-                *elapsed_ms,
-                verbose,
-                window,
-                cx,
-            ),
+            ChatItem::Thinking { text, streaming, open, elapsed_ms, .. } => {
+                self.render_thinking(idx, text, *streaming, *open, *elapsed_ms, verbose, window, cx)
+            }
             ChatItem::Info { text, open } => {
                 Self::render_info(idx, text, *open, verbose, window, cx)
             }
@@ -2430,7 +2457,7 @@ impl ChatApp {
             ChatItem::Agent(text) => self.render_agent(idx, None, text, window, cx),
             ChatItem::Failed { message, kind } => self.render_failed(idx, message, *kind, cx),
             ChatItem::Compaction { state, open, .. } => {
-                Self::render_compaction(idx, state, *open, window, cx)
+                self.render_compaction(idx, state, *open, window, cx)
             }
             // 一轮层面的提示（续接、停止…）：和正文左对齐，图标打头
             ChatItem::Note(text) => {
@@ -2469,48 +2496,32 @@ impl ChatApp {
         // 元素 id 用显示行下标：拆开的每一块都不一样，整条时等于记录下标
         let key = s.row_of(idx) + part.unwrap_or(0);
         let last = part.is_none_or(|p| s.part_count(idx).is_some_and(|count| p + 1 == count));
-        let text = reading_markdown(text, streaming);
         // 代码块右上角：语言名 + 「复制」（点完短暂变对勾，和消息下方的复制同一套状态）。
         // 拆开的大回复里每块的 span 都从 0 起，加上这块在整条回复里的起始字节才是唯一标识
         let base = part.map_or(0, |p| s.part_start(idx, p));
         let token = s.token;
-        let copied_block = match self.copied {
-            Some((t, i, block)) if t == token && i == idx => block,
+        let copied = match self.copied {
+            Some((t, i, Some(block))) if t == token && i == idx => {
+                self.copied_at.map(|at| (block, at))
+            }
             _ => None,
         };
-        let copied_at = self.copied_at;
-        let app = cx.entity().downgrade();
-        let body = div().min_w_0().child(
-            TextView::markdown(("agent", key), text)
-                .style(markdown_style())
-                .markdown_extensions(crate::app::math::extensions())
-                .text_size(TEXT_BODY)
-                .line_height(LEADING)
-                .stream_fade(streaming)
-                .code_block_actions(move |block, window, cx| {
-                    let start = base + block.span.map(|span| span.start).unwrap_or(0);
-                    let code = block.code();
-                    let app = app.clone();
-                    code_block_header(
-                        block.lang(),
-                        copied_at.filter(|_| copied_block == Some(start)),
-                        move |_, _, cx| {
-                            let _ = app.update(cx, |this, cx| {
-                                this.copy_to_clipboard(idx, Some(start), code.to_string(), cx)
-                            });
-                        },
-                        window,
-                        cx,
-                    )
-                }),
-        );
+        let body = div().min_w_0().child(self.markdown_body(
+            idx,
+            BodyKind::Agent(part),
+            text,
+            streaming,
+            Some(CodeCopy { base, copied }),
+            window,
+            cx,
+        ));
         if !last || !s.is_turn_end(idx) {
             return body;
         }
         // 一轮回复的末尾挂「复制」和这一轮的用时 / 用量：最后一轮常显，
         // 更早的悬停才淡入（只改透明度，不挤布局）
         let latest = !s.transcript[idx + 1..].iter().any(|i| matches!(i, ChatItem::User { .. }));
-        let hovered = self.hovered_msg == Some(idx);
+        let hovered = !self.message_hover_suppressed() && self.hovered_msg == Some(idx);
         let fade =
             (!latest).then(|| motion::hover_opacity(("agent-actions", key), hovered, window, cx));
         let summary = s.turn_summary(idx);
@@ -2557,6 +2568,22 @@ impl ChatApp {
                 .children(changes)
                 .child(actions),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn markdown_body(
+        &self,
+        src: usize,
+        kind: BodyKind,
+        text: &str,
+        streaming: bool,
+        copy: Option<CodeCopy>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session = self.session();
+        let body = session.body_cache.body(src, kind, text, streaming, copy, cx);
+        AgentBodyView::element(body, session.list_metrics(), self.transcript_scrolling, window, cx)
     }
 }
 

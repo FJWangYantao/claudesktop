@@ -167,6 +167,7 @@ pub(super) struct MenuList {
     footer: Option<AnyElement>,
     picks: Vec<Pick>,
     shortcuts: bool,
+    shortcut_hints: bool,
     scrollbar: bool,
 }
 
@@ -186,6 +187,7 @@ impl MenuList {
             footer: None,
             picks: Vec::new(),
             shortcuts: true,
+            shortcut_hints: true,
             scrollbar: false,
         }
     }
@@ -193,6 +195,12 @@ impl MenuList {
     /// 在添加条目前调用：不显示数字键帽，也不绑定数字快捷键。
     pub(super) fn without_shortcuts(mut self) -> Self {
         self.shortcuts = false;
+        self
+    }
+
+    /// 隐藏右侧数字键帽，仍可按数字选择。
+    pub(super) fn hide_shortcut_hints(mut self) -> Self {
+        self.shortcut_hints = false;
         self
     }
 
@@ -241,7 +249,9 @@ impl MenuList {
         // 键帽样式，免得和条目里的数字（如增删行数）连成一串
         let row = row
             .on_click(move |_, window, cx| on_click(window, cx))
-            .when(self.shortcuts && n <= MAX_KEYED, |d| d.child(ChatApp::kbd(&n.to_string())));
+            .when(self.shortcuts && self.shortcut_hints && n <= MAX_KEYED, |d| {
+                d.child(ChatApp::kbd(&n.to_string()))
+            });
         self.body = self.body.child(row);
         self
     }

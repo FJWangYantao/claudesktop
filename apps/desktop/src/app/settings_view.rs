@@ -431,10 +431,7 @@ impl ChatApp {
             .chat_instructions
             .update(cx, |state, cx| state.set_value(s.chat.instructions.clone(), window, cx));
         // web_search 的 Brave key（环境变量优先；文件里没有时输入框留空）
-        let brave = std::env::var(claudesktop_builtin::websearch::BRAVE_KEY_ENV)
-            .ok()
-            .or_else(claudesktop_builtin::websearch::brave_key)
-            .unwrap_or_default();
+        let brave = claudesktop_builtin::websearch::brave_key().unwrap_or_default();
         self.settings_form.brave_key.update(cx, |state, cx| state.set_value(brave, window, cx));
         // web_search 的后端选择 + DeepSeek 搜索单独填的 key
         self.settings_form.search = claudesktop_builtin::websearch::load();

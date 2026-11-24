@@ -197,14 +197,17 @@ pub fn hash_of(bytes: &str) -> String {
 }
 
 /// 给所有画回复的 `TextView` 挂上的扩展：行内 + 块级公式，加上回复里的远程图片。
-///
-/// 每帧重建 `MarkdownExtensions` 不会重排文档：`parser_revision` 固定，gpui-kit 只换渲染句柄。
 pub fn extensions() -> MarkdownExtensions {
-    MarkdownExtensions::default()
-        .plugin(InlineMath)
-        .plugin(BlockMath)
-        .plugin(super::remote_image::RemoteImagePlugin)
-        .parser_revision(3)
+    static EXTENSIONS: std::sync::OnceLock<MarkdownExtensions> = std::sync::OnceLock::new();
+    EXTENSIONS
+        .get_or_init(|| {
+            MarkdownExtensions::default()
+                .plugin(InlineMath)
+                .plugin(BlockMath)
+                .plugin(super::remote_image::RemoteImagePlugin)
+                .parser_revision(3)
+        })
+        .clone()
 }
 
 #[cfg(test)]
