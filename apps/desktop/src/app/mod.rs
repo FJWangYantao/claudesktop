@@ -2024,6 +2024,48 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 调试钩子：CLAUDESKTOP_OPEN=sample-code，摆出多语言代码块回复，用于无头截图检查语法高亮。
+    pub(crate) fn debug_sample_code(&mut self, cx: &mut Context<Self>) {
+        let s = &mut self.sessions[self.active];
+        s.transcript.push(ChatItem::User {
+            text: "请用 Rust、Python、TypeScript 和 Shell 写几个简短示例".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.transcript.push(ChatItem::Agent(
+            concat!(
+                "下面是各语言的简短示例：\n\n",
+                "```rust\n",
+                "/// 统计条目数量\n",
+                "pub fn count_items(items: &[&str]) -> usize {\n",
+                "    let total = items.iter().filter(|s| !s.is_empty()).count();\n",
+                "    println!(\"valid = {total}\");\n",
+                "    total\n",
+                "}\n",
+                "```\n\n",
+                "```python\n",
+                "def greet(name: str, times: int = 2) -> list[str]:\n",
+                "    # 返回问候语列表\n",
+                "    return [f\"Hello, {name}!\" for _ in range(times)]\n",
+                "```\n\n",
+                "```typescript\n",
+                "interface Config { readonly port: number; debug?: boolean }\n",
+                "export async function start(cfg: Config): Promise<void> {\n",
+                "  console.log(`listening on :${cfg.port}`);\n",
+                "}\n",
+                "```\n\n",
+                "```json\n",
+                "{\"name\": \"claudesktop\", \"port\": 4390, \"enabled\": true}\n",
+                "```\n\n",
+                "```shell\n",
+                "cargo test --workspace && echo \"done\"\n",
+                "```\n",
+            )
+            .into(),
+        ));
+        cx.notify();
+    }
+
     /// 压测钩子：往当前会话灌 `n` 行混合内容（用户消息 / markdown 回复 / 工具行 / 备注）。
     pub(crate) fn debug_stress(&mut self, n: usize, busy: bool, cx: &mut Context<Self>) {
         let s = &mut self.sessions[self.active];

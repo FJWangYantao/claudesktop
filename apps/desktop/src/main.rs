@@ -20,6 +20,7 @@ mod pricing;
 mod requests;
 mod session;
 mod settings;
+mod syntax;
 mod theme;
 mod usage;
 
@@ -88,6 +89,7 @@ fn main() {
         .run(move |cx| {
             let t_gpui_run = t0.elapsed();
             gpui_kit::init(cx);
+            syntax::register_language_aliases();
             // 系统通知要有应用身份（Windows AppUserModelID，通知上显示的应用名）
             cx.set_app_identity("claudesktop.desktop", "claudesktop");
             app::keys::bind(cx);
@@ -280,6 +282,8 @@ fn main() {
                                 "worktree" => app.debug_worktree(cx),
                                 // 把排版样本摆成一轮回复，供对比验证。
                                 "sample-reply" => app.debug_sample_reply(cx),
+                                // 多语言代码块高亮样本，供无头截图验收。
+                                "sample-code" => app.debug_sample_code(cx),
                                 #[cfg(feature = "headless-screenshot")]
                                 "auth-login" => app.debug_authenticate_first(cx),
                                 #[cfg(feature = "headless-screenshot")]

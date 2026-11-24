@@ -10,7 +10,7 @@ use super::keys::{CHANGES_KEY, FILES_KEY, NEW_SESSION_KEY, SHORTCUTS_KEY, TOGGLE
 use super::project_label;
 use super::right_panel::RightTab;
 use crate::model::ViewMode;
-use crate::settings::{KernelChoice, Space, ThemeChoice};
+use crate::settings::{CodeThemeChoice, KernelChoice, Space, ThemeChoice};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
@@ -58,6 +58,8 @@ enum PaletteCmd {
     View(ViewMode),
     /// 配色
     Theme(ThemeChoice),
+    /// 代码配色
+    CodeTheme(CodeThemeChoice),
     Mode(usize),
     /// 挑模型（供应商档案下标, 模型 ID；挑别家的会切到那家，见 `choose_model_from`）
     Model(usize, String),
@@ -286,6 +288,19 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         })
         .collect();
 
+    let code_themes = CodeThemeChoice::ALL
+        .into_iter()
+        .map(|c| {
+            Entry::new(
+                IconAll::CodeXml,
+                format!("代码配色：{}", c.label()),
+                PaletteCmd::CodeTheme(c),
+            )
+            .desc(c.desc())
+            .checked(c == app.settings.code_theme)
+        })
+        .collect();
+
     let modes = s
         .modes
         .iter()
@@ -322,6 +337,7 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         ("历史", history),
         ("视图", views),
         ("配色", themes),
+        ("代码配色", code_themes),
         ("权限模式", modes),
         ("模型", models),
     ]
@@ -439,6 +455,7 @@ impl ChatApp {
             }
             PaletteCmd::View(mode) => self.set_view_mode(mode, cx),
             PaletteCmd::Theme(theme) => self.set_theme(theme, cx),
+            PaletteCmd::CodeTheme(code_theme) => self.set_code_theme(code_theme, cx),
             PaletteCmd::Mode(i) => self.choose_mode(i, cx),
             PaletteCmd::Model(pi, model) => self.choose_model_from(pi, model, cx),
         }

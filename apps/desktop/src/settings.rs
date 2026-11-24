@@ -8,7 +8,7 @@
 //! / `CLAUDESKTOP_PROTOCOL` / `CLAUDESKTOP_TEMPERATURE` / `CLAUDESKTOP_MAX_TOKENS` /
 //! `CLAUDESKTOP_EXTRA_JSON`（后三个覆盖请求参数）/ `CLAUDESKTOP_MAX_STEPS`（一轮最多几步）/
 //! `CLAUDESKTOP_GATEWAY`（`0` / `1`，用量网关）/ `CLAUDESKTOP_THEME`（配色 key，见 `ThemeChoice`）
-//! 以及 `ACP_AGENT`。
+//! / `CLAUDESKTOP_CODE_THEME`（代码配色 key，见 `CodeThemeChoice`）以及 `ACP_AGENT`。
 //! 设置页保存时写下的是当时界面上的值。
 
 use crate::model::ViewMode;
@@ -441,6 +441,8 @@ pub struct Settings {
     pub appearance: Appearance,
     /// 配色（Kimi / 暖纸 / 墨纸 / …），每套都有浅深两版
     pub theme: ThemeChoice,
+    /// 代码块语法高亮配色（跟随界面配色 / GitHub / One / …）
+    pub code_theme: CodeThemeChoice,
     /// 主内容区对齐方式（居中 / 左对齐），设置页切换后立即生效并写回
     pub content_align: ContentAlign,
     /// 主内容区是否使用宽阅读列（920px vs 标准 760px），设置页切换后立即生效并写回
@@ -605,6 +607,7 @@ impl Default for Settings {
             view_mode: ViewMode::default(),
             appearance: Appearance::default(),
             theme: ThemeChoice::default(),
+            code_theme: CodeThemeChoice::default(),
             content_align: ContentAlign::default(),
             wide_reading: false,
             sidebar_kernel_status: false,
@@ -818,6 +821,88 @@ impl ThemeChoice {
     }
 }
 
+/// 代码块语法高亮配色：每套都有浅色 / 深色两版（`Follow` 随「配色」自动搭配）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeThemeChoice {
+    #[default]
+    Follow,
+    Github,
+    One,
+    Catppuccin,
+    TokyoNight,
+    RosePine,
+    Everforest,
+    Nord,
+    Flexoki,
+    Gruvbox,
+}
+
+impl CodeThemeChoice {
+    pub const ALL: [CodeThemeChoice; 10] = [
+        Self::Follow,
+        Self::Github,
+        Self::One,
+        Self::Catppuccin,
+        Self::TokyoNight,
+        Self::RosePine,
+        Self::Everforest,
+        Self::Nord,
+        Self::Flexoki,
+        Self::Gruvbox,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Follow => "跟随界面配色",
+            Self::Github => "GitHub",
+            Self::One => "One",
+            Self::Catppuccin => "Catppuccin",
+            Self::TokyoNight => "Tokyo Night",
+            Self::RosePine => "Rosé Pine",
+            Self::Everforest => "Everforest",
+            Self::Nord => "Nord",
+            Self::Flexoki => "Flexoki",
+            Self::Gruvbox => "Gruvbox",
+        }
+    }
+
+    pub fn desc(self) -> &'static str {
+        match self {
+            Self::Follow => "随当前界面配色自动搭配语法色",
+            Self::Github => "GitHub Primer · 清晰克制，红蓝紫区分明确",
+            Self::One => "One Light / Dark · 经典编辑器高辨识度",
+            Self::Catppuccin => "Catppuccin · Latte / Mocha 柔和粉彩",
+            Self::TokyoNight => "Tokyo Night · Day / Night 靛蓝与霓虹",
+            Self::RosePine => "Rosé Pine · Dawn / Moon 低饱和玫瑰与松石",
+            Self::Everforest => "Everforest · 森林绿与暖米黄，温和护眼",
+            Self::Nord => "Nord · 极地冰蓝与极光色，冷静通透",
+            Self::Flexoki => "Flexoki · 纸墨印刷暖调，层次分明",
+            Self::Gruvbox => "Gruvbox · 复古暖棕与赭红橙绿",
+        }
+    }
+
+    pub fn parse(v: &str) -> Option<Self> {
+        Some(match v.trim().to_ascii_lowercase().as_str() {
+            "follow" | "auto" => Self::Follow,
+            "github" => Self::Github,
+            "one" | "one_dark" | "onedark" | "atom" => Self::One,
+            "catppuccin" => Self::Catppuccin,
+            "tokyo_night" | "tokyonight" | "tokyo" => Self::TokyoNight,
+            "rose_pine" | "rosepine" => Self::RosePine,
+            "everforest" => Self::Everforest,
+            "nord" => Self::Nord,
+            "flexoki" => Self::Flexoki,
+            "gruvbox" => Self::Gruvbox,
+            _ => return None,
+        })
+    }
+}
+
 /// 动画偏好：系统「动画效果」关掉时 gpui-kit 会停掉所有动效，这里可以单独给本应用打开或关掉。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -939,8 +1024,12 @@ impl Settings {
     }
 
     /// 用环境变量覆盖（启动时调用一次）。
-    pub fn with_env(mut self) -> Self {
-        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    pub fn with_env(self) -> Self {
+        self.with_env_from(|k| std::env::var(k).ok())
+    }
+
+    pub(crate) fn with_env_from(mut self, lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |k: &str| lookup(k).filter(|v| !v.trim().is_empty());
         if let Some(k) = var("CLAUDESKTOP_KERNEL").and_then(|v| KernelChoice::parse(&v, &self.acp))
         {
             self.kernel = Some(k);
@@ -994,6 +1083,9 @@ impl Settings {
         }
         if let Some(t) = var("CLAUDESKTOP_THEME").and_then(|v| ThemeChoice::parse(&v)) {
             self.theme = t;
+        }
+        if let Some(c) = var("CLAUDESKTOP_CODE_THEME").and_then(|v| CodeThemeChoice::parse(&v)) {
+            self.code_theme = c;
         }
         self
     }
@@ -1861,5 +1953,44 @@ mod tests {
         std::fs::write(&path, r#"{"kernel":"acp"}"#).unwrap();
         assert_eq!(Settings::load(Some(&path)).0.kernel, Some(KernelChoice::Builtin));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 代码配色：旧设置文件缺这项时默认跟随界面配色，写盘回读、解析与环境变量覆盖一致。
+    #[core::prelude::v1::test]
+    fn code_theme_choice_default_and_roundtrip() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.code_theme, CodeThemeChoice::Follow);
+
+        let dir =
+            std::env::temp_dir().join(format!("claudesktop-code-theme-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        for (choice, key) in [
+            (CodeThemeChoice::Follow, "follow"),
+            (CodeThemeChoice::Github, "github"),
+            (CodeThemeChoice::One, "one"),
+            (CodeThemeChoice::Catppuccin, "catppuccin"),
+            (CodeThemeChoice::TokyoNight, "tokyo_night"),
+            (CodeThemeChoice::RosePine, "rose_pine"),
+            (CodeThemeChoice::Everforest, "everforest"),
+            (CodeThemeChoice::Nord, "nord"),
+            (CodeThemeChoice::Flexoki, "flexoki"),
+            (CodeThemeChoice::Gruvbox, "gruvbox"),
+        ] {
+            assert_eq!(CodeThemeChoice::parse(key), Some(choice));
+            let s = Settings { code_theme: choice, ..Default::default() };
+            s.save(&path).unwrap();
+            assert!(std::fs::read_to_string(&path).unwrap().contains(&format!("\"{key}\"")));
+            assert_eq!(Settings::load(Some(&path)).0.code_theme, choice);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(CodeThemeChoice::parse("auto"), Some(CodeThemeChoice::Follow));
+        assert_eq!(CodeThemeChoice::parse("TokyoNight"), Some(CodeThemeChoice::TokyoNight));
+        assert_eq!(CodeThemeChoice::parse("one_dark"), Some(CodeThemeChoice::One));
+        assert_eq!(CodeThemeChoice::parse("nope"), None);
+
+        let overridden = Settings::default()
+            .with_env_from(|k| (k == "CLAUDESKTOP_CODE_THEME").then(|| "gruvbox".into()));
+        assert_eq!(overridden.code_theme, CodeThemeChoice::Gruvbox);
     }
 }

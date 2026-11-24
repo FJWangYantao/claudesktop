@@ -458,14 +458,11 @@ pub(super) fn font_menu_item(
         })
 }
 
-/// 配色菜单条目：上面一行名称 + 灰色说明，下面一行色块预览
-/// （纸底 / 侧栏 / 卡片 / 强调 / 正文），行尾当前项打勾。
-/// `palette` 是这套色板在 `theme::PALETTES` 里的下标，色块经 `theme::swatch` 取色。
-pub(super) fn theme_menu_item(
+fn swatch_menu_item(
     id: impl Into<ElementId>,
     name: impl Into<SharedString>,
     desc: impl Into<SharedString>,
-    palette: usize,
+    preview: Div,
     active: bool,
 ) -> Stateful<Div> {
     div()
@@ -488,18 +485,55 @@ pub(super) fn theme_menu_item(
                 .gap_1()
                 .child(div().text_size(TEXT_BODY).text_color(rgb(INK)).child(name.into()))
                 .child(div().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(desc.into()))
-                .child(div().h_flex().gap_1().children([PAPER, SAND, CARD, CORAL, INK].map(|c| {
-                    div()
-                        .size_3p5()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .bg(crate::theme::swatch(palette, c))
-                }))),
+                .child(preview),
         )
         .when(active, |d| {
             d.child(Icon::new(IconAll::Check).size_4().flex_shrink_0().text_color(rgb(CORAL)))
         })
+}
+
+/// 配色菜单条目：上面一行名称 + 灰色说明，下面一行色块预览
+/// （纸底 / 侧栏 / 卡片 / 强调 / 正文），行尾当前项打勾。
+/// `palette` 是这套色板在 `theme::PALETTES` 里的下标，色块经 `theme::swatch` 取色。
+pub(super) fn theme_menu_item(
+    id: impl Into<ElementId>,
+    name: impl Into<SharedString>,
+    desc: impl Into<SharedString>,
+    palette: usize,
+    active: bool,
+) -> Stateful<Div> {
+    let preview = div().h_flex().gap_1().children([PAPER, SAND, CARD, CORAL, INK].map(|c| {
+        div()
+            .size_3p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(crate::theme::swatch(palette, c))
+    }));
+    swatch_menu_item(id, name, desc, preview, active)
+}
+
+/// 代码配色菜单条目：名称 + 灰色说明，下面一行是沙色代码块底上的 5 个代表语法色块，当前项打勾。
+pub(super) fn code_theme_menu_item(
+    id: impl Into<ElementId>,
+    name: impl Into<SharedString>,
+    desc: impl Into<SharedString>,
+    swatches: [Rgba; 5],
+    active: bool,
+) -> Stateful<Div> {
+    let preview = div()
+        .h_flex()
+        .items_center()
+        .gap_1p5()
+        .px_1p5()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(SAND))
+        .border_1()
+        .border_color(rgb(LINE))
+        .self_start()
+        .children(swatches.map(|c| div().size_3().rounded_sm().bg(c)));
+    swatch_menu_item(id, name, desc, preview, active)
 }
 
 /// 组一个下拉菜单：`chip` 是 trigger，面板锚在 chip 上按 `anchor` 方向展开，

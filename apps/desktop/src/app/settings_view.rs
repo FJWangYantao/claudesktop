@@ -2,8 +2,8 @@
 
 use super::ChatApp;
 use super::menu::{
-    FONT_PREVIEW, MenuChip, MenuList, font_menu_item, menu_item, menu_popover, menu_text_item,
-    theme_menu_item,
+    FONT_PREVIEW, MenuChip, MenuList, code_theme_menu_item, font_menu_item, menu_item,
+    menu_popover, menu_text_item, theme_menu_item,
 };
 use super::motion::{self, Reveal};
 use super::settings_kit::*;
@@ -816,8 +816,9 @@ impl ChatApp {
     /// 把字号缩放、字体族和色板装进组件主题。Root 每帧读 `Theme::font_size` 写进窗口的 rem，
     /// 所以这里改完，下一帧整套界面（字号 / 间距 / 圆角 / 图标）等比缩放。
     pub(crate) fn apply_font(&mut self, cx: &mut Context<Self>) {
-        // 色板先设：后面 `Theme::update` 里的 `apply_to_theme` 按它写组件配色
+        // 色板与代码配色先设：后面 `Theme::update` 里的 `apply_to_theme` 按它们写组件主题
         crate::theme::set_palette(self.settings.theme.index());
+        crate::syntax::set_code_theme(self.settings.code_theme);
         crate::theme::set_font_scale(self.settings.font_scale);
         // 没装的字体族会被忽略（GPUI 排版找不到字体族时会 panic）
         if let Some(name) = self.settings.font_family_or_default()
@@ -833,6 +834,12 @@ impl ChatApp {
     /// 设置页换配色：立即生效，并只把这一项写回文件。
     pub(crate) fn set_theme(&mut self, theme: ThemeChoice, cx: &mut Context<Self>) {
         self.save_ui_pref(move |s| s.theme = theme, cx);
+        self.apply_font(cx);
+    }
+
+    /// 设置页换代码块语法配色：立即生效，并只把这一项写回文件。
+    pub(crate) fn set_code_theme(&mut self, code_theme: CodeThemeChoice, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.code_theme = code_theme, cx);
         self.apply_font(cx);
     }
 
@@ -895,6 +902,7 @@ impl ChatApp {
                 ),
             ),
             self.theme_row(cx),
+            self.code_theme_row(cx),
             setting_row(
                 "主区对齐",
                 seg_control(
@@ -1028,6 +1036,23 @@ impl ChatApp {
                 &self.menu_focus,
                 MenuChip::new(IconAll::Palette, self.settings.theme.label()),
                 theme_menu_items,
+            ),
+        )
+    }
+
+    /// 代码块语法高亮配色下拉：跟随界面配色 + 多套独立配色，每项带语法色块预览。
+    fn code_theme_row(&self, cx: &mut Context<Self>) -> Div {
+        let app = cx.entity();
+        setting_row(
+            "代码配色",
+            menu_popover(
+                "code-theme-menu",
+                Anchor::BottomRight,
+                rems(18.5),
+                &app,
+                &self.menu_focus,
+                MenuChip::new(IconAll::CodeXml, self.settings.code_theme.label()),
+                code_theme_menu_items,
             ),
         )
     }
@@ -4363,6 +4388,31 @@ fn theme_menu_items(
                 t == current,
             ),
             move |this, cx| this.set_theme(t, cx),
+        );
+    }
+    menu
+}
+
+/// 代码配色下拉的条目：名称 + 说明 + 5 个语法色块，当前项打勾。
+fn code_theme_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let current = app.settings.code_theme;
+    let ui_palette = app.settings.theme.index();
+    let dark = crate::theme::is_dark();
+    let mut menu = MenuList::new("code-theme-list", handle, popover).scroll(rems(26.));
+    for c in CodeThemeChoice::ALL {
+        menu = menu.pick(
+            code_theme_menu_item(
+                ("code-theme-item", c.index()),
+                c.label(),
+                c.desc(),
+                crate::syntax::swatches(c, ui_palette, dark),
+                c == current,
+            ),
+            move |this, cx| this.set_code_theme(c, cx),
         );
     }
     menu

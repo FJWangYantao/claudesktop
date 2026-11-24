@@ -565,6 +565,12 @@ pub fn swatch(index: usize, color: Color) -> Rgba {
     gpui_kit::rgb(pick(&PALETTES[index.min(PALETTES.len() - 1)], color, is_dark()))
 }
 
+/// 取指定色板在给定明暗下代码块底（`SAND`）的十六进制色值，供语法高亮对比度测试使用。
+#[cfg(test)]
+pub(crate) fn sand_hex(palette_index: usize, dark: bool) -> u32 {
+    pick(&PALETTES[palette_index.min(PALETTES.len() - 1)], SAND, dark)
+}
+
 // 常量名保留，调用点不用改
 /// 主区底色
 pub const PAPER: Color = Color::Paper;
@@ -774,6 +780,7 @@ pub fn apply_to_theme(theme: &mut gpui_kit::component::theme::Theme) {
     // `Theme::change` 切外观时会重新载入 gpui-kit 自带主题，配色要在它之后每次重写
     let dark = theme.mode.is_dark();
     apply_colors(&mut theme.colors, palette(), dark);
+    theme.highlight_theme = crate::syntax::active_highlight_theme(palette_index(), dark);
 }
 
 /// 把色板写进 gpui-kit 组件主题的语义色，让 `Button` / `TabBar` / `Kbd` / 弹层 / 滚动条
@@ -1199,5 +1206,29 @@ mod tests {
         assert_eq!(ring[2].color, hsla_of(PAPER));
         // 放在卡片里的元素换缝的颜色
         assert_eq!(focus_ring_on(CORAL, CARD)[2].color, hsla_of(CARD));
+    }
+
+    #[core::prelude::v1::test]
+    fn apply_to_theme_updates_highlight_theme() {
+        let _g = theme_globals();
+        set_palette(0);
+        set_dark(false);
+        crate::syntax::set_code_theme(crate::settings::CodeThemeChoice::Follow);
+
+        let mut t = gpui_kit::component::theme::Theme {
+            mode: gpui_kit::component::theme::ThemeMode::Light,
+            ..Default::default()
+        };
+        apply_to_theme(&mut t);
+        assert_eq!(t.highlight_theme.name, "GitHub Light");
+
+        crate::syntax::set_code_theme(crate::settings::CodeThemeChoice::Catppuccin);
+        t.mode = gpui_kit::component::theme::ThemeMode::Dark;
+        apply_to_theme(&mut t);
+        assert_eq!(t.highlight_theme.name, "Catppuccin Dark");
+
+        crate::syntax::set_code_theme(crate::settings::CodeThemeChoice::Follow);
+        set_palette(0);
+        set_dark(false);
     }
 }
