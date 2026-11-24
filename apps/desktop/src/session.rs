@@ -319,33 +319,111 @@ const STREAM_FLUSH_MAX: std::time::Duration = std::time::Duration::from_millis(2
 const STREAM_FLUSH_RAMP: usize = 8 * 1024;
 const STREAM_FLUSH_LONG: usize = 64 * 1024;
 
-/// 对话平滑滚动的时间常数（指数阻尼缓出：单格约 230ms 柔停，快起长缓出、连滚无缝衔接）
-const WHEEL_TAU: f32 = 0.068;
+/// 单格滚轮的基准段时长（等价 Chromium 约 180–200ms 的紧凑落停）
+const WHEEL_DUR_BASE: Duration = Duration::from_millis(180);
+/// 连续快速滚轮时的最短段时长（仿 Chromium 的 INVERSE_DELTA：欠量越大段越紧，停手不拖尾）
+const WHEEL_DUR_MIN: Duration = Duration::from_millis(135);
+/// 段时长随欠量收紧的起止区间（84px 起开始收紧，多出 336px 即四格时收到底）
+const WHEEL_DUR_RAMP_START: f32 = 84.;
+const WHEEL_DUR_RAMP_SPAN: f32 = 336.;
+/// 静止起步时的三次贝塞尔控制点 (x1, y1)，第二个控制点固定 (`WHEEL_X2`, 1.0)：
+/// 起手立刻给约 6px 反馈（不肉也不冲），中段平滑圆顶，尾段斜率归零干脆落位。
+const WHEEL_X1_REST: f32 = 0.25;
+const WHEEL_Y1_REST: f32 = 0.10;
+const WHEEL_X2: f32 = 0.55;
+/// 最高推进速度（px/s，60Hz 下等价每帧 48px）：不同刷新率下最高速度一致
+const WHEEL_MAX_SPEED: f32 = 2880.;
 /// 一帧最多走的像素：卡顿帧（进了高行要排版）不许一步跨出去，宁可多滑几帧
 const WHEEL_STEP_MAX: Pixels = px(48.);
-/// 剩不到这么多像素时当前帧顺手走完，不留亚像素尾巴多排一帧（也不丢位移）
-const WHEEL_SETTLE: Pixels = px(0.5);
 /// 余量一直走不出去（列表还没量出那段，或正好在边界）最多再等这么久；
 /// 超过就丢掉，不会一直排帧。
 const WHEEL_HOLD: Duration = Duration::from_millis(400);
 /// 两帧之间隔了这么久说明列表压根没在画（去了设置页 / 最小化）：这期间的余量全部作废，
 /// 回来时不能把几秒前的滚轮一次性补上。
 const WHEEL_STALE: Duration = Duration::from_millis(500);
+/// 平台查不到显示器刷新率时的兜底帧间隔（60Hz）
+pub const DEFAULT_FRAME_DT: Duration = Duration::from_micros(16_667);
 
-/// 对话的滚轮平滑状态：只存用户还要滚多少像素（`remaining`），每帧按真实帧间隔走
-/// $1 - e^{-\Delta t / \tau}$ 的比例。
+/// 求解三次贝塞尔曲线 (0,0)-(x1,y1)-(x2,1)-(1,1) 在横坐标 `x ∈ [0,1]` 处的纵坐标和斜率 dy/dx。
+/// 牛顿迭代 + 二分兜底：x1, x2 ∈ [0,1] 且 y1 ∈ [0,1] 时曲线严格单调、零过冲。
+fn cubic_bezier_y_and_slope(x: f32, x1: f32, y1: f32, x2: f32) -> (f32, f32) {
+    if x <= 0. {
+        return (0., if x1 > 1e-6 { y1 / x1 } else { 0. });
+    }
+    if x >= 1. {
+        return (1., 0.);
+    }
+    let mut t = x;
+    let (mut lo, mut hi) = (0f32, 1f32);
+    for _ in 0..10 {
+        let mt = 1. - t;
+        let bx = 3. * mt * mt * t * x1 + 3. * mt * t * t * x2 + t * t * t;
+        let err = bx - x;
+        if err.abs() < 1e-6 {
+            break;
+        }
+        if err < 0. {
+            lo = t;
+        } else {
+            hi = t;
+        }
+        let dbx = 3. * mt * mt * x1 + 6. * mt * t * (x2 - x1) + 3. * t * t * (1. - x2);
+        if dbx > 1e-6 {
+            let next = t - err / dbx;
+            t = if next > lo && next < hi { next } else { 0.5 * (lo + hi) };
+        } else {
+            t = 0.5 * (lo + hi);
+        }
+    }
+    let mt = 1. - t;
+    let by = 3. * mt * mt * t * y1 + 3. * mt * t * t + t * t * t;
+    let dbx = 3. * mt * mt * x1 + 6. * mt * t * (x2 - x1) + 3. * t * t * (1. - x2);
+    let dby = 3. * mt * mt * y1 + 6. * mt * t * (1. - y1);
+    let slope = if dbx > 1e-6 { (dby / dbx).max(0.) } else { 0. };
+    (by, slope)
+}
+
+/// `advance` 算出、等 `consume` 拿到实际位移之后再提交（或按实际速度重锚）的一帧计划。
+#[derive(Clone, Copy, Debug)]
+struct PendingStep {
+    next_elapsed: Duration,
+    next_pos: f32,
+    next_vel: f32,
+    next_err: f32,
+    capped: bool,
+    planned_abs: f32,
+}
+
+/// 对话的滚轮平滑状态：只存用户还要滚多少像素（`remaining`），每帧沿一段
+/// $C^1$ 连续的三次贝塞尔曲线推进，并按物理像素取整 + 误差扩散交给列表。
 ///
 /// 和旧写法（记住滚动条的绝对目标、每帧用读数逼近）的区别在于这里**完全不依赖滚动条读数**：
 /// 上方行补量会抬高滚动条读数，但欠量只由输入和已走的距离决定，补量不会凭空造出位移；
-/// 同向连滚直接累加剩余位移、速度无缝衔接；反向输入清空旧余量，从新方向重新起步。
+/// 同向连滚把当前速度接成新段的起手斜率（速度连续、不冲不顿）；反向输入清空旧余量重新起步。
 #[derive(Clone, Debug, Default)]
 pub struct WheelInput {
     /// 用户还要滚多少像素（正 = 向下，负 = 向上）
     remaining: Pixels,
-    /// 上一次采样（或新串起步）的时刻
+    /// 当前瞬时速度（带符号，px/s）：同向追加输入时继承为新段起手斜率
+    vel: f32,
+    /// 当前曲线段的目标总长（无符号）与已经走到的曲线位置（无符号）
+    seg_dist: f32,
+    seg_pos: f32,
+    seg_elapsed: Duration,
+    seg_dur: Duration,
+    /// 当前曲线段的第一个控制点 (x1, y1)；第二个控制点固定 (`WHEEL_X2`, 1.0)
+    x1: f32,
+    y1: f32,
+    /// 物理像素取整后的小数余量（无符号，沿当前方向累加到下一帧，总位移严格守恒）
+    pixel_err: f32,
+    /// 上一次采样（或新串 push）的时刻
     last: Option<Instant>,
+    /// 本串是否已经推进过首帧：首帧固定按一个刷新周期起步，消除事件到达相位的抖动
+    started_frame: bool,
     /// 还欠着却一步都走不出去是从什么时候开始的（超过 `WHEEL_HOLD` 就认定到边界）
     stalled_at: Option<Instant>,
+    /// `advance` 算出的待确认状态，`consume` 收到实际位移后提交或重锚
+    pending: Option<PendingStep>,
 }
 
 impl WheelInput {
@@ -355,7 +433,30 @@ impl WheelInput {
         w
     }
 
-    /// 追加一次输入。方向和已有的一致就累进剩余位移，反了（或已走完 / 隔太久）就整条重来。
+    /// 按当前欠量和起手速度规划一段曲线：段长 = 欠量，段时长随欠量收紧；
+    /// 起手速度不为零时把曲线的起点斜率接上去（$C^1$ 连续，连滚不冲）。
+    fn plan_segment(&mut self, vel_abs: f32) {
+        let d = self.remaining.as_f32().abs();
+        self.seg_dist = d;
+        self.seg_pos = 0.;
+        self.seg_elapsed = Duration::ZERO;
+        let ratio = ((d - WHEEL_DUR_RAMP_START) / WHEEL_DUR_RAMP_SPAN).clamp(0., 1.);
+        let base = WHEEL_DUR_BASE.as_secs_f32();
+        let dur_s = base - (base - WHEEL_DUR_MIN.as_secs_f32()) * ratio;
+        self.seg_dur = Duration::from_secs_f32(dur_s);
+        if vel_abs <= 1e-3 || d <= 1e-4 {
+            self.x1 = WHEEL_X1_REST;
+            self.y1 = WHEEL_Y1_REST;
+        } else {
+            // 归一化起手斜率 = v0 * T / D；把 P1 约束在 [0, 0.42] × [0, 0.85] 内保证严格单调无过冲
+            let slope = vel_abs * dur_s / d;
+            let x1 = if slope > 1e-4 { (0.85 / slope).min(0.42) } else { WHEEL_X1_REST };
+            self.x1 = x1;
+            self.y1 = x1 * slope;
+        }
+    }
+
+    /// 追加一次输入。方向和已有的一致就累进剩余位移并接上当前速度，反了（或已走完 / 隔太久）就整条重来。
     pub fn push(&mut self, now: Instant, delta: Pixels) {
         if delta == px(0.) {
             return;
@@ -365,55 +466,177 @@ impl WheelInput {
         // 免得 `advance` 的过期判定把刚推入的这一格也一起清掉
         let stale =
             self.last.is_some_and(|last| now.saturating_duration_since(last) >= WHEEL_STALE);
-        let fresh = self.remaining == px(0.);
+        let fresh = self.remaining.as_f32().abs() <= 1e-4;
         let old_down = self.remaining > px(0.);
         if fresh || stale || old_down != down {
             // 新的一串 / 换了方向 / 隔了太久：旧方向的余量作废，从此刻起算
             self.remaining = delta;
+            self.vel = 0.;
+            self.pixel_err = 0.;
             self.last = Some(now);
+            self.started_frame = false;
+            self.plan_segment(0.);
         } else {
-            // 同向连滚：保留上一次采样时刻继续积分，当前帧直接平滑衔接新速度
+            // 同向连滚：保留当前速度做 $C^1$ 衔接，不打断首帧节拍
             self.remaining += delta;
+            self.plan_segment(self.vel.abs());
         }
         // 新的输入重新给足等待窗口：卡顿期同向再滚一格不该沿用旧的计时
         self.stalled_at = None;
+        self.pending = None;
     }
 
-    /// 推进到 `now`：按这段间隔的指数衰减比例取出这一帧该走的距离（已按 `WHEEL_STEP_MAX` 限速）。
+    /// 推进一帧：`frame_dt` 是显示器刷新周期，`scale` 是窗口 DPI 缩放比。
     /// 采样时间和当前时间都从外面传，测试可以注入固定时刻。
     ///
     /// 两帧间隔太久（去了设置页、窗口最小化）时作废：隔了几秒回来不能把之前的滚轮补上。
-    pub fn advance(&mut self, now: Instant) -> Pixels {
-        let last = self.last.replace(now).unwrap_or(now);
-        let elapsed = now.saturating_duration_since(last);
-        if elapsed >= WHEEL_STALE {
+    pub fn advance(&mut self, now: Instant, frame_dt: Duration, scale: f32) -> Pixels {
+        self.pending = None;
+        let rem = self.remaining.as_f32();
+        // 已经不到 0.0001px：当作走完（顺手清掉，别让极小残留让 `is_done` 永远为假、每帧空排）
+        if rem.abs() <= 1e-4 {
             self.clear();
             return px(0.);
         }
-        if self.remaining == px(0.) || elapsed.is_zero() {
+        let frame_dt = if frame_dt.is_zero() { DEFAULT_FRAME_DT } else { frame_dt };
+        let scale = if scale > 0. { scale } else { 1. };
+
+        // VSync 节拍量化：① 首帧固定按一个刷新周期推进，消除 WM_MOUSEWHEEL 到达相位的抖动；
+        // ② 后续帧把 WM_PAINT 的唤醒抖动折合到整数倍刷新周期（1..=4）；
+        // ③ 同一刷新周期内的杂重绘（< min(0.25T, 2ms)）跳过，不重复推进也不动 `last`。
+        let paced_dt = if !self.started_frame {
+            if self.last.is_some_and(|last| now.saturating_duration_since(last) >= WHEEL_STALE) {
+                self.clear();
+                return px(0.);
+            }
+            self.started_frame = true;
+            self.last = Some(now);
+            frame_dt
+        } else {
+            let last = self.last.unwrap_or(now);
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed >= WHEEL_STALE {
+                self.clear();
+                return px(0.);
+            }
+            let min_gap = frame_dt.mul_f32(0.25).min(Duration::from_millis(2));
+            if elapsed < min_gap {
+                return px(0.);
+            }
+            let frames = (elapsed.as_secs_f32() / frame_dt.as_secs_f32()).round().clamp(1., 4.);
+            self.last = Some(now);
+            frame_dt.mul_f32(frames)
+        };
+
+        let sign = rem.signum();
+        let rem_abs = rem.abs();
+        let dt_s = paced_dt.as_secs_f32();
+        let next_elapsed = self.seg_elapsed + paced_dt;
+        let dur_s = self.seg_dur.as_secs_f32().max(1e-4);
+        let u = (next_elapsed.as_secs_f32() / dur_s).min(1.);
+        // 限速按物理像素算，高刷下也不至于一帧走不动
+        let max_step = (WHEEL_MAX_SPEED * dt_s).max(1. / scale).min(WHEEL_STEP_MAX.as_f32());
+
+        let (mut raw, next_pos, mut next_vel) = if u >= 1. {
+            (rem_abs, self.seg_dist, 0.)
+        } else {
+            let (by, slope) = cubic_bezier_y_and_slope(u, self.x1, self.y1, WHEEL_X2);
+            let pos = self.seg_dist * by;
+            let step = (pos - self.seg_pos).clamp(0., rem_abs);
+            (step, pos, (self.seg_dist / dur_s) * slope)
+        };
+
+        let mut capped = false;
+        if raw > max_step {
+            raw = max_step;
+            next_vel = max_step / dt_s;
+            capped = true;
+        }
+
+        // 物理像素取整 + 误差扩散：每帧按整数物理像素平移，总位移不丢亚像素
+        let (step_abs, next_err) = if u >= 1. && !capped {
+            (rem_abs, 0.)
+        } else if capped {
+            // 限速帧不叠旧误差：向下取整到物理像素（至少一个），严格不越过 `max_step`。
+            // 下一帧 `consume` 会按实际速度重锚，误差本来也不该跨过限速边界积累
+            let q = ((raw * scale).floor() / scale).max(1. / scale).min(rem_abs);
+            (q, 0.)
+        } else {
+            let want = raw + self.pixel_err;
+            let q = ((want * scale).round() / scale).clamp(0., rem_abs);
+            // 尾段只剩不到半个物理像素时当帧顺手收干净
+            if rem_abs - q < 0.5 / scale && u >= 0.9 { (rem_abs, 0.) } else { (q, want - q) }
+        };
+
+        // 高刷尾段单帧不足半个物理像素：返回 0 直接记账，等攒够一个物理像素再挪
+        if step_abs == 0. {
+            self.seg_elapsed = next_elapsed;
+            self.seg_pos = next_pos;
+            self.vel = sign * next_vel;
+            self.pixel_err = next_err;
             return px(0.);
         }
-        let raw = self.remaining * (1. - (-elapsed.as_secs_f32() / WHEEL_TAU).exp());
-        // 走完这一步剩不到半像素时顺手带完，既不丢亚像素位移，也不为尾巴多排一帧
-        let step = if (self.remaining - raw).abs() < WHEEL_SETTLE { self.remaining } else { raw };
-        step.clamp(-WHEEL_STEP_MAX, WHEEL_STEP_MAX)
+
+        self.pending = Some(PendingStep {
+            next_elapsed,
+            next_pos,
+            next_vel: sign * next_vel,
+            next_err,
+            capped,
+            planned_abs: step_abs,
+        });
+        px(sign * step_abs)
     }
 
-    /// 记账：实际走了 `applied`（边界裁剪之后）。一步都没走成时开始计「卡住」的时长，
-    /// 走成了就清零。
+    /// 记账：实际走了 `applied`（边界裁剪之后）。只有真走动了才提交这一帧的曲线进度——
+    /// 被卡住（等未测行 / 撞边界）时重锚并开始计「卡住」的时长，否则解堵那一帧会把
+    /// 剩余距离一次性吐出来。
     pub fn consume(&mut self, applied: Pixels, now: Instant) {
         self.remaining -= applied;
-        if applied != px(0.) {
-            self.stalled_at = None;
-        } else if self.remaining != px(0.) {
+        if self.remaining.as_f32().abs() <= 1e-4 {
+            self.clear();
+            return;
+        }
+        let pend = self.pending.take();
+        if applied == px(0.) {
+            // 计划了却没走动（等未测行 / 撞边界）：曲线时间不推进，重锚并开始计「卡住」。
+            // 没有计划（高刷尾段不到半个物理像素，`advance` 已自己记过账）就什么都不做。
+            if pend.is_none() {
+                return;
+            }
+            self.vel = 0.;
+            self.pixel_err = 0.;
             self.stalled_at.get_or_insert(now);
+            self.plan_segment(0.);
+            return;
+        }
+        self.stalled_at = None;
+        if let Some(p) = pend {
+            let applied_abs = applied.as_f32().abs();
+            if p.capped || (applied_abs - p.planned_abs).abs() > 1e-3 {
+                // 被限速或部分截断：按当前实际速度重锚剩余距离，平滑脱离限速
+                self.vel = p.next_vel;
+                self.pixel_err = 0.;
+                self.plan_segment(p.next_vel.abs());
+            } else {
+                self.seg_elapsed = p.next_elapsed;
+                self.seg_pos = p.next_pos;
+                self.vel = p.next_vel;
+                self.pixel_err = p.next_err;
+            }
         }
     }
 
     /// 全部作废（切页、定位、列表重置、太长时间没画）。
     pub fn clear(&mut self) {
         self.remaining = px(0.);
+        self.vel = 0.;
+        self.seg_dist = 0.;
+        self.seg_pos = 0.;
+        self.seg_elapsed = Duration::ZERO;
+        self.pixel_err = 0.;
         self.stalled_at = None;
+        self.pending = None;
     }
 
     /// 这个方向已经到头：朝这个方向的余量作废，别每帧空转。
@@ -428,9 +651,10 @@ impl WheelInput {
         self.stalled_at.is_some_and(|at| now.saturating_duration_since(at) >= WHEEL_HOLD)
     }
 
-    /// 欠量走完了（或卡住超时）：不再排帧。
+    /// 欠量走完了（或卡住超时）：不再排帧。阈值和 `advance` / `consume` 保持一致，
+    /// 否则极小残留会让 `advance` 早退、`is_done` 又不认，每帧空排。
     pub fn is_done(&self, now: Instant) -> bool {
-        self.remaining == px(0.) || self.expired(now)
+        self.remaining.as_f32().abs() <= 1e-4 || self.expired(now)
     }
 
     /// 还有多少欠量（只在测试里看）。
@@ -1251,8 +1475,8 @@ impl Session {
     /// 每次渲染前调用；先重算分组（[`Session::layout`]），再只比对指纹，不做布局，1 万行也很便宜。
     /// 指纹里带着视图模式和分组结果，切模式、展开 / 收起组时相关的行自动重测。
     pub fn sync_list(&mut self, view: ViewMode) {
-        // 跟在底部就是都看到了
-        if self.list.is_following_tail() {
+        // 跟在底部（或已经在吸附带里待命）就是都看到了
+        if self.list.is_following_tail() || self.follow.armed {
             self.seen_seq = self.content_seq;
         }
         self.layout = self.compute_layout(view);
@@ -1343,6 +1567,7 @@ impl Session {
             // 会话恢复的位置说了算：滚轮剩下的余量作废
             self.wheel = None;
             self.follow.force_until = None;
+            self.follow.armed = false;
             if following {
                 self.list.scroll_to_end();
             } else {
@@ -1355,6 +1580,7 @@ impl Session {
         if let Some(ix) = self.reveal.take().filter(|&ix| ix < self.transcript.len()) {
             self.wheel = None;
             self.follow.force_until = None;
+            self.follow.armed = false;
             let row = self.row_of(ix);
             self.list.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
             self.list.scroll_by(-px(24.));
@@ -1418,6 +1644,7 @@ impl Session {
         self.wheel = None;
         self.pin = None;
         self.follow.force_until = None;
+        self.follow.armed = false;
         self.rows_restore = Some((anchor, offset, following));
         // 强制下一段重测状态行（重建后它也是未测的）
         self.measured_busy = !self.status_visible();
@@ -1542,6 +1769,11 @@ const FOLLOW_FORCE: Duration = Duration::from_millis(800);
 pub struct ScrollFollow {
     /// 「回到底部」按钮显不显示：进入脱离带才置位，回到吸附带才清掉，中间带保持
     pub away: bool,
+    /// 用户往下滚进了距底 80px 的吸附带、但还没到 1px 处：**不立刻把视口吸到底**，
+    /// 等真正有新内容到来（`content_seq > armed_seq`）时再平滑接回跟底。
+    armed: bool,
+    /// 进入待命态那一刻的内容序号
+    armed_seq: u64,
     quiet_until: Option<Instant>,
     force_until: Option<Instant>,
     /// 最近一次用户输入的方向（Some(true) = 向下）；只有向下滚回底部才自动吸附
@@ -1577,6 +1809,7 @@ impl Session {
         self.list.pause_following_tail();
         // 用户主动点开卡片：强跟随窗口作废，否则松手后几帧里还会被拽回底部
         self.follow.force_until = None;
+        self.follow.armed = false;
         self.follow.away = self.follow.away || self.distance_to_end() > FOLLOW_ATTACH;
         if let Some(bounds) = self.list.bounds_for_item(row) {
             self.pin = Some(RowPin {
@@ -1614,18 +1847,65 @@ impl Session {
     }
 }
 
+/// `sync_follow` 拿到几何量之后要做的动作（纯函数，方便单测）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FollowStep {
+    /// 什么都不做（钉在中间带，或已经在待命）
+    Hold,
+    /// 几何上已经贴底：直接交回跟底，没有视觉跳变
+    Attach,
+    /// 停在吸附带里等新内容
+    Arm,
+    /// 待命期间真来了新内容：平滑滑回底部
+    GlideToTail,
+    /// 翻走了：脱离跟底
+    Detach,
+}
+
+/// 跟随判定的核心规则（见 [`Session::sync_follow`]）。
+fn follow_step(
+    remaining: Pixels,
+    detach: Pixels,
+    tail_known: bool,
+    last_input_down: Option<bool>,
+    armed: bool,
+    new_content: bool,
+) -> FollowStep {
+    // 已经贴到 1px 以内：直接交回跟底，没有视觉跳变
+    if remaining <= px(1.) {
+        return FollowStep::Attach;
+    }
+    if armed {
+        // 待在吸附带里等新内容：只有真来了新内容才滑回底部，松手那一刻绝不瞬移。
+        // 期间不动视口，也不重新记 `armed_seq`（否则新内容永远算「没变化」）。
+        if new_content {
+            return FollowStep::GlideToTail;
+        }
+        return if remaining > detach { FollowStep::Detach } else { FollowStep::Hold };
+    }
+    if remaining <= FOLLOW_ATTACH && last_input_down == Some(true) && tail_known {
+        return FollowStep::Arm;
+    }
+    if remaining > detach {
+        return FollowStep::Detach;
+    }
+    FollowStep::Hold
+}
+
 impl Session {
     pub fn note_input(&mut self, down: bool) {
         self.follow.last_input_down = Some(down);
         if !down {
             // 用户自己往上翻了：发消息后的强跟随窗口当场作废，别跟用户抢
             self.follow.force_until = None;
+            self.follow.armed = false;
         }
     }
 
     /// 用户自己开始滚动 / 跳转 / 点开卡片：作废强跟随窗口。
     pub fn drop_force_follow(&mut self) {
         self.follow.force_until = None;
+        self.follow.armed = false;
     }
 
     /// 程序化定位（搜索跳转、显示恢复）之后的一小段安静期，别被自动吸附拉走。
@@ -1634,15 +1914,17 @@ impl Session {
     }
 
     /// 每帧在列表定位推进之后调用：按距底距离和输入方向决定吸附 / 脱离，中间带保持原状。
+    /// 返回 `true` 表示「待命态下刚来了新内容，请外层平滑滑回底部」。
     ///
     /// 按钮显隐（`away`）和自动吸附是两件事：前者只按几何滞回更新，滚轮还在缓出、正拖
     /// 滚动条时也要立刻变（否则连续翻页要等 200 多毫秒才冒出按钮）；吸附才要求方向向下、
     /// 静止、尾部已实测。
-    pub fn sync_follow(&mut self, now: Instant, moving: bool) {
+    pub fn sync_follow(&mut self, now: Instant, moving: bool) -> bool {
         let dragging = self.list.is_scrollbar_dragging();
         // 用户正拖着滚动条：强跟随作废，跟随判定让位，别把人拽回去
         if dragging {
             self.follow.force_until = None;
+            self.follow.armed = false;
         } else if let Some(until) = self.follow.force_until
             && now < until
         {
@@ -1650,11 +1932,13 @@ impl Session {
                 self.list.set_follow_mode(FollowMode::Tail);
             }
             self.follow.away = false;
-            return;
+            self.follow.armed = false;
+            return false;
         }
         if self.list.is_following_tail() {
             self.follow.away = false;
-            return;
+            self.follow.armed = false;
+            return false;
         }
         let remaining = self.distance_to_end();
         let viewport = self.list.viewport_bounds().size.height;
@@ -1669,19 +1953,45 @@ impl Session {
             || self.wheel.is_some()
             || self.follow.quiet_until.is_some_and(|until| now < until);
         if dragging || settling {
-            return;
+            return false;
         }
         let tail_known = self.list.is_tail_measured();
-        if remaining <= FOLLOW_ATTACH
-            && (self.follow.last_input_down == Some(true) || remaining <= px(1.))
-            && (tail_known || remaining <= px(1.))
-        {
-            self.list.set_follow_mode(FollowMode::Tail);
-            self.follow.away = false;
-            self.follow.quiet_until = Some(now + FOLLOW_QUIET);
-        } else if remaining > detach {
-            self.list.pause_following_tail();
+        let step = follow_step(
+            remaining,
+            detach,
+            tail_known,
+            self.follow.last_input_down,
+            self.follow.armed,
+            self.content_seq > self.follow.armed_seq,
+        );
+        match step {
+            FollowStep::GlideToTail => {
+                self.follow.armed = false;
+                self.follow.away = false;
+                return true;
+            }
+            // 真滚到 1px 处 / 待命期间新内容已经贴底：没有视觉跳变，直接交回跟底
+            FollowStep::Attach => {
+                self.list.set_follow_mode(FollowMode::Tail);
+                self.follow.armed = false;
+                self.follow.away = false;
+                self.follow.quiet_until = Some(now + FOLLOW_QUIET);
+            }
+            // 停在 1..=80px 之间：视口原地不动，只进入待命态
+            FollowStep::Arm => {
+                if !self.follow.armed {
+                    self.follow.armed = true;
+                    self.follow.armed_seq = self.content_seq;
+                }
+                self.follow.away = false;
+            }
+            FollowStep::Detach => {
+                self.follow.armed = false;
+                self.list.pause_following_tail();
+            }
+            FollowStep::Hold => {}
         }
+        false
     }
 
     /// 距列表末尾还有多少像素（按当前已量 + 估算的高度算）。
@@ -2066,6 +2376,7 @@ impl Session {
         self.list.set_follow_mode(FollowMode::Tail);
         let now = Instant::now();
         self.follow.away = false;
+        self.follow.armed = false;
         self.follow.quiet_until = Some(now + FOLLOW_QUIET);
         self.follow.force_until = Some(now + FOLLOW_FORCE);
     }
@@ -3061,7 +3372,9 @@ impl Session {
     ) -> Option<claudesktop_core::UserPrompt> {
         let rows_before = self.transcript.len();
         let turn_ended = matches!(event, KernelEvent::TurnEnded { .. });
-        if Record::worth_keeping(&event) {
+        // 后台起标题不是「来了新内容」：不算进 `content_seq`，否则用户停在吸附带里会被
+        // 平白滑回底部、未读红点也会误亮
+        if Record::worth_keeping(&event) && !matches!(event, KernelEvent::TitleGenerated { .. }) {
             self.content_seq += 1;
         }
         // 实质事件（工具、轮末、用量……）动手前先让攒着的流式文本落进正文，状态始终一致
@@ -3600,48 +3913,63 @@ mod tests {
     // 注意：本文件顶层 `use gpui_kit::*` 会把 gpui 的 test 宏带进作用域，
     // 遮蔽内建 #[test]，必须用全路径（原文件其他测试同理）。
 
-    /// 模拟一段时间里的逐帧推进：返回每帧的步长（每帧都实际走完）。
-    fn run_wheel(w: &mut WheelInput, start: Instant, tick: Duration, frames: usize) -> Vec<f32> {
+    /// 模拟一段时间里的逐帧推进：返回每帧的步长。和 `ChatApp::step_wheel` 一致——
+    /// 一步都没走出来（高刷尾段不到半个物理像素）时不调 `consume`。
+    fn run_wheel(
+        w: &mut WheelInput,
+        start: Instant,
+        tick: Duration,
+        frames: usize,
+        scale: f32,
+    ) -> Vec<f32> {
         (1..=frames)
             .map(|i| {
                 let at = start + tick * i as u32;
-                let step = w.advance(at).as_f32();
-                w.consume(px(step), at);
-                step
+                let step = w.advance(at, tick, scale);
+                if step != px(0.) {
+                    w.consume(step, at);
+                }
+                step.as_f32()
             })
             .collect()
     }
 
-    /// 单格 84px 在 1/60s 帧下：首帧快起（约 18.3px），随后逐帧单调衰减滑停，总位移精确守恒。
+    /// 单格 84px 在 1/60s 帧下：起手约 6px、圆顶到约 12px 再单调收到 1px，11 帧（约 183ms）走完，
+    /// 每帧都是整数物理像素，总位移精确守恒。
     #[core::prelude::v1::test]
     fn wheel_single_notch_eases_out_at_60hz() {
         let start = Instant::now();
         let mut w = WheelInput::new(start, px(84.));
-        let steps = run_wheel(&mut w, start, Duration::from_secs_f32(1. / 60.), 30);
-        // 84 * (1 - exp(-(1/60) / 0.068)) ≈ 18.26
-        assert!((steps[0] - 18.26).abs() < 0.2, "首帧 {:?}", steps[0]);
-        assert!(steps[0] > steps[1] && steps[1] > steps[2] && steps[2] > steps[3]);
+        let frame = Duration::from_secs_f32(1. / 60.);
+        let steps = run_wheel(&mut w, start, frame, 30, 1.);
+        // 6, 9, 11, 12, 12, 10, 9, 7, 5, 2, 1
+        assert!((steps[0] - 6.).abs() < 1.5, "首帧 {:?}", steps[0]);
+        let peak = steps.iter().cloned().fold(0f32, f32::max);
+        assert!((peak - 12.).abs() < 1.5, "巡航峰 {peak}");
         assert!(steps.iter().all(|s| *s >= 0.), "全程同向");
+        let moved = steps.iter().filter(|s| **s > 0.).count();
+        assert!((10..=13).contains(&moved), "走完用了 {moved} 帧");
         assert!((steps.iter().sum::<f32>() - 84.).abs() < 0.05);
         assert!(w.is_done(start + Duration::from_millis(500)));
     }
 
-    /// 60 / 120 / 144 / 240 Hz 下，单格（84）和正反四格（±336）的总位移都严格等于输入。
+    /// 60 / 120 / 144 / 240 Hz 下，单格（84）和正反四格（±336）的总位移都严格等于输入，
+    /// 且每帧都是整数物理像素。
     #[core::prelude::v1::test]
     fn wheel_distance_matches_input_at_any_refresh_rate() {
         for hz in [60u32, 120, 144, 240] {
             let frame = Duration::from_secs_f32(1. / hz as f32);
-            let frames = (hz as usize).max(30);
+            let frames = (hz as usize).max(60);
             let start = Instant::now();
             let mut one = WheelInput::new(start, px(84.));
-            let total: f32 = run_wheel(&mut one, start, frame, frames).iter().sum();
+            let total: f32 = run_wheel(&mut one, start, frame, frames, 1.).iter().sum();
             assert!((total - 84.).abs() <= 0.1, "{hz}Hz 单格走了 {total}");
 
             let mut four = WheelInput::new(start, px(84.));
             for _ in 0..3 {
                 four.push(start, px(84.));
             }
-            let steps = run_wheel(&mut four, start, frame, frames);
+            let steps = run_wheel(&mut four, start, frame, frames, 1.);
             let total: f32 = steps.iter().sum();
             assert!((total - 336.).abs() <= 0.1, "{hz}Hz 四格走了 {total}");
             assert!(steps.iter().all(|s| *s >= 0.), "{hz}Hz 出现反向帧");
@@ -3650,7 +3978,7 @@ mod tests {
             for _ in 0..3 {
                 up.push(start, px(-84.));
             }
-            let steps = run_wheel(&mut up, start, frame, frames);
+            let steps = run_wheel(&mut up, start, frame, frames, 1.);
             let total: f32 = steps.iter().sum();
             assert!((total + 336.).abs() <= 0.1, "{hz}Hz 上滚四格走了 {total}");
             assert!(steps.iter().all(|s| *s <= 0.), "{hz}Hz 上滚出现反向帧");
@@ -3664,38 +3992,134 @@ mod tests {
             let frame = Duration::from_secs_f32(1. / hz as f32);
             let start = Instant::now();
             let mut w = WheelInput::new(start, px(10.));
-            let total: f32 = run_wheel(&mut w, start, frame, (hz as usize).max(30)).iter().sum();
+            let total: f32 =
+                run_wheel(&mut w, start, frame, (hz as usize).max(60), 1.).iter().sum();
             assert!((total - 10.).abs() <= 0.05, "{hz}Hz 10px 只走了 {total}");
         }
     }
 
-    /// 紧邻首帧（1ms、2ms、4ms）：快起指数模型 1ms 即可跨出 1.2px（不被 1px 尾随阈值拽回），总量守恒。
+    /// 紧邻首帧（1ms、2ms、4ms）：首帧固定按一个刷新周期起步，到达相位不影响首步和总量。
     #[core::prelude::v1::test]
     fn wheel_adjacent_first_frames_keep_their_share() {
+        let mut firsts = Vec::new();
         for dt in [1u64, 2, 4] {
             let start = Instant::now();
             let mut w = WheelInput::new(start, px(84.));
             let mut total = px(0.);
             let mut at = start + Duration::from_millis(dt);
-            let first = w.advance(at);
+            let first = w.advance(at, DEFAULT_FRAME_DT, 1.);
             w.consume(first, at);
             total += first;
-            if dt == 1 {
-                assert!(first > px(1.), "1ms 首帧应大于 1px 防被尾随拉回：{first:?}");
-            }
+            firsts.push(first);
             for _ in 0..3 {
                 at += Duration::from_millis(dt);
-                let step = w.advance(at);
-                w.consume(step, at);
+                let step = w.advance(at, DEFAULT_FRAME_DT, 1.);
+                if step != px(0.) {
+                    w.consume(step, at);
+                }
                 total += step;
             }
             for _ in 0..30 {
                 at += Duration::from_millis(16);
-                let step = w.advance(at);
-                w.consume(step, at);
+                let step = w.advance(at, DEFAULT_FRAME_DT, 1.);
+                if step != px(0.) {
+                    w.consume(step, at);
+                }
                 total += step;
             }
             assert!((total.as_f32() - 84.).abs() <= 0.1, "dt={dt}ms 总计 {total:?}");
+        }
+        // 三者的首步完全一致（不再随事件到达时刻在 1–18px 之间乱跳）
+        assert!(firsts.iter().all(|f| *f == firsts[0]), "首帧不一致：{firsts:?}");
+        assert!(firsts[0] > px(4.), "首帧要有起手反馈：{:?}", firsts[0]);
+    }
+
+    /// 杂重绘（同一刷新周期内的第二次唤醒）直接跳过：不推进节拍也不改总量。
+    #[core::prelude::v1::test]
+    fn wheel_ignores_spurious_redraws_inside_a_frame() {
+        let start = Instant::now();
+        let mut w = WheelInput::new(start, px(84.));
+        let mut at = start;
+        let mut total = px(0.);
+        // 首帧：固定按一个刷新周期起步（6px）
+        at += Duration::from_micros(600);
+        let mut step = w.advance(at, DEFAULT_FRAME_DT, 1.);
+        assert_eq!(step, px(6.));
+        w.consume(step, at);
+        total += step;
+        // 同一刷新周期里的杂重绘：一律 0，且不推进曲线时间
+        for _ in 0..2 {
+            at += Duration::from_micros(500);
+            assert_eq!(w.advance(at, DEFAULT_FRAME_DT, 1.), px(0.), "杂重绘不该走位移");
+        }
+        // 抖动的唤醒间隔（13 / 20 / 14 / 19ms）都折合到整数倍刷新周期，逐帧照常推进
+        for dt in [13u64, 20, 14, 19, 16, 17, 15] {
+            at += Duration::from_millis(dt);
+            step = w.advance(at, DEFAULT_FRAME_DT, 1.);
+            if step != px(0.) {
+                w.consume(step, at);
+            }
+            total += step;
+        }
+        for _ in 0..20 {
+            at += Duration::from_millis(16);
+            step = w.advance(at, DEFAULT_FRAME_DT, 1.);
+            if step != px(0.) {
+                w.consume(step, at);
+            }
+            total += step;
+        }
+        assert!((total.as_f32() - 84.).abs() <= 0.05, "总计 {total:?}");
+    }
+
+    /// 每秒 10 格连滚：巡航段相邻帧步长比值远小于旧的快起指数曲线（≤1.42 而不是 4.37）。
+    #[core::prelude::v1::test]
+    fn wheel_continuous_rolling_has_no_sawtooth_spike() {
+        let start = Instant::now();
+        let frame = Duration::from_millis(16);
+        let mut w = WheelInput::new(start, px(84.));
+        let mut pushed = 1;
+        let mut steps = Vec::new();
+        for i in 1..=60u32 {
+            let at = start + frame * i;
+            while pushed < 4 && at >= start + Duration::from_millis(100 * pushed as u64) {
+                w.push(start + Duration::from_millis(100 * pushed as u64), px(84.));
+                pushed += 1;
+            }
+            let step = w.advance(at, frame, 1.);
+            if step != px(0.) {
+                w.consume(step, at);
+            }
+            steps.push(step.as_f32());
+        }
+        assert_eq!(pushed, 4);
+        assert!((steps.iter().sum::<f32>() - 336.).abs() <= 0.1);
+        // 巡航段（第 4–24 帧）不许出现「一格一冲」的锯齿
+        let cruise = &steps[3..24];
+        let hi = cruise.iter().cloned().fold(0f32, f32::max);
+        let lo = cruise.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(hi / lo < 2.0, "巡航段 max/min = {hi}/{lo}");
+    }
+
+    /// 任意 DPI 缩放 × 任意刷新率：每帧步长都落在物理像素网格上，总量严格守恒。
+    #[core::prelude::v1::test]
+    fn wheel_quantizes_to_physical_pixels_at_all_scales() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            for hz in [60u32, 120, 144, 240] {
+                let frame = Duration::from_secs_f32(1. / hz as f32);
+                let start = Instant::now();
+                let mut w = WheelInput::new(start, px(84.));
+                let steps = run_wheel(&mut w, start, frame, (hz as usize).max(60), scale);
+                for step in &steps {
+                    let physical = step * scale;
+                    assert!(
+                        (physical - physical.round()).abs() < 1e-3,
+                        "scale={scale} {hz}Hz 出现亚物理像素步长 {step}"
+                    );
+                }
+                let total: f32 = steps.iter().sum();
+                assert!((total - 84.).abs() <= 0.05, "scale={scale} {hz}Hz 总计 {total}");
+            }
         }
     }
 
@@ -3713,8 +4137,10 @@ mod tests {
                 w.push(start + marks[pushed], px(84.));
                 pushed += 1;
             }
-            let step = w.advance(at);
-            w.consume(step, at);
+            let step = w.advance(at, Duration::from_millis(16), 1.);
+            if step != px(0.) {
+                w.consume(step, at);
+            }
             total += step;
             assert!(step >= px(0.), "出现反向帧：{step:?}");
         }
@@ -3727,16 +4153,18 @@ mod tests {
     fn wheel_long_frame_is_capped_and_finished_next() {
         let start = Instant::now();
         let mut w = WheelInput::new(start, px(600.));
-        let first = w.advance(start + Duration::from_millis(100));
-        assert!(first <= px(48.), "单帧 {first:?} 超过上限");
-        w.consume(first, start + Duration::from_millis(100));
-        let mut total = first;
         let mut at = start + Duration::from_millis(100);
+        let first = w.advance(at, DEFAULT_FRAME_DT, 1.);
+        assert!(first <= px(48.), "单帧 {first:?} 超过上限");
+        w.consume(first, at);
+        let mut total = first;
         for _ in 0..50 {
             at += Duration::from_millis(16);
-            let step = w.advance(at);
+            let step = w.advance(at, DEFAULT_FRAME_DT, 1.);
             assert!(step <= px(48.), "限速帧超上限 {step:?}");
-            w.consume(step, at);
+            if step != px(0.) {
+                w.consume(step, at);
+            }
             total += step;
         }
         assert!((total.as_f32() - 600.).abs() <= 0.1, "总计 {total:?}");
@@ -3749,12 +4177,12 @@ mod tests {
         let start = Instant::now();
         let mut w = WheelInput::new(start, px(240.));
         let later = start + WHEEL_STALE;
-        assert_eq!(w.advance(later), px(0.));
+        assert_eq!(w.advance(later, DEFAULT_FRAME_DT, 1.), px(0.));
         assert_eq!(w.remaining(), px(0.));
         assert!(w.is_done(later));
         // 之后的输入照常走
         w.push(later, px(84.));
-        let total: f32 = run_wheel(&mut w, later, Duration::from_millis(16), 30).iter().sum();
+        let total: f32 = run_wheel(&mut w, later, Duration::from_millis(16), 30, 1.).iter().sum();
         assert!((total - 84.).abs() <= 0.1, "恢复后的输入只走了 {total}");
     }
 
@@ -3763,12 +4191,12 @@ mod tests {
     fn wheel_reverse_clears_pending_distance() {
         let start = Instant::now();
         let mut w = WheelInput::new(start, px(84.));
-        let s1 = w.advance(start + Duration::from_millis(16));
+        let s1 = w.advance(start + Duration::from_millis(16), DEFAULT_FRAME_DT, 1.);
         w.consume(s1, start + Duration::from_millis(16));
         // 还没走完就往回滚一格
         w.push(start + Duration::from_millis(16), px(-84.));
         assert_eq!(w.remaining(), px(-84.), "反向时旧欠量应当清空并重置为新输入");
-        let back = w.advance(start + Duration::from_millis(32));
+        let back = w.advance(start + Duration::from_millis(32), DEFAULT_FRAME_DT, 1.);
         assert!(back < px(0.), "换向后第一帧就朝新方向：{back:?}");
         w.consume(back, start + Duration::from_millis(32));
         // 走完这一格的总位移正好是 -84（不带上一格剩下的）
@@ -3776,8 +4204,10 @@ mod tests {
         let mut at = start + Duration::from_millis(32);
         for _ in 0..30 {
             at += Duration::from_millis(16);
-            let step = w.advance(at);
-            w.consume(step, at);
+            let step = w.advance(at, DEFAULT_FRAME_DT, 1.);
+            if step != px(0.) {
+                w.consume(step, at);
+            }
             total += step;
         }
         assert!((total.as_f32() + 84.).abs() <= 0.1, "换向后总位移 {total:?}");
@@ -3789,7 +4219,7 @@ mod tests {
         let start = Instant::now();
         let mut w = WheelInput::new(start, px(-84.));
         let at = start + Duration::from_millis(16);
-        let step = w.advance(at);
+        let step = w.advance(at, DEFAULT_FRAME_DT, 1.);
         // 顶部：一步也没走（`apply_relative` 返回 0，于是判到头），朝这个方向的余量作废
         assert!(step < px(0.));
         w.consume(px(0.), at);
@@ -3798,7 +4228,7 @@ mod tests {
         let mut now = at;
         for _ in 0..30 {
             now += Duration::from_millis(16);
-            assert_eq!(w.advance(now), px(0.));
+            assert_eq!(w.advance(now, DEFAULT_FRAME_DT, 1.), px(0.));
         }
         assert!(w.is_done(now));
 
@@ -3807,7 +4237,8 @@ mod tests {
         let mut now = start;
         for _ in 0..10 {
             now += Duration::from_millis(16);
-            let _ = w.advance(now);
+            let planned = w.advance(now, DEFAULT_FRAME_DT, 1.);
+            assert!(planned > px(0.));
             w.consume(px(0.), now);
         }
         assert!(!w.is_done(now), "刚等一会儿不该放弃");
@@ -3823,7 +4254,7 @@ mod tests {
         let mut now = start;
         for _ in 0..20 {
             now += Duration::from_millis(16);
-            w.advance(now);
+            w.advance(now, DEFAULT_FRAME_DT, 1.);
             w.consume(px(0.), now);
         }
         assert!(!w.expired(now));
@@ -3841,8 +4272,89 @@ mod tests {
         // 期间一帧都没画（去了设置页 / 最小化），回来时同向再推一格
         let back = start + Duration::from_secs(3);
         w.push(back, px(84.));
-        let total: f32 = run_wheel(&mut w, back, Duration::from_millis(16), 30).iter().sum();
+        let total: f32 = run_wheel(&mut w, back, Duration::from_millis(16), 30, 1.).iter().sum();
         assert!((total - 84.).abs() <= 0.1, "恢复后的这一格走了 {total}");
+    }
+
+    /// 卡住 10 帧之后解堵：进度没有被偷偷推进，首步仍是起手大小，不会一次性吐出全部欠量。
+    #[core::prelude::v1::test]
+    fn wheel_resumes_smoothly_after_unblocking() {
+        let start = Instant::now();
+        let mut w = WheelInput::new(start, px(84.));
+        let mut now = start;
+        // 首帧走了一步就撞上边界：后面 10 帧一步都走不出去
+        let first = w.advance(now, DEFAULT_FRAME_DT, 1.);
+        assert_eq!(first, px(6.));
+        w.consume(px(0.), now);
+        for _ in 0..10 {
+            now += DEFAULT_FRAME_DT;
+            let planned = w.advance(now, DEFAULT_FRAME_DT, 1.);
+            assert!(planned > px(0.), "欠量还在，每帧都要有计划");
+            w.consume(px(0.), now);
+        }
+        assert_eq!(w.remaining().as_f32(), 84., "一步都没走成，欠量原封不动");
+        // 解堵：这一步必须是起手大小（~6px），不能是憋了 10 帧的 84px 一笔吐出
+        now += DEFAULT_FRAME_DT;
+        let resumed = w.advance(now, DEFAULT_FRAME_DT, 1.);
+        assert!((resumed - px(6.)).abs() < px(2.), "解堵首步 {resumed:?}");
+    }
+
+    /// 极小残留（浮点减法的零头）当场算走完：`advance` / `consume` / `is_done` 用同一个阈值，
+    /// 否则 `advance` 早退、`is_done` 不认，每帧空排一帧动画请求。
+    #[core::prelude::v1::test]
+    fn wheel_tiny_remainder_counts_as_done() {
+        let start = Instant::now();
+        let mut w = WheelInput::new(start, px(5e-5));
+        assert_eq!(w.advance(start, DEFAULT_FRAME_DT, 1.), px(0.));
+        assert_eq!(w.remaining(), px(0.));
+        assert!(w.is_done(start), "极小残留要当场算走完");
+
+        // 走完最后一步只剩零头时也一样
+        let mut w = WheelInput::new(start, px(84.));
+        let mut now = start;
+        loop {
+            now += DEFAULT_FRAME_DT;
+            let step = w.advance(now, DEFAULT_FRAME_DT, 1.);
+            if step == px(0.) {
+                break;
+            }
+            w.consume(step, now);
+            if w.is_done(now) {
+                break;
+            }
+        }
+        assert!(w.is_done(now));
+        assert_eq!(w.remaining(), px(0.), "不留零头");
+    }
+
+    /// 限速帧不叠旧误差：非整数缩放下也不会因为四舍五入越过 `WHEEL_STEP_MAX`。
+    #[core::prelude::v1::test]
+    fn wheel_capped_frames_never_exceed_the_step_limit() {
+        for scale in [1.0f32, 1.25, 1.5, 1.75] {
+            let start = Instant::now();
+            let mut w = WheelInput::new(start, px(2000.));
+            let mut now = start;
+            let mut total = px(0.);
+            for _ in 0..400 {
+                now += DEFAULT_FRAME_DT;
+                let step = w.advance(now, DEFAULT_FRAME_DT, scale);
+                if step == px(0.) {
+                    continue;
+                }
+                assert!(step <= WHEEL_STEP_MAX, "scale={scale} 限速帧 {step:?} 越过上限");
+                let physical = step.as_f32() * scale;
+                assert!(
+                    (physical - physical.round()).abs() < 1e-3,
+                    "scale={scale} 出现亚物理像素步长 {step:?}"
+                );
+                w.consume(step, now);
+                total += step;
+                if w.is_done(now) {
+                    break;
+                }
+            }
+            assert!((total.as_f32() - 2000.).abs() <= 0.1, "scale={scale} 总计 {total:?}");
+        }
     }
 
     /// 渐隐跟着滚动位置收放：滚不动时两条都不画（不然最后一行会被底下那条盖住一截）。
@@ -3972,6 +4484,47 @@ mod tests {
         assert!(!s.follow.away, "距底 80px 内按钮要消失");
         // 只清按钮，不自动吸附（没有向下的输入方向）
         assert!(!s.list.is_following_tail());
+    }
+
+    /// 距底 80px 内松手：不瞬移视口，只进入待命；真来了新内容才平滑滑回底部。
+    #[core::prelude::v1::test]
+    fn sync_follow_arms_within_80px_without_teleporting() {
+        let detach = px(600.);
+        // 往下滚停在距底 50px：原地待命，不吸底
+        assert_eq!(follow_step(px(50.), detach, true, Some(true), false, false), FollowStep::Arm);
+        // 待命期间没有新内容：保持在待命态（不重复置位、也不吸底）
+        assert_eq!(follow_step(px(50.), detach, true, Some(true), true, false), FollowStep::Hold);
+        // 待命期间真来了新内容：平滑滑回底部
+        assert_eq!(
+            follow_step(px(50.), detach, true, Some(true), true, true),
+            FollowStep::GlideToTail
+        );
+        // 已经贴到 1px 内：直接交回跟底，没有视觉跳变
+        assert_eq!(follow_step(px(0.5), detach, true, Some(true), true, true), FollowStep::Attach);
+        // 没往下滚（往上翻）别自动吸附
+        assert_eq!(follow_step(px(50.), detach, true, Some(false), false, false), FollowStep::Hold);
+        // 尾部还没测出来时不吸附（估算高度会让「到底了」说谎）
+        assert_eq!(follow_step(px(50.), detach, false, Some(true), false, false), FollowStep::Hold);
+        // 翻出一屏半：脱离跟底
+        assert_eq!(
+            follow_step(px(900.), detach, true, Some(true), false, false),
+            FollowStep::Detach
+        );
+    }
+
+    /// 用户主动往上翻 / 重定位会当场清掉吸附带的待命态。
+    #[core::prelude::v1::test]
+    fn user_actions_clear_the_armed_state() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.follow.armed = true;
+        s.note_input(false);
+        assert!(!s.follow.armed);
+        s.follow.armed = true;
+        s.drop_force_follow();
+        assert!(!s.follow.armed);
+        s.follow.armed = true;
+        s.follow_tail();
+        assert!(!s.follow.armed);
     }
 
     #[core::prelude::v1::test]

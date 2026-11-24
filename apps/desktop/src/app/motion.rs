@@ -204,7 +204,8 @@ pub(super) fn jump_step(elapsed: Duration, dt: Duration) -> f32 {
 }
 
 /// 设置页 / 模型清单的平滑滚动：剩下的距离每过这么久衰减到 1/e。
-/// （对话列表不用这套，走 `session::WheelInput` 的相对指数阻尼缓出）
+/// （对话列表不用这套，走 `session::WheelInput`：$C^1$ 三次贝塞尔曲线 + VSync 节拍对齐
+/// + 物理像素误差扩散，见那里的注释）
 pub(super) const WHEEL_TAU: f32 = 0.05;
 /// 一串滚轮最后一格之后最多再滑这么久（正常 4 倍 TAU 就到了，这是兜底）
 pub(super) const WHEEL_MAX: Duration = Duration::from_millis(600);

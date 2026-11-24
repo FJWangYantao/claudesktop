@@ -25,6 +25,12 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
   宽度变化时保留每行原有的 `size_hint`；`set_auto_reengage(false)` 关掉「离底 1px 自动重贴」，
   由 `Session::sync_follow` 按几何 + 方向接管；`is_tail_measured` 改为「视口顶到末尾全部实测」，
   避免中间某段估高偏小时提前判定到底。
+- **绘制起点对齐物理像素网格**（`src/elements/list.rs` 的 `prepaint_items`，2026-11 scroll polish）：
+  可见项从 `bounds.origin + padding.top - offset_in_item` 起画，那个值常带小数。GPUI 纵向没有亚像素字形
+  （`SUBPIXEL_VARIANTS_Y = 1`），小数相位一变，相邻行和边框就会在不同帧跨过 0.5px 边界，看着是 1px 呼吸抖动。
+  这里只把**绘制坐标** `item_origin.y` 钉到 `round(y * scale) / scale`，逻辑偏移和各行的尺寸都不动、不累积误差；
+  配合 `Session::WheelInput` 的物理像素误差扩散，整屏文字在所有滚动帧里保持恒定相位
+  （等价于 Chromium 合成器平移整块 GPU 纹理）。
 
 ## markdown 1.0.0
 

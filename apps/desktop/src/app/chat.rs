@@ -2056,7 +2056,8 @@ impl ChatApp {
     }
 
     /// 滚轮往末尾滚了 `delta`（正 = 往下，负 = 往上）：把离散输入累计到
-    /// [`WheelInput`] 的相对余量里，由 [`Self::step_wheel`] 每帧按 `68ms` 指数阻尼缓出交给列表。
+    /// [`WheelInput`] 的相对余量里，由 [`Self::step_wheel`] 每帧沿 $C^1$ 三次贝塞尔曲线
+    /// 推进（段时长约 135–180ms，按显示器刷新周期节拍对齐）交给列表。
     /// 只记「用户还要滚多少」，不再记滚动条的绝对目标——上方行补量抬高读数时不会
     /// 凭空多走一段（见 HANDOFF 里「绝对像素目标在补量行高后失效」）。
     /// 触控板的精确位移本来就连续，和「减少动态效果」时一样直接滚到位。
@@ -2080,7 +2081,8 @@ impl ChatApp {
         } else {
             match &mut s.wheel {
                 Some(w) => w.push(now, delta),
-                // 新的一串从此刻起算，首帧即按经过的帧时间比例快速起步并柔缓滑停
+                // 新的一串从此刻起算：首帧固定按一个刷新周期起步（不受事件到达相位影响），
+                // 之后沿曲线圆顶加速再收到零，干脆落位
                 None => s.wheel = Some(WheelInput::new(now, delta)),
             }
         }
@@ -2089,10 +2091,12 @@ impl ChatApp {
     }
 
     /// 滚轮平滑的一帧（`render_content` 里 `sync_list` 之后调，定位先完成再推进当帧滚轮）：
-    /// 按帧间隔从剩余位移里按指数衰减取出这一步，按当前布局裁掉越界部分，剩下的下一帧继续。
-    /// 只要还有余量，每帧只追加一次动画请求。
-    pub(super) fn step_wheel(&mut self, window: &mut Window) {
+    /// 按显示器刷新周期推进一段 $C^1$ 贝塞尔曲线，按物理像素取整后交给列表，
+    /// 再按当前布局裁掉越界部分，剩下的下一帧继续。只要还有余量，每帧只追加一次动画请求。
+    pub(super) fn step_wheel(&mut self, window: &mut Window, cx: &App) {
         let now = Instant::now();
+        let frame_dt = window.refresh_interval(cx).unwrap_or(crate::session::DEFAULT_FRAME_DT);
+        let scale = window.scale_factor();
         let s = &mut self.sessions[self.active];
         let Some(mut w) = s.wheel.take() else {
             return;
@@ -2101,11 +2105,11 @@ impl ChatApp {
         if s.list.is_scrollbar_dragging() {
             return;
         }
-        let step = w.advance(now);
+        let step = w.advance(now, frame_dt, scale);
         if step != px(0.) {
             let (applied, edge) = apply_relative(&s.list, step);
             // 先记账再 `block`：`block` 会把欠量清零，反过来相减会留下负的余量。
-            // `applied == 0`（一步没走成）由 `consume` 开始计「卡住」的时长
+            // `applied == 0`（一步没走成）由 `consume` 重锚曲线并开始计「卡住」的时长
             w.consume(applied, now);
             // 这个方向真到头了：朝外的欠量作废，别每帧空转。
             // 位移方向永远和输入一致，不会有回弹帧

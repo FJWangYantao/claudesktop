@@ -1402,6 +1402,13 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
+                // claudesktop patch: 对齐绘制起点到物理像素网格。GPUI 纵向无亚像素字形
+                // （SUBPIXEL_VARIANTS_Y = 1），未对齐的浮点偏移会让相邻行和边框在不同帧跨过
+                // 0.5px 边界产生 1px 呼吸抖动；只对齐绘制坐标，不改逻辑偏移，不累积误差。
+                let scale = window.scale_factor();
+                if scale > 0. {
+                    item_origin.y = px((item_origin.y.0 * scale).round() / scale);
+                }
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         item.element.prepaint_at(item_origin, window, cx);

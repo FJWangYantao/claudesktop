@@ -283,14 +283,27 @@ impl ChatApp {
         });
         self.sessions[active].sync_list(view);
         // 滚轮在列表状态（行数、定位）都更新完之后才推进这一帧，免得和跳转、补行抢
-        self.step_wheel(window);
+        self.step_wheel(window, cx);
         // 展开 / 收起卡片：把被点的那一行钉回屏幕原位（按上一帧布局量到的偏差补偿）
         if self.sessions[active].step_pin(Instant::now()) {
             window.request_animation_frame();
         }
         // 跟随判定放到最后：这一帧的位移都落位了，再按几何 + 方向决定吸附 / 脱离
         let moving = self.jump.is_some();
-        self.sessions[active].sync_follow(Instant::now(), moving);
+        // 待在距底 80px 吸附带里来了新内容：平滑滑回底部（不在松手那一刻瞬移）
+        if self.sessions[active].sync_follow(Instant::now(), moving) {
+            if cx.reduce_motion() {
+                self.sessions[active].follow_tail();
+            } else {
+                let now = Instant::now();
+                self.jump = Some(motion::JumpAnim {
+                    token: self.sessions[active].token,
+                    started: now,
+                    last: now,
+                });
+                window.request_animation_frame();
+            }
+        }
         // 这一帧还在滚（平滑余量 / 回底动画 / 正拖着滚动条）：悬停变化不再单独通知内容区
         if self.jump.is_some()
             || self.sessions[active].wheel.is_some()
