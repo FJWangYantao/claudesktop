@@ -42,6 +42,12 @@ const TODO_MAX: usize = 50;
 /// 清单里还有没做完的项、连续这么多步没更新时，提醒模型一次。
 /// 原来取 8，太密（一个五项的活至少多出五六次调用），按「方案-内核提速.md」阶段 1 提到 15。
 pub const TODO_REMIND_STEPS: u32 = 15;
+/// 一轮里连着这么多步（每步一次请求）都没对用户说话，提醒模型汇报一次进度。
+/// 改前的数据：模型自己大约每 7 个工具说一句；10 步留出余量，只在真闷头时触发。
+pub const PROGRESS_REMIND_STEPS: u32 = 10;
+/// 连着这么多步的工具调用全部失败，提醒模型说明卡点、考虑停下来问用户。
+/// 按步数不按调用数：一步里并行试探几条路径都失败是查证，不是卡住。
+pub const FAILURE_REMIND_STEPS: u32 = 3;
 /// 压缩摘要末尾附的清单的标题（再压缩时先去掉，免得旧清单被抄进新摘要）
 const TODO_SECTION: &str = "\n\n## Todo list at the time of compaction\n";
 
@@ -246,11 +252,10 @@ pub enum Exposure {
 
 /// 哪些工具默认不声明给模型，要先用 `tool_search` 找出来（「方案-内核提速.md」阶段 2）。
 ///
-/// 常驻的是每次都要用的那几个（读写文件、改文件、shell、搜代码、提问、搜工具）；
+/// 常驻的是每次都要用的那几个（读写文件、改文件、shell、搜代码、待办清单、提问、搜工具）；
 /// 这里是不常用、但真要用时必须能找回来的。`task` 来自 `subagent`，名字直接写字符串。
 const DEFERRED: &[&str] = &[
     LIST_DIR,
-    TODO_WRITE,
     WEB_FETCH,
     WEB_SEARCH,
     MEMORY_SEARCH,
@@ -615,10 +620,10 @@ fn build_specs(writable: bool) -> Vec<Value> {
             }),
         ));
     }
-    // `tool_search` 在两种模式下都给（它不碰文件）：Plan 模式也得能把 `todo_write` / `web_fetch` 找回来
+    // `tool_search` 在两种模式下都给（它不碰文件）：Plan 模式也得能把 `web_fetch` 这类找回来
     tools.push(f(
         TOOL_SEARCH,
-        "Some of your tools are not listed here (memory, todo list, subagents, background \
+        "Some of your tools are not listed here (memory, subagents, background \
          commands, web access, MCP servers, and so on). Describe in one sentence what you want to do \
          and this finds them by name and description; they become callable from your NEXT request \
          onwards, not in this one. So: search first, finish this request, and call the tool you found \
@@ -629,7 +634,7 @@ fn build_specs(writable: bool) -> Vec<Value> {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "What you want to do, e.g. `todo list` or `run a command in the background`"
+                    "description": "What you want to do, e.g. `remember this` or `run a command in the background`"
                 }
             },
             "required": ["query"]
@@ -961,6 +966,25 @@ pub fn todo_reminder(entries: &[PlanEntryView]) -> String {
          the list; if it no longer applies, clear it. Do not mention this reminder to the user.\n\
          </system-reminder>",
         todo_lines(entries)
+    )
+}
+
+/// 连着好几步没对用户说话时挂在请求末尾（只进这一次请求，不进历史）。
+pub fn progress_reminder(steps: u32) -> String {
+    format!(
+        "\n\n<progress-reminder>\nYou have worked {steps} steps without telling the user anything. \
+         Along with your next tool call, add one or two plain sentences: what is done, what you \
+         found, what comes next. Do not mention this reminder.\n</progress-reminder>"
+    )
+}
+
+/// 连着好几步的工具调用都没成功时挂在请求末尾。
+pub fn blocker_reminder(steps: u32) -> String {
+    format!(
+        "\n\n<progress-reminder>\nThe tool calls of the last {steps} steps all failed. Tell the user in \
+         a sentence what is blocking you. If fixing it is outside what they asked for, stop and ask \
+         them how to proceed (ask_user) instead of trying more workarounds. Do not mention this \
+         reminder.\n</progress-reminder>"
     )
 }
 
@@ -3621,15 +3645,17 @@ y
         for name in [READ_FILE, WRITE_FILE, EDIT_FILE, SHELL, GREP, GLOB, ASK_USER, TOOL_SEARCH] {
             assert!(direct.contains(&name.to_string()), "{name} 应该常驻：{direct:?}");
         }
-        for name in [LIST_DIR, TODO_WRITE, MEMORY_SEARCH, SHELL_OUTPUT, "task"] {
+        // 清单也常驻：它是用户看进度的主渠道，搜一次才能用会让模型干脆不建（见 `DEFERRED`）
+        assert!(direct.contains(&TODO_WRITE.to_string()), "{direct:?}");
+        for name in [LIST_DIR, MEMORY_SEARCH, SHELL_OUTPUT, "task"] {
             assert!(!direct.contains(&name.to_string()), "{name} 应该先搜：{direct:?}");
         }
         // 加载过的出现；不存在的名字不报错也不多给
-        let loaded = vec![TODO_WRITE.to_string(), "no_such_tool".to_string()];
-        let with_todo = names(for_model(specs(true), &loaded));
-        assert!(with_todo.contains(&TODO_WRITE.to_string()), "{with_todo:?}");
-        assert!(!with_todo.contains(&MEMORY_SEARCH.to_string()), "{with_todo:?}");
-        assert_eq!(with_todo.len(), direct.len() + 1);
+        let loaded = vec![LIST_DIR.to_string(), "no_such_tool".to_string()];
+        let with_list_dir = names(for_model(specs(true), &loaded));
+        assert!(with_list_dir.contains(&LIST_DIR.to_string()), "{with_list_dir:?}");
+        assert!(!with_list_dir.contains(&MEMORY_SEARCH.to_string()), "{with_list_dir:?}");
+        assert_eq!(with_list_dir.len(), direct.len() + 1);
     }
 
     /// MCP 工具也是 `Deferred`：一个服务器挂几个工具事先不知道，全常驻太贵。

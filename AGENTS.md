@@ -398,6 +398,14 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - 待办清单（`todo_write`）：内核在 `SessionState::todos` 记着当前清单（续接 / 回退从日志的 `PlanReplaced` 恢复）；
   还有没做完的项、连续 `TODO_REMIND_STEPS` 步没更新时，在那次请求的最后一条消息上临时挂提醒（不进历史，`todo_nudge`）；
   压缩时内核把当前清单附在摘要后面（`tools::summary_with_todos`），不靠总结的模型抄。
+  `todo_write` 常驻（不在 `DEFERRED` 里）：清单是用户看进度的主渠道，搜一次才能用会让模型干脆不建。
+- **中途汇报的兜底**（`run_steps` 里的局部计数器）：连续 `PROGRESS_REMIND_STEPS` 步只调工具不说话、
+  或连续 `FAILURE_REMIND_STEPS` 步的工具调用全部失败时，同样在那次请求的最后一条消息上挂 `<progress-reminder>`
+  （`tools::progress_reminder` / `blocker_reminder`，不进历史，失败优先并同时清零静默计数）。
+  失败**按步数**不按调用数：一步里并行试探几条路径都不存在是查证，不是卡住。
+  只提醒主会话的 Code 会话（子会话用户看不到、聊天会话没有长工具链）；同一段「中途汇报」的提示词也
+  只注入主会话的 `preamble`（子会话被明确告知没人看得到它、也不能提问）。标签**别改回 `<system-reminder>`**：
+  清单提醒的测试按那个子串断言。
 - **历史与用量按需读取**：启动时 `Session::placeholder` 只给最近 100 个会话建元信息占位，首屏不读 jsonl；
   激活后 `ChatApp::ensure_history_loaded` 后台读日志，界面移动有效记录重放，读取期间发送进现有队列。
   磁盘搜索逐行扫描，只留短标题和有限命中，遇回退撤销失效命中，跳转等加载完成再定位。

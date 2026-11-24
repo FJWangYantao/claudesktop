@@ -44,7 +44,9 @@ mod sse;
 mod subagent;
 pub mod suggest;
 mod tools;
-pub use tools::{TODO_REMIND_STEPS, ToolOutput, run_command};
+pub use tools::{
+    FAILURE_REMIND_STEPS, PROGRESS_REMIND_STEPS, TODO_REMIND_STEPS, ToolOutput, run_command,
+};
 pub mod websearch;
 
 pub use anthropic::AnthropicProvider;
@@ -2709,13 +2711,25 @@ fn prompt_sections(
     let mut sections: Vec<(&'static str, String)> = Vec::new();
     // 子会话没有待办清单（计划是主会话的），也不能再派子任务
     let todo = if agent.is_none() {
-        "For tasks with several steps, track progress with todo_write (find it with tool_search \
-         first) and keep it current: mark each item completed as soon as it is done. "
+        "For tasks with several steps, track progress with todo_write and keep it current: it is what \
+         the user watches while you work, so mark each item completed as soon as it is done. "
     } else {
         ""
     };
     let delegation =
         if agent.is_none() { format!("{}\n", subagent::DELEGATION) } else { String::new() };
+    // 中途汇报只给主会话：子会话的话用户看不到，也不能提问（`subagent::prompt_section`），
+    // 两边的指令会打架
+    let progress = if agent.is_none() {
+        "On longer work, keep the user in the loop with one or two plain sentences alongside your \
+         next tool call when you finish a phase, when you find something that changes the plan, or \
+         when you are blocked (the same kind of call keeps failing, a tool or dependency is missing, \
+         the environment misbehaves). If getting unblocked would take you away from what the user \
+         asked for (repairing a toolchain, installing things, long workarounds), stop and report \
+         what is blocking you and the options instead of pressing on.\n"
+    } else {
+        ""
+    };
     sections.push((
         "preamble",
         format!(
@@ -2737,9 +2751,10 @@ fn prompt_sections(
              When a reply runs past three paragraphs or covers more than one topic, split it with \
 short headings (numbered or a few words), one topic per section, list items within a section, \
 and keep headings bare (no trailing explanation).\n\
-             Act on the task directly: don't restate a plan or narrate what you are about to do \
-             before a tool call, and don't re-confirm facts you already have from the conversation \
-             or from tool results. A short reply is better than a thorough-looking one.",
+             {progress}\
+             Act on the task directly: don't restate a plan, don't narrate each tool call, and don't \
+             re-confirm facts you already have from the conversation or from tool results.\n\
+             A short final reply is better than a thorough-looking one.",
             cwd.display(),
             std::env::consts::OS,
         ),
@@ -3069,6 +3084,9 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
     let mut overflow_compacted = false;
     // 连着几步的回复被输出上限截断（中间只要有一整步正常就清零）
     let mut truncated_steps: u32 = 0;
+    // 连着几步没对用户说话 / 连着几步工具调用全失败（只给主会话的 Code 会话提醒，见下）
+    let mut silent_steps: u32 = 0;
+    let mut failed_steps: u32 = 0;
     // 会话级档位（输入框下拉选的）按轮取：一轮中途换了档，后面的步骤仍用开头那一档
     //（工具循环中途开 / 关思考，Anthropic 会因上一条助手消息没有 thinking 块报 400）
     let Some(thinking) = inner.sessions.lock().unwrap().get(session).map(|s| s.thinking) else {
@@ -3113,6 +3131,23 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             && let Some(last) = messages.last_mut().filter(|m| m.role == "user" || m.role == "tool")
         {
             last.append_text(&reminder);
+        }
+        // 子会话的话用户看不到、聊天会话没有长工具链：只提醒主会话的 Code 会话。
+        // 先看计数（每步都查会话状态要加锁，没必要）
+        let blocked = failed_steps >= tools::FAILURE_REMIND_STEPS;
+        if (blocked || silent_steps >= tools::PROGRESS_REMIND_STEPS)
+            && agent.is_none()
+            && inner.chat_web_of(session).is_none()
+            && let Some(last) = messages.last_mut().filter(|m| m.role == "user" || m.role == "tool")
+        {
+            if blocked {
+                last.append_text(&tools::blocker_reminder(failed_steps));
+                failed_steps = 0;
+                silent_steps = 0;
+            } else {
+                last.append_text(&tools::progress_reminder(silent_steps));
+                silent_steps = 0;
+            }
         }
         // 当前模型看不了图（能力表知道，或被 400 记过）：历史里的图片换成文字占位，
         // 不让整轮报错。只影响发出去的请求，日志不动（换回能看图的模型又是原图）
@@ -3294,6 +3329,8 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
         }
         // 这一步没被截断：连续计数清零
         truncated_steps = 0;
+        // 这一步对用户说了话就清零；只调工具不说话就加一
+        silent_steps = if text.trim().is_empty() { silent_steps + 1 } else { 0 };
 
         if outcome.tool_calls.is_empty() {
             if !text.is_empty() {
@@ -3315,6 +3352,11 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             .iter()
             .zip(&outputs)
             .any(|(c, o)| c.function.name == tools::ASK_USER && o.stop_turn);
+        // 「连续失败」按步数：同一步里只要有一个调用成功就清零，全部失败（用户叫停的不算）才加一。
+        // 按单个调用数会把「一步里并行试探几条路径、都不存在」误判成卡住
+        if outputs.iter().any(|o| !o.stop_turn) {
+            failed_steps = if outputs.iter().any(|o| o.ok) { 0 } else { failed_steps + 1 };
+        }
         let results: Vec<_> = outcome
             .tool_calls
             .iter()

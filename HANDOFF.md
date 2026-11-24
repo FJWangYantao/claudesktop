@@ -349,6 +349,16 @@
 
 ## 内核 / 工具
 
+- **提示词里禁止「工具前旁白」会把阶段汇报也一起压掉**（2026-11-24）：10-23 的提速改动加了「don't narrate what you are about to do before a tool call」，
+  同一模型在重度轮次里的中间汇报从每轮 8.4 次掉到 1.0 次，93% 的中间请求正文为空，最长连续 33 分钟不出声。
+  改成只禁逐步旁白，并点名阶段完成、计划变化、卡住三种要汇报的时机（只注入主会话：子会话被告知没人看得到它、
+  也不能提问，两边的指令会打架）；内核在连续 10 步静默（`PROGRESS_REMIND_STEPS`）或连续 3 步的工具调用全失败
+  （`FAILURE_REMIND_STEPS`，按步不按调用，避免并行试探几条路径被当成卡住）时挂一次 `<progress-reminder>`
+  （只进这一次请求，不进历史）。
+  **提醒标签别用 `<system-reminder>`**：现有清单提醒测试按这个子串断言，第 10 步就会撞上。
+  计数器是 `run_steps` 的局部变量（只管这一轮，续接 / 回退不用存）；聊天会话不提醒（没有长工具链）。
+  同时 `todo_write` 改回常驻：清单是用户看进度的主渠道，搜一次才能用会让模型干脆不用（13 个长会话里 11 个一次没加载）。
+
 - **工具定义共享（2026-11-17，固定测量条件下验收通过）**：`ToolSpec` 用 `Arc<Value>` 持定义；MCP 清单更换时替换整份定义，请求只克隆引用，搜索只取名字 / 说明，调用目标不带 schema 副本。三个 provider 借用工具字段序列化。
   `serde_json` 在本仓库启用了保留插入顺序：Anthropic 工具原顺序是 name → input_schema → description → cache_control，Responses 是 type → name → description → parameters → strict；工具在请求顶层也要占回原来的字段位置。首轮字节断言抓到顺序差异，修复后内核 release 196 项单测通过。
   大型 MCP 基准在 `request-memory-bench.mjs` 加 `--mcp-tools=0,200 --loaded-tools=none,small,all`，默认把 JSON / SHA 校验移到轮后，保留 20ms 发送 / 整轮门槛；A/A 要求同一 exe 哈希且看绝对差。原文只归一化隔离 cwd 后按字节校验，同时核对完整 JSON。

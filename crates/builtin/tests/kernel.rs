@@ -596,6 +596,25 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> Reply {
     }
 }
 
+/// 和 `tool_call` 一样，但这一步**不对用户说话**（没有正文）：用来测静默 / 失败提醒。
+fn quiet_tool_call(id: &str, name: &str, args: serde_json::Value) -> Reply {
+    let call = serde_json::json!({
+        "choices": [{ "index": 0, "delta": { "tool_calls": [{
+            "index": 0, "id": id, "type": "function",
+            "function": { "name": name, "arguments": args.to_string() }
+        }]}, "finish_reason": null }]
+    });
+    Reply::Sse {
+        lines: vec![
+            format!("data: {call}"),
+            finish("tool_calls"),
+            USAGE.into(),
+            "data: [DONE]".into(),
+        ],
+        gap_ms: 5,
+    }
+}
+
 /// 每个 harness 一个空的工作目录（同一进程里的测试并行跑，按序号区分）。
 fn empty_dir() -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -691,6 +710,7 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
         [
             "read_file",
             "glob",
+            "todo_write",
             "ask_user",
             "grep",
             "write_file",
@@ -711,32 +731,28 @@ fn read_tool_runs_without_asking_and_feeds_result_back() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 工具分层：`todo_write` 第一次请求里没有，`tool_search` 找出来之后下一次请求就在了。
+/// 工具分层：`list_dir` 第一次请求里没有，`tool_search` 找出来之后下一次请求就在了。
 /// 加载动作要落进日志（`KernelEvent::ToolsLoaded`，界面转成 `Record::ToolLoadout`），
 /// 否则续接 / 回退后模型手里的工具和界面显示的对不上。
 #[test]
 fn tool_search_loads_a_deferred_tool_for_the_next_request() {
     let dir = workdir("tool-search");
     let (base, bodies) = serve(vec![
-        tool_call("s1", "tool_search", serde_json::json!({ "query": "todo" })),
-        tool_call(
-            "t1",
-            "todo_write",
-            serde_json::json!({ "todos": [{ "content": "读文件", "status": "pending" }] }),
-        ),
-        happy_stream("先列个清单"),
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "list directory" })),
+        tool_call("d1", "list_dir", serde_json::json!({ "path": "." })),
+        happy_stream("先看看目录"),
     ]);
     let h = Harness::with_cwd(base, dir.clone());
     let sid = h.start();
     h.kernel.send_prompt(&sid, UserPrompt::text("改一下")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
 
-    // 第一次请求里没有 todo_write
+    // 第一次请求里没有 list_dir
     let first = tool_names(&body(&bodies, 0));
-    assert!(!first.contains(&"todo_write".to_string()), "{first:?}");
+    assert!(!first.contains(&"list_dir".to_string()), "{first:?}");
     assert!(first.contains(&"tool_search".to_string()), "{first:?}");
 
-    // tool_search 的结果里有 todo_write，并说清楚下一轮才能调（这一步已经发完了）
+    // tool_search 的结果里有 list_dir，并说清楚下一轮才能调（这一步已经发完了）
     let second = body(&bodies, 1);
     let result = second["messages"]
         .as_array()
@@ -747,22 +763,19 @@ fn tool_search_loads_a_deferred_tool_for_the_next_request() {
         .and_then(|m| m["content"].as_str())
         .unwrap_or_default()
         .to_string();
-    assert!(result.contains("todo_write"), "{result}");
+    assert!(result.contains("list_dir"), "{result}");
     assert!(result.contains("NEXT request"), "{result}");
 
-    // 下一次请求的 tools 里出现 todo_write，而且它真能调（清单换上了）
-    assert!(tool_names(&second).contains(&"todo_write".to_string()));
-    assert_eq!(
-        h.count(|e| matches!(e, KernelEvent::PlanReplaced { entries } if !entries.is_empty())),
-        1
-    );
+    // 下一次请求的 tools 里出现 list_dir，而且它真能调（目录列出来了）
+    assert!(tool_names(&second).contains(&"list_dir".to_string()));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { id, .. } if id == "d1")), 1);
 
     // 加载记进了日志
     assert_eq!(
-        h.count(|e| matches!(e, KernelEvent::ToolsLoaded { names } if names.iter().any(|n| n == "todo_write"))),
+        h.count(|e| matches!(e, KernelEvent::ToolsLoaded { names } if names.iter().any(|n| n == "list_dir"))),
         1
     );
-    // 工具行不占位（和 todo_write 一样：它只改下一轮的工具清单）
+    // 工具行不占位（它只改下一轮的工具清单）
     assert_eq!(h.count(|e| matches!(e, KernelEvent::ToolCallStarted { id, .. } if id == "s1")), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1124,7 +1137,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
     assert_eq!(h.tool_status("p1").as_deref(), Some("failed"));
     assert!(!dir.join("x.txt").exists());
-    // Plan 模式：常驻的只有只读的那几个（写文件的整段不给）
+    // Plan 模式：常驻的只有只读的那几个（写文件的整段不给）；清单不碰文件，照样常驻
     let first = body(&bodies, 0);
     let names: Vec<_> = first["tools"]
         .as_array()
@@ -1132,7 +1145,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, ["read_file", "glob", "ask_user", "grep", "tool_search"]);
+    assert_eq!(names, ["read_file", "glob", "todo_write", "ask_user", "grep", "tool_search"]);
     assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1721,6 +1734,181 @@ fn reminds_to_update_a_stale_todo_list_once_per_interval() {
     assert!(content.contains("<system-reminder>") && content.contains("[>] 改代码"), "{content}");
     // 提醒不进历史，提醒过就重新计数
     assert!(!has_reminder(steps + 2), "提醒只挂一次请求");
+}
+
+#[test]
+fn reminds_to_report_progress_after_a_long_silent_streak() {
+    let steps = claudesktop_builtin::PROGRESS_REMIND_STEPS as usize;
+    // 连着 `steps + 1` 步只调工具、不对用户说话
+    let mut script = Vec::new();
+    for i in 0..=steps {
+        script.push(quiet_tool_call(
+            &format!("g{i}"),
+            "glob",
+            serde_json::json!({ "pattern": "*.nope" }),
+        ));
+    }
+    script.push(happy_stream("查完了"));
+    let (base, bodies) = serve(script);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    let has = |i: usize, needle: &str| body(&bodies, i).to_string().contains(needle);
+    // 第 `steps` 步走完正好攒够，下一次请求（下标 `steps`）挂上提醒
+    for i in 0..steps {
+        assert!(!has(i, "progress-reminder"), "请求 {i} 不该有提醒");
+    }
+    let reminded = body(&bodies, steps);
+    let last = reminded["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["tool_call_id"], format!("g{}", steps - 1));
+    let content = last["content"].as_str().unwrap();
+    assert!(content.contains("<progress-reminder>"), "{content}");
+    assert!(content.contains(&format!("worked {steps} steps")), "{content}");
+    // 不进历史：提醒过就重新计数，下一次请求干净
+    assert!(!has(steps + 1, "progress-reminder"), "提醒只挂一次请求");
+}
+
+#[test]
+fn reminds_to_report_a_failing_streak_of_tool_calls() {
+    let steps = claudesktop_builtin::FAILURE_REMIND_STEPS as usize;
+    // 多跑一步：看「提醒只挂一次」
+    let mut script = Vec::new();
+    for i in 0..=steps {
+        script.push(quiet_tool_call(
+            &format!("r{i}"),
+            "read_file",
+            serde_json::json!({ "path": "no_such_file.txt" }),
+        ));
+    }
+    script.push(happy_stream("读不到"));
+    let (base, bodies) = serve(script);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("读文件")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    let needle = format!("The tool calls of the last {steps} steps all failed");
+    let has = |i: usize| body(&bodies, i).to_string().contains(&needle);
+    // 前 `steps - 1` 次失败还不够
+    for i in 0..steps {
+        assert!(!has(i), "请求 {i} 不该有失败提醒");
+    }
+    // 第 `steps` 次失败之后的那次请求说明卡点
+    let content = body(&bodies, steps).to_string();
+    assert!(content.contains(&needle), "{content}");
+    let last = body(&bodies, steps)["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["tool_call_id"], format!("r{}", steps - 1));
+    // 失败提醒优先，且同样只挂一次（后面那次失败重新计数，才 1 次）
+    assert!(!has(steps + 1), "提醒只挂一次请求");
+    assert!(!body(&bodies, steps + 1).to_string().contains("progress-reminder"));
+}
+
+/// 同一步里并行几个调用、全失败只算一步：并行试探几条不存在的路径不该被当成「卡住」
+#[test]
+fn parallel_failures_in_one_step_count_as_one_step() {
+    let steps = claudesktop_builtin::FAILURE_REMIND_STEPS as usize;
+    // 每步发三个都失败的只读调用（并行），只跑 `steps - 1` 步：不到门槛，不该提醒
+    let mut script = Vec::new();
+    for step in 0..steps.saturating_sub(1) {
+        let a = format!("a{step}");
+        let b = format!("b{step}");
+        let c = format!("c{step}");
+        let calls = [
+            (a.as_str(), "read_file", serde_json::json!({ "path": "nope_a.txt" })),
+            (b.as_str(), "read_file", serde_json::json!({ "path": "nope_b.txt" })),
+            (c.as_str(), "read_file", serde_json::json!({ "path": "nope_c.txt" })),
+        ];
+        script.push(tool_calls(&calls));
+    }
+    script.push(happy_stream("都没有"));
+    let (base, bodies) = serve(script);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("都在哪")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    let total = bodies.lock().unwrap().len();
+    for i in 0..total {
+        assert!(
+            !body(&bodies, i).to_string().contains("progress-reminder"),
+            "请求 {i} 不该有提醒（每步的失败只算一步）"
+        );
+    }
+}
+
+/// 子会话的请求不挂进度提醒：它连跑几步都失败也不提醒（用户看不到子会话）
+#[test]
+fn subagents_get_no_progress_reminders() {
+    let dir = workdir("subagent-remind");
+    let steps = claudesktop_builtin::FAILURE_REMIND_STEPS as usize;
+    let mut script = vec![
+        // `task` 是 deferred 的：主会话得先搜一次，下一轮才能派子任务
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "subagent" })),
+        tool_call(
+            "t1",
+            "task",
+            serde_json::json!({
+                "description": "找不到",
+                "prompt": "Read nothing.txt",
+                "subagent_type": "scout",
+            }),
+        ),
+    ];
+    // 子会话连着 `steps` 步失败，然后交报告
+    for i in 0..steps {
+        script.push(quiet_tool_call(
+            &format!("c{i}"),
+            "read_file",
+            serde_json::json!({ "path": "nothing.txt" }),
+        ));
+    }
+    script.push(happy_stream("读不到"));
+    script.push(happy_stream("子任务读不到"));
+    let (base, bodies) = serve(script);
+    let h = Harness::with_cwd(base, dir.clone());
+    h.kernel.set_plugins(vec![agent_plugin(&dir)]);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("读 nothing")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    // 0 = tool_search，1 = 派任务，2 起是子会话自己的几步，最后一个请求是主会话收尾
+    let total = bodies.lock().unwrap().len();
+    for i in 0..total {
+        let body = body(&bodies, i);
+        assert!(!body.to_string().contains("progress-reminder"), "请求 {i} 不该有提醒：{body}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn speaking_up_resets_the_silent_counter() {
+    // 静默步数一共是两段，每段都不到门槛：中间说话那一步把计数清零
+    let half = claudesktop_builtin::PROGRESS_REMIND_STEPS / 2;
+    let glob = || serde_json::json!({ "pattern": "*.nope" });
+    let mut script = Vec::new();
+    for i in 0..half {
+        script.push(quiet_tool_call(&format!("a{i}"), "glob", glob()));
+    }
+    script.push(tool_call("mid", "glob", glob()));
+    for i in 0..half {
+        script.push(quiet_tool_call(&format!("b{i}"), "glob", glob()));
+    }
+    script.push(happy_stream("查完了"));
+    let (base, bodies) = serve(script);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("看看")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+
+    let total = bodies.lock().unwrap().len();
+    for i in 0..total {
+        assert!(
+            !body(&bodies, i).to_string().contains("progress-reminder"),
+            "请求 {i} 不该有提醒（中间说过话）"
+        );
+    }
 }
 
 #[test]
@@ -4489,7 +4677,7 @@ fn self_answer_skips_the_rest_of_the_step() {
 #[test]
 fn rewind_drops_tools_loaded_in_rewound_turns() {
     let (base, bodies) = serve(vec![
-        tool_call("s1", "tool_search", serde_json::json!({ "query": "todo" })),
+        tool_call("s1", "tool_search", serde_json::json!({ "query": "list directory" })),
         happy_stream("找到了"),
         happy_stream("重来答"),
     ]);
@@ -4497,12 +4685,12 @@ fn rewind_drops_tools_loaded_in_rewound_turns() {
     let sid = h.start();
     h.kernel.send_prompt(&sid, UserPrompt::text("第一问")).unwrap();
     h.wait("turn 1", |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    assert!(tool_names(&body(&bodies, 1)).contains(&"todo_write".to_string()));
+    assert!(tool_names(&body(&bodies, 1)).contains(&"list_dir".to_string()));
 
     let ev = |event| Record::Event { event };
     let log = vec![
         Record::user("第一问"),
-        Record::ToolLoadout { names: vec!["todo_write".into()] },
+        Record::ToolLoadout { names: vec!["list_dir".into()] },
         ev(KernelEvent::AgentMessageChunk { text: "找到了".into() }),
         ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
         Record::Rewind { turn: 0, conversation: true, files: 0, prompt: "第一问".into() },
@@ -4511,5 +4699,5 @@ fn rewind_drops_tools_loaded_in_rewound_turns() {
     h.kernel.send_prompt(&sid, UserPrompt::text("重来问")).unwrap();
     h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
     let tools = tool_names(&body(&bodies, 2));
-    assert!(!tools.contains(&"todo_write".to_string()), "{tools:?}");
+    assert!(!tools.contains(&"list_dir".to_string()), "{tools:?}");
 }
