@@ -30,10 +30,16 @@ const SNIPPET_CHARS: usize = 300;
 const DEEPSEEK_SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
 
 /// 环境变量里的 Brave API key（设置页 / 系统环境变量都行）
-pub const BRAVE_KEY_ENV: &str = "CLAUDEDESKTOP_BRAVE_KEY";
+pub const BRAVE_KEY_ENV: &str = "CLAUDESKTOP_BRAVE_KEY";
+
+/// 旧名（早先是拼错的），仍认，见 [`brave_key`]。
+pub const BRAVE_KEY_ENV_LEGACY: &str = "CLAUDEDESKTOP_BRAVE_KEY";
 
 /// 环境变量里的 DeepSeek 搜索 key（没填的话用 provider 配置里那把）
-pub const DEEPSEEK_KEY_ENV: &str = "CLAUDEDESKTOP_DEEPSEEK_KEY";
+pub const DEEPSEEK_KEY_ENV: &str = "CLAUDESKTOP_DEEPSEEK_KEY";
+
+/// 旧名，仍认，见 [`deepseek_key`]。
+pub const DEEPSEEK_KEY_ENV_LEGACY: &str = "CLAUDEDESKTOP_DEEPSEEK_KEY";
 
 /// 数据目录（key 文件和 `search.json` 的位置）；内核启动时设置一次。
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -53,9 +59,14 @@ pub fn data_dir_known() -> bool {
     DATA_DIR.get().is_some()
 }
 
-/// 取 Brave key：先环境变量，再数据目录的 `brave_key` 文件（设置页写入）。
+/// 取 Brave key：先环境变量（新名优先，旧名兜底），再数据目录的 `brave_key` 文件（设置页写入）。
 pub fn brave_key() -> Option<String> {
-    env_key(BRAVE_KEY_ENV).or_else(|| key_file("brave_key"))
+    key_from_env(&[BRAVE_KEY_ENV, BRAVE_KEY_ENV_LEGACY]).or_else(|| key_file("brave_key"))
+}
+
+/// 按顺序试几个环境变量名，取第一个非空的（新旧名兼容用）。
+fn key_from_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| env_key(name))
 }
 
 fn env_key(name: &str) -> Option<String> {
@@ -209,9 +220,9 @@ pub fn save(cfg: &SearchConfig) -> std::io::Result<()> {
     std::fs::write(dir.join("search.json"), text + "\n")
 }
 
-/// DeepSeek 搜索单独的 key（数据目录的 `deepseek_key` 文件 / 环境变量）。
+/// DeepSeek 搜索单独的 key（数据目录的 `deepseek_key` 文件 / 环境变量，新旧名都认）。
 pub fn own_deepseek_key() -> Option<String> {
-    env_key(DEEPSEEK_KEY_ENV).or_else(|| key_file("deepseek_key"))
+    key_from_env(&[DEEPSEEK_KEY_ENV, DEEPSEEK_KEY_ENV_LEGACY]).or_else(|| key_file("deepseek_key"))
 }
 
 /// 把 DeepSeek 搜索的 key 存进数据目录（None = 删掉，改用 provider 配置里那把）。
@@ -665,6 +676,15 @@ fn render(query: &str, backend: SearchBackend, hits: &[Hit], notes: &[String]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 新旧环境变量名都是 `CLAUDESKTOP_` 开头（早先的 `CLAUDEDESKTOP_` 只作兼容保留）。
+    #[test]
+    fn key_env_names_use_the_correct_spelling() {
+        assert_eq!(BRAVE_KEY_ENV, "CLAUDESKTOP_BRAVE_KEY");
+        assert_eq!(DEEPSEEK_KEY_ENV, "CLAUDESKTOP_DEEPSEEK_KEY");
+        assert_eq!(BRAVE_KEY_ENV_LEGACY, "CLAUDEDESKTOP_BRAVE_KEY");
+        assert_eq!(DEEPSEEK_KEY_ENV_LEGACY, "CLAUDEDESKTOP_DEEPSEEK_KEY");
+    }
 
     #[test]
     fn parses_ddg_results() {

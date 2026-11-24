@@ -1338,12 +1338,21 @@ pub(crate) fn error_message(body: &str) -> String {
     }
 }
 
-/// `CLAUDEDESKTOP_DEBUG_HTTP=1` 时把请求 / 错误细节打到 stderr（排障用）。
+/// `CLAUDESKTOP_DEBUG_HTTP=1` 时把请求 / 错误细节打到 stderr（排障用）。
+/// 旧名 `CLAUDEDESKTOP_DEBUG_HTTP` 仍认。
 pub(crate) fn debug_http(make: impl FnOnce() -> String) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var("CLAUDEDESKTOP_DEBUG_HTTP").as_deref() == Ok("1")) {
+    if *ON.get_or_init(|| debug_http_from_env(|k| std::env::var(k).ok())) {
         eprintln!("[http] {}", make());
     }
+}
+
+/// 开关值取自调用方给的环境变量读取函数（便于单测，见 [`debug_http`]）。
+pub(crate) fn debug_http_from_env(var: impl Fn(&str) -> Option<String>) -> bool {
+    var("CLAUDESKTOP_DEBUG_HTTP")
+        .or_else(|| var("CLAUDEDESKTOP_DEBUG_HTTP"))
+        .as_deref()
+        == Some("1")
 }
 
 /// 一条流是怎么结束的。
@@ -1393,6 +1402,30 @@ pub(crate) fn finish_stream(end: SseEnd, finish_reason: bool) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 闭包注入 env：并行单测里 `set_var` 会互相污染（且 Rust 2024 下是 unsafe）。
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn debug_http_accepts_both_env_names() {
+        assert!(debug_http_from_env(fake_env(&[("CLAUDESKTOP_DEBUG_HTTP", "1")])));
+        assert!(debug_http_from_env(fake_env(&[("CLAUDEDESKTOP_DEBUG_HTTP", "1")])));
+        assert!(!debug_http_from_env(fake_env(&[])));
+        assert!(!debug_http_from_env(fake_env(&[("CLAUDESKTOP_DEBUG_HTTP", "0")])));
+    }
+
+    #[test]
+    fn debug_http_prefers_the_new_name_when_both_are_set() {
+        let both = fake_env(&[
+            ("CLAUDESKTOP_DEBUG_HTTP", "0"),
+            ("CLAUDEDESKTOP_DEBUG_HTTP", "1"),
+        ]);
+        assert!(!debug_http_from_env(both), "新名设了就以前者为准");
+    }
 
     #[test]
     fn cloned_messages_share_history_but_temporary_edits_are_isolated() {

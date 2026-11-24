@@ -204,17 +204,21 @@ impl BuiltinConfig {
     /// - `CLAUDESKTOP_BASE_URL`（必填）：端点，如 `http://127.0.0.1:8045/v1`
     /// - `CLAUDESKTOP_MODEL`（必填）：模型 ID
     /// - `CLAUDESKTOP_API_KEY`（可选，其次 `OPENAI_API_KEY`）
-    /// - `CLAUDEDESKTOP_PROTOCOL`（可选，`anthropic` = Anthropic 原生协议）
+    /// - `CLAUDESKTOP_PROTOCOL`（可选，`anthropic` = Anthropic 原生协议；
+    ///   旧名 `CLAUDEDESKTOP_PROTOCOL` 仍认）
     pub fn from_env() -> anyhow::Result<Self> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Self::from_env_with(var)
+    }
+
+    /// 和 [`Self::from_env`] 一样，但环境变量由调用方给：单测里不必 `set_var`
+    /// （并行测试会互相污染，Rust 2024 下 `set_var` 还是 unsafe）。
+    fn from_env_with(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let base_url = var("CLAUDESKTOP_BASE_URL")
             .ok_or_else(|| anyhow::anyhow!("未设置 CLAUDESKTOP_BASE_URL（OpenAI 兼容端点）"))?;
         let model =
             var("CLAUDESKTOP_MODEL").ok_or_else(|| anyhow::anyhow!("未设置 CLAUDESKTOP_MODEL"))?;
-        let protocol = match var("CLAUDEDESKTOP_PROTOCOL").as_deref() {
-            Some("anthropic") => Protocol::Anthropic,
-            _ => Protocol::OpenAiCompat,
-        };
+        let protocol = protocol_from_env(&var);
         let mut config = Self::new(
             ProviderConfig {
                 protocol,
@@ -239,6 +243,18 @@ impl BuiltinConfig {
     /// 夹回允许范围的步数上限（设置文件被手改时也守住）。
     pub fn clamped_max_steps(&self) -> usize {
         self.max_steps.clamp(MIN_MAX_STEPS, MAX_MAX_STEPS)
+    }
+}
+
+/// 协议选择：主读 `CLAUDESKTOP_PROTOCOL`，没设时认旧名 `CLAUDEDESKTOP_PROTOCOL`
+/// （早先文档里就是拼错的这个名字，用户脚本可能还在用）。
+pub(crate) fn protocol_from_env(var: &impl Fn(&str) -> Option<String>) -> Protocol {
+    match var("CLAUDESKTOP_PROTOCOL")
+        .or_else(|| var("CLAUDEDESKTOP_PROTOCOL"))
+        .as_deref()
+    {
+        Some("anthropic") => Protocol::Anthropic,
+        _ => Protocol::OpenAiCompat,
     }
 }
 
@@ -3808,6 +3824,64 @@ impl Kernel for BuiltinKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 环境变量单测一律走闭包注入：并行测试里 `set_var` 会互相污染（且 Rust 2024 下是 unsafe）。
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn protocol_env_prefers_the_new_name() {
+        let env = fake_env(&[("CLAUDESKTOP_PROTOCOL", "anthropic")]);
+        assert_eq!(protocol_from_env(&env), Protocol::Anthropic);
+    }
+
+    #[test]
+    fn protocol_env_still_accepts_the_legacy_name() {
+        let env = fake_env(&[("CLAUDEDESKTOP_PROTOCOL", "anthropic")]);
+        assert_eq!(protocol_from_env(&env), Protocol::Anthropic);
+    }
+
+    #[test]
+    fn protocol_env_falls_back_to_openai_compat() {
+        assert_eq!(protocol_from_env(&fake_env(&[])), Protocol::OpenAiCompat);
+        let other = fake_env(&[("CLAUDESKTOP_PROTOCOL", "whatever")]);
+        assert_eq!(protocol_from_env(&other), Protocol::OpenAiCompat);
+    }
+
+    #[test]
+    fn from_env_reads_the_provider_config() {
+        let config = BuiltinConfig::from_env_with(fake_env(&[
+            ("CLAUDESKTOP_BASE_URL", "http://127.0.0.1:8045/v1"),
+            ("CLAUDESKTOP_MODEL", "demo-model"),
+            ("CLAUDESKTOP_API_KEY", "sk-test"),
+            ("CLAUDESKTOP_PROTOCOL", "anthropic"),
+        ]))
+        .unwrap();
+        assert_eq!(config.provider.protocol, Protocol::Anthropic);
+        assert_eq!(config.provider.base_url, "http://127.0.0.1:8045/v1");
+        assert_eq!(config.provider.model, "demo-model");
+        assert_eq!(config.provider.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn from_env_requires_base_url_and_model() {
+        let only_model = fake_env(&[("CLAUDESKTOP_MODEL", "m")]);
+        assert!(BuiltinConfig::from_env_with(only_model).is_err());
+        let only_url = fake_env(&[("CLAUDESKTOP_BASE_URL", "http://x/v1")]);
+        assert!(BuiltinConfig::from_env_with(only_url).is_err());
+    }
+
+    #[test]
+    fn from_env_treats_a_blank_value_as_unset() {
+        let blank = fake_env(&[
+            ("CLAUDESKTOP_BASE_URL", "http://x/v1"),
+            ("CLAUDESKTOP_MODEL", "   "),
+        ]);
+        assert!(BuiltinConfig::from_env_with(blank).is_err());
+    }
 
     #[derive(Default)]
     struct AuthorizationProbe(Mutex<Vec<String>>);

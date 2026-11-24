@@ -64,7 +64,7 @@ pub struct SearchConfig {
 - **默认值**：`prefer = Brave`、`allow_brave` / `allow_duckduckgo` 都开——和加后端之前的行为一致，
   升级不会悄悄花钱。DeepSeek 要在设置页选了（「也允许 DeepSeek」或「先用」它）才进降级链，
   **配了 key 不算允许**——不然「服务商」里有 DeepSeek 档案的用户，DuckDuckGo 一被限流就开始按次扣费。
-- **key 的取法**（DeepSeek 后端）：数据目录的 `deepseek_key` 文件 / 环境变量 `CLAUDEDESKTOP_DEEPSEEK_KEY`
+- **key 的取法**（DeepSeek 后端）：数据目录的 `deepseek_key` 文件 / 环境变量 `CLAUDESKTOP_DEEPSEEK_KEY`（旧名 `CLAUDEDESKTOP_DEEPSEEK_KEY` 仍认）
   → provider 配置里 DeepSeek 官方端点档案那把（只认 host 是 `api.deepseek.com` 的，`is_deepseek_endpoint`：
   搜索固定发往官方，中转站的 key 发过去用不了，还把凭据交给了别的服务器；`Settings::deepseek_search_key` 在起内核时经
   `ProviderConfig::deepseek_key` → `websearch::set_key_hint` 交过去）。
