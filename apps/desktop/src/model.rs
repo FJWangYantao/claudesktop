@@ -271,8 +271,8 @@ pub fn tool_icon(kind: &str) -> IconAll {
         "delete" => IconAll::Trash,
         "move" => IconAll::ArrowRightLeft,
         "fetch" => IconAll::Globe,
-        "think" => IconAll::Brain,
-        "task" => IconAll::Bot,
+        "think" => IconAll::Sparkles,
+        "task" => IconAll::Layers,
         _ => IconAll::Wrench,
     }
 }
@@ -379,8 +379,8 @@ pub fn turn_files(items: &[ChatItem], offset: usize) -> Vec<TurnFile> {
 /// 读文件按路径去重；只有思考时说「已思考」。
 pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (String, usize) {
     let mut read_args: Vec<&str> = Vec::new();
-    let (mut search, mut exec, mut edit, mut fetch, mut other, mut auto, mut think, mut failed) =
-        (0, 0, 0, 0, 0, 0, 0, 0);
+    let (mut search, mut exec, mut edit, mut fetch, mut other, mut think, mut failed) =
+        (0, 0, 0, 0, 0, 0, 0);
     let mut tasks = 0;
     // 思考总用时；有一段不知道（旧日志）就整体不报
     let mut think_ms = Some(0);
@@ -404,7 +404,6 @@ pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (Stri
                     _ => other += 1,
                 }
             }
-            ChatItem::AutoApproved { .. } => auto += 1,
             ChatItem::Thinking { elapsed_ms, .. } => {
                 think += 1;
                 think_ms = think_ms.zip(*elapsed_ms).map(|(a, b)| a + b);
@@ -425,13 +424,20 @@ pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (Stri
     push(edit, format!("编辑 {edit} 次"));
     push(fetch, format!("访问网页 {fetch} 次"));
     push(other, format!("调用工具 {other} 次"));
-    push(auto, format!("自动批准 {auto} 次"));
-    if parts.is_empty() && think > 0 {
-        parts.push(match (think, think_ms) {
-            (1, ms) => thought_label(ms),
-            (n, Some(ms)) => format!("思考 {n} 次，共 {}", duration_label(ms)),
-            (n, None) => format!("已思考 {n} 次"),
-        });
+    if parts.is_empty() {
+        if think > 0 {
+            parts.push(match (think, think_ms) {
+                (1, ms) => thought_label(ms),
+                (n, Some(ms)) => format!("思考 {n} 次，共 {}", duration_label(ms)),
+                (n, None) => format!("已思考 {n} 次"),
+            });
+        }
+    } else if think > 0
+        && let Some(ms) = think_ms
+        && ms >= 1000
+    {
+        // 和工具混在一组时也带上思考时间（「思考 4 秒，读取 2 个文件」）
+        parts.insert(0, format!("思考 {}", duration_label(ms)));
     }
     (parts.join("，"), failed)
 }
@@ -752,14 +758,12 @@ impl ChatItem {
     /// 这一行在某个视图模式下是否显示。摘要模式只留回复、用户消息、权限卡、备注和子任务卡片；
     /// 别的工具调用只在「执行中且带 diff」时留着——那是正等你对着改动决定放不放行的一步。
     pub fn visible_in(&self, view: ViewMode) -> bool {
+        // 自动放行只是过程里的记账，正式视图不占一行；要看细节切「详细」
+        if matches!(self, Self::AutoApproved { .. }) {
+            return view == ViewMode::Verbose;
+        }
         match (view, self) {
-            (
-                ViewMode::Summary,
-                Self::Thinking { .. }
-                | Self::Info { .. }
-                | Self::Plan(_)
-                | Self::AutoApproved { .. },
-            ) => false,
+            (ViewMode::Summary, Self::Thinking { .. } | Self::Info { .. } | Self::Plan(_)) => false,
             (ViewMode::Summary, Self::Tool(c)) => {
                 c.task || c.phase == ToolPhase::Running && !c.diffs.is_empty()
             }
@@ -943,7 +947,8 @@ impl ChatItem {
                 c.name.len(),
                 c.arg.len(),
                 c.result.len(),
-                c.output.len(),
+                // 折叠态只看有没有输出（长度变化不重排）；展开态的长度由 `Session::row_key` 管
+                !c.output.trim().is_empty(),
                 c.content.len(),
                 c.images.len(),
                 c.phase,
@@ -1654,6 +1659,16 @@ mod tests {
         assert_eq!(group_summary(&timed).0, "思考 2 次，共 1 分 15 秒");
         let partly = [thought("想", Some(30_000)), thought("再想", None)];
         assert_eq!(group_summary(&partly).0, "已思考 2 次");
+        // 思考和工具混在一组：思考够 1 秒就排在摘要头上
+        let mixed = [
+            thought("想", Some(4_200)),
+            tool("read", "Read", "a.rs", ToolPhase::Done),
+            tool("read", "Read", "b.rs", ToolPhase::Done),
+        ];
+        assert_eq!(group_summary(&mixed).0, "思考 4 秒，读取 2 个文件");
+        // 不足 1 秒的不占位
+        let brief = [thought("想", Some(400)), tool("read", "Read", "a.rs", ToolPhase::Done)];
+        assert_eq!(group_summary(&brief).0, "读取 1 个文件");
     }
 
     /// 已收尾的一段思考。

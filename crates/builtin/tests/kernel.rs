@@ -1211,10 +1211,10 @@ fn auto_mode_runs_a_command_the_classifier_allows() {
     h.kernel.set_mode(&sid, "auto").unwrap();
     h.kernel.send_prompt(&sid, UserPrompt::text("跑一下测试")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    // 没有权限卡，命令真的跑了
+    // 自动放行保持安静：没有权限卡，也不发「分类器放行」事件
     assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionRequest { .. })), 0);
     assert_eq!(h.tool_status("s1").as_deref(), Some("completed"));
-    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionAuto { .. })), 1);
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::PermissionAuto { .. })), 0);
     // 分类器看到的是用户消息 + 命令，不含助手的解释（第 2 次请求是分类器）
     let sent = body(&bodies, 1)["messages"].to_string();
     assert!(sent.contains("跑一下测试"), "{sent}");
@@ -1265,8 +1265,25 @@ fn auto_mode_denies_what_the_classifier_blocks() {
     let tool = third["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
     assert!(tool.contains("[Data Exfiltration]"), "{tool}");
     assert!(tool.contains("Do not retry"), "{tool}");
-    // 对话里看得到被拦下的一行
-    assert_eq!(h.count(|e| matches!(e, KernelEvent::Notice(n) if n.contains("自动模式拦下"))), 1);
+    // 拦下的结果挂在失败的工具行上，不另发一行 Notice
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Notice(n) if n.contains("自动模式拦下"))), 0);
+    let (summary, body) = h
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|r| match &r.event {
+            KernelEvent::ToolCallUpdated {
+                id, status: Some(status), raw_output, output, ..
+            } if id == "s1" && status == "failed" => {
+                Some((raw_output.clone().unwrap_or_default(), output.clone().unwrap_or_default()))
+            }
+            _ => None,
+        })
+        .expect("failed tool row for s1");
+    assert!(summary.contains("自动模式拦下"), "{summary}");
+    assert!(body.contains("[Data Exfiltration]"), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

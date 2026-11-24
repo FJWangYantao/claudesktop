@@ -186,7 +186,7 @@ impl ChatApp {
         if s.undo.is_none_or(|u| u.exact) {
             return;
         }
-        let Some(item) = (0..s.transcript.len()).rev().find(|&i| s.is_turn_end(i)) else { return };
+        let Some(item) = s.latest_turn_anchor(self.settings.view_mode) else { return };
         let undo = self.review_page(item).ok().and_then(|page| undo_of(&page));
         let active = self.active;
         self.sessions[active].undo = undo;
@@ -364,7 +364,7 @@ impl ChatApp {
         }
         self.activate_session(1, cx);
         let s = self.session();
-        let Some(item) = (0..s.transcript.len()).rev().find(|&i| s.is_turn_end(i)) else { return };
+        let Some(item) = s.latest_turn_anchor(self.settings.view_mode) else { return };
         self.open_review(item, cx);
         let first = |p: &ReviewPage, n: usize| match p.files.get(n).map(|f| &f.state) {
             Some(FileState::Ready { hunks, .. }) => hunks.first().map(|h| h.range),

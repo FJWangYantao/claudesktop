@@ -520,6 +520,12 @@ enum Verdict {
     Partial(tools::KeepHunks),
     /// 拒绝；内容回给模型
     Deny(String),
+    /// 自动模式拦下：`reason` 回给模型并进工具展开输出，`summary` 显示在失败的工具行上。
+    /// 不另发 `Notice`——失败的工具行本身就是用户要看到的那条记录。
+    AutoDeny {
+        reason: String,
+        summary: &'static str,
+    },
 }
 
 /// 用户在权限卡上选了什么：选项 ID，加上（选了按块同意时）放行哪些块。
@@ -1817,6 +1823,7 @@ impl Inner {
                         }
                     }
                     Verdict::Deny(reason) => ToolOutput::fail(reason, "已拒绝"),
+                    Verdict::AutoDeny { reason, summary } => ToolOutput::fail(reason, summary),
                 }
             }
         };
@@ -2033,7 +2040,9 @@ impl Inner {
             // → 分类器。前三个都是省掉一次分类器往返的快路
             MODE_AUTO => {
                 if let Some(reason) = tools::hard_block(action, cwd) {
-                    return Verdict::Deny(reason);
+                    return Verdict::AutoDeny {
+                        reason, summary: "自动模式拦下（硬熔断）"
+                    };
                 }
                 if access == Access::Edit && action.inside(cwd) {
                     return Verdict::Allow;
@@ -2187,21 +2196,24 @@ impl Inner {
         }
         // 连着被拦得太多次：分类器要么缺上下文、要么模型在硬顶，停下来问人
         if let Some(reason) = self.denials_give_up(session) {
-            return Verdict::Deny(reason);
+            return Verdict::AutoDeny { reason, summary: "自动模式已暂停" };
         }
         let messages = self.user_messages(session);
-        let (verdict, note) = self.classify(session, auto, cwd, action, title, &messages, stopped);
+        let verdict = self.classify(session, auto, cwd, action, title, &messages, stopped);
         // 被取消：不算一次拒绝，也不再发事件（取消后不发任何事件）
         if matches!(&verdict, Verdict::Deny(reason) if reason == "cancelled") {
             return verdict;
         }
-        self.note_verdict(session, &verdict, title, &note);
+        self.note_verdict(session, &verdict);
         // 拒绝的理由连同「别换个马甲重试」的说明一起回给模型：它自己决定换路子还是问用户
         match verdict {
             Verdict::Allow => Verdict::Allow,
             // 分类器不按块同意（它只给放行 / 拒绝），按块只有用户在卡片上勾选这一条路
             Verdict::Partial(keep) => Verdict::Partial(keep),
-            Verdict::Deny(reason) => Verdict::Deny(auto::denial_text(&reason)),
+            Verdict::Deny(reason) => Verdict::Deny(reason),
+            Verdict::AutoDeny { reason, summary } => {
+                Verdict::AutoDeny { reason: auto::denial_text(&reason), summary }
+            }
         }
     }
 
@@ -2220,27 +2232,16 @@ impl Inner {
     }
 
     /// 记一次判定结果：放行清零连续计数，拒绝两个计数都加。
-    fn note_verdict(&self, session: &str, verdict: &Verdict, title: &str, note: &str) {
+    /// 放行不发事件（自动模式本来就该安静）；拒绝的结果挂在失败的工具行上。
+    fn note_verdict(&self, session: &str, verdict: &Verdict) {
         let Some(auto) = &self.auto_mode else { return };
         let mut counters = auto.denials.lock().unwrap();
         let d = counters.entry(session.to_string()).or_default();
         match verdict {
-            Verdict::Allow | Verdict::Partial(_) => {
-                d.streak = 0;
-                self.emit(
-                    Some(session),
-                    KernelEvent::PermissionAuto {
-                        title: title.to_string(),
-                        chosen: format!("分类器放行（{note}）"),
-                        tool: None,
-                    },
-                );
-            }
-            Verdict::Deny(reason) => {
+            Verdict::Allow | Verdict::Partial(_) => d.streak = 0,
+            Verdict::Deny(_) | Verdict::AutoDeny { .. } => {
                 d.streak += 1;
                 d.total += 1;
-                // 被拦下的在对话里记一行，用户看得到分类器在做什么
-                self.emit(Some(session), KernelEvent::Notice(format!("自动模式拦下：{reason}")));
             }
         }
     }
@@ -2267,8 +2268,7 @@ impl Inner {
             .unwrap_or_default()
     }
 
-    /// 调一次分类器，返回 (判定, 给人看的一句话)。端点出错、回复解析不出来、被取消：
-    /// 都按拒绝处理。
+    /// 调一次分类器。端点出错、回复解析不出来、被取消：都按拒绝处理。
     #[allow(clippy::too_many_arguments)] // 一次判定要的东西本来就多，拆结构体反而绕
     fn classify(
         &self,
@@ -2279,7 +2279,7 @@ impl Inner {
         title: &str,
         user_messages: &[String],
         stopped: &dyn Fn() -> bool,
-    ) -> (Verdict, String) {
+    ) -> Verdict {
         let system = auto::system_prompt(&auto.config.environment);
         let user = format!(
             "{}\n\n{}",
@@ -2309,26 +2309,25 @@ impl Inner {
             }
         });
         if stopped() {
-            return (Verdict::Deny("cancelled".into()), "已中断".into());
+            return Verdict::Deny("cancelled".into());
         }
         match outcome {
             Ok(_) => match auto::parse(&reply) {
-                Some(auto::Decision::Allow(note)) => (Verdict::Allow, note),
+                Some(auto::Decision::Allow(_)) => Verdict::Allow,
                 Some(auto::Decision::Deny(reason)) => {
-                    let one_line = auto::one_line(&reason);
-                    (Verdict::Deny(reason), one_line)
+                    Verdict::AutoDeny { reason, summary: "自动模式拦下" }
                 }
-                None => (
-                    Verdict::Deny(auto::FAILED.into()),
-                    "分类器的回复解析不出来，已按拒绝处理".into(),
-                ),
+                None => Verdict::AutoDeny {
+                    reason: auto::FAILED.into(),
+                    summary: "自动模式拦下（分类器失败）",
+                },
             },
             Err(err) => {
                 self.emit(None, KernelEvent::Status(format!("分类器请求失败：{err}")));
-                (
-                    Verdict::Deny(auto::FAILED.into()),
-                    format!("分类器请求失败（{err}），已按拒绝处理"),
-                )
+                Verdict::AutoDeny {
+                    reason: auto::FAILED.into(),
+                    summary: "自动模式拦下（分类器失败）",
+                }
             }
         }
     }

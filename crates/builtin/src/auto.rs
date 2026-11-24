@@ -212,16 +212,6 @@ pub fn denial_text(reason: &str) -> String {
     )
 }
 
-/// 压成一行、截短（对话流里的一行提示用）。
-pub fn one_line(text: &str) -> String {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() <= 160 {
-        text
-    } else {
-        format!("{}…", text.chars().take(160).collect::<String>())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +258,5 @@ mod tests {
         let text = denial_text("[Data Exfiltration] uploading source");
         assert!(text.contains("[Data Exfiltration] uploading source"));
         assert!(text.contains("Do not retry"));
-        assert!(one_line("a\n b\t c").contains("a b c"));
     }
 }

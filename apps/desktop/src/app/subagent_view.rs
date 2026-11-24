@@ -65,7 +65,7 @@ fn task_icon(card: &ToolCard, settle: f32) -> AnyElement {
     let icon = match card.phase {
         ToolPhase::Running => return motion::spinner().into_any_element(),
         ToolPhase::Failed => Icon::new(IconAll::CircleX).size_3p5().text_color(rgb(RED)),
-        ToolPhase::Done => Icon::new(IconAll::Bot).size_3p5().text_color(rgb(INK_SOFT)),
+        ToolPhase::Done => Icon::new(IconAll::Layers).size_3p5().text_color(rgb(INK_SOFT)),
     };
     let scale = 0.6 + 0.4 * settle;
     div()
@@ -371,7 +371,7 @@ impl ChatApp {
     ) -> Div {
         let has_text = !text.trim().is_empty();
         let task_id = task.to_string();
-        let header = step_line(Icon::new(IconAll::Brain).size_3p5().text_color(rgb(INK_SOFT)))
+        let header = step_line(Icon::new(IconAll::Sparkles).size_3p5().text_color(rgb(INK_SOFT)))
             .id(("task-think-toggle", k))
             .when(has_text, |d| {
                 d.cursor_pointer().hover(|d| d.text_color(rgb(INK))).on_click(cx.listener(
@@ -426,9 +426,17 @@ impl ChatApp {
     ) -> Div {
         let settle = motion::settle(("task-tool", k), card.phase != ToolPhase::Running, window, cx);
         if !card.diffs.is_empty() {
-            return div().v_flex().gap_2().children(card.diffs.iter().map(|diff| {
-                Self::render_diff(diff, cwd, Some(DIFF_PREVIEW_ROWS), None, Some((card, settle)))
-            }));
+            return div().v_flex().gap_2().children(card.diffs.iter().enumerate().map(
+                |(d, diff)| {
+                    Self::render_diff(
+                        diff,
+                        cwd,
+                        Some(DIFF_PREVIEW_ROWS),
+                        None,
+                        Some((100_000 + k * 8 + d, card, settle)),
+                    )
+                },
+            ));
         }
         let has_output = card.can_open();
         let task_id = task.to_string();
@@ -464,7 +472,12 @@ impl ChatApp {
         let progress =
             motion::reveal_progress(("task-tool", k), has_output && card.expanded, window, cx);
         if progress > 0. && has_output {
-            col = col.child(Reveal::new(("task-tool-body", k), progress, self.tool_output(card)));
+            col = col.child(Reveal::new(
+                ("task-tool-body", k),
+                progress,
+                // 详情页的下标空间和对话错开，复制状态按 100_000 + k 记
+                self.tool_output(100_000 + k, card, window, cx),
+            ));
         }
         col
     }
