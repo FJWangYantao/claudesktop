@@ -66,14 +66,13 @@ pub fn fetch_models(config: ProviderConfig) -> anyhow::Result<Vec<ModelInfo>> {
     make_provider(&config).list_models()
 }
 
-/// 按配置里的协议构造 provider。
-/// 只留最近 [`MAX_USER_MESSAGES_KEPT`] 条用户消息。
-fn recent_user_messages(mut messages: Vec<String>) -> Vec<String> {
-    let extra = messages.len().saturating_sub(MAX_USER_MESSAGES_KEPT);
-    messages.drain(..extra);
-    messages
+/// 只留最近 [`MAX_USER_INPUTS_KEPT`] 条用户输入。
+fn trim_user_inputs(inputs: &mut Vec<auto::UserInput>) {
+    let extra = inputs.len().saturating_sub(MAX_USER_INPUTS_KEPT);
+    inputs.drain(..extra);
 }
 
+/// 按配置里的协议构造 provider。
 fn make_provider(config: &ProviderConfig) -> std::sync::Arc<dyn ChatProvider> {
     match config.protocol {
         Protocol::OpenAiCompat => std::sync::Arc::new(OpenAiProvider::new(config.clone())),
@@ -108,8 +107,8 @@ pub const MAX_MAX_STEPS: usize = 5_000;
 pub const AUTO_COMPACT_PERCENT: u64 = compact::AUTO_COMPACT_PERCENT;
 /// 同一步里最多同时执行几个只读工具
 const PARALLEL_TOOLS: usize = 8;
-/// 自动模式的会话里最多记住多少条用户消息（分类器据此判断授权）
-const MAX_USER_MESSAGES_KEPT: usize = 50;
+/// 自动模式的会话里最多记住多少条用户输入（分类器据此判断授权）
+const MAX_USER_INPUTS_KEPT: usize = 50;
 /// 自动模式：连着被拦这么多次就停下来问人（Claude Code 的阈值）
 const MAX_DENIAL_STREAK: u32 = 3;
 /// 自动模式：一个会话累计被拦这么多次也停下来
@@ -319,10 +318,8 @@ struct SessionState {
     memory_shown: Vec<String>,
     /// 这一轮到目前为止带进过上下文的条目 id（`used_ms` 据此更新，只在写盘时落下去）
     memory_used: Vec<String>,
-    /// 用户说过的话（从早到晚，最近 50 条）：自动模式的分类器据此判断用户授权了什么。
-    /// 只有用户的话，没有助手的话和工具结果——那是 Claude Code 的做法，避免助手把自己说服过去、
-    /// 也避免工具结果里的注入内容影响判定
-    user_messages: Vec<String>,
+    /// 用户消息和提交的提问答案（从早到晚，最近 50 条），供自动模式判断授权。
+    user_inputs: Vec<auto::UserInput>,
     /// 当前的待办清单（`todo_write` 最后一次写的）：提醒和压缩摘要要用
     todos: Vec<PlanEntryView>,
     /// 上次写清单之后又走了几步（每步一次请求）：到 `TODO_REMIND_STEPS` 提醒一次
@@ -956,9 +953,8 @@ impl Inner {
             parts.push(ContentPart::Image { media_type: image.media_type, data: image.data });
         }
         state.history.push(ChatMessage::with_parts("user", parts));
-        state.user_messages.push(text);
-        let messages = std::mem::take(&mut state.user_messages);
-        state.user_messages = recent_user_messages(messages);
+        state.user_inputs.push(auto::UserInput::Message(text));
+        trim_user_inputs(&mut state.user_inputs);
         Some(warnings)
     }
 
@@ -1940,7 +1936,7 @@ impl Inner {
                     memory_shown: parent.memory_shown.clone(),
                     memory_used: Vec::new(),
                     // 子会话的分类器判定同样要看用户说过的话
-                    user_messages: parent.user_messages.clone(),
+                    user_inputs: parent.user_inputs.clone(),
                     // 子会话没有待办清单
                     todos: Vec::new(),
                     steps_since_todo: 0,
@@ -2200,8 +2196,8 @@ impl Inner {
         if let Some(reason) = self.denials_give_up(session) {
             return Verdict::AutoDeny { reason, summary: "自动模式已暂停" };
         }
-        let messages = self.user_messages(session);
-        let verdict = self.classify(session, auto, cwd, action, title, &messages, stopped);
+        let inputs = self.user_inputs(session);
+        let verdict = self.classify(session, auto, cwd, action, title, &inputs, stopped);
         // 被取消：不算一次拒绝，也不再发事件（取消后不发任何事件）
         if matches!(&verdict, Verdict::Deny(reason) if reason == "cancelled") {
             return verdict;
@@ -2248,7 +2244,7 @@ impl Inner {
         }
     }
 
-    /// 用户发了新消息：连续拒绝清零；累计到了上限、已经停下来问过人的，也重新计数。
+    /// 用户发了消息或提交了答案：连续拒绝清零；累计到了上限时也重新计数。
     /// 否则一旦暂停，分类器再也不会被调用（放行才清零，而暂停时根本不判）。
     fn reset_denials(&self, session: &str) {
         let Some(auto) = &self.auto_mode else { return };
@@ -2260,13 +2256,13 @@ impl Inner {
         }
     }
 
-    /// 会话里用户说过的话（分类器的输入之一）。
-    fn user_messages(&self, session: &str) -> Vec<String> {
+    /// 会话里用户发的消息和提交的答案（分类器的输入之一）。
+    fn user_inputs(&self, session: &str) -> Vec<auto::UserInput> {
         self.sessions
             .lock()
             .unwrap()
             .get(session)
-            .map(|s| s.user_messages.clone())
+            .map(|s| s.user_inputs.clone())
             .unwrap_or_default()
     }
 
@@ -2279,13 +2275,13 @@ impl Inner {
         cwd: &Path,
         action: &Action,
         title: &str,
-        user_messages: &[String],
+        user_inputs: &[auto::UserInput],
         stopped: &dyn Fn() -> bool,
     ) -> Verdict {
         let system = auto::system_prompt(&auto.config.environment);
         let user = format!(
             "{}\n\n{}",
-            auto::user_section(user_messages),
+            auto::user_section(user_inputs),
             auto::action_section(title, action, cwd)
         );
         let messages = vec![ChatMessage::new("system", system), ChatMessage::new("user", user)];
@@ -2403,6 +2399,13 @@ impl Inner {
                 }
             }
         };
+        if let Some(input) = auto::UserInput::question_answer(&questions, &answer) {
+            if let Some(state) = self.sessions.lock().unwrap().get_mut(session) {
+                state.user_inputs.push(input);
+                trim_user_inputs(&mut state.user_inputs);
+            }
+            self.reset_denials(session);
+        }
         let (content, summary) = tools::question_result(&questions, &answer);
         match answer {
             QuestionAnswer::Choices { .. } | QuestionAnswer::Form { .. } => {
@@ -2627,8 +2630,7 @@ impl BuiltinKernel {
             memory_global: Vec::new(),
             memory_shown: Vec::new(),
             memory_used: Vec::new(),
-            // 续接的会话从日志里找回用户说过的话，否则分类器以为用户什么都没授权
-            user_messages: recent_user_messages(history.user_messages),
+            user_inputs: history.user_inputs,
             // 续接的会话接着用日志里最后那份清单
             todos: history.todos,
             steps_since_todo: 0,
@@ -3605,10 +3607,9 @@ impl Kernel for BuiltinKernel {
     fn resolve_question(&self, request_id: u64, answer: QuestionAnswer) -> anyhow::Result<()> {
         let tx = self.inner.pending.lock().unwrap().remove(&request_id);
         match tx {
-            Some(tx) => {
-                let _ = tx.send(Reply::Question(answer));
-                Ok(())
-            }
+            Some(tx) => tx
+                .send(Reply::Question(answer))
+                .map_err(|_| anyhow::anyhow!("提问 {request_id} 已失效")),
             None => anyhow::bail!("提问 {request_id} 已失效"),
         }
     }
@@ -3695,8 +3696,8 @@ impl Kernel for BuiltinKernel {
         }
         state.history = rebuilt.messages;
         state.summary = rebuilt.summary;
-        // 撤回的消息里的授权跟着作废
-        state.user_messages = recent_user_messages(rebuilt.user_messages);
+        // 撤回的消息和答案里的授权跟着作废
+        state.user_inputs = rebuilt.user_inputs;
         // 清单回到回退点那时的样子
         state.todos = rebuilt.todos;
         // 回退掉的轮次里 `tool_search` 加载的工具也撤掉，和重启后续接看到的一致
@@ -3807,6 +3808,131 @@ impl Kernel for BuiltinKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct AuthorizationProbe(Mutex<Vec<String>>);
+
+    impl ChatProvider for AuthorizationProbe {
+        fn stream_chat(
+            &self,
+            _: &str,
+            messages: &[ChatMessage],
+            _: &[ToolSpec],
+            _: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(StreamEvent),
+        ) -> anyhow::Result<provider::StreamOutcome> {
+            let input = messages[1].text().unwrap();
+            let verdict = if input.contains("Only run echo confirmed") {
+                r#"{"decision":"allow","reason":"confirmed action"}"#
+            } else {
+                r#"{"decision":"deny","reason":"[Scope] missing confirmation"}"#
+            };
+            self.0.lock().unwrap().push(input);
+            on_event(StreamEvent::Text(verdict.into()));
+            Ok(provider::StreamOutcome { completed: true, ..Default::default() })
+        }
+
+        fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn auto_mode_classifies_with_question_answers_live_and_after_resume() {
+        let cwd = std::env::temp_dir();
+        let mut provider = ProviderConfig { model: "test-classifier".into(), ..Default::default() };
+        provider.params.thinking = suggest::short_thinking(provider.protocol, &provider.model);
+        let mut config = BuiltinConfig::new(provider.clone(), cwd.clone());
+        config.auto_mode =
+            Some(AutoModeConfig { model: Some(provider.clone()), ..Default::default() });
+        config.rules_path = None;
+        config.user_instructions = None;
+        config.mcp_config = None;
+        config.memory_path = None;
+        config.hibernation_dir = None;
+        let (tx, rx) = mpsc::channel();
+        let kernel = BuiltinKernel::spawn(
+            config,
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        )
+        .unwrap();
+        let next = |pred: fn(&KernelEvent) -> bool| loop {
+            let record = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if pred(&record.event) {
+                break record;
+            }
+        };
+        let inner = &kernel.inner;
+        let probe = Arc::new(AuthorizationProbe::default());
+        *inner.auto_mode.as_ref().unwrap().provider.lock().unwrap() =
+            Some((provider, probe.clone()));
+
+        let mut records = vec![Record::user("What could we run?")];
+        let resume = |records: &[Record]| {
+            kernel.resume_session(1, "old", SessionSpec::code(Some(cwd.clone())), records).unwrap();
+            let sid = next(|e| matches!(e, KernelEvent::Started { .. })).session.unwrap();
+            kernel.set_mode(&sid, MODE_AUTO).unwrap();
+            sid
+        };
+        let sid = resume(&records);
+        let action = Action::Shell {
+            command: "echo confirmed".into(),
+            timeout: Duration::from_secs(1),
+            cwd: cwd.clone(),
+        };
+        let authorize = |sid: &str| inner.authorize(sid, &cwd, &action, "Shell", "s1", &|| false);
+        for _ in 0..MAX_DENIAL_STREAK {
+            assert!(matches!(authorize(&sid), Verdict::AutoDeny { .. }));
+        }
+        assert!(inner.denials_give_up(&sid).is_some());
+        assert!(probe.0.lock().unwrap().iter().all(|input| !input.contains("ask_user answer")));
+
+        let answer = QuestionAnswer::Choices { choices: vec![0] };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let asked = std::thread::scope(|scope| {
+            let pending = scope.spawn(|| {
+                inner.ask_user(
+                    &sid,
+                    r#"{"questions":[{
+                "question":"Which command?",
+                "options":[{"label":"Run it","description":"Only run echo confirmed"},
+                           {"label":"Unselected command"}]
+            }]}"#,
+                    &|| std::time::Instant::now() >= deadline,
+                )
+            });
+            let asked = next(|e| matches!(e, KernelEvent::UserQuestion { .. })).event;
+            let KernelEvent::UserQuestion { id, .. } = asked else { unreachable!() };
+            kernel.resolve_question(id, answer.clone()).unwrap();
+            assert!(pending.join().unwrap().ok);
+            asked
+        });
+        assert!(matches!(authorize(&sid), Verdict::Allow));
+        let live = probe.0.lock().unwrap().last().unwrap().clone();
+        assert!(live.contains("[ask_user answer 2]") && live.contains("Which command?"), "{live}");
+        assert!(
+            !live.contains("Unselected command") && !live.contains("missing confirmation"),
+            "{live}"
+        );
+
+        let KernelEvent::UserQuestion { id, .. } = asked else { unreachable!() };
+        records.extend([Record::Event { event: asked }, Record::QuestionAnswered { id, answer }]);
+        let resumed = resume(&records);
+        assert!(matches!(authorize(&resumed), Verdict::Allow));
+        assert_eq!(probe.0.lock().unwrap().last().unwrap(), &live);
+
+        records.push(Record::Rewind {
+            turn: 0,
+            conversation: true,
+            files: 0,
+            prompt: String::new(),
+        });
+        kernel.rewind(&resumed, &records).unwrap();
+        assert!(matches!(authorize(&resumed), Verdict::AutoDeny { .. }));
+        assert!(!probe.0.lock().unwrap().last().unwrap().contains("ask_user answer"));
+    }
 
     /// 骨架阶段的分节重构必须逐字节等于原来的拼法：节之间用空行连起来，每节自身不带
     /// 前导 / 尾随空行，所以拼回去不会多出或吃掉空行（见 `prompt_sections`）。

@@ -9,6 +9,7 @@
 //! 一轮中间的自动压缩保留这一轮，空闲时的手动压缩全部丢掉（规则同 `compact` 模块）。
 
 use crate::ChatMessage;
+use crate::auto::UserInput;
 use crate::provider::ContentPart;
 use claudesktop_core::{KernelEvent, PlanEntryView, QuestionAnswer, QuestionView, Record};
 
@@ -77,8 +78,8 @@ pub struct Rebuilt {
     pub summary: Option<String>,
     /// 对话历史（不含系统提示词和摘要）
     pub messages: Vec<ChatMessage>,
-    /// 用户说过的话（从早到晚，回退掉的不算；压缩前的也留着）：「自动」模式的分类器据此判断授权
-    pub user_messages: Vec<String>,
+    /// 分类器看的用户消息和答案。聊天压缩前的输入也可保留，回退撤销的输入剔除。
+    pub user_inputs: Vec<UserInput>,
     /// 最后一次的待办清单（回退掉的不算；压缩前写的也算）
     pub todos: Vec<PlanEntryView>,
     /// 内核通过 `tool_search` 额外声明给模型的工具（见 `Record::ToolLoadout`；回退掉的不算）。
@@ -90,7 +91,7 @@ pub struct Rebuilt {
 pub fn rebuild(records: &[Record]) -> Rebuilt {
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut summary = None;
-    let mut user_messages = Vec::new();
+    let mut user_inputs = Vec::new();
     let mut todos = Vec::new();
     let mut loaded_tools: Vec<String> = Vec::new();
     // 提问的 id → 问了什么（`QuestionAnswered` 只记选了几号，摘要要回到这里拿）
@@ -102,9 +103,10 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
         match record {
             Record::User { text, images, sent } => {
                 messages.extend(assistant.take());
+                questions.clear();
                 // 插件命令展开过的，模型当时看到的是展开后的全文
                 messages.push(user_message(sent.as_deref().unwrap_or(text), images));
-                user_messages.push(sent.as_deref().unwrap_or(text).to_string());
+                user_inputs.push(UserInput::Message(sent.as_deref().unwrap_or(text).to_string()));
                 in_turn = true;
             }
             Record::Event { event } => match event {
@@ -185,8 +187,13 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
             },
             Record::QuestionAnswered { id, answer } => {
                 let key = format!("ask_user/{id}");
-                let summary = match questions.get(id) {
-                    Some(asked) => crate::tools::question_result(asked, answer).1,
+                let summary = match questions.remove(id) {
+                    Some(asked) => {
+                        if let Some(input) = UserInput::question_answer(&asked, answer) {
+                            user_inputs.push(input);
+                        }
+                        crate::tools::question_result(&asked, answer).1
+                    }
                     None => "问了一下".to_string(),
                 };
                 if let Some((_, status, output)) = assistant.tool(&key) {
@@ -216,7 +223,8 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
         }
     }
     messages.extend(assistant.take());
-    Rebuilt { summary, messages: trim(messages), user_messages, todos, loaded_tools }
+    crate::trim_user_inputs(&mut user_inputs);
+    Rebuilt { summary, messages: trim(messages), user_inputs, todos, loaded_tools }
 }
 
 /// 超出上限时从最早的轮次丢，并保证从一条用户消息开始。
