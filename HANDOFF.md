@@ -5,6 +5,10 @@
 
 ## 构建 / 测试
 
+- **本机 cargo 在 `D:\dev\cargo\bin`，不在 PATH 里**（2026-11-25）：`cargo`/`rustfmt` 直接敲会报「无法将 cargo 项识别为 cmdlet」。先 `$env:Path="D:\dev\cargo\bin;$env:Path"` 再构建；目标目录固定 `$env:CARGO_TARGET_DIR="D:/t3"`，否则 `ring` 在项目内 `target` 下报 D8050。
+- **桌面端没有 lib target**：`cargo test -p claudesktop --lib` 报 "no library targets found"，单测入口是 `cargo test -p claudesktop --bin claudesktop`。
+- **PowerShell 的 `>` 重定向会写坏 UTF-8 源码**（2026-11-25）：`git show HEAD:file > out.rs` 之后的文件是 UTF-16 且带 BOM，粘回仓库会让整个文件变成二进制 diff。要还原被自己改过的文件用 `git restore --source=HEAD --worktree -- <path>`；读带中文的文件用 `[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8)`，`Get-Content` 默认按 GBK 解码会出乱码。
+- **`**加粗链接**` 星号外露在 2026-11-14 的 vendor/markdown 补丁里已经修好**（2026-11-25 复核）：用探针把 12 组 `**http://…**` 写法在有 / 无补丁下对比，输出完全一致；真正还漏网的是 `close_dangling_markup` 按单个反引号数奇偶配对行内代码（双反引号里夹单反引号时把代码里的 `**` 当成粗体标记），改用同长反引号串配对后修好。
 - **D 盘满时可复用 Release 缓存换盘续编**（2026-11-25）：`gpui-component` 写 `.rlib` 报 Windows 错误 112 后，用 `robocopy /E /COPY:DAT /DCOPY:DAT` 把 `target/release` 复制到可写临时目录的 `release` 子目录（跳过锁文件、`*.rcgu.o` 和旧的桌面 exe / PDB），再用 `cargo build --release -p claudesktop --locked --offline --target-dir <临时目录>`。本次复用了已编好的依赖，普通 Release 构建通过，旧的 `target/release/claudesktop.exe` 仍是上一次的产物。
 - **`CLAUDESKTOP_STRESS` 报完统计不会自己退出**（2026-11-24）：busy 模式 5 秒后 `stress_report()` 打完就留在前台（只有 `CLAUDESKTOP_STRESS_SESSIONS` 那条会定时退出）。脚本里跑要设 `CLAUDESKTOP_STRESS_OUT=<文件>`（默认写 stderr），`Start-Process -PassThru` 起进程、等够时间再 `Stop-Process`，否则管道一直挂着看不到结果。同一台机器上还开着正式实例时数字会被抢 CPU，最好先关。
 - **Windows SDK 的 Lib / Include 曾被掏空，`setup.exe modify --add` 不修**（2026-11-24，已修复）：现象是编译卡在 `LNK1181 无法打开输入文件 kernel32.lib`，`C:\Program Files (x86)\Windows Kits\10\` 只剩 `bin` / `Redist` / `DesignTime`。此时 `vswhere -requires Microsoft.VisualStudio.Component.Windows11SDK.26100` 仍返回安装路径，`modify --add` 6 秒退出 0（组件登记着，MSI 的 `Lib`/`Include` 文件没了）。正确做法是跑 `setup.exe repair --installPath ...\2022\BuildTools --quiet --norestart`：它会先自更新 installer，再在后台进程里重装缺的 MSI；父进程立刻返回，要以 `Get-Process setup` 是否退出为准。修复后 `Windows Kits\10\Lib\10.0.26100.0\um\x64\kernel32.lib` 回来，`cargo check` 通过。
