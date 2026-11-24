@@ -213,7 +213,9 @@ impl BuiltinConfig {
 
     /// 和 [`Self::from_env`] 一样，但环境变量由调用方给：单测里不必 `set_var`
     /// （并行测试会互相污染，Rust 2024 下 `set_var` 还是 unsafe）。
+    /// 空白值当没设——注意这个过滤在这里做，`from_env` 的闭包只负责读原始值。
     fn from_env_with(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let var = |k: &str| var(k).filter(|v| !v.trim().is_empty());
         let base_url = var("CLAUDESKTOP_BASE_URL")
             .ok_or_else(|| anyhow::anyhow!("未设置 CLAUDESKTOP_BASE_URL（OpenAI 兼容端点）"))?;
         let model =
@@ -249,10 +251,7 @@ impl BuiltinConfig {
 /// 协议选择：主读 `CLAUDESKTOP_PROTOCOL`，没设时认旧名 `CLAUDEDESKTOP_PROTOCOL`
 /// （早先文档里就是拼错的这个名字，用户脚本可能还在用）。
 pub(crate) fn protocol_from_env(var: &impl Fn(&str) -> Option<String>) -> Protocol {
-    match var("CLAUDESKTOP_PROTOCOL")
-        .or_else(|| var("CLAUDEDESKTOP_PROTOCOL"))
-        .as_deref()
-    {
+    match var("CLAUDESKTOP_PROTOCOL").or_else(|| var("CLAUDEDESKTOP_PROTOCOL")).as_deref() {
         Some("anthropic") => Protocol::Anthropic,
         _ => Protocol::OpenAiCompat,
     }
@@ -3876,10 +3875,8 @@ mod tests {
 
     #[test]
     fn from_env_treats_a_blank_value_as_unset() {
-        let blank = fake_env(&[
-            ("CLAUDESKTOP_BASE_URL", "http://x/v1"),
-            ("CLAUDESKTOP_MODEL", "   "),
-        ]);
+        let blank =
+            fake_env(&[("CLAUDESKTOP_BASE_URL", "http://x/v1"), ("CLAUDESKTOP_MODEL", "   ")]);
         assert!(BuiltinConfig::from_env_with(blank).is_err());
     }
 

@@ -1,0 +1,29 @@
+# 换行符固定：源码 / 文档一律 LF，Windows 批处理一律 CRLF。
+# 不写这条时 git 按 core.autocrlf 决定，跨机器提交会整文件翻写（见 HANDOFF.md）。
+* text=auto
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.lock  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.glsl  text eol=lf
+
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# .ps1 保持原样：PowerShell 5.1 没有 UTF-8 BOM 时按 GBK 解码中文会吃掉后续引号，
+# 让 git 去改换行 / 编码只会把 BOM 弄丢（HANDOFF.md）。
+*.ps1   -text
+
+# 二进制产物不参与换行转换
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.svg   text eol=lf
+*.woff2 binary
+*.dll   binary
+*.exe   binary
