@@ -48,5 +48,7 @@ smol = "2"
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+# 打过补丁的 gpui-base：长 Markdown 表格按外层视口虚拟化（vendor/gpui-base）
+gpui-base = { path = "vendor/gpui-base" }
 # 打过补丁的 markdown：GFM 自动链接遇全角标点收尾（vendor/markdown）
 markdown = { path = "vendor/markdown" }

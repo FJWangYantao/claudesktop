@@ -3,6 +3,16 @@
 经根 `Cargo.toml` 的 `[patch.crates-io]` 替换 crates.io 上的同名版本。工作区 `exclude` 了本目录，
 `cargo test --workspace` / clippy 不会跑到这里。
 
+## gpui-base 0.7.3
+
+gpui-kit 0.7.3 的基础组件层（Markdown 的 `TextView`、表格、列表都在这里）。拷自 crates.io 发布包，
+删了 `.cargo-ok` / `.cargo_vcs_info.json` / `Cargo.toml.orig` / `benches/` / `tests/`，并把清单里
+对应的 `[[test]]` / `[[bench]]` 条目一并去掉，否则 `cargo` 会去找不存在的文件。
+
+**当前为零改动拷贝**：只为了让后续的表格虚拟化有个能改的落点（`src/text/node.rs` 的
+`render_table` / `render_table_rows`）。改这里之前先确认真的必须改 gpui-base——它是全项目最重的
+依赖，打补丁后每次升级 gpui-kit 都要重打。
+
 ## gpui-pre 0.3.9
 
 gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发布包，只删了清单里的
