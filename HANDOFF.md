@@ -7,6 +7,7 @@
 
 - **本机 cargo 在 `D:\dev\cargo\bin`，不在 PATH 里**（2026-11-25）：`cargo`/`rustfmt` 直接敲会报「无法将 cargo 项识别为 cmdlet」。先 `$env:Path="D:\dev\cargo\bin;$env:Path"` 再构建；目标目录固定 `$env:CARGO_TARGET_DIR="D:/t3"`，否则 `ring` 在项目内 `target` 下报 D8050。
 - **桌面端没有 lib target**：`cargo test -p claudesktop --lib` 报 "no library targets found"，单测入口是 `cargo test -p claudesktop --bin claudesktop`。
+- **`Get-Content -Raw | Set-Content` 往返会永久损坏 UTF-8 源码**（2026-11-25）：PowerShell 5.1 的 `Get-Content` 默认按 ANSI / GBK（CP936）解码，中文变乱码；GBK 解不开的字节被替换成 `?` 并吞掉后一个字节（`— ` 变 `鈥?`），再写回 UTF-8 就丢了原文。本轮对 `vendor/gpui-base/src/text/node.rs` 做 `-replace` 时中招，编译报 `unknown start of token: \u{e15f}`。改源码一律用 Edit / Write 工具；非要用脚本就先 `[IO.File]::ReadAllText($p,[Text.UTF8Encoding]::new($false,$true))`。抢救办法：按 CP936 把乱码还原回字节，再把每处 `?` 用 `git show HEAD:file` 的上下文补齐（脚本留在 `D:/t3/repair_node.py` 可参考）。
 - **PowerShell 的 `>` 重定向会写坏 UTF-8 源码**（2026-11-25）：`git show HEAD:file > out.rs` 之后的文件是 UTF-16 且带 BOM，粘回仓库会让整个文件变成二进制 diff。要还原被自己改过的文件用 `git restore --source=HEAD --worktree -- <path>`；读带中文的文件用 `[IO.File]::ReadAllText($p,[Text.Encoding]::UTF8)`，`Get-Content` 默认按 GBK 解码会出乱码。
 - **`**加粗链接**` 星号外露在 2026-11-14 的 vendor/markdown 补丁里已经修好**（2026-11-25 复核）：用探针把 12 组 `**http://…**` 写法在有 / 无补丁下对比，输出完全一致；真正还漏网的是 `close_dangling_markup` 按单个反引号数奇偶配对行内代码（双反引号里夹单反引号时把代码里的 `**` 当成粗体标记），改用同长反引号串配对后修好。
 - **D 盘满时可复用 Release 缓存换盘续编**（2026-11-25）：`gpui-component` 写 `.rlib` 报 Windows 错误 112 后，用 `robocopy /E /COPY:DAT /DCOPY:DAT` 把 `target/release` 复制到可写临时目录的 `release` 子目录（跳过锁文件、`*.rcgu.o` 和旧的桌面 exe / PDB），再用 `cargo build --release -p claudesktop --locked --offline --target-dir <临时目录>`。本次复用了已编好的依赖，普通 Release 构建通过，旧的 `target/release/claudesktop.exe` 仍是上一次的产物。
@@ -82,6 +83,18 @@
   项目内新建 `target/compact-verify` 仍会在同一步失败（2026-11-13），仅换子目录不够。
   或删 `target/debug/build/ring-*` 后换新目录。别再顺着 cc-rs / vcvars / CFLAGS 排查——
   那条路本机已全部证伪（INCLUDE/LIB/并发内存都不是原因）。
+- **拆模块时的三个必踩点**（2026-11-25，session / settings_view / builtin tools 大拆分）：
+  ① 父模块 `pub(crate) use child::*;` 再接子模块 `use super::*;` 是循环 glob，rustc 不保证链式可见——
+  兄弟模块之间直接写 `use super::files::*;`，被共享的项改 `pub(super)`；凡是原来 `pub(super)`
+  的方法搬进子模块后含义会缩成「仅 settings_view 内可见」，外层 `app::keys` 调用的要升成 `pub(crate)`。
+  ② 用「方法名 + 大括号计数」切函数会提前收尾（字符串 / 注释里有 `}`），按顶层 items 或方法边界切；
+  ③ 切分点落在 `///` 注释和下一项之间会留下「empty line after doc comment」的孤儿注释，clippy 必报——
+  文档注释要跟着函数一起搬。新增自由函数若在子模块里被 `impl` 块后插入，记得先闭合 `impl`。
+- **`core.autocrlf=true` + `.gitattributes eol=lf` 下批量改 EOL 后 `git status` 会残留假脏**（2026-11-25）：
+  工作区的 CRLF 一次性转成 LF 后，200 多个文件显示 ` M`，但 `git diff` / `git diff-files` 的 blob 哈希完全一致，
+  `git update-index --refresh` 也清不掉（只对确认无改动的单个文件 `git checkout -- <path>` 才恢复）。
+  **判断改动一律以 `git diff` 为准，不要被 status 的 M 数吓到**；正常编辑源码不需要手动转 EOL，
+  git 提交时会按 `eol=lf` 归一，脚本批量改写时才要自己写 LF（见上一条 —— 全程用 Edit/Write）。
 
 ## UI / gpui
 
@@ -404,8 +417,6 @@
   **新的 chip 里放长度不由我们定的文字（项目名 / 模型名 / 分支名）时记得 `.shrink()`。**
 
 ## 内核 / 工具
-
-- **`ask_user` 确认要进入自动分类器的上下文**（2026-11-25）。此前主模型收到了工具返回的答案，分类器只读对话消息，用户点了同意后仍会被拦。实时应答和日志重放共用 `auto::UserInput::question_answer`，只提交选中的答案及其题目和描述。沙箱内回环 HTTP 测试报 Windows 10013，可用 `cargo test -p claudesktop-builtin --lib auto`，进程内模拟分类器会检查当前回合、续接和回退的请求内容。
 
 - **提示词里禁止「工具前旁白」会把阶段汇报也一起压掉**（2026-11-24）：10-23 的提速改动加了「don't narrate what you are about to do before a tool call」，
   同一模型在重度轮次里的中间汇报从每轮 8.4 次掉到 1.0 次，93% 的中间请求正文为空，最长连续 33 分钟不出声。

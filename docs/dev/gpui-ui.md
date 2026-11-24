@@ -11,9 +11,16 @@
 Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模块。
 
 视觉与交互的取舍依据（色彩 / 圆角 / 层级 / 文案 / 反模式）见
-[设计指南-Claude风格UI.md](../设计指南-Claude风格UI.md)，第七章是对照本项目的落地清单。
+[设计指南-Claude风格UI.md](../design/设计指南-Claude风格UI.md)，第七章是对照本项目的落地清单。
 哪些网页上的 CSS 手法能搬进 gpui、怎么换算、哪些根本做不到，见
-[调研报告-Claude前端CSS手法对照.md](../调研报告-Claude前端CSS手法对照.md)。
+[调研报告-Claude前端CSS手法对照.md](../archive/调研报告-Claude前端CSS手法对照.md)。
+
+模块位置：`session/` 下 `wheel.rs` 是滚轮曲线（欠量积分 / 视觉节拍，带纯时间单测），
+`layout.rs` 是行划分、分组、估高与测量指纹，`replay.rs` 是历史记录重放与内核事件投影；
+`app/settings_view/` 的 `kernel.rs` / `model.rs` / `provider.rs` 是三类分栏的绘制，
+`general.rs` / `rules.rs` / `web_search.rs` 是通用、规则、联网搜索三栏，`lifecycle.rs` 管设置页开合、
+外观生效与 Magpie 引导，`form.rs` 管表单读写与模型 / 服务商管理，`debug.rs` 是无头调试入口；
+`mod.rs` 只留设置表单状态、分栏调度与总渲染。
 
 ### 已沉淀的封装与惯例
 

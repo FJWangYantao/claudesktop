@@ -3,6 +3,13 @@
 > 本文件从根 `AGENTS.md` 拆出（2026-11）。改 `crates/builtin/**`、`crates/core/**`
 > 的内核侧逻辑前先读这里。条目逐字搬过来，只在根文件做索引。
 
+模块位置：`builtin/src/lib.rs` 只剩内核装配、事件分发与审批编排；`prompt.rs` 组装系统提示词
+（分节、稳定前缀 / 易变尾巴），`runner.rs` 是一次运行的工具循环（提示词进场、并行工具、steer、
+压缩、收尾），`dispatch.rs` 是工具调用分发（路由、并行、检查点、子任务），`approval.rs` 是审批判定
+（规则命中、自动模式分类器、拒绝计数、提问），`tools/` 目录里 `mod.rs` 是工具类型、schema、
+待办 / 提问 / 记忆 / 搜索参数，
+`safety.rs` 是 `Action` 解析与危险命令拦截，`files.rs` 是读写 / glob / grep，`shell.rs` 是命令执行与后台任务。
+
 ## 自动模式与向用户提问
 
 - **权限模式「自动」**（`crates/builtin/src/auto.rs`）：由一次独立的模型调用（分类器）代替用户审批。

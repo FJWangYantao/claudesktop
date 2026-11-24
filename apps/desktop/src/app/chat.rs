@@ -3079,7 +3079,7 @@ mod tests {
     fn bold_autolink_keeps_strong_and_drops_trailing_stars() {
         use markdown::{ParseOptions, mdast::Node};
 
-        /// 段落里 Strong 节点的文本（顺带证明它没有散成 Text("**")）
+        // 段落里 Strong 节点的文本（顺带证明它没有散成 Text("**")）
         let strong_of = |source: &str| -> Vec<String> {
             let mut options = ParseOptions::gfm();
             options.constructs.math_text = true;

@@ -43,5 +43,5 @@
 - 用量网关 / 内存与帧率压测 / 独立验收包 → [docs/dev/gateway-and-bench.md](./docs/dev/gateway-and-bench.md)
 - ACP 外部 agent 协议 / 工具内容 / 登录 / 结构化提问 → [docs/dev/acp-protocol.md](./docs/dev/acp-protocol.md)
 
-视觉与交互的取舍依据见 [设计指南-Claude风格UI.md](./设计指南-Claude风格UI.md)，
-网页 CSS 手法能否搬进 gpui 见 [调研报告-Claude前端CSS手法对照.md](./调研报告-Claude前端CSS手法对照.md)。
+视觉与交互的取舍依据见 [设计指南-Claude风格UI.md](./docs/design/设计指南-Claude风格UI.md)，
+网页 CSS 手法能否搬进 gpui 见 [调研报告-Claude前端CSS手法对照.md](./docs/archive/调研报告-Claude前端CSS手法对照.md)。
