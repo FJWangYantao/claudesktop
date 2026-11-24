@@ -115,6 +115,9 @@ const MAX_DENIAL_STREAK: u32 = 3;
 const MAX_DENIALS: u32 = 20;
 /// 一轮里连着这么多次回复被输出上限截断就停下来（模型重发也还是截断，再试没意义）
 const MAX_TRUNCATED_STEPS: u32 = 2;
+/// 延迟工具每轮最多带多少 token 的工具定义（按 schema JSON 字节 / 4 估算）。
+/// 超出的旧工具本轮先不声明；模型真要用再搜一次就回来了（`tool_search` 会把它们排到最前）。
+const DEFERRED_TOOL_BUDGET_TOKENS: usize = 2_000;
 
 const MODE_DEFAULT: &str = "default";
 const MODE_ACCEPT_EDITS: &str = "acceptEdits";
@@ -257,6 +260,36 @@ pub(crate) fn protocol_from_env(var: &impl Fn(&str) -> Option<String>) -> Protoc
     }
 }
 
+/// 延迟工具按预算挑出本轮要声明的那些（见 `DEFERRED_TOOL_BUDGET_TOKENS`）。
+///
+/// `loaded` 是会话里加载过的延迟工具，`last_used` 给每个工具最后一次被搜到 / 被调用的步序，
+/// `token_cost` 给单个工具的估算 token 数。排序：最近用过的在前。
+/// **至少放行一个**（即使单个大 MCP 工具的 schema 就超预算）：模型刚搜到它，下一步却看不见，
+/// 会陷入「再搜一次 → 还是看不见」的死循环。
+fn select_within_budget(
+    loaded: &[String],
+    last_used: &std::collections::HashMap<String, u64>,
+    token_cost: impl Fn(&str) -> usize,
+) -> Vec<String> {
+    let mut ranked: Vec<&String> = loaded.iter().collect();
+    ranked.sort_by_key(|name| std::cmp::Reverse(last_used.get(*name).copied().unwrap_or(0)));
+    let mut used = 0usize;
+    let mut active = Vec::new();
+    for name in ranked {
+        let cost = token_cost(name);
+        if active.is_empty() || used + cost <= DEFERRED_TOOL_BUDGET_TOKENS {
+            used += cost;
+            active.push(name.clone());
+        }
+    }
+    active
+}
+
+/// 一个工具定义的估算 token 数：schema JSON 字节数 / 4（够用的粗估，不引 tokenizer）。
+fn spec_token_cost(spec: &ToolSpec) -> usize {
+    serde_json::to_string(&**spec).map(|json| json.len() / 4).unwrap_or(0)
+}
+
 /// 「自动」模式可用的前提下才有它（没配置就不出现，见 [`AutoModeConfig`]）。
 pub fn permission_modes(auto_available: bool) -> Vec<ModeView> {
     let m = |id: &str, name: &str, desc: &str| ModeView {
@@ -342,6 +375,10 @@ struct SessionState {
     /// 本会话已经通过 `tool_search` 额外声明给模型的工具（见 `tools::exposure`）。
     /// 骨架阶段恒为空；续接时从日志的 `Record::ToolLoadout` 拿回来。
     loaded_tools: Vec<String>,
+    /// 已经走了多少步（每步一次请求）：给 `tool_last_step` 排序用
+    step_seq: u64,
+    /// 每个延迟工具最后一次被搜到或被调用的步序；预算淘汰时越近越优先
+    tool_last_step: std::collections::HashMap<String, u64>,
 }
 
 impl SessionState {
@@ -629,6 +666,46 @@ impl Inner {
     fn loaded_tools(&self, session: &str) -> Vec<String> {
         let sessions = self.sessions.lock().unwrap();
         sessions.get(session).map(|s| s.loaded_tools.clone()).unwrap_or_default()
+    }
+
+    /// 每个延迟工具最后一次被搜到 / 被调用的步序（预算淘汰排序用）。
+    fn tool_last_step(&self, session: &str) -> std::collections::HashMap<String, u64> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session).map(|s| s.tool_last_step.clone()).unwrap_or_default()
+    }
+
+    /// 记下「这一步用到了这个工具」，下一轮预算排序把它排前面。
+    fn touch_tool(&self, session: &str, name: &str) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(state) = sessions.get_mut(session) {
+            state.step_seq += 1;
+            let step = state.step_seq;
+            state.tool_last_step.insert(name.to_string(), step);
+        }
+    }
+
+    /// 单个工具定义的估算 token 数（预算淘汰用）；找不到定义时给 0，按「免费」放进预算。
+    fn tool_spec_token_cost(
+        &self,
+        name: &str,
+        writable: bool,
+        disabled: &[String],
+        plugin_scope: Option<&[String]>,
+    ) -> usize {
+        if let Some(spec) =
+            tools::specs(writable).iter().find(|spec| subagent::spec_name(spec) == name)
+        {
+            return spec_token_cost(spec);
+        }
+        if let Some(spec) =
+            self.mcp.specs_for(writable, disabled, |candidate| candidate == name).into_iter().next()
+        {
+            return spec_token_cost(&spec);
+        }
+        if name == subagent::TASK {
+            return spec_token_cost(&subagent::spec(&self.agents(plugin_scope)).into());
+        }
+        0
     }
 
     /// 这个模型看不了图片吗（能力表说只吃文字，或端点回过 400、界面记进了名单）。
@@ -1212,6 +1289,10 @@ impl Inner {
     ) -> ToolOutput {
         // 聊天会话：不在名单里的工具一律回错误结果（模型照着续接前的文字瞎编、
         // 或者别家模型幻觉都会走到这里），不进 authorize
+        if tools::exposure(&call.function.name) == tools::Exposure::Deferred {
+            // 记下这一步用到了它：下一轮的工具预算排序把它排最前
+            self.touch_tool(session, &call.function.name);
+        }
         if let Some(web) = self.chat_web_of(session)
             && !tools::chat_allows(web, &call.function.name)
         {
@@ -1315,10 +1396,14 @@ impl Inner {
             let Some(state) = sessions.get_mut(session) else {
                 return ToolOutput::fail("This session is gone.", "会话已结束");
             };
+            state.step_seq += 1;
+            let step = state.step_seq;
             for name in &found {
                 if !state.loaded_tools.contains(name) {
                     state.loaded_tools.push(name.clone());
                 }
+                // 刚搜出来的排最前：预算不够时先保它们
+                state.tool_last_step.insert(name.clone(), step);
             }
             state.loaded_tools.clone()
         };
@@ -1957,6 +2042,8 @@ impl Inner {
                     steps_since_todo: 0,
                     // 子会话的工具按角色清单筛（`subagent::allows`），不走 exposure 那一套
                     loaded_tools: Vec::new(),
+                    step_seq: parent.step_seq,
+                    tool_last_step: parent.tool_last_step.clone(),
                 };
                 Some((flag, state))
             }) else {
@@ -2651,6 +2738,9 @@ impl BuiltinKernel {
             steps_since_todo: 0,
             // 续接的会话要把加载过的工具还给模型，否则模型手里的工具和日志里的调用对不上
             loaded_tools: history.loaded_tools,
+            // 步序从头算：加载过的工具先按「都没用过」排在后面，第一步用完就正常了
+            step_seq: 0,
+            tool_last_step: std::collections::HashMap::new(),
         };
         // 记住的东西一开始就带上（之后每轮重读）
         for warning in state.reload_memory_for_turn(self.inner.memory_path.as_deref()) {
@@ -2791,9 +2881,7 @@ and keep headings bare (no trailing explanation).\n\
     if let Some(section) = instructions::prompt_section(project) {
         sections.push(("project", section));
     }
-    if let Some(section) = claudesktop_core::memory::prompt_section(memory_project, memory_global) {
-        sections.push(("memory", section));
-    }
+    // 越稳定的越靠前：项目说明和技能一改就整段变，记忆每轮重读、摘要随压缩变，都放后面
     if !skills.is_empty() {
         let mut text = "# Skills\n\
              The user's plugins provide these skills: instructions for specific kinds of tasks. \
@@ -2809,9 +2897,6 @@ and keep headings bare (no trailing explanation).\n\
             ));
         }
         sections.push(("skills", text));
-    }
-    if let Some(summary) = summary {
-        sections.push(("summary", compact::prompt_section(summary)));
     }
     if mode == MODE_PLAN {
         let mut text = "Plan mode is active: only read-only tools are available. \
@@ -2838,6 +2923,12 @@ and keep headings bare (no trailing explanation).\n\
              Either take a clearly safer route, or use `ask_user` to have the user decide."
                 .to_string(),
         ));
+    }
+    if let Some(summary) = summary {
+        sections.push(("summary", compact::prompt_section(summary)));
+    }
+    if let Some(section) = claudesktop_core::memory::prompt_section(memory_project, memory_global) {
+        sections.push(("memory", section));
     }
     sections
 }
@@ -3185,16 +3276,26 @@ fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) -> Steps {
             tools::chat_specs(web)
         } else {
             let loaded = inner.loaded_tools(session);
+            // 延迟工具按预算挑：最近搜到 / 用过的优先，装载太多时旧工具本轮先不声明
+            let last_step = inner.tool_last_step(session);
+            let active = select_within_budget(&loaded, &last_step, |name| {
+                inner.tool_spec_token_cost(
+                    name,
+                    mode != MODE_PLAN,
+                    &disabled,
+                    plugin_scope.as_deref(),
+                )
+            });
             let include = |name: &str| match &agent {
                 Some(agent) => subagent::allows(agent, name),
                 None => {
                     tools::exposure(name) == tools::Exposure::Direct
-                        || loaded.iter().any(|tool| tool == name)
+                        || active.iter().any(|tool| tool == name)
                 }
             };
             let mut specs = tools::specs(mode != MODE_PLAN);
             if agent.is_none() {
-                specs = tools::for_model(specs, &loaded);
+                specs = tools::for_model_within(specs, &loaded, &active);
             } else {
                 specs.retain(|spec| include(subagent::spec_name(spec)));
             }
@@ -4048,14 +4149,46 @@ mod tests {
         let names: Vec<_> = sections.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
-            ["preamble", "restored", "project", "skills", "summary", "plan"],
-            "节的顺序就是缓存前缀的顺序，改顺序等于让所有会话的缓存失效一次"
+            ["preamble", "restored", "project", "skills", "plan", "summary"],
+            "节的顺序就是缓存前缀的顺序，改顺序等于让所有会话的缓存失效一次；易变节（摘要、记忆）必须在末尾"
         );
         // 每节自身不带空行，拼起来才不会出现三个空行
         for (name, text) in &sections {
             assert!(!text.starts_with('\n'), "{name} 以空行开头");
             assert!(!text.ends_with('\n'), "{name} 以空行结尾");
         }
+    }
+
+    /// 延迟工具按预算淘汰：最近用过的优先，超预算的旧工具本轮不声明；
+    /// 但至少放行一个，免得模型刚搜到的工具下一步就看不见、陷入反复重搜。
+    #[test]
+    fn deferred_tools_fit_the_budget_and_keep_the_newest() {
+        let loaded: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let mut last = std::collections::HashMap::new();
+        last.insert("a".to_string(), 1u64);
+        last.insert("b".to_string(), 5u64);
+        last.insert("c".to_string(), 9u64);
+        // 每个 900 token：两个以内放得进 2000
+        let active = select_within_budget(&loaded, &last, |_| 900);
+        assert_eq!(active, ["c", "b"], "最近用过的排前，超预算的淘汰");
+
+        // 都很小：全放
+        let all = select_within_budget(&loaded, &last, |_| 10);
+        assert_eq!(all, ["c", "b", "a"]);
+
+        // 单个大工具就超预算：仍要放行，否则模型搜到了也看不见
+        let huge = select_within_budget(&loaded, &last, |_| 5_000);
+        assert_eq!(huge, ["c"]);
+    }
+
+    /// 没记录过使用步序的工具（续接后第一步）排在后面，但不至于被全砍掉。
+    #[test]
+    fn deferred_tools_without_history_rank_last() {
+        let loaded: Vec<String> = ["fresh", "stale"].iter().map(|s| s.to_string()).collect();
+        let mut last = std::collections::HashMap::new();
+        last.insert("stale".to_string(), 3u64);
+        let active = select_within_budget(&loaded, &last, |_| 100);
+        assert_eq!(active, ["stale", "fresh"]);
     }
 
     #[test]

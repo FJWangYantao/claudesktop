@@ -294,6 +294,25 @@ pub fn for_model(specs: Vec<ToolSpec>, loaded: &[String]) -> Vec<ToolSpec> {
         .collect()
 }
 
+/// 和 [`for_model`] 一样，但延迟工具只放预算内的那些（`active` 由 `select_within_budget` 给）。
+/// 预算外的工具本轮不声明，模型要用时再搜一次就回来了。
+pub fn for_model_within(
+    specs: Vec<ToolSpec>,
+    loaded: &[String],
+    active: &[String],
+) -> Vec<ToolSpec> {
+    if active.len() == loaded.len() {
+        return for_model(specs, loaded);
+    }
+    specs
+        .into_iter()
+        .filter(|spec| {
+            let name = spec_name(spec);
+            exposure(name) == Exposure::Direct || active.iter().any(|tool| tool == name)
+        })
+        .collect()
+}
+
 /// 一份工具定义里的名字（`{"function": {"name": ..}}`）。
 fn spec_name(spec: &Value) -> &str {
     spec["function"]["name"].as_str().unwrap_or_default()
