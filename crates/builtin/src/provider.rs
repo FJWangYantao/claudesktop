@@ -1349,9 +1349,7 @@ pub(crate) fn debug_http(make: impl FnOnce() -> String) {
 
 /// 开关值取自调用方给的环境变量读取函数（便于单测，见 [`debug_http`]）。
 pub(crate) fn debug_http_from_env(var: impl Fn(&str) -> Option<String>) -> bool {
-    var("CLAUDESKTOP_DEBUG_HTTP")
-        .or_else(|| var("CLAUDEDESKTOP_DEBUG_HTTP"))
-        .as_deref()
+    var("CLAUDESKTOP_DEBUG_HTTP").or_else(|| var("CLAUDEDESKTOP_DEBUG_HTTP")).as_deref()
         == Some("1")
 }
 
@@ -1420,10 +1418,7 @@ mod tests {
 
     #[test]
     fn debug_http_prefers_the_new_name_when_both_are_set() {
-        let both = fake_env(&[
-            ("CLAUDESKTOP_DEBUG_HTTP", "0"),
-            ("CLAUDEDESKTOP_DEBUG_HTTP", "1"),
-        ]);
+        let both = fake_env(&[("CLAUDESKTOP_DEBUG_HTTP", "0"), ("CLAUDEDESKTOP_DEBUG_HTTP", "1")]);
         assert!(!debug_http_from_env(both), "新名设了就以前者为准");
     }
 
