@@ -17,7 +17,7 @@
 
 use super::ChatApp;
 use super::chrome::CHROME_H;
-use super::keys::{COLLAPSE_COMPLETION_KEY, CollapseCompletion, ExpandCompletion};
+use super::keys::{COLLAPSE_COMPLETION_KEY, CollapseCompletion, ExpandCompletion, SteerSend};
 use crate::complete::{self, Trigger, TriggerKind};
 use crate::model::ViewMode;
 use crate::settings::KernelChoice;
@@ -416,6 +416,11 @@ impl ChatApp {
                 return;
             }
             this.accept_selected(window, cx);
+        }))
+        // Ctrl+Shift+Enter：运行中插话（排队条上的「插话」是同一个入口）
+        .capture_action(cx.listener(|this, _: &SteerSend, window, cx| {
+            cx.stop_propagation();
+            this.steer_send(window, cx);
         }))
         .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
             // 一轮结束后猜的那句（淡色画在空输入框里）：Tab 填入（见 suggest.rs）

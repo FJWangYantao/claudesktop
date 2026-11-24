@@ -39,8 +39,8 @@ pub use diff::{
 pub use json_error::json_error_text;
 pub use process_guard::kill_children_on_exit;
 pub use store::{
-    Record, SessionKind, SessionLog, SessionMeta, SessionStore, WorktreeMeta, default_data_dir,
-    effective, into_effective, iter_effective, read_log,
+    QueuedImageMeta, QueuedPromptMeta, Record, SessionKind, SessionLog, SessionMeta, SessionStore,
+    WorktreeMeta, default_data_dir, effective, into_effective, iter_effective, read_log,
 };
 
 pub use plugin::Plugin;
@@ -330,6 +330,9 @@ pub enum KernelEvent {
     AgentThoughtChunk { text: String },
     /// 用户消息回显块（部分 agent 会流式回显用户输入）
     UserMessageChunk { text: String },
+    /// 运行中的一轮收到了插话，已在步间作为新的用户消息追加进上下文
+    /// （见 [`Kernel::steer`]）。界面把它落成一行真实用户消息。
+    SteerInjected { text: String },
     /// 新工具调用开始
     ToolCallStarted {
         /// 工具调用 ID（后续 update 按此关联）
@@ -579,6 +582,7 @@ impl KernelEvent {
             Self::AgentMessageChunk { .. } => "agent_message_chunk",
             Self::AgentThoughtChunk { .. } => "agent_thought_chunk",
             Self::UserMessageChunk { .. } => "user_message_chunk",
+            Self::SteerInjected { .. } => "steer_injected",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::SubagentStarted { .. } => "subagent_started",
             Self::SubagentChunk { .. } => "subagent_chunk",
@@ -854,6 +858,17 @@ pub trait Kernel: Send + Sync {
     fn resolve_question(&self, request_id: u64, answer: QuestionAnswer) -> anyhow::Result<()> {
         let _ = (request_id, answer);
         anyhow::bail!("这个内核不支持向用户提问")
+    }
+    /// 运行中插话：把 `prompt` 追加成下一步的用户消息（模型下一轮就能看见）。
+    ///
+    /// 只在该轮「步间安全点」落地——上一步的 assistant 工具调用和全部结果都已写进历史、
+    /// 下一轮请求还没发，所以不会破坏两者的配对；模型刚说完最后一段话时插的话会多跑一步
+    /// 再收尾，步数用尽 / 取消则丢弃并发 `Notice` 让用户重发。
+    /// 界面目前只让插纯文字（`SteerInjected` 不带附件，带图的历史 / 气泡会缺内容）。
+    /// 默认不支持（ACP agent 由对方决定何时读输入）。
+    fn steer(&self, session: &str, prompt: UserPrompt) -> anyhow::Result<()> {
+        let _ = (session, prompt);
+        anyhow::bail!("当前内核不支持运行中插话")
     }
     /// 切换权限模式；结果经 `Status` 事件回报，不支持的 agent 会被忽略。
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()>;

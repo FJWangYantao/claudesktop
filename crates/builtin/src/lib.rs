@@ -385,6 +385,9 @@ struct SessionState {
     step_seq: u64,
     /// 每个延迟工具最后一次被搜到或被调用的步序；预算淘汰时越近越优先
     tool_last_step: std::collections::HashMap<String, u64>,
+    /// 运行中收到的「插话」：`run_steps` 在步间安全点把这些话追加成新的用户消息，
+    /// 模型下一步就能看见（见 [`Kernel::steer`]）
+    pending_steer: std::collections::VecDeque<claudesktop_core::UserPrompt>,
 }
 
 impl SessionState {
@@ -652,6 +655,43 @@ impl Inner {
     fn tool_last_step(&self, session: &str) -> std::collections::HashMap<String, u64> {
         let sessions = self.sessions.lock().unwrap();
         sessions.get(session).map(|s| s.tool_last_step.clone()).unwrap_or_default()
+    }
+
+    /// 收下运行中收到的插话（由 `run_steps` 在步间安全点取走）。
+    fn take_steer(&self, session: &str) -> Vec<claudesktop_core::UserPrompt> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions
+            .get_mut(session)
+            .map(|state| state.pending_steer.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// 是否还有没送出去的插话（`run_steps` 收尾前用它决定要不要继续跑一步）。
+    fn has_steer(&self, session: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|state| !state.pending_steer.is_empty())
+    }
+
+    /// 把插话追加成一条新的用户消息（和正常发送走同一套 history / user_inputs）。
+    fn push_steered_message(
+        &self,
+        session: &str,
+        text: String,
+        images: Vec<claudesktop_core::PromptImage>,
+    ) {
+        let mut parts = vec![ContentPart::Text(text.clone())];
+        for image in images {
+            parts.push(ContentPart::Image { media_type: image.media_type, data: image.data });
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(state) = sessions.get_mut(session) {
+            state.history.push(ChatMessage::with_parts("user", parts));
+            state.user_inputs.push(auto::UserInput::Message(text));
+            trim_user_inputs(&mut state.user_inputs);
+        }
     }
 
     /// 记下「这一步用到了这个工具」，下一轮预算排序把它排前面。
@@ -941,7 +981,7 @@ impl Inner {
             state.mode = mode;
         }
         let state = sessions.get(session)?;
-        let mut messages = vec![ChatMessage::new("system", state.system_prompt())];
+        let mut messages = state.system_messages();
         messages.extend(state.history.iter().cloned());
         Some(Snapshot {
             messages,
@@ -1251,11 +1291,26 @@ impl Inner {
     }
 
     /// 本轮结束：清掉自己的标志（取消后可能已经开始了新的一轮）。
+    /// 还没送出去的插话也在这里丢掉——界面的输入框已经清空，只能明确告诉用户重发，
+    /// 留着会在下一轮被当成新消息「幽灵注入」。
     fn finish(&self, session: &str, flag: &Arc<AtomicBool>) {
-        if let Some(state) = self.sessions.lock().unwrap().get_mut(session)
-            && state.turn.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag))
-        {
-            state.turn = None;
+        let dropped = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.get_mut(session) {
+                Some(state) if state.turn.as_ref().is_some_and(|f| Arc::ptr_eq(f, flag)) => {
+                    state.turn = None;
+                    state.pending_steer.drain(..).count()
+                }
+                _ => 0,
+            }
+        };
+        if dropped > 0 {
+            self.emit(
+                Some(session),
+                KernelEvent::Notice(format!(
+                    "这一轮已经结束，{dropped} 条插话没能送到模型，请重新发送。"
+                )),
+            );
         }
     }
 }
@@ -1478,6 +1533,7 @@ impl BuiltinKernel {
             // 步序从头算：加载过的工具先按「都没用过」排在后面，第一步用完就正常了
             step_seq: 0,
             tool_last_step: std::collections::HashMap::new(),
+            pending_steer: Default::default(),
         };
         // 记住的东西一开始就带上（之后每轮重读）
         for warning in state.reload_memory_for_turn(self.inner.memory_path.as_deref()) {
@@ -1698,20 +1754,32 @@ impl Kernel for BuiltinKernel {
     }
 
     fn cancel(&self, session: &str) -> anyhow::Result<()> {
-        // 持锁置位：与 commit() 的判断互斥，取消后这一轮的结果不会再写进历史
-        let cancelled = {
+        // 持锁置位：与 commit() 的判断互斥，取消后这一轮的结果不会再写进历史；
+        // 没送出去的插话（输入框已清空）一并丢掉并提示，免得下一轮被幽灵注入
+        let (cancelled, dropped) = {
             let mut sessions = self.inner.sessions.lock().unwrap();
-            match sessions.get_mut(session).and_then(|s| s.turn.take()) {
-                Some(flag) => {
-                    flag.store(true, Ordering::SeqCst);
-                    true
-                }
-                None => false,
+            match sessions.get_mut(session) {
+                Some(state) => match state.turn.take() {
+                    Some(flag) => {
+                        flag.store(true, Ordering::SeqCst);
+                        (true, state.pending_steer.drain(..).count())
+                    }
+                    None => (false, 0),
+                },
+                None => (false, 0),
             }
         };
         if cancelled {
             self.inner
                 .emit(Some(session), KernelEvent::TurnEnded { stop_reason: "cancelled".into() });
+        }
+        if dropped > 0 {
+            self.inner.emit(
+                Some(session),
+                KernelEvent::Notice(format!(
+                    "这一轮已停止，{dropped} 条插话没能送到模型，请重新发送。"
+                )),
+            );
         }
         Ok(())
     }
@@ -1748,6 +1816,19 @@ impl Kernel for BuiltinKernel {
             }
             None => anyhow::bail!("权限请求 {request_id} 已失效"),
         }
+    }
+
+    /// 运行中插话：排进 `pending_steer`，由 `run_steps` 在步间安全点取走。
+    /// 没有在跑的一轮时直接报错——那条路径该用 `send_prompt`。
+    fn steer(&self, session: &str, prompt: claudesktop_core::UserPrompt) -> anyhow::Result<()> {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        let state =
+            sessions.get_mut(session).ok_or_else(|| anyhow::anyhow!("未知会话 {session}"))?;
+        if state.turn.is_none() {
+            anyhow::bail!("这一轮已经结束了，用普通发送");
+        }
+        state.pending_steer.push_back(prompt);
+        Ok(())
     }
 
     fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()> {
@@ -1924,7 +2005,7 @@ impl Kernel for BuiltinKernel {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt::{Context, prompt_sections, system_prompt};
+    use super::prompt::{Context, prompt_messages, prompt_sections, system_prompt};
     use super::*;
 
     /// 环境变量单测一律走闭包注入：并行测试里 `set_var` 会互相污染（且 Rust 2024 下是 unsafe）。
@@ -2159,6 +2240,28 @@ mod tests {
             assert!(!text.starts_with('\n'), "{name} 以空行开头");
             assert!(!text.ends_with('\n'), "{name} 以空行结尾");
         }
+    }
+
+    /// 稳定前缀单独一条 system 消息：拼回去等于整段提示词，切模式 / 压缩只动后一条。
+    #[test]
+    fn prompt_messages_keep_the_stable_prefix_bytes() {
+        let cwd = Path::new("/tmp/proj");
+        let ctx =
+            || Context { instructions: &[], skills: &[], memory_project: &[], memory_global: &[] };
+        // 没有易变节：一条，和整段提示词相同
+        let plain = prompt_sections(cwd, MODE_DEFAULT, false, None, None, ctx());
+        let one = prompt_messages(&plain);
+        assert_eq!(one, [system_prompt(cwd, MODE_DEFAULT, false, None, None, ctx())]);
+        // 有计划 / 摘要：拆成两条，第一条仍是那条稳定前缀，拼回去逐字节不变
+        let volatile = prompt_sections(cwd, MODE_PLAN, false, Some("## 摘要"), None, ctx());
+        let two = prompt_messages(&volatile);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0], one[0], "前面的节不变，缓存断点才命中");
+        assert!(two[1].contains("Plan mode"));
+        assert_eq!(
+            two.join("\n\n"),
+            system_prompt(cwd, MODE_PLAN, false, Some("## 摘要"), None, ctx())
+        );
     }
 
     /// 延迟工具按预算淘汰：最近用过的优先，超预算的旧工具本轮不声明；

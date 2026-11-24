@@ -137,6 +137,7 @@ impl ChatApp {
             self.sessions[new].worktree = Some(meta);
             self.sessions[new].task = false;
             self.sessions[new].queued = queued;
+            self.persist_queued(new, cx);
             // 用户期间换到别的会话了就别把人拽回来
             if self.active == idx {
                 self.active = new;
@@ -168,6 +169,7 @@ impl ChatApp {
                 let _ = store.save_meta(&meta);
             }
         }
+        self.persist_queued(idx, cx);
         // 建好之前写的消息接着发（会话还没就绪时留着，Started 之后由 `dispatch_queued` 带走）
         self.dispatch_queued(idx, cx);
         cx.notify();

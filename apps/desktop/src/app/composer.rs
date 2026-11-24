@@ -908,6 +908,8 @@ impl ChatApp {
         }
         let count = s.queued.len() + usize::from(compact);
         let busy = s.busy;
+        // 自研内核支持运行中插话（ACP agent 由对方决定何时读输入，不提供这个入口）
+        let can_steer = busy && s.kernel == crate::settings::KernelChoice::Builtin;
         let hint = if busy {
             format!("排队 {count} 条 · 这一轮结束后依次发出")
         } else if s.stopping {
@@ -977,6 +979,19 @@ impl ChatApp {
                             .text_color(rgb(INK))
                             .child(text),
                     )
+                    .when(can_steer, |d| {
+                        d.child(
+                            Self::quiet_button(
+                                ("queue-steer", i),
+                                IconAll::MessageSquarePlus,
+                                Surface::Sand,
+                                cx,
+                            )
+                            .xsmall()
+                            .tooltip("插话：下一步就带上它")
+                            .on_click(cx.listener(move |this, _, _, cx| this.steer_queued(i, cx))),
+                        )
+                    })
                     .when(!busy, |d| {
                         d.child(
                             Self::quiet_button(

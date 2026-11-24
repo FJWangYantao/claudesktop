@@ -172,6 +172,45 @@ impl Serialize for DataUrl<'_> {
     }
 }
 
+/// OpenAI 兼容端点的 messages：开头的多条 `system` 并成一条再序列化。
+/// 系统提示词按稳定性拆成两条是为了 Anthropic 的缓存断点；vLLM / Ollama 一类模板只认一条
+/// `system`（第二条会覆盖前一条或直接 400），所以在共享层这里合并。
+pub(crate) struct WireMessages<'a>(pub &'a [ChatMessage]);
+
+impl Serialize for WireMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq as _;
+        let split = self.0.iter().take_while(|message| message.role == "system").count();
+        if split == 1 {
+            let blank = self.0[0].text_ref().is_none_or(|text| text.trim().is_empty());
+            let mut sequence = serializer.serialize_seq(Some(self.0.len() - usize::from(blank)))?;
+            if !blank {
+                sequence.serialize_element(&self.0[0])?;
+            }
+            for message in &self.0[1..] {
+                sequence.serialize_element(message)?;
+            }
+            return sequence.end();
+        }
+        // 多条（或没有）时把前导 system 合成一条；全是空白就整段省掉
+        let text = self.0[..split]
+            .iter()
+            .filter_map(ChatMessage::text_ref)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut sequence =
+            serializer.serialize_seq(Some(self.0.len() - split + usize::from(!text.is_empty())))?;
+        if !text.is_empty() {
+            sequence.serialize_element(&serde_json::json!({"role": "system", "content": text}))?;
+        }
+        for message in &self.0[split..] {
+            sequence.serialize_element(message)?;
+        }
+        sequence.end()
+    }
+}
+
 pub(crate) fn system_text(messages: &[ChatMessage], skip_blank: bool) -> Option<Cow<'_, str>> {
     let mut parts: Vec<_> = messages
         .iter()
@@ -192,6 +231,38 @@ pub(crate) fn system_text(messages: &[ChatMessage], skip_blank: bool) -> Option<
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn leading_system_messages_are_merged_for_openai_compatible_endpoints() {
+        let messages = vec![
+            ChatMessage::new("system", "稳定的前缀"),
+            ChatMessage::new("system", "易变的尾巴"),
+            ChatMessage::new("system", "   "),
+            ChatMessage::new("user", "你好"),
+        ];
+        let encoded = serde_json::to_value(WireMessages(&messages)).unwrap();
+        assert_eq!(
+            encoded,
+            json!([
+                {"role": "system", "content": "稳定的前缀\n\n易变的尾巴"},
+                {"role": "user", "content": "你好"},
+            ])
+        );
+        // 单条 system 原样穿过；前导 system 全是空白就整段省掉
+        let single = vec![ChatMessage::new("system", "只有一条"), ChatMessage::new("user", "你好")];
+        assert_eq!(
+            serde_json::to_value(WireMessages(&single)).unwrap(),
+            json!([
+                {"role": "system", "content": "只有一条"},
+                {"role": "user", "content": "你好"},
+            ])
+        );
+        let blank = vec![ChatMessage::new("system", "  \n "), ChatMessage::new("user", "你好")];
+        assert_eq!(
+            serde_json::to_value(WireMessages(&blank)).unwrap(),
+            json!([{"role": "user", "content": "你好"}])
+        );
+    }
 
     #[test]
     fn extras_override_borrowed_input_system_and_regular_fields_once() {

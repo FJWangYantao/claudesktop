@@ -182,6 +182,8 @@ impl Session {
                 s.permission_mode = i;
             }
         }
+        // 上次退出时还没发出去的排队消息：接着排（内核就绪后由 `dispatch_queued` 发出）
+        s.queued = meta.queued.iter().cloned().map(QueuedPrompt::from_meta).collect();
         s.meta = Some(meta);
         s
     }
@@ -645,6 +647,14 @@ impl Session {
                 if stop_reason != "end_turn" && !stopped {
                     self.note(format!("本轮结束：{stop_reason}"));
                 }
+            }
+            // 运行中插话：内核已把它追加进上下文，界面上落成一行真实用户消息
+            KernelEvent::SteerInjected { text } => {
+                self.transcript.push(ChatItem::User {
+                    text: text.into(),
+                    images: Vec::new(),
+                    files: Default::default(),
+                });
             }
             // 插件钩子出错等：会话里提示一行
             KernelEvent::Notice(text) => self.note(text),

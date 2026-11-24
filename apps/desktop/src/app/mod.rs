@@ -1690,6 +1690,7 @@ impl ChatApp {
         if !self.queued_compaction(idx) {
             if self.sessions[idx].restored && !self.sessions[idx].queued.is_empty() {
                 let queued = self.sessions[idx].queued.remove(0);
+                self.persist_queued(idx, cx);
                 self.submit_to(idx, queued.into_prompt(), cx);
             } else {
                 self.dispatch_queued(idx, cx);
@@ -2467,6 +2468,7 @@ impl ChatApp {
             self.history.push(&queued.text);
             self.sessions[active].steering = None;
             self.sessions[active].queued.push(queued);
+            self.persist_queued(active, cx);
             cx.notify();
             return;
         }
@@ -2480,6 +2482,7 @@ impl ChatApp {
             self.history.push(&queued.text);
             self.sessions[active].steering = None;
             self.sessions[active].queued.push(queued);
+            self.persist_queued(active, cx);
             cx.notify();
             return;
         }
@@ -2491,6 +2494,7 @@ impl ChatApp {
             self.history.push(&queued.text);
             self.sessions[active].steering = None;
             self.sessions[active].queued.push(queued);
+            self.persist_queued(active, cx);
             cx.notify();
             return;
         }
@@ -2521,7 +2525,102 @@ impl ChatApp {
             return;
         }
         let queued = s.queued.remove(0);
+        self.persist_queued(idx, cx);
         self.submit_to(idx, queued.into_prompt(), cx);
+    }
+
+    /// 把排队消息同步进会话元信息：应用退出 / 崩溃后重开，队列还在（见 `SessionMeta::queued`）。
+    /// 落盘失败只提示一次，不影响这一轮。
+    pub(crate) fn persist_queued(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else { return };
+        let Some(session) = self.sessions.get(idx) else { return };
+        if session.meta.is_none() {
+            return;
+        }
+        let queued: Vec<_> = session.queued.iter().map(|q| q.meta()).collect();
+        let Some(meta) = self.sessions[idx].meta.as_mut() else { return };
+        if meta.queued == queued {
+            return;
+        }
+        meta.queued = queued;
+        if let Err(err) = store.save_meta(meta) {
+            self.toast(Notification::error(format!("排队消息未能保存：{err}")), cx);
+        }
+    }
+
+    /// 运行中插话（Ctrl+Shift+Enter，或排队条上的「插话」）：自研内核在下一步开头
+    /// 把它追加成新的用户消息（见 `Kernel::steer`）。没在跑就照常发送。
+    pub(crate) fn steer_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.active;
+        if !self.sessions[active].busy || self.sessions[active].kernel_rewinding {
+            self.send(window, cx);
+            return;
+        }
+        let text = self.input.read(cx).value().to_string();
+        if text.trim().is_empty() && self.pending.is_empty() && self.pending_files.is_empty() {
+            return;
+        }
+        if self.pending.iter().any(|p| p.preparing) {
+            self.toast(Notification::warning("图片还在处理，稍等一下再插话"), cx);
+            return;
+        }
+        // 插话在界面 / 日志里只落一行纯文字（`SteerInjected` 不带附件），带图或带文件
+        // 会看着像发出去了、其实右侧气泡和续接后的历史里都没有——先拦住，等这一轮结束再发
+        if !self.pending.is_empty() || !self.pending_files.is_empty() {
+            self.toast(Notification::warning("插话只支持纯文字，图片和附件等这一轮结束再发"), cx);
+            return;
+        }
+        let queued =
+            QueuedPrompt { text, images: self.pending.clone(), files: self.pending_files.clone() };
+        if self.steer_to(active, queued.into_prompt(), cx) {
+            self.input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.pending.clear();
+            self.pending_files.clear();
+            self.sessions[active].steering = None;
+            self.refresh_composer(cx);
+        }
+    }
+
+    /// 排队条上的「插话」：把这一条从队列里拿出来，直接追加给正在跑的这一轮。
+    pub(crate) fn steer_queued(&mut self, i: usize, cx: &mut Context<Self>) {
+        let active = self.active;
+        if !self.sessions[active].busy || i >= self.sessions[active].queued.len() {
+            return;
+        }
+        // 插话只落纯文字（见 `steer_send`）：带附件的原样留在队列里，别先取出再放回
+        let item = &self.sessions[active].queued[i];
+        if !item.images.is_empty() || !item.files.is_empty() {
+            self.toast(Notification::warning("插话只支持纯文字，图片和附件等这一轮结束再发"), cx);
+            return;
+        }
+        let prompt = self.sessions[active].queued.remove(i).into_prompt();
+        if !self.steer_to(active, prompt.clone(), cx)
+            && let Ok(back) = QueuedPrompt::from_prompt(prompt)
+        {
+            // 插不进去（内核不支持 / 这一轮刚好收尾）：放回原位，别丢
+            self.sessions[active].queued.insert(i, back);
+        }
+        self.persist_queued(active, cx);
+        cx.notify();
+    }
+
+    /// 把一条消息交给内核的插话通道；失败时提示并返回 false。
+    fn steer_to(&mut self, idx: usize, prompt: UserPrompt, cx: &mut Context<Self>) -> bool {
+        let Some(kernel) = self.session_kernel(idx) else {
+            self.toast(Notification::warning("内核还没连上，插不了话"), cx);
+            return false;
+        };
+        let Some(id) = self.sessions[idx].acp_id.clone() else {
+            self.toast(Notification::warning("会话还没就绪，插不了话"), cx);
+            return false;
+        };
+        match kernel.steer(&id, prompt) {
+            Ok(()) => true,
+            Err(err) => {
+                self.toast(Notification::warning(format!("没能插话：{err}")), cx);
+                false
+            }
+        }
     }
 
     /// 把当前会话排队的消息退回输入框：`only` 给了只退这一条，否则全部（按 Esc 停下时）。
@@ -2567,6 +2666,7 @@ impl ChatApp {
             window,
             cx,
         );
+        self.persist_queued(active, cx);
         cx.notify();
     }
 
@@ -2578,6 +2678,7 @@ impl ChatApp {
             return;
         }
         let queued = s.queued.remove(i);
+        self.persist_queued(active, cx);
         self.submit_to(active, queued.into_prompt(), cx);
     }
 
@@ -2586,6 +2687,7 @@ impl ChatApp {
         let active = self.active;
         if i < self.sessions[active].queued.len() {
             self.sessions[active].queued.remove(i);
+            self.persist_queued(active, cx);
             cx.notify();
         }
     }
@@ -2809,6 +2911,7 @@ impl ChatApp {
                 }
             };
             self.sessions[idx].queued.push(queued);
+            self.persist_queued(idx, cx);
             self.ensure_history_loaded(idx, cx);
             cx.notify();
             return true;

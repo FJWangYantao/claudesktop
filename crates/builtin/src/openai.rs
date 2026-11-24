@@ -106,8 +106,13 @@ fn request_body<'a>(
         body["tools"] = Value::Null;
     }
     apply_params(&mut body, model, params);
-    crate::request::RequestBody::new(body, &params.extra, "messages", messages)
-        .with_tools((!tools.is_empty()).then_some(tools))
+    crate::request::RequestBody::new(
+        body,
+        &params.extra,
+        "messages",
+        crate::request::WireMessages(messages),
+    )
+    .with_tools((!tools.is_empty()).then_some(tools))
 }
 
 fn apply_params(body: &mut Value, model: &str, params: &RequestParams) {

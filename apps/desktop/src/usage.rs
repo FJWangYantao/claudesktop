@@ -640,6 +640,7 @@ mod tests {
             kind: claudesktop_core::SessionKind::Code,
             web: None,
             mode: None,
+            queued: Vec::new(),
         }
     }
 

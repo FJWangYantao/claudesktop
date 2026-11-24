@@ -184,10 +184,23 @@ fn request_body<'a>(
         body["temperature"] = json!(t);
     }
     crate::provider::apply_thinking(&mut body, crate::provider::Protocol::Anthropic, model, params);
-    let system =
-        crate::request::system_text(messages, false).filter(|text| !text.is_empty()).map(|text| {
-            [SystemBlock { kind: "text", text, cache_control: json!({"type":"ephemeral"}) }]
-        });
+    // 每条 system 消息各成一个 block、各打一个缓存断点：内核把稳定的前缀和易变的尾部
+    // 拆成两条（`SessionState::system_messages`），所以压缩 / 切模式只让后一段失效。
+    // Anthropic 侧拼回来的正文和单条时逐字节相同。
+    let system: Option<Vec<SystemBlock>> = {
+        let blocks: Vec<SystemBlock> = messages
+            .iter()
+            .filter(|message| message.role == "system")
+            .filter_map(ChatMessage::text_ref)
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| SystemBlock {
+                kind: "text",
+                text,
+                cache_control: json!({"type":"ephemeral"}),
+            })
+            .collect();
+        (!blocks.is_empty()).then_some(blocks)
+    };
     crate::request::RequestBody::new(body, &params.extra, "messages", wire_messages(messages))
         .with_system("system", system)
         .with_tools(wire_tools)
@@ -273,6 +286,17 @@ fn wire_messages<'a>(messages: &'a [ChatMessage]) -> Vec<WireMessage<'a>> {
                                 .unwrap_or_else(|_| json!({})),
                         })
                     }));
+                }
+                // 工具结果已经作为一条 user 发出去了；紧接着的用户消息（运行中插话）必须并进
+                // 同一条 user 轮，连续两条 user 会被严格校验角色交替的端点拒掉
+                if !assistant
+                    && let Some(WireMessage {
+                        role: "user",
+                        content: WireMessageContent::Blocks(last),
+                    }) = out.last_mut()
+                {
+                    last.extend(blocks);
+                    continue;
                 }
                 if !blocks.is_empty() {
                     out.push(WireMessage {
@@ -696,6 +720,35 @@ mod tests {
     }
 
     #[test]
+    fn steer_after_tool_results_joins_the_same_user_turn() {
+        let call = ToolCall {
+            id: "t1".into(),
+            kind: "function".into(),
+            function: crate::provider::FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"a"}"#.into(),
+            },
+        };
+        let messages = vec![
+            M::new("user", "读一下"),
+            M::assistant_tool_calls(String::new(), vec![call]),
+            M::tool_result("t1".into(), "内容".into()),
+            // 两步之间插的话：工具结果后面紧跟一条 user，角色必须并进同一条
+            M::new("user", "顺便说一声"),
+            M::new("user", "还有一句"),
+            M::new("assistant", "好"),
+        ];
+        let (_, out) = convert_messages(&messages);
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        let content = out[2]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "顺便说一声");
+        assert_eq!(content[2]["text"], "还有一句");
+    }
+
+    #[test]
     fn merges_consecutive_tool_results_into_one_user_turn() {
         let call = ToolCall {
             id: "t1".into(),
@@ -783,6 +836,30 @@ mod tests {
         assert_eq!(arr[0]["input_schema"]["type"], "object");
         assert!(arr[0].get("cache_control").is_none());
         assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// 内核把系统提示词拆成「稳定前缀 + 易变尾部」两条 system 消息：这里各成一个 block、
+    /// 各打一个缓存断点，拼起来的正文和单条时一样。
+    #[test]
+    fn system_messages_become_separate_cache_blocks() {
+        let messages = vec![
+            M::new("system", "稳定前缀"),
+            M::new("system", "易变的摘要"),
+            M::new("user", "继续"),
+        ];
+        let body = build_body("m", &messages, &[], &RequestParams::default());
+        let blocks = body["system"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "稳定前缀");
+        assert_eq!(blocks[1]["text"], "易变的摘要");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        // 全部拼回去和原来一条 system 时一致
+        let (joined, _) = convert_messages(&messages);
+        assert_eq!(joined, "稳定前缀\n\n易变的摘要");
+        // 只有一条时仍是一个 block（老会话 / 聊天）
+        let body = build_body("m", &[M::new("system", "只有一段")], &[], &RequestParams::default());
+        assert_eq!(body["system"].as_array().unwrap().len(), 1);
     }
 
     #[test]

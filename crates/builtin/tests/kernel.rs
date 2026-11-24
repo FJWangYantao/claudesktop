@@ -675,6 +675,19 @@ fn body(bodies: &Arc<Mutex<Vec<String>>>, i: usize) -> serde_json::Value {
     serde_json::from_str(&bodies.lock().unwrap()[i]).unwrap()
 }
 
+/// 请求开头的 system 消息正文。内核把「稳定前缀 + 易变尾部」拆成两条发（见
+/// `SessionState::system_messages`），拼回去才是整段系统提示词；断言一律看拼好的这份。
+fn system_text(request: &serde_json::Value) -> String {
+    request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "system")
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 #[test]
 fn read_tool_runs_without_asking_and_feeds_result_back() {
     let dir = workdir("read");
@@ -964,6 +977,83 @@ fn write_asks_permission_and_allow_always_is_remembered() {
 }
 
 #[test]
+fn cancel_drops_pending_steer_and_says_so() {
+    let dir = workdir("steer-cancel");
+    let (base, bodies) = serve(vec![
+        tool_call("w1", "write_file", serde_json::json!({ "path": "out/a.txt", "content": "A" })),
+        happy_stream("新的一轮"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("写 a")).unwrap();
+    let _ = h.permission(1);
+    h.kernel.steer(&sid, UserPrompt::text("这条会被取消丢掉")).unwrap();
+    h.kernel.cancel(&sid).unwrap();
+    h.wait(
+        "cancelled",
+        |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "cancelled"),
+    );
+    h.wait("notice", |e| matches!(e, KernelEvent::Notice(text) if text.contains("插话")));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::SteerInjected { .. })), 0);
+
+    // 新一轮不能把被丢掉的插话带进上下文
+    h.kernel.send_prompt(&sid, UserPrompt::text("换个话题")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let last = body(&bodies, 1);
+    let texts: Vec<&str> =
+        last["messages"].as_array().unwrap().iter().filter_map(|m| m["content"].as_str()).collect();
+    assert!(texts.contains(&"换个话题"), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("这条会被取消丢掉")), "{texts:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn steer_lands_between_steps_and_not_after_the_turn() {
+    let dir = workdir("steer");
+    let (base, bodies) = serve(vec![
+        tool_call("w1", "write_file", serde_json::json!({ "path": "out/a.txt", "content": "A" })),
+        happy_stream("按你说的改了"),
+        happy_stream("新话题收到"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("写 a")).unwrap();
+    // 等权限卡（工具结果还没入历史）时插话：下一个请求的开头就该带
+    let (req, _) = h.permission(1);
+    h.kernel.steer(&sid, UserPrompt::text("顺便把标题加上")).unwrap();
+    h.kernel.resolve_permission(req, Some("allow_once".into())).unwrap();
+    h.wait("turn", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(
+        h.count(|e| matches!(e, KernelEvent::SteerInjected { text } if text == "顺便把标题加上")),
+        1
+    );
+    let second = body(&bodies, 1);
+    let messages = second["messages"].as_array().unwrap();
+    let last_user = messages.iter().rev().find(|m| m["role"] == "user").unwrap();
+    // 插话是工具结果之后的一条独立 user 消息（OpenAI 兼容协议允许这样）
+    assert_eq!(last_user["content"], "顺便把标题加上");
+
+    // 再发一轮：上一轮的插话不能「幽灵注入」到新消息后面
+    h.kernel.send_prompt(&sid, UserPrompt::text("换个话题")).unwrap();
+    h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    let third = body(&bodies, 2);
+    let users: Vec<&str> = third["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    let steer_at = users.iter().position(|t| t.contains("顺便把标题加上"));
+    let fresh_at = users.iter().position(|t| t.contains("换个话题"));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::SteerInjected { .. })), 1);
+    // 插话作为上一轮的历史留在原位；新消息必须是最后一条，不能再被插话跟一条
+    assert!(steer_at < fresh_at, "{users:?}");
+    assert_eq!(fresh_at, Some(users.len() - 1), "{users:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn reject_always_saves_a_deny_rule_and_skips_asking_next_time() {
     let dir = workdir("reject");
     let (base, bodies) = serve(vec![
@@ -1146,7 +1236,7 @@ fn plan_mode_offers_read_only_tools_and_denies_writes() {
         .map(|t| t["function"]["name"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(names, ["read_file", "glob", "todo_write", "ask_user", "grep", "tool_search"]);
-    assert!(first["messages"][0]["content"].as_str().unwrap().contains("Plan mode"));
+    assert!(system_text(&first).contains("Plan mode"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1583,13 +1673,13 @@ fn project_instructions_go_into_the_system_prompt_and_are_reread() {
     let sid = h.start();
     h.kernel.send_prompt(&sid, UserPrompt::text("一")).unwrap();
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    let system = body(&bodies, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    let system = system_text(&body(&bodies, 0));
     assert!(system.contains("代码注释用中文") && system.contains("AGENTS.md"), "{system}");
 
     std::fs::write(dir.join("AGENTS.md"), "提交信息用英文").unwrap();
     h.kernel.send_prompt(&sid, UserPrompt::text("二")).unwrap();
     h.wait_n("turn end", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    let system = body(&bodies, 1)["messages"][0]["content"].as_str().unwrap().to_string();
+    let system = system_text(&body(&bodies, 1));
     assert!(system.contains("提交信息用英文") && !system.contains("代码注释用中文"), "{system}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1677,12 +1767,17 @@ fn reply_with_usage(answer: &str, prompt_tokens: u64) -> Reply {
 }
 
 /// 请求里的 (系统提示词, 其余消息的文本)
+/// 请求拆成（系统提示词，后面的对话）。系统提示词可能分成两条 system 消息发
+/// （稳定前缀 + 易变尾部，见 `SessionState::system_messages`），这里拼回去。
 fn conversation(bodies: &Arc<Mutex<Vec<String>>>, i: usize) -> (String, Vec<String>) {
     let b = body(bodies, i);
     let msgs = b["messages"].as_array().unwrap();
-    let system = msgs[0]["content"].as_str().unwrap_or_default().to_string();
-    let rest =
-        msgs[1..].iter().map(|m| m["content"].as_str().unwrap_or_default().to_string()).collect();
+    let system = system_text(&b);
+    let rest = msgs
+        .iter()
+        .filter(|m| m["role"] != "system")
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect();
     (system, rest)
 }
 
@@ -2747,7 +2842,7 @@ fn chat_session_gets_only_web_and_memory_tools() {
         .find(|t| t["function"]["name"] == "memory_write")
         .unwrap();
     assert!(write["function"]["parameters"]["properties"].get("scope").is_none(), "{write}");
-    let system = first["messages"][0]["content"].as_str().unwrap();
+    let system = system_text(&first);
     assert!(!system.contains("Working directory"), "{system}");
     assert!(!system.contains("coding agent"), "{system}");
     assert!(system.contains("helpful assistant"), "{system}");
@@ -2831,7 +2926,7 @@ fn chat_session_uses_chat_instructions() {
     kernel.send_prompt(&sid, UserPrompt::text("你好")).unwrap();
     wait_turn_end(&events);
     let body = first_body(&bodies);
-    let system = body["messages"][0]["content"].as_str().unwrap();
+    let system = system_text(&body);
     assert!(system.contains("回答尽量简短"), "{system}");
     assert!(!system.contains("项目里的约定不该进聊天"), "{system}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -2993,7 +3088,7 @@ fn task_runs_a_subagent_and_returns_its_report() {
             && task_doc.contains("- general-purpose:")
             && task_doc.contains("- explore:")
     );
-    let main_system = main["messages"][0]["content"].as_str().unwrap();
+    let main_system = system_text(&main);
     assert!(main_system.contains("Delegate with the task tool"), "{main_system}");
     // 报告作为 task 的结果回给主模型
     let last = body(&bodies, 4);
@@ -3701,7 +3796,7 @@ fn memory_write_lands_in_the_prompt_of_the_next_turn() {
     // 2) 下一轮的系统提示词里就有这条（记忆每轮重读，不是写进状态里常驻）
     h.kernel.send_prompt(&sid, UserPrompt::text("再问一句")).unwrap();
     h.wait_n("turn 2", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    let system = body(&bodies, 2)["messages"][0]["content"].as_str().unwrap().to_string();
+    let system = system_text(&body(&bodies, 2));
     assert!(system.contains("# Memory"), "{system}");
     assert!(system.contains("构建只用 cargo test -p claudesktop-core"), "{system}");
     // 全局那份是空的，不该有那一段
@@ -3751,7 +3846,7 @@ fn memory_scope_global_is_per_user_and_project_goes_with_the_directory() {
     let sid2 = h2.start();
     h2.kernel.send_prompt(&sid2, UserPrompt::text("你好")).unwrap();
     h2.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    let system = body(&bodies2, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    let system = system_text(&body(&bodies2, 0));
     assert!(system.contains("回复一律用中文"), "{system}");
     assert!(!system.contains("日志一律走 tracing"), "{system}");
     assert!(system.contains("## Everywhere") && !system.contains("## This project"), "{system}");
@@ -3764,7 +3859,7 @@ fn memory_scope_global_is_per_user_and_project_goes_with_the_directory() {
     let sid3 = h3.start();
     h3.kernel.send_prompt(&sid3, UserPrompt::text("你好")).unwrap();
     h3.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
-    let system = body(&bodies3, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    let system = system_text(&body(&bodies3, 0));
     assert!(system.contains("回复一律用中文") && system.contains("日志一律走 tracing"), "{system}");
     let _ = std::fs::remove_file(&global);
     for d in [&dir, &other] {
@@ -3855,7 +3950,7 @@ fn broken_memory_file_still_opens_the_session_with_a_notice() {
     h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
     // 每轮重读会再报一次；提示词里没有记忆一节
     assert!(h.count(|e| matches!(e, KernelEvent::Notice(t) if t.contains("memory.json"))) >= 1);
-    let system = body(&bodies, 0)["messages"][0]["content"].as_str().unwrap().to_string();
+    let system = system_text(&body(&bodies, 0));
     assert!(!system.contains("# Memory"), "{system}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3907,7 +4002,7 @@ fn memory_context_rides_on_the_user_message_and_needs_no_permission() {
 
     // 系统提示词：项目那条在、全局那条被预算挤掉了（并告诉模型还有几条没带上）
     let first = body(&bodies, 0);
-    let system = first["messages"][0]["content"].as_str().unwrap().to_string();
+    let system = system_text(&first);
     assert!(system.contains("日志一律走 tracing"), "{system}");
     assert!(!system.contains("包管理用 pnpm"), "{system}");
     assert!(system.contains("did not fit"), "{system}");

@@ -768,6 +768,7 @@ impl Inner {
                     loaded_tools: Vec::new(),
                     step_seq: parent.step_seq,
                     tool_last_step: parent.tool_last_step.clone(),
+                    pending_steer: Default::default(),
                 };
                 Some((flag, state))
             }) else {

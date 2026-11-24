@@ -13,13 +13,17 @@ impl SessionState {
                 &self.memory_global,
             );
         }
+        self.code_sections().into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n\n")
+    }
+
+    pub(crate) fn code_sections(&self) -> Vec<(&'static str, String)> {
         let ctx = Context {
             instructions: &self.instructions,
             skills: &self.skills,
             memory_project: &self.memory_project,
             memory_global: &self.memory_global,
         };
-        system_prompt(
+        prompt_sections(
             &self.cwd,
             &self.mode,
             self.restored,
@@ -27,6 +31,21 @@ impl SessionState {
             self.agent.as_ref(),
             ctx,
         )
+    }
+
+    /// 发给模型的 system 消息：稳定的那几节单独一条，模式 / 摘要 / 记忆这些易变的节另起一条。
+    ///
+    /// 两条消息按 `\n\n` 拼起来和 [`Self::system_prompt`] 逐字节相同；`anthropic.rs` 把每条
+    /// 都当独立 block 并各打一个 `cache_control` 断点，于是压缩、切模式、记忆变化只让后一条
+    /// 失效，前面的字节仍然命中提示缓存（见「方案-内核提速.md」阶段 2 B）。
+    pub(crate) fn system_messages(&self) -> Vec<ChatMessage> {
+        if self.kind == SessionKind::Chat {
+            return vec![ChatMessage::new("system", self.system_prompt())];
+        }
+        prompt_messages(&self.code_sections())
+            .into_iter()
+            .map(|text| ChatMessage::new("system", text))
+            .collect()
     }
 }
 
@@ -42,6 +61,7 @@ pub(crate) struct Context<'a> {
 }
 
 /// 系统提示词。节之间用空行连起来（每节的内容里不带前导空行）。
+#[cfg(test)]
 pub(crate) fn system_prompt(
     cwd: &Path,
     mode: &str,
@@ -57,11 +77,30 @@ pub(crate) fn system_prompt(
         .join("\n\n")
 }
 
+/// 几乎不变的节（项目说明 / 技能）：`SessionState::system_messages` 把它们切成第一条
+/// system 消息，缓存断点打在它上面；模式、摘要、记忆变化只影响后面那条。
+const STABLE_SECTIONS: &[&str] = &["preamble", "agent", "restored", "project", "skills"];
+
+/// 把分好的节切成要发的 system 消息正文：稳定的前缀一组、易变的尾部一组。
+///
+/// 两条按 `\n\n` 拼起来和整段提示词逐字节相同；只有「头部不变、尾部变了」这种常见情形
+/// （压缩、切模式、记忆变化）才拆开，其余（没有任何易变节 / 一条节都没有）照旧一条。
+pub(crate) fn prompt_messages(sections: &[(&'static str, String)]) -> Vec<String> {
+    let join = |parts: &[(&'static str, String)]| {
+        parts.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("\n\n")
+    };
+    let stable_end = sections.iter().take_while(|(name, _)| STABLE_SECTIONS.contains(name)).count();
+    if stable_end == 0 || stable_end == sections.len() {
+        return vec![join(sections)];
+    }
+    vec![join(&sections[..stable_end]), join(&sections[stable_end..])]
+}
+
 /// 系统提示词按「多久变一次」分节（见「方案-内核提速.md」阶段 2 B）。
 ///
-/// 骨架阶段只是把原来一次拼完的字符串拆成节、再原样拼回去（结果逐字节相同）；
-/// 阶段 2 再改成「只把变了的节追加成新的 system 消息」，好让前面的提示缓存前缀不动。
-/// 名字只用来比对，不进提示词；越靠前的节越稳定（记忆 / 技能 / 摘要一变就全废，所以放后面）。
+/// 稳定的节拼成第一条 system 消息、易变的节拼成第二条（`system_messages`）：只变了尾巴时，
+/// 前面的提示缓存前缀不动。名字只用来比对，不进提示词；越靠前的节越稳定
+/// （记忆 / 技能 / 摘要一变就全废，所以放后面）。
 pub(crate) fn prompt_sections(
     cwd: &Path,
     mode: &str,

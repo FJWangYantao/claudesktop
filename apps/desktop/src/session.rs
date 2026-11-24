@@ -2279,6 +2279,7 @@ mod tests {
             kind: SessionKind::Code,
             web: None,
             mode: None,
+            queued: Vec::new(),
         }
     }
 

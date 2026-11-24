@@ -56,6 +56,8 @@ actions!(
         ExpandCompletion,
         /// 输入框：收起 `/` `@` 补全，不填入（Alt+→）
         CollapseCompletion,
+        /// 运行中插话：不排队，直接追加给正在跑的这一轮（见 `Kernel::steer`）
+        SteerSend,
         /// 对话向上 / 向下翻一页（和滚轮同一套阻尼）
         ScrollPageUp,
         ScrollPageDown,
@@ -87,6 +89,9 @@ pub(super) const ZOOM_OUT_KEY: &str = "secondary--";
 pub(super) const ZOOM_RESET_KEY: &str = "secondary-0";
 /// 权限卡上的第 n 个按钮。带 Alt：焦点总在输入框里，裸数字键会和打字（排队消息）抢
 pub(super) const PERMISSION_KEYS: [&str; 4] = ["alt-1", "alt-2", "alt-3", "alt-4"];
+/// 运行中插话（输入框卡片上处理，见 `composer.rs` / `complete_view.rs`）。
+/// 和 Enter（排队）/ Ctrl+Enter（不认补全直接发）错开，按住 Shift 才是插话
+pub(super) const STEER_KEY: &str = "secondary-shift-enter";
 /// 输入框里的上下键（历史回溯 / 跳到句首句末）。这两个键由输入框自己绑动作
 /// （`MoveUp` / `MoveDown`），在 `complete_view.rs` 的 `capture_action` 里接管，
 /// 所以这里只是速查表用的文案常量，**不进 `bind()`**。
@@ -142,6 +147,7 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(EXPAND_COMPLETION_KEY, ExpandCompletion, Some(CONTEXT)),
         KeyBinding::new(COLLAPSE_COMPLETION_KEY, CollapseCompletion, Some(CONTEXT)),
         // 对话翻页 / 跳到开头与底部
+        KeyBinding::new(STEER_KEY, SteerSend, Some(CONTEXT)),
         KeyBinding::new(PAGE_UP_KEY, ScrollPageUp, Some(CONTEXT)),
         KeyBinding::new(PAGE_DOWN_KEY, ScrollPageDown, Some(CONTEXT)),
         KeyBinding::new(SCROLL_TOP_KEY, ScrollToTop, Some(CONTEXT)),

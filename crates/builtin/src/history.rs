@@ -111,6 +111,14 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
             }
             Record::Event { event } => match event {
                 KernelEvent::AgentMessageChunk { text } => assistant.text(text),
+                // 运行中插话：内核当时就当成一条新的用户消息追加了，续接时按同样的位置重建
+                KernelEvent::SteerInjected { text } => {
+                    messages.extend(assistant.take());
+                    questions.clear();
+                    messages.push(user_message(text, &[]));
+                    user_inputs.push(UserInput::Message(text.clone()));
+                    in_turn = true;
+                }
                 // 子任务里的调用是子会话的事，主会话只看 task 那一行的结果
                 KernelEvent::ToolCallStarted { parent: Some(_), .. } => {}
                 KernelEvent::ToolCallStarted { id, title, status, .. } => {

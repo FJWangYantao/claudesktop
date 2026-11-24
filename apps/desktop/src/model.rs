@@ -704,6 +704,48 @@ impl QueuedPrompt {
         }
         out
     }
+
+    /// 落盘形态（`SessionMeta::queued`）：图片只留 base64 与类型，重开时重建预览。
+    pub fn meta(&self) -> claudesktop_core::QueuedPromptMeta {
+        claudesktop_core::QueuedPromptMeta {
+            text: self.text.clone(),
+            images: self
+                .images
+                .iter()
+                .map(|image| claudesktop_core::QueuedImageMeta {
+                    name: image.name.to_string(),
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                })
+                .collect(),
+            files: self.files.clone(),
+        }
+    }
+
+    /// 从落盘的元信息重建。图片解不开就丢掉那一张（其余照常排队）。
+    pub fn from_meta(meta: claudesktop_core::QueuedPromptMeta) -> Self {
+        use base64::Engine as _;
+        let images = meta
+            .images
+            .into_iter()
+            .filter_map(|image| {
+                let format = match image.media_type.as_str() {
+                    "image/png" => gpui_kit::ImageFormat::Png,
+                    "image/gif" => gpui_kit::ImageFormat::Gif,
+                    "image/webp" => gpui_kit::ImageFormat::Webp,
+                    "image/bmp" => gpui_kit::ImageFormat::Bmp,
+                    "image/jpeg" => gpui_kit::ImageFormat::Jpeg,
+                    _ => return None,
+                };
+                let bytes = base64::engine::general_purpose::STANDARD.decode(&image.data).ok()?;
+                let mut pending = PendingImage::from_bytes(image.name.into(), bytes, format);
+                pending.data = image.data;
+                pending.preparing = false;
+                Some(pending)
+            })
+            .collect();
+        Self { text: meta.text, images, files: meta.files }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1381,6 +1423,35 @@ mod tests {
             };
         assert_eq!(q.summary(), "先别改 测试");
         assert_eq!(q.into_prompt(), UserPrompt::text("先别改\n  测试\n"));
+    }
+
+    /// 排队消息落盘再读回来：文字与文本附件原样，认不出格式的图片丢掉。
+    #[core::prelude::v1::test]
+    fn queued_prompt_meta_round_trips() {
+        let q = QueuedPrompt {
+            text: "下一句".into(),
+            images: Vec::new(),
+            files: vec![claudesktop_core::attach::TextAttachment {
+                name: "a.txt".into(),
+                path: "C:/a.txt".into(),
+                text: "内容".into(),
+            }],
+        };
+        let back = QueuedPrompt::from_meta(q.meta());
+        assert_eq!(back.text, "下一句");
+        assert_eq!(back.files, q.files);
+        assert!(back.images.is_empty());
+        // 不认识的图片类型（如老版本存下的）：丢掉那一张，其余照常
+        let meta = claudesktop_core::QueuedPromptMeta {
+            text: "看图".into(),
+            images: vec![claudesktop_core::QueuedImageMeta {
+                name: "x.tiff".into(),
+                media_type: "image/tiff".into(),
+                data: "aGVsbG8=".into(),
+            }],
+            files: Vec::new(),
+        };
+        assert!(QueuedPrompt::from_meta(meta).images.is_empty());
     }
 
     #[core::prelude::v1::test]

@@ -418,6 +418,16 @@
 
 ## 内核 / 工具
 
+- **插话（steer）只能在步间注入，且不能跟新消息抢第 0 步**（2026-11-25）：`run_steps` 第 0 步正上方
+  刚由 `prepare_prompt` 提交用户消息，此时再取插话就成了连续两条 `user`（Anthropic 400），所以第 0 步
+  不收、留到第 1 步；模型说完最后一段话时若 `pending_steer` 非空要 `continue` 再跑一步，否则输入框
+  已清空的插话既没送到模型也没退回；步数耗尽 / 取消时由 `finish` / `cancel` 丢弃并发 `Notice`，
+  绝不能让它在下一轮被幽灵注入。协议侧还有两处配套：Anthropic 的工具结果后面紧跟插话要并进同一条
+  `user` 消息（`wire_messages`），OpenAI 兼容端点开头多条 `system` 要合并成一条（`request::WireMessages`，
+  vLLM / Ollama 模板只认一条）。界面侧目前只允许插纯文字——`SteerInjected` 不带附件，带图 / 文件插话
+  会在气泡和续接历史里缺内容。
+- **`ask_user` 确认要进入自动分类器的上下文**（2026-11-25）。此前主模型收到了工具返回的答案，分类器只读对话消息，用户点了同意后仍会被拦。实时应答和日志重放共用 `auto::UserInput::question_answer`，只提交选中的答案及其题目和描述。沙箱内回环 HTTP 测试报 Windows 10013，可用 `cargo test -p claudesktop-builtin --lib auto`，进程内模拟分类器会检查当前回合、续接和回退的请求内容。
+
 - **提示词里禁止「工具前旁白」会把阶段汇报也一起压掉**（2026-11-24）：10-23 的提速改动加了「don't narrate what you are about to do before a tool call」，
   同一模型在重度轮次里的中间汇报从每轮 8.4 次掉到 1.0 次，93% 的中间请求正文为空，最长连续 33 分钟不出声。
   改成只禁逐步旁白，并点名阶段完成、计划变化、卡住三种要汇报的时机（只注入主会话：子会话被告知没人看得到它、

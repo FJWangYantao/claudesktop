@@ -77,6 +77,33 @@ pub struct SessionMeta {
     /// 会话选中的权限模式 ID；老记录未保存，按内核默认模式处理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// 还没发出去的排队消息：应用退出 / 崩溃后重开还接着发（见界面 `Session::queued`）。
+    /// 只在内存里排队的会话也要靠它保住这一串待办。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<QueuedPromptMeta>,
+}
+
+/// 排队消息的落盘形态（界面重建时再变回可发送的 `UserPrompt`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedPromptMeta {
+    pub text: String,
+    /// 图片附件（base64，和发送时同一份数据）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<QueuedImageMeta>,
+    /// 聊天会话的文本附件（内容原样存，重开后还能退回输入框）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<crate::attach::TextAttachment>,
+}
+
+/// 排队消息里的一张图片。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedImageMeta {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// 如 `image/png`
+    pub media_type: String,
+    /// base64 编码的图片字节
+    pub data: String,
 }
 
 /// 会话的 git worktree：[`SessionMeta::cwd`] 是检出目录，这里记它从哪个仓库、哪个分支分出来。
@@ -194,6 +221,7 @@ impl Record {
             event,
             KernelEvent::AgentMessageChunk { .. }
                 | KernelEvent::AgentThoughtChunk { .. }
+                | KernelEvent::SteerInjected { .. }
                 | KernelEvent::ToolCallStarted { .. }
                 | KernelEvent::ToolCallUpdated { .. }
                 | KernelEvent::ToolCallDiff { .. }
@@ -296,6 +324,7 @@ impl SessionStore {
             kind: SessionKind::Code,
             web: None,
             mode: None,
+            queued: Vec::new(),
         };
         self.save_meta(&meta)?;
         let log = self.append_log(&meta.id)?;
@@ -563,6 +592,34 @@ mod tests {
         let text = serde_json::to_string(&chat).unwrap();
         assert!(text.contains("\"kind\":\"chat\""), "{text}");
         assert_eq!(serde_json::from_str::<SessionMeta>(&text).unwrap(), chat);
+    }
+
+    #[test]
+    fn queued_prompts_round_trip_and_old_metas_read_empty() {
+        // 老元信息没有 queued：读成空队列，写回去也不多写这一项
+        let old = r#"{"id":"s","title":"t","cwd":".","agent":"a","created_ms":1,"updated_ms":2}"#;
+        let meta: SessionMeta = serde_json::from_str(old).unwrap();
+        assert!(meta.queued.is_empty());
+        assert!(!serde_json::to_string(&meta).unwrap().contains("\"queued\""));
+        let store = temp_store("queued");
+        let (mut meta, log) = store.create("t", ".".into(), "builtin:test").unwrap();
+        drop(log);
+        meta.queued = vec![QueuedPromptMeta {
+            text: "还没发出去的一句话".into(),
+            images: vec![QueuedImageMeta {
+                name: "shot.png".into(),
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+            files: vec![crate::attach::TextAttachment {
+                name: "a.txt".into(),
+                path: "C:/a.txt".into(),
+                text: "内容".into(),
+            }],
+        }];
+        store.save_meta(&meta).unwrap();
+        assert_eq!(store.list().pop().unwrap().queued, meta.queued);
+        fs::remove_dir_all(store.dir()).unwrap();
     }
 
     #[test]

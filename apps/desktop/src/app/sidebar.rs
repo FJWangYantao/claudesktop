@@ -1575,6 +1575,7 @@ mod tests {
             kind: claudesktop_core::SessionKind::Code,
             web: None,
             mode: None,
+            queued: Vec::new(),
         };
         let restored =
             crate::session::Session::from_records(3, meta.clone(), Vec::new(), &Default::default());

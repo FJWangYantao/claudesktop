@@ -2,6 +2,7 @@
 
 use super::*;
 
+/// 发送的后台兜底：先等休眠写盘 / 预恢复结束并恢复完整历史，再追加用户消息。
 pub(crate) fn run_pending_prompt(
     inner: Arc<Inner>,
     session: String,
@@ -135,7 +136,7 @@ pub(crate) fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>
 
 /// 一轮结束后提炼候选记忆：一次小请求，读这一轮的用户消息和最后的回复。
 /// 结果作为 `MemorySuggested` 发给界面（只进「待确认」，不写文件）。
-pub(crate) fn suggest_memories(inner: &Inner, session: &str) {
+fn suggest_memories(inner: &Inner, session: &str) {
     let Some((model, user, reply, known)) = inner.turn_inputs(session) else {
         return;
     };
@@ -158,7 +159,7 @@ pub(crate) fn suggest_memories(inner: &Inner, session: &str) {
 
 /// 用模型给会话起标题：单独发一个 max_tokens 很小的请求，只带第一条用户消息和第一条回复。
 /// 成功发 `TitleGenerated`；失败 / 取消 / 内容为空都不吭声（界面保留截断版标题）。
-pub(crate) fn name_session(inner: &Inner, session: &str) {
+fn name_session(inner: &Inner, session: &str) {
     let Some((model, first_user, first_reply)) = inner.title_inputs(session) else {
         return;
     };
@@ -208,7 +209,22 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
     // 覆盖了档位时造的 provider，按模型缓存（一轮里一般只造一次，连接接着用）
     let mut turn_provider: Option<(String, Arc<dyn ChatProvider>)> = None;
 
-    for _ in 0..inner.max_steps {
+    for step in 0..inner.max_steps {
+        // 插话的安全点：上一步的 assistant(tool_calls) 和它的全部 tool 结果都已经进历史，
+        // 下一轮请求还没发。插在这里不会破坏 assistant → tool 的消息配对（见 `Kernel::steer`）。
+        // 第 0 步不收：用户消息刚由 `prepare_prompt` 提交，紧跟着再来一条会变成连续两条 user
+        // （严格校验角色交替的端点直接 400）；留到第 1 步，或在收尾处继续跑一步。
+        if step > 0 {
+            for steer in inner.take_steer(session) {
+                let full = if steer.attachments.is_empty() {
+                    steer.text.clone()
+                } else {
+                    claudesktop_core::attach::compose(&steer.text, &steer.attachments)
+                };
+                inner.push_steered_message(session, full, steer.images);
+                inner.emit(Some(session), KernelEvent::SteerInjected { text: steer.text.clone() });
+            }
+        }
         // 用量快到窗口：先压缩再请求
         if !just_compacted {
             if let Some((model, window)) =
@@ -456,11 +472,18 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
         silent_steps = if text.trim().is_empty() { silent_steps + 1 } else { 0 };
 
         if outcome.tool_calls.is_empty() {
-            if !text.is_empty() {
-                inner.commit(session, flag, vec![ChatMessage::new("assistant", text)]);
+            if !text.is_empty()
+                && !inner.commit(session, flag, vec![ChatMessage::new("assistant", text)])
+            {
+                return Steps::Stopped;
             }
             inner.measure(session, step_tokens, 0);
             stop = stop_reason(outcome.finish_reason.as_deref());
+            // 模型这一轮只说完了话，但用户插了话：再跑一步把它当成新的用户消息发出去，
+            // 别让输入框已清空的插话落空（步数用尽时才交给 `finish` 明确提示丢掉）
+            if step + 1 < inner.max_steps && inner.has_steer(session) {
+                continue;
+            }
             break;
         }
 
