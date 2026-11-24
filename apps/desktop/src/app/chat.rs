@@ -2770,24 +2770,35 @@ fn hash_text(text: &str) -> u64 {
 /// 免得标记原样露出来、等收尾后整段又跳成代码 / 粗体样式。
 pub(super) fn close_dangling_markup(text: &str) -> Cow<'_, str> {
     let mut in_fence = false;
-    // 当前段落（围栏外）里的反引号个数；行内代码不跨段落
-    let mut ticks = 0;
+    // 当前段落（围栏外）里还没配对的行内代码分隔符：反引号串长度（CommonMark 按同长配对）
+    let mut open_ticks: Option<usize> = None;
     for line in text.lines() {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
-            ticks = 0;
+            open_ticks = None;
         } else if !in_fence {
             if line.trim().is_empty() {
-                ticks = 0;
+                open_ticks = None;
             } else {
-                ticks += line.matches('`').count();
+                let mut rest = line;
+                while let Some(at) = rest.find('`') {
+                    let run = rest[at..].len() - rest[at..].trim_start_matches('`').len();
+                    match open_ticks {
+                        // 同长的收尾：这一对结束
+                        Some(open) if open == run => open_ticks = None,
+                        Some(_) => {}
+                        None => open_ticks = Some(run),
+                    }
+                    rest = &rest[at + run..];
+                }
             }
         }
     }
     if in_fence {
         Cow::Owned(format!("{text}\n```"))
-    } else if ticks % 2 == 1 {
-        Cow::Owned(format!("{text}`"))
+    } else if let Some(run) = open_ticks {
+        // 补齐时用同长的反引号串，否则包不住（` ``a`b `` 需要两个反引号收尾）
+        Cow::Owned(format!("{text}{}", "`".repeat(run)))
     } else {
         close_dangling_bold(text)
     }
@@ -2905,16 +2916,30 @@ fn tidy_line(line: &str, out: &mut String) {
 /// 后面还没字（`- **`）就先不显示这个标记。只看最后一行，行内代码里的星号不算。
 fn close_dangling_bold(text: &str) -> Cow<'_, str> {
     let start = text.rfind('\n').map_or(0, |i| i + 1);
-    // 按反引号切开，偶数段在行内代码外
-    let (mut count, mut open, mut at) = (0, None, start);
-    for (i, part) in text[start..].split('`').enumerate() {
-        if i % 2 == 0 {
-            for (j, _) in part.match_indices("**") {
-                count += 1;
-                open = Some(at + j);
+    let (mut count, mut open) = (0, None);
+    // 行内代码按**同长**的反引号串配对（CommonMark 的规则）：` ``a`b`` ` 里那个单个反引号
+    // 不是分隔符。早先按单个 ` 切开数奇偶，遇到双反引号包单反引号就把段算反，
+    // 代码里的 `**` 被当成正文的粗体标记。
+    let line = &text[start..];
+    let mut at = 0;
+    while at < line.len() {
+        let rest = &line[at..];
+        if rest.starts_with('`') {
+            let run = rest.len() - rest.trim_start_matches('`').len();
+            match find_tick_run(line, at + run, run) {
+                Some(end) => at = end + run,
+                // 没有配对的收尾围栏：后面都被它包住，不再算正文
+                None => break,
             }
+            continue;
         }
-        at += part.len() + 1;
+        if rest.starts_with("**") {
+            count += 1;
+            open = Some(start + at);
+            at += 2;
+            continue;
+        }
+        at += rest.chars().next().map_or(1, char::len_utf8);
     }
     match open {
         Some(open) if count % 2 == 1 && text[open + 2..].trim().is_empty() => {
@@ -2923,6 +2948,24 @@ fn close_dangling_bold(text: &str) -> Cow<'_, str> {
         Some(_) if count % 2 == 1 => Cow::Owned(format!("{}**", text.trim_end())),
         _ => Cow::Borrowed(text),
     }
+}
+
+/// 从 `from` 起找长度正好是 `len` 的反引号串，返回它的起始下标（找不到 = 没有配对）。
+fn find_tick_run(line: &str, from: usize, len: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let end = bytes[i..].iter().take_while(|b| **b == b'`').count() + i;
+        if end - i == len {
+            return Some(i);
+        }
+        i = end;
+    }
+    None
 }
 
 /// 权限卡的标题：按动作类型说清楚要允许什么，别一律「这一步」。
@@ -3014,6 +3057,75 @@ mod tests {
         assert_eq!(close_dangling_markup("**a\nb"), "**a\nb");
     }
 
+    /// 行内代码按同长反引号串配对：`` `` `` 里夹一个单反引号时，代码里的 `**`
+    /// 不能被算成正文的粗体标记（早先按单个 ` 数奇偶会把段算反）。
+    #[core::prelude::v1::test]
+    fn inline_code_pairs_backtick_runs_of_equal_length() {
+        // 双反引号包裹、里面含单个反引号：整体是代码，末尾的 `- **待补` 才是正文
+        assert_eq!(close_dangling_markup("见 ``a`b`` 然后 - **待补"), "见 ``a`b`` 然后 - **待补**");
+        // 双反引号里的 `**` 不算正文标记
+        assert_eq!(close_dangling_markup("见 ``x**y`` 结束"), "见 ``x**y`` 结束");
+        // 单反引号里含 `**`：照旧不算
+        assert_eq!(close_dangling_markup("`a**b` 结束"), "`a**b` 结束");
+        // 没收尾的双反引号用同长串补齐（上游实现是补一个 `，包不住双反引号）
+        assert_eq!(close_dangling_markup("``x**y 还没收"), "``x**y 还没收``");
+        // 单反引号与双反引号混排，配对不串
+        assert_eq!(close_dangling_markup("`a` 和 ``b**c`` 和 **粗"), "`a` 和 ``b**c`` 和 **粗**");
+    }
+
+    /// `**加粗链接**` 结尾的星号不能被 GFM 裸链接吞进 URL（vendor/markdown 补丁，
+    /// 见 `vendor/README.md`）：AST 里必须是 Strong -> Link，正文没有落单的 `**`。
+    #[core::prelude::v1::test]
+    fn bold_autolink_keeps_strong_and_drops_trailing_stars() {
+        use markdown::{ParseOptions, mdast::Node};
+
+        /// 段落里 Strong 节点的文本（顺带证明它没有散成 Text("**")）
+        let strong_of = |source: &str| -> Vec<String> {
+            let mut options = ParseOptions::gfm();
+            options.constructs.math_text = true;
+            let ast = markdown::to_mdast(source, &options).expect("parse");
+            let mut texts = Vec::new();
+            fn text_of(node: &Node, buf: &mut String) {
+                match node {
+                    Node::Text(text) => buf.push_str(&text.value),
+                    _ => {
+                        if let Some(children) = node.children() {
+                            for child in children {
+                                text_of(child, buf);
+                            }
+                        }
+                    }
+                }
+            }
+            fn walk(node: &Node, texts: &mut Vec<String>) {
+                if let Node::Strong(strong) = node {
+                    let mut buf = String::new();
+                    for child in &strong.children {
+                        text_of(child, &mut buf);
+                    }
+                    texts.push(buf);
+                }
+                if let Some(children) = node.children() {
+                    for child in children {
+                        walk(child, texts);
+                    }
+                }
+            }
+            walk(&ast, &mut texts);
+            texts
+        };
+
+        // 引号里是用户实际报的那句：加粗成立、URL 不带尾随星号
+        assert_eq!(
+            strong_of("请访问 **http://localhost:4390/**（等价）"),
+            ["http://localhost:4390/".to_string()]
+        );
+        assert_eq!(strong_of("请访问 **http://a.b/** (半角)"), ["http://a.b/".to_string()]);
+        assert_eq!(strong_of("请访问 **http://a.b/**。"), ["http://a.b/".to_string()]);
+        assert_eq!(strong_of("请访问 **http://a.b/** "), ["http://a.b/".to_string()]);
+        // 路径中间的星号属于 URL，不能裁（`http://a.b/x*y` 整条仍是链接文本）
+        assert_eq!(strong_of("见 **http://a.b/x*y**"), ["http://a.b/x*y".to_string()]);
+    }
     /// 中文避头尾是 vendor 里 gpui-pre 的补丁（见 `vendor/README.md`）：升级 gpui-kit 时补丁丢了这里会挂。
     /// 用 `NoopTextSystem`（每个字等宽）驱动真的 `LineWrapper`。
     #[core::prelude::v1::test]
