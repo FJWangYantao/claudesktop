@@ -1694,6 +1694,163 @@ impl Paragraph {
     }
 }
 
+/// Rows a table needs before its body is drawn through the viewport window
+/// instead of laid out whole (claudesktop patch).
+const TABLE_VIRTUAL_MIN_ROWS: usize = 48;
+/// Rows drawn past each viewport edge, so a fast scroll does not reach a gap.
+const TABLE_VIRTUAL_OVERSCAN: usize = 6;
+
+/// The body rows of a long table, laid out only where the outer viewport can
+/// see them (claudesktop patch).
+///
+/// The track reports its full height from prefix sums, so the surrounding list
+/// scrolls exactly like the full table; rows measured on screen replace their
+/// single-line estimate on the next frame. Cell ordinals are taken from the
+/// full table, so text leaf keys (selection, highlights, fades) stay aligned.
+struct VirtualTableRows {
+    id: ElementId,
+    table: Table,
+    columns: Vec<TableColumn>,
+    node_cx: NodeContext,
+    radii: [Option<Pixels>; 4],
+    offsets: Vec<usize>,
+    key: TableRowHeightsKey,
+    estimate: Pixels,
+    content_width: Pixels,
+}
+
+/// The rows intersecting `top..bottom` (offsets from the track's top), plus
+/// [`TABLE_VIRTUAL_OVERSCAN`] rows on each side.
+fn table_visible_rows(origins: &[Pixels], top: Pixels, bottom: Pixels) -> (usize, usize) {
+    let first = origins
+        .partition_point(|&origin| origin < top)
+        .saturating_sub(1)
+        .saturating_sub(TABLE_VIRTUAL_OVERSCAN);
+    let last = (origins.partition_point(|&origin| origin < bottom) + 1 + TABLE_VIRTUAL_OVERSCAN)
+        .min(origins.len());
+    (first, last)
+}
+
+struct VirtualTableRowsState {
+    /// Row top offsets from the track's top, in order.
+    origins: Vec<Pixels>,
+    items: Vec<AnyElement>,
+}
+
+impl IntoElement for VirtualTableRows {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for VirtualTableRows {
+    type RequestLayoutState = VirtualTableRowsState;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let heights = self.table.row_heights(&self.key, self.estimate);
+        let mut origins = Vec::with_capacity(heights.heights.len());
+        let mut total = px(0.);
+        for height in &heights.heights {
+            origins.push(total);
+            total += *height;
+        }
+        let content_width = self.content_width;
+        let layout_id = window.request_measured_layout(
+            StyleRefinement::default().into(),
+            move |known_dimensions: gpui::Size<Option<Pixels>>,
+                  available_space: gpui::Size<gpui::AvailableSpace>,
+                  _window,
+                  _cx| {
+                let width = known_dimensions.width.unwrap_or(match available_space.width {
+                    gpui::AvailableSpace::Definite(width) => width,
+                    gpui::AvailableSpace::MinContent | gpui::AvailableSpace::MaxContent => {
+                        content_width
+                    }
+                });
+                gpui::size(width, total)
+            },
+        );
+        (layout_id, VirtualTableRowsState { origins, items: Vec::new() })
+    }
+
+    fn prepaint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        // The live viewport of this frame, not the outer list's last recorded
+        // one (that lands after prepaint): clip the window content mask to
+        // this element.
+        let view = window.content_mask().bounds.intersect(&bounds);
+        if view.size.height <= px(0.) {
+            return;
+        }
+        let rel_top = view.top() - bounds.top();
+        let rel_bottom = view.bottom() - bounds.top();
+        let (first, last) = table_visible_rows(&layout.origins, rel_top, rel_bottom);
+        let available = gpui::size(
+            gpui::AvailableSpace::Definite(bounds.size.width),
+            gpui::AvailableSpace::MinContent,
+        );
+        let mut items = Vec::with_capacity(last.saturating_sub(first));
+        for ix in first..last {
+            let mut item = BlockNode::table_row(
+                &self.table,
+                &self.columns,
+                ix,
+                self.offsets[ix],
+                self.radii,
+                &self.node_cx,
+                window,
+                cx,
+            );
+            let laid_out = item.layout_as_root(available, window, cx);
+            // Wrapped rows are taller than the estimate: remember it for the
+            // next frame's prefix sums.
+            self.table.set_row_height(&self.key, ix, laid_out.height);
+            item.prepaint_at(bounds.origin + gpui::point(px(0.), layout.origins[ix]), window, cx);
+            items.push(item);
+        }
+        layout.items = items;
+    }
+
+    fn paint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        for item in &mut layout.items {
+            item.paint(window, cx);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Table {
     pub(crate) children: Vec<TableRow>,
@@ -1703,6 +1860,9 @@ pub(crate) struct Table {
     /// frames; see [`Table::cached_table_data`].
     pub(crate) table_data_cache: TableDataCache,
     pub(crate) column_widths_cache: TableColumnWidthsCache,
+    /// Measured row heights for the virtualized path (claudesktop patch, see
+    /// [`VirtualTableRows`]); keyed by the layout inputs that change them.
+    pub(crate) row_heights_cache: TableRowHeightsCache,
 }
 
 /// Derived state, invisible to `Debug` and equality.
@@ -1756,6 +1916,52 @@ impl std::fmt::Debug for TableColumnWidthsCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("TableColumnWidthsCache")
     }
+}
+
+/// Like [`TableColumnWidthsCache`]: row heights measured while scrolling a long
+/// table survive clones of an unchanged parsed table (claudesktop patch).
+#[derive(Default)]
+pub(crate) struct TableRowHeightsCache(Mutex<Option<Arc<TableRowHeights>>>);
+
+impl Clone for TableRowHeightsCache {
+    fn clone(&self) -> Self {
+        let cached = self.0.lock().ok().and_then(|cache| cache.clone());
+        Self(Mutex::new(cached))
+    }
+}
+
+impl PartialEq for TableRowHeightsCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for TableRowHeightsCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TableRowHeightsCache")
+    }
+}
+
+#[derive(Clone)]
+struct TableRowHeights {
+    /// The layout inputs these heights were measured under; any change
+    /// re-wraps the cells and invalidates every row.
+    key: TableRowHeightsKey,
+    /// One entry per row; rows not on screen yet carry the estimate.
+    heights: Vec<Pixels>,
+}
+
+#[derive(Clone, PartialEq)]
+struct TableRowHeightsKey {
+    /// `(min, max)` per column.
+    columns: Vec<(f32, f32)>,
+    text_size: f32,
+    /// Cells wrap at the same width, but a different line height still moves
+    /// every row's height.
+    line_height: f32,
+    rem_size: f32,
+    scale_factor: f32,
+    rows: usize,
 }
 
 struct TableColumnWidths {
@@ -1836,6 +2042,54 @@ pub struct TableData {
 impl Table {
     pub(crate) fn column_align(&self, index: usize) -> ColumnumnAlign {
         self.column_aligns.get(index).copied().unwrap_or_default()
+    }
+
+    /// The first cell ordinal of every row: text leaf keys are numbered across
+    /// the whole table, so the virtualized rows must start each row where the
+    /// full layout would have (claudesktop patch).
+    fn cell_ordinal_offsets(&self, col_count: usize) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.children.len());
+        let mut ordinal = 0;
+        for row in &self.children {
+            offsets.push(ordinal);
+            ordinal += row.children.len().min(col_count);
+        }
+        offsets
+    }
+
+    /// This frame's row heights under `key`, estimating rows that have not
+    /// been on screen yet (claudesktop patch).
+    fn row_heights(&self, key: &TableRowHeightsKey, estimate: Pixels) -> Arc<TableRowHeights> {
+        let mut cache = match self.row_heights_cache.0.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cached) = cache.as_ref().filter(|cached| &cached.key == key) {
+            return cached.clone();
+        }
+        let heights = Arc::new(TableRowHeights { key: key.clone(), heights: vec![estimate; key.rows] });
+        *cache = Some(heights.clone());
+        heights
+    }
+
+    /// Record a row's laid-out height for the next frame.
+    fn set_row_height(&self, key: &TableRowHeightsKey, ix: usize, height: Pixels) {
+        if height <= px(0.) {
+            return;
+        }
+        let mut cache = match self.row_heights_cache.0.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(cached) = cache.as_mut().filter(|cached| &cached.key == key) else {
+            return;
+        };
+        let heights = &mut Arc::make_mut(cached).heights;
+        if let Some(slot) = heights.get_mut(ix)
+            && (*slot - height).abs() > px(0.5)
+        {
+            *slot = height;
+        }
     }
 
     /// Serialize the table back to GFM pipe-table Markdown (`| a | b |`),
@@ -2931,6 +3185,7 @@ fn slice_backgrounds(
 }
 
 /// A table column's cell widths for layout, excluding the divider after it.
+#[derive(Clone, Copy)]
 struct TableColumn {
     /// The width that fits the content on its widest line.
     max: f32,
@@ -3600,7 +3855,17 @@ impl BlockNode {
             })
             .collect();
 
-        let rows = Self::render_table_rows(table, &columns, node_cx, window, cx);
+        // Long tables lay out only the rows the outer viewport can see
+        // (claudesktop patch); short ones keep the plain full layout.
+        let rows: AnyElement = if table.children.len() >= TABLE_VIRTUAL_MIN_ROWS {
+            Self::virtual_table_rows(table, &columns, node_cx, text_size, options, window)
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .children(Self::render_table_rows(table, &columns, node_cx, window, cx))
+                .into_any_element()
+        };
         let frame = StyleRefinement::default()
             .text_size(text_size)
             .bg(style
@@ -3641,7 +3906,7 @@ impl BlockNode {
                 // shrink-to-fit (their text wrapping), the definite
                 // `w(min_total_w)` keeps the floors once they are reached,
                 // letting the track exceed the viewport and scroll.
-                div().min_w_full().w(px(min_total_w)).children(rows),
+                div().min_w_full().w(px(min_total_w)).child(rows),
             )
             .into_any_element()
         } else {
@@ -3649,7 +3914,7 @@ impl BlockNode {
                 .w_full()
                 .overflow_hidden()
                 .refine_style(&frame)
-                .children(rows)
+                .child(rows)
                 .into_any_element()
         };
 
@@ -3717,6 +3982,37 @@ impl BlockNode {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
+        let radii = Self::table_row_corner_radii(&node_cx.style, window);
+        let offsets = table.cell_ordinal_offsets(columns.len());
+        (0..table.children.len())
+            .map(|row_ix| {
+                Self::table_row(
+                    table,
+                    columns,
+                    row_ix,
+                    offsets[row_ix],
+                    radii,
+                    node_cx,
+                    window,
+                    cx,
+                )
+            })
+            .collect()
+    }
+
+    /// One row of the column grid, shared by the full and the virtualized
+    /// table (claudesktop patch: see [`VirtualTableRows`]).
+    #[allow(clippy::too_many_arguments)]
+    fn table_row(
+        table: &Table,
+        columns: &[TableColumn],
+        row_ix: usize,
+        cell_ordinal_start: usize,
+        radii: [Option<Pixels>; 4],
+        node_cx: &NodeContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
         // The slack's share of the frame while any cell is still growing is
         // `SLACK_GROW / (cells * CELL_GROW)`, a negligible fraction of a
         // pixel. The slack factors still add up to `SLACK_GROW`: flex layout
@@ -3743,81 +4039,109 @@ impl BlockNode {
         };
 
         let row_count = table.children.len();
-        let [top_left, top_right, bottom_left, bottom_right] =
-            Self::table_row_corner_radii(style, window);
-        let mut rows = Vec::with_capacity(row_count);
-        let mut cell_ordinal = 0;
-        for (row_ix, row) in table.children.iter().enumerate() {
-            let mut cells = Vec::with_capacity(col_count * 2);
-            for (ix, column) in columns.iter().enumerate() {
-                let is_last_col = ix + 1 == col_count;
-                let align = table.column_align(ix);
-                let content = row.children.get(ix).map(|cell| {
-                    let fade_key = table
-                        .span
-                        .map(|span| TextLeafKey::table_cell(span.start, cell_ordinal));
-                    cell_ordinal += 1;
-                    cell.children.render(fade_key, node_cx, window, cx)
-                });
+        let [top_left, top_right, bottom_left, bottom_right] = radii;
+        let row = &table.children[row_ix];
+        let mut cells = Vec::with_capacity(col_count * 2);
+        let mut cell_ordinal = cell_ordinal_start;
+        for (ix, column) in columns.iter().enumerate() {
+            let is_last_col = ix + 1 == col_count;
+            let align = table.column_align(ix);
+            let content = row.children.get(ix).map(|cell| {
+                let fade_key =
+                    table.span.map(|span| TextLeafKey::table_cell(span.start, cell_ordinal));
+                cell_ordinal += 1;
+                cell.children.render(fade_key, node_cx, window, cx)
+            });
 
-                let grow = SLACK_GROW * column.max / total_w;
-                let (lead, trail) = match align {
-                    ColumnumnAlign::Left => (0., grow),
-                    ColumnumnAlign::Center => (grow / 2., grow / 2.),
-                    ColumnumnAlign::Right => (grow, 0.),
-                };
-                if lead > 0. {
-                    cells.push(slack(lead).into_any_element());
-                }
-                cells.push(
-                    div()
-                        .flex_basis(px(0.))
-                        .flex_grow(CELL_GROW)
-                        .min_w(px(column.min))
-                        .max_w(px(column.max))
-                        .overflow_hidden()
-                        .when(align == ColumnumnAlign::Center, |this| this.text_center())
-                        .when(align == ColumnumnAlign::Right, |this| this.text_right())
-                        .px_3()
-                        .py(px(7.))
-                        .refine_style(&style.table_cell())
-                        .children(content)
-                        .into_any_element(),
-                );
-                if trail > 0. || !is_last_col {
-                    cells.push(
-                        slack(trail)
-                            .when(!is_last_col, |this| this.border_r_1())
-                            .into_any_element(),
-                    );
-                }
+            let grow = SLACK_GROW * column.max / total_w;
+            let (lead, trail) = match align {
+                ColumnumnAlign::Left => (0., grow),
+                ColumnumnAlign::Center => (grow / 2., grow / 2.),
+                ColumnumnAlign::Right => (grow, 0.),
+            };
+            if lead > 0. {
+                cells.push(slack(lead).into_any_element());
             }
-            rows.push(
+            cells.push(
                 div()
-                    .w_full()
-                    .when(row_ix < row_count - 1, |this| this.border_b_1())
-                    .border_color(style.border())
-                    .flex()
-                    .flex_row()
-                    // The first row is the header, as everywhere else that
-                    // reads a table (`table_data`, `to_markdown`). The
-                    // refinement comes last so it can override the defaults.
-                    .when(row_ix == 0, |this| {
-                        this.bg(style.code_background())
-                            .text_color(style.foreground())
-                            .when_some(top_left, |this, radius| this.rounded_tl(radius))
-                            .when_some(top_right, |this, radius| this.rounded_tr(radius))
-                            .refine_style(&style.table_head())
-                    })
-                    .when(row_ix + 1 == row_count, |this| {
-                        this.when_some(bottom_left, |this, radius| this.rounded_bl(radius))
-                            .when_some(bottom_right, |this, radius| this.rounded_br(radius))
-                    })
-                    .children(cells)
+                    .flex_basis(px(0.))
+                    .flex_grow(CELL_GROW)
+                    .min_w(px(column.min))
+                    .max_w(px(column.max))
+                    .overflow_hidden()
+                    .when(align == ColumnumnAlign::Center, |this| this.text_center())
+                    .when(align == ColumnumnAlign::Right, |this| this.text_right())
+                    .px_3()
+                    .py(px(7.))
+                    .refine_style(&style.table_cell())
+                    .children(content)
                     .into_any_element(),
             );
+            if trail > 0. || !is_last_col {
+                cells.push(
+                    slack(trail)
+                        .when(!is_last_col, |this| this.border_r_1())
+                        .into_any_element(),
+                );
+            }
         }
-        rows
+        div()
+            .w_full()
+            .when(row_ix < row_count - 1, |this| this.border_b_1())
+            .border_color(style.border())
+            .flex()
+            .flex_row()
+            // The first row is the header, as everywhere else that
+            // reads a table (`table_data`, `to_markdown`). The
+            // refinement comes last so it can override the defaults.
+            .when(row_ix == 0, |this| {
+                this.bg(style.code_background())
+                    .text_color(style.foreground())
+                    .when_some(top_left, |this, radius| this.rounded_tl(radius))
+                    .when_some(top_right, |this, radius| this.rounded_tr(radius))
+                    .refine_style(&style.table_head())
+            })
+            .when(row_ix + 1 == row_count, |this| {
+                this.when_some(bottom_left, |this, radius| this.rounded_bl(radius))
+                    .when_some(bottom_right, |this, radius| this.rounded_br(radius))
+            })
+            .children(cells)
+            .into_any_element()
+    }
+
+    /// Build the virtualized row track for a long table (claudesktop patch).
+    fn virtual_table_rows(
+        table: &Table,
+        columns: &[TableColumn],
+        node_cx: &NodeContext,
+        text_size: Pixels,
+        options: &NodeRenderOptions,
+        window: &Window,
+    ) -> VirtualTableRows {
+        let style = &node_cx.style;
+        let rem_size = window.rem_size();
+        let body = TableTextStyles::new(style, window).row(1).clone();
+        // One line of cell text plus the cell's `py(7.)` and the row's bottom
+        // border: every row starts from this until it is measured on screen.
+        let estimate = body.line_height.to_pixels(body.font_size, rem_size) + px(15.);
+        VirtualTableRows {
+            id: block_element_id("table-rows", table.span, options.ix),
+            table: table.clone(),
+            columns: columns.to_vec(),
+            node_cx: node_cx.clone(),
+            radii: Self::table_row_corner_radii(style, window),
+            offsets: table.cell_ordinal_offsets(columns.len()),
+            key: TableRowHeightsKey {
+                columns: columns.iter().map(|column| (column.min, column.max)).collect(),
+                text_size: f32::from(text_size),
+                line_height: f32::from(body.line_height.to_pixels(body.font_size, rem_size)),
+                rem_size: f32::from(rem_size),
+                scale_factor: window.scale_factor(),
+                rows: table.children.len(),
+            },
+            estimate,
+            content_width: px(columns.iter().map(|column| column.max).sum::<f32>() + 2.),
+        }
     }
 
     pub(crate) fn render_block(
@@ -4553,6 +4877,7 @@ mod tests {
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
+            row_heights_cache: TableRowHeightsCache::default(),
         };
         let node_cx = NodeContext::default();
 
@@ -5002,6 +5327,7 @@ mod tests {
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
+            row_heights_cache: TableRowHeightsCache::default(),
         };
         let block = BlockNode::Table(table);
         assert_eq!(
@@ -5029,6 +5355,7 @@ mod tests {
             span: None,
             table_data_cache: TableDataCache::default(),
             column_widths_cache: TableColumnWidthsCache::default(),
+            row_heights_cache: TableRowHeightsCache::default(),
         }
     }
 
@@ -5421,4 +5748,5 @@ mod tests {
 
         assert_ne!(first, second);
     }
+
 }

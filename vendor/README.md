@@ -9,9 +9,16 @@ gpui-kit 0.7.3 的基础组件层（Markdown 的 `TextView`、表格、列表都
 删了 `.cargo-ok` / `.cargo_vcs_info.json` / `Cargo.toml.orig` / `benches/` / `tests/`，并把清单里
 对应的 `[[test]]` / `[[bench]]` 条目一并去掉，否则 `cargo` 会去找不存在的文件。
 
-**当前为零改动拷贝**：只为了让后续的表格虚拟化有个能改的落点（`src/text/node.rs` 的
-`render_table` / `render_table_rows`）。改这里之前先确认真的必须改 gpui-base——它是全项目最重的
-依赖，打补丁后每次升级 gpui-kit 都要重打。
+**当前有一处改动**（`grep -rn "claudesktop patch" vendor/gpui-base/` 核对）：
+
+- **长表格按外层视口虚拟化**（`src/text/node.rs` 的 `render_table` / `VirtualTableRows`）：48 行以上的表格
+  只布局、绘制视口内（含上下各 6 行 overscan）的行，轨道高度用行高前缀和整份报出，滚动范围和未改动时一致；
+  可见行量出的真实行高缓存在解析出的 `Table` 上，下一帧替换单行估算值（长文本换行不再抖）。
+  视口取窗口内容遮罩与表格自身边界的交集，不依赖外层 `ListState` 的滞后偏移；单元格序号按整张表算，
+  `TextLeafKey` 不变，选中 / 高亮 / 渐隐继续对齐。
+  验收：`tools/markdown-sample.md` 换成 256 行表格，`CLAUDESKTOP_OPEN=sample-reply` 配合
+  `--features headless-screenshot` 跑 `CLAUDESKTOP_STRESS=0`（300 帧滚动），帧时间 p50 / p95
+  从 57.7 / 85.2 ms 降到 24.4 / 34.5 ms（debug + 软件渲染）。
 
 ## gpui-pre 0.3.9
 
