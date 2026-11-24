@@ -1191,6 +1191,11 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    // claudesktop patch: compositor time for motion, independent of profiling.
+    fn frame_vsync_at(&self) -> Option<std::time::Instant> {
+        None
+    }
+
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;

@@ -27,6 +27,7 @@ use crate::{
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
+use crate::scene::RecordedScene;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -1042,6 +1043,7 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    translated_views: usize,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -1072,6 +1074,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    translated_views: usize,
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
     mouse_listeners_index: usize,
@@ -1098,6 +1101,7 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
+            translated_views: 0,
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -1125,6 +1129,7 @@ impl Frame {
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.translated_views = 0;
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -1284,6 +1289,12 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    // claudesktop patch: distinguish Window::refresh (including device recovery)
+    // from the temporary refresh scope of a cached parent.
+    pub(crate) refreshing_window: bool,
+    pub(crate) scroll_prepaint_recording: bool,
+    pub(crate) scroll_atlas_revision: u64,
+    settling_cached_scroll: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2185,6 +2196,10 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            refreshing_window: false,
+            scroll_prepaint_recording: false,
+            scroll_atlas_revision: 0,
+            settling_cached_scroll: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3458,6 +3473,7 @@ impl Window {
                 self.rendered_frame.input_handlers.push(Some(input_handler));
             }
         }
+        self.refreshing_window = self.refreshing;
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
@@ -3553,6 +3569,7 @@ impl Window {
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         self.refreshing = false;
+        self.refreshing_window = false;
         self.invalidator.set_phase(DrawPhase::None);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
@@ -3999,6 +4016,11 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+        self.reuse_prepaint_side_effects(range);
+    }
+
+    // claudesktop patch: keep frame-local state and dispatch nodes alive during replay.
+    fn reuse_prepaint_side_effects(&mut self, range: Range<PrepaintStateIndex>) {
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
@@ -4047,6 +4069,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            translated_views: self.next_frame.translated_views,
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.next_frame.debug_bounds_records.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
@@ -4059,13 +4082,25 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.reuse_paint_side_effects(&range, px(0.));
+        self.next_frame.translated_views +=
+            range.end.translated_views - range.start.translated_views;
+        self.next_frame.scene.replay(
+            range.start.scene_index..range.end.scene_index,
+            &self.rendered_frame.scene,
+        );
+    }
+
+    fn reuse_paint_side_effects(&mut self, range: &Range<PaintIndex>, _dy: Pixels) {
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
             [range.start.debug_bounds_index..range.end.debug_bounds_index]
         {
+            let mut bounds = *bounds;
+            bounds.origin.y += _dy;
             self.next_frame
-                .record_debug_bounds(selector.clone(), *bounds);
+                .record_debug_bounds(selector.clone(), bounds);
         }
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -4096,12 +4131,96 @@ impl Window {
                 [range.start.tab_handle_index..range.end.tab_handle_index],
         );
 
-        self.text_system
-            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
+        self.text_system.reuse_layouts(
+            range.start.line_layout_index.clone()..range.end.line_layout_index.clone(),
         );
+    }
+
+    // claudesktop patch: record clips relative to the view, then restore the
+    // actual viewport clip on hitboxes, deferred draws and scene primitives.
+    fn with_recording_mask<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let corner = px(1_000_000.);
+        self.content_mask_stack.push(ContentMask {
+            bounds: Bounds::from_corners(point(-corner, -corner), point(corner, corner)),
+        });
+        let result = f(self);
+        self.content_mask_stack.pop();
+        result
+    }
+
+    pub(crate) fn record_scroll_prepaint<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, Option<Vec<Hitbox>>) {
+        let outer = self.content_mask();
+        let start = self.prepaint_index();
+        self.scroll_prepaint_recording = true;
+        let result = self.with_recording_mask(f);
+        self.scroll_prepaint_recording = false;
+        let hitboxes = &mut self.next_frame.hitboxes[start.hitboxes_index..];
+        let deferred = &mut self.next_frame.deferred_draws[start.deferred_draws_index..];
+        let recorded = deferred.is_empty().then(|| hitboxes.to_vec());
+        for hitbox in hitboxes {
+            hitbox.content_mask = hitbox.content_mask.intersect(&outer);
+        }
+        for draw in deferred {
+            draw.content_mask = draw.content_mask.map(|mask| mask.intersect(&outer));
+        }
+        (result, recorded)
+    }
+
+    pub(crate) fn record_scroll_paint(&mut self, f: impl FnOnce(&mut Self)) -> RecordedScene {
+        let outer_clip = self.snapped_content_mask().bounds;
+        self.next_frame.scene.begin_recording(outer_clip);
+        self.with_recording_mask(f);
+        self.next_frame.scene.end_recording()
+    }
+
+    pub(crate) fn reuse_prepaint_translated(
+        &mut self,
+        hitboxes: &[Hitbox],
+        range: Range<PrepaintStateIndex>,
+        dy: Pixels,
+        outer: ContentMask<Pixels>,
+    ) {
+        self.next_frame
+            .hitboxes
+            .extend(hitboxes.iter().cloned().map(|mut hitbox| {
+                hitbox.bounds.origin.y += dy;
+                hitbox.content_mask.bounds.origin.y += dy;
+                hitbox.content_mask = hitbox.content_mask.intersect(&outer);
+                hitbox
+            }));
+        self.reuse_prepaint_side_effects(range);
+    }
+
+    pub(crate) fn reuse_paint_translated(
+        &mut self,
+        scene: &RecordedScene,
+        range: Range<PaintIndex>,
+        dy: Pixels,
+        frame_dy: Pixels,
+        outer: ContentMask<Pixels>,
+    ) {
+        let dy_scaled = ScaledPixels((dy.0 * self.scale_factor()).round());
+        let outer_clip = self.cover_bounds(outer.bounds);
+        self.reuse_paint_side_effects(&range, frame_dy);
+        self.next_frame.translated_views += 1;
+        self.next_frame
+            .scene
+            .replay_translated(scene, dy_scaled, outer_clip);
+    }
+
+    /// Whether this draw is synchronizing cached view geometry before pointer dispatch.
+    /// Scroll controllers should preserve their current position during this draw.
+    pub fn is_settling_cached_scroll(&self) -> bool {
+        self.settling_cached_scroll
+    }
+
+    // claudesktop patch: expose the current platform frame's compositor time.
+    /// The latest compositor tick consumed by this frame callback, when available.
+    pub fn frame_vsync_at(&self) -> Option<std::time::Instant> {
+        self.platform_window.frame_vsync_at()
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -5173,6 +5292,7 @@ impl Window {
 
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+        self.scroll_atlas_revision = self.scroll_atlas_revision.wrapping_add(1);
         for frame_index in 0..data.frame_count() {
             let params = RenderImageParams {
                 image_id: data.id,
@@ -5928,6 +6048,28 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        // claudesktop patch: a listener may capture absolute geometry, even
+        // when its hitbox is translated. Settle before dispatching the click
+        // or a pure horizontal scroll to an inline scrolling element. The
+        // transcript consumes any vertical delta, including diagonal trackpad input.
+        if self.rendered_frame.translated_views != 0
+            && !self.settling_cached_scroll
+            && !self.rendered_frame.mouse_listeners.is_empty()
+            && self.invalidator.not_drawing()
+            && (event.is::<crate::MouseDownEvent>()
+                || event.is::<MouseUpEvent>()
+                || event
+                    .downcast_ref::<crate::ScrollWheelEvent>()
+                    .is_some_and(|wheel| {
+                        let delta = wheel.delta.pixel_delta(px(1.));
+                        delta.x != px(0.) && delta.y == px(0.)
+                    }))
+        {
+            self.settling_cached_scroll = true;
+            self.refresh();
+            self.draw(cx).clear(cx);
+            self.settling_cached_scroll = false;
+        }
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;

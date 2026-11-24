@@ -55,6 +55,9 @@ pub struct WindowsWindowState {
 
     pub callbacks: Callbacks,
     pub frame_signal: Arc<PlatformFrameSignal>,
+    // claudesktop patch: the current tick is scoped to the request_frame callback.
+    pub vsync_clock: Arc<crate::vsync::LatestVsyncClock>,
+    pub current_vsync_at: Cell<Option<Instant>>,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_enabled: Cell<bool>,
     pub pending_surrogate: Cell<Option<u16>>,
@@ -170,6 +173,8 @@ impl WindowsWindowState {
             min_size,
             callbacks,
             frame_signal: Arc::new(PlatformFrameSignal::new()),
+            vsync_clock: Arc::new(crate::vsync::LatestVsyncClock::new()),
+            current_vsync_at: Cell::new(None),
             input_handler: Cell::new(input_handler),
             ime_enabled: Cell::new(true),
             pending_surrogate: Cell::new(pending_surrogate),
@@ -645,6 +650,11 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    // claudesktop patch: synchronous draws outside request_frame have no tick.
+    fn frame_vsync_at(&self) -> Option<Instant> {
+        self.state.current_vsync_at.get()
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.state.bounds()
     }

@@ -1,5 +1,8 @@
 use std::{
-    sync::LazyLock,
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -23,6 +26,35 @@ static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
 const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
 const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
 
+// claudesktop patch: motion uses the latest coalesced tick. The profiler keeps
+// the first signal to measure how long a frame request waited for delivery.
+pub(crate) struct LatestVsyncClock {
+    origin: Instant,
+    latest_ns: AtomicU64,
+}
+
+impl LatestVsyncClock {
+    pub(crate) fn new() -> Self {
+        Self { origin: Instant::now(), latest_ns: AtomicU64::new(0) }
+    }
+
+    pub(crate) fn record(&self, at: Instant) {
+        let Some(elapsed) = at.checked_duration_since(self.origin) else {
+            return;
+        };
+        self.latest_ns.store(elapsed.as_nanos() as u64 + 1, Ordering::Release);
+    }
+
+    pub(crate) fn take(&self) -> Option<Instant> {
+        let ns = self.latest_ns.swap(0, Ordering::AcqRel).checked_sub(1)?;
+        Some(self.origin + Duration::from_nanos(ns))
+    }
+
+    pub(crate) fn clear(&self) {
+        self.latest_ns.store(0, Ordering::Release);
+    }
+}
+
 pub(crate) struct VSyncProvider {
     interval: Duration,
     f: Box<dyn Fn() -> bool>,
@@ -38,10 +70,12 @@ impl VSyncProvider {
         Self { interval, f }
     }
 
-    pub(crate) fn wait_for_vsync(&self) -> FrameRequestSource {
+    // claudesktop patch: reuse the native wait's end time as the motion clock.
+    pub(crate) fn wait_for_vsync(&self) -> (FrameRequestSource, Option<Instant>) {
         let vsync_start = Instant::now();
         let wait_succeeded = (self.f)();
-        let elapsed = vsync_start.elapsed();
+        let at = Instant::now();
+        let elapsed = at.duration_since(vsync_start);
         // DwmFlush and DCompositionWaitForCompositorClock returns very early
         // instead of waiting until vblank when the monitor goes to sleep or is
         // unplugged (nothing to present due to desktop occlusion). We use 1ms as
@@ -52,9 +86,9 @@ impl VSyncProvider {
         if !wait_succeeded || elapsed < VSYNC_INTERVAL_THRESHOLD {
             log::trace!("VSyncProvider::wait_for_vsync() took less time than expected");
             std::thread::sleep(self.interval);
-            FrameRequestSource::LocalSchedule
+            (FrameRequestSource::LocalSchedule, None)
         } else {
-            FrameRequestSource::NativeCallback
+            (FrameRequestSource::NativeCallback, Some(at))
         }
     }
 }
@@ -98,10 +132,9 @@ mod tests {
             }),
         };
 
-        assert_eq!(
-            provider.wait_for_vsync(),
-            FrameRequestSource::NativeCallback
-        );
+        let (source, at) = provider.wait_for_vsync();
+        assert_eq!(source, FrameRequestSource::NativeCallback);
+        assert!(at.is_some());
     }
 
     #[test]
@@ -114,6 +147,20 @@ mod tests {
             }),
         };
 
-        assert_eq!(provider.wait_for_vsync(), FrameRequestSource::LocalSchedule);
+        assert_eq!(provider.wait_for_vsync(), (FrameRequestSource::LocalSchedule, None));
+    }
+
+    #[test]
+    fn motion_clock_keeps_only_the_latest_tick_until_consumed_or_cleared() {
+        let clock = LatestVsyncClock::new();
+        let first = Instant::now();
+        let second = first + Duration::from_millis(6);
+        clock.record(first);
+        clock.record(second);
+        assert_eq!(clock.take(), Some(second));
+        assert_eq!(clock.take(), None);
+        clock.record(second);
+        clock.clear();
+        assert_eq!(clock.take(), None);
     }
 }

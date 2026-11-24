@@ -1402,16 +1402,17 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
-                // claudesktop patch: 对齐绘制起点到物理像素网格。GPUI 纵向无亚像素字形
-                // （SUBPIXEL_VARIANTS_Y = 1），未对齐的浮点偏移会让相邻行和边框在不同帧跨过
-                // 0.5px 边界产生 1px 呼吸抖动；只对齐绘制坐标，不改逻辑偏移，不累积误差。
+                // claudesktop patch: Keep the logical accumulator continuous when the top
+                // item changes. Snap each draw origin independently, with a consistent
+                // half-pixel tie on both sides of the viewport.
                 let scale = window.scale_factor();
-                if scale > 0. {
-                    item_origin.y = px((item_origin.y.0 * scale).round() / scale);
-                }
                 for item in &mut layout_response.item_layouts {
+                    let mut draw_origin = item_origin;
+                    if scale > 0. {
+                        draw_origin.y = px((item_origin.y.0 * scale + 0.5).floor() / scale);
+                    }
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
+                        item.element.prepaint_at(draw_origin, window, cx);
                     });
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
@@ -1419,7 +1420,7 @@ impl StateInner {
                     {
                         if autoscroll_bounds.top() < bounds.top() {
                             let mut item_ix = item.index;
-                            let mut offset_in_item = autoscroll_bounds.top() - item_origin.y;
+                            let mut offset_in_item = autoscroll_bounds.top() - draw_origin.y;
 
                             // The requested top can sit above this item's own
                             // top. Walk into earlier items so the offset stays
@@ -1457,7 +1458,7 @@ impl StateInner {
                             let mut height = bounds.size.height - padding.top - padding.bottom;
 
                             // Account for the height of the element down until the autoscroll bottom.
-                            height -= autoscroll_bounds.bottom() - item_origin.y;
+                            height -= autoscroll_bounds.bottom() - draw_origin.y;
 
                             // Keep decreasing the scroll top until we fill all the available space.
                             while height > Pixels::ZERO {

@@ -42,6 +42,8 @@ use gpui::*;
 struct TrackedWindow {
     handle: SafeHwnd,
     frame_signal: Arc<PlatformFrameSignal>,
+    // claudesktop patch: latest compositor tick, even with profiling disabled.
+    vsync_clock: Arc<crate::vsync::LatestVsyncClock>,
 }
 
 impl TrackedWindow {
@@ -455,7 +457,7 @@ impl WindowsPlatform {
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
                 loop {
-                    let signal_source = vsync_provider.wait_for_vsync();
+                    let (signal_source, vsync_at) = vsync_provider.wait_for_vsync();
                     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     if stop.load(Ordering::Acquire) {
                         break;
@@ -478,13 +480,21 @@ impl WindowsPlatform {
                     };
                     for hwnd in all_windows.read().iter() {
                         unsafe {
-                            if let Some(signal_at) = signal_at {
-                                if IsWindowVisible(hwnd.as_raw()).as_bool()
-                                    && !IsIconic(hwnd.as_raw()).as_bool()
-                                {
-                                    hwnd.frame_signal.record(signal_at, signal_source);
+                            // claudesktop patch: hidden draws use the caller's clock.
+                            let visible = IsWindowVisible(hwnd.as_raw()).as_bool()
+                                && !IsIconic(hwnd.as_raw()).as_bool();
+                            if visible {
+                                if let Some(at) = vsync_at {
+                                    hwnd.vsync_clock.record(at);
                                 } else {
-                                    // Hidden windows may not consume WM_PAINT until shown again.
+                                    hwnd.vsync_clock.clear();
+                                }
+                                if let Some(signal_at) = signal_at {
+                                    hwnd.frame_signal.record(signal_at, signal_source);
+                                }
+                            } else {
+                                hwnd.vsync_clock.clear();
+                                if signal_at.is_some() {
                                     hwnd.frame_signal.take();
                                 }
                             }
@@ -774,6 +784,7 @@ impl Platform for WindowsPlatform {
         self.raw_window_handles.write().push(TrackedWindow {
             handle: handle.into(),
             frame_signal: window.state.frame_signal.clone(),
+            vsync_clock: window.state.vsync_clock.clone(),
         });
 
         Ok(Box::new(window))

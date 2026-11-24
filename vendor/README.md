@@ -25,12 +25,16 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
   宽度变化时保留每行原有的 `size_hint`；`set_auto_reengage(false)` 关掉「离底 1px 自动重贴」，
   由 `Session::sync_follow` 按几何 + 方向接管；`is_tail_measured` 改为「视口顶到末尾全部实测」，
   避免中间某段估高偏小时提前判定到底。
-- **绘制起点对齐物理像素网格**（`src/elements/list.rs` 的 `prepaint_items`，2026-11 scroll polish）：
-  可见项从 `bounds.origin + padding.top - offset_in_item` 起画，那个值常带小数。GPUI 纵向没有亚像素字形
-  （`SUBPIXEL_VARIANTS_Y = 1`），小数相位一变，相邻行和边框就会在不同帧跨过 0.5px 边界，看着是 1px 呼吸抖动。
-  这里只把**绘制坐标** `item_origin.y` 钉到 `round(y * scale) / scale`，逻辑偏移和各行的尺寸都不动、不累积误差；
-  配合 `Session::WheelInput` 的物理像素误差扩散，整屏文字在所有滚动帧里保持恒定相位
-  （等价于 Chromium 合成器平移整块 GPU 纹理）。
+- **虚拟列表滚动时对齐物理像素**：`src/elements/list.rs` 的 `prepaint_items` 保留连续的逻辑 Y 坐标，
+  每项 prepaint 时单独对齐绘制起点。定位自动滚动请求时使用该项的绘制起点。半物理像素统一向正方向取整，
+  让顶行切换和跨越零点时的整数物理像素位移一致。
+
+- **滚动时平移重放固定尺寸视图**：`src/view.rs` 的 `Entity::cached_scroll` 保留正文的原始坐标，
+  `src/scene.rs` 录制未受外层视口裁切的图元，`src/window.rs` 接力上一帧的布局、元素状态和输入处理器。
+  每帧沿 Y 轴按物理像素平移，再应用当前视口裁切。指针按下、抬起或纯横向滚动前同步正文布局，
+  避免命中回调使用旧坐标。整窗刷新、缩放变化和 atlas 失效都会更新快照。
+- **合成器帧时间戳**：`PlatformWindow::frame_vsync_at` 提供默认空值，`Window::frame_vsync_at` 将它转发给滚轮控制器。
+  时间戳独立于 `RequestFrameOptions` 和 profiler。
 
 ## markdown 1.0.0
 
@@ -53,6 +57,11 @@ markdown crate 换版本时：把新版发布包拷进来，重打上面的补�
 删掉本目录和根 `Cargo.toml` 的 patch 行。
 
 ## gpui-pre-windows 0.3.9
+
+- **绘制前校验失效区**：`src/events.rs` 的 `draw_window` 拿到绘制锁后立即调用 `ValidateRect`，保留绘制期间下一次 VSync 提交的失效区。重入保护仍校验已收到的 `WM_PAINT`。
+- **Windows VSync 时钟**：`src/vsync.rs` 的 `LatestVsyncClock` 用每窗一个原子槽保留最新的 `DwmFlush` 完成时刻。
+  `draw_window` 在校验失效区后取出时间戳，限当次 `request_frame` 回调使用。隐藏、最小化和 `DwmFlush` 回退时清空槽，
+  离屏节拍测量可用自己的时钟。profiler 继续使用独立的 `PlatformFrameSignal` 记录首个未消费信号。
 
 gpui 的 Windows 平台层（lib 名 `gpui_windows`），原样拷自 crates.io 发布包（删了 `Cargo.toml.orig` / `Cargo.lock`）。
 

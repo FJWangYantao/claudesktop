@@ -1333,6 +1333,11 @@ impl WindowsWindowInner {
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             return Some(0);
         };
+        // claudesktop patch: consume this paint's invalidation before drawing. A
+        // vsync can invalidate the window again while request_frame is running.
+        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+        // claudesktop patch: a subsequent compositor tick stays queued for the next draw.
+        let vsync_at = self.state.vsync_clock.take();
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
         self.state.direct_manipulation.update();
@@ -1357,6 +1362,7 @@ impl WindowsWindowInner {
             (None, FrameRequestSource::NativeCallback),
             |(at, source)| (Some(at), source),
         );
+        self.state.current_vsync_at.set(vsync_at);
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
@@ -1364,9 +1370,9 @@ impl WindowsWindowInner {
             signal_source,
         });
 
+        self.state.current_vsync_at.set(None);
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         Some(0)
     }

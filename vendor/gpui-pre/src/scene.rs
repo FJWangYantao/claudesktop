@@ -50,6 +50,18 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    // claudesktop patch: record a view before applying the viewport clip.
+    recording: Option<SceneRecording>,
+}
+
+pub(crate) struct RecordedScene {
+    ops: Vec<PaintOperation>,
+    pub(crate) has_non_unit_transform: bool,
+}
+
+struct SceneRecording {
+    outer_clip: Bounds<ScaledPixels>,
+    scene: RecordedScene,
 }
 
 #[expect(missing_docs)]
@@ -73,6 +85,13 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        // claudesktop patch: retain the original layer for translated replay.
+        let bounds = if let Some(recording) = self.recording.as_mut() {
+            recording.scene.ops.push(PaintOperation::StartLayer(bounds));
+            bounds.intersect(&recording.outer_clip)
+        } else {
+            bounds
+        };
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
         self.paint_operations
@@ -80,12 +99,30 @@ impl Scene {
     }
 
     pub fn pop_layer(&mut self) {
+        if let Some(recording) = self.recording.as_mut() {
+            recording.scene.ops.push(PaintOperation::EndLayer);
+        }
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        if let Some(recording) = self.recording.as_mut() {
+            if primitive
+                .bounds()
+                .intersect(&primitive.content_mask().bounds)
+                .is_empty()
+            {
+                return;
+            }
+            recording.scene.has_non_unit_transform |= primitive.has_non_unit_transform();
+            recording
+                .scene
+                .ops
+                .push(PaintOperation::Primitive(primitive.clone()));
+            primitive.translate_and_clip(ScaledPixels(0.), &recording.outer_clip);
+        }
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -143,6 +180,51 @@ impl Scene {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
+    // claudesktop patch: snapshots are immutable. A replay never becomes the next baseline.
+    pub(crate) fn begin_recording(&mut self, outer_clip: Bounds<ScaledPixels>) {
+        debug_assert!(self.recording.is_none());
+        self.recording = Some(SceneRecording {
+            outer_clip,
+            scene: RecordedScene {
+                ops: Vec::new(),
+                has_non_unit_transform: false,
+            },
+        });
+    }
+
+    pub(crate) fn end_recording(&mut self) -> RecordedScene {
+        self.recording.take().unwrap().scene
+    }
+
+    pub(crate) fn replay_translated(
+        &mut self,
+        scene: &RecordedScene,
+        dy: ScaledPixels,
+        outer_clip: Bounds<ScaledPixels>,
+    ) {
+        debug_assert!(self.recording.is_none());
+        debug_assert!(!scene.has_non_unit_transform);
+        let mut source_clip = outer_clip;
+        source_clip.origin.y -= dy;
+        for operation in &scene.ops {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    if primitive.bounds().intersects(&source_clip) {
+                        let mut primitive = primitive.clone();
+                        primitive.translate_and_clip(dy, &outer_clip);
+                        self.insert_primitive(primitive);
+                    }
+                }
+                PaintOperation::StartLayer(bounds) => {
+                    let mut bounds = *bounds;
+                    bounds.origin.y += dy;
+                    self.push_layer(bounds.intersect(&outer_clip));
+                }
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
@@ -232,6 +314,45 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    // claudesktop patch: sprite matrices can contain absolute coordinates.
+    fn has_non_unit_transform(&self) -> bool {
+        match self {
+            Self::MonochromeSprite(sprite) => sprite.transformation != TransformationMatrix::unit(),
+            Self::SubpixelSprite(sprite) => sprite.transformation != TransformationMatrix::unit(),
+            _ => false,
+        }
+    }
+
+    fn translate_and_clip(&mut self, dy: ScaledPixels, clip: &Bounds<ScaledPixels>) {
+        let shift_mask = |mask: &mut ContentMask<ScaledPixels>| {
+            mask.bounds.origin.y += dy;
+            mask.bounds = mask.bounds.intersect(clip);
+        };
+        let (bounds, mask) = match self {
+            Self::Quad(p) => (&mut p.bounds, &mut p.content_mask),
+            Self::Underline(p) => (&mut p.bounds, &mut p.content_mask),
+            Self::MonochromeSprite(p) => (&mut p.bounds, &mut p.content_mask),
+            Self::SubpixelSprite(p) => (&mut p.bounds, &mut p.content_mask),
+            Self::PolychromeSprite(p) => (&mut p.bounds, &mut p.content_mask),
+            Self::Surface(p) => (&mut p.bounds, &mut p.content_mask),
+            Self::Shadow(p) => {
+                p.element_bounds.origin.y += dy;
+                (&mut p.bounds, &mut p.content_mask)
+            }
+            Self::Path(p) => {
+                p.start.y += dy;
+                p.current.y += dy;
+                for vertex in &mut p.vertices {
+                    vertex.xy_position.y += dy;
+                    shift_mask(&mut vertex.content_mask);
+                }
+                (&mut p.bounds, &mut p.content_mask)
+            }
+        };
+        bounds.origin.y += dy;
+        shift_mask(mask);
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -944,6 +1065,102 @@ impl PathVertex<Pixels> {
             xy_position: self.xy_position.scale(factor),
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
+        }
+    }
+}
+
+#[cfg(test)]
+mod scroll_scene_tests {
+    use super::*;
+    use crate::px;
+
+    fn rect(left: f32, top: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(left), ScaledPixels(top)),
+            size: Size::new(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    #[test]
+    fn translated_replay_recovers_primitives_hidden_by_the_first_viewport() {
+        let viewport = rect(0., 0., 100., 100.);
+        let inner = rect(10., 100., 60., 50.);
+        let mut scene = Scene::default();
+        scene.begin_recording(viewport);
+        scene.push_layer(rect(0., 95., 120., 60.));
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds: rect(0., 120., 120., 15.),
+            content_mask: ContentMask { bounds: inner },
+            background: Background::default(),
+            border_color: Hsla::default(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        });
+        scene.pop_layer();
+        let snapshot = scene.end_recording();
+        assert!(scene.quads.is_empty());
+
+        for dy in [-60., -40., -60.] {
+            scene.clear();
+            scene.replay_translated(&snapshot, ScaledPixels(dy), viewport);
+            assert_eq!(scene.quads.len(), 1);
+            assert_eq!(scene.quads[0].bounds, rect(0., 120. + dy, 120., 15.));
+            assert_eq!(
+                scene.quads[0].content_mask.bounds,
+                rect(10., 100. + dy, 60., 50.).intersect(&viewport)
+            );
+        }
+    }
+
+    #[test]
+    fn translated_replay_moves_shadow_centers_and_every_path_coordinate() {
+        let viewport = rect(0., 0., 100., 100.);
+        let mask = ContentMask {
+            bounds: rect(10., 10., 70., 80.),
+        };
+        let mut scene = Scene::default();
+        scene.begin_recording(viewport);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(2.),
+            bounds: rect(10., 20., 30., 30.),
+            content_mask: mask,
+            corner_radii: Corners::default(),
+            color: Hsla::default(),
+            element_bounds: rect(12., 22., 26., 26.),
+            element_corner_radii: Corners::default(),
+            inset: 1,
+            pad: 0,
+        });
+        let mut path = Path::new(point(px(20.), px(30.)));
+        path.line_to(point(px(40.), px(30.)));
+        path.line_to(point(px(40.), px(50.)));
+        let mut path = path.scale(1.);
+        path.content_mask = mask;
+        for vertex in &mut path.vertices {
+            vertex.content_mask = mask;
+        }
+        let original = path.clone();
+        scene.insert_primitive(path);
+        let snapshot = scene.end_recording();
+
+        scene.clear();
+        scene.replay_translated(&snapshot, ScaledPixels(30.), viewport);
+        assert_eq!(scene.shadows[0].bounds.top(), ScaledPixels(50.));
+        assert_eq!(scene.shadows[0].element_bounds.top(), ScaledPixels(52.));
+        let path = &scene.paths[0];
+        assert_eq!(path.bounds.top(), ScaledPixels(60.));
+        assert_eq!(path.start.y, original.start.y + ScaledPixels(30.));
+        assert_eq!(path.current.y, original.current.y + ScaledPixels(30.));
+        assert_eq!(path.content_mask.bounds, rect(10., 40., 70., 60.));
+        for (vertex, original) in path.vertices.iter().zip(&original.vertices) {
+            assert_eq!(
+                vertex.xy_position.y,
+                original.xy_position.y + ScaledPixels(30.)
+            );
+            assert_eq!(vertex.content_mask.bounds, path.content_mask.bounds);
         }
     }
 }

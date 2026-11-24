@@ -1,3 +1,4 @@
+use crate::scene::RecordedScene;
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
@@ -5,6 +6,7 @@ use crate::{
     StyleRefinement, TextStyle, WeakEntity,
 };
 use crate::{Empty, Window};
+use crate::{Hitbox, Point};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
@@ -250,6 +252,22 @@ impl<T: Render> Entity<T> {
     pub fn cached(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
         ViewElement::with_type_name(self, type_name::<T>()).cached(style)
     }
+
+    /// Cache this fixed-size view, allowing vertical pixel-aligned replay while scrolling.
+    ///
+    /// Enable translation only for position-independent content without active selection or
+    /// animation. Pass false after scrolling so descendants receive their final coordinates.
+    /// Notify the entity when its content, styling, or externally supplied callbacks change.
+    #[track_caller]
+    pub fn cached_scroll(
+        self,
+        style: StyleRefinement,
+        allow_translate: bool,
+    ) -> ViewElement<Entity<T>> {
+        let mut element = self.cached(style);
+        element.scroll_cache = Some(allow_translate);
+        element
+    }
 }
 
 /// The element type for [`View`] implementations. Wraps a `View` and hooks it
@@ -259,6 +277,7 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    scroll_cache: Option<bool>,
     #[cfg(feature = "profiler")]
     view_type_name: &'static str,
     #[cfg(debug_assertions)]
@@ -281,6 +300,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            scroll_cache: None,
             #[cfg(feature = "profiler")]
             view_type_name,
             view: Some(view),
@@ -317,6 +337,25 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    scroll: Option<ScrollSnapshot>,
+}
+
+// claudesktop patch: only the frame-local ranges advance after replay. The
+// original origin, hitboxes and scene remain untouched until the next redraw.
+struct ScrollSnapshot {
+    origin: Point<Pixels>,
+    scale: f32,
+    rem: Pixels,
+    opacity: f32,
+    atlas_revision: u64,
+    hitboxes: Vec<Hitbox>,
+    scene: Option<RecordedScene>,
+    translated: Option<ScrollTranslation>,
+}
+
+struct ScrollTranslation {
+    from_recording: Pixels,
+    from_previous_frame: Pixels,
 }
 
 struct ViewElementCacheKey {
@@ -397,6 +436,7 @@ impl<V: View> Element for ViewElement<V> {
                 global_id,
                 bounds,
                 element,
+                self.scroll_cache,
                 window,
                 cx,
                 &mut |window, cx| {
@@ -510,6 +550,7 @@ fn prepaint_view(
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
+    scroll_cache: Option<bool>,
     window: &mut Window,
     cx: &mut App,
     render: &mut dyn FnMut(&mut Window, &mut App) -> AnyElement,
@@ -526,31 +567,95 @@ fn prepaint_view(
             |element_state, window| {
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
+                let scale = window.scale_factor();
+                let rem = window.rem_size();
+                let opacity = window.element_opacity();
+                let atlas_revision = window.scroll_atlas_revision;
+                let scroll_cache = scroll_cache.filter(|_| !window.scroll_prepaint_recording);
 
                 if let Some(mut element_state) = element_state
-                    && element_state.cache_key.bounds == bounds
-                    && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
-                    && !window.refreshing
                 {
+                    let snapshot = element_state.scroll.as_mut().filter(|snapshot| {
+                        scroll_cache.is_some()
+                            && !window.refreshing_window
+                            && snapshot.scale == scale
+                            && snapshot.rem == rem
+                            && snapshot.opacity == opacity
+                            && snapshot.atlas_revision == atlas_revision
+                    });
+                    let stationary = element_state.cache_key.bounds == bounds
+                        && element_state.cache_key.content_mask == content_mask
+                        && if let Some(snapshot) = snapshot.as_ref() {
+                            snapshot.translated.is_none()
+                        } else {
+                            scroll_cache.is_none() && !window.refreshing
+                        };
                     let prepaint_start = window.prepaint_index();
-                    window.reuse_prepaint(element_state.prepaint_range.clone());
-                    cx.entities
-                        .extend_accessed(&element_state.accessed_entities);
-                    let prepaint_end = window.prepaint_index();
-                    element_state.prepaint_range = prepaint_start..prepaint_end;
+                    let reused = if stationary {
+                        window.reuse_prepaint(element_state.prepaint_range.clone());
+                        true
+                    } else if let Some(snapshot) = snapshot
+                        && scroll_cache == Some(true)
+                        && bounds.origin.x == snapshot.origin.x
+                        && bounds.size == element_state.cache_key.bounds.size
+                        && snapshot
+                            .scene
+                            .as_ref()
+                            .is_some_and(|scene| !scene.has_non_unit_transform)
+                    {
+                        let dy = bounds.origin.y - snapshot.origin.y;
+                        let physical = f32::from(dy) * scale;
+                        if (physical - physical.round()).abs() < 0.02 {
+                            window.reuse_prepaint_translated(
+                                &snapshot.hitboxes,
+                                element_state.prepaint_range.clone(),
+                                dy,
+                                content_mask,
+                            );
+                            let previous_dy = snapshot
+                                .translated
+                                .as_ref()
+                                .map_or(Pixels::ZERO, |translation| translation.from_recording);
+                            snapshot.translated = Some(ScrollTranslation {
+                                from_recording: dy,
+                                from_previous_frame: dy - previous_dy,
+                            });
+                            element_state.cache_key.bounds = bounds;
+                            element_state.cache_key.content_mask = content_mask;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
 
-                    return (None, element_state);
+                    if reused {
+                        cx.entities
+                            .extend_accessed(&element_state.accessed_entities);
+                        element_state.prepaint_range = prepaint_start..window.prepaint_index();
+                        return (None, element_state);
+                    }
                 }
 
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
-                let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
+                let ((element, hitboxes), accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
                     element.layout_as_root(Size::<AvailableSpace>::from(bounds.size), window, cx);
-                    element.prepaint_at(bounds.origin, window, cx);
-                    element
+                    let hitboxes = if scroll_cache.is_some() {
+                        window
+                            .record_scroll_prepaint(|window| {
+                                element.prepaint_at(bounds.origin, window, cx);
+                            })
+                            .1
+                    } else {
+                        element.prepaint_at(bounds.origin, window, cx);
+                        None
+                    };
+                    (element, hitboxes)
                 });
 
                 let prepaint_end = window.prepaint_index();
@@ -562,6 +667,16 @@ fn prepaint_view(
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
+                        scroll: hitboxes.map(|hitboxes| ScrollSnapshot {
+                            origin: bounds.origin,
+                            scale,
+                            rem,
+                            opacity,
+                            atlas_revision,
+                            hitboxes,
+                            scene: None,
+                            translated: None,
+                        }),
                         cache_key: ViewElementCacheKey {
                             bounds,
                             content_mask,
@@ -608,8 +723,24 @@ fn paint_view(
 
                     if let Some(element) = element {
                         let refreshing = mem::replace(&mut window.refreshing, true);
-                        element.paint(window, cx);
+                        if let Some(scroll) = &mut element_state.scroll {
+                            scroll.scene = Some(window.record_scroll_paint(|window| {
+                                element.paint(window, cx);
+                            }));
+                        } else {
+                            element.paint(window, cx);
+                        }
                         window.refreshing = refreshing;
+                    } else if let Some(scroll) = &element_state.scroll
+                        && let Some(translation) = &scroll.translated
+                    {
+                        window.reuse_paint_translated(
+                            scroll.scene.as_ref().unwrap(),
+                            element_state.paint_range.clone(),
+                            translation.from_recording,
+                            translation.from_previous_frame,
+                            element_state.cache_key.content_mask,
+                        );
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
                     }
@@ -636,4 +767,230 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.as_mut().unwrap().paint(window, cx);
     });
+}
+
+#[cfg(test)]
+mod scroll_cache_tests {
+    use crate::{
+        self as gpui, AppContext, Context, Entity, InteractiveElement as _, IntoElement,
+        ListAlignment, ListOffset, ListState, Modifiers, MouseButton, ParentElement as _, Pixels,
+        Render, ScrollDelta, ScrollWheelEvent, StyleRefinement, Styled as _, TestAppContext,
+        TouchPhase, Window, canvas, div, fill, list, point, px, rgb,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct Body {
+        rendered: Rc<Cell<usize>>,
+        top: Rc<Cell<Pixels>>,
+        clicked_at: Rc<Cell<Option<Pixels>>>,
+    }
+
+    impl Render for Body {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.rendered.set(self.rendered.get() + 1);
+            let top = self.top.clone();
+            let clicked_at = self.clicked_at.clone();
+            let paint = canvas(
+                move |bounds, _, _| top.set(bounds.top()),
+                |bounds, _, window, _| window.paint_quad(fill(bounds, rgb(0x524321))),
+            )
+            .h(px(20.))
+            .w_full();
+            div()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, {
+                    let top = self.top.clone();
+                    move |_, _, _| clicked_at.set(Some(top.get()))
+                })
+                .child(paint)
+        }
+    }
+
+    struct Scroller {
+        body: Entity<Body>,
+        top: Pixels,
+        moving: bool,
+    }
+
+    impl Render for Scroller {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .w(px(120.))
+                .h(px(80.))
+                .overflow_hidden()
+                .child(div().absolute().top(self.top).left_0().child(
+                    self.body.clone().cached_scroll(
+                        StyleRefinement::default().w(px(100.)).h(px(60.)),
+                        self.moving,
+                    ),
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn cached_scroll_replays_then_settles_before_pointer_dispatch(cx: &mut TestAppContext) {
+        let rendered = Rc::new(Cell::new(0));
+        let top = Rc::new(Cell::new(px(0.)));
+        let clicked_at = Rc::new(Cell::new(None));
+        let (root, cx) = cx.add_window_view(|_, cx| Scroller {
+            body: cx.new(|_| Body {
+                rendered: rendered.clone(),
+                top: top.clone(),
+                clicked_at: clicked_at.clone(),
+            }),
+            top: px(-15.),
+            moving: false,
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(top.get(), px(-15.));
+        let initial = rendered.get();
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.top = px(15.);
+                root.moving = true;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(rendered.get(), initial);
+        assert_eq!(top.get(), px(-15.));
+        for (x, y) in [(0.25, 7.), (-1., -9.), (5., 1.)] {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(5.), px(20.)),
+                delta: ScrollDelta::Pixels(point(px(x), px(y))),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+        }
+        assert_eq!(
+            rendered.get(),
+            initial,
+            "diagonal input must not settle the window"
+        );
+        cx.simulate_mouse_down(
+            point(px(5.), px(20.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(clicked_at.get(), Some(px(15.)));
+        assert!(rendered.get() > initial);
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.top = px(25.);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(top.get(), px(15.));
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.moving = false;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(top.get(), px(25.));
+
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.top = px(35.);
+                root.moving = true;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(top.get(), px(25.));
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(5.), px(40.)),
+            delta: ScrollDelta::Pixels(point(px(12.), px(0.))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        assert_eq!(
+            top.get(),
+            px(35.),
+            "horizontal scroll must settle before dispatch"
+        );
+
+        let before_force = rendered.get();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(rendered.get(), before_force + 1);
+    }
+
+    struct CachedList {
+        state: ListState,
+        rows: Vec<Entity<Body>>,
+    }
+
+    impl Render for CachedList {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let rows = self.rows.clone();
+            list(self.state.clone(), move |ix, _, _| {
+                rows[ix]
+                    .clone()
+                    .cached_scroll(StyleRefinement::default().w_full().h(px(22.25)), true)
+                    .into_any_element()
+            })
+            .w(px(120.))
+            .h(px(64.))
+        }
+    }
+
+    #[gpui::test]
+    fn cached_scroll_preserves_device_phase_across_top_item_at_150_percent(
+        cx: &mut TestAppContext,
+    ) {
+        let state = ListState::new(6, ListAlignment::Top, px(0.));
+        let counts = (0..6).map(|_| Rc::new(Cell::new(0))).collect::<Vec<_>>();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            window.set_scale_factor(1.5);
+            state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(21.),
+            });
+            CachedList {
+                state: state.clone(),
+                rows: counts
+                    .iter()
+                    .map(|count| {
+                        cx.new(|_| Body {
+                            rendered: count.clone(),
+                            top: Rc::new(Cell::new(px(0.))),
+                            clicked_at: Rc::new(Cell::new(None)),
+                        })
+                    })
+                    .collect(),
+            }
+        });
+
+        let first_painted_top = |window: &Window| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .map(|quad| quad.bounds.top().0)
+                .min_by(f32::total_cmp)
+                .unwrap()
+        };
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(state.logical_scroll_top().item_ix, 0);
+            assert_eq!(first_painted_top(window), 2.);
+        });
+        let retained_rows = [counts[1].get(), counts[2].get()];
+        cx.update(|window, cx| {
+            state.scroll_by(px(2.)); // Three device pixels, crossing item 0's bottom.
+            window.draw(cx).clear(cx);
+            assert_eq!(state.logical_scroll_top().item_ix, 1);
+            assert_eq!(first_painted_top(window), -1.);
+        });
+        assert_eq!([counts[1].get(), counts[2].get()], retained_rows);
+    }
 }
