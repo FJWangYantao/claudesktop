@@ -2212,6 +2212,10 @@ impl ChatApp {
         // 刚跑完的工具：确认底部驻留 1.5 秒时仍显示最终输出
         let mut linger_tool = None;
         match kind {
+            // 仅状态行「正在处理」：去掉预设的占位回复，让当前轮停在工作等待态
+            "working" => {
+                s.transcript.pop();
+            }
             // 单条命令、还没有输出：确认 `No output` 和命令首行
             "tool-empty" => {
                 s.transcript

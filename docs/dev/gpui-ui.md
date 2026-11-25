@@ -172,7 +172,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
   - 「进行中」使用统一的圆弧转圈 `motion::spinner()`（`canvas` + `PathBuilder` 矢量画）和少量线性状态图标；
     不使用卡通形象或品牌 Logo；左上角标题为「Kimi Code」，运行状态使用线性图标或统一圆弧。
-    思考中的扫光用 `shimmer_text()`（按像素分档着色）。
+    思考中和底部进行中状态行的扫光用 `shimmer_text()`（按像素分档着色）。
     内容区里的转圈和扫光只是占位格（prepaint 记位置），由叠在内容区上的 `motion::LoopOverlay` 画，节拍器只重画它、不重画整页对话；
     内容区以外自己就是小覆盖层的 view（侧栏转圈）用 `spinner_in_place`。
     转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：

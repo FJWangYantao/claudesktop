@@ -8,7 +8,7 @@
 
 use super::ChatApp;
 use super::mascot::Mood;
-use super::motion::mascot;
+use super::motion::{mascot, shimmer_text};
 use crate::model::{ChatItem, ToolCard, ViewMode, tool_icon};
 use crate::session::{
     Activity, LIVE_CMD_PREVIEW_LINES, LIVE_PARALLEL_MAX, LIVE_THINK_LINES, LivePreviewContent,
@@ -45,10 +45,21 @@ impl ChatApp {
                         .h_flex()
                         .items_center()
                         .gap_1p5()
+                        .min_w_0()
                         .text_size(TEXT_SMALL)
                         .text_color(rgb(INK_SOFT))
                         .child(mascot(Mood::Scan))
-                        .child("正在准备 worktree（现在发的话会等它建好再发）…"),
+                        .child(
+                            shimmer_text(
+                                "正在准备 worktree（现在发的话会等它建好再发）…",
+                                INK_SOFT,
+                                INK,
+                            )
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap(),
+                        ),
                 );
             }
             // 续接历史会话（内核在重建上下文，好了才把消息发出去）：只在这里说一声，接上了就消失
@@ -57,32 +68,44 @@ impl ChatApp {
                     .h_flex()
                     .items_center()
                     .gap_1p5()
+                    .min_w_0()
                     .text_size(TEXT_SMALL)
                     .text_color(rgb(INK_SOFT))
                     .child(mascot(Mood::Wake))
-                    .child("正在续接会话…")
+                    .child(
+                        shimmer_text("正在续接会话…", INK_SOFT, INK)
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap(),
+                    )
             });
         }
         let activity = s.activity();
-        // 左边是统一的几何状态指示；等授权要用户处理，文字是红的。
-        let (mood, label) = match activity {
-            Activity::WaitingPermission => {
-                (Mood::Ask, div().text_color(rgb(RED)).child("等待你授权"))
-            }
-            Activity::WaitingQuestion => {
-                (Mood::Ask, div().text_color(rgb(CORAL_DEEP)).child("等你的回答"))
-            }
+        // 左边是统一的几何状态指示；等授权要用户处理，文字是红的；进行中的活动带扫光。
+        let (mood, text, color): (Mood, SharedString, Option<Color>) = match activity {
+            Activity::WaitingPermission => (Mood::Ask, "等待你授权".into(), Some(RED)),
+            Activity::WaitingQuestion => (Mood::Ask, "等你的回答".into(), Some(CORAL_DEEP)),
             // 限流 / 5xx：内核自己会重发，告诉用户在等什么、还要等多久（不然看着像卡死）
             Activity::Retrying => (
                 Mood::Sweat,
-                div().child(s.retry.as_ref().map_or_else(String::new, |r| {
+                s.retry.as_ref().map_or_else(SharedString::default, |r| {
                     retry_label(r.status, r.attempt, r.at.saturating_duration_since(Instant::now()))
-                })),
+                        .into()
+                }),
+                None,
             ),
-            Activity::Compacting => (Mood::Squish, div().child("正在压缩上下文")),
-            Activity::Replying => (Mood::Talk, div().child("正在回复")),
+            Activity::Compacting => (Mood::Squish, "正在压缩上下文".into(), None),
+            Activity::Replying => (Mood::Talk, "正在回复".into(), None),
             // 说清楚此刻在做什么，而不是每轮换一个随机动词
-            Activity::Working => (Mood::Think, div().child(working_label(s).into_owned())),
+            Activity::Working => (Mood::Think, working_label(s).into_owned().into(), None),
+        };
+        let label = if activity_shimmers(activity) {
+            shimmer_text(text, INK_SOFT, INK)
+        } else if let Some(color) = color {
+            div().text_color(rgb(color)).child(text)
+        } else {
+            div().child(text)
         };
         let mut meta: Vec<(String, Option<String>, Color)> = s
             .turn_started
@@ -401,6 +424,11 @@ fn output_sig(text: &str) -> u64 {
     h.finish()
 }
 
+/// 进行中的状态文案带扫光；等用户操作或错误重试保持静态文字。
+const fn activity_shimmers(activity: Activity) -> bool {
+    matches!(activity, Activity::Compacting | Activity::Replying | Activity::Working)
+}
+
 /// 进程中状态的文字：并行 / 单个工具 / 正在思考（都没有就等模型）。
 fn working_label(s: &Session) -> Cow<'static, str> {
     let running = s.running_tools_in_turn();
@@ -636,5 +664,15 @@ mod tests {
         assert_eq!(turn_meta(&t).unwrap(), "用时 3 秒");
         let t = TurnSummary { elapsed_ms: None, usage: TurnUsage::default() };
         assert_eq!(turn_meta(&t), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn activity_shimmers_only_for_active_progress() {
+        assert!(activity_shimmers(Activity::Working));
+        assert!(activity_shimmers(Activity::Replying));
+        assert!(activity_shimmers(Activity::Compacting));
+        assert!(!activity_shimmers(Activity::WaitingPermission));
+        assert!(!activity_shimmers(Activity::WaitingQuestion));
+        assert!(!activity_shimmers(Activity::Retrying));
     }
 }

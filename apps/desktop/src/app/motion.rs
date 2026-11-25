@@ -321,7 +321,7 @@ pub(super) fn mascot(mood: Mood) -> Div {
     div().size_5().flex_shrink_0().flex().justify_center().items_center().child(icon.size_4())
 }
 
-/// 扫光文字（「思考中…」）：`base` 色的字上一道 `highlight` 色的柔和高光从左扫到右，约 30 帧。
+/// 扫光文字（「思考中…」、底部进行中状态行）：`base` 色的字上一道 `highlight` 色的柔和高光从左扫到右，约 60 帧。
 /// 按像素位置着色：高光强度是余弦钟形，切成 [`SHIMMER_LEVELS`] 档同心竖条，每档用一种颜色
 /// 画一遍文字、裁到自己那条（各条不重叠，字形边缘不会被叠画加粗）。排版靠一份透明的同样文字。
 /// 减少动态效果时整段都是 `base` 色。
