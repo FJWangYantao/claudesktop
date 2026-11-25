@@ -10,6 +10,8 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+# 只保留常读语言；java/kotlin/lua/php/ruby/zig/make/jsdoc 已裁掉以省冷编时间与体积，
+# 这些语言的代码块退化为纯文本。要恢复时加回对应 feature，syntax.rs 的别名表无需改。
 gpui-kit = { version = "0.7.3", features = [
     "tree-sitter",
     "tree-sitter-bash",
@@ -19,23 +21,15 @@ gpui-kit = { version = "0.7.3", features = [
     "tree-sitter-diff",
     "tree-sitter-go",
     "tree-sitter-html",
-    "tree-sitter-java",
     "tree-sitter-javascript",
-    "tree-sitter-jsdoc",
-    "tree-sitter-kotlin",
-    "tree-sitter-lua",
-    "tree-sitter-make",
     "tree-sitter-markdown",
-    "tree-sitter-php",
     "tree-sitter-python",
-    "tree-sitter-ruby",
     "tree-sitter-rust",
     "tree-sitter-sql",
     "tree-sitter-toml",
     "tree-sitter-tsx",
     "tree-sitter-typescript",
     "tree-sitter-yaml",
-    "tree-sitter-zig",
 ] }
 agent-client-protocol = "3"
 anyhow = "1"
@@ -45,6 +39,14 @@ futures = "0.3"
 smol = "2"
 
 # 打过补丁的 gpui：中文避头尾（gpui-pre）、文字纵向位置不算 lineGap（gpui-pre-windows）。改了什么、怎么升级见 vendor/README.md
+[profile.dev]
+# 只保留文件名与行号，panic 栈仍可读，体积与链接耗时明显下降
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# 第三方/vendor 依赖不生成调试符号（体积与链接耗时的主要来源）
+debug = false
+
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
