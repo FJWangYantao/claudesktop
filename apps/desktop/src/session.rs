@@ -116,6 +116,9 @@ pub struct Session {
     /// 会话跑在自己的 git worktree 里（`cwd` 就是 worktree 目录）：侧栏仍归到主项目组，
     /// 顶栏的分支 chip 用它（见 `app/worktree.rs`）
     pub worktree: Option<claudesktop_core::WorktreeMeta>,
+    /// 主工作目录的当前分支（后台读取，不持久化）；worktree 会话由上面的元信息显示
+    pub git_branch: Option<SharedString>,
+    pub git_detached: bool,
     /// 正在后台建 worktree（建好了 `worktree` 才有值）：目录 chip 显示转圈，消息先排队
     pub worktree_busy: Option<String>,
     /// worktree 的最新状态（脏了几个文件、领先 / 落后）：`None` 内的 `None` = 还没读到，
@@ -441,6 +444,8 @@ impl Session {
             pending_web: None,
             task: false,
             worktree: None,
+            git_branch: None,
+            git_detached: false,
             worktree_busy: None,
             worktree_state: None,
             worktree_blocker: None,
@@ -947,10 +952,10 @@ impl Session {
         self.turn_summaries.get(&user)
     }
 
-    /// `ix` 是不是一轮回复的最后一段正文：它后面（跳过备注）紧跟用户消息，
+    /// `ix` 是不是一轮回复的最后一段正文：它后面（跳过备注和纯空白正文）紧跟用户消息，
     /// 或者它就是最后一段且这一轮已经结束。这样的回复下面挂「复制」等操作。
     pub fn is_turn_end(&self, ix: usize) -> bool {
-        if !matches!(self.transcript.get(ix), Some(ChatItem::Agent(_))) {
+        if !matches!(self.transcript.get(ix), Some(ChatItem::Agent(t)) if !t.trim().is_empty()) {
             return false;
         }
         match self.transcript[ix + 1..].iter().find(|i| {
@@ -960,7 +965,7 @@ impl Session {
                     | ChatItem::Failed { .. }
                     | ChatItem::Compaction { .. }
                     | ChatItem::Question { .. }
-            )
+            ) && !matches!(i, ChatItem::Agent(t) if t.trim().is_empty())
         }) {
             Some(ChatItem::User { .. }) => true,
             Some(_) => false,
@@ -989,7 +994,10 @@ impl Session {
         if end == t.len() && self.busy {
             return false;
         }
-        if t[start..end].iter().any(|i| matches!(i, ChatItem::Agent(_))) {
+        if t[start..end]
+            .iter()
+            .any(|i| matches!(i, ChatItem::Agent(text) if !text.trim().is_empty()))
+        {
             return false;
         }
         !t[ix + 1..end].iter().any(|i| i.visible_in(view) && i.has_content())
@@ -1133,6 +1141,11 @@ impl Session {
     pub fn has_user_message(&self) -> bool {
         (!self.history_loaded && self.meta.is_some())
             || self.transcript.iter().any(|i| matches!(i, ChatItem::User { .. }))
+    }
+
+    /// 项目和分支只在还没开始对话时提供切换；worktree 建立期间保留进度。
+    pub fn show_context_bar(&self) -> bool {
+        !self.is_chat() && (!self.has_user_message() || self.worktree_busy.is_some())
     }
 
     /// 能否在空闲回收时断开外部 agent；任何待发送、待应答或进行中的状态都排除。
@@ -1380,7 +1393,9 @@ impl Session {
         let running =
             turn.iter().any(|i| matches!(i, ChatItem::Tool(c) if c.phase == ToolPhase::Running));
         match turn.last() {
-            Some(ChatItem::Agent(_)) if !running => Activity::Replying,
+            Some(ChatItem::Agent(text)) if !running && !text.trim().is_empty() => {
+                Activity::Replying
+            }
             _ => Activity::Working,
         }
     }
@@ -1603,6 +1618,12 @@ impl Session {
                     buf.push_str(&text)
                 }
                 Some(ChatItem::Agent(buf)) => buf.push_str(&text),
+                _ if text.trim().is_empty() => {
+                    // 模型在工具调用之间常吐出纯换行/空白：不单独起一条空白正文，
+                    // 免得拆断连续过程组并在界面留下空白行
+                    self.stream_flushed_at = Instant::now();
+                    return;
+                }
                 _ if before_first_prompt => {
                     self.transcript.push(ChatItem::Info { text, open: false })
                 }
@@ -1992,6 +2013,26 @@ mod tests {
 
     // 注意：本文件顶层 `use gpui_kit::*` 会把 gpui 的 test 宏带进作用域，
     // 遮蔽内建 #[test]，必须用全路径（原文件其他测试同理）。
+
+    /// 项目 / 分支顶盖只在 Code 空会话显示；开始对话后收起，建 worktree 期间例外。
+    #[core::prelude::v1::test]
+    fn context_bar_only_before_the_first_message() {
+        let code =
+            || Session::of_kind(1, KernelChoice::Demo, PathBuf::from("/proj"), SessionKind::Code);
+        let mut s = code();
+        assert!(s.show_context_bar());
+        s.transcript.push(ChatItem::User {
+            text: "开始".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        assert!(!s.show_context_bar());
+        s.worktree_busy = Some("claudesktop/1".into());
+        assert!(s.show_context_bar());
+        let chat =
+            Session::of_kind(2, KernelChoice::Demo, PathBuf::from("/chat"), SessionKind::Chat);
+        assert!(!chat.show_context_bar());
+    }
 
     /// 渐隐跟着滚动位置收放：滚不动时两条都不画（不然最后一行会被底下那条盖住一截）。
     #[core::prelude::v1::test]
@@ -4624,5 +4665,168 @@ mod tests {
         let l = s.compute_layout(ViewMode::Summary);
         assert!(l[0].head.unwrap().open);
         assert!(l[0].body && l[1].body);
+    }
+
+    #[core::prelude::v1::test]
+    fn flush_stream_skips_standalone_whitespace_agent_chunks() {
+        let mut s = live_test_session();
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.begin_turn();
+        s.apply_event(read("a"), None);
+        // 工具之后单独收到纯换行：不新建空白正文，也不置 stream_dirty
+        s.apply_event(KernelEvent::AgentMessageChunk { text: "\n\n  ".into() }, None);
+        s.flush_stream();
+        assert_eq!(s.transcript.len(), 2);
+        assert!(!s.take_stream_dirty());
+
+        // 已有正文时保留段落间换行
+        s.apply_event(KernelEvent::AgentMessageChunk { text: "第一段".into() }, None);
+        s.flush_stream();
+        assert!(s.take_stream_dirty());
+        s.apply_event(KernelEvent::AgentMessageChunk { text: "\n\n".into() }, None);
+        s.flush_stream();
+        s.apply_event(KernelEvent::AgentMessageChunk { text: "第二段".into() }, None);
+        s.flush_stream();
+        assert!(matches!(s.transcript.last(), Some(ChatItem::Agent(t)) if t == "第一段\n\n第二段"));
+    }
+
+    #[core::prelude::v1::test]
+    fn blank_agent_items_do_not_split_groups_or_steal_turn_end() {
+        let mut s = live_test_session();
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.begin_turn();
+        s.apply_event(read("a"), None);
+        s.transcript.push(ChatItem::Agent("\n\n".into()));
+        s.apply_event(read("b"), None);
+
+        // 空白正文在末尾时不误判为 Replying
+        s.transcript.push(ChatItem::Agent("   \n".into()));
+        assert_eq!(s.activity(), Activity::Working);
+
+        // Normal 与 Summary 下空白正文透明桥接，前后工具合成一组且保持 live
+        for view in [ViewMode::Normal, ViewMode::Summary] {
+            let l = s.compute_layout(view);
+            assert!(l[1].head.is_some());
+            assert!(l[1].head.unwrap().live);
+            assert_eq!(l[1].head.unwrap().end, 5);
+            assert!(!l[2].body && l[2].head.is_none());
+            assert!(!l[4].body && l[4].head.is_none());
+        }
+
+        // 真实正文之后再跟一条空白正文：is_turn_end 仍在真实正文上
+        s.transcript.push(ChatItem::Agent("正文".into()));
+        s.transcript.push(ChatItem::Agent("\n\n".into()));
+        s.busy = false;
+        assert!(s.is_turn_end(5));
+        assert!(!s.is_turn_end(6));
+    }
+
+    #[core::prelude::v1::test]
+    fn summary_mode_groups_edits_without_flashing_and_shows_only_unpreviewed_pending_permission() {
+        let mut s = live_test_session();
+        s.transcript.push(ChatItem::User {
+            text: "q".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.begin_turn();
+        s.apply_event(read("a.rs"), None);
+        s.apply_event(
+            KernelEvent::ToolCallStarted {
+                id: "e1".into(),
+                title: "Edit b.rs".into(),
+                status: "in_progress".into(),
+                kind: "edit".into(),
+                parent: None,
+            },
+            None,
+        );
+        s.apply_event(
+            KernelEvent::ToolCallDiff {
+                id: "e1".into(),
+                diff: DiffView::compute("b.rs", Some("x\n"), "y\n"),
+            },
+            None,
+        );
+        s.apply_event(
+            KernelEvent::PlanReplaced {
+                entries: vec![claudesktop_core::PlanEntryView {
+                    content: "步骤一".into(),
+                    priority: "medium".into(),
+                    status: "in_progress".into(),
+                }],
+            },
+            None,
+        );
+
+        // 自动放行（无待定权限）时，运行中带 diff 的 Edit 不闪出，直接收在过程组里
+        let l = s.compute_layout(ViewMode::Summary);
+        assert!(!l[2].body);
+        let head = l[1].head.expect("过程组头");
+        assert_eq!(head.end, 4);
+
+        // 没有 hunks 预览的待定权限请求（ACP）：此时露出运行中的 Edit diff 卡片
+        s.apply_event(
+            KernelEvent::PermissionRequest {
+                id: 1,
+                title: "Edit b.rs".into(),
+                options: vec![PermissionOptionView {
+                    id: "allow".into(),
+                    name: "允许".into(),
+                    kind: "allow_once".into(),
+                }],
+                tool: Some("e1".into()),
+                hunks: None,
+            },
+            None,
+        );
+        let l = s.compute_layout(ViewMode::Summary);
+        assert!(l[2].body);
+
+        // 带 hunks 按块预览的待定权限请求（自研内核）：Edit 不重复露出第二份 diff
+        if let Some(ChatItem::Permission { hunks, .. }) = s.transcript.get_mut(4) {
+            *hunks = Some(claudesktop_core::PermissionHunks { files: Vec::new() });
+        }
+        let l = s.compute_layout(ViewMode::Summary);
+        assert!(!l[2].body);
+
+        // 应答、Edit 完成并接上 Bash 后，整段合并进一个过程组；摘要统计到「编辑 1 次」，点开可看到 Edit
+        if let Some(ChatItem::Permission { resolved, .. }) = s.transcript.get_mut(4) {
+            *resolved = Some("允许".into());
+        }
+        s.merge_permission(4);
+        s.apply_event(
+            KernelEvent::ToolCallUpdated {
+                id: "e1".into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: None,
+                output: None,
+            },
+            None,
+        );
+        s.apply_event(bash_running("cargo test"), None);
+        s.apply_event(bash_done("cargo test"), None);
+        let l = s.compute_layout(ViewMode::Summary);
+        let head = l[1].head.expect("合并后的过程组头");
+        assert_eq!(head.end, 6);
+        assert!(!l[2].body && !l[3].body && !l[4].body && !l[5].body);
+        let (summary, _) =
+            group_summary(s.transcript[1..head.end].iter().filter(|i| i.has_content()));
+        assert!(summary.contains("编辑 1 次"), "实际摘要: {summary}");
+
+        s.toggle_group(1);
+        let l = s.compute_layout(ViewMode::Summary);
+        assert!(l[1].body && l[1].nested);
+        assert!(l[2].body && l[2].nested);
+        assert!(l[5].body && l[5].nested);
     }
 }

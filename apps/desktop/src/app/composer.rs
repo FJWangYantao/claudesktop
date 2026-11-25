@@ -1,9 +1,9 @@
 //! 底部输入区（多行输入，下方一行权限模式 / 附件 / 模型 / 发送）与导出、附件等动作。
 
-use super::ChatApp;
 use super::chrome::CHROME_H;
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::widgets::Surface;
+use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
 use crate::theme::rgb;
 use crate::theme::*;
@@ -324,7 +324,193 @@ impl ChatApp {
         self.input.update(cx, |_, cx| cx.notify());
     }
 
-    pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// 输入框顶盖：空 Code 会话里选项目、切分支；开始对话后整条收起。
+    fn render_context_bar(&self, cx: &mut Context<Self>) -> Div {
+        let app = cx.entity();
+        let s = self.session();
+        let task = s.task;
+        let (icon, label) = if task {
+            (IconAll::ListTodo, SharedString::from("任务"))
+        } else {
+            (IconAll::Folder, project_label(s.group_dir()))
+        };
+        let project = menu_popover(
+            "composer-project-menu",
+            Anchor::BottomLeft,
+            rems(18.),
+            &app,
+            &self.menu_focus,
+            MenuChip::new(icon, label).id("composer-project-chip").on_sand().shrink(),
+            project_menu_items,
+        )
+        .default_open(
+            cfg!(feature = "headless-screenshot")
+                && std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("project-menu"),
+        );
+
+        let branch = if task {
+            None
+        } else if let Some(branch) = &s.worktree_busy {
+            Some(
+                div()
+                    .h_flex()
+                    .flex_shrink_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .items_center()
+                    .gap_1p5()
+                    .py_1()
+                    .px_1()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK_SOFT))
+                    .child(super::motion::spinner_in_place())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(format!("正在建 worktree {branch}…")),
+                    )
+                    .into_any_element(),
+            )
+        } else if let Some(meta) = &s.worktree {
+            let refresh = app.clone();
+            Some(
+                menu_popover(
+                    "composer-worktree-menu",
+                    Anchor::BottomLeft,
+                    rems(21.),
+                    &app,
+                    &self.menu_focus,
+                    MenuChip::new(IconAll::GitBranch, meta.branch.clone())
+                        .id("composer-branch-chip")
+                        .on_sand()
+                        .mono()
+                        .pill()
+                        .shrink(),
+                    ChatApp::worktree_menu_items,
+                )
+                .on_open_change(move |open, _, cx| {
+                    if *open {
+                        let active = refresh.read(cx).active;
+                        refresh.update(cx, |app, cx| app.refresh_worktree(active, cx));
+                    }
+                })
+                .into_any_element(),
+            )
+        } else if let Some(name) = &s.git_branch {
+            let detached = s.git_detached;
+            let refresh = app.clone();
+            let chip = menu_popover(
+                "composer-branch-menu",
+                Anchor::BottomLeft,
+                rems(16.),
+                &app,
+                &self.menu_focus,
+                MenuChip::new(IconAll::GitBranch, name.clone())
+                    .id("composer-branch-chip")
+                    .on_sand()
+                    .mono()
+                    .pill()
+                    .shrink(),
+                branch_menu_items,
+            )
+            .on_open_change(move |open, _, cx| {
+                if *open {
+                    refresh.update(cx, |app, cx| app.fetch_branches_for_menu(cx));
+                }
+            })
+            .default_open(
+                cfg!(feature = "headless-screenshot")
+                    && std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("branch-menu"),
+            )
+            .into_any_element();
+            Some(if detached {
+                div()
+                    .id("composer-detached-branch")
+                    .min_w_0()
+                    .flex_shrink_1()
+                    .tooltip(|window, cx| {
+                        Tooltip::new("当前是游离 HEAD：不在任何分支上").build(window, cx)
+                    })
+                    .child(chip)
+                    .into_any_element()
+            } else {
+                chip
+            })
+        } else {
+            None
+        };
+
+        div()
+            .h_flex()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .mx(COMPOSER_RADIUS)
+            .px_2p5()
+            .py_1()
+            // 由后画的输入卡片盖住这 1px，上沿只留中间一条接缝
+            .mb(px(-1.))
+            .rounded_tl(COMPOSER_INNER_RADIUS)
+            .rounded_tr(COMPOSER_INNER_RADIUS)
+            .bg(rgb(SIDEBAR))
+            .border_t_1()
+            .border_l_1()
+            .border_r_1()
+            .border_color(rgb(LINE))
+            .when(!task, |d| {
+                d.child(
+                    div()
+                        .size(px(5.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(rgb(if s.worktree.is_some() { GREEN } else { CORAL })),
+                )
+            })
+            .child(project)
+            .when_some(branch, |d, branch| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_FAINT))
+                        .child("/"),
+                )
+                .child(branch)
+            })
+            .child(div().flex_1())
+            .child(Self::render_grip_dots())
+    }
+
+    /// 顶盖右端静态微点阵（3×2），按容器中心排布，不请求动画帧。
+    fn render_grip_dots() -> impl IntoElement {
+        canvas(
+            |_, _, _| {},
+            |bounds, _, window, _| {
+                let color = with_alpha(rgb(INK_FAINT), 0.55);
+                let (radius, gap) = (px(1.1), px(4.));
+                let span = point(gap * 2., gap);
+                let start = bounds.center() - span * 0.5;
+                for col in 0..3 {
+                    for row in 0..2 {
+                        super::motion::paint_dot(
+                            start + point(gap * col as f32, gap * row as f32),
+                            radius,
+                            color,
+                            window,
+                        );
+                    }
+                }
+            },
+        )
+        .flex_shrink_0()
+        .w(rems(0.75))
+        .h(rems(0.5))
+    }
+
+    pub(super) fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
         let busy = self.session().busy;
         let mode_name: SharedString = self
@@ -517,6 +703,26 @@ impl ChatApp {
             )
             .child(toolbar);
 
+        let open = self.session().show_context_bar();
+        let reveal = super::motion::reveal_progress(
+            ("composer-context-bar", self.session().token),
+            open,
+            window,
+            cx,
+        );
+        // 展开态也挂着 Reveal：首帧量好高度，开始对话收起时不会先塌一下
+        let composer_stack = div()
+            .v_flex()
+            .w_full()
+            .when(open || reveal > 0.001, |d| {
+                d.child(super::motion::Reveal::new(
+                    ("composer-context-bar", self.session().token),
+                    reveal,
+                    self.render_context_bar(cx),
+                ))
+            })
+            .child(self.with_completion_keys(card, cx));
+
         div()
             .v_flex()
             .w_full()
@@ -534,7 +740,7 @@ impl ChatApp {
                     .child(
                         div()
                             .relative()
-                            .child(self.with_completion_keys(card, cx))
+                            .child(composer_stack)
                             .child(self.composer_top.probe())
                             // 提问面板（`ask_user`）贴着输入框上沿：一次问一题，选完自动交给模型
                             .children(self.render_question_panel(window, cx).map(|panel| {
@@ -1168,6 +1374,118 @@ fn paste_to_attachments(
 }
 
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
+
+/// 顶盖的项目菜单：最近项目、改成任务、选择文件夹。
+fn project_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let session = app.session();
+    let current = session.group_dir();
+    let mut menu = MenuList::new("composer-project-list", handle, popover)
+        .without_shortcuts()
+        .compact()
+        .scroll_with_bar(rems(18.));
+    for (i, dir) in app.recent_workspaces().into_iter().enumerate() {
+        let active = !session.task && dir == current;
+        let path = short_path(&dir);
+        menu = menu.pick(
+            project_menu_item(
+                ("composer-project-item", i),
+                IconAll::Folder,
+                project_label(&dir),
+                active,
+            )
+            .tooltip(move |window, cx| super::chat::text_tip(&path, window, cx)),
+            move |this, cx| this.switch_workspace(dir.clone(), cx),
+        );
+    }
+    menu = menu.child(div().my_0p5().border_t_1().border_color(rgb(LINE)));
+    menu.pick(
+        project_menu_item(
+            "composer-project-task",
+            IconAll::ListTodo,
+            "不选项目（任务）",
+            session.task,
+        ),
+        |this, cx| this.as_task(cx),
+    )
+    .pick(
+        project_menu_item("composer-project-pick", IconAll::FolderOpen, "选择文件夹…", false),
+        |this, cx| this.pick_workspace(cx),
+    )
+}
+
+fn project_menu_item(
+    id: impl Into<ElementId>,
+    icon: IconAll,
+    name: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    menu_item(id, icon, name, "", active)
+        .h(rems(1.75))
+        .gap_1p5()
+        .px_2()
+        .py_0()
+        .line_height(relative(1.25))
+        .text_size(TEXT_SMALL)
+}
+
+/// 顶盖的分支菜单：列本地分支（最近提交在前），底部保留复制与新建 worktree。
+fn branch_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let session = app.session();
+    let current = session.git_branch.clone();
+    let mut menu = MenuList::new("composer-branch-list", handle, popover)
+        .without_shortcuts()
+        .compact()
+        .scroll_with_bar(rems(16.));
+    if app.git_branches.is_empty() {
+        menu = menu.child(
+            div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(
+                if app.git_branches_loading {
+                    "正在读取分支…"
+                } else {
+                    "没有本地分支"
+                },
+            ),
+        );
+    }
+    for (i, name) in app.git_branches.iter().enumerate() {
+        let active = current.as_deref() == Some(name.as_str());
+        let target = name.clone();
+        menu = menu.pick(
+            menu_item(("composer-branch-item", i), IconAll::GitBranch, name.clone(), "", active)
+                .h(rems(1.75))
+                .gap_1p5()
+                .px_2()
+                .py_0()
+                .line_height(relative(1.25))
+                .text_size(TEXT_SMALL),
+            move |this, cx| this.switch_branch(target.clone(), cx),
+        );
+    }
+    menu = menu.footer(div().border_t_1().border_color(rgb(LINE)));
+    menu = menu.footer_pick(
+        project_menu_item("composer-branch-worktree", IconAll::GitBranch, "新建 worktree", false),
+        |this, cx| this.start_in_worktree(cx),
+    );
+    if let Some(name) = current {
+        let copy = name.to_string();
+        menu = menu.footer_pick(
+            project_menu_item("composer-branch-copy", IconAll::Copy, "复制分支名", false),
+            move |this, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                this.toast(Notification::success("分支名已复制"), cx);
+            },
+        );
+    }
+    menu
+}
 
 /// 会话当前模型的档位表：能选哪些档、字段怎么发，都以它为准
 pub(crate) fn session_thinking_spec(app: &ChatApp) -> claudesktop_builtin::ThinkingSpec {

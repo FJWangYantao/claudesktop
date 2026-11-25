@@ -319,7 +319,7 @@ impl RightPanelState {
         self.refresh();
     }
 
-    fn refresh(&mut self) {
+    pub(super) fn refresh(&mut self) {
         self.file_tree =
             FileTree { query: std::mem::take(&mut self.file_tree.query), ..FileTree::default() };
         self.selected_file = None;

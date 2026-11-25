@@ -812,8 +812,9 @@ impl ChatItem {
         }
     }
 
-    /// 这一行在某个视图模式下是否显示。摘要模式只留回复、用户消息、权限卡、备注和子任务卡片；
-    /// 别的工具调用只在「执行中且带 diff」时留着——那是正等你对着改动决定放不放行的一步。
+    /// 这一行在某个视图模式下是否显示。摘要模式只常显回复、用户消息、权限卡、备注和子任务卡片；
+    /// 别的工具调用只在真的停在无自带 hunks 预览的待定权限请求上时才单独露出来
+    /// （由 `Session::compute_layout` 按上下文判断），免得自动放行的 edit diff 闪一下就收掉。
     pub fn visible_in(&self, view: ViewMode) -> bool {
         // 自动放行只是过程里的记账，正式视图不占一行；要看细节切「详细」
         if matches!(self, Self::AutoApproved { .. }) {
@@ -821,9 +822,7 @@ impl ChatItem {
         }
         match (view, self) {
             (ViewMode::Summary, Self::Thinking { .. } | Self::Info { .. } | Self::Plan(_)) => false,
-            (ViewMode::Summary, Self::Tool(c)) => {
-                c.task || c.phase == ToolPhase::Running && !c.diffs.is_empty()
-            }
+            (ViewMode::Summary, Self::Tool(c)) => c.task,
             _ => true,
         }
     }
@@ -840,10 +839,11 @@ impl ChatItem {
         }
     }
 
-    /// 作为一步有没有东西可画：空的思考块（只有换行）不画、不计数。
+    /// 作为一步或正文有没有东西可画：空的思考块和纯空白正文（只有换行 / 空格）不画、不计数。
     pub fn has_content(&self) -> bool {
         match self {
             Self::Thinking { text, streaming, .. } => *streaming || !text.trim().is_empty(),
+            Self::Agent(text) => !text.trim().is_empty(),
             Self::Permission { merged, .. } => !*merged,
             _ => true,
         }
@@ -1544,8 +1544,8 @@ mod tests {
         }
         assert!(!thinking.visible_in(ViewMode::Summary));
         assert!(agent.visible_in(ViewMode::Summary));
-        // 摘要模式：只留正在执行、带 diff 的那一步
-        assert!(card(ToolPhase::Running, true).visible_in(ViewMode::Summary));
+        // 摘要模式：普通/带 diff 工具默认都不直接常显（是否真等无 hunks 权限审批由 compute_layout 判断）
+        assert!(!card(ToolPhase::Running, true).visible_in(ViewMode::Summary));
         assert!(!card(ToolPhase::Running, false).visible_in(ViewMode::Summary));
         assert!(!card(ToolPhase::Done, true).visible_in(ViewMode::Summary));
     }
@@ -1794,6 +1794,8 @@ mod tests {
         }
         assert!(!edit.is_step());
         assert!(!ChatItem::Agent("a".into()).is_step());
+        assert!(!ChatItem::Agent("\n\n".into()).has_content());
+        assert!(ChatItem::Agent("a".into()).has_content());
         let blank = thought("\n\n", None);
         assert!(blank.is_step() && !blank.has_content());
         let streaming = ChatItem::thinking(String::new(), None);

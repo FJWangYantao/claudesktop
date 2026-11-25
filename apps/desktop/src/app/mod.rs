@@ -9,6 +9,7 @@ mod complete_view;
 mod composer;
 mod content;
 mod gauge;
+mod git_branch;
 #[cfg(feature = "headless-screenshot")]
 mod hibernate_bench;
 mod history;
@@ -145,6 +146,11 @@ pub struct ChatApp {
     cwd: PathBuf,
     /// 当前项目名（取工作目录名），侧栏分组名用
     project_name: SharedString,
+    /// 顶盖分支菜单的缓存（只在菜单打开时后台刷新）
+    git_branches: Vec<String>,
+    git_branches_cwd: Option<PathBuf>,
+    git_branches_loading: bool,
+    git_switching: bool,
     overview_tab: usize, // 0 概览 / 1 模型 / 2 请求
     /// 首页「请求」页签：读到的用量网关日志、筛选、点开的轮
     requests_view: requests_view::RequestsView,
@@ -579,6 +585,10 @@ impl ChatApp {
             store: None,
             cwd,
             project_name,
+            git_branches: Vec::new(),
+            git_branches_cwd: None,
+            git_branches_loading: false,
+            git_switching: false,
             overview_tab: 0,
             requests_view: Default::default(),
             overview_range: 0,
@@ -712,6 +722,7 @@ impl ChatApp {
             }
         }
         app.apply_appearance(window, cx);
+        app.refresh_git_branch(0, cx);
         app.apply_motion_pref(cx);
         app.init_notifications(window, cx);
         // 启动时的会话里，worktree 目录没了的（用户删了 / 换了电脑）：现在就把分支接回来
@@ -1348,6 +1359,15 @@ impl ChatApp {
     /// 新建一个会话并切过去（在当前空间里：聊天空间建聊天，代码空间按设置的默认内核）。
     pub(crate) fn add_session(&mut self, cx: &mut Context<Self>) {
         let space = self.space();
+        if space == Space::Code {
+            let dir = self.session().group_dir().to_path_buf();
+            if self.session().task {
+                self.add_task_session(cx);
+            } else {
+                self.add_session_in_project(dir, cx);
+            }
+            return;
+        }
         let kind_of_session = space.kind();
         let (kind, cwd) = self.space_defaults(space);
         // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」；
@@ -1371,6 +1391,61 @@ impl ChatApp {
         // 换会话了：上一条对话猜的灰字作废
         self.suggestion.clear();
         cx.notify();
+    }
+
+    /// 在指定目录开（或复用）一个空 Code 会话；任务和项目即使同目录也不能混用。
+    fn open_or_reuse_code_session(&mut self, dir: PathBuf, task: bool, cx: &mut Context<Self>) {
+        let kind = self.settings.kernel_for_space(Space::Code);
+        let blank = self.sessions.iter().position(|s| {
+            !s.has_user_message()
+                && !s.busy
+                && !s.renamed
+                && s.kind == SessionKind::Code
+                && s.kernel == kind
+                && s.cwd == dir
+                && s.task == task
+                && s.worktree.is_none()
+                && s.worktree_busy.is_none()
+        });
+        let idx = match blank {
+            Some(idx) => idx,
+            None => {
+                let idx = self.open_session_of(kind, dir, SessionKind::Code);
+                self.sessions[idx].task = task;
+                idx
+            }
+        };
+        self.active = idx;
+        self.settings_open = false;
+        self.remember_space(Space::Code);
+        self.suggestion.clear();
+        self.refresh_git_branch(idx, cx);
+        self.refresh_composer(cx);
+        cx.notify();
+    }
+
+    /// 侧栏项目组标题的「+」：新对话直接落在这个项目里。
+    pub(crate) fn add_session_in_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if self.space() != Space::Code {
+            self.remember_space(self.space());
+            self.settings.space = Space::Code;
+            self.update_settings(|s| s.space = Space::Code);
+        }
+        self.cwd = dir.clone();
+        self.project_name = project_label(&dir);
+        self.update_settings(|s| s.workspace = Some(dir.clone()));
+        self.open_or_reuse_code_session(dir, false, cx);
+    }
+
+    /// 「任务」组标题的「+」：默认目录、明确标成任务。
+    pub(crate) fn add_task_session(&mut self, cx: &mut Context<Self>) {
+        if self.space() != Space::Code {
+            self.remember_space(self.space());
+            self.settings.space = Space::Code;
+            self.update_settings(|s| s.space = Space::Code);
+        }
+        let dir = self.acp_base.cwd.clone();
+        self.open_or_reuse_code_session(dir, true, cx);
     }
 
     /// 在某种内核上开一个 Code 会话，返回下标（`rerun_on` / worktree 那几处用）。
@@ -1432,26 +1507,30 @@ impl ChatApp {
         self.settings.workspace.as_deref() == Some(dir) || dir != self.acp_base.cwd
     }
 
-    /// 当前会话所在的目录是个 git 仓库（侧栏「项目」菜单据此给「新建 worktree」）。
-    /// 只看有没有 `.git`（目录或 worktree 的文件），不在 render 里跑 git。
-    pub(super) fn git_repo_here(&self) -> bool {
-        let s = self.session();
-        s.worktree.is_none() && s.cwd.join(".git").exists()
-    }
-
     /// 把一个还没对话的会话换到另一种内核上：原地换成新会话，
     /// 旧内核会话的迟到事件因为令牌 / 内核不同会被忽略。
-    pub(crate) fn rebind_session(&mut self, idx: usize, kind: KernelChoice) {
+    pub(crate) fn rebind_session(
+        &mut self,
+        idx: usize,
+        kind: KernelChoice,
+        cx: &mut Context<Self>,
+    ) {
         let s = &self.sessions[idx];
         if s.kernel == kind || s.has_user_message() || s.busy {
             return;
         }
         let cwd = s.cwd.clone();
-        self.replace_session(idx, kind, cwd);
+        self.replace_session(idx, kind, cwd, cx);
     }
 
     /// 第 `idx` 个会话原地换成 `kind` 内核、`cwd` 目录下的新会话（调用方保证它还没对话）。
-    fn replace_session(&mut self, idx: usize, kind: KernelChoice, cwd: PathBuf) {
+    fn replace_session(
+        &mut self,
+        idx: usize,
+        kind: KernelChoice,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         let old = self.session_kernel(idx);
         self.sessions[idx].cancel_pending_permissions(old.as_ref());
         if kind == KernelChoice::Builtin {
@@ -1461,6 +1540,7 @@ impl ChatApp {
         self.next_token += 1;
         self.sessions[idx] = self.new_session(kind, cwd, token);
         self.request_pending_sessions();
+        self.refresh_git_branch(idx, cx);
     }
 
     /// 侧栏切换项目：设为新会话的默认目录并记进设置；
@@ -1471,17 +1551,26 @@ impl ChatApp {
         self.cwd = dir.clone();
         self.update_settings(|s| s.workspace = Some(dir.clone()));
         let s = self.session();
-        if s.cwd != dir {
-            if s.has_user_message() || s.busy {
+        let (same_dir, has_chat, kind, task) =
+            (s.cwd == dir, s.has_user_message() || s.busy, s.kernel.clone(), s.task);
+        let mut refresh = false;
+        if !same_dir {
+            if has_chat {
                 self.active = self.open_session(self.settings.kernel(), dir);
+                refresh = true;
             } else {
-                let kind = s.kernel.clone();
-                self.replace_session(self.active, kind, dir);
+                // 原地换目录时由 `replace_session` 刷新分支缓存
+                self.replace_session(self.active, kind, dir, cx);
             }
-        } else if self.sessions[self.active].task {
+        } else if task {
             // 选的就是它已经在跑的目录：只是从「任务」改成项目，对话不动
             self.sessions[self.active].task = false;
             self.save_task(self.active);
+            refresh = true;
+        }
+        if refresh {
+            let active = self.active;
+            self.refresh_git_branch(active, cx);
         }
         cx.notify();
     }
@@ -1491,17 +1580,26 @@ impl ChatApp {
     pub(crate) fn as_task(&mut self, cx: &mut Context<Self>) {
         let default_dir = self.acp_base.cwd.clone();
         let s = self.session();
-        let kind = s.kernel.clone();
-        if s.cwd == default_dir {
+        let (same_dir, has_chat, kind) =
+            (s.cwd == default_dir, s.has_user_message() || s.busy, s.kernel.clone());
+        let mut refresh = false;
+        if same_dir {
             self.sessions[self.active].task = true;
             self.save_task(self.active);
-        } else if !s.has_user_message() && !s.busy {
-            self.replace_session(self.active, kind, default_dir);
+            refresh = true;
+        } else if !has_chat {
+            // 原地换目录时由 `replace_session` 刷新分支缓存
+            self.replace_session(self.active, kind, default_dir, cx);
             self.sessions[self.active].task = true;
         } else {
             let idx = self.open_session(kind, default_dir);
             self.sessions[idx].task = true;
             self.active = idx;
+            refresh = true;
+        }
+        if refresh {
+            let active = self.active;
+            self.refresh_git_branch(active, cx);
         }
         cx.notify();
     }
@@ -1649,6 +1747,8 @@ impl ChatApp {
                         let folded_live_groups = old.folded_live_groups.clone();
                         let changes_open = old.changes_open.clone();
                         let plan_folded = old.plan_folded;
+                        let git_branch = old.git_branch.clone();
+                        let git_detached = old.git_detached;
                         let mut loaded = Session::from_records(token, meta, records, &app.settings);
                         loaded.diff_revision = app.sessions[idx].diff_revision + 1;
                         loaded.diff_epoch = app.sessions[idx].diff_epoch + 1;
@@ -1659,6 +1759,8 @@ impl ChatApp {
                         loaded.folded_live_groups = folded_live_groups;
                         loaded.changes_open = changes_open;
                         loaded.plan_folded = plan_folded;
+                        loaded.git_branch = git_branch;
+                        loaded.git_detached = git_detached;
                         loaded.queued = std::mem::take(&mut app.sessions[idx].queued);
                         loaded.compact_queued = app.sessions[idx].compact_queued;
                         app.sessions[idx] = loaded;
@@ -1734,6 +1836,7 @@ impl ChatApp {
         self.sessions[i].wheel = None;
         self.sessions[i].release_pin();
         self.ensure_history_loaded(i, cx);
+        self.refresh_git_branch(i, cx);
         self.wake_kernel_session(i, cx);
         // worktree 目录被用户删了 / 换了电脑：切过来时试着重新检出接上（见 worktree.rs）
         if ChatApp::worktree_is_missing(&self.sessions[i]) {
@@ -3692,6 +3795,7 @@ impl ChatApp {
                     // 一轮结束、worktree 会话：刷新分支状态（脏文件数、领先几个提交）
                     if turn_over {
                         self.refresh_worktree(idx, cx);
+                        self.refresh_git_branch(idx, cx);
                     }
                     // 刚就绪（Started）：建 worktree 期间排队的话这会儿能发了
                     if matches!(event, KernelEvent::Started { .. }) {

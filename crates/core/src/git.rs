@@ -49,6 +49,72 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     git_stdout(dir, &["rev-parse", "--show-toplevel"]).ok().map(|s| normalize(Path::new(s.trim())))
 }
 
+/// 当前 HEAD：普通 / 未提交分支上是分支名，游离时是短提交号。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentBranch {
+    pub name: String,
+    pub detached: bool,
+}
+
+/// 从子目录也能读出当前分支。优先直接读 HEAD，不在界面刷新时起 git 子进程。
+pub fn current_branch(dir: &Path) -> Option<CurrentBranch> {
+    let mut cursor = dir.is_dir().then_some(dir)?;
+    loop {
+        let dot = cursor.join(".git");
+        let gitdir = if dot.is_dir() {
+            Some(dot)
+        } else if dot.is_file() {
+            crate::project::gitdir_target(cursor)
+        } else {
+            None
+        };
+        if let Some(gitdir) = gitdir {
+            let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+            let head = head.trim();
+            if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+                if branch != ".invalid" {
+                    return Some(CurrentBranch { name: branch.into(), detached: false });
+                }
+            } else if head.len() >= 7
+                && head.len() <= 64
+                && head.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Some(CurrentBranch { name: head[..7].into(), detached: true });
+            }
+            // reftable 的 HEAD 固定写 `refs/heads/.invalid`：分支名和游离状态都让 git 判断
+            if let Ok(branch) = git_stdout(dir, &["symbolic-ref", "--short", "-q", "HEAD"])
+                && !branch.trim().is_empty()
+            {
+                return Some(CurrentBranch { name: branch.trim().into(), detached: false });
+            }
+            return git_stdout(dir, &["rev-parse", "--short=7", "HEAD"])
+                .ok()
+                .map(|hash| CurrentBranch { name: hash.trim().into(), detached: true });
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
+/// 本地分支，最近有提交的在前。
+pub fn list_branches(dir: &Path) -> Result<Vec<String>, String> {
+    git_stdout(
+        dir,
+        &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads"],
+    )
+    .map(|out| out.lines().filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+
+/// 在这个工作目录切到已有的本地分支。同一主仓库的写操作串行。
+pub fn switch_branch(dir: &Path, branch: &str) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() || branch.starts_with('-') {
+        return Err("分支名不合法".into());
+    }
+    let repo = repo_root(dir).ok_or_else(|| "这个目录不在 git 仓库里".to_string())?;
+    let _guard = lock(&repo);
+    git(dir, &["switch", branch]).map(|_| ())
+}
+
 /// 当前 HEAD 叫什么：在分支上是分支名，游离时为提交号（合并目标、领先几个提交都按它算）。
 pub fn base_of(repo: &Path) -> Result<String, String> {
     if let Ok(branch) = git_stdout(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
@@ -383,6 +449,9 @@ pub fn explain_git_error(stderr: &str) -> String {
     if has("connection timed out") || has("failed to connect") || has("connection refused") {
         return "连不上仓库：检查网络或代理设置".into();
     }
+    if has("already used by worktree") || has("already checked out at") {
+        return "这个分支已经在另一个 worktree 里检出了，不能在主目录重复切换".into();
+    }
     if has("not possible to fast-forward") || has("diverging") || has("would be overwritten") {
         return "目录里有本地改动和这次操作冲突（会被覆盖 / 分叉了）：先在命令行里提交或处理掉这些改动"
             .into();
@@ -573,6 +642,61 @@ mod tests {
         assert_eq!(
             dispose_worktree(&repo, &dirty, "main", "claudesktop/dirty"),
             Disposal::BranchKept { ahead: 0 }
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reads_and_switches_local_branches() {
+        let Some((base, repo)) = repo("branches") else {
+            return;
+        };
+        assert_eq!(
+            current_branch(&repo),
+            Some(CurrentBranch { name: "main".into(), detached: false })
+        );
+        let child = repo.join("nested/deep");
+        std::fs::create_dir_all(&child).unwrap();
+        assert_eq!(current_branch(&child).unwrap().name, "main");
+        run(&repo, &["branch", "older"]);
+        run(&repo, &["switch", "-c", "newer"]);
+        // committerdate 只精确到秒：隔开一秒，排序断言才不会和 older 撞在同一时间片
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(repo.join("a.txt"), "另一版").unwrap();
+        run(&repo, &["commit", "-qam", "另一版"]);
+        assert_eq!(list_branches(&repo).unwrap().first().map(String::as_str), Some("newer"));
+        switch_branch(&child, "main").unwrap();
+        assert_eq!(current_branch(&child).unwrap().name, "main");
+        assert!(switch_branch(&repo, "-bad").is_err());
+
+        run(&repo, &["switch", "--detach", "-q"]);
+        let detached = current_branch(&child).unwrap();
+        assert!(detached.detached && detached.name.len() == 7);
+        run(&repo, &["switch", "-q", "main"]);
+        let wt = base.join("wt");
+        add_worktree(&repo, &wt, "occupied").unwrap();
+        assert_eq!(current_branch(&wt).unwrap().name, "occupied");
+        assert!(switch_branch(&repo, "occupied").unwrap_err().contains("另一个 worktree"));
+        std::fs::write(repo.join("a.txt"), "冲突").unwrap();
+        std::fs::write(repo.join("only-main.txt"), "主分支").unwrap();
+        run(&repo, &["add", "only-main.txt"]);
+        run(&repo, &["commit", "-qm", "主分支新增"]);
+        std::fs::write(repo.join("only-main.txt"), "没提交的冲突").unwrap();
+        assert!(switch_branch(&repo, "older").is_err());
+        remove_worktree(&repo, &wt, true).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reads_an_unborn_branch_without_running_git() {
+        if !has_git() {
+            return;
+        }
+        let base = tmp("unborn");
+        run(&base, &["init", "-q", "-b", "empty"]);
+        assert_eq!(
+            current_branch(&base),
+            Some(CurrentBranch { name: "empty".into(), detached: false })
         );
         let _ = std::fs::remove_dir_all(&base);
     }

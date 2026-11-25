@@ -29,8 +29,14 @@ const CHIP_MIN_W: Rems = rems(3.5);
 pub(super) struct MenuChip {
     icon: Option<IconAll>,
     label: SharedString,
+    id: Option<ElementId>,
     /// 沙色实底（筛选条这类放在纸底上、要一眼看出能点的 chip）
     filled: bool,
+    /// 侧栏色顶盖上：浅色色板的 HOVER 与底色相同，要改用 SELECTED
+    on_sand: bool,
+    /// 等宽分支名 + 卡片底细边胶囊
+    mono: bool,
+    pill: bool,
     /// 一行放不下时允许把这个 chip 压窄、文字末尾打省略号（项目名 / 模型名这类外来的长文字）
     shrink: bool,
     open: bool,
@@ -38,7 +44,39 @@ pub(super) struct MenuChip {
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self { icon: Some(icon), label: label.into(), filled: false, shrink: false, open: false }
+        Self {
+            icon: Some(icon),
+            label: label.into(),
+            id: None,
+            filled: false,
+            on_sand: false,
+            mono: false,
+            pill: false,
+            shrink: false,
+            open: false,
+        }
+    }
+
+    /// 同一行有重名文字时显式区分元素 ID（项目名可能和分支名相同）。
+    pub(super) fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// 侧栏色表面上：悬停 / 打开态用 SELECTED，避免浅色下 HOVER 与底色相同。
+    pub(super) fn on_sand(mut self) -> Self {
+        self.on_sand = true;
+        self
+    }
+
+    pub(super) fn mono(mut self) -> Self {
+        self.mono = true;
+        self
+    }
+
+    pub(super) fn pill(mut self) -> Self {
+        self.pill = true;
+        self
     }
 
     /// 沙色实底（筛选条、「添加」这类放在纸底上的 chip）。
@@ -78,7 +116,9 @@ impl RenderOnce for MenuChip {
         // 状态只有一份——原版 `data-cds` 契约真正值钱的地方）。`role` 要挂在带 id 的
         // stateful div 上，所以先给个 id
         let mut chip = div()
-            .id(ElementId::Name(format!("menu-chip-{}", self.label).into()))
+            .id(self
+                .id
+                .unwrap_or_else(|| ElementId::Name(format!("menu-chip-{}", self.label).into())))
             .role(Role::Button)
             .aria_expanded(self.open)
             .aria_label(self.label.clone())
@@ -91,7 +131,11 @@ impl RenderOnce for MenuChip {
             // 文字那格再 min_w_0 + 省略号（否则最小宽度就是整串文字的宽度）；
             // 但也不能缩成一条线——留到图标 + 一两个字，还认得出是哪一类
             .when(self.shrink, |d| d.flex_shrink_1().min_w(CHIP_MIN_W))
-            .map(|d| if self.filled { d.px_2p5().bg(rgb(SAND)) } else { d.px_2() });
+            .map(|d| if self.filled { d.px_2p5().bg(rgb(SAND)) } else { d.px_2() })
+            .when(self.pill, |d| {
+                // 胶囊多一道 1px 边框：收紧纵向内边距，和无边框的项目 chip 等高
+                d.py_0p5().bg(rgb(CARD)).border_1().border_color(rgb(LINE)).rounded_full()
+            });
         if let Some(icon) = self.icon {
             chip = chip.child(Icon::new(icon).size_3p5().flex_shrink_0().text_color(rgb(INK_SOFT)));
         }
@@ -103,6 +147,7 @@ impl RenderOnce for MenuChip {
                 .whitespace_nowrap()
                 .text_ellipsis()
                 .text_size(TEXT_SMALL)
+                .when(self.mono, |d| d.font_family(MONO))
                 .text_color(rgb(INK_SOFT))
                 .child(self.label),
         );
@@ -110,7 +155,7 @@ impl RenderOnce for MenuChip {
             Icon::new(IconAll::ChevronDown).size_3().flex_shrink_0().text_color(rgb(INK_SOFT)),
         );
         // 沙色底上的悬停 / 打开用 SELECTED，纸底上用 HOVER
-        let active = if self.filled { SELECTED } else { HOVER };
+        let active = if self.filled || self.on_sand { SELECTED } else { HOVER };
         if self.open { chip.bg(rgb(active)) } else { chip.hover(move |d| d.bg(rgb(active))) }
     }
 }
@@ -130,6 +175,18 @@ pub(super) fn diff_stat(added: u32, removed: u32) -> Div {
 /// 选中一个条目：执行动作后收起面板。点击和数字键共用。
 type Pick = Rc<dyn Fn(&mut Window, &mut App)>;
 
+fn pick_action(
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+    action: impl Fn(&mut ChatApp, &mut Window, &mut Context<ChatApp>) + 'static,
+) -> Pick {
+    let (handle, popover) = (handle.clone(), popover.clone());
+    Rc::new(move |window, cx| {
+        handle.update(cx, |this, cx| action(this, window, cx));
+        popover.update(cx, |s, cx| s.dismiss(window, cx));
+    })
+}
+
 /// 最多几个条目能按数字键选
 const MAX_KEYED: usize = 9;
 
@@ -141,6 +198,8 @@ pub(super) struct MenuList {
     popover: Entity<PopoverState>,
     body: Stateful<Div>,
     header: Option<AnyElement>,
+    /// 固定在滚动列表下方（不随分支 / 条目滚走）
+    footer: Option<Div>,
     picks: Vec<Pick>,
     shortcuts: bool,
     shortcut_hints: bool,
@@ -160,6 +219,7 @@ impl MenuList {
             popover: popover.clone(),
             body: div().id(id).v_flex().gap_0p5(),
             header: None,
+            footer: None,
             picks: Vec::new(),
             shortcuts: true,
             shortcut_hints: true,
@@ -206,11 +266,7 @@ impl MenuList {
         row: Stateful<Div>,
         action: impl Fn(&mut ChatApp, &mut Window, &mut Context<ChatApp>) + 'static,
     ) -> Self {
-        let (handle, popover) = (self.handle.clone(), self.popover.clone());
-        let pick: Pick = Rc::new(move |window, cx| {
-            handle.update(cx, |this, cx| action(this, window, cx));
-            popover.update(cx, |s, cx| s.dismiss(window, cx));
-        });
+        let pick = pick_action(&self.handle, &self.popover, action);
         let n = self.picks.len() + 1;
         let on_click = pick.clone();
         if self.shortcuts {
@@ -223,6 +279,34 @@ impl MenuList {
                 d.child(ChatApp::kbd(&n.to_string()))
             });
         self.body = self.body.child(row);
+        self
+    }
+
+    /// 固定在滚动列表下方的内容（分隔线、底部操作）。
+    pub(super) fn footer(mut self, child: impl IntoElement) -> Self {
+        let footer = self.footer.take().unwrap_or_else(|| div().v_flex().gap_1());
+        self.footer = Some(footer.child(child));
+        self
+    }
+
+    /// 固定在底栏里的可选条目：点了执行并收起面板，但不占列表的数字快捷键。
+    pub(super) fn footer_pick(
+        self,
+        row: Stateful<Div>,
+        action: impl Fn(&mut ChatApp, &mut Context<ChatApp>) + 'static,
+    ) -> Self {
+        self.footer_pick_in(row, move |this, _, cx| action(this, cx))
+    }
+
+    pub(super) fn footer_pick_in(
+        mut self,
+        row: Stateful<Div>,
+        action: impl Fn(&mut ChatApp, &mut Window, &mut Context<ChatApp>) + 'static,
+    ) -> Self {
+        let on_click = pick_action(&self.handle, &self.popover, action);
+        let row = row.on_click(move |_, window, cx| on_click(window, cx));
+        let footer = self.footer.take().unwrap_or_else(|| div().v_flex().gap_1());
+        self.footer = Some(footer.child(row));
         self
     }
 
@@ -240,6 +324,7 @@ impl MenuList {
     /// 收尾：外层挂上 `focus`（面板打开时焦点在这里），数字键选对应条目。
     pub(super) fn finish(self, focus: &FocusHandle, window: &mut Window, cx: &mut App) -> Div {
         let picks = self.picks;
+        let footer = self.footer;
         let body = if self.scrollbar {
             let scroll = window
                 .use_keyed_state((self.id, "scroll"), cx, |_, _| ScrollHandle::new())
@@ -260,7 +345,8 @@ impl MenuList {
                     .v_flex()
                     .gap_1()
                     .when_some(self.header, |d, header| d.child(header))
-                    .child(body),
+                    .child(body)
+                    .when_some(footer, |d, footer| d.child(footer)),
             )
             .on_key_down(move |event, window, cx| {
                 let keys = &event.keystroke;

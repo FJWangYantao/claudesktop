@@ -231,7 +231,7 @@ impl ChatApp {
         if default_changed {
             // 默认内核换了：还没对话的会话跟着换，有对话的留在原来的内核上
             for idx in 0..self.sessions.len() {
-                self.rebind_session(idx, default.clone());
+                self.rebind_session(idx, default.clone(), cx);
             }
         }
         // 首次配置自研内核：把等着的会话接上；外部 agent 仍等首次发送。

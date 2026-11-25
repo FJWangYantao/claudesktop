@@ -47,6 +47,17 @@ debug = "line-tables-only"
 # 第三方/vendor 依赖不生成调试符号（体积与链接耗时的主要来源）
 debug = false
 
+# 仅对渲染 / 布局 / 图片热路径开启优化，让 debug 界面接近 release 流畅度，
+# 改动本工作区代码时不会触发这几个依赖重编
+[profile.dev.package.gpui-pre]
+opt-level = 2
+[profile.dev.package.gpui-pre-windows]
+opt-level = 2
+[profile.dev.package.taffy]
+opt-level = 2
+[profile.dev.package.image]
+opt-level = 2
+
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }

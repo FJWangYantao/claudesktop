@@ -1030,14 +1030,35 @@ impl Session {
         h.finish()
     }
 
+    /// 摘要模式下运行中且带 diff 的工具是否正停在「没有自带 hunks 预览的待定权限请求」上：
+    /// 只有这时才把它单独露在对话里，方便用户对着改动决定放不放行；
+    /// 自动放行，或权限卡已经自带 `hunks` 按块选择器时，都不把 diff 卡片闪出来又收掉。
+    fn tool_waiting_permission(&self, card: &ToolCard) -> bool {
+        if card.phase != ToolPhase::Running || card.diffs.is_empty() {
+            return false;
+        }
+        let turn = &self.transcript[self.turn_start()..];
+        turn.iter().any(|item| {
+            matches!(
+                item,
+                ChatItem::Permission { resolved: None, hunks: None, tool, .. }
+                    if tool.is_none() || tool.as_deref() == card.id.as_deref()
+            )
+        })
+    }
+
     /// 算出每行怎么画：连续的过程步骤合成一组。只有一步（不算空思考）时照常一行、不要组头；
-    /// 组默认收起，进行中露出最近 [`LIVE_TAIL`] 步，点开或详细视图看全部；摘要视图整组不画。
+    /// 组默认收起，进行中露出最近 [`LIVE_TAIL`] 步，点开或详细视图看全部；摘要视图把非直出工具
+    /// 并入折叠栏头，带 diff 的工具只合并进组（点开再看）。
     pub fn compute_layout(&self, view: ViewMode) -> Vec<RowLayout> {
         let t = &self.transcript;
         let mut out = vec![RowLayout::default(); t.len()];
-        // 最后一段正文 / 用户消息之后的组还在长
-        let last_text =
-            t.iter().rposition(|i| matches!(i, ChatItem::Agent(_) | ChatItem::User { .. }));
+        // 最后一段有内容的正文 / 用户消息之后的组还在长
+        let last_text = t.iter().rposition(|i| match i {
+            ChatItem::Agent(text) => !text.trim().is_empty(),
+            ChatItem::User { .. } => true,
+            _ => false,
+        });
         let pinned = self.pinned_plan();
         // 正由底部实时预览槽承接的步骤不在上面重复画一遍：跑完落进上面的记录栏，
         // 上下职责分开（下面 = 此刻在跑，上面 = 已经完成的轨迹）。
@@ -1054,38 +1075,70 @@ impl Session {
             LivePreview::ParallelTools(indices) => indices,
             _ => Vec::new(),
         };
+        let is_blank_agent =
+            |item: &ChatItem| matches!(item, ChatItem::Agent(text) if text.trim().is_empty());
+        let is_groupable = |item: &ChatItem| {
+            if is_blank_agent(item) {
+                return true;
+            }
+            match view {
+                ViewMode::Summary => match item {
+                    ChatItem::Thinking { .. }
+                    | ChatItem::AutoApproved { .. }
+                    | ChatItem::Info { .. }
+                    | ChatItem::Plan(_) => true,
+                    ChatItem::Permission { merged, .. } => *merged,
+                    ChatItem::Tool(c) => !c.task && !self.tool_waiting_permission(c),
+                    _ => false,
+                },
+                ViewMode::Normal | ViewMode::Verbose => item.is_step(),
+            }
+        };
         let mut i = 0;
         while i < t.len() {
-            if !t[i].is_step() {
-                out[i].body = t[i].visible_in(view);
+            if !is_groupable(&t[i]) {
+                out[i].body = match &t[i] {
+                    ChatItem::Tool(c)
+                        if view == ViewMode::Summary && self.tool_waiting_permission(c) =>
+                    {
+                        true
+                    }
+                    item => item.visible_in(view) && item.has_content(),
+                };
                 out[i].compact = pinned == Some(i);
                 i += 1;
                 continue;
             }
             let start = i;
-            while i < t.len() && t[i].is_step() {
+            while i < t.len() && is_groupable(&t[i]) {
                 i += 1;
             }
-            let live = self.busy && last_text.is_none_or(|p| p < start);
-            // 摘要模式也留一行折叠的过程记录栏头：执行过哪些工具 / 搜索还能点开看
+            // 摘要模式也留一行折叠的过程记录栏头：执行过哪些工具 / 搜索 / 编辑还能点开看
             if view == ViewMode::Summary {
-                let steps: Vec<usize> = (start..i).filter(|&k| t[k].has_content()).collect();
+                let steps: Vec<usize> = (start..i)
+                    .filter(|&k| {
+                        matches!(t[k], ChatItem::Thinking { .. } | ChatItem::Tool(_))
+                            && t[k].has_content()
+                    })
+                    .collect();
                 // 只有思考的组不占位：记录栏讲的是「跑过哪些工具 / 搜过什么」
                 if steps.iter().any(|&k| matches!(t[k], ChatItem::Tool(_))) {
-                    let open = self.open_groups.contains(&start);
-                    out[start].head = Some(StepGroup { end: i, live, open, live_small: false });
+                    let head_ix = steps[0];
+                    let live = self.busy && last_text.is_none_or(|p| p < head_ix);
+                    let open = self.open_groups.contains(&head_ix);
+                    out[head_ix].head = Some(StepGroup { end: i, live, open, live_small: false });
                     for &s in &steps {
                         out[s].member = true;
-                        out[s].group_start = Some(start);
+                        out[s].group_start = Some(head_ix);
                     }
                     if open {
-                        // 点开只露工具 / 搜索（摘要模式不看思考）
+                        // 点开只露工具 / 搜索 / 编辑（摘要模式不看思考）
                         let shown: Vec<usize> = steps
                             .iter()
                             .copied()
                             .filter(|&k| matches!(t[k], ChatItem::Tool(_)))
                             .collect();
-                        out[start].tight = !shown.is_empty();
+                        out[head_ix].tight = !shown.is_empty();
                         for (k, &s) in shown.iter().enumerate() {
                             out[s].body = true;
                             out[s].nested = true;
@@ -1103,12 +1156,14 @@ impl Session {
                 0 => {}
                 1 => out[steps[0]].body = true,
                 n => {
+                    let head_ix = steps[0];
+                    let live = self.busy && last_text.is_none_or(|p| p < head_ix);
                     // 活跃的小组默认全展开：刚开始的几步没有「尾巴」可藏，点一下能收起来
                     let live_small = live && view != ViewMode::Verbose && n <= LIVE_TAIL;
                     let open = if live_small {
-                        !self.folded_live_groups.contains(&start)
+                        !self.folded_live_groups.contains(&head_ix)
                     } else {
-                        view == ViewMode::Verbose || self.open_groups.contains(&start)
+                        view == ViewMode::Verbose || self.open_groups.contains(&head_ix)
                     };
                     let shown = if open {
                         &steps[..]
@@ -1118,11 +1173,11 @@ impl Session {
                     } else {
                         &[]
                     };
-                    out[start].head = Some(StepGroup { end: i, live, open, live_small });
-                    out[start].tight = !shown.is_empty();
+                    out[head_ix].head = Some(StepGroup { end: i, live, open, live_small });
+                    out[head_ix].tight = !shown.is_empty();
                     for &s in &steps {
                         out[s].member = true;
-                        out[s].group_start = Some(start);
+                        out[s].group_start = Some(head_ix);
                     }
                     for (k, &s) in shown.iter().enumerate() {
                         out[s].body = true;

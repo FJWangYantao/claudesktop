@@ -31,6 +31,8 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   chip 里放长度不由我们定的文字（项目名 / 模型名 / 分支名）时加 `.shrink()`：它给 chip 和
   Popover 的 trigger 容器一起设 `flex_shrink` + `min_w`，文字打省略号；不加就会在窄窗口 /
   大字号下把同一行的发送键顶到卡片外面（见 HANDOFF.md）。
+  同一帧里可能重名的 chip（项目名恰巧等于分支名）显式传 `.id(..)`；放在 `SIDEBAR` 色表面上时
+  加 `.on_sand()`（浅色色板的 `HOVER` 与侧栏底色相同，悬停会看不出来）。
 - **菜单条目**：两行式（图标 + 名称 + 灰色说明 + 当前项对勾）用 `menu.rs` 的 `menu_item()`，
   「选的是观感」的条目（如字体）用 `font_menu_item()`（上面灰字名称，下面用该字体本身排一行预览）；
   装进 `MenuList::pick(row, action)`（点了执行并收起，前 9 个自动标键帽、按数字直接选；动作要 `Window` 时用 `pick_in`）；
@@ -200,10 +202,15 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     （只放行不拦会双滚动：`overflow_y_scroll` 和列表的 bubble 监听器都会各滚一次）。
 - **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
   下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
-  `SessionMeta::task`），最后是「已归档」。判定在 `ChatApp::new_session`（`is_project_dir`：
-  默认目录 `acp_base.cwd` 以外都算项目，默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）；
-  输入框不显示项目选择器。项目在侧栏「项目」菜单切换、选文件夹、改成任务（`ChatApp::as_task`，已经跑在默认目录就只改归类），
-  菜单列最近代码会话目录、跳过聊天占位目录和 worktree；git 仓库可从这里建 worktree，顶栏面包屑对任务显示「任务」。
+  `SessionMeta::task`），最后是「已归档」。项目组标题右侧悬停出「+」和「打开文件夹」，
+  点「+」直接在该项目里新建对话；任务组的「+」明确新建任务对话。顶部「+ 新会话」跟随当前会话：
+  在项目里就落在同一项目，在任务里就落在任务（判定见 `ChatApp::add_session`）。
+  判定在 `ChatApp::new_session`（`is_project_dir`：默认目录 `acp_base.cwd` 以外都算项目，
+  默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）。
+  输入框上方另有**项目顶盖**：只在尚未发消息的 Code 会话显示，可选项目 / 切本地分支 / 建 worktree；
+  发出第一条消息后由 `motion::Reveal` 收起，对话中不再提供切换项目。worktree 会话的收尾入口随之
+  交给顶栏分支 chip（`s.has_user_message() && s.worktree.is_some()`），两边不同时出现。
+  分支读取、列表和切换都在后台线程跑，缓存进会话的 `git_branch`；菜单打开时才重列分支。
   新增对话行状态时记得把它并进 `sync_sidebar` 的指纹。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
   否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。

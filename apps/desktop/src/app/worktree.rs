@@ -154,7 +154,7 @@ impl ChatApp {
         let kind = s.kernel.clone();
         // 建 worktree 期间排队的消息：换会话（`replace_session`）会新建一个 Session，先收好再放回去
         let queued = std::mem::take(&mut self.sessions[idx].queued);
-        self.replace_session(idx, kind, path.clone());
+        self.replace_session(idx, kind, path.clone(), cx);
         let s = &mut self.sessions[idx];
         s.worktree = Some(meta);
         s.task = false;
@@ -524,7 +524,7 @@ impl ChatApp {
                 };
                 match result {
                     Ok(branch_left) => {
-                        app.detach_from_worktree(idx, repo);
+                        app.detach_from_worktree(idx, repo, cx);
                         let s = &mut app.sessions[idx];
                         match branch_left {
                             None => s.note(format!("worktree 和分支 {branch_name} 删掉了")),
@@ -544,11 +544,11 @@ impl ChatApp {
     }
 
     /// worktree 删掉以后：会话回到主仓库目录（`cwd` 不再指着已经不在的目录）。
-    fn detach_from_worktree(&mut self, idx: usize, repo: PathBuf) {
+    fn detach_from_worktree(&mut self, idx: usize, repo: PathBuf, cx: &mut Context<Self>) {
         if !self.sessions[idx].has_user_message() {
             // 还没对话：原地换成主目录里的新会话
             let kind = self.sessions[idx].kernel.clone();
-            self.replace_session(idx, kind, repo);
+            self.replace_session(idx, kind, repo, cx);
             return;
         }
         // 有对话：断开内核会话（它的工作目录已经没了），下一条消息在主目录里续接这段对话
@@ -569,6 +569,7 @@ impl ChatApp {
                 let _ = store.save_meta(existing);
             }
         }
+        self.refresh_git_branch(idx, cx);
     }
 
     /// 令牌 → 会话下标（后台任务回来时用：下标会因为删会话而挪）。
@@ -664,7 +665,7 @@ pub(super) fn render_worktree_chip(
     handle: &Entity<ChatApp>,
     focus: &FocusHandle,
 ) -> Option<Popover> {
-    let label = app.worktree_chip_label()?;
+    let label = app.session().has_user_message().then(|| app.worktree_chip_label()).flatten()?;
     Some(menu_popover(
         "worktree-menu",
         Anchor::TopRight,

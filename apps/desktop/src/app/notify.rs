@@ -29,6 +29,9 @@ impl ChatApp {
                 if this.settings.motion == crate::settings::MotionPref::System {
                     this.apply_motion_pref(cx);
                 }
+                // 用户可能在外部终端切了分支：回到窗口时重读一次
+                let active = this.active;
+                this.refresh_git_branch(active, cx);
             }
         }
         self.window_active = in_front(window);

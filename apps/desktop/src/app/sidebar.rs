@@ -19,14 +19,13 @@ use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
 use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
-use super::{ChatApp, project_label, short_path};
+use super::{ChatApp, project_label};
 use crate::session::scroll_handle_edge;
 use crate::settings::{KernelChoice, Space};
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::SessionKind;
 use gpui_kit::assets::IconName as IconAll;
-use gpui_kit::base::PopoverState;
 use gpui_kit::base::motion::{Transition, transition};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Input;
@@ -40,7 +39,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,6 +48,8 @@ pub(crate) struct SessionGroup {
     /// 记折叠 / 展开用：`dir:<工作目录>` 或 `date:<日期组名>`
     pub key: String,
     pub name: SharedString,
+    /// 项目组对应的目录；任务 / 日期 / 已归档组为 None
+    pub dir: Option<PathBuf>,
     pub members: Vec<usize>,
 }
 
@@ -387,14 +388,16 @@ impl ChatApp {
                 .filter(|&i| self.sidebar_keeps(filter, i))
                 .collect();
             let name = format!("{} · {}", filter.label(), members.len()).into();
-            vec![SessionGroup { key: String::new(), name, members }]
+            vec![SessionGroup { key: String::new(), name, dir: None, members }]
         };
         let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
         let keep = |i: usize| {
             let s = &self.sessions[i];
             i == self.active || s.busy || s.unread
         };
-        for (g, SessionGroup { key, name, members }) in groups.into_iter().enumerate() {
+        for (g, SessionGroup { key, name, dir, members }) in groups.into_iter().enumerate() {
+            let group_name = name.clone();
+            let group_dir = dir;
             // 筛选时不折叠、不收（筛出来的本来就少）
             let foldable = filter == SidebarFilter::All;
             // 已归档组默认收起、点开就全列，开合只记在内存里（`sidebar_expanded`）
@@ -559,11 +562,28 @@ impl ChatApp {
                             })),
                         )
                     })
-                    // 聊天没有工作目录，没有「在资源管理器中打开」
-                    .when(!chat, |d| {
+            } else {
+                header
+            };
+            // 每个项目组直接新建到自己的目录；任务组新建一个任务对话。
+            // 「已归档」和其他分组不提供新建入口
+            let header = header
+                .when_some(group_dir.clone(), |d, path| {
+                    let reveal = path.clone();
+                    d.child(
+                        Self::quiet_button(("group-new", g), IconAll::Plus, Surface::Sand, cx)
+                            .xsmall()
+                            .tooltip(format!("在「{}」中新建对话", group_name))
+                            .opacity(0.)
+                            .group_hover("group-header", |d| d.opacity(1.))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.add_session_in_project(path.clone(), cx);
+                            })),
+                    )
+                    .when(!folded, |d| {
                         d.child(
                             Self::sidebar_icon_button(
-                                "open-workspace",
+                                ("group-open-workspace", g),
                                 IconAll::FolderOpen,
                                 "在资源管理器中打开",
                                 false,
@@ -571,15 +591,20 @@ impl ChatApp {
                             )
                             .opacity(0.)
                             .group_hover("group-header", |d| d.opacity(1.))
-                            .on_click({
-                                let cwd = self.cwd.clone();
-                                move |_, _, cx: &mut App| cx.reveal_path(&cwd)
-                            }),
+                            .on_click(move |_, _, cx: &mut App| cx.reveal_path(&reveal)),
                         )
                     })
-            } else {
-                header
-            };
+                })
+                .when(tasks, |d| {
+                    d.child(
+                        Self::quiet_button(("group-new-task", g), IconAll::Plus, Surface::Sand, cx)
+                            .xsmall()
+                            .tooltip("新建任务对话")
+                            .opacity(0.)
+                            .group_hover("group-header", |d| d.opacity(1.))
+                            .on_click(cx.listener(|this, _, _, cx| this.add_task_session(cx))),
+                    )
+                });
             body = body.child(header);
             // 筛完一个不剩时的提示。「全部」下没有提示（折叠的组、空的当前项目组），
             // 别画空行：空串的行照样占着内边距和行高
@@ -687,9 +712,6 @@ impl ChatApp {
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
                     .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
             )
-            .when(self.space() == Space::Code, |d| {
-                d.child(div().mx_2().child(self.sidebar_project_menu(cx)))
-            })
             .child(nav_item("plugins", IconAll::Blocks, "插件", plugins_open).on_click(
                 cx.listener(|this, _, window, cx| {
                     this.open_settings_at(super::settings_view::PLUGINS_TAB, window, cx)
@@ -842,7 +864,7 @@ impl ChatApp {
 
     /// 侧栏分组标题上的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
     fn sidebar_icon_button(
-        id: &'static str,
+        id: impl Into<ElementId>,
         icon: IconAll,
         tip: &'static str,
         on: bool,
@@ -871,10 +893,19 @@ impl ChatApp {
             .iter()
             .position(|s| s.restored && s.kind == SessionKind::Code && s.has_user_message())
             .expect("没有可预览的项目会话");
-        self.activate_session(idx, cx);
         if !verify_flow {
+            // 顶盖只在还没发过消息的 Code 会话里出现
+            match self
+                .sessions
+                .iter()
+                .position(|s| s.kind == SessionKind::Code && !s.has_user_message())
+            {
+                Some(idx) => self.activate_session(idx, cx),
+                None => self.add_task_session(cx),
+            }
             return;
         }
+        self.activate_session(idx, cx);
         let original = self.session().token;
         let original_dir = self.session().cwd.clone();
         let target = self
@@ -903,43 +934,21 @@ impl ChatApp {
         assert!(!self.session().task);
         assert_eq!(self.sessions.len(), total);
         assert_ne!(self.session().token, blank);
+        // 侧栏项目组 / 任务组的「+」：同目录也按 task 分开复用，不串台
+        let project_token = self.session().token;
+        self.add_session_in_project(target.clone(), cx);
+        assert_eq!(self.session().token, project_token);
+        assert!(!self.session().task);
+        self.add_task_session(cx);
+        let task_token = self.session().token;
+        assert!(self.session().task);
+        self.add_task_session(cx);
+        assert_eq!(self.session().token, task_token);
+        self.add_session_in_project(target.clone(), cx);
+        assert!(!self.session().task);
         eprintln!(
             "sidebar projects verified: existing conversation, blank conversation, task, recent projects"
         );
-    }
-
-    fn sidebar_project_menu(&self, cx: &mut Context<Self>) -> Popover {
-        let handle = cx.entity();
-        let focus = self.menu_focus.clone();
-        let trigger = Self::quiet_button("sidebar-projects", IconAll::Folder, Surface::Sand, cx)
-            .h(rems(2.))
-            .w_full()
-            .px_2()
-            .accessibility_label("项目")
-            .child(
-                div()
-                    .h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .pl_0p5()
-                    .child(div().flex_1().text_size(TEXT_BODY).text_color(rgb(INK)).child("项目"))
-                    .child(Icon::new(IconAll::ChevronDown).size_3().text_color(rgb(INK_SOFT))),
-            );
-        menu_panel(Popover::new("sidebar-project-menu"), &self.menu_focus)
-            .anchor(Anchor::TopLeft)
-            .w(rems(16.))
-            .p_0p5()
-            .trigger_style(StyleRefinement::default().w_full())
-            .trigger(trigger)
-            .default_open(
-                cfg!(feature = "headless-screenshot")
-                    && std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("project-menu"),
-            )
-            .content(move |_, window, cx| {
-                let popover = cx.entity();
-                project_menu_items(handle.read(cx), &handle, &popover).finish(&focus, window, cx)
-            })
     }
 
     /// 第一组组名旁的筛选按钮：点开选全部 / 进行中 / 待查看。筛选中时图标高亮、常显。
@@ -1050,7 +1059,12 @@ impl ChatApp {
                 .filter(|(members, _)| !members.is_empty())
                 .map(|(mut members, name)| {
                     members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
-                    SessionGroup { key: format!("date:{name}"), name: name.into(), members }
+                    SessionGroup {
+                        key: format!("date:{name}"),
+                        name: name.into(),
+                        dir: None,
+                        members,
+                    }
                 })
                 .collect();
         }
@@ -1075,7 +1089,12 @@ impl ChatApp {
                 }
                 let name =
                     if cwd == self.cwd { self.project_name.clone() } else { project_label(cwd) };
-                SessionGroup { key: format!("dir:{}", cwd.display()), name, members }
+                SessionGroup {
+                    key: format!("dir:{}", cwd.display()),
+                    name,
+                    dir: Some(cwd.to_path_buf()),
+                    members,
+                }
             })
             .collect()
     }
@@ -1418,58 +1437,6 @@ impl ChatApp {
     }
 }
 
-fn project_menu_items(
-    app: &ChatApp,
-    handle: &Entity<ChatApp>,
-    popover: &Entity<PopoverState>,
-) -> MenuList {
-    let session = app.session();
-    let current = session.group_dir();
-    let mut menu = MenuList::new("sidebar-project-list", handle, popover)
-        .without_shortcuts()
-        .compact()
-        .scroll_with_bar(rems(18.));
-    for (i, dir) in app.recent_workspaces().into_iter().enumerate() {
-        let active = !session.task && dir == current;
-        let path = short_path(&dir);
-        menu = menu.pick(
-            project_menu_item(("project-item", i), IconAll::Folder, project_label(&dir), active)
-                .tooltip(move |window, cx| super::chat::text_tip(&path, window, cx)),
-            move |this, cx| this.switch_workspace(dir.clone(), cx),
-        );
-    }
-    menu = menu.child(div().my_0p5().border_t_1().border_color(rgb(LINE)));
-    if app.git_repo_here() {
-        menu = menu.pick(
-            project_menu_item("project-worktree", IconAll::GitBranch, "新建 worktree", false),
-            |this, cx| this.start_in_worktree(cx),
-        );
-    }
-    menu.pick(
-        project_menu_item("project-task", IconAll::ListTodo, "不选项目（任务）", session.task),
-        |this, cx| this.as_task(cx),
-    )
-    .pick(
-        project_menu_item("project-pick", IconAll::FolderOpen, "选择文件夹…", false),
-        |this, cx| this.pick_workspace(cx),
-    )
-}
-
-fn project_menu_item(
-    id: impl Into<ElementId>,
-    icon: IconAll,
-    name: impl Into<SharedString>,
-    active: bool,
-) -> Stateful<Div> {
-    menu_item(id, icon, name, "", active)
-        .h(rems(1.75))
-        .gap_1p5()
-        .px_2()
-        .py_0()
-        .line_height(relative(1.25))
-        .text_size(TEXT_SMALL)
-}
-
 /// 侧栏分组的收尾：在项目分组后面补「任务」和「已归档」两组。
 /// `projects` 是 `active_session_groups` 排好的项目分组，其余参数从会话列表里读；
 /// `in_space` 决定一个会话在不在当前空间（聊天空间里没有任务组）。
@@ -1487,8 +1454,12 @@ fn assemble_groups(
         (0..total).filter(|&i| in_space(i) && !archived(i) && is_task(i)).collect();
     if !tasks.is_empty() {
         tasks.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
-        projects
-            .push(SessionGroup { key: TASKS_KEY.into(), name: "任务".into(), members: tasks });
+        projects.push(SessionGroup {
+            key: TASKS_KEY.into(),
+            name: "任务".into(),
+            dir: None,
+            members: tasks,
+        });
     }
     // 已归档：最近归档 / 用过的在前（也是当前空间的）
     let mut old: Vec<usize> = (0..total).filter(|&i| in_space(i) && archived(i)).collect();
@@ -1497,6 +1468,7 @@ fn assemble_groups(
         projects.push(SessionGroup {
             key: ARCHIVED_KEY.into(),
             name: "已归档".into(),
+            dir: None,
             members: old,
         });
     }
@@ -1597,7 +1569,12 @@ mod tests {
     fn tasks_and_archive_follow_the_projects() {
         // 0 / 1 在项目里，2 / 3 是任务，4 归档了；活动时间越大越新
         let groups = assemble_groups(
-            vec![SessionGroup { key: "dir:a".into(), name: "a".into(), members: vec![0, 1] }],
+            vec![SessionGroup {
+                key: "dir:a".into(),
+                name: "a".into(),
+                dir: Some("/a".into()),
+                members: vec![0, 1],
+            }],
             5,
             |i| i as u64,
             |i| i == 2 || i == 3,

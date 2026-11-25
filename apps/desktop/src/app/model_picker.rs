@@ -248,23 +248,14 @@ impl ModelPickerContent {
         }
     }
 
-    fn set_hover(&mut self, target: PreviewTarget, hovered: bool, cx: &mut Context<Self>) {
-        let changed = if hovered {
-            if self.hovered.as_ref() != Some(&target) {
-                self.hovered = Some(target);
-                true
-            } else {
-                false
-            }
-        } else if self.hovered.as_ref() == Some(&target) {
-            self.hovered = None;
-            true
-        } else {
-            false
-        };
-        if changed {
-            cx.notify();
+    /// 只在移入时换预览：行之间有空隙，移出就退回当前模型会让说明卡来回闪。
+    /// 收起时由 `_popover_observed` 复位。
+    fn set_hover(&mut self, target: PreviewTarget, cx: &mut Context<Self>) {
+        if self.hovered.as_ref() == Some(&target) {
+            return;
         }
+        self.hovered = Some(target);
+        cx.notify();
     }
 }
 
@@ -487,7 +478,9 @@ impl ModelPickerContent {
             .when(active, |d| d.bg(rgb(SELECTED)).hover(|d| d.bg(rgb(SELECTED))))
             .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER))))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                this.set_hover(target.clone(), *hovered, cx);
+                if *hovered {
+                    this.set_hover(target.clone(), cx);
+                }
             }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 let value = click_value.clone();

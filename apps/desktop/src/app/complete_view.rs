@@ -83,6 +83,13 @@ pub(super) struct CompletionState {
     files: Option<(PathBuf, Vec<String>)>,
 }
 
+impl CompletionState {
+    /// 切分支后文件索引失效：下次 `@` 立刻重新列文件。
+    pub(super) fn invalidate_files(&mut self) {
+        self.files = None;
+    }
+}
+
 impl ChatApp {
     /// 输入内容变了：重新判断光标处是不是触发词、刷新候选。
     pub(super) fn update_completion(&mut self, cx: &mut Context<Self>) {

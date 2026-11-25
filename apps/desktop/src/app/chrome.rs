@@ -6,6 +6,7 @@
 use super::ChatApp;
 use super::keys::CYCLE_VIEW_KEY;
 use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::project_label;
 use super::right_panel::RightTab;
 use super::widgets::Surface;
 use crate::model::ViewMode;
@@ -94,6 +95,10 @@ impl ChatApp {
     /// 会话区顶栏：「项目 / 会话标题」面包屑 + 视图模式 + 导出 + 窗口按钮。整行除按钮外都能拖动窗口。
     pub(super) fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let s = self.session();
+        let crumb_branch =
+            (!s.is_chat() && !s.task && s.worktree.is_none() && s.has_user_message())
+                .then(|| s.git_branch.clone())
+                .flatten();
         let crumb = div()
             .h_flex()
             .h_full()
@@ -109,16 +114,11 @@ impl ChatApp {
             // 任务会话没有项目：面包屑里写「任务」，不拿默认目录的名字冒充项目；
             // 聊天会话没有工作目录，写「聊天」
             let (icon, project) = if s.is_chat() {
-                (IconAll::MessageSquare, "聊天".to_string())
+                (IconAll::MessageSquare, SharedString::from("聊天"))
             } else if s.task {
-                (IconAll::ListTodo, "任务".to_string())
+                (IconAll::ListTodo, SharedString::from("任务"))
             } else {
-                let label = s
-                    .cwd
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| self.project_name.to_string());
-                (IconAll::Folder, label)
+                (IconAll::Folder, project_label(s.group_dir()))
             };
             // 顶栏窄到放不下「项目 / 标题」时只留标题（项目名在侧栏分组里也有）：
             // 带省略号的文字缩不到零，留着项目名会把标题挤没
@@ -146,6 +146,21 @@ impl ChatApp {
                                 .text_color(rgb(INK_SOFT))
                                 .child(project),
                         )
+                        .when_some(crumb_branch, |crumb, branch| {
+                            crumb.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .min_w_0()
+                                    .max_w(rems(10.))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_family(MONO)
+                                    .text_size(TEXT_META)
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(format!("({branch})")),
+                            )
+                        })
                         .child(div().flex_shrink_0().text_color(rgb(INK_FAINT)).child("/"))
                 })
                 .child(
@@ -266,7 +281,10 @@ impl ChatApp {
             .when(
                 !self.right_panel_controls()
                     && window_controls(window).is_some()
-                    && (can_export || running_count > 0 || self.session().worktree.is_some()),
+                    && (can_export
+                        || running_count > 0
+                        || (self.session().has_user_message()
+                            && self.session().worktree.is_some())),
                 |d| d.child(div().w(px(1.)).h(rems(1.)).mr_1().bg(rgb(LINE))),
             )
             .when(!self.right_panel_controls(), |d| d.children(window_controls(window)))
