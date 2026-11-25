@@ -114,13 +114,12 @@ fn main() {
             options.window_bounds =
                 Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx)));
             #[cfg(feature = "headless-screenshot")]
-            if screenshot.is_some() {
-                if let Some((width, height)) = std::env::var("CLAUDESKTOP_SCREENSHOT_SIZE").ok()
+            if screenshot.is_some()
+                && let Some((width, height)) = std::env::var("CLAUDESKTOP_SCREENSHOT_SIZE").ok()
                     .and_then(|size| size.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))))
                     .filter(|(w, h)| w.is_finite() && h.is_finite() && *w >= 400. && *h >= 300.)
-                {
-                    options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(None, size(px(width), px(height)), cx)));
-                }
+            {
+                options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(None, size(px(width), px(height)), cx)));
             }
             if let Some(tb) = options.titlebar.as_mut() {
                 // 任务栏 / Alt+Tab 里的名字（窗口内不显示标题栏）
@@ -273,6 +272,15 @@ fn main() {
                                     let file =
                                         o.strip_prefix("review:").and_then(|n| n.parse().ok());
                                     app.debug_review(file, cx)
+                                }
+                                // 底部状态行的实时预览槽：thinking / tool-empty / tool-output / tool-other / parallel
+                                #[cfg(feature = "headless-screenshot")]
+                                o if o.starts_with("live-preview") => {
+                                    let kind = o
+                                        .strip_prefix("live-preview:")
+                                        .unwrap_or("thinking")
+                                        .to_string();
+                                    app.debug_live_preview(&kind, cx)
                                 }
                                 "restart" => {
                                     let kind = app.session().kernel.clone();

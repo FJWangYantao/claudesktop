@@ -9,18 +9,29 @@
 use super::ChatApp;
 use super::mascot::Mood;
 use super::motion::mascot;
-use crate::model::{ChatItem, ToolPhase, ViewMode};
-use crate::session::{Activity, Session, TurnSummary, TurnUsage};
+use crate::model::{ChatItem, ToolCard, ViewMode, tool_icon};
+use crate::session::{
+    Activity, LIVE_CMD_PREVIEW_LINES, LIVE_PARALLEL_MAX, LIVE_THINK_LINES, LivePreview, Session,
+    TurnSummary, TurnUsage,
+};
 use crate::theme::rgb;
 use crate::theme::*;
 use crate::usage;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::*;
 use gpui_kit::*;
+use std::borrow::Cow;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 impl ChatApp {
-    pub(super) fn render_turn_status(&self) -> Option<Div> {
+    pub(super) fn render_turn_status(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         let s = self.session();
         if !s.busy {
             // 正在后台建 worktree（大仓库检出要几秒）：说一声，建好之前发的话先排队
@@ -67,7 +78,7 @@ impl ChatApp {
             Activity::Compacting => (Mood::Squish, div().child("正在压缩上下文")),
             Activity::Replying => (Mood::Talk, div().child("正在回复")),
             // 说清楚此刻在做什么，而不是每轮换一个随机动词
-            Activity::Working => (Mood::Think, div().child(working_label(s))),
+            Activity::Working => (Mood::Think, div().child(working_label(s).into_owned())),
         };
         let mut meta: Vec<(String, Option<String>, Color)> = s
             .turn_started
@@ -120,24 +131,283 @@ impl ChatApp {
                 None => row.child(cell.child(text)),
             };
         }
-        Some(row)
+        // 状态行和它的实时预览槽同宽左对齐：预览卡片缩进到状态文字起点
+        let mut col = div().v_flex().gap_2().min_w_0().child(row);
+        if let Some(preview) = self.render_live_preview(window, cx) {
+            col = col.child(preview);
+        }
+        Some(col)
+    }
+
+    /// 状态行下方的实时预览槽：思考 / 单个非简单工具 / 并行工具。
+    /// 简单工具、子任务、等待中的状态都不出预览（见 [`Session::live_preview`]）。
+    fn render_live_preview(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        let s = self.session();
+        match s.live_preview(self.settings.view_mode) {
+            LivePreview::None => None,
+            LivePreview::Thinking(_) => {
+                let (lines, has_more) = s.live_think_block()?;
+                if lines.is_empty() {
+                    return None;
+                }
+                let mut col = div().v_flex().gap_1().min_w_0();
+                for (n, line) in lines.iter().take(LIVE_THINK_LINES).enumerate() {
+                    let mut text = line.clone();
+                    if has_more && n + 1 == lines.len().min(LIVE_THINK_LINES) {
+                        text = format!("{text} …").into();
+                    }
+                    col = col.child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(text),
+                    );
+                }
+                Some(self.live_card(col))
+            }
+            LivePreview::Tool(ix) => {
+                let Some(ChatItem::Tool(card)) = s.transcript.get(ix) else {
+                    return None;
+                };
+                Some(self.live_card(self.live_tool_body(ix, card, window, cx)))
+            }
+            LivePreview::ParallelTools(indices) => {
+                let mut col = div().v_flex().gap_1().min_w_0();
+                for (n, &ix) in indices.iter().take(LIVE_PARALLEL_MAX).enumerate() {
+                    let Some(ChatItem::Tool(card)) = s.transcript.get(ix) else {
+                        continue;
+                    };
+                    let mut row = div()
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(
+                            Icon::new(tool_icon(card.kind_key()))
+                                .size_3p5()
+                                .text_color(rgb(INK_SOFT)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(rgb(INK))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(card.name.clone()),
+                        );
+                    if !card.arg.trim().is_empty() {
+                        row = row.child(
+                            super::chat::ellipsis_plain(
+                                ("live-par-arg", n),
+                                super::chat::first_line(&card.arg),
+                            )
+                            .font_family(MONO)
+                            .text_color(rgb(INK_SOFT)),
+                        );
+                    }
+                    col = col.child(row);
+                }
+                if indices.len() > LIVE_PARALLEL_MAX {
+                    col = col.child(div().text_color(rgb(INK_SOFT)).child(format!(
+                        "… 另有 {} 个工具运行中",
+                        indices.len() - LIVE_PARALLEL_MAX
+                    )));
+                }
+                Some(self.live_card(col))
+            }
+        }
+    }
+
+    /// 预览槽的卡片底：和工具展开块同样的描边 / 底色，左缩进到状态文字起点。
+    fn live_card(&self, body: Div) -> Div {
+        div().pl(rems(1.625)).child(
+            div()
+                .v_flex()
+                .gap_1p5()
+                .min_w_0()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(CARD))
+                .text_size(TEXT_SMALL)
+                .line_height(LEADING)
+                .text_color(rgb(INK_SOFT))
+                .child(body),
+        )
+    }
+
+    /// 单个运行中工具的预览：命令或「图标 + 名称 + 参数」，下面跟输出（空时 `No output`）。
+    fn live_tool_body(
+        &self,
+        ix: usize,
+        card: &ToolCard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut col = div().v_flex().gap_1p5().min_w_0();
+        if card.shows_command() {
+            let lines: Vec<&str> = card.arg.trim().lines().collect();
+            let shown = lines.len().min(LIVE_CMD_PREVIEW_LINES);
+            let mut head =
+                div().v_flex().gap_1().min_w_0().font_family(MONO).text_color(rgb(INK)).children(
+                    lines[..shown].iter().enumerate().map(|(n, l)| {
+                        let text = if n == 0 { format!("$ {l}") } else { (*l).to_string() };
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(text)
+                    }),
+                );
+            if lines.len() > shown {
+                head = head.child(
+                    div()
+                        .text_color(rgb(INK_SOFT))
+                        .child(format!("… 其余 {} 行未显示", lines.len() - shown)),
+                );
+            }
+            col = col.child(head);
+        } else {
+            // 工具名用正文字体、参数用等宽；输出另起一段竖排，不和这一行并排
+            let mut row = div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .child(Icon::new(tool_icon(card.kind_key())).size_3p5().text_color(rgb(INK_SOFT)))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(rgb(INK))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(card.name.clone()),
+                );
+            if !card.arg.trim().is_empty() {
+                row = row.child(
+                    super::chat::ellipsis_plain(
+                        ("live-tool-arg", ix),
+                        super::chat::first_line(&card.arg),
+                    )
+                    .font_family(MONO)
+                    .text_color(rgb(INK_SOFT)),
+                );
+            }
+            col = col.child(row);
+        }
+
+        let output = if card.content.trim().is_empty() {
+            card.output.trim_matches('\n')
+        } else {
+            card.content.trim_matches('\n')
+        };
+        if output.is_empty() {
+            return col.child(div().font_family(MONO).text_color(rgb(INK_SOFT)).child("No output"));
+        }
+
+        // 跟着输出的最新几行走：内容变了就贴底，用户手动上滚后暂停（同工具展开块的滚动方式）
+        let key = ElementId::Name(format!("live-tool-out-{}-{}", self.session().token, ix).into());
+        let state = window.use_keyed_state(key.clone(), cx, |_, _| LiveToolScroll {
+            handle: ScrollHandle::new(),
+            last_sig: None,
+            follow_bottom: true,
+        });
+        let sig = output_sig(output);
+        state.update(cx, |st, _| {
+            let max = st.handle.max_offset().y.max(px(0.));
+            // offset().y 顶部为 0、底部为 -max；换算成距顶距离再判断是否还贴着底
+            let top = -st.handle.offset().y;
+            if st.last_sig.is_some() && max > px(0.) {
+                st.follow_bottom = top >= max - px(6.);
+            }
+            if st.last_sig != Some(sig) {
+                if st.follow_bottom {
+                    st.handle.scroll_to_bottom();
+                }
+                st.last_sig = Some(sig);
+            }
+        });
+        let scroll = state.read(cx).handle.clone();
+        let regions = self.tool_scroll_regions.clone();
+        let paint_handle = scroll.clone();
+        let scroll_id = key;
+        col.child(
+            div().border_t_1().border_color(rgb(LINE)).pt_2().child(
+                div()
+                    .relative()
+                    .child(
+                        div()
+                            .id(scroll_id)
+                            .font_family(MONO)
+                            .max_h(rems(10.))
+                            .overflow_y_scroll()
+                            .track_scroll(&scroll)
+                            .pr_4()
+                            .child(div().v_flex().children(output.lines().map(|l| {
+                                div().child(if l.is_empty() {
+                                    " ".to_string()
+                                } else {
+                                    l.to_string()
+                                })
+                            }))),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, window, _| {
+                                let visible = bounds.intersect(&window.content_mask().bounds);
+                                regions.borrow_mut().push((
+                                    visible,
+                                    paint_handle.clone(),
+                                    usize::MAX,
+                                ))
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(Scrollbar::vertical(&scroll).mode(ScrollbarMode::Always)),
+            ),
+        )
     }
 }
 
-/// 进程中状态的文字：看正在跑的工具（没有就等模型）。
-fn working_label(s: &Session) -> &'static str {
-    let kind = s.transcript.iter().rev().find_map(|i| match i {
-        ChatItem::Tool(c) if c.phase == ToolPhase::Running => Some(c.kind_key()),
+/// 预览槽里单个工具的滚动状态：贴底跟随 + 内容签名。
+struct LiveToolScroll {
+    handle: ScrollHandle,
+    last_sig: Option<u64>,
+    follow_bottom: bool,
+}
+
+fn output_sig(text: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// 进程中状态的文字：并行 / 单个工具 / 正在思考（都没有就等模型）。
+fn working_label(s: &Session) -> Cow<'static, str> {
+    let running = s.running_tools_in_turn();
+    if running.len() >= 2 {
+        return format!("正在并行执行 {} 个工具", running.len()).into();
+    }
+    let kind = running.first().and_then(|&ix| match s.transcript.get(ix) {
+        Some(ChatItem::Tool(c)) => Some(c.kind_key()),
         _ => None,
     });
     match kind {
-        Some("execute") => "正在运行命令",
-        Some("read") => "正在读取文件",
-        Some("search") => "正在搜索",
-        Some("edit" | "delete" | "move") => "正在修改文件",
-        Some("fetch") => "正在访问网页",
-        Some("task") => "正在执行子任务",
-        _ => "正在处理",
+        Some("execute") => "正在运行命令".into(),
+        Some("read") => "正在读取文件".into(),
+        Some("search") => "正在搜索".into(),
+        Some("edit" | "delete" | "move") => "正在修改文件".into(),
+        Some("fetch") => "正在访问网页".into(),
+        Some("task") => "正在执行子任务".into(),
+        Some(_) => "正在处理".into(),
+        None if s.is_streaming_thinking() => "正在思考".into(),
+        None => "正在处理".into(),
     }
 }
 
@@ -246,6 +516,33 @@ mod tests {
         assert_eq!(working_label(&session_with_run("read")), "正在读取文件");
         assert_eq!(working_label(&session_with_run("edit")), "正在修改文件");
         assert_eq!(working_label(&session_with_run("task")), "正在执行子任务");
+        // 两个工具并行：先说有几个在跑
+        let mut par = session_with_run("execute");
+        par.apply_event(
+            KernelEvent::ToolCallStarted {
+                id: "b".into(),
+                title: "t".into(),
+                status: "in_progress".into(),
+                kind: "fetch".into(),
+                parent: None,
+            },
+            None,
+        );
+        assert_eq!(working_label(&par), "正在并行执行 2 个工具");
+        // 没有工具、但还在流式思考
+        let mut thinking = Session::new(
+            1,
+            crate::settings::KernelChoice::Acp("custom-1".into()),
+            std::path::PathBuf::from("."),
+        );
+        thinking.transcript.push(ChatItem::Thinking {
+            text: "先想想".into(),
+            streaming: true,
+            open: false,
+            started: None,
+            elapsed_ms: None,
+        });
+        assert_eq!(working_label(&thinking), "正在思考");
         // 没有在跑的工具（等模型）：说「正在处理」
         let idle = Session::new(
             1,

@@ -73,6 +73,154 @@ pub enum Activity {
     Compacting,
 }
 
+/// 底部实时思考预览最多显示的行数。
+pub const LIVE_THINK_LINES: usize = 4;
+/// 思考块超出后冻结展示多久再整块替换。
+pub const LIVE_THINK_HOLD: Duration = Duration::from_secs(3);
+/// 并行工具调用在底部预览槽最多列几行。
+pub const LIVE_PARALLEL_MAX: usize = 6;
+/// 单个运行中命令在底部预览槽最多列的命令行数。
+pub const LIVE_CMD_PREVIEW_LINES: usize = 8;
+
+/// 运行状态行下方的实时预览槽内容。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LivePreview {
+    None,
+    Thinking(usize),
+    Tool(usize),
+    ParallelTools(Vec<usize>),
+}
+
+/// 思考实时预览的整块翻页器：显示当前 4 行，超出后冻结 3 秒再整块替换。
+#[derive(Clone, Debug)]
+pub(crate) struct LiveThinkPager {
+    pub item_ix: usize,
+    pub cols: usize,
+    pub byte_offset: usize,
+    pub bytes_consumed: usize,
+    pub lines: Vec<SharedString>,
+    pub has_more: bool,
+    pub overflow_since: Option<Instant>,
+    pub last_text_len: usize,
+}
+
+pub(crate) struct WrappedLine {
+    pub(crate) text: SharedString,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+fn char_cols(ch: char) -> usize {
+    if ch.is_ascii() { 1 } else { 2 }
+}
+
+/// 按视觉列宽把纯文本折成多行，记录每行在 `slice` 内的 UTF-8 字节起止偏移；
+/// 给定 `limit` 时只取前 `limit` 行，并报告后面是否还有非空白内容。
+pub(crate) fn wrap_lines_with_offsets(
+    slice: &str,
+    max_cols: usize,
+    limit: Option<usize>,
+) -> (Vec<WrappedLine>, bool) {
+    let max_cols = max_cols.max(1);
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < slice.len() {
+        let (line_end, next_pos) = match slice[pos..].find('\n') {
+            Some(rel) => (pos + rel, pos + rel + 1),
+            None => (slice.len(), slice.len()),
+        };
+        let raw_end = if line_end > pos && slice.as_bytes()[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let raw = &slice[pos..raw_end];
+        if raw.trim().is_empty() {
+            pos = next_pos;
+            continue;
+        }
+
+        let mut seg_start = 0usize;
+        while seg_start < raw.len() {
+            if limit.is_some_and(|k| out.len() >= k) {
+                let more =
+                    !raw[seg_start..].trim().is_empty() || !slice[next_pos..].trim().is_empty();
+                return (out, more);
+            }
+            let mut cols = 0usize;
+            let mut split_at = raw.len();
+            let mut last_space: Option<(usize, usize)> = None;
+            for (idx, ch) in raw[seg_start..].char_indices() {
+                let abs = seg_start + idx;
+                let w = char_cols(ch);
+                if cols > 0 && cols + w > max_cols {
+                    if let Some((sp_idx, sp_cols)) = last_space
+                        && sp_cols >= max_cols / 2
+                    {
+                        split_at = sp_idx;
+                    } else {
+                        split_at = abs;
+                    }
+                    break;
+                }
+                cols += w;
+                if ch == ' ' || ch == '\t' {
+                    last_space = Some((abs, cols - w));
+                }
+            }
+            let seg_text = raw[seg_start..split_at].trim_end();
+            let mut next_seg = split_at;
+            while next_seg < raw.len() && matches!(raw.as_bytes()[next_seg], b' ' | b'\t') {
+                next_seg += 1;
+            }
+            let end_in_slice = if next_seg >= raw.len() { next_pos } else { pos + next_seg };
+            if !seg_text.is_empty() {
+                out.push(WrappedLine {
+                    text: seg_text.to_string().into(),
+                    start: pos + seg_start,
+                    end: end_in_slice,
+                });
+            }
+            seg_start = next_seg;
+        }
+        pos = next_pos;
+    }
+    (out, false)
+}
+
+/// 估算输出折行后的视觉行数（到达 `cap` 即停），供状态行指纹判断是否已撑满限高视口。
+fn estimate_visual_lines_capped(text: &str, max_cols: usize, cap: usize) -> usize {
+    if text.is_empty() || cap == 0 {
+        return 0;
+    }
+    let max_cols = max_cols.max(1);
+    let mut lines = 0usize;
+    for raw in text.lines() {
+        let mut cols = 0usize;
+        let mut segs = 1usize;
+        for ch in raw.chars() {
+            let w = char_cols(ch);
+            if cols > 0 && cols + w > max_cols {
+                segs += 1;
+                cols = w;
+            } else {
+                cols += w;
+            }
+        }
+        lines += segs;
+        if lines >= cap {
+            return cap;
+        }
+    }
+    lines.min(cap)
+}
+
+/// 读 / 搜 / 改 / 删 / 移动等瞬时简单工具：单独跑时不弹底部预览槽，防止连续调用时闪烁。
+pub(crate) fn is_simple_tool(card: &ToolCard) -> bool {
+    matches!(card.kind_key(), "read" | "search" | "edit" | "delete" | "move")
+}
+
 pub(crate) fn new_list_state() -> ListState {
     // overdraw：视口外多渲染的高度，滚动时少一点空白。
     // 初始 1 行 = 末尾的运行状态行（对话记录的行都插在它前面）
@@ -390,7 +538,7 @@ impl Session {
         self.follow.armed = false;
         self.rows_restore = Some((anchor, offset, following));
         // 强制下一段重测状态行（重建后它也是未测的）
-        self.measured_busy = !self.status_visible();
+        self.measured_status = None;
     }
 
     /// 旧行划分里的某一行，在重建后的行划分里对应的下标。
@@ -431,6 +579,237 @@ impl Session {
     /// 列表末尾那一行运行状态行显不显示。
     pub(crate) fn status_visible(&self) -> bool {
         self.busy || self.resuming || self.worktree_busy.is_some()
+    }
+
+    /// 底部预览卡片内每行大约能容下多少个窄字符列。
+    pub(crate) fn preview_cols(&self) -> usize {
+        let Some(m) = self.metrics else {
+            return 76;
+        };
+        let avail = (m.inner_w() - rems(3.125).to_pixels(m.rem)).max(px(120.));
+        let col_w = (crate::theme::TEXT_SMALL.to_pixels(m.rem) * 0.60).max(px(1.));
+        ((avail / col_w).floor() as usize).clamp(32, 120)
+    }
+
+    /// 本轮（最后一条用户消息之后）所有正在运行中的工具下标。
+    pub fn running_tools_in_turn(&self) -> Vec<usize> {
+        let start = self.turn_start();
+        (start..self.transcript.len())
+            .filter(|&ix| matches!(&self.transcript[ix], ChatItem::Tool(c) if c.phase == ToolPhase::Running))
+            .collect()
+    }
+
+    /// 本轮是否正在流式思考。
+    pub fn is_streaming_thinking(&self) -> bool {
+        let start = self.turn_start();
+        self.transcript[start..]
+            .iter()
+            .any(|item| matches!(item, ChatItem::Thinking { streaming: true, .. }))
+    }
+
+    /// 计算底部运行状态行下方的实时预览槽内容。
+    pub fn live_preview(&self, view: ViewMode) -> LivePreview {
+        if !self.busy || view == ViewMode::Verbose || self.activity() != Activity::Working {
+            return LivePreview::None;
+        }
+        let running = self.running_tools_in_turn();
+        if running.len() >= 2 {
+            return LivePreview::ParallelTools(running);
+        }
+        if let Some(&ix) = running.first()
+            && let Some(ChatItem::Tool(card)) = self.transcript.get(ix)
+        {
+            if card.task || is_simple_tool(card) {
+                return LivePreview::None;
+            }
+            if view == ViewMode::Normal
+                && card.expanded
+                && self.layout.get(ix).is_some_and(|l| l.body)
+            {
+                return LivePreview::None;
+            }
+            return LivePreview::Tool(ix);
+        }
+        let start = self.turn_start();
+        for ix in (start..self.transcript.len()).rev() {
+            if let ChatItem::Thinking { streaming: true, text, open, .. } = &self.transcript[ix] {
+                if text.trim().is_empty() {
+                    return LivePreview::None;
+                }
+                if view == ViewMode::Normal && *open && self.layout.get(ix).is_some_and(|l| l.body)
+                {
+                    return LivePreview::None;
+                }
+                return LivePreview::Thinking(ix);
+            }
+        }
+        LivePreview::None
+    }
+
+    /// 推进底部思考预览的 4 行块状态：超出后冻结 3 秒，再整块替换。
+    pub fn sync_live_think(&mut self, view: ViewMode, now: Instant) {
+        let LivePreview::Thinking(ix) = self.live_preview(view) else {
+            self.live_think = None;
+            return;
+        };
+        let Some(ChatItem::Thinking { text, .. }) = self.transcript.get(ix) else {
+            self.live_think = None;
+            return;
+        };
+        if text.trim().is_empty() {
+            self.live_think = None;
+            return;
+        }
+        let cols = self.preview_cols();
+        let text_len = text.len();
+        let same_item = self.live_think.as_ref().is_some_and(|p| p.item_ix == ix);
+        if !same_item {
+            let (wrapped, has_more) = wrap_lines_with_offsets(text, cols, Some(LIVE_THINK_LINES));
+            let bytes_consumed = wrapped.last().map_or(0, |l| l.end);
+            let lines = wrapped.into_iter().map(|l| l.text).collect();
+            self.live_think = Some(LiveThinkPager {
+                item_ix: ix,
+                cols,
+                byte_offset: 0,
+                bytes_consumed,
+                lines,
+                has_more,
+                overflow_since: has_more.then_some(now),
+                last_text_len: text_len,
+            });
+            return;
+        }
+
+        let mut pager = self.live_think.take().unwrap();
+        if let Some(since) = pager.overflow_since {
+            if now.duration_since(since) >= LIVE_THINK_HOLD {
+                let next_offset = (pager.byte_offset + pager.bytes_consumed).min(text_len);
+                let (next_wrapped, next_has_more) =
+                    wrap_lines_with_offsets(&text[next_offset..], cols, Some(LIVE_THINK_LINES));
+                if !next_has_more {
+                    pager.byte_offset = next_offset;
+                    pager.bytes_consumed = next_wrapped.last().map_or(0, |l| l.end);
+                    pager.lines = next_wrapped.into_iter().map(|l| l.text).collect();
+                    pager.has_more = false;
+                    pager.overflow_since = None;
+                } else {
+                    let tail_raw = text_len.saturating_sub(4096);
+                    let mut tail_base = tail_raw.max(next_offset);
+                    while tail_base < text_len && !text.is_char_boundary(tail_base) {
+                        tail_base += 1;
+                    }
+                    if tail_base > next_offset
+                        && let Some(rel) = text[tail_base..].find('\n')
+                    {
+                        let after_nl = tail_base + rel + 1;
+                        if after_nl < text_len && !text[after_nl..].trim().is_empty() {
+                            tail_base = after_nl;
+                        }
+                    }
+                    let (tail_wrapped, _) = wrap_lines_with_offsets(&text[tail_base..], cols, None);
+                    if tail_wrapped.is_empty() {
+                        pager.byte_offset = next_offset;
+                        pager.bytes_consumed = next_wrapped.last().map_or(0, |l| l.end);
+                        pager.lines = next_wrapped.into_iter().map(|l| l.text).collect();
+                        pager.has_more = next_has_more;
+                        pager.overflow_since = Some(now);
+                    } else {
+                        let keep_from = tail_wrapped.len().saturating_sub(LIVE_THINK_LINES);
+                        let kept = &tail_wrapped[keep_from..];
+                        let first_start = kept[0].start;
+                        let last_end = kept[kept.len() - 1].end;
+                        pager.byte_offset = tail_base + first_start;
+                        pager.bytes_consumed = last_end.saturating_sub(first_start);
+                        pager.lines = kept.iter().map(|l| l.text.clone()).collect();
+                        pager.has_more = false;
+                        pager.overflow_since = None;
+                    }
+                }
+                pager.cols = cols;
+                pager.last_text_len = text_len;
+            } else if pager.cols != cols {
+                let slice = &text[pager.byte_offset.min(text_len)..];
+                let (wrapped, has_more) =
+                    wrap_lines_with_offsets(slice, cols, Some(LIVE_THINK_LINES));
+                pager.bytes_consumed = wrapped.last().map_or(0, |l| l.end);
+                pager.lines = wrapped.into_iter().map(|l| l.text).collect();
+                pager.has_more = has_more;
+                pager.cols = cols;
+            }
+        } else if text_len != pager.last_text_len || pager.cols != cols {
+            let slice = &text[pager.byte_offset.min(text_len)..];
+            let (wrapped, has_more) = wrap_lines_with_offsets(slice, cols, Some(LIVE_THINK_LINES));
+            pager.bytes_consumed = wrapped.last().map_or(0, |l| l.end);
+            pager.lines = wrapped.into_iter().map(|l| l.text).collect();
+            pager.has_more = has_more;
+            pager.cols = cols;
+            pager.last_text_len = text_len;
+            if has_more {
+                pager.overflow_since = Some(now);
+            }
+        }
+        self.live_think = Some(pager);
+    }
+
+    /// 供状态行渲染读取当前思考预览块和截断省略标志。
+    pub fn live_think_block(&self) -> Option<(&[SharedString], bool)> {
+        self.live_think.as_ref().map(|p| (p.lines.as_slice(), p.has_more))
+    }
+
+    /// 末尾运行状态行的布局测量指纹：可见状态、预览模式或影响高度的内容变化时重测末行。
+    pub(crate) fn status_row_key(&self, view: ViewMode) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if !self.status_visible() {
+            0u8.hash(&mut h);
+            return h.finish();
+        }
+        if !self.busy {
+            (1u8, self.worktree_busy.is_some(), self.resuming).hash(&mut h);
+            return h.finish();
+        }
+        match self.live_preview(view) {
+            LivePreview::None => (2u8, 0u8).hash(&mut h),
+            LivePreview::Thinking(ix) => {
+                let pager = self.live_think.as_ref();
+                (
+                    2u8,
+                    1u8,
+                    ix,
+                    pager.map_or(0, |p| p.byte_offset),
+                    pager.map_or(0, |p| p.lines.len()),
+                    pager.is_some_and(|p| p.has_more),
+                )
+                    .hash(&mut h);
+            }
+            LivePreview::Tool(ix) => {
+                let (cmd_lines, out_empty, out_lines) = if let Some(ChatItem::Tool(card)) =
+                    self.transcript.get(ix)
+                {
+                    let cmd_lines = if card.shows_command() {
+                        let total = card.arg.trim().lines().count();
+                        total.min(LIVE_CMD_PREVIEW_LINES)
+                            + usize::from(total > LIVE_CMD_PREVIEW_LINES)
+                    } else {
+                        1
+                    };
+                    let output = if card.content.trim().is_empty() {
+                        card.output.trim_matches('\n')
+                    } else {
+                        card.content.trim_matches('\n')
+                    };
+                    let cols = self.preview_cols();
+                    (cmd_lines, output.is_empty(), estimate_visual_lines_capped(output, cols, 14))
+                } else {
+                    (0, true, 0)
+                };
+                (2u8, 2u8, ix, cmd_lines, out_empty, out_lines).hash(&mut h);
+            }
+            LivePreview::ParallelTools(indices) => {
+                (2u8, 3u8, indices.len().min(LIVE_PARALLEL_MAX + 1)).hash(&mut h);
+            }
+        }
+        h.finish()
     }
 }
 
@@ -728,6 +1107,8 @@ impl Session {
         if self.list.is_following_tail() || self.follow.armed {
             self.seen_seq = self.content_seq;
         }
+        // 先推进思考翻页计时：即使没有新 chunk 到达，满 3 秒也应触发状态行重测与整块替换
+        self.sync_live_think(view, Instant::now());
         let mut sync = SyncSig {
             layout_rev: self.layout_rev,
             transcript_rev: self.transcript.revision,
@@ -736,7 +1117,7 @@ impl Session {
             view,
             metrics: self.metrics,
             images: crate::app::remote_image::revision(),
-            status_visible: self.status_visible(),
+            status_key: self.status_row_key(view),
             busy: self.busy,
             compact_turn: self.compact_turn,
             undo: self.undo,
@@ -746,6 +1127,7 @@ impl Session {
             return;
         }
         self.layout = self.compute_layout(view);
+        self.sync_live_think(view, Instant::now());
         // 大回复拆块只跟记录形态有关（条数 / 是否在跑 / 末尾回复多长），和视图模式无关
         let sig = self.rows_signature();
         if self.rows_sig != Some(sig) {
@@ -759,6 +1141,7 @@ impl Session {
         }
         let n = self.rows.len();
         sync.rows = n;
+        sync.status_key = self.status_row_key(view);
         self.last_sync = Some(sync);
         // 字号 / 列宽变了：屏外缓存的行高全部过期，按新度量重估 + 重测。
         // 视口顶那一行按比例保留（`remeasure_with_hints` 走 proportional 锚点）
@@ -779,7 +1162,7 @@ impl Session {
                 }
                 // 末尾的运行状态行跟着字号变
                 self.list.remeasure_items(n..n + 1);
-                self.measured_busy = self.status_visible();
+                self.measured_status = Some(sync.status_key);
                 // 滚轮余量只在「用户真改了列宽 / 字号」时作废（相对像素在重排后仍然有效）。
                 // 窄窗口第 1 帧按限宽铺、第 2 帧才有真实宽度，那一次不算用户改动。
                 let real_width_change =
@@ -794,6 +1177,7 @@ impl Session {
             // 记录只会变长；万一变短就整体重来
             self.list.reset(1);
             self.measured.clear();
+            self.measured_status = None;
             // 列表被重置，旧的滚轮余量对不上号
             self.wheel = None;
         }
@@ -817,10 +1201,9 @@ impl Session {
             };
             self.list.splice_with_hints(old..old, hints);
         }
-        // 状态行在忙 / 续接 / 建 worktree 时出现（见 `render_turn_status`）
-        let status = self.status_visible();
-        if status != self.measured_busy {
-            self.measured_busy = status;
+        // 状态行在忙 / 续接 / 建 worktree 时出现，或者预览内容高度变了（见 `render_turn_status`）
+        if self.measured_status != Some(sync.status_key) {
+            self.measured_status = Some(sync.status_key);
             self.list.remeasure_items(n..n + 1);
         }
         // 行划分刚重建过：行都塞进去了，把阅读位置放回去

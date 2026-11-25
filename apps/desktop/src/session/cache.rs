@@ -105,7 +105,8 @@ impl Session {
         self.agent_parts.clear();
         self.stream_pending = String::new();
         self.wheel = None;
-        self.measured_busy = false;
+        self.measured_status = None;
+        self.live_think = None;
         self.animated_group = None;
         self.history_loaded = false;
         self.history_loading = true;

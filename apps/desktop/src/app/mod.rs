@@ -2072,6 +2072,82 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 调试钩子：CLAUDESKTOP_OPEN=live-preview:<thinking|tool-empty|tool-output|tool-other|parallel>，
+    /// 摆出底部状态行 + 实时预览槽的几种样子，供无头截图验收。
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_live_preview(&mut self, kind: &str, cx: &mut Context<Self>) {
+        self.settings.view_mode = ViewMode::Normal;
+        let s = &mut self.sessions[self.active];
+        s.title = "实时预览".into();
+        s.transcript.push(ChatItem::User {
+            text: "看看这个仓库为什么构建慢".into(),
+            images: Vec::new(),
+            files: Default::default(),
+        });
+        s.transcript.push(ChatItem::Agent("先量一下各阶段的耗时，再看热点。".into()));
+        let tool = |kind: &str, name: &str, arg: &str, output: &str| {
+            ChatItem::Tool(ToolCard {
+                id: None,
+                kind: kind.into(),
+                name: name.into(),
+                arg: arg.into(),
+                result: SharedString::default(),
+                output: output.into(),
+                content: SharedString::default(),
+                phase: ToolPhase::Running,
+                diffs: Vec::new(),
+                expanded: false,
+                task: false,
+                grant: None,
+                images: Vec::new(),
+            })
+        };
+        match kind {
+            // 单条命令、还没有输出：确认 `No output` 和命令首行
+            "tool-empty" => {
+                s.transcript
+                    .push(tool("execute", "Bash", "cargo build -p claudesktop --release", ""));
+            }
+            // 长输出：确认限高 10rem 的滚动窗、常显滚动条和贴底
+            "tool-output" => {
+                let output: String = (1..=40)
+                    .map(|i| format!("   Compiling crate-{i:02} v0.{i}.0 (/d/t3/build/crate-{i:02})"))
+                    .chain(std::iter::once("    Finished `release` profile".to_string()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                s.transcript.push(tool("execute", "Bash", "cargo build -p claudesktop --release", &output));
+            }
+            // 非命令类工具（fetch / MCP）：确认「图标 + 名称 + 参数」和下方输出是竖排
+            "tool-other" => {
+                s.transcript.push(tool(
+                    "fetch",
+                    "Fetch",
+                    "https://docs.rs/gpui/latest/gpui/",
+                    "HTTP 200 OK\ncontent-length: 18432\ntitle: gpui - Rust",
+                ));
+            }
+            // 并行三个工具：确认紧凑多行列表
+            "parallel" => {
+                s.transcript.push(tool("fetch", "Fetch", "https://docs.rs/gpui", ""));
+                s.transcript.push(tool("execute", "Bash", "cargo clippy --workspace", ""));
+                s.transcript.push(tool("other", "MCP", "核对依赖树里重复的 crate", ""));
+            }
+            // 默认：流式思考，溢出 4 行后冻结
+            _ => s.transcript.push(ChatItem::Thinking {
+                text: (0..10)
+                    .map(|i| format!("第 {i} 行：先看看各个 crate 的编译时间，再按耗时从高到低排序，找能并行的那几步。"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                streaming: true,
+                open: false,
+                started: Some(std::time::Instant::now()),
+                elapsed_ms: None,
+            }),
+        }
+        s.begin_turn();
+        cx.notify();
+    }
+
     /// 压测钩子：往当前会话灌 `n` 行混合内容（用户消息 / markdown 回复 / 工具行 / 备注）。
     pub(crate) fn debug_stress(&mut self, n: usize, busy: bool, cx: &mut Context<Self>) {
         let s = &mut self.sessions[self.active];

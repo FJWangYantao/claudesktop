@@ -181,7 +181,7 @@ pub(super) fn ellipsis_plain(id: impl Into<ElementId>, text: SharedString) -> St
 }
 
 /// 多行文字在单行里只显示第一行，后面还有就接个省略号。
-fn first_line(text: &str) -> SharedString {
+pub(super) fn first_line(text: &str) -> SharedString {
     let text = text.trim();
     match text.split_once('\n') {
         Some((first, _)) => format!("{} …", first.trim_end()).into(),

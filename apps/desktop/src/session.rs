@@ -21,7 +21,10 @@ pub(crate) mod replay;
 pub(crate) mod wheel;
 
 use layout::new_list_state;
-pub use layout::{Activity, ListMetrics, Row, RowLayout, StepGroup, TurnSummary, TurnUsage};
+pub use layout::{
+    Activity, LIVE_CMD_PREVIEW_LINES, LIVE_PARALLEL_MAX, LIVE_THINK_LINES, ListMetrics,
+    LivePreview, Row, RowLayout, StepGroup, TurnSummary, TurnUsage,
+};
 
 pub use wheel::{DEFAULT_FRAME_DT, WheelInput, WheelScroll};
 
@@ -67,8 +70,10 @@ pub struct Session {
     rows_sig: Option<(usize, bool, usize)>,
     /// 行划分变了、列表重建之后要恢复的阅读位置：(视口顶那一行, 行内偏移, 是否贴底)
     rows_restore: Option<(Option<Row>, Pixels, bool)>,
-    /// 列表末尾的运行状态行上次测量时是否在忙（忙时有一行，不忙时高度为 0）
-    measured_busy: bool,
+    /// 列表末尾的运行状态行上次测量时的指纹（未测量过为 None）
+    measured_status: Option<u64>,
+    /// 底部思考实时预览的 4 行整块翻页状态
+    pub(crate) live_think: Option<layout::LiveThinkPager>,
     /// 本帧的排版度量（列宽、rem）：变了就按新字号 / 列宽重估所有行高并重测。
     /// 由内容区每帧交进来（见 [`Session::set_list_metrics`]）。
     metrics: Option<ListMetrics>,
@@ -273,7 +278,7 @@ struct SyncSig {
     view: ViewMode,
     metrics: Option<ListMetrics>,
     images: u64,
-    status_visible: bool,
+    status_key: u64,
     busy: bool,
     compact_turn: bool,
     undo: Option<TurnUndo>,
@@ -401,7 +406,8 @@ impl Session {
             row_start: Vec::new(),
             rows_sig: None,
             rows_restore: None,
-            measured_busy: false,
+            measured_status: None,
+            live_think: None,
             metrics: None,
             applied_metrics: None,
             layout_rev: 0,
@@ -919,6 +925,7 @@ impl Session {
             usage: std::mem::take(&mut self.turn_usage),
         };
         self.turn_streamed.clear();
+        self.live_think = None;
         if let Some(user) = self.last_user() {
             self.turn_summaries.insert(user, summary);
             self.layout_rev = self.layout_rev.wrapping_add(1);
@@ -995,6 +1002,9 @@ impl Session {
             .iter()
             .position(|i| matches!(i, ChatItem::Tool(c) if c.id.as_deref() == Some(id)))
         {
+            if matches!(self.live_preview(view), LivePreview::Tool(live_ix) if live_ix == ix) {
+                return true;
+            }
             let ChatItem::Tool(card) = &self.transcript[ix] else { return false };
             // 详细视图里工具行总是展开的，不用 `expanded` 也画
             return (card.expanded || view == ViewMode::Verbose)
@@ -1329,6 +1339,7 @@ impl Session {
         // 上一轮留下的组折叠状态（按行下标）对新一轮没有意义
         self.folded_live_groups.clear();
         self.animated_group = None;
+        self.live_think = None;
     }
 
     /// 本轮此刻的活动：等授权 > 等自动重试 > 正在输出正文（且没有工具在跑）> 其余都算「工作中」。
@@ -1595,6 +1606,7 @@ impl Session {
     /// 正在流式的思考块收尾，记下想了多久（计时的才有）。
     /// 展开与否保持原样（默认就是收起的，用户点开过的不替他收）。
     pub fn finish_thinking(&mut self) {
+        self.live_think = None;
         if let Some(ChatItem::Thinking { streaming, started, elapsed_ms, .. }) =
             self.transcript.last_mut()
         {
@@ -4274,5 +4286,180 @@ mod tests {
         let long = "很长".repeat(100);
         assert!(preview_line(&long).unwrap().ends_with('…'));
         assert_eq!(preview_line(&long).unwrap().chars().count(), 81);
+    }
+
+    fn live_test_session() -> Session {
+        Session::new(
+            1,
+            crate::settings::KernelChoice::Acp("custom-1".into()),
+            std::path::PathBuf::from("."),
+        )
+    }
+
+    fn live_tool(kind: &str, name: &str, phase: ToolPhase) -> ChatItem {
+        ChatItem::Tool(ToolCard {
+            id: None,
+            kind: kind.into(),
+            name: name.into(),
+            arg: "arg".into(),
+            result: String::new().into(),
+            output: SharedString::default(),
+            content: SharedString::default(),
+            phase,
+            diffs: Vec::new(),
+            expanded: false,
+            task: false,
+            grant: None,
+            images: Vec::new(),
+        })
+    }
+
+    fn live_think(text: &str, streaming: bool) -> ChatItem {
+        ChatItem::Thinking {
+            text: text.into(),
+            streaming,
+            open: false,
+            started: None,
+            elapsed_ms: None,
+        }
+    }
+
+    /// 预览槽跟着本轮当前状态走：思考 → 单个工具 → 并行 → 非 Working 时收起。
+    #[core::prelude::v1::test]
+    fn live_preview_follows_the_running_step() {
+        let mut s = live_test_session();
+        s.busy = true;
+        // 刚发出去、还没出思考或工具
+        assert_eq!(s.live_preview(ViewMode::Normal), LivePreview::None);
+
+        // 正在流式思考
+        s.transcript.push(live_think("先想一想", true));
+        assert_eq!(s.live_preview(ViewMode::Normal), LivePreview::Thinking(0));
+        // 详细视图里思考整段展开着，不重复预览
+        assert_eq!(s.live_preview(ViewMode::Verbose), LivePreview::None);
+        s.transcript[0] = live_think("想完了", false);
+
+        // 单个简单工具：不弹（防止高频调用闪烁）
+        s.transcript.push(live_tool("read", "Read", ToolPhase::Running));
+        assert_eq!(s.live_preview(ViewMode::Normal), LivePreview::None);
+
+        // 单个非简单工具：弹
+        let mut s = live_test_session();
+        s.busy = true;
+        s.transcript.push(live_tool("execute", "Bash", ToolPhase::Running));
+        assert_eq!(s.live_preview(ViewMode::Normal), LivePreview::Tool(0));
+        // Summary 模式同样给
+        assert_eq!(s.live_preview(ViewMode::Summary), LivePreview::Tool(0));
+
+        // 两个以上并行：列成多行
+        s.transcript.push(live_tool("fetch", "Fetch", ToolPhase::Running));
+        assert_eq!(s.live_preview(ViewMode::Normal), LivePreview::ParallelTools(vec![0, 1]));
+
+        // 等授权 / 等回答 / 回复正文时都不是 Working：这里只覆盖回合结束这一种
+        s.busy = false;
+        assert_eq!(s.live_preview(ViewMode::Normal), LivePreview::None);
+    }
+
+    /// 思考预览：先逐行填满 4 行，溢出后冻结 3 秒，再按慢速 / 高速两种方式整块替换。
+    #[core::prelude::v1::test]
+    fn live_think_pager_freezes_then_pages() {
+        let mut s = live_test_session();
+        s.busy = true;
+        // 6 行：前 4 行上屏并标记还有更多
+        let short = (0..6).map(|i| format!("第{i}行")).collect::<Vec<_>>().join("\n");
+        s.transcript.push(live_think(&short, true));
+        let t0 = Instant::now();
+        s.sync_live_think(ViewMode::Normal, t0);
+        let (lines, more) = s.live_think_block().unwrap();
+        assert_eq!(lines.len(), layout::LIVE_THINK_LINES);
+        assert!(more);
+        assert_eq!(lines[0].as_ref(), "第0行");
+
+        // 未满 3 秒：内容冻结不动
+        s.sync_live_think(ViewMode::Normal, t0 + Duration::from_secs(1));
+        assert_eq!(s.live_think_block().unwrap().0[0].as_ref(), "第0行");
+
+        // 满 3 秒：剩余只有 2 行（≤ 4），顺延到下一块、不丢行
+        s.sync_live_think(ViewMode::Normal, t0 + layout::LIVE_THINK_HOLD);
+        let (lines, more) = s.live_think_block().unwrap();
+        assert_eq!(lines[0].as_ref(), "第4行");
+        assert!(!more);
+
+        // 高速思考：长文中途溢出，3 秒后直接跳到最新块
+        let long = (0..80).map(|i| format!("长思考第{i}行")).collect::<Vec<_>>().join("\n");
+        let mut s = live_test_session();
+        s.busy = true;
+        s.transcript.push(live_think(&long, true));
+        let t0 = Instant::now();
+        s.sync_live_think(ViewMode::Normal, t0);
+        let first = s.live_think_block().unwrap().0[0].clone();
+        assert!(s.live_think_block().unwrap().1);
+        s.sync_live_think(ViewMode::Normal, t0 + layout::LIVE_THINK_HOLD);
+        let (lines, more) = s.live_think_block().unwrap();
+        assert!(!more);
+        assert_ne!(lines[0], first);
+        assert!(lines[0].as_ref().contains("长思考第"));
+
+        // 预览消失（例如切到正文回复）时清掉翻页器
+        s.busy = false;
+        s.sync_live_think(ViewMode::Normal, t0);
+        assert!(s.live_think_block().is_none());
+    }
+
+    /// 折行：ASCII 记 1 列、中文记 2 列，收满 4 行就停，超长无换行段落也安全切。
+    #[core::prelude::v1::test]
+    fn wrap_lines_counts_columns_and_stops_at_limit() {
+        let (lines, more) = layout::wrap_lines_with_offsets("abcdefghij", 4, Some(2));
+        assert_eq!(lines.iter().map(|l| l.text.as_ref()).collect::<Vec<_>>(), ["abcd", "efgh"]);
+        assert!(more);
+        // 中文每字 2 列
+        let (lines, _) = layout::wrap_lines_with_offsets("你好世界你好", 4, None);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_ref()).collect::<Vec<_>>(),
+            ["你好", "世界", "你好"]
+        );
+        // 空行跳过
+        let (lines, _) = layout::wrap_lines_with_offsets("\n\n实际内容\n\n", 20, None);
+        assert_eq!(lines.len(), 1);
+    }
+
+    /// Summary 模式里工具行收在过程组中，但底部预览槽放行它的进度重绘；预览之外仍按原规则。
+    #[core::prelude::v1::test]
+    fn live_preview_lets_tool_progress_through() {
+        let mut s = live_test_session();
+        s.busy = true;
+        s.transcript.push(live_tool("execute", "Bash", ToolPhase::Running));
+        if let ChatItem::Tool(card) = &mut s.transcript[0] {
+            card.id = Some("a".into());
+        }
+        // 底部预览槽正显示这条工具：Summary / Normal 都要刷新
+        assert!(s.is_tool_output_visible("a", ViewMode::Summary));
+        assert!(s.is_tool_output_visible("a", ViewMode::Normal));
+        // 回合结束、预览收起后回到原规则（没展开 = 不画）
+        s.busy = false;
+        assert!(!s.is_tool_output_visible("a", ViewMode::Summary));
+        assert!(!s.is_tool_output_visible("a", ViewMode::Normal));
+    }
+
+    /// 状态行指纹：思考冻结期间不变，翻块 / 换预览状态才变（否则虚拟列表不重测末行高度）。
+    #[core::prelude::v1::test]
+    fn status_row_key_tracks_the_preview() {
+        let mut s = live_test_session();
+        s.busy = true;
+        let text = (0..6).map(|i| format!("第{i}行")).collect::<Vec<_>>().join("\n");
+        s.transcript.push(live_think(&text, true));
+        let t0 = Instant::now();
+        s.sync_live_think(ViewMode::Normal, t0);
+        let frozen = s.status_row_key(ViewMode::Normal);
+        // 冻结期内指纹不变
+        s.sync_live_think(ViewMode::Normal, t0 + Duration::from_secs(1));
+        assert_eq!(s.status_row_key(ViewMode::Normal), frozen);
+        // 满 3 秒翻到下一块：指纹变化，末行才会重测
+        s.sync_live_think(ViewMode::Normal, t0 + layout::LIVE_THINK_HOLD);
+        assert_ne!(s.status_row_key(ViewMode::Normal), frozen);
+        // 换到别的状态（回合结束）也变
+        let paged = s.status_row_key(ViewMode::Normal);
+        s.busy = false;
+        assert_ne!(s.status_row_key(ViewMode::Normal), paged);
     }
 }

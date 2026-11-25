@@ -418,7 +418,9 @@ impl ChatApp {
                             _ => row,
                         }
                     }
-                    None if ix == s.rows.len() => row.pb_12().children(this.render_turn_status()),
+                    None if ix == s.rows.len() => {
+                        row.pb_12().children(this.render_turn_status(window, cx))
+                    }
                     _ => row,
                 };
                 div().w_full().child(content).into_any_element()

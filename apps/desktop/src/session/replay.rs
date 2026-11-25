@@ -262,6 +262,7 @@ impl Session {
     /// 回退对话：对话截到第 `idx` 行之前（那条用户消息起都不要了），挂在这些行上的状态一并清掉。
     pub fn truncate_to(&mut self, idx: usize) {
         self.stream_pending.clear();
+        self.live_think = None;
         if idx < self.transcript.len() {
             self.transcript.truncate(idx);
             self.body_cache.truncate(idx);
@@ -306,6 +307,7 @@ impl Session {
     /// 有对话的会话变成「历史会话」，下次发消息时在新内核上续接。
     pub fn detach_kernel(&mut self, kernel: Option<&Arc<dyn Kernel>>) {
         self.flush_stream();
+        self.live_think = None;
         self.cancel_pending_permissions(kernel);
         // 排着的压缩是给旧内核会话的：撤掉，免得新会话接上时和第一轮撞在一起
         self.drop_queued_compaction("内核已切换");
@@ -338,6 +340,7 @@ impl Session {
     /// 内核致命错误：这个会话不再可用。
     pub fn on_fatal(&mut self, message: &str, kernel: Option<&Arc<dyn Kernel>>) {
         self.flush_stream();
+        self.live_think = None;
         self.busy = false;
         self.stopping = false;
         self.ready = false;
