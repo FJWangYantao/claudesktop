@@ -156,6 +156,13 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
 - **提示消息**：不属于某个对话的（导出结果、设置 / 文件读写失败、输入限制）用 `ChatApp::toast`
   （gpui-kit `Notification`，应用内）；会话自己的事（内核错误、停止、续接）才用 `Session::note` 进对话流。
   系统通知走 `notify.rs` 的 `notify_attention`：它注册的点击回调顶掉了 gpui-kit 的，所以别用 `Notification::system()`。
+- **对话末尾状态行与实时预览槽**（`app/status.rs` + `session/layout.rs`）：上下分工——
+  正在跑的非简单工具 / 并行工具 / 流式思考只在**底部**画；跑完立刻落进上面的过程组（`compute_layout` 里把活跃预览项从组内剔除）。
+  思考与工具结束后底部原地驻留 `LIVE_PREVIEW_LINGER`（1.5 秒）再收起，新的预览接手即让位；驻留靠 `ChatApp` 排的准点定时器收起，不靠 1 秒心跳。
+  思考**不逐字流式**：攒满 4 行或等够 `LIVE_THINK_REVEAL_AFTER`（1.2 秒，且出了完整段落）才整块亮出，之后冻结 `LIVE_THINK_HOLD`（3 秒）再整块替换；
+  思考块无边框、`INK_SOFT` 72% 灰、斜体。思考 chunk 不再按 50ms 重画，只有首次创建时通知一次。
+  进行中的过程组露最近 `LIVE_TAIL`（6）步；摘要模式保留一行折叠的过程记录栏头。
+  截图预览：`CLAUDESKTOP_OPEN=live-preview:<thinking|tool-empty|tool-output|tool-other|parallel|tool-done>`。
 - **命令面板**（Ctrl+K，`app/palette.rs`）：新的全局操作顺手在 `palette_groups` 里加一条。
   条目确认走 `on_confirm` 回调改 `ChatApp`，不用 `CommandItem::action`：对话框在 Root 浮层里，
   不在 `ChatApp` 键上下文下，派发的动作收不到。

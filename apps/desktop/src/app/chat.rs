@@ -500,12 +500,14 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let s = self.session();
+        let view = self.settings.view_mode;
+        // 摘要模式下过程行本来就不画，组头仍按全部步骤统计（它就是那一栏的全部信息）
         let (summary, failed) = group_summary(
             s.transcript[ix..group.end]
                 .iter()
-                .filter(|i| i.has_content() && i.visible_in(self.settings.view_mode)),
+                .filter(|i| i.has_content() && (view == ViewMode::Summary || i.visible_in(view))),
         );
-        let toggle = self.settings.view_mode != ViewMode::Verbose;
+        let toggle = view != ViewMode::Verbose;
         div()
             .id(("step-group", ix))
             .when(toggle, |d| d.role(Role::Button).aria_expanded(group.open))

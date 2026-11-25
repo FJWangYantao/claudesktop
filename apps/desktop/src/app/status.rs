@@ -11,8 +11,8 @@ use super::mascot::Mood;
 use super::motion::mascot;
 use crate::model::{ChatItem, ToolCard, ViewMode, tool_icon};
 use crate::session::{
-    Activity, LIVE_CMD_PREVIEW_LINES, LIVE_PARALLEL_MAX, LIVE_THINK_LINES, LivePreview, Session,
-    TurnSummary, TurnUsage,
+    Activity, LIVE_CMD_PREVIEW_LINES, LIVE_PARALLEL_MAX, LIVE_THINK_LINES, LivePreviewContent,
+    Session, TurnSummary, TurnUsage,
 };
 use crate::theme::rgb;
 use crate::theme::*;
@@ -34,6 +34,10 @@ impl ChatApp {
     ) -> Option<Div> {
         let s = self.session();
         if !s.busy {
+            // 回合刚结束、底部还挂着驻留：只画那一屏，不再画转圈和 Esc
+            if s.has_live_linger() {
+                return self.render_live_preview(window, cx);
+            }
             // 正在后台建 worktree（大仓库检出要几秒）：说一声，建好之前发的话先排队
             if s.worktree_busy.is_some() {
                 return Some(
@@ -143,14 +147,23 @@ impl ChatApp {
     /// 简单工具、子任务、等待中的状态都不出预览（见 [`Session::live_preview`]）。
     fn render_live_preview(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let s = self.session();
-        match s.live_preview(self.settings.view_mode) {
-            LivePreview::None => None,
-            LivePreview::Thinking(_) => {
-                let (lines, has_more) = s.live_think_block()?;
+        match s.live_preview_content(self.settings.view_mode) {
+            LivePreviewContent::None => None,
+            // 思考：无框、低对比度灰、斜体，缩进到状态文字起点（不加卡片底色和描边）
+            LivePreviewContent::Thinking { lines, has_more } => {
                 if lines.is_empty() {
                     return None;
                 }
-                let mut col = div().v_flex().gap_1().min_w_0();
+                let mut col = div()
+                    .v_flex()
+                    .gap_1()
+                    .min_w_0()
+                    .pl(rems(1.625))
+                    .pt_0p5()
+                    .text_size(TEXT_SMALL)
+                    .line_height(LEADING)
+                    .text_color(with_alpha(rgb(INK_SOFT), 0.72))
+                    .italic();
                 for (n, line) in lines.iter().take(LIVE_THINK_LINES).enumerate() {
                     let mut text = line.clone();
                     if has_more && n + 1 == lines.len().min(LIVE_THINK_LINES) {
@@ -165,15 +178,15 @@ impl ChatApp {
                             .child(text),
                     );
                 }
-                Some(self.live_card(col))
+                Some(col)
             }
-            LivePreview::Tool(ix) => {
+            LivePreviewContent::Tool(ix) => {
                 let Some(ChatItem::Tool(card)) = s.transcript.get(ix) else {
                     return None;
                 };
                 Some(self.live_card(self.live_tool_body(ix, card, window, cx)))
             }
-            LivePreview::ParallelTools(indices) => {
+            LivePreviewContent::ParallelTools(indices) => {
                 let mut col = div().v_flex().gap_1().min_w_0();
                 for (n, &ix) in indices.iter().take(LIVE_PARALLEL_MAX).enumerate() {
                     let Some(ChatItem::Tool(card)) = s.transcript.get(ix) else {
@@ -402,6 +415,7 @@ fn working_label(s: &Session) -> Cow<'static, str> {
         Some("execute") => "正在运行命令".into(),
         Some("read") => "正在读取文件".into(),
         Some("search") => "正在搜索".into(),
+        Some("websearch") => "正在联网搜索".into(),
         Some("edit" | "delete" | "move") => "正在修改文件".into(),
         Some("fetch") => "正在访问网页".into(),
         Some("task") => "正在执行子任务".into(),

@@ -402,6 +402,13 @@
 - **无前台且窗口被遮挡时，滚轮压测可能一直不出统计**：`on_next_frame` 等不到可见窗口的正常呈现，别把超时当通过，
   也别为了拿数字抢前台；功能验证可用 `WM_MOUSEWHEEL` 的 `PostMessage` 驱动真实窗口，再用 `shot.ps1` 截图。
 
+- **实时预览槽已有截图钩子，别另起一个**（2026-11-25）：`CLAUDESKTOP_OPEN=live-preview:<thinking|tool-empty|tool-output|tool-other|parallel|tool-done>`
+  在 `ChatApp::debug_live_preview` 里摆状态（仅 `headless-screenshot` 特性）；新增预览样式先往这里加 kind，
+  不要再建 `CLAUDESKTOP_PREVIEW_*`（会撞同名方法）。
+- **`D:/t3/debug/claudesktop.exe` 被正在运行的实例占用时链接报 `os error 5`**（2026-11-25）：
+  先 `Get-Process claudesktop` 看 PID / 路径，确认是自己起的才关；用户前台开着的实例不要动。
+  不想关它时可以把 `claudesktop.exe` / `.pdb` `Move-Item` 成别的名字（运行中的镜像允许改名、不允许删除），
+  再正常构建——老进程照常跑，名字留到关闭后再删。
 - **验证 UI 别用会抢前台的招**：`tools/shot.ps1` 走 PrintWindow，不抢焦点不移动光标，
   随便截；`tools/demo-drive.ps1` 要置顶 + SetCursorPos + 点击，会打断用户手头的事，
   用户明确要求"起无头的、不占前台"后就不要再用它驱动交互。交互逻辑改走单元测试

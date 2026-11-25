@@ -189,6 +189,8 @@ pub struct ChatApp {
     copied: Option<(u64, usize, Option<usize>)>,
     /// 点「复制」的时刻（对勾的入场动画）
     copied_at: Option<Instant>,
+    /// 已经为哪个驻留截止时刻排过一次准点收起（避免同一条驻留重复排定时器）
+    linger_timer: Option<Instant>,
     /// 鼠标停在对话里第几条消息上（当前会话；消息下方的操作按钮淡入淡出）
     hovered_msg: Option<usize>,
     /// 滚动进行中的截止时刻：这期间悬停变化不再单独通知内容区（每帧本来就在重画）
@@ -513,7 +515,7 @@ impl ChatApp {
                             app.session_stress = Some(stress);
                         }
                     }
-                    if app.session().busy {
+                    if app.session().busy || app.session().has_live_linger() {
                         cx.notify();
                     }
                 });
@@ -602,6 +604,7 @@ impl ChatApp {
             fetching_models: false,
             context_probed: false,
             copied: None,
+            linger_timer: None,
             copied_at: None,
             hovered_msg: None,
             scrolling_until: None,
@@ -2103,11 +2106,28 @@ impl ChatApp {
                 images: Vec::new(),
             })
         };
+        // 刚跑完的工具：确认底部驻留 1.5 秒时仍显示最终输出
+        let mut linger_tool = None;
         match kind {
             // 单条命令、还没有输出：确认 `No output` 和命令首行
             "tool-empty" => {
                 s.transcript
                     .push(tool("execute", "Bash", "cargo build -p claudesktop --release", ""));
+            }
+            "tool-done" => {
+                let ix = s.transcript.len();
+                let mut card = tool(
+                    "execute",
+                    "Bash",
+                    "cargo build -p claudesktop --release",
+                    "   Compiling claudesktop v0.19.0\n    Finished `release` profile in 1.8s",
+                );
+                if let ChatItem::Tool(c) = &mut card {
+                    c.phase = ToolPhase::Done;
+                    c.result = "Finished in 1.8s".into();
+                }
+                s.transcript.push(card);
+                linger_tool = Some(ix);
             }
             // 长输出：确认限高 10rem 的滚动窗、常显滚动条和贴底
             "tool-output" => {
@@ -2146,6 +2166,12 @@ impl ChatApp {
             }),
         }
         s.begin_turn();
+        if let Some(ix) = linger_tool {
+            s.live_linger = Some(crate::session::layout::LiveLinger {
+                snapshot: crate::session::layout::LingerSnapshot::Tool(ix),
+                until: std::time::Instant::now() + crate::session::layout::LIVE_PREVIEW_LINGER,
+            });
+        }
         cx.notify();
     }
 
@@ -3592,7 +3618,13 @@ impl ChatApp {
                             self.sessions[idx].drop_queued_compaction("这一轮出错了");
                         }
                     }
+                    // 思考 chunk 不按 50ms 流式重画：整块攒好才会跳出（见 sync_live_think），
+                    // 只在刚开始思考时立刻通知一次，之后交给 1 秒定时器推进
+                    let was_thinking = self.sessions[idx].is_streaming_thinking();
                     let prompt = self.sessions[idx].apply_event(event.clone(), kernel.as_ref());
+                    let thinking_started = matches!(event, KernelEvent::AgentThoughtChunk { .. })
+                        && !was_thinking
+                        && self.sessions[idx].is_streaming_thinking();
                     if idx == self.active
                         && matches!(event, KernelEvent::AvailableCommandsChanged { .. })
                     {
@@ -3677,10 +3709,28 @@ impl ChatApp {
                             && self.sessions[idx]
                                 .is_tool_output_visible(id, self.settings.view_mode))
                     });
-                    skip_notify =
-                        is_chunk && !self.sessions[idx].take_stream_dirty() || hidden_progress;
+                    skip_notify = is_chunk && !self.sessions[idx].take_stream_dirty()
+                        || hidden_progress
+                        // 思考只进缓冲不重画（除了刚创建那一下）
+                        || (matches!(event, KernelEvent::AgentThoughtChunk { .. })
+                            && !thinking_started);
                 }
             }
+        }
+        // 驻留只有 1.5 秒：排一个准点定时器，别让 1 秒心跳把收起拖到两秒多
+        if let Some(until) = self.sessions.iter().filter_map(|s| s.live_linger_until()).min()
+            && self.linger_timer != Some(until)
+        {
+            self.linger_timer = Some(until);
+            cx.spawn(async move |this, cx| {
+                let wait = until.saturating_duration_since(Instant::now());
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |app: &mut Self, cx| {
+                    app.linger_timer = None;
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         if !skip_notify {
             cx.notify();

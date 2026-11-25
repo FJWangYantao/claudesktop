@@ -183,6 +183,10 @@ impl ToolCard {
         if self.name.as_ref() == "Task" {
             return "task";
         }
+        // 联网搜索和网页抓取分开：过程记录栏里要能一眼看出搜了什么
+        if matches!(self.name.as_ref(), "WebSearch" | "web_search") {
+            return "websearch";
+        }
         if !self.kind.is_empty() {
             return &self.kind;
         }
@@ -266,6 +270,7 @@ pub fn tool_icon(kind: &str) -> IconAll {
     match kind {
         "read" => IconAll::FileText,
         "search" => IconAll::TextSearch,
+        "websearch" => IconAll::Globe,
         "execute" => IconAll::SquareTerminal,
         "edit" => IconAll::FilePen,
         "delete" => IconAll::Trash,
@@ -379,8 +384,16 @@ pub fn turn_files(items: &[ChatItem], offset: usize) -> Vec<TurnFile> {
 /// 读文件按路径去重；只有思考时说「已思考」。
 pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (String, usize) {
     let mut read_args: Vec<&str> = Vec::new();
-    let (mut search, mut exec, mut edit, mut fetch, mut other, mut think, mut failed) =
-        (0, 0, 0, 0, 0, 0, 0);
+    let (
+        mut search,
+        mut websearch,
+        mut exec,
+        mut edit,
+        mut fetch,
+        mut other,
+        mut think,
+        mut failed,
+    ) = (0, 0, 0, 0, 0, 0, 0, 0);
     let mut tasks = 0;
     // 思考总用时；有一段不知道（旧日志）就整体不报
     let mut think_ms = Some(0);
@@ -397,6 +410,7 @@ pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (Stri
                         }
                     }
                     "search" => search += 1,
+                    "websearch" => websearch += 1,
                     "execute" => exec += 1,
                     "edit" => edit += 1,
                     "fetch" => fetch += 1,
@@ -420,6 +434,7 @@ pub fn group_summary<'a>(items: impl IntoIterator<Item = &'a ChatItem>) -> (Stri
     push(tasks, format!("派出 {tasks} 个子任务"));
     push(read_args.len(), format!("读取 {} 个文件", read_args.len()));
     push(search, format!("搜索 {search} 次"));
+    push(websearch, format!("联网搜索 {websearch} 次"));
     push(exec, format!("运行 {exec} 条命令"));
     push(edit, format!("编辑 {edit} 次"));
     push(fetch, format!("访问网页 {fetch} 次"));
@@ -1165,6 +1180,7 @@ pub fn tool_label(kind: &str, title: &str) -> (SharedString, SharedString) {
         "delete" => "Delete",
         "move" => "Move",
         "search" => "Search",
+        "websearch" => "WebSearch",
         "fetch" => "Fetch",
         "think" => "Think",
         _ => return (name, arg),
@@ -1740,6 +1756,12 @@ mod tests {
         // 不足 1 秒的不占位
         let brief = [thought("想", Some(400)), tool("read", "Read", "a.rs", ToolPhase::Done)];
         assert_eq!(group_summary(&brief).0, "读取 1 个文件");
+        // 联网搜索和网页抓取分开计数（ACP 都报 fetch，按工具名区分）
+        let web = [
+            tool("fetch", "WebSearch", "rust 2024", ToolPhase::Done),
+            tool("fetch", "Fetch", "https://example.com", ToolPhase::Done),
+        ];
+        assert_eq!(group_summary(&web).0, "联网搜索 1 次，访问网页 1 次");
     }
 
     /// 已收尾的一段思考。

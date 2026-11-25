@@ -77,10 +77,14 @@ pub enum Activity {
 pub const LIVE_THINK_LINES: usize = 4;
 /// 思考块超出后冻结展示多久再整块替换。
 pub const LIVE_THINK_HOLD: Duration = Duration::from_secs(3);
+/// 思考块攒够这么久还没折满 4 行，也一次性整块亮出（慢模型别让底下长时间空着）。
+pub const LIVE_THINK_REVEAL_AFTER: Duration = Duration::from_millis(1200);
 /// 并行工具调用在底部预览槽最多列几行。
 pub const LIVE_PARALLEL_MAX: usize = 6;
 /// 单个运行中命令在底部预览槽最多列的命令行数。
 pub const LIVE_CMD_PREVIEW_LINES: usize = 8;
+/// 思考 / 工具走完后，底部预览原地停留多久再收起。
+pub const LIVE_PREVIEW_LINGER: Duration = Duration::from_millis(1500);
 
 /// 运行状态行下方的实时预览槽内容。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +95,7 @@ pub enum LivePreview {
     ParallelTools(Vec<usize>),
 }
 
-/// 思考实时预览的整块翻页器：显示当前 4 行，超出后冻结 3 秒再整块替换。
+/// 思考实时预览的整块翻页器：攒够一块才一次性亮出，之后冻结 3 秒再整块替换。
 #[derive(Clone, Debug)]
 pub(crate) struct LiveThinkPager {
     pub item_ix: usize,
@@ -100,8 +104,34 @@ pub(crate) struct LiveThinkPager {
     pub bytes_consumed: usize,
     pub lines: Vec<SharedString>,
     pub has_more: bool,
-    pub overflow_since: Option<Instant>,
-    pub last_text_len: usize,
+    /// 第一块什么时候亮出来的；`None` = 还在后台攒，界面暂不画半截字
+    pub shown_at: Option<Instant>,
+    /// 开始攒这一块的时间（慢模型 1.2 秒兜底亮出用）
+    pub first_seen: Instant,
+}
+
+/// 预览槽刚走完、还在原地停留的那一屏是什么。
+#[derive(Clone, Debug)]
+pub(crate) enum LingerSnapshot {
+    Thinking { lines: Vec<SharedString>, has_more: bool },
+    Tool(usize),
+    ParallelTools(Vec<usize>),
+}
+
+/// 思考 / 工具走完后的短暂驻留：到 `until` 就收，期间有新的预览接手就让位。
+#[derive(Clone, Debug)]
+pub(crate) struct LiveLinger {
+    pub snapshot: LingerSnapshot,
+    pub until: Instant,
+}
+
+/// 底部预览槽此刻实际要画的东西（活跃预览优先，其次驻留快照）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LivePreviewContent {
+    None,
+    Thinking { lines: Vec<SharedString>, has_more: bool },
+    Tool(usize),
+    ParallelTools(Vec<usize>),
 }
 
 pub(crate) struct WrappedLine {
@@ -218,7 +248,7 @@ fn estimate_visual_lines_capped(text: &str, max_cols: usize, cap: usize) -> usiz
 
 /// 读 / 搜 / 改 / 删 / 移动等瞬时简单工具：单独跑时不弹底部预览槽，防止连续调用时闪烁。
 pub(crate) fn is_simple_tool(card: &ToolCard) -> bool {
-    matches!(card.kind_key(), "read" | "search" | "edit" | "delete" | "move")
+    matches!(card.kind_key(), "read" | "search" | "websearch" | "edit" | "delete" | "move")
 }
 
 pub(crate) fn new_list_state() -> ListState {
@@ -578,7 +608,7 @@ impl Session {
 
     /// 列表末尾那一行运行状态行显不显示。
     pub(crate) fn status_visible(&self) -> bool {
-        self.busy || self.resuming || self.worktree_busy.is_some()
+        self.busy || self.resuming || self.worktree_busy.is_some() || self.has_live_linger()
     }
 
     /// 底部预览卡片内每行大约能容下多少个窄字符列。
@@ -646,7 +676,8 @@ impl Session {
         LivePreview::None
     }
 
-    /// 推进底部思考预览的 4 行块状态：超出后冻结 3 秒，再整块替换。
+    /// 推进底部思考预览的 4 行块状态：攒够一块才一次性亮出，之后冻结 3 秒再整块替换。
+    /// 亮出前不画半截字；思考结束时由 `finish_thinking` 把最后一块交给驻留。
     pub fn sync_live_think(&mut self, view: ViewMode, now: Instant) {
         let LivePreview::Thinking(ix) = self.live_preview(view) else {
             self.live_think = None;
@@ -666,94 +697,228 @@ impl Session {
         if !same_item {
             let (wrapped, has_more) = wrap_lines_with_offsets(text, cols, Some(LIVE_THINK_LINES));
             let bytes_consumed = wrapped.last().map_or(0, |l| l.end);
-            let lines = wrapped.into_iter().map(|l| l.text).collect();
             self.live_think = Some(LiveThinkPager {
                 item_ix: ix,
                 cols,
                 byte_offset: 0,
                 bytes_consumed,
-                lines,
+                lines: wrapped.into_iter().map(|l| l.text).collect(),
                 has_more,
-                overflow_since: has_more.then_some(now),
-                last_text_len: text_len,
+                // 已经折满 4 行还有溢出：第一块就是完整的，直接亮
+                shown_at: has_more.then_some(now),
+                first_seen: now,
             });
             return;
         }
 
         let mut pager = self.live_think.take().unwrap();
-        if let Some(since) = pager.overflow_since {
-            if now.duration_since(since) >= LIVE_THINK_HOLD {
-                let next_offset = (pager.byte_offset + pager.bytes_consumed).min(text_len);
-                let (next_wrapped, next_has_more) =
-                    wrap_lines_with_offsets(&text[next_offset..], cols, Some(LIVE_THINK_LINES));
-                if !next_has_more {
-                    pager.byte_offset = next_offset;
-                    pager.bytes_consumed = next_wrapped.last().map_or(0, |l| l.end);
-                    pager.lines = next_wrapped.into_iter().map(|l| l.text).collect();
-                    pager.has_more = false;
-                    pager.overflow_since = None;
-                } else {
-                    let tail_raw = text_len.saturating_sub(4096);
-                    let mut tail_base = tail_raw.max(next_offset);
-                    while tail_base < text_len && !text.is_char_boundary(tail_base) {
-                        tail_base += 1;
-                    }
-                    if tail_base > next_offset
-                        && let Some(rel) = text[tail_base..].find('\n')
-                    {
-                        let after_nl = tail_base + rel + 1;
-                        if after_nl < text_len && !text[after_nl..].trim().is_empty() {
-                            tail_base = after_nl;
-                        }
-                    }
-                    let (tail_wrapped, _) = wrap_lines_with_offsets(&text[tail_base..], cols, None);
-                    if tail_wrapped.is_empty() {
-                        pager.byte_offset = next_offset;
-                        pager.bytes_consumed = next_wrapped.last().map_or(0, |l| l.end);
-                        pager.lines = next_wrapped.into_iter().map(|l| l.text).collect();
-                        pager.has_more = next_has_more;
-                        pager.overflow_since = Some(now);
-                    } else {
-                        let keep_from = tail_wrapped.len().saturating_sub(LIVE_THINK_LINES);
-                        let kept = &tail_wrapped[keep_from..];
-                        let first_start = kept[0].start;
-                        let last_end = kept[kept.len() - 1].end;
-                        pager.byte_offset = tail_base + first_start;
-                        pager.bytes_consumed = last_end.saturating_sub(first_start);
-                        pager.lines = kept.iter().map(|l| l.text.clone()).collect();
-                        pager.has_more = false;
-                        pager.overflow_since = None;
-                    }
-                }
-                pager.cols = cols;
-                pager.last_text_len = text_len;
-            } else if pager.cols != cols {
-                let slice = &text[pager.byte_offset.min(text_len)..];
-                let (wrapped, has_more) =
-                    wrap_lines_with_offsets(slice, cols, Some(LIVE_THINK_LINES));
-                pager.bytes_consumed = wrapped.last().map_or(0, |l| l.end);
-                pager.lines = wrapped.into_iter().map(|l| l.text).collect();
-                pager.has_more = has_more;
-                pager.cols = cols;
-            }
-        } else if text_len != pager.last_text_len || pager.cols != cols {
-            let slice = &text[pager.byte_offset.min(text_len)..];
-            let (wrapped, has_more) = wrap_lines_with_offsets(slice, cols, Some(LIVE_THINK_LINES));
+        // 列宽变了：从当前窗口起点重新折一遍（亮出与否保持不变）
+        if pager.cols != cols {
+            let start = pager.byte_offset.min(text_len);
+            let (wrapped, has_more) =
+                wrap_lines_with_offsets(&text[start..], cols, Some(LIVE_THINK_LINES));
+            pager.byte_offset = start;
             pager.bytes_consumed = wrapped.last().map_or(0, |l| l.end);
             pager.lines = wrapped.into_iter().map(|l| l.text).collect();
             pager.has_more = has_more;
             pager.cols = cols;
-            pager.last_text_len = text_len;
-            if has_more {
-                pager.overflow_since = Some(now);
+        }
+        match pager.shown_at {
+            // 还在攒第一块：只折前 4 行，够格才亮
+            None => {
+                let start = pager.byte_offset.min(text_len);
+                let (wrapped, has_more) =
+                    wrap_lines_with_offsets(&text[start..], cols, Some(LIVE_THINK_LINES));
+                pager.bytes_consumed = wrapped.last().map_or(0, |l| l.end);
+                pager.lines = wrapped.into_iter().map(|l| l.text).collect();
+                pager.has_more = has_more;
+                // 满 4 行溢出，或已经等够 1.2 秒且出了完整段落
+                let waited = now.duration_since(pager.first_seen) >= LIVE_THINK_REVEAL_AFTER;
+                if has_more || (waited && text.contains('\n')) {
+                    pager.shown_at = Some(now);
+                }
+            }
+            // 亮出之后严格冻结；满 3 秒且后面又有新内容才整块替换
+            Some(shown) => {
+                let has_newer = pager.byte_offset + pager.bytes_consumed < text_len;
+                if has_newer && now.duration_since(shown) >= LIVE_THINK_HOLD {
+                    let next_offset = (pager.byte_offset + pager.bytes_consumed).min(text_len);
+                    let (next_wrapped, next_has_more) =
+                        wrap_lines_with_offsets(&text[next_offset..], cols, Some(LIVE_THINK_LINES));
+                    if next_wrapped.is_empty() {
+                        // 后面只有空白：这一拍不动，等下一块
+                    } else if !next_has_more {
+                        pager.byte_offset = next_offset;
+                        pager.bytes_consumed = next_wrapped.last().map_or(0, |l| l.end);
+                        pager.lines = next_wrapped.into_iter().map(|l| l.text).collect();
+                        pager.has_more = false;
+                        pager.shown_at = Some(now);
+                    } else {
+                        // 高速思考：直接跳到最新块（最近 4 行），不逐块追赶
+                        let tail_raw = text_len.saturating_sub(4096);
+                        let mut tail_base = tail_raw.max(next_offset);
+                        while tail_base < text_len && !text.is_char_boundary(tail_base) {
+                            tail_base += 1;
+                        }
+                        if tail_base > next_offset
+                            && let Some(rel) = text[tail_base..].find('\n')
+                        {
+                            let after_nl = tail_base + rel + 1;
+                            if after_nl < text_len && !text[after_nl..].trim().is_empty() {
+                                tail_base = after_nl;
+                            }
+                        }
+                        let (tail_wrapped, _) =
+                            wrap_lines_with_offsets(&text[tail_base..], cols, None);
+                        if tail_wrapped.is_empty() {
+                            pager.byte_offset = next_offset;
+                            pager.bytes_consumed = next_wrapped.last().map_or(0, |l| l.end);
+                            pager.lines = next_wrapped.into_iter().map(|l| l.text).collect();
+                            pager.has_more = next_has_more;
+                        } else {
+                            let keep_from = tail_wrapped.len().saturating_sub(LIVE_THINK_LINES);
+                            let kept = &tail_wrapped[keep_from..];
+                            let first_start = kept[0].start;
+                            let last_end = kept[kept.len() - 1].end;
+                            pager.byte_offset = tail_base + first_start;
+                            pager.bytes_consumed = last_end.saturating_sub(first_start);
+                            pager.lines = kept.iter().map(|l| l.text.clone()).collect();
+                            pager.has_more = false;
+                        }
+                        pager.shown_at = Some(now);
+                    }
+                }
             }
         }
         self.live_think = Some(pager);
     }
 
-    /// 供状态行渲染读取当前思考预览块和截断省略标志。
+    /// 供状态行渲染读取当前已经亮出的思考预览块和截断省略标志。
     pub fn live_think_block(&self) -> Option<(&[SharedString], bool)> {
-        self.live_think.as_ref().map(|p| (p.lines.as_slice(), p.has_more))
+        let pager = self.live_think.as_ref()?;
+        pager.shown_at?;
+        (!pager.lines.is_empty()).then_some((pager.lines.as_slice(), pager.has_more))
+    }
+
+    /// 思考收尾时留在底部的最后一块：已经亮出的沿用当前窗口，没来得及亮出的取末尾 4 行整块补上。
+    /// 只有进行中的真实回合才驻留（回放历史、停下时不闪）。
+    pub(crate) fn thinking_linger_snapshot(&self) -> Option<LingerSnapshot> {
+        if self.replaying || !self.busy {
+            return None;
+        }
+        let Some(ChatItem::Thinking { text, streaming: true, .. }) = self.transcript.last() else {
+            return None;
+        };
+        if text.trim().is_empty() {
+            return None;
+        }
+        let (lines, has_more) = match &self.live_think {
+            Some(p) if !p.lines.is_empty() => (p.lines.clone(), p.has_more),
+            _ => {
+                let (wrapped, _) =
+                    wrap_lines_with_offsets(text, self.preview_cols(), Some(LIVE_THINK_LINES));
+                (wrapped.into_iter().map(|l| l.text).collect(), false)
+            }
+        };
+        Some(LingerSnapshot::Thinking { lines, has_more })
+    }
+
+    /// 本轮正在跑、且会出现在底部预览槽里的工具。
+    fn running_previewable(&self) -> Vec<usize> {
+        let start = self.turn_start();
+        (start..self.transcript.len())
+            .filter(|&ix| {
+                matches!(&self.transcript[ix], ChatItem::Tool(c)
+                    if c.phase == ToolPhase::Running && !is_simple_tool(c) && !c.task)
+            })
+            .collect()
+    }
+
+    /// 并行工具刚起跑：记下这一批，等它们全结束再一起驻留（只有真正并行时才记）。
+    pub(crate) fn note_parallel_batch(&mut self) {
+        let running = self.running_previewable();
+        if running.len() >= 2 {
+            self.live_parallel_batch = running;
+        }
+    }
+
+    /// 某个可预览的工具刚走完：单条驻留它自己，并行批驻留整批。
+    /// 简单工具（读 / 搜 / 改）不算，也不会把本轮早先的命令重新翻出来。
+    pub(crate) fn linger_finished_tool(&mut self, ix: usize) {
+        if self.replaying || !self.busy {
+            return;
+        }
+        let Some(ChatItem::Tool(card)) = self.transcript.get(ix) else { return };
+        if is_simple_tool(card) || card.task {
+            return;
+        }
+        let until = Instant::now() + LIVE_PREVIEW_LINGER;
+        if !self.live_parallel_batch.is_empty() {
+            // 同一批里还有在跑的：等它们都结束
+            if !self.running_previewable().is_empty() {
+                return;
+            }
+            let batch = std::mem::take(&mut self.live_parallel_batch);
+            self.live_linger =
+                Some(LiveLinger { snapshot: LingerSnapshot::ParallelTools(batch), until });
+        } else {
+            self.live_linger = Some(LiveLinger { snapshot: LingerSnapshot::Tool(ix), until });
+        }
+    }
+
+    /// 驻留是否还没到期。
+    pub(crate) fn has_live_linger(&self) -> bool {
+        self.live_linger.as_ref().is_some_and(|l| Instant::now() < l.until)
+    }
+
+    /// 驻留的截止时刻（不给准点定时器用）。
+    pub(crate) fn live_linger_until(&self) -> Option<Instant> {
+        self.live_linger.as_ref().map(|l| l.until)
+    }
+
+    /// 到点、或者切到了不该看预览的状态，就把驻留清掉。
+    pub(crate) fn expire_live_linger(&mut self, view: ViewMode, now: Instant) {
+        let Some(linger) = &self.live_linger else { return };
+        let quiet = matches!(
+            self.activity(),
+            Activity::WaitingPermission
+                | Activity::WaitingQuestion
+                | Activity::Retrying
+                | Activity::Compacting
+        );
+        if now >= linger.until || view == ViewMode::Verbose || quiet {
+            self.live_linger = None;
+        }
+    }
+
+    /// 底部预览槽这一刻实际要画的内容：正在跑的东西优先，没有就让驻留顶 1.5 秒。
+    pub fn live_preview_content(&self, view: ViewMode) -> LivePreviewContent {
+        let active = self.live_preview(view);
+        match active {
+            LivePreview::Thinking(_) => {
+                if let Some((lines, has_more)) = self.live_think_block() {
+                    return LivePreviewContent::Thinking { lines: lines.to_vec(), has_more };
+                }
+            }
+            LivePreview::Tool(ix) => return LivePreviewContent::Tool(ix),
+            LivePreview::ParallelTools(indices) => {
+                return LivePreviewContent::ParallelTools(indices);
+            }
+            LivePreview::None => {}
+        }
+        let Some(linger) = &self.live_linger else { return LivePreviewContent::None };
+        if Instant::now() >= linger.until {
+            return LivePreviewContent::None;
+        }
+        match &linger.snapshot {
+            LingerSnapshot::Thinking { lines, has_more } => {
+                LivePreviewContent::Thinking { lines: lines.clone(), has_more: *has_more }
+            }
+            LingerSnapshot::Tool(ix) => LivePreviewContent::Tool(*ix),
+            LingerSnapshot::ParallelTools(indices) => {
+                LivePreviewContent::ParallelTools(indices.clone())
+            }
+        }
     }
 
     /// 末尾运行状态行的布局测量指纹：可见状态、预览模式或影响高度的内容变化时重测末行。
@@ -765,24 +930,19 @@ impl Session {
             return h.finish();
         }
         if !self.busy {
-            (1u8, self.worktree_busy.is_some(), self.resuming).hash(&mut h);
+            // 回合结束后可能还挂着工具 / 思考的短暂驻留：进出也要重测末行
+            (1u8, self.worktree_busy.is_some(), self.resuming, self.has_live_linger()).hash(&mut h);
             return h.finish();
         }
-        match self.live_preview(view) {
-            LivePreview::None => (2u8, 0u8).hash(&mut h),
-            LivePreview::Thinking(ix) => {
-                let pager = self.live_think.as_ref();
-                (
-                    2u8,
-                    1u8,
-                    ix,
-                    pager.map_or(0, |p| p.byte_offset),
-                    pager.map_or(0, |p| p.lines.len()),
-                    pager.is_some_and(|p| p.has_more),
-                )
-                    .hash(&mut h);
+        match self.live_preview_content(view) {
+            LivePreviewContent::None => (2u8, 0u8).hash(&mut h),
+            LivePreviewContent::Thinking { lines, has_more } => {
+                (2u8, 1u8, lines.len(), has_more).hash(&mut h);
+                for line in &lines {
+                    line.as_ref().hash(&mut h);
+                }
             }
-            LivePreview::Tool(ix) => {
+            LivePreviewContent::Tool(ix) => {
                 let (cmd_lines, out_empty, out_lines) = if let Some(ChatItem::Tool(card)) =
                     self.transcript.get(ix)
                 {
@@ -805,7 +965,7 @@ impl Session {
                 };
                 (2u8, 2u8, ix, cmd_lines, out_empty, out_lines).hash(&mut h);
             }
-            LivePreview::ParallelTools(indices) => {
+            LivePreviewContent::ParallelTools(indices) => {
                 (2u8, 3u8, indices.len().min(LIVE_PARALLEL_MAX + 1)).hash(&mut h);
             }
         }
@@ -879,6 +1039,21 @@ impl Session {
         let last_text =
             t.iter().rposition(|i| matches!(i, ChatItem::Agent(_) | ChatItem::User { .. }));
         let pinned = self.pinned_plan();
+        // 正由底部实时预览槽承接的步骤不在上面重复画一遍：跑完落进上面的记录栏，
+        // 上下职责分开（下面 = 此刻在跑，上面 = 已经完成的轨迹）。
+        let previewed: Vec<usize> = match self.live_preview(view) {
+            LivePreview::Thinking(ix)
+                if self
+                    .live_think
+                    .as_ref()
+                    .is_some_and(|p| p.item_ix == ix && p.shown_at.is_some()) =>
+            {
+                vec![ix]
+            }
+            LivePreview::Tool(ix) => vec![ix],
+            LivePreview::ParallelTools(indices) => indices,
+            _ => Vec::new(),
+        };
         let mut i = 0;
         while i < t.len() {
             if !t[i].is_step() {
@@ -891,16 +1066,43 @@ impl Session {
             while i < t.len() && t[i].is_step() {
                 i += 1;
             }
+            let live = self.busy && last_text.is_none_or(|p| p < start);
+            // 摘要模式也留一行折叠的过程记录栏头：执行过哪些工具 / 搜索还能点开看
             if view == ViewMode::Summary {
+                let steps: Vec<usize> = (start..i).filter(|&k| t[k].has_content()).collect();
+                // 只有思考的组不占位：记录栏讲的是「跑过哪些工具 / 搜过什么」
+                if steps.iter().any(|&k| matches!(t[k], ChatItem::Tool(_))) {
+                    let open = self.open_groups.contains(&start);
+                    out[start].head = Some(StepGroup { end: i, live, open, live_small: false });
+                    for &s in &steps {
+                        out[s].member = true;
+                        out[s].group_start = Some(start);
+                    }
+                    if open {
+                        // 点开只露工具 / 搜索（摘要模式不看思考）
+                        let shown: Vec<usize> = steps
+                            .iter()
+                            .copied()
+                            .filter(|&k| matches!(t[k], ChatItem::Tool(_)))
+                            .collect();
+                        out[start].tight = !shown.is_empty();
+                        for (k, &s) in shown.iter().enumerate() {
+                            out[s].body = true;
+                            out[s].nested = true;
+                            out[s].tight = k + 1 < shown.len();
+                        }
+                    }
+                }
                 continue;
             }
-            let steps: Vec<usize> =
-                (start..i).filter(|&k| t[k].visible_in(view) && t[k].has_content()).collect();
+            let steps: Vec<usize> = (start..i)
+                .filter(|&k| t[k].visible_in(view) && t[k].has_content())
+                .filter(|k| !previewed.contains(k))
+                .collect();
             match steps.len() {
                 0 => {}
                 1 => out[steps[0]].body = true,
                 n => {
-                    let live = self.busy && last_text.is_none_or(|p| p < start);
                     // 活跃的小组默认全展开：刚开始的几步没有「尾巴」可藏，点一下能收起来
                     let live_small = live && view != ViewMode::Verbose && n <= LIVE_TAIL;
                     let open = if live_small {
@@ -1109,6 +1311,8 @@ impl Session {
         }
         // 先推进思考翻页计时：即使没有新 chunk 到达，满 3 秒也应触发状态行重测与整块替换
         self.sync_live_think(view, Instant::now());
+        // 驻留到点 / 切到不该看预览的状态：先收掉再算状态行指纹
+        self.expire_live_linger(view, Instant::now());
         let mut sync = SyncSig {
             layout_rev: self.layout_rev,
             transcript_rev: self.transcript.revision,

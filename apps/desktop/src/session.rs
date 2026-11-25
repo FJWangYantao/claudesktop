@@ -23,7 +23,7 @@ pub(crate) mod wheel;
 use layout::new_list_state;
 pub use layout::{
     Activity, LIVE_CMD_PREVIEW_LINES, LIVE_PARALLEL_MAX, LIVE_THINK_LINES, ListMetrics,
-    LivePreview, Row, RowLayout, StepGroup, TurnSummary, TurnUsage,
+    LivePreview, LivePreviewContent, Row, RowLayout, StepGroup, TurnSummary, TurnUsage,
 };
 
 pub use wheel::{DEFAULT_FRAME_DT, WheelInput, WheelScroll};
@@ -74,6 +74,10 @@ pub struct Session {
     measured_status: Option<u64>,
     /// 底部思考实时预览的 4 行整块翻页状态
     pub(crate) live_think: Option<layout::LiveThinkPager>,
+    /// 思考 / 工具走完后在底部预览槽原地停留的一屏（1.5 秒后收起）
+    pub(crate) live_linger: Option<layout::LiveLinger>,
+    /// 这一批同时在跑的可预览工具（≥2 才记）；全部结束后整批驻留
+    pub(crate) live_parallel_batch: Vec<usize>,
     /// 本帧的排版度量（列宽、rem）：变了就按新字号 / 列宽重估所有行高并重测。
     /// 由内容区每帧交进来（见 [`Session::set_list_metrics`]）。
     metrics: Option<ListMetrics>,
@@ -360,8 +364,9 @@ pub struct Retry {
     pub at: Instant,
 }
 
-/// 进行中的过程组露出最近几步，其余收在组头里
-pub const LIVE_TAIL: usize = 3;
+/// 进行中的过程组露出最近几步，其余收在组头里。
+/// 露 6 步：命令 / 搜索刚跑完不至于立刻被挤进折叠里。
+pub const LIVE_TAIL: usize = 6;
 
 /// 流式文本两次并进正文的最小间隔：界面按这个节奏出字（每秒约 20 次），
 /// 而不是 chunk 来多快就画多快（见 `Session::stream_pending`）
@@ -408,6 +413,8 @@ impl Session {
             rows_restore: None,
             measured_status: None,
             live_think: None,
+            live_linger: None,
+            live_parallel_batch: Vec::new(),
             metrics: None,
             applied_metrics: None,
             layout_rev: 0,
@@ -1005,6 +1012,13 @@ impl Session {
             if matches!(self.live_preview(view), LivePreview::Tool(live_ix) if live_ix == ix) {
                 return true;
             }
+            // 刚跑完还在底部驻留：那一屏照样得跟着输出刷新
+            if matches!(
+                self.live_preview_content(view),
+                LivePreviewContent::Tool(live_ix) if live_ix == ix
+            ) {
+                return true;
+            }
             let ChatItem::Tool(card) = &self.transcript[ix] else { return false };
             // 详细视图里工具行总是展开的，不用 `expanded` 也画
             return (card.expanded || view == ViewMode::Verbose)
@@ -1340,6 +1354,8 @@ impl Session {
         self.folded_live_groups.clear();
         self.animated_group = None;
         self.live_think = None;
+        self.live_linger = None;
+        self.live_parallel_batch.clear();
     }
 
     /// 本轮此刻的活动：等授权 > 等自动重试 > 正在输出正文（且没有工具在跑）> 其余都算「工作中」。
@@ -1606,7 +1622,15 @@ impl Session {
     /// 正在流式的思考块收尾，记下想了多久（计时的才有）。
     /// 展开与否保持原样（默认就是收起的，用户点开过的不替他收）。
     pub fn finish_thinking(&mut self) {
+        // 收尾前先把最后一块记进驻留：底部再停 1.5 秒，不要一结束就消失
+        let linger = self.thinking_linger_snapshot();
         self.live_think = None;
+        if let Some(snapshot) = linger {
+            self.live_linger = Some(layout::LiveLinger {
+                snapshot,
+                until: std::time::Instant::now() + layout::LIVE_PREVIEW_LINGER,
+            });
+        }
         if let Some(ChatItem::Thinking { streaming, started, elapsed_ms, .. }) =
             self.transcript.last_mut()
         {
@@ -3488,6 +3512,26 @@ mod tests {
         }
     }
 
+    fn bash_running(id: &str) -> KernelEvent {
+        KernelEvent::ToolCallStarted {
+            id: id.into(),
+            title: format!("Bash {id}"),
+            status: "in_progress".into(),
+            kind: "execute".into(),
+            parent: None,
+        }
+    }
+
+    fn bash_done(id: &str) -> KernelEvent {
+        KernelEvent::ToolCallUpdated {
+            id: id.into(),
+            title: None,
+            status: Some("completed".into()),
+            raw_output: Some("ok".into()),
+            output: Some("ok".into()),
+        }
+    }
+
     fn thought(text: &str) -> KernelEvent {
         KernelEvent::AgentThoughtChunk { text: text.into() }
     }
@@ -3753,16 +3797,18 @@ mod tests {
         let l = s.compute_layout(ViewMode::Normal);
         assert!(l[1].body && l[1].head.is_none() && !l[1].nested);
 
-        // 空思考不算一步；再来四步，进行中只露出最近三步
-        for event in [thought("\n\n"), read("b"), thought("想"), read("c"), read("d")] {
+        // 空思考不算一步；再来六步，进行中只露出最近六步（LIVE_TAIL）
+        for event in
+            [thought("\n\n"), read("b"), thought("想"), read("c"), read("d"), read("e"), read("f")]
+        {
             s.apply_event(event, None);
         }
         let l = s.compute_layout(ViewMode::Normal);
         let head = l[1].head.expect("组头在第一步上");
-        assert!(head.live && !head.open && head.end == 7);
-        let shown: Vec<usize> = (1..7).filter(|&i| l[i].body).collect();
-        assert_eq!(shown, [4, 5, 6]);
-        assert!(l[4].nested && l[4].tight && l[5].tight && !l[6].tight);
+        assert!(head.live && !head.open && head.end == 9);
+        let shown: Vec<usize> = (1..9).filter(|&i| l[i].body).collect();
+        assert_eq!(shown, [3, 4, 5, 6, 7, 8]);
+        assert!(l[3].nested && l[3].tight && l[7].tight && !l[8].tight);
         // 组头那行自己没露出来，但下面紧跟着组内的步骤
         assert!(!l[1].body && l[1].tight);
 
@@ -3771,24 +3817,25 @@ mod tests {
         s.flush_stream();
         let l = s.compute_layout(ViewMode::Normal);
         assert!(!l[1].head.unwrap().live);
-        assert!((1..7).all(|i| !l[i].body) && !l[1].tight);
-        assert!(l[7].body);
+        assert!((1..9).all(|i| !l[i].body) && !l[1].tight);
+        assert!(l[9].body);
         // 收起了也还记着是组里的一步（收起动画要按进度画完）；空思考和正文不算
-        let members: Vec<usize> = (0..8).filter(|&i| l[i].member).collect();
-        assert_eq!(members, [1, 3, 4, 5, 6]);
+        let members: Vec<usize> = (0..10).filter(|&i| l[i].member).collect();
+        assert_eq!(members, [1, 3, 4, 5, 6, 7, 8]);
 
         // 点开：除了空思考全都露出来
         s.toggle_group(1);
         let l = s.compute_layout(ViewMode::Normal);
-        assert_eq!((1..7).filter(|&i| l[i].body).collect::<Vec<_>>(), [1, 3, 4, 5, 6]);
+        assert_eq!((1..9).filter(|&i| l[i].body).collect::<Vec<_>>(), [1, 3, 4, 5, 6, 7, 8]);
         s.toggle_group(1);
         assert!(s.open_groups.is_empty());
 
-        // 详细视图总是展开；摘要视图整组不画
+        // 详细视图总是展开；摘要视图只留一行折叠的组头
         let l = s.compute_layout(ViewMode::Verbose);
-        assert!(l[1].head.unwrap().open && l[6].body);
+        assert!(l[1].head.unwrap().open && l[8].body);
         let l = s.compute_layout(ViewMode::Summary);
-        assert!((1..7).all(|i| !l[i].body && l[i].head.is_none()));
+        assert!(l[1].head.is_some() && !l[1].head.unwrap().open);
+        assert!((1..9).all(|i| !l[i].body));
     }
 
     #[core::prelude::v1::test]
@@ -3938,14 +3985,15 @@ mod tests {
         s.sync_list(ViewMode::Normal);
         assert!(s.layout[1].body && s.layout[2].body);
 
-        // 步骤超过 LIVE_TAIL 之后回到「露出尾巴、点开看全部」
-        for event in [read("c"), read("d")] {
+        // 步骤超过 LIVE_TAIL（6 步）之后回到「露出尾巴、点开看全部」
+        for event in [read("c"), read("d"), read("e"), read("f"), read("g")] {
             s.apply_event(event, None);
         }
         s.sync_list(ViewMode::Normal);
         let head = s.layout[1].head.expect("组头还在");
         assert!(!head.live_small && !head.open);
-        assert!(!s.layout[1].body && s.layout[3].body && s.layout[4].body);
+        // 只藏最早一步（a），露出 b..g 这 6 步
+        assert!(!s.layout[1].body && s.layout[2].body && s.layout[7].body);
     }
 
     /// 这一轮没有正文回复时，回合末尾（改动卡 / 用时）挂在最后一步上。
@@ -4461,5 +4509,120 @@ mod tests {
         let paged = s.status_row_key(ViewMode::Normal);
         s.busy = false;
         assert_ne!(s.status_row_key(ViewMode::Normal), paged);
+    }
+
+    /// 思考预览整块亮出：不画半截，等够 1.2 秒兜底；结束后转入 1.5 秒驻留再收起。
+    #[core::prelude::v1::test]
+    fn live_think_reveals_whole_blocks_then_lingers() {
+        let mut s = live_test_session();
+        s.busy = true;
+        s.transcript.push(live_think("想\n一下", true));
+        let t0 = Instant::now();
+        s.sync_live_think(ViewMode::Normal, t0);
+        assert!(s.live_think_block().is_none(), "没攒够不画半截字");
+        s.sync_live_think(ViewMode::Normal, t0 + layout::LIVE_THINK_REVEAL_AFTER);
+        assert!(s.live_think_block().is_some(), "等够 1.2 秒整块亮出");
+        // 亮出后不再逐字追加：文字变长但没到 3 秒，窗口不动
+        let frozen = s.live_think_block().unwrap().0[0].clone();
+        if let Some(ChatItem::Thinking { text, .. }) = s.transcript.last_mut() {
+            text.push_str("\n又想了想");
+        }
+        s.sync_live_think(ViewMode::Normal, t0 + layout::LIVE_THINK_REVEAL_AFTER);
+        assert_eq!(s.live_think_block().unwrap().0[0], frozen);
+
+        // 收尾：最后一块转成驻留，状态行继续显示
+        s.finish_thinking();
+        assert!(s.live_think_block().is_none());
+        match s.live_preview_content(ViewMode::Normal) {
+            LivePreviewContent::Thinking { lines, .. } => assert!(!lines.is_empty()),
+            other => panic!("应显示思考驻留: {other:?}"),
+        }
+        assert!(s.status_visible());
+        // 到点收起
+        s.busy = false;
+        s.expire_live_linger(ViewMode::Normal, Instant::now() + layout::LIVE_PREVIEW_LINGER);
+        assert!(!s.has_live_linger());
+        assert_eq!(s.live_preview_content(ViewMode::Normal), LivePreviewContent::None);
+    }
+
+    /// 可预览的工具跑完在底部驻留 1.5 秒；运行中不在上面重复画，跑完立刻落进过程栏。
+    #[core::prelude::v1::test]
+    fn finished_tool_lingers_and_moves_up() {
+        let mut s = live_test_session();
+        s.busy = true;
+        s.transcript.push(live_tool("execute", "Bash", ToolPhase::Running));
+        if let ChatItem::Tool(card) = &mut s.transcript[0] {
+            card.id = Some("a".into());
+        }
+        let l = s.compute_layout(ViewMode::Normal);
+        assert!(!l[0].body && l[0].head.is_none(), "运行中的工具只在底部画");
+
+        s.apply_event(
+            KernelEvent::ToolCallUpdated {
+                id: "a".into(),
+                title: None,
+                status: Some("completed".into()),
+                raw_output: None,
+                output: Some("done".into()),
+            },
+            None,
+        );
+        assert!(s.has_live_linger());
+        assert_eq!(s.live_preview_content(ViewMode::Normal), LivePreviewContent::Tool(0));
+        // 完成后立刻落进上面的过程栏
+        assert!(s.compute_layout(ViewMode::Normal)[0].body);
+
+        s.expire_live_linger(ViewMode::Normal, Instant::now() + layout::LIVE_PREVIEW_LINGER);
+        assert_eq!(s.live_preview_content(ViewMode::Normal), LivePreviewContent::None);
+    }
+
+    /// 串行两条命令各自单独驻留；简单工具结束不会把旧命令翻出来。并行批等最后一条结束再整批驻留。
+    #[core::prelude::v1::test]
+    fn linger_tracks_only_the_tool_that_just_finished() {
+        let mut s = live_test_session();
+        s.busy = true;
+        s.apply_event(bash_running("ls"), None);
+        s.apply_event(bash_done("ls"), None);
+        assert_eq!(s.live_preview_content(ViewMode::Normal), LivePreviewContent::Tool(0));
+
+        // 第二条串行命令：驻留换成它自己，不是 [ls, test]
+        s.apply_event(bash_running("test"), None);
+        s.apply_event(bash_done("test"), None);
+        assert_eq!(s.live_preview_content(ViewMode::Normal), LivePreviewContent::Tool(1));
+
+        // 简单工具（Read）结束：不驻留、也不复活前面的 Bash
+        s.expire_live_linger(ViewMode::Normal, Instant::now() + layout::LIVE_PREVIEW_LINGER);
+        s.apply_event(read("r"), None);
+        assert!(!s.has_live_linger());
+        assert_eq!(s.live_preview_content(ViewMode::Normal), LivePreviewContent::None);
+
+        // 并行两条：一条先结束不驻留，两条都结束才整批驻留
+        let mut p = live_test_session();
+        p.busy = true;
+        p.apply_event(bash_running("a"), None);
+        p.apply_event(bash_running("b"), None);
+        p.apply_event(bash_done("a"), None);
+        assert!(!p.has_live_linger());
+        p.apply_event(bash_done("b"), None);
+        assert_eq!(
+            p.live_preview_content(ViewMode::Normal),
+            LivePreviewContent::ParallelTools(vec![0, 1])
+        );
+    }
+
+    /// 摘要模式也留一行折叠的过程记录栏头，点开能看到工具 / 搜索。
+    #[core::prelude::v1::test]
+    fn summary_keeps_a_collapsed_process_bar() {
+        let mut s = live_test_session();
+        s.transcript.push(live_tool("execute", "Bash", ToolPhase::Done));
+        s.transcript.push(live_tool("search", "Search", ToolPhase::Done));
+        let l = s.compute_layout(ViewMode::Summary);
+        assert!(l[0].head.is_some());
+        assert!(!l[0].body && !l[1].body);
+        // 点开：工具行露出来
+        s.toggle_group(0);
+        let l = s.compute_layout(ViewMode::Summary);
+        assert!(l[0].head.unwrap().open);
+        assert!(l[0].body && l[1].body);
     }
 }

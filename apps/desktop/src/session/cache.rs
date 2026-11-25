@@ -107,6 +107,8 @@ impl Session {
         self.wheel = None;
         self.measured_status = None;
         self.live_think = None;
+        self.live_linger = None;
+        self.live_parallel_batch.clear();
         self.animated_group = None;
         self.history_loaded = false;
         self.history_loading = true;

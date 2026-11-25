@@ -263,6 +263,8 @@ impl Session {
     pub fn truncate_to(&mut self, idx: usize) {
         self.stream_pending.clear();
         self.live_think = None;
+        self.live_linger = None;
+        self.live_parallel_batch.clear();
         if idx < self.transcript.len() {
             self.transcript.truncate(idx);
             self.body_cache.truncate(idx);
@@ -308,6 +310,8 @@ impl Session {
     pub fn detach_kernel(&mut self, kernel: Option<&Arc<dyn Kernel>>) {
         self.flush_stream();
         self.live_think = None;
+        self.live_linger = None;
+        self.live_parallel_batch.clear();
         self.cancel_pending_permissions(kernel);
         // 排着的压缩是给旧内核会话的：撤掉，免得新会话接上时和第一轮撞在一起
         self.drop_queued_compaction("内核已切换");
@@ -341,6 +345,7 @@ impl Session {
     pub fn on_fatal(&mut self, message: &str, kernel: Option<&Arc<dyn Kernel>>) {
         self.flush_stream();
         self.live_think = None;
+        self.live_linger = None;
         self.busy = false;
         self.stopping = false;
         self.ready = false;
@@ -488,11 +493,16 @@ impl Session {
                 // 子 agent 的调用归到它那个子任务里，不进对话记录
                 match parent {
                     Some(task) => self.subagent(&task).push_tool(card),
-                    None => self.transcript.push(ChatItem::Tool(card)),
+                    None => {
+                        self.transcript.push(ChatItem::Tool(card));
+                        // 几个工具同时起跑：记下一批，等全部结束再整批驻留
+                        self.note_parallel_batch();
+                    }
                 }
             }
             KernelEvent::ToolCallUpdated { id, title, status, raw_output, output } => {
                 let mut changed_diffs = false;
+                let mut just_finished = false;
                 if let Some(card) = self.tool_card(&id) {
                     if let Some(title) = title {
                         let (name, arg) = tool_label(&card.kind, &title);
@@ -501,6 +511,8 @@ impl Session {
                     }
                     if let Some(status) = status {
                         let phase = tool_phase(&status);
+                        just_finished =
+                            card.phase == ToolPhase::Running && phase != ToolPhase::Running;
                         changed_diffs = !card.diffs.is_empty()
                             && (card.phase == ToolPhase::Done) != (phase == ToolPhase::Done);
                         card.phase = phase;
@@ -514,6 +526,11 @@ impl Session {
                 }
                 if changed_diffs {
                     self.diff_revision += 1;
+                }
+                // 可预览的工具刚跑完：底部原地停一会儿再收起
+                // （只认刚结束这一条；简单工具、子 agent 不算，也不翻出早先的命令）
+                if just_finished && let Some(ix) = self.tool_index(&id) {
+                    self.linger_finished_tool(ix);
                 }
             }
             KernelEvent::ToolCallProgress { id, output } => {
@@ -761,6 +778,16 @@ impl Session {
             card.task = true;
         }
         self.subagents.entry(task.to_string()).or_default()
+    }
+
+    /// 按 tool_call_id 找最近的工具行下标；子 agent 的调用（带 `task/` 前缀）不在这里。
+    fn tool_index(&self, id: &str) -> Option<usize> {
+        if id.contains('/') {
+            return None;
+        }
+        self.transcript
+            .iter()
+            .rposition(|i| matches!(i, ChatItem::Tool(c) if c.id.as_deref() == Some(id)))
     }
 
     /// 按 tool_call_id 找最近的工具行；子 agent 的调用（`task 调用 ID/调用 ID`）在它那个子任务里找。
