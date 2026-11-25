@@ -19,6 +19,7 @@ pub mod math;
 mod mcp_view;
 mod memory_view;
 mod menu;
+mod model_picker;
 mod motion;
 mod notify;
 mod overview;

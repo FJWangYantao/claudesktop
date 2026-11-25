@@ -651,6 +651,17 @@
   另外不要带 BOM。Windows 上 `.bat` 会被套一层 `cmd.exe` 跑，路径里不能有 `" % ^ ! & | < >`。
 - **REA + ADB**：`REA_ADB_PATH` 同样要绝对路径；不给就在 PATH 里找。本机用 SDK 自带那份
   `E:\Android\Sdk\platform-tools\adb.exe`（37.0.1），只探测客户端版本，不碰设备。
+- **输入框模型选择器的弹层内容要做成独立 entity**（2026-11）：`gpui-kit` 的 `Popover::content`
+  是 `Fn`，每次父视图渲染都会重跑，但 `PopoverState` 自己 `notify` **不会**重建面板那棵树——
+  悬停换说明卡时想只重绘弹层，必须把内容做成 `window.use_keyed_state` 里 `cx.new` 出来的 entity
+  （`ModelPickerContent`），让它观察 `ChatApp` 并在自己的 `Render` 里读状态；否则只能通知整个
+  `ChatApp`，会话区跟着重画。注意 `use_keyed_state` 返回的是 `Entity<Entity<T>>`（init 的返回值外面
+  再包一层），要 `.read(cx).clone()` 取里面的 entity。
+- **`ScrollHandle::scroll_to_item` 在首帧会被丢掉**：新弹层第一次渲染时还没有子元素的 bounds，
+  active_item 被消费掉但滚不动。要连着请求几帧（`scroll_attempts`）直到 `offset().y != 0`
+  （GPUI 向下滚是**负**的，别写 `> 0`），并补 `window.request_animation_frame()` 让 prepaint
+  真的跑一次；`window.on_next_frame` 里的回调在无头截图路径下不一定触发，别只靠它。
+  同理，滚动请求要作用在挂了 `track_scroll` 且带 `overflow_y_scroll` 的同一个元素上。
 - **对话列表的行下标和记录下标是两套**（2026-11 滚动手感改造）：`Session::rows` 把很大的已完成回复
   拆成多个虚拟行之后，`list` / `measured` 用**行下标**，`layout` / `transcript` / `is_turn_end` 仍是
   **记录下标**；两者用 `Session::row_of(ix)` 换算。新代码碰列表下标前先想清楚在哪一套里：

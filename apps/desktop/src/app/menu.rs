@@ -29,8 +29,6 @@ const CHIP_MIN_W: Rems = rems(3.5);
 pub(super) struct MenuChip {
     icon: Option<IconAll>,
     label: SharedString,
-    /// 纯文字（输入框工具栏里的模型）：不带图标和展开箭头，靠悬停底色提示可点
-    plain: bool,
     /// 沙色实底（筛选条这类放在纸底上、要一眼看出能点的 chip）
     filled: bool,
     /// 一行放不下时允许把这个 chip 压窄、文字末尾打省略号（项目名 / 模型名这类外来的长文字）
@@ -40,26 +38,7 @@ pub(super) struct MenuChip {
 
 impl MenuChip {
     pub(super) fn new(icon: IconAll, label: impl Into<SharedString>) -> Self {
-        Self {
-            icon: Some(icon),
-            label: label.into(),
-            plain: false,
-            filled: false,
-            shrink: false,
-            open: false,
-        }
-    }
-
-    /// 只有文字，不带展开箭头（输入框工具栏里的模型）。
-    pub(super) fn plain(label: impl Into<SharedString>) -> Self {
-        Self {
-            icon: None,
-            label: label.into(),
-            plain: true,
-            filled: false,
-            shrink: false,
-            open: false,
-        }
+        Self { icon: Some(icon), label: label.into(), filled: false, shrink: false, open: false }
     }
 
     /// 沙色实底（筛选条、「添加」这类放在纸底上的 chip）。
@@ -127,11 +106,9 @@ impl RenderOnce for MenuChip {
                 .text_color(rgb(INK_SOFT))
                 .child(self.label),
         );
-        if !self.plain {
-            chip = chip.child(
-                Icon::new(IconAll::ChevronDown).size_3().flex_shrink_0().text_color(rgb(INK_SOFT)),
-            );
-        }
+        chip = chip.child(
+            Icon::new(IconAll::ChevronDown).size_3().flex_shrink_0().text_color(rgb(INK_SOFT)),
+        );
         // 沙色底上的悬停 / 打开用 SELECTED，纸底上用 HOVER
         let active = if self.filled { SELECTED } else { HOVER };
         if self.open { chip.bg(rgb(active)) } else { chip.hover(move |d| d.bg(rgb(active))) }
@@ -164,7 +141,6 @@ pub(super) struct MenuList {
     popover: Entity<PopoverState>,
     body: Stateful<Div>,
     header: Option<AnyElement>,
-    footer: Option<AnyElement>,
     picks: Vec<Pick>,
     shortcuts: bool,
     shortcut_hints: bool,
@@ -184,7 +160,6 @@ impl MenuList {
             popover: popover.clone(),
             body: div().id(id).v_flex().gap_0p5(),
             header: None,
-            footer: None,
             picks: Vec::new(),
             shortcuts: true,
             shortcut_hints: true,
@@ -198,12 +173,7 @@ impl MenuList {
         self
     }
 
-    /// 隐藏右侧数字键帽，仍可按数字选择。
-    pub(super) fn hide_shortcut_hints(mut self) -> Self {
-        self.shortcut_hints = false;
-        self
-    }
-
+    /// 条目之间不留间隙（模型这类纯列表）。
     pub(super) fn compact(mut self) -> Self {
         self.body = self.body.gap_0();
         self
@@ -256,19 +226,7 @@ impl MenuList {
         self
     }
 
-    /// 固定底栏里的可选条目：点了执行动作并收起，但不占模型列表的数字快捷键。
-    pub(super) fn footer_pick(
-        &self,
-        row: Stateful<Div>,
-        action: impl Fn(&mut ChatApp, &mut Context<ChatApp>) + 'static,
-    ) -> Stateful<Div> {
-        let (handle, popover) = (self.handle.clone(), self.popover.clone());
-        row.on_click(move |_, window, cx| {
-            handle.update(cx, |this, cx| action(this, cx));
-            popover.update(cx, |s, cx| s.dismiss(window, cx));
-        })
-    }
-
+    /// 加一段不进数字键的内容（提示、分组标题）。
     pub(super) fn child(mut self, child: impl IntoElement) -> Self {
         self.body = self.body.child(child);
         self
@@ -279,16 +237,9 @@ impl MenuList {
         self
     }
 
-    /// 固定在滚动列表下方的内容，不随条目一起滚动。
-    pub(super) fn footer(mut self, footer: impl IntoElement) -> Self {
-        self.footer = Some(footer.into_any_element());
-        self
-    }
-
     /// 收尾：外层挂上 `focus`（面板打开时焦点在这里），数字键选对应条目。
     pub(super) fn finish(self, focus: &FocusHandle, window: &mut Window, cx: &mut App) -> Div {
         let picks = self.picks;
-        let has_footer = self.footer.is_some();
         let body = if self.scrollbar {
             let scroll = window
                 .use_keyed_state((self.id, "scroll"), cx, |_, _| ScrollHandle::new())
@@ -307,10 +258,9 @@ impl MenuList {
             .child(
                 div()
                     .v_flex()
-                    .when(!has_footer, |d| d.gap_1())
+                    .gap_1()
                     .when_some(self.header, |d, header| d.child(header))
-                    .child(body)
-                    .when_some(self.footer, |d, footer| d.child(footer)),
+                    .child(body),
             )
             .on_key_down(move |event, window, cx| {
                 let keys = &event.keystroke;

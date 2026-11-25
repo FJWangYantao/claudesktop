@@ -2,11 +2,9 @@
 
 use super::ChatApp;
 use super::chrome::CHROME_H;
-use super::menu::{MenuChip, MenuList, menu_item, menu_popover, menu_text_item};
-use super::settings_view::{active_thinking, thinking_options};
+use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::widgets::Surface;
 use crate::model::PendingImage;
-use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_builtin::ThinkingLevel;
@@ -16,7 +14,6 @@ use gpui_kit::base::PopoverState;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::Textarea;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -102,7 +99,9 @@ impl ChatApp {
         let idx = self
             .sessions
             .iter()
-            .position(|s| s.restored && s.kernel == KernelChoice::Builtin && !s.is_chat())
+            .position(|s| {
+                s.restored && s.kernel == crate::settings::KernelChoice::Builtin && !s.is_chat()
+            })
             .expect("没有可预览的自研内核历史会话");
         self.activate_session(idx, cx);
         let session = self.session();
@@ -433,14 +432,8 @@ impl ChatApp {
                 cx.listener(|this, _, window, cx| this.focus_input(window, cx)),
             ))
             .children(self.render_context_gauge())
-            .child(model_menu_popover(
-                &app,
-                &self.menu_focus,
-                "model-menu",
-                Anchor::BottomRight,
-                // 模型名（尤其带端点标签的）比别的 chip 长得多：允许压窄、末尾打省略号
-                MenuChip::plain(self.session().model_label.clone()).shrink(),
-            ))
+            // 模型名（尤其带端点标签的）比别的 chip 长得多：允许压窄、末尾打省略号
+            .child(self.render_model_picker(cx))
             // 发送键不参与收缩：一行排不下时先让 chip 让路，它永远在最右边
             .child(div().pl_1().flex_shrink_0().child(send));
 
@@ -1174,28 +1167,6 @@ fn paste_to_attachments(
     }
 }
 
-/// 模型下拉：
-/// 打开时若自研内核还没有模型列表，顺手获取一次。
-fn model_menu_popover(
-    handle: &Entity<ChatApp>,
-    focus: &FocusHandle,
-    id: &'static str,
-    anchor: Anchor,
-    chip: MenuChip,
-) -> Popover {
-    let fetch = handle.clone();
-    menu_popover(id, anchor, rems(16.), handle, focus, chip, model_menu_items)
-        .on_open_change(move |open, _, cx| {
-            if *open {
-                fetch.update(cx, |app, cx| app.fetch_models_for_menu(cx));
-            }
-        })
-        .default_open(
-            cfg!(feature = "headless-screenshot")
-                && std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("composer-model-menu"),
-        )
-}
-
 // ---------- 菜单条目（在 Popover 面板里渲染） ----------
 
 /// 会话当前模型的档位表：能选哪些档、字段怎么发，都以它为准
@@ -1238,188 +1209,6 @@ fn mode_menu_items(
                 .text_size(TEXT_SMALL),
             move |this, cx| this.choose_mode(i, cx),
         );
-    }
-    menu
-}
-
-fn model_menu_group(name: impl Into<SharedString>) -> Div {
-    div()
-        .flex_shrink_0()
-        .px_2p5()
-        .pt_1()
-        .overflow_hidden()
-        .text_ellipsis()
-        .whitespace_nowrap()
-        .text_size(TEXT_META)
-        .text_color(rgb(INK_SOFT))
-        .child(name.into())
-}
-
-fn model_menu_row(
-    id: impl Into<ElementId>,
-    name: impl Into<SharedString>,
-    active: bool,
-    detail: Option<String>,
-) -> Stateful<Div> {
-    let name = name.into();
-    menu_text_item(id, name.clone(), active)
-        .h(rems(1.625))
-        .flex_shrink_0()
-        .py_0()
-        .line_height(relative(1.25))
-        .tooltip(move |window, cx| {
-            let tip = match &detail {
-                Some(detail) => format!("{name}\n{detail}"),
-                None => name.to_string(),
-            };
-            super::chat::text_tip(&tip, window, cx)
-        })
-}
-
-/// 模型列表滚动，刷新与当前模型的思考档位固定在底部；外部内核使用上报的选项。
-fn model_menu_items(
-    app: &ChatApp,
-    handle: &Entity<ChatApp>,
-    popover: &Entity<PopoverState>,
-) -> MenuList {
-    let hint = |text: SharedString| {
-        div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
-    };
-    let builtin = app.session().kernel == KernelChoice::Builtin;
-    let mut menu = MenuList::new("model-menu-list", handle, popover)
-        .hide_shortcut_hints()
-        .compact()
-        .scroll(rems(13.));
-    if !builtin {
-        return agent_model_menu(app, menu);
-    }
-    // 所有来源的模型都列出来（在「设置 · 模型」里勾掉的不进），按来源分组；
-    // 挑别家来源的模型会自动切到那家（端点跟着换，见 `choose_model_from`）。
-    let multi = app.settings.builtin.profiles.len() > 1;
-    let mut any = false;
-    let current = app.session().model_label.clone();
-    for (pi, p) in app.settings.builtin.profiles.iter().enumerate() {
-        let models = p.menu_models();
-        if models.is_empty() {
-            continue;
-        }
-        any = true;
-        if multi {
-            menu = menu.child(model_menu_group(p.display_name().to_string()));
-        }
-        for (i, model) in models.iter().enumerate() {
-            let active = pi == app.settings.builtin.active && current.as_ref() == model.as_str();
-            let m = (*model).clone();
-            menu = menu.pick(
-                model_menu_row(("model-item", pi * 10000 + i), m.clone(), active, None),
-                move |this, cx| this.choose_model_from(pi, m.clone(), cx),
-            );
-        }
-    }
-    if !any {
-        menu = menu.child(hint(if app.fetching_models {
-            "正在获取模型列表…".into()
-        } else if app.settings.builtin.models().is_empty() {
-            "没有模型列表，可在设置里获取".into()
-        } else {
-            "模型都在「设置 · 模型」里关着，去勾几个进来".into()
-        }));
-    }
-    let refresh_handle = handle.clone();
-    let refresh = div()
-        .id("model-refresh")
-        .h_flex()
-        .gap_1p5()
-        .px_2p5()
-        .py_1()
-        .border_t_1()
-        .border_color(rgb(LINE))
-        .cursor_pointer()
-        .hover(|d| d.bg(rgb(HOVER)))
-        .text_size(TEXT_SMALL)
-        .text_color(rgb(INK_SOFT))
-        .on_click(move |_, _, cx| {
-            refresh_handle.update(cx, |this, cx| this.fetch_models(false, cx));
-        })
-        .child(Icon::new(IconAll::RefreshCw).size_3p5())
-        .child("刷新模型列表");
-    let mut footer = div().v_flex().child(refresh);
-
-    let spec = session_thinking_spec(app);
-    let active = active_thinking(&spec, app.session().thinking);
-    let mut options = div().h_flex().flex_1().min_w_0().flex_wrap().gap_0p5();
-    for (i, (level, label)) in thinking_options(&spec).into_iter().enumerate() {
-        let selected = active == level;
-        let row = div()
-            .id(("model-thinking", i))
-            .role(Role::MenuItem)
-            .aria_selected(selected)
-            .h_flex()
-            .justify_center()
-            .flex_shrink_0()
-            .px_1p5()
-            .py_0p5()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(TEXT_SMALL)
-            .text_color(rgb(if selected { INK } else { INK_SOFT }))
-            .bg(if selected { rgb(SELECTED) } else { rgba(CLEAR) })
-            .when(!selected, |d| d.hover(|d| d.bg(rgb(HOVER))))
-            .child(label);
-        options =
-            options.child(menu.footer_pick(row, move |this, cx| this.choose_thinking(level, cx)));
-    }
-    footer = footer.child(
-        div()
-            .h_flex()
-            .items_center()
-            .gap_1()
-            .px_2p5()
-            .py_1()
-            .border_t_1()
-            .border_color(rgb(LINE))
-            .child(
-                div().flex_shrink_0().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child("思考"),
-            )
-            .child(options),
-    );
-    menu.footer(footer)
-}
-
-fn agent_model_menu(app: &ChatApp, mut menu: MenuList) -> MenuList {
-    let hint = |text: SharedString| {
-        div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
-    };
-    let Some(config) = app
-        .session()
-        .config_options
-        .iter()
-        .find(|option| option.category == "model" || option.id == "model")
-    else {
-        return menu.child(hint("agent 未上报模型列表，请在 agent 自己的界面里切换".into()));
-    };
-    let mut group = None;
-    for (i, choice) in config.options.iter().enumerate() {
-        if choice.group != group {
-            group = choice.group.clone();
-            if let Some(name) = &group {
-                menu = menu.child(model_menu_group(name.clone()));
-            }
-        }
-        let active = choice.id == config.current_value;
-        let id = choice.id.clone();
-        menu = menu.pick(
-            model_menu_row(
-                ("agent-model-item", i),
-                choice.name.clone(),
-                active,
-                Some(choice.description.clone().unwrap_or_else(|| choice.id.clone())),
-            ),
-            move |this, cx| this.choose_model(id.clone(), cx),
-        );
-    }
-    if config.options.is_empty() {
-        menu = menu.child(hint("agent 未上报模型列表，请在 agent 自己的界面里切换".into()));
     }
     menu
 }

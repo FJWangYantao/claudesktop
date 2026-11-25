@@ -16,6 +16,7 @@ mod demo;
 mod fonts;
 mod http;
 mod model;
+mod model_catalog;
 mod pricing;
 mod requests;
 mod session;
