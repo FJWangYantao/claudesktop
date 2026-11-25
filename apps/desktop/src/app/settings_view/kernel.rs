@@ -7,41 +7,39 @@ impl ChatApp {
     pub(super) fn render_kernel_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
         let body = div().v_flex().gap_4().child(self.render_kernel_list(window, cx));
-        match f.kernel {
-            KernelChoice::Builtin => body
-                .child(self.render_auto_mode(window, cx))
-                .child(self.render_suggest(cx))
-                .child(self.render_memory_options(cx))
-                .child(self.render_chat(cx))
-                .child(
-                    section(
-                        "运行",
-                        None,
-                        compact_setting_group([
-                            setting_row(
-                                "一轮最多几步",
-                                div().w(NUMBER_INPUT_W).child(Self::text_input_with(
-                                    Input::new(&f.max_steps)
-                                        .small()
-                                        .appearance(false)
-                                        .bordered(false),
-                                )),
-                            ),
-                            setting_row(
-                                "子任务模型",
-                                div()
-                                    .w(rems(20.))
-                                    .child(Input::new(&f.subagent_model).small().cleanable(true)),
-                            ),
-                        ]),
-                    )
-                    .gap_2(),
-                )
-                .child(self.render_advanced(window, cx)),
-            KernelChoice::Acp(_) | KernelChoice::Demo => {
-                body.child(self.render_advanced(window, cx))
-            }
+        // 自研选项按「自研是否还在用」显示，而不是按默认内核是不是自研：默认内核可以
+        // 选成某个 agent，自研内核照样在跑聊天空间和其他会话，整块藏掉会让人没法改
+        let builtin_options =
+            self.settings.builtin.is_configured() || self.settings.acp.first().is_none();
+        if !builtin_options {
+            return body.child(self.render_advanced(window, cx));
         }
+        body.child(self.render_auto_mode(window, cx))
+            .child(self.render_suggest(cx))
+            .child(self.render_memory_options(cx))
+            .child(self.render_chat(cx))
+            .child(
+                section(
+                    "运行",
+                    None,
+                    compact_setting_group([
+                        setting_row(
+                            "一轮最多几步",
+                            div().w(NUMBER_INPUT_W).child(Self::text_input_with(
+                                Input::new(&f.max_steps).small().appearance(false).bordered(false),
+                            )),
+                        ),
+                        setting_row(
+                            "子任务模型",
+                            div()
+                                .w(rems(20.))
+                                .child(Input::new(&f.subagent_model).small().cleanable(true)),
+                        ),
+                    ]),
+                )
+                .gap_2(),
+            )
+            .child(self.render_advanced(window, cx))
     }
 
     pub(super) fn render_kernel_list(&self, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -292,6 +290,9 @@ impl ChatApp {
     /// 手填端点档案在「服务商」页；这里的开关保存才生效。
     pub(super) fn render_advanced(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let f = &self.settings_form;
+        // 用量记录 / 单价表是自研网关的东西：自研还在用时才显示
+        let builtin_options =
+            self.settings.builtin.is_configured() || self.settings.acp.first().is_none();
         let gateway_rows: Vec<_> = f
             .agents
             .iter()
@@ -335,7 +336,7 @@ impl ChatApp {
                 )
                 .gap_2(),
             )
-            .when(f.kernel == KernelChoice::Builtin, |d| {
+            .when(builtin_options, |d| {
                 let mut rows = vec![self.gateway_row(cx)];
                 if f.usage_gateway {
                     rows.push(self.bodies_row(cx));

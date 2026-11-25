@@ -125,6 +125,19 @@ impl ChatApp {
             return;
         }
         let new = self.form_settings(cx);
+        // 自定义命令和已启用预设的命令一样：菜单里会出现两个一模一样的内核
+        if let Some(preset) = duplicate_agent_command(&new) {
+            self.settings_form.message = Some((
+                true,
+                format!(
+                    "自定义命令与已启用的「{}」重复：请清空自定义命令，或停用该预设",
+                    preset.display_name()
+                )
+                .into(),
+            ));
+            cx.notify();
+            return;
+        }
         // 选了「本机 agent」却一家都没启用：先让用户勾一家（或填一条自定义命令）
         if matches!(new.kernel(), KernelChoice::Acp(_)) && new.acp.first().is_none() {
             self.settings_form.message = Some((
@@ -407,7 +420,8 @@ impl ChatApp {
             None => {}
         }
         s.acp.agents = agents;
-        s.kernel = None;
+        // 默认内核：保留已保存的选择；所选档案被停用 / 删掉时才回退（交给 kernel() 重新自动选）
+        keep_kernel_choice(&mut s);
         s.max_steps = parse_max_steps(&value(&f.max_steps, cx));
         s.auto_mode.enabled = f.auto_enabled;
         s.auto_mode.use_session_model = f.auto_follow;
@@ -871,5 +885,144 @@ impl ChatApp {
             });
         })
         .detach();
+    }
+}
+
+/// 自定义档案的启动命令和某个已启用预设相同时，返回撞车的那个预设。
+/// 比较用 [`command_key`]：空白折叠、Windows 上忽略 `cmd /c` 前缀和大小写
+/// （设置页手填提示本来就不带 `cmd /c`）。
+fn duplicate_agent_command(s: &Settings) -> Option<&AgentProfile> {
+    let windows = cfg!(windows);
+    let key = |cmd: &str| command_key(cmd, windows);
+    let customs: Vec<String> = s
+        .acp
+        .agents
+        .iter()
+        .filter(|a| a.preset().is_none())
+        .map(|a| key(&a.command_for(windows)))
+        .filter(|c| !c.is_empty())
+        .collect();
+    if customs.is_empty() {
+        return None;
+    }
+    s.acp
+        .agents
+        .iter()
+        .filter(|a| a.preset().is_some())
+        .find(|a| customs.iter().any(|c| *c == key(&a.command_for(windows))))
+}
+
+fn command_key(cmd: &str, windows: bool) -> String {
+    let mut parts: Vec<&str> = cmd.split_whitespace().collect();
+    if windows
+        && parts.len() >= 2
+        && parts[0].eq_ignore_ascii_case("cmd")
+        && parts[1].eq_ignore_ascii_case("/c")
+    {
+        parts.drain(..2);
+    }
+    let joined = parts.join(" ");
+    if windows { joined.to_lowercase() } else { joined }
+}
+
+/// 保存设置时保留默认内核的选择；选择失效时才置空，交给 [`Settings::kernel`] 重新自动选。
+fn keep_kernel_choice(s: &mut Settings) {
+    // 选了某个 ACP 档案，但它被停用 / 删掉了
+    if let Some(KernelChoice::Acp(id)) = &s.kernel
+        && s.acp.get(id).is_none()
+    {
+        s.kernel = None;
+    }
+    // 默认是自研，但自研已经没配好、又有启用的 agent：否则保存会被自研校验
+    // （「还没有设置端点地址」）锁死，而设置页没有改默认内核的地方
+    if matches!(s.kernel, Some(KernelChoice::Builtin))
+        && !s.builtin.is_configured()
+        && s.acp.first().is_some()
+    {
+        s.kernel = None;
+    }
+}
+
+#[cfg(test)]
+mod kernel_choice_tests {
+    use super::*;
+
+    fn preset_profile(id: &str) -> AgentProfile {
+        AgentProfile::from_preset(claudesktop_core::agents::AgentPreset::find(id).unwrap())
+    }
+
+    #[core::prelude::v1::test]
+    fn saved_kernel_choice_survives_when_its_agent_is_still_enabled() {
+        let mut s = Settings::default();
+        s.acp.agents = vec![preset_profile("claude"), preset_profile("pi")];
+        s.kernel = Some(KernelChoice::Acp("claude".into()));
+        keep_kernel_choice(&mut s);
+        assert_eq!(s.kernel, Some(KernelChoice::Acp("claude".into())));
+        assert_eq!(s.kernel(), KernelChoice::Acp("claude".into()));
+    }
+
+    #[core::prelude::v1::test]
+    fn disabled_agent_falls_back_to_auto_choice() {
+        let mut s = Settings::default();
+        s.acp.agents = vec![preset_profile("pi")];
+        s.kernel = Some(KernelChoice::Acp("claude".into()));
+        keep_kernel_choice(&mut s);
+        assert_eq!(s.kernel, None);
+    }
+
+    #[core::prelude::v1::test]
+    fn builtin_default_survives_while_builtin_is_configured() {
+        let mut s = Settings::default();
+        s.builtin.current_mut().base_url = "https://api.example.com".into();
+        s.builtin.current_mut().model = "m".into();
+        s.acp.agents = vec![preset_profile("pi")];
+        s.kernel = Some(KernelChoice::Builtin);
+        keep_kernel_choice(&mut s);
+        assert_eq!(s.kernel, Some(KernelChoice::Builtin));
+    }
+
+    /// 自研被清空后默认还停在自研：不能把保存锁死在自研校验上
+    #[core::prelude::v1::test]
+    fn unconfigured_builtin_default_falls_back_to_enabled_agent() {
+        let mut s = Settings::default();
+        s.acp.agents = vec![preset_profile("pi")];
+        s.kernel = Some(KernelChoice::Builtin);
+        keep_kernel_choice(&mut s);
+        assert_eq!(s.kernel, None);
+        assert_eq!(s.kernel(), KernelChoice::Acp("pi".into()));
+    }
+
+    #[core::prelude::v1::test]
+    fn custom_command_matching_enabled_preset_is_rejected() {
+        let mut s = Settings::default();
+        let pi = preset_profile("pi");
+        let clone = AgentProfile::custom(1, &pi.command_for(cfg!(windows)));
+        s.acp.agents = vec![pi, clone];
+        assert_eq!(duplicate_agent_command(&s).map(|a| a.id.clone()), Some("pi".into()));
+    }
+
+    #[core::prelude::v1::test]
+    fn whitespace_differences_still_count_as_duplicate() {
+        let mut s = Settings::default();
+        let pi = preset_profile("pi");
+        let spaced = format!("  {}  ", pi.command_for(cfg!(windows)).replace(' ', "  "));
+        s.acp.agents = vec![pi, AgentProfile::custom(1, &spaced)];
+        assert!(duplicate_agent_command(&s).is_some());
+    }
+
+    #[core::prelude::v1::test]
+    fn different_custom_command_is_allowed() {
+        let mut s = Settings::default();
+        s.acp.agents = vec![preset_profile("pi"), AgentProfile::custom(1, "npx -y other-acp")];
+        assert!(duplicate_agent_command(&s).is_none());
+    }
+
+    /// 预设的启动命令带 `cmd /c`，用户手填一般不带：前缀和大小写都不能绕过检查
+    #[cfg(windows)]
+    #[core::prelude::v1::test]
+    fn windows_cmd_prefix_and_case_do_not_bypass_duplicate_check() {
+        let mut s = Settings::default();
+        s.acp.agents = vec![preset_profile("pi"), AgentProfile::custom(1, "CMD /C npx -y pi-acp")];
+        assert!(duplicate_agent_command(&s).is_some());
     }
 }

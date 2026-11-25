@@ -5,6 +5,7 @@ use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
 use super::widgets::Surface;
 use super::{ChatApp, project_label, short_path};
 use crate::model::PendingImage;
+use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_builtin::ThinkingLevel;
@@ -324,6 +325,76 @@ impl ChatApp {
         self.input.update(cx, |_, cx| cx.notify());
     }
 
+    /// 输入框工具栏的内核 chip：空 Code 会话里点开换内核；已开始的 ACP 会话只读显示当前内核；
+    /// 聊天会话、只有一个可用内核、自研内核已开始的会话都不占位置。
+    fn render_kernel_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let s = self.session();
+        if s.is_chat() {
+            return None;
+        }
+        let label = s.kernel.label(&self.settings.acp);
+        let (icon, acp) = match s.kernel {
+            KernelChoice::Acp(_) => (IconAll::Bot, true),
+            _ => (IconAll::Sparkles, false),
+        };
+        if s.has_user_message() || s.busy {
+            // 已开始：只读标识。自研内核是默认，不额外标注
+            if !acp {
+                return None;
+            }
+            let tip = format!("当前会话绑定在「{label}」内核");
+            return Some(
+                div()
+                    .id("composer-kernel-badge")
+                    .h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    // agent 名长度不由我们定：允许压窄、末尾省略，别把发送键挤出卡片
+                    .flex_shrink_1()
+                    .min_w(rems(3.5))
+                    .overflow_hidden()
+                    .px_1()
+                    .py_1()
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .child(Icon::new(icon).size_3p5().flex_none().text_color(rgb(INK_SOFT)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(TEXT_SMALL)
+                            .text_color(rgb(INK_SOFT))
+                            .child(label),
+                    )
+                    .into_any_element(),
+            );
+        }
+        // 只有一个可用内核时没必要选（自研内核没配好不算候选）
+        let builtin = if self.settings.builtin.is_configured() { 1 } else { 0 };
+        let count = builtin + self.settings.acp.agents.len();
+        if count < 2 {
+            return None;
+        }
+        let app = cx.entity();
+        Some(
+            menu_popover(
+                "composer-kernel-menu",
+                Anchor::BottomLeft,
+                rems(14.),
+                &app,
+                &self.menu_focus,
+                MenuChip::new(icon, label).id("composer-kernel-chip").shrink(),
+                kernel_menu_items,
+            )
+            .default_open(
+                cfg!(feature = "headless-screenshot")
+                    && std::env::var("CLAUDESKTOP_OPEN").as_deref() == Ok("composer-kernel-menu"),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// 输入框顶盖：空 Code 会话里选项目、切分支；开始对话后整条收起。
     fn render_context_bar(&self, cx: &mut Context<Self>) -> Div {
         let app = cx.entity();
@@ -603,6 +674,7 @@ impl ChatApp {
                 )
             })
             .when(chat, |d| d.child(self.render_web_chip(cx)))
+            .children(self.render_kernel_chip(cx))
             .child(
                 Self::quiet_button("attach-file", IconAll::Plus, Surface::Paper, cx)
                     .small()
@@ -1505,6 +1577,39 @@ pub(crate) fn thinking_wire(level: ThinkingLevel) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "high".into())
+}
+
+/// 内核条目：自研内核（配好时）+ 每个启用的 agent，当前项打勾。
+fn kernel_menu_items(
+    app: &ChatApp,
+    handle: &Entity<ChatApp>,
+    popover: &Entity<PopoverState>,
+) -> MenuList {
+    let session = app.session();
+    let mut menu =
+        MenuList::new("composer-kernel-list", handle, popover).without_shortcuts().compact();
+    if app.settings.builtin.is_configured() {
+        let active = session.kernel == KernelChoice::Builtin;
+        menu = menu.pick(
+            menu_item(
+                ElementId::Name("kernel-item-builtin".into()),
+                IconAll::Sparkles,
+                "自研内核",
+                "",
+                active,
+            ),
+            |this, cx| this.choose_session_kernel(KernelChoice::Builtin, cx),
+        );
+    }
+    for (i, agent) in app.settings.acp.agents.iter().enumerate() {
+        let kind = KernelChoice::Acp(agent.id.clone());
+        let active = session.kernel == kind;
+        menu = menu.pick(
+            menu_item(("kernel-item", i), IconAll::Bot, agent.display_name(), "", active),
+            move |this, cx| this.choose_session_kernel(kind.clone(), cx),
+        );
+    }
+    menu
 }
 
 /// 权限模式条目：单行图标与名称，当前项打勾。

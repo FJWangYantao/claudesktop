@@ -1471,10 +1471,6 @@ impl ChatApp {
     /// 先改界面上的选中项，内核会话建立（Started）后再交给内核。
     /// 没为 `cwd` 选过文件夹的会话算**任务**（侧栏归到「任务」区，见 `sidebar.rs`）；
     /// 聊天会话没有工作目录，恒为任务之外（`task = false`，侧栏按日期分组）
-    fn new_session(&self, kind: KernelChoice, cwd: PathBuf, token: u64) -> Session {
-        self.new_session_of(kind, cwd, token, SessionKind::Code)
-    }
-
     fn new_session_of(
         &self,
         kind: KernelChoice,
@@ -1523,6 +1519,19 @@ impl ChatApp {
         self.replace_session(idx, kind, cwd, cx);
     }
 
+    /// 空会话里换内核，并把这次选择记成默认：之后新建的 Code 会话沿用。
+    /// 只对还没对话、没在跑的 Code 会话生效（聊天会话永远是自研内核）。
+    pub(crate) fn choose_session_kernel(&mut self, kind: KernelChoice, cx: &mut Context<Self>) {
+        let s = &self.sessions[self.active];
+        if s.is_chat() || s.has_user_message() || s.busy || s.kernel == kind {
+            return;
+        }
+        self.rebind_session(self.active, kind.clone(), cx);
+        self.update_settings(|s| s.kernel = Some(kind.clone()));
+        self.refresh_composer(cx);
+        cx.notify();
+    }
+
     /// 第 `idx` 个会话原地换成 `kind` 内核、`cwd` 目录下的新会话（调用方保证它还没对话）。
     fn replace_session(
         &mut self,
@@ -1538,7 +1547,16 @@ impl ChatApp {
         }
         let token = self.next_token;
         self.next_token += 1;
-        self.sessions[idx] = self.new_session(kind, cwd, token);
+        // 原地换内核要沿用原来的会话类型、任务归属和 worktree 元信息：
+        // 直接 new_session 会把它重算成 Code / 任务，或把 worktree 丢掉
+        let (task, worktree, sk) = {
+            let s = &self.sessions[idx];
+            (s.task, s.worktree.clone(), s.kind)
+        };
+        let mut fresh = self.new_session_of(kind, cwd, token, sk);
+        fresh.task = task;
+        fresh.worktree = worktree;
+        self.sessions[idx] = fresh;
         self.request_pending_sessions();
         self.refresh_git_branch(idx, cx);
     }

@@ -644,7 +644,14 @@ impl ChatApp {
         } else {
             None
         };
-        let chip = ModelPickerChip::new(brand, session.model_label.clone(), effort);
+        // ACP 会话在 agent 报模型前 `model_label` 是空的：写「默认模型」，
+        // 别留一个空 chip 让人误以为是上一个自研会话的模型
+        let label = if !builtin && session.model_label.trim().is_empty() {
+            SharedString::from("默认模型")
+        } else {
+            session.model_label.clone()
+        };
+        let chip = ModelPickerChip::new(brand, label, effort);
         let handle = cx.entity();
         let fetch = handle.clone();
         let content_app = handle.clone();

@@ -22,6 +22,15 @@ const RESUME_MODE =
   process.env.MOCK_RESUME ??
   '';
 const PROMPT_IMAGE = process.argv.includes('--prompt-image') || process.env.MOCK_PROMPT_IMAGE === '1';
+// session/new 之后、首轮 prompt 之前主动发一段正文（模拟 pi-acp 的开机清单）
+const STARTUP_CHUNK = process.argv.includes('--startup-chunk') || process.env.MOCK_STARTUP_CHUNK === '1';
+// 应答之后再下一 tick 才发（模拟 pi-acp 的 setTimeout 0，可能晚于客户端首轮 prompt）
+const STARTUP_CHUNK_LATE =
+  process.argv.includes('--startup-chunk-late') || process.env.MOCK_STARTUP_CHUNK_LATE === '1';
+const AGENT_NAME =
+  process.argv.find((a) => a.startsWith('--agent-name='))?.slice('--agent-name='.length) ??
+  process.env.MOCK_AGENT_NAME ??
+  'mock-agent';
 const AUTH_MODE = process.argv.find((a) => a.startsWith('--auth='))?.slice('--auth='.length) ?? process.env.MOCK_AUTH ?? '';
 const REQUIRE_AUTH = process.argv.includes('--require-auth') || process.env.MOCK_REQUIRE_AUTH === '1';
 const AUTH_DELAY = Number(process.argv.find((a) => a.startsWith('--auth-delay='))?.slice('--auth-delay='.length) ?? process.env.MOCK_AUTH_DELAY_MS ?? 0);
@@ -109,6 +118,13 @@ function emitStartupUpdates(sid) {
     content: { type: 'text', text: '第一段摘要' },
   });
   update(sid, { sessionUpdate: 'compaction_update', compactionId: 'compact-1', status: 'completed' });
+  if (STARTUP_CHUNK) {
+    update(sid, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '## Context\nmock 开机清单：不是回复' },
+      messageId: 'startup',
+    });
+  }
 }
 /** @type {Map<number, (result: any) => void>} */
 const pending = new Map();
@@ -336,7 +352,7 @@ rl.on('line', (line) => {
           ...(RESUME_MODE === 'resume' ? { sessionCapabilities: { resume: {} } } : {}),
         },
         authMethods: AUTH_MODE ? advertisedAuthMethods() : [],
-        agentInfo: { name: 'mock-agent', title: 'Mock Agent', version: '0.1.0' },
+        agentInfo: { name: AGENT_NAME, title: 'Mock Agent', version: '0.1.0' },
       });
       break;
     case 'authenticate':
@@ -356,6 +372,17 @@ rl.on('line', (line) => {
       sessionConfigs.set(sid, makeConfig('model-a'));
       reply(id, { sessionId: sid, configOptions: sessionConfigs.get(sid), modes: sessionModes() });
       emitStartupUpdates(sid);
+      if (STARTUP_CHUNK_LATE) {
+        setTimeout(
+          () =>
+            update(sid, {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: '## Context\n晚到的开机清单' },
+              messageId: 'startup',
+            }),
+          0,
+        );
+      }
       break;
     }
     case 'session/resume':

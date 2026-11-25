@@ -904,3 +904,73 @@ fn plugin_mcp_servers_are_passed_to_new_sessions() {
     kernel.shutdown();
     assert_eq!(assistant_text(&events.lock().unwrap()), "mcp servers: db");
 }
+
+/// agent 在首轮 prompt 之前主动发的正文（pi-acp 的开机清单）降级成提示，
+/// 不进助手回复；prompt 之后的正文照常。
+#[test]
+fn startup_chunk_before_first_prompt_is_demoted_to_notice() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
+    };
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: format!("{} --startup-chunk", mock_command()),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+            env: Vec::new(),
+        },
+        sink,
+    )
+    .expect("spawn kernel");
+
+    let sid = start_session(&kernel, &events);
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Notice(t) if t.contains("开机清单")));
+    assert!(
+        !assistant_text(&events.lock().unwrap()).contains("开机清单"),
+        "启动清单不该作为助手正文"
+    );
+
+    kernel.send_prompt(&sid, UserPrompt::text("你好 mock")).expect("send prompt");
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    kernel.shutdown();
+
+    let assistant = assistant_text(&events.lock().unwrap());
+    assert!(assistant.contains("我是 mock 内核"), "assistant text: {assistant}");
+    assert!(!assistant.contains("开机清单"), "assistant text: {assistant}");
+}
+
+/// pi-acp 会先应答 session/new、下一 tick 才发开机清单，可能和客户端首轮 Prompt 抢跑：
+/// 认 agent 名 + 特征开头兜住，仍然降级成提示。
+#[test]
+fn late_pi_startup_chunk_still_demoted_after_prompt() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink: EventSink = {
+        let events = events.clone();
+        Arc::new(move |routed: RoutedEvent| events.lock().unwrap().push(routed.event))
+    };
+    let kernel = AcpKernel::spawn(
+        AcpKernelConfig {
+            command: format!("{} --startup-chunk-late --agent-name=pi-acp", mock_command()),
+            cwd: workspace_root(),
+            debug_wire: false,
+            auto_approve: true,
+            env: Vec::new(),
+        },
+        sink,
+    )
+    .expect("spawn kernel");
+
+    // 不等开机清单，Started 之后立刻发首条（模拟懒启动的 autoprompt）
+    let sid = start_session(&kernel, &events);
+    kernel.send_prompt(&sid, UserPrompt::text("你好 mock")).expect("send prompt");
+    wait_for(&events, 20_000, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    wait_for(&events, 10_000, |e| matches!(e, KernelEvent::Notice(t) if t.contains("开机清单")));
+    kernel.shutdown();
+
+    let assistant = assistant_text(&events.lock().unwrap());
+    assert!(assistant.contains("我是 mock 内核"), "assistant text: {assistant}");
+    assert!(!assistant.contains("开机清单"), "assistant text: {assistant}");
+}

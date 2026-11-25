@@ -71,6 +71,13 @@ struct AcpShared {
     compactions: Mutex<HashMap<(String, String), CompactionView>>,
     started: Mutex<HashSet<String>>,
     early: Mutex<Vec<SessionNotification>>,
+    /// 已经发过至少一条 `session/prompt` 的会话。首轮 Prompt 之前的
+    /// `AgentMessageChunk` 不是回复（pi-acp 的开机清单），降级成提示。
+    prompted: Mutex<HashSet<String>>,
+    /// 收到过正文块的会话（判断「第一条」用）。
+    saw_chunk: Mutex<HashSet<String>>,
+    /// 这个 agent 的名字（initialize 报的），用来认 pi-acp 的开机清单。
+    agent_name: Mutex<String>,
 }
 
 /// ACP 内核配置。
@@ -806,6 +813,7 @@ fn run_kernel(
                         }
                         KernelCommand::Prompt { session, prompt } => {
                             replaying.lock().unwrap().remove(&session);
+                            shared.prompted.lock().unwrap().insert(session.clone());
                             // 在独立任务里等本轮结束：指令循环必须保持空闲，
                             // 否则一轮进行中的 Cancel / SetMode / 其他会话的提示
                             // 都要等到轮末才处理。
@@ -1053,9 +1061,22 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification, shared
         SessionUpdate::UserMessageChunk(chunk) => {
             text_of(&chunk.content).map(|text| KernelEvent::UserMessageChunk { text })
         }
-        SessionUpdate::AgentMessageChunk(chunk) => {
-            text_of(&chunk.content).map(|text| KernelEvent::AgentMessageChunk { text })
-        }
+        SessionUpdate::AgentMessageChunk(chunk) => text_of(&chunk.content).map(|text| {
+            // 不是回复的正文降级成淡色提示，别混进助手气泡：
+            // 1. 首轮 Prompt 之前到达的（新会话开机清单）；
+            // 2. pi-acp 的开机清单可能晚于 Prompt 到达（`setTimeout(..., 0)`），
+            //    对它第一条、以特征开头的那块单独认。
+            let first = shared.saw_chunk.lock().unwrap().insert(session.clone());
+            let pre_prompt = !shared.prompted.lock().unwrap().contains(&session);
+            let startup = first
+                && shared.agent_name.lock().unwrap().eq_ignore_ascii_case("pi-acp")
+                && (text.starts_with("## Context") || text.starts_with("pi v"));
+            if pre_prompt || startup {
+                KernelEvent::Notice(text)
+            } else {
+                KernelEvent::AgentMessageChunk { text }
+            }
+        }),
         SessionUpdate::AgentThoughtChunk(chunk) => {
             text_of(&chunk.content).map(|text| KernelEvent::AgentThoughtChunk { text })
         }
@@ -1410,6 +1431,7 @@ fn report_started(
         Ok(OpenedSession { session_id, model, config_options, modes }) => {
             shared.configs.lock().unwrap().insert(session_id.clone(), config_options.clone());
             shared.started.lock().unwrap().insert(session_id.clone());
+            *shared.agent_name.lock().unwrap() = agent_name.to_string();
             let (modes, current_mode) = match modes {
                 Some(state) => (
                     state

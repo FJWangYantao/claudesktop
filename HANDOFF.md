@@ -691,3 +691,16 @@
   `sync_follow` 用距底像素 + 最近输入方向 + `is_tail_measured()`；向上任何一格就 `pause_following_tail`
   （流式追加会抢位置），向下回到 80px 内且尾行已测才重新 `FollowMode::Tail`，中间带保持原状。
   程序化定位（reveal、恢复位置）后要 `quiet_follow(700ms)`，否则会被自动吸附拉走。
+- **多内核默认选择**（2026-11）：`settings_view/form.rs` 的 `form_settings()` 以前结尾写死 `s.kernel = None`，
+  保存一次设置就把默认内核清空，`Settings::kernel()` 于是永远回落自研。改成保留原值（`keep_kernel_choice`）：
+  所选 ACP 档案被停用 / 删掉时置空；默认是 `Builtin` 但自研已没配好、又有启用的 agent 时也置空，
+  否则保存会被自研校验锁死。输入框内核菜单选完会写成默认（`choose_session_kernel`）。
+  注意设置页「内核」里的自研选项（自动模式 / 运行参数 / 用量记录）**不能**再按 `f.kernel == Builtin` 判断，
+  否则默认选成 agent 后整块消失——改看「自研是否已配置，或一家 agent 都没启用」。
+- **原地换内核不能直接 `new_session`**：会把 `task` 重算、`worktree` 元信息丢掉（项目会话被降成任务）。
+  `replace_session` 现在用 `new_session_of(..., sk)` 并回写 `task` / `worktree`；切到 ACP 仍保持懒启动（等首次发送）。
+- **ACP 首轮 Prompt 前的 `AgentMessageChunk` 不是回复**（pi-acp 会在 `session/new` 后塞开机清单）：
+  `AcpShared::prompted` 记发过 Prompt 的会话，之前的正文降级成 `KernelEvent::Notice`（淡色提示、不进日志）。
+  pi-acp 的 `setTimeout(..., 0)` 可能晚于客户端首轮 Prompt（懒启动 autoprompt）：再用 `agent_name == "pi-acp"`
+  + 该会话第一个正文块 + 以 `## Context` / `pi v` 开头兜一层。`session/load` 重放本来就被 `replaying` 丢弃；
+  别按 `Retrying (attempt` 前缀硬拦正文（会误伤正常回复）。命令重复校验比较时 Windows 上要剥掉 `cmd /c` 前缀。
