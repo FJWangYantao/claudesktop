@@ -75,6 +75,9 @@ fn hint_line(text: SharedString) -> Div {
     div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
 }
 
+/// 说明卡的整体定高（两行文案 + 胶囊 + 内边距）：每行卡片一样高，面板不会跟着伸缩。
+const CARD_H: Rems = rems(5.5);
+
 /// 品牌图标：有内置 SVG 就单色着色，没有就画圆角首字母徽章；
 /// 中继站的 `cn:xxx` 这类认不出品牌的用中性图标，字母徽章只会是噪音。
 fn brand_icon(brand: ModelBrand, model: &str) -> Div {
@@ -590,24 +593,33 @@ impl ModelPickerContent {
 }
 
 /// 悬停说明卡：一句话定位 + 能力胶囊。
+///
+/// 整张卡定高并垂直居中：目录里没有的模型（中转站的 `cn:xxx`、新发模型）只有胶囊，
+/// 换成别的行时卡片不能跟着长高变矮，否则列表会上下跳、鼠标底下的行跟着变。
 fn render_card(detail: Option<SharedString>, caps: Vec<&'static str>) -> Div {
+    // 没有说明的模型留一行淡色占位，卡片高度才不跟着悬停变
+    let (text, color) = match detail {
+        Some(text) => (text, INK_SOFT),
+        None => ("No description available for this model.".into(), INK_FAINT),
+    };
     div()
         .v_flex()
-        .gap_2()
+        .justify_center()
+        .h(CARD_H)
         .mt_1p5()
         .px_3()
         .py_2p5()
         .rounded_lg()
         .bg(rgb(SAND))
-        .when_some(detail, |d, text| {
-            d.child(
-                div()
-                    .text_size(TEXT_SMALL)
-                    .line_height(LEADING)
-                    .text_color(rgb(INK_SOFT))
-                    .child(text),
-            )
-        })
+        .child(
+            div()
+                .mb_2()
+                .line_clamp(2)
+                .text_size(TEXT_SMALL)
+                .line_height(LEADING)
+                .text_color(rgb(color))
+                .child(text),
+        )
         .when(!caps.is_empty(), |d| {
             d.child(div().h_flex().flex_wrap().gap_1p5().children(caps.into_iter().map(|cap| {
                 div()
