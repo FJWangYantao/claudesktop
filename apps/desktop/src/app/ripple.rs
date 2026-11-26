@@ -37,6 +37,9 @@ const DAMPING: f32 = 0.984;
 const SPEED_SQ: f32 = 0.22;
 /// 静止态字阵的基础不透明度（0..255）。
 const IDLE_ALPHA: f32 = 46.;
+/// 静止态云雾的起伏强度。首帧铺底和「波纹收敛后重铺」必须用同一个值，
+/// 否则第一次起波停下时整屏亮度会跳一档。
+pub(crate) const IDLE_CLOUD: f32 = 0.45;
 /// 一次步进按 60Hz 算：帧率低的时候多走几步，别让波纹看起来在慢放。
 const STEP_SECONDS: f32 = 1. / 60.;
 
@@ -137,7 +140,7 @@ impl RippleField {
         self.last_step = None;
         self.fill_idle(&PackParams {
             wave_gain: 1.,
-            cloud: 0.,
+            cloud: IDLE_CLOUD,
         });
     }
 

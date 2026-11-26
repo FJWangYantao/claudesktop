@@ -76,10 +76,18 @@ float4 horizon_glow_fragment(HorizonGlowFragmentInput input): SV_Target {
     float curtain = smoothstep(0.32, 0.86, curtain_a * 0.72 + curtain_b * 0.5);
     float band = rise * (0.32 + 0.68 * curtain);
 
-    // 透视半调点阵：越往上（离视平线越远）网格越密，像铺在斜面上的网点。
-    float spacing = 6. * max(glow.dpr, 0.5);
+    // 透视半调点阵：横向按 1/(0.55 + y) 收拢、纵向用 log 积分。
+    // 直接用 `local / (spacing * perspective)` 会出事：对 y 求导后是
+    // `1.55 - 2 * (local.y / size.y)`，在 `uv.y ≈ 0.225`（正好是极光最亮那条带）
+    // 导数为 0，点阵会拉成横线再反向翻转；取 log 才能让纵横密度处处等比、严格单调。
+    // 横向再减掉一半宽度，灭点才在画面中央而不是左边缘。
+    float spacing = 7. * max(glow.dpr, 0.5);
     float perspective = 1. / (0.55 + uv.y);
-    float2 dot_uv = frac(local / (spacing * perspective)) - 0.5;
+    float2 grid = float2(
+        (local.x - size.x * 0.5) * perspective,
+        size.y * log(0.55 + uv.y)
+    );
+    float2 dot_uv = frac(grid / spacing) - 0.5;
     float dot = saturate(1. - length(dot_uv) * 1.9);
     float proximity_to_horizon = saturate(1. - above * 1.4);
     float dots = smoothstep(0.45, 0.95, dot * (0.55 + 0.65 * proximity_to_horizon)) * glow.presence;

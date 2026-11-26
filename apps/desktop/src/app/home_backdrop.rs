@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::prism_rim::ambient_level;
-use super::ripple::{CELL_H, CELL_W, GLYPHS, GLYPH_COUNT, PackParams, RippleField};
+use super::ripple::{CELL_H, CELL_W, GLYPHS, GLYPH_COUNT, IDLE_CLOUD, PackParams, RippleField};
 
 /// 指针停下之后光晕再留多久。
 const AURA_LINGER: Duration = Duration::from_millis(1200);
@@ -71,10 +71,14 @@ impl Default for HomeBackdrop {
 
 impl HomeBackdrop {
     /// 指针移动：注入扰动 + 更新光晕。抖动（位移小于阈值）只续光晕不扰动水面。
-    pub(crate) fn pointer(&mut self, position: Point<Pixels>) {
-        let Some(bounds) = self.bounds else { return };
+    ///
+    /// 返回是否落在背景范围内（侧栏 / 顶栏上的鼠标不该搅动首页水面）。
+    pub(crate) fn pointer(&mut self, position: Point<Pixels>) -> bool {
+        let Some(bounds) = self.bounds else {
+            return false;
+        };
         if !bounds.contains(&position) {
-            return;
+            return false;
         }
         let local = (
             f32::from(position.x) - f32::from(bounds.origin.x),
@@ -94,13 +98,16 @@ impl HomeBackdrop {
             self.last_wake = Some(position);
         }
         self.aura = Some((position, Instant::now()));
+        true
     }
 
-    /// 首页空白处点一下：一个圆形波包。
-    pub(crate) fn splash(&mut self, position: Point<Pixels>) {
-        let Some(bounds) = self.bounds else { return };
+    /// 首页空白处点一下：一个圆形波包。返回是否命中背景范围。
+    pub(crate) fn splash(&mut self, position: Point<Pixels>) -> bool {
+        let Some(bounds) = self.bounds else {
+            return false;
+        };
         if !bounds.contains(&position) {
-            return;
+            return false;
         }
         let local = (
             f32::from(position.x) - f32::from(bounds.origin.x),
@@ -108,6 +115,7 @@ impl HomeBackdrop {
         );
         self.field.splash(local.0, local.1, SPLASH_STRENGTH);
         self.aura = Some((position, Instant::now()));
+        true
     }
 
     /// 有没有东西还在动（决定要不要排下一帧）。
@@ -131,7 +139,7 @@ impl HomeBackdrop {
     fn pack_params(&self) -> PackParams {
         PackParams {
             wave_gain: 1.,
-            cloud: 0.45,
+            cloud: IDLE_CLOUD,
         }
     }
 
@@ -413,12 +421,12 @@ impl super::ChatApp {
             return;
         }
         self.home_pointer_at = Some(now);
-        let animating = {
+        // 只有指针真的落在背景范围内、并且确实有东西在动时才重绘
+        let touched = {
             let mut backdrop = self.home_backdrop.borrow_mut();
-            backdrop.pointer(position);
-            backdrop.animating()
+            backdrop.pointer(position) && backdrop.animating()
         };
-        if animating {
+        if touched {
             self.home_backdrop_view.update(cx, |_, cx| cx.notify());
         }
     }
@@ -428,7 +436,10 @@ impl super::ChatApp {
         if !self.home_backdrop_active() {
             return;
         }
-        self.home_backdrop.borrow_mut().splash(position);
-        self.home_backdrop_view.update(cx, |_, cx| cx.notify());
+        // `borrow_mut` 只包住调用本身：命中判断拿到结果后再通知，别把 RefMut 带进渲染
+        let inside = self.home_backdrop.borrow_mut().splash(position);
+        if inside {
+            self.home_backdrop_view.update(cx, |_, cx| cx.notify());
+        }
     }
 }

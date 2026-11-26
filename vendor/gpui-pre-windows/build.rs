@@ -71,6 +71,13 @@ mod shader_compilation {
 
         // claudesktop patch: 首页背景 / 输入框棱镜描边。三个效果各一份文件，
         // 入口名仍是 `{module}_vertex` / `{module}_fragment`（见 shader_resources）。
+        // 三份都 include 了 `prism_common.hlsl`，改了它 Release 必须重编。
+        println!(
+            "cargo:rerun-if-changed={}",
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("src/prism_common.hlsl")
+                .display()
+        );
         for (module, file) in [
             ("prism_rim", "prism_rim.hlsl"),
             ("horizon_glow", "horizon_glow.hlsl"),
@@ -80,13 +87,6 @@ mod shader_compilation {
                 .join("src")
                 .join(file);
             println!("cargo:rerun-if-changed={}", path.display());
-            // 三个效果共用的头文件：改了它 Release 也要重编
-            println!(
-                "cargo:rerun-if-changed={}",
-                PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                    .join("src/prism_common.hlsl")
-                    .display()
-            );
             compile_shader_for_module(
                 module,
                 &out_dir,
