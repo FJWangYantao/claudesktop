@@ -3246,11 +3246,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     focused && show_cursor && single_caret && no_selection && !cx.reduce_motion();
                 let scale_factor = window.scale_factor();
                 self.state.update(cx, |state, _| {
+                    // 第 4 个参数是「文档是否为空」：发送清空后光标要直接落位，
+                    // 传 `no_selection` 会让它永远为真、清空时照样滑回开头。
+                    let empty = state.text.len() == 0;
                     state.smooth_caret_frame(
                         active.bounds,
                         prepaint.cursor_scroll_offset,
                         focused,
-                        no_selection,
+                        empty,
                         animate,
                         scale_factor,
                     )

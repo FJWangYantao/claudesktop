@@ -49,12 +49,6 @@ struct ActiveRect {
     r1: usize,
 }
 
-impl ActiveRect {
-    fn contains(&self, c: usize, r: usize) -> bool {
-        c >= self.c0 && c <= self.c1 && r >= self.r0 && r <= self.r1
-    }
-}
-
 /// 首页字阵的波动场。
 pub(crate) struct RippleField {
     cols: usize,
@@ -76,13 +70,14 @@ pub(crate) struct RippleField {
 }
 
 /// 打包时用到的、每帧都可能变的参数（颜色在 shader 里，这里只有强度）。
+///
+/// 指针光晕**不在这里**：光晕是纯 GPU 叠色（`ascii_ripple.hlsl` 的 `params.aura`），
+/// CPU 贴图保持「只有波场」，否则波纹收敛时会把光斑永久烤进静止字阵。
 pub(crate) struct PackParams {
     /// 波面抬升的增益：越大，波峰的字越亮。
     pub wave_gain: f32,
     /// 云雾/呼吸的强度（0 = 完全均匀）。
     pub cloud: f32,
-    /// 指针位置（逻辑像素，相对字阵左上）与光晕半径；`None` 表示没有指针。
-    pub aura: Option<(f32, f32, f32)>,
 }
 
 impl RippleField {
@@ -143,7 +138,6 @@ impl RippleField {
         self.fill_idle(&PackParams {
             wave_gain: 1.,
             cloud: 0.,
-            aura: None,
         });
     }
 
@@ -164,12 +158,12 @@ impl RippleField {
         }
         let (c0, r0) = self.cell_at(from.0, from.1);
         let (c1, r1) = self.cell_at(to.0, to.1);
-        let steps = (c1 as isize - c0 as isize).abs().max((r1 as isize - r0 as isize).abs()) as usize;
+        let steps = (c1 - c0).abs().max((r1 - r0).abs()) as usize;
         let steps = steps.max(1);
         for step in 0..=steps {
             let t = step as f32 / steps as f32;
-            let c = (c0 as f32 + (c1 as f32 - c0 as f32) * t).round() as isize;
-            let r = (r0 as f32 + (r1 as f32 - r0 as f32) * t).round() as isize;
+            let c = (c0 as f32 + (c1 - c0) as f32 * t).round() as isize;
+            let r = (r0 as f32 + (r1 - r0) as f32 * t).round() as isize;
             self.add_velocity(c, r, -strength);
             // 顺着方向给一点横向推力，波纹才会跟着鼠标走而不是原地抖
             if c1 > c0 {
@@ -178,8 +172,6 @@ impl RippleField {
                 self.add_velocity(c + 1, r, -strength * 0.35);
             }
         }
-        self.touch(c0, r0);
-        self.touch(c1, r1);
     }
 
     /// 点击：一个圆形波包。
@@ -188,7 +180,7 @@ impl RippleField {
             return;
         }
         let (cc, cr) = self.cell_at(x, y);
-        let radius = 3i64;
+        let radius = 3isize;
         for dr in -radius..=radius {
             for dc in -radius..=radius {
                 let distance = ((dc * dc + dr * dr) as f32).sqrt();
@@ -199,7 +191,6 @@ impl RippleField {
                 self.add_velocity(cc + dc, cr + dr, -strength * falloff);
             }
         }
-        self.touch(cc, cr);
     }
 
     /// 走一步。传 `now` 而不是固定步长：掉帧时补步，波纹速度看起来才一致。
@@ -233,6 +224,9 @@ impl RippleField {
     }
 
     /// 一次显式差分步进，只算活跃矩形（外扩一格）。没有能量了就返回 `None`。
+    ///
+    /// 分两遍走：第一遍只读 `height` 更新速度，第二遍用新速度推进高度并统计新的
+    /// 活跃矩形。一遍里又读又写会变成 Gauss-Seidel，波会明显往右下偏。
     fn step_once(&mut self, active: ActiveRect) -> Option<ActiveRect> {
         let cols = self.cols;
         let rows = self.rows;
@@ -244,10 +238,6 @@ impl RippleField {
         for r in r0..=r1 {
             for c in c0..=c1 {
                 let i = r * cols + c;
-                if !active.contains(c, r) {
-                    // 新扩进来的格子这一帧才开始有能量，先给零速度
-                    self.velocity[i] = 0.;
-                }
                 let left = if c > 0 { self.height[i - 1] } else { self.height[i] };
                 let right = if c + 1 < cols {
                     self.height[i + 1]
@@ -275,35 +265,34 @@ impl RippleField {
                     velocity = 0.;
                 }
                 self.velocity[i] = velocity;
-                let mut height = self.height[i] + velocity;
-                if height.abs() < REST_HEIGHT && velocity.abs() < REST_HEIGHT {
-                    height = 0.;
-                    velocity = 0.;
-                    self.velocity[i] = 0.;
-                }
-                self.height[i] = height;
             }
         }
 
-        // 重新算活跃矩形：只扫刚才那块，取有能量的包围盒
+        // 第二遍：推进高度，取还有能量的包围盒；低于阈值的格子就地归零。
         let mut bounds: Option<ActiveRect> = None;
         for r in r0..=r1 {
             for c in c0..=c1 {
                 let i = r * cols + c;
-                if self.height[i].abs() >= REST_HEIGHT || self.velocity[i].abs() >= REST_HEIGHT {
-                    bounds = Some(match bounds {
-                        None => ActiveRect { c0: c, r0: r, c1: c, r1: r },
-                        Some(b) => ActiveRect {
-                            c0: b.c0.min(c),
-                            r0: b.r0.min(r),
-                            c1: b.c1.max(c),
-                            r1: b.r1.max(r),
-                        },
-                    });
-                } else {
+                let velocity = self.velocity[i];
+                let mut height = self.height[i] + velocity;
+                if !height.is_finite() {
+                    height = 0.;
+                }
+                if height.abs() < REST_HEIGHT && velocity.abs() < REST_HEIGHT {
                     self.height[i] = 0.;
                     self.velocity[i] = 0.;
+                    continue;
                 }
+                self.height[i] = height;
+                bounds = Some(match bounds {
+                    None => ActiveRect { c0: c, r0: r, c1: c, r1: r },
+                    Some(b) => ActiveRect {
+                        c0: b.c0.min(c),
+                        r0: b.r0.min(r),
+                        c1: b.c1.max(c),
+                        r1: b.r1.max(r),
+                    },
+                });
             }
         }
         bounds
@@ -370,15 +359,7 @@ impl RippleField {
             1. - params.cloud * (1. - (0.55 + 0.45 * noise))
         };
 
-        let mut alpha = (IDLE_ALPHA + energy * 1400. * params.wave_gain) * cloud;
-        if let Some((ax, ay, radius)) = params.aura {
-            let dx = c as f32 * CELL_W + CELL_W * 0.5 - ax;
-            let dy = r as f32 * CELL_H + CELL_H * 0.5 - ay;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let aura = (1. - distance / radius.max(1.)).max(0.);
-            alpha += aura * aura * 150.;
-        }
-        let alpha = alpha.clamp(0., 255.) as u8;
+        let alpha = ((IDLE_ALPHA + energy * 1400. * params.wave_gain) * cloud).clamp(0., 255.) as u8;
 
         let mix = (energy * 520. * params.wave_gain).clamp(0., 1.);
         let mix_byte = (mix * 255.) as u8;
@@ -413,6 +394,9 @@ impl RippleField {
             velocity = 0.;
         }
         self.velocity[i] = velocity.clamp(-2.5, 2.5);
+        // 写过速度的格子必须进活跃矩形：否则下一帧的步进根本走不到它，
+        // 注入的波包就等于没发生（之前在这里踩过，splash 完全没反应）。
+        self.touch(c, r);
     }
 
     fn touch(&mut self, c: isize, r: isize) {
@@ -492,7 +476,6 @@ mod tests {
         PackParams {
             wave_gain: 1.,
             cloud: 0.3,
-            aura: None,
         }
     }
 
@@ -573,27 +556,26 @@ mod tests {
     }
 
     #[test]
-    fn aura_lifts_the_cells_under_the_pointer() {
+    fn splash_actually_reaches_the_cells_it_wrote() {
+        // 回归：注入速度但不把格子算进活跃矩形时，下一次 step 会跳过它们（波包等于没发生）。
         let mut field = RippleField::new();
         field.resize(700., 450.);
         field.splash(350., 200., 1.5);
-        field.step(Instant::now());
-        let dark = PackParams {
-            wave_gain: 1.,
-            cloud: 0.,
-            aura: None,
-        };
-        let lit = PackParams {
-            wave_gain: 1.,
-            cloud: 0.,
-            aura: Some((350., 200., 200.)),
-        };
-        field.pack(&dark);
+        let start = Instant::now();
+        field.step(start);
+        field.step(start + Duration::from_millis(16));
+        assert!(field.is_active(), "点一下应当留下还在跑的波纹");
+        field.pack(&params());
         let cols = field.cols();
-        let center = ((200. / CELL_H) as usize * cols + (350. / CELL_W) as usize) * 4 + 1;
-        let without = field.pixels()[center];
-        field.pack(&lit);
-        let with = field.pixels()[center];
-        assert!(with >= without, "指针光晕不该让字变暗：{without} → {with}");
+        // 波心周围 ±3 格都要有能量（只更新 1×1 的话这里会全是静止值）
+        for (dr, dc) in [(0, 0), (0, 2), (2, 0), (0, -2), (-2, 0)] {
+            let r = (200. / CELL_H) as isize + dr;
+            let c = (350. / CELL_W) as isize + dc;
+            let index = (r as usize * cols + c as usize) * 4 + 1;
+            assert!(
+                field.pixels()[index] > 46,
+                "波心附近的格子应当被点亮：({dr}, {dc})"
+            );
+        }
     }
 }

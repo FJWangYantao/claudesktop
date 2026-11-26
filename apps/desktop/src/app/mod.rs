@@ -2928,8 +2928,6 @@ impl ChatApp {
             );
             return;
         }
-        // 发出去之前给首页背景一个脉冲（切到对话页后这层就卸载了，算是收尾的一亮）
-        self.home_backdrop.borrow_mut().surge();
         let queued =
             QueuedPrompt { text, images: self.pending.clone(), files: self.pending_files.clone() };
         // 发出去了：光标后面那句灰字、以及轮结束时猜的下一句都作废
@@ -4403,15 +4401,24 @@ impl Render for ChatApp {
         self.sync_placeholder(window, cx);
 
         // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
-        let body = v_flex().flex_1().min_h_0().w_full().child(self.content_slot()).when(
-            !self.settings_open,
-            |d| {
+        // 首页背景（地平线极光 + ASCII 波动字阵）铺在「内容区 + 输入区」整块背后，
+        // 所以挂在这个 relative 容器的最底层而不是 content_slot 里——挂在后者会让
+        // 极光在输入框上沿被一刀截断。对话态整块不挂载（0 CPU / 0 GPU，显存自动回收）。
+        let body = v_flex()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .when(self.home_backdrop_active(), |d| {
+                d.child(self.home_backdrop_view.clone())
+            })
+            .child(self.content_slot())
+            .when(!self.settings_open, |d| {
                 d.child(
                     self.reading_column(div().pb_4().pt_2())
                         .child(self.render_composer(window, cx)),
                 )
-            },
-        );
+            });
         let main = v_flex()
             .flex_1()
             .min_w_0()

@@ -877,10 +877,11 @@ impl DirectXRenderer {
                     let cells = self.prism.cells_srv.clone();
                     let atlas = self.prism.atlas_srv.clone();
                     let sampler = self.prism.sampler.clone();
-                    anyhow::ensure!(
-                        cells.is_some() && atlas.is_some(),
-                        "ascii ripple needs both the cell and the atlas texture"
-                    );
+                    // 纹理还没准备好（首帧 / 尺寸为 0 / 字形一个都没光栅出来）：
+                    // 跳过这一层，别让整窗 render() 报错。
+                    if cells.is_none() || atlas.is_none() {
+                        continue;
+                    }
                     let pipeline = self
                         .prism
                         .ascii

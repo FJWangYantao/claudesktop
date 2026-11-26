@@ -76,9 +76,10 @@ float4 horizon_glow_fragment(HorizonGlowFragmentInput input): SV_Target {
     float curtain = smoothstep(0.32, 0.86, curtain_a * 0.72 + curtain_b * 0.5);
     float band = rise * (0.32 + 0.68 * curtain);
 
-    // 透视半调点阵：越贴近地平线点越大、越亮。
+    // 透视半调点阵：越往上（离视平线越远）网格越密，像铺在斜面上的网点。
     float spacing = 6. * max(glow.dpr, 0.5);
-    float2 dot_uv = frac(local / spacing) - 0.5;
+    float perspective = 1. / (0.55 + uv.y);
+    float2 dot_uv = frac(local / (spacing * perspective)) - 0.5;
     float dot = saturate(1. - length(dot_uv) * 1.9);
     float proximity_to_horizon = saturate(1. - above * 1.4);
     float dots = smoothstep(0.45, 0.95, dot * (0.55 + 0.65 * proximity_to_horizon)) * glow.presence;
@@ -87,6 +88,12 @@ float4 horizon_glow_fragment(HorizonGlowFragmentInput input): SV_Target {
         0.56 + 0.10 * glow.semantic + 0.12 * glow.spectrum * uv.y + 0.07 * curtain_a - t * 0.015
     );
     float3 aurora = hsv_to_rgb(float3(hue, lerp(0.42, 0.62, glow.spectrum), 0.78));
+    // 棱镜色散：R / B 通道各偏一点色相，极光边上就有玻璃感（`prism` 为 0 时不变）
+    float split = 0.06 * saturate(glow.prism);
+    if (split > 0.001) {
+        aurora.r = hsv_to_rgb(float3(frac(hue + split), 0.55, 0.78)).r;
+        aurora.b = hsv_to_rgb(float3(frac(hue - split), 0.55, 0.78)).b;
+    }
 
     float alpha = saturate((band * 0.9 + dots * 0.55) * glow.intensity);
     // 发消息那一瞬间整层亮一下（surge 由界面侧衰减）。
@@ -95,6 +102,10 @@ float4 horizon_glow_fragment(HorizonGlowFragmentInput input): SV_Target {
     // 浅色底上往白里靠一档，免得在纸上糊成一片脏色；深色底保持饱和度。
     float3 color = lerp(aurora, float3(1., 1., 1.), 0.22 * (1. - glow.dark));
     color *= lerp(0.62, 1.08, saturate(band));
+
+    // TPDF 抖色：两层噪声相减，把 8bit 量化台阶打散，大面积渐变不出色带。
+    float dither = value_noise(input.position.xy * 0.71) + value_noise(input.position.xy * 1.37) - 1.;
+    alpha = saturate(alpha + dither * (1. / 255.));
 
     if (alpha <= 0.002) {
         discard;

@@ -773,3 +773,15 @@
 - **显存回收**：`PrismGpuResources::tick_idle` 在连续 `PRISM_IDLE_FRAMES`（120）帧没有字阵后
   `take()` 掉单元格与图集纹理；设备丢失时先 `PrismGpuResources::empty()` 再 `devices.take()`，
   否则 debug 层会报 live object 泄漏。
+- **波场：写进速度的格子必须同时扩活跃矩形**。只 `touch` 波心那一格的话，下一帧步进根本
+  走不到周边预注入的速度（`step_once` 只扫活跃矩形），`splash` 就等于没发生。现在
+  `add_velocity` 内部自己 `touch`，不要再在外面手动补。
+- **波场：一遍里读 `height` 又改 `height` 会变成 Gauss-Seidel**，波会明显往右下偏。
+  必须两遍：先只读高度更新速度，再用新速度推进高度并统计新的活跃矩形。
+- **指针光晕是 GPU 的事，别烤进 CPU 贴图**。CPU 侧把光斑写进像素后，波纹收敛时
+  `fill_idle` 会把那个亮斑永久留在静止字阵里；光晕只走 `ascii_ripple.hlsl` 的
+  `params.aura`（圆心 / 半径 / 强度），强度按停留时间 `smoothstep` 归零。
+- **首页背景要挂在 `body`（内容区 + 输入区）的底层**，不是 `content_slot()` 里：
+  后者在输入框上沿就结束了，极光会被一刀截断。
+- **弹出式提示别用「同帧就卸载」的脉冲**：`surge` 曾经在发送消息时触发，但同一帧
+  `home_backdrop_active()` 就变假、整块卸载，一帧都画不出来——已删掉。

@@ -4811,8 +4811,10 @@ impl Window {
                 ScaledPixels(style.pointer.x.0 * scale_factor),
                 ScaledPixels(style.pointer.y.0 * scale_factor),
             ),
-            radius: ScaledPixels(style.radius.0 * scale_factor),
-            stroke_width: self.snap_stroke(style.stroke_width),
+            // `radius` / `stroke_width` 在 GPU 结构里是裸 f32（`ScaledPixels` 没实现
+            // `Debug`，进不了 `PrismRim` 的 derive），这里取回 f32 再写。
+            radius: style.radius.0 * scale_factor,
+            stroke_width: self.snap_stroke(style.stroke_width).0,
             alpha: (style.alpha * opacity).clamp(0., 1.),
             dark: style.dark as u32,
             tone_key: style.tone_key,

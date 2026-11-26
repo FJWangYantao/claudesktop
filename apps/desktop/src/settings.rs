@@ -1033,8 +1033,8 @@ impl ThemeChoice {
     /// 顺序和 `theme::PALETTES` 一致，改配色要两条一起看（`theme::prism_tone` 走这张表）。
     pub fn prism_tone(self) -> u32 {
         match self {
-            // Kimi 的强调色是暖橙，默认那组暖白光谱最贴
-            ThemeChoice::Kimi => 0,
+            // Kimi 的强调色是电光蓝（`0x1783FF`），配钴蓝那组光谱
+            ThemeChoice::Kimi => 2,
             ThemeChoice::Warm => 1,
             // Flexoki 的纸是米黄、强调色偏赭
             ThemeChoice::Flexoki => 4,

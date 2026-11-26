@@ -138,7 +138,20 @@ impl ChatApp {
         let Some(bounds) = self.rim_view.read(cx).card_bounds() else {
             return;
         };
+
         if distance_to_bounds(bounds, position) > FADE_END {
+            // 移出有效范围：如果刚才还亮着，清掉位置并**通知一次**把它熄灭；
+            // 此后位置为空，就再也不会重绘（这就是「移远自动熄灭 + 0fps」）。
+            let was_lit = {
+                let mut pointer = self.rim_pointer.borrow_mut();
+                let was_lit = pointer.position.is_some() || pointer.painted.is_some();
+                pointer.position = None;
+                pointer.painted = None;
+                was_lit
+            };
+            if was_lit {
+                self.rim_view.update(cx, |_, cx| cx.notify());
+            }
             return;
         }
 
@@ -149,9 +162,11 @@ impl ChatApp {
             let too_soon = pointer
                 .last_notify
                 .is_some_and(|last| now.saturating_duration_since(last) < MIN_FRAME_GAP);
-            let painted = pointer.painted.unwrap_or(position);
-            let moved = (f32::from(position.x) - f32::from(painted.x)).abs() >= MIN_MOVE
-                || (f32::from(position.y) - f32::from(painted.y)).abs() >= MIN_MOVE;
+            // 还没画过（`painted` 为空）时算作「动过」：否则刚一靠近那一帧不会重绘。
+            let moved = pointer.painted.is_none_or(|painted| {
+                (f32::from(position.x) - f32::from(painted.x)).abs() >= MIN_MOVE
+                    || (f32::from(position.y) - f32::from(painted.y)).abs() >= MIN_MOVE
+            });
             if too_soon || !moved {
                 false
             } else {

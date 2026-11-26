@@ -94,15 +94,10 @@ float4 prism_rim_fragment(PrismRimFragmentInput input): SV_Target {
     float3 color = lerp(base, spectral, saturate(proximity * 0.9 + 0.06));
     float alpha = coverage * rim.alpha * (0.34 + 0.66 * proximity);
 
-    // mode == 1：底部一层向内反射，让卡片下沿像有光从桌面反上来。
-    if (rim.mode == 1u) {
-        float2 normalized = (input.position.xy - rim.bounds.origin) / max(rim.bounds.size, float2(1., 1.));
-        float from_bottom = saturate(1. - normalized.y);
-        float inside = saturate(-sdf / 22.);
-        float reflect = from_bottom * from_bottom * inside * proximity * 0.45;
-        color = lerp(color, spectral, saturate(reflect));
-        alpha = saturate(alpha + reflect * 0.35);
-    }
+    // 说明：结构体里的 `mode` 目前恒为 0（只在描边环上画）。原先这里有个
+    // `mode == 1` 的底部反射分支，但上面已经 `discard` 掉环外的像素，那一段永远
+    // 走不到；而且 D3D 的 y 向下，`1 - normalized.y` 算的其实是顶边。真要做，
+    // 得把 discard 挪到反射计算之后重写，先留字段不实现。
 
     return float4(color * alpha, alpha);
 }

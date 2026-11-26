@@ -103,9 +103,11 @@ float4 ascii_ripple_fragment(AsciiRippleFragmentInput input): SV_Target {
 
     // 取图集里那一格：用纹素中心、POINT 采样，避免相邻字形渗色。
     float2 atlas_px = float2(max(ripple.params.atlas_size.x, 1.), max(ripple.params.atlas_size.y, 1.));
+    // 用 POINT 采样 + 纹素中心：`within` 满格映射到 `atlas_cell` 个纹素，
+    // 右/下边界收半个纹素，最右一列不会被压窄，也不会串到下一个字形。
     float2 atlas_uv = float2(
-        (glyph * atlas_cell + saturate(within.x) * (atlas_cell - 1.)) / atlas_px.x,
-        (saturate(within.y) * (atlas_px.y - 1.)) / atlas_px.y
+        (glyph * atlas_cell + min(saturate(within.x) * atlas_cell, atlas_cell - 0.5)) / atlas_px.x,
+        min(saturate(within.y) * atlas_px.y, atlas_px.y - 0.5) / atlas_px.y
     );
     float coverage = t_atlas.Sample(s_atlas, atlas_uv);
     if (coverage <= 0.004) {

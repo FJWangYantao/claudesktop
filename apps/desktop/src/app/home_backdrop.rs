@@ -30,8 +30,9 @@ const WAKE_MIN_MOVE: f32 = 7.;
 const WAKE_STRENGTH: f32 = 0.5;
 /// 点击注入的波包强度。
 const SPLASH_STRENGTH: f32 = 1.7;
-/// 发消息瞬间的脉冲时长。
-const SURGE_LINGER: Duration = Duration::from_millis(700);
+/// 字形光栅化用的字号（逻辑像素）。比格子高小一档：等宽字体在 10px 下宽字母
+/// （`W` / `M` / `8`）才塞得进 7px 的格子，不会被右边裁掉。
+const GLYPH_FONT_SIZE: f32 = 10.;
 
 /// 首页背景的全部可变状态。
 pub(crate) struct HomeBackdrop {
@@ -44,8 +45,6 @@ pub(crate) struct HomeBackdrop {
     last_wake: Option<Point<Pixels>>,
     /// 指针光晕：位置 + 最近一次移动的时刻
     aura: Option<(Point<Pixels>, Instant)>,
-    /// 发消息的脉冲：起始时刻 + 起始强度
-    surge: Option<(Instant, f32)>,
     /// 背景的窗口坐标（prepaint 写入，指针换算成局部坐标要用）
     bounds: Option<Bounds<Pixels>>,
     /// 计数开始时刻：极光的时间轴
@@ -63,7 +62,6 @@ impl Default for HomeBackdrop {
             atlas_key: None,
             last_wake: None,
             aura: None,
-            surge: None,
             bounds: None,
             started: Instant::now(),
             seeded: false,
@@ -75,6 +73,9 @@ impl HomeBackdrop {
     /// 指针移动：注入扰动 + 更新光晕。抖动（位移小于阈值）只续光晕不扰动水面。
     pub(crate) fn pointer(&mut self, position: Point<Pixels>) {
         let Some(bounds) = self.bounds else { return };
+        if !bounds.contains(&position) {
+            return;
+        }
         let local = (
             f32::from(position.x) - f32::from(bounds.origin.x),
             f32::from(position.y) - f32::from(bounds.origin.y),
@@ -98,6 +99,9 @@ impl HomeBackdrop {
     /// 首页空白处点一下：一个圆形波包。
     pub(crate) fn splash(&mut self, position: Point<Pixels>) {
         let Some(bounds) = self.bounds else { return };
+        if !bounds.contains(&position) {
+            return;
+        }
         let local = (
             f32::from(position.x) - f32::from(bounds.origin.x),
             f32::from(position.y) - f32::from(bounds.origin.y),
@@ -106,18 +110,12 @@ impl HomeBackdrop {
         self.aura = Some((position, Instant::now()));
     }
 
-    /// 发出第一条消息时的脉冲（切走之前的最后一亮）。
-    pub(crate) fn surge(&mut self) {
-        self.surge = Some((Instant::now(), 1.));
-    }
-
     /// 有没有东西还在动（决定要不要排下一帧）。
     pub(crate) fn animating(&self) -> bool {
-        if self.field.is_active() || self.surge.is_some() {
-            return true;
-        }
-        self.aura
-            .is_some_and(|(_, at)| at.elapsed() < AURA_LINGER)
+        self.field.is_active()
+            || self
+                .aura
+                .is_some_and(|(_, at)| at.elapsed() < AURA_LINGER)
     }
 
     fn resize(&mut self, bounds: Bounds<Pixels>) {
@@ -128,24 +126,34 @@ impl HomeBackdrop {
         );
     }
 
-    /// 这一帧的打包参数（光晕随指针停留时间缩小到消失）。
-    fn pack_params(&self, bounds: Bounds<Pixels>) -> PackParams {
-        let aura = self
-            .aura
-            .filter(|(_, at)| at.elapsed() < AURA_LINGER)
-            .map(|(position, at)| {
-                let age = at.elapsed().as_secs_f32() / AURA_LINGER.as_secs_f32();
-                (
-                    f32::from(position.x) - f32::from(bounds.origin.x),
-                    f32::from(position.y) - f32::from(bounds.origin.y),
-                    AURA_RADIUS * (1. - age).max(0.15),
-                )
-            });
+    /// CPU 侧的打包参数。指针光晕**不在这里**：它是纯 GPU 叠色，CPU 贴图只存波场，
+    /// 否则波纹收敛时会把光斑烤进静止字阵（见 `pack_params_for_gpu`）。
+    fn pack_params(&self) -> PackParams {
         PackParams {
             wave_gain: 1.,
             cloud: 0.45,
-            aura,
         }
+    }
+
+    /// 传给 shader 的指针光晕：圆心（相对背景左上）、半径、强度。
+    ///
+    /// 强度按停留时间平滑归零（`smoothstep`），而不是到点突然消失；没有指针时全 0，
+    /// shader 里 `aura` 就是 0，格子一点都不亮。
+    fn aura_params(&self, bounds: Bounds<Pixels>) -> [f32; 4] {
+        let Some((position, at)) = self.aura else {
+            return [0.; 4];
+        };
+        let age = at.elapsed().as_secs_f32() / AURA_LINGER.as_secs_f32();
+        if age >= 1. {
+            return [0.; 4];
+        }
+        let t = 1. - age;
+        [
+            f32::from(position.x) - f32::from(bounds.origin.x),
+            f32::from(position.y) - f32::from(bounds.origin.y),
+            AURA_RADIUS,
+            t * t * (3. - 2. * t),
+        ]
     }
 
     /// 画这一层，并决定要不要排下一帧。
@@ -156,6 +164,9 @@ impl HomeBackdrop {
             return;
         }
 
+        // 窗口不在前台就冻结：照常把当前这一帧画出来（切回来时不会闪），
+        // 但不再步进、也不再排帧。
+        let awake = window.is_window_active();
         let now = Instant::now();
         // 离屏截图的确定性入口：固定时间、固定波包、固定指针（见 `prism_seed`）
         let seed = prism_seed();
@@ -176,10 +187,10 @@ impl HomeBackdrop {
                     self.field.step(self.started + Duration::from_millis(16 * step));
                 }
             }
-        } else {
+        } else if awake {
             self.field.step(now);
         }
-        let params = self.pack_params(bounds);
+        let params = self.pack_params();
         if self.field.pack(&params) || self.cells.is_none() {
             let revision = self.field.revision();
             self.cells = Some(Arc::new(AsciiCellsUpload {
@@ -195,16 +206,6 @@ impl HomeBackdrop {
 
         let dark = theme::is_dark();
         let seconds = seed.map_or_else(|| self.started.elapsed().as_secs_f32(), |s| s.0);
-        let surge = self.surge.map_or(0., |(at, amount)| {
-            let age = at.elapsed().as_secs_f32() / SURGE_LINGER.as_secs_f32();
-            if age >= 1. { 0. } else { amount * (1. - age) }
-        });
-        if self
-            .surge
-            .is_some_and(|(at, _)| at.elapsed() >= SURGE_LINGER)
-        {
-            self.surge = None;
-        }
 
         // 地平线极光：贴着底部，从下往上淡出
         window.paint_horizon_glow(
@@ -217,7 +218,8 @@ impl HomeBackdrop {
                 stretch: 1.,
                 presence: 0.38,
                 prism: 0.35,
-                surge,
+                // 脉冲留给「背景还在场时」的场合；目前发送同帧就卸载，传 0 即可
+                surge: 0.,
                 speed: 1.,
                 spectrum: 1.,
                 semantic: semantic_hue(),
@@ -235,12 +237,7 @@ impl HomeBackdrop {
                     // 色值直接给 sRGB 分量：观感在 shader 里调，和界面其它地方一致
                     ink: with_alpha(theme::rgb(theme::INK_FAINT), 0.9),
                     wave: with_alpha(theme::rgb(theme::CORAL), 0.8),
-                    aura: [
-                        params.aura.map_or(0., |a| a.0),
-                        params.aura.map_or(0., |a| a.1),
-                        params.aura.map_or(0., |a| a.2),
-                        1.,
-                    ],
+                    aura: self.aura_params(bounds),
                     optics: [0.75, 0.12, 0., 0.6],
                     timing: [seconds, if dark { 1. } else { 0. }, 0.9 * ambient, seconds * 0.15],
                     nebula: [0.4, 0., 0.7, 0.35],
@@ -256,8 +253,8 @@ impl HomeBackdrop {
             );
         }
 
-        // 种子模式下不再排帧：截图要的就是这一刻的样子
-        if seed.is_none() && self.animating() {
+        // 种子模式下不再排帧：截图要的就是这一刻的样子；失焦时也不排。
+        if seed.is_none() && awake && self.animating() {
             window.request_animation_frame();
         }
     }
@@ -282,7 +279,7 @@ impl HomeBackdrop {
         let baseline = (cell_h as f32 * 0.78).round() as i32;
         for (index, ch) in GLYPHS.iter().enumerate() {
             let Ok((size, origin, bitmap)) =
-                text_system.rasterize_mono_glyph(&mono, px(CELL_H), *ch as char, dpr)
+                text_system.rasterize_mono_glyph(&mono, px(GLYPH_FONT_SIZE), *ch as char, dpr)
             else {
                 continue;
             };

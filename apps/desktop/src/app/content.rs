@@ -52,11 +52,6 @@ impl ChatApp {
             .flex_1()
             .min_h_0()
             .w_full()
-            // 首页背景（地平线极光 + ASCII 波动字阵）铺在首页内容和输入区背后。
-            // 对话态整块不挂载：0 CPU / 0 GPU，显存由渲染器在 120 帧后回收。
-            .when(self.home_backdrop_active(), |d| {
-                d.child(self.home_backdrop_view.clone())
-            })
             .child(
                 image_cache(self.image_cache.clone()).size_full().child(
                     self.content_view.clone().cached(StyleRefinement::default().size_full()),

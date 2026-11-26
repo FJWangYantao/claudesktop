@@ -80,6 +80,13 @@ mod shader_compilation {
                 .join("src")
                 .join(file);
             println!("cargo:rerun-if-changed={}", path.display());
+            // 三个效果共用的头文件：改了它 Release 也要重编
+            println!(
+                "cargo:rerun-if-changed={}",
+                PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("src/prism_common.hlsl")
+                    .display()
+            );
             compile_shader_for_module(
                 module,
                 &out_dir,
