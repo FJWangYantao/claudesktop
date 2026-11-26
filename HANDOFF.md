@@ -785,3 +785,11 @@
   后者在输入框上沿就结束了，极光会被一刀截断。
 - **弹出式提示别用「同帧就卸载」的脉冲**：`surge` 曾经在发送消息时触发，但同一帧
   `home_backdrop_active()` 就变假、整块卸载，一帧都画不出来——已删掉。
+- **出图验收清单**（`--features headless-screenshot` + `CLAUDESKTOP_PRISM_SEED=<秒,px,py>`）：
+  1. 首页静止：极光最亮那条带没有横向拉丝（点阵折叠已修，见上一条 log 映射）、字阵
+     `W/M/8` 没被 7px 格子切边；
+  2. 输入框：棱镜描边与 `COMPOSER_RADIUS` 同心，没有溢出或被祖先裁掉；
+  3. **进对话后再截一张**：整层背景必须彻底消失，只剩输入卡片（无残留极光 / 字阵）；
+  4. 观感旋钮都在两处：极光底部白化 `0.22 * (1. - glow.dark)`（`horizon_glow.hlsl`）、
+     字阵 ink / 波面色配比（`home_backdrop.rs` 里 `with_alpha(rgb(INK_FAINT), 0.9)` /
+     `with_alpha(rgb(CORAL), 0.8)`）。浅色纸面上觉得抢眼就先调这两个，别动 shader 结构。
