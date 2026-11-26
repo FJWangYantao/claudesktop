@@ -10,6 +10,12 @@
   `promptCapabilities.image` 放行或在发送前明确拒绝。资源链接只展示，不自动请求；实时终端与音频播放尚未实现。
 - **ACP 配置与早到通知**：`config_options` 保留分组和稳定选项 ID，切换走 `session/set_config_option`，
   模型菜单只显示 agent 上报的选项；`usage_update` 的 used / size / cost 不进本轮 token。
+  **思考强度统一进模型菜单的 Effort 底栏，不进左侧模式菜单**：原生 `thought_level` 直接认
+  （`KernelCommand::SetThinking` → `session/set_config_option`）；把思考档位塞在 `modes` 里的 agent
+  （pi-acp 的 `off / low / … / xhigh`）由 `is_thinking_modes` 认出来，合成一个
+  `id = "__mode_thought_level__"` 的 `thought_level` 配置项，切档走 `session/set_mode`。
+  合成的项存在 `AcpShared::mode_thought`：agent 刷新 `config_options`（换模型 / `config_option_update`）
+  会整表覆盖，必须用 `merge_mode_thought` 合并回去；一旦 agent 另报原生 `thought_level`，合成项让位。
   `available_commands_update` 接 `/` 补全（Skills 原样发给 agent，不做本地展开），晚到命令要刷新已打开的面板。
   **在 `Started` 之前到达的通知先在 `AcpShared::early` 缓存，绑定后按序回放**，不能按 sessionId 找不到会话就丢。
   压缩按 `compactionId` 原位更新。

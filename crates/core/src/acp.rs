@@ -78,6 +78,85 @@ struct AcpShared {
     saw_chunk: Mutex<HashSet<String>>,
     /// 这个 agent 的名字（initialize 报的），用来认 pi-acp 的开机清单。
     agent_name: Mutex<String>,
+    /// `modes` 其实是思考强度的会话 → 由 `modes` 合成的 `thought_level` 配置项。
+    /// agent 刷新 `config_options` 时会把它整表覆盖掉，靠这里合并回去。
+    mode_thought: Mutex<HashMap<String, ConfigOptionView>>,
+    /// `modes` 报的是思考强度的会话（权限模式交给 UI 的是空表）。
+    thinking_mode_sessions: Mutex<HashSet<String>>,
+}
+
+/// 由 `modes` 合成的思考配置项的 ID（真 agent 的 ID 不会长这样）。
+const MODE_THOUGHT_ID: &str = "__mode_thought_level__";
+
+/// 思考强度的常见档位 ID（忽略大小写）。判「这组 `modes` 像不像思考档位」时，
+/// 至少要命中这里的一个，`off` 不算（它同时是通用开关词，见 [`THOUGHT_NEUTRAL_IDS`]）。
+const THOUGHT_LEVEL_IDS: &[&str] =
+    &["minimal", "min", "low", "medium", "med", "high", "xhigh", "extra_high", "max"];
+
+/// 只在思考档位里出现、权限模式里绝不会有的中性词：`default` / `auto` / `off` 两边都说得通，单列。
+const THOUGHT_NEUTRAL_IDS: &[&str] =
+    &["off", "none", "on", "enabled", "disabled", "adaptive", "default", "auto"];
+
+/// 这组 `modes` 是不是其实是思考强度（典型：pi-acp 报 `off / minimal / low / medium / high / xhigh`）。
+///
+/// 判据：全部条目都落在思考词表内，且至少有一个明确属于强度的档位。
+/// 权限模式（Claude 的 `default / acceptEdits / plan`、OpenCode 的 `build / plan`）
+/// 里 `plan` / `build` 不在词表内，所以不会命中。
+fn is_thinking_modes(modes: &[ModeView]) -> bool {
+    if modes.is_empty() {
+        return false;
+    }
+    let known = |id: &str, table: &[&str]| table.iter().any(|word| word.eq_ignore_ascii_case(id));
+    modes
+        .iter()
+        .all(|mode| known(&mode.id, THOUGHT_LEVEL_IDS) || known(&mode.id, THOUGHT_NEUTRAL_IDS))
+        && modes.iter().any(|mode| known(&mode.id, THOUGHT_LEVEL_IDS))
+}
+
+/// 把思考档位表做成一个 `thought_level` 配置项（进模型菜单的 Effort 底栏）。
+fn thought_option_from_modes(modes: &[ModeView], current: Option<&str>) -> ConfigOptionView {
+    let fallback = modes.first().map(|mode| mode.id.clone()).unwrap_or_default();
+    ConfigOptionView {
+        id: MODE_THOUGHT_ID.into(),
+        name: "思考强度".into(),
+        description: None,
+        category: "thought_level".into(),
+        current_value: current.map(str::to_owned).unwrap_or(fallback),
+        options: modes
+            .iter()
+            .map(|mode| ConfigChoiceView {
+                id: mode.id.clone(),
+                name: mode.name.clone(),
+                description: mode.description.clone(),
+                group: None,
+            })
+            .collect(),
+    }
+}
+
+/// 会话当下的配置表。`.await` 之后一律重新取，不要拿请求前的快照回写。
+fn session_configs(shared: &AcpShared, session: &str) -> Vec<ConfigOptionView> {
+    shared.configs.lock().unwrap().get(session).cloned().unwrap_or_default()
+}
+
+/// agent 整表刷新 `config_options` 后，把合成的思考项合并回去。
+///
+/// 原生 `thought_level` 一旦出现就由它接管（合成项作废），避免两条路径各显示一个底栏。
+fn merge_mode_thought(shared: &AcpShared, session: &str, options: &mut Vec<ConfigOptionView>) {
+    let native = options
+        .iter()
+        .any(|option| option.id != MODE_THOUGHT_ID && crate::is_selectable_thought(option));
+    if native {
+        // 原生接管：清掉自己合成的那一份（表和 map 都不留）
+        options.retain(|option| option.id != MODE_THOUGHT_ID);
+        shared.mode_thought.lock().unwrap().remove(session);
+        return;
+    }
+    let synthesized = shared.mode_thought.lock().unwrap().get(session).cloned();
+    if let Some(thought) = synthesized {
+        options.retain(|option| option.id != MODE_THOUGHT_ID);
+        options.push(thought);
+    }
 }
 
 /// ACP 内核配置。
@@ -339,6 +418,16 @@ impl Kernel for AcpKernel {
         self.send_command(KernelCommand::SetModel {
             session: session.to_string(),
             model: model.to_string(),
+        })
+    }
+
+    fn set_thinking(&self, session: &str, level: Option<&str>) -> anyhow::Result<()> {
+        // ACP 没有「回到 agent 默认档」这条路：只能选一个具体档位
+        let level =
+            level.ok_or_else(|| anyhow::anyhow!("ACP agent 没有默认档位，请选一个具体档位"))?;
+        self.send_command(KernelCommand::SetThinking {
+            session: session.to_string(),
+            level: level.to_string(),
         })
     }
 
@@ -895,7 +984,9 @@ fn run_kernel(
                                     .await;
                                 match result {
                                     Ok(response) => {
-                                        let options = config_views(&response.config_options);
+                                        let mut options = config_views(&response.config_options);
+                                        // agent 刷新配置时不会带上我们从 `modes` 合成的思考项
+                                        merge_mode_thought(&shared, &session, &mut options);
                                         shared
                                             .configs
                                             .lock()
@@ -928,6 +1019,126 @@ fn run_kernel(
                                     Some(session),
                                     KernelEvent::Status("agent 未提供模型配置".into()),
                                 );
+                            }
+                        }
+                        KernelCommand::SetThinking { session, level } => {
+                            let thought = session_configs(&shared, &session)
+                                .into_iter()
+                                .find(crate::is_selectable_thought);
+                            match thought {
+                                // 原生 `thought_level`：走 ACP 的配置项通道
+                                Some(option) if option.id != MODE_THOUGHT_ID => {
+                                    let result = connection
+                                        .send_request(SetSessionConfigOptionRequest::new(
+                                            session.clone(),
+                                            option.id.clone(),
+                                            level.as_str(),
+                                        ))
+                                        .block_task()
+                                        .await;
+                                    match result {
+                                        Ok(response) => {
+                                            let mut options =
+                                                config_views(&response.config_options);
+                                            merge_mode_thought(&shared, &session, &mut options);
+                                            shared
+                                                .configs
+                                                .lock()
+                                                .unwrap()
+                                                .insert(session.clone(), options.clone());
+                                            emit(
+                                                &sink,
+                                                Some(session),
+                                                KernelEvent::ConfigOptionsChanged { options },
+                                            );
+                                        }
+                                        Err(err) => {
+                                            emit(
+                                                &sink,
+                                                Some(session.clone()),
+                                                KernelEvent::Status(format!(
+                                                    "切换思考强度失败: {err}"
+                                                )),
+                                            );
+                                            // 回滚：UI 上还是原来那档（以当下配置表为准）
+                                            emit(
+                                                &sink,
+                                                Some(session.clone()),
+                                                KernelEvent::ConfigOptionsChanged {
+                                                    options: session_configs(&shared, &session),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                // 思考强度塞在 `modes` 里的 agent：换档就是换 mode
+                                Some(_) => {
+                                    let result = connection
+                                        .send_request(SetSessionModeRequest::new(
+                                            session.clone(),
+                                            level.clone(),
+                                        ))
+                                        .block_task()
+                                        .await;
+                                    match result {
+                                        Ok(_) => {
+                                            // 重新取当下配置表（`.await` 期间可能已被刷新）
+                                            let mut options = session_configs(&shared, &session);
+                                            if let Some(slot) = options
+                                                .iter_mut()
+                                                .find(|option| option.id == MODE_THOUGHT_ID)
+                                            {
+                                                slot.current_value = level.clone();
+                                            }
+                                            if let Some(synthesized) = shared
+                                                .mode_thought
+                                                .lock()
+                                                .unwrap()
+                                                .get_mut(&session)
+                                            {
+                                                synthesized.current_value = level.clone();
+                                            }
+                                            shared
+                                                .configs
+                                                .lock()
+                                                .unwrap()
+                                                .insert(session.clone(), options.clone());
+                                            emit(
+                                                &sink,
+                                                Some(session.clone()),
+                                                KernelEvent::ConfigOptionsChanged { options },
+                                            );
+                                            emit(
+                                                &sink,
+                                                Some(session),
+                                                KernelEvent::Status(format!(
+                                                    "思考强度已切换: {level}"
+                                                )),
+                                            );
+                                        }
+                                        Err(err) => {
+                                            emit(
+                                                &sink,
+                                                Some(session.clone()),
+                                                KernelEvent::Status(format!(
+                                                    "切换思考强度失败: {err}"
+                                                )),
+                                            );
+                                            emit(
+                                                &sink,
+                                                Some(session.clone()),
+                                                KernelEvent::ConfigOptionsChanged {
+                                                    options: session_configs(&shared, &session),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                None => emit(
+                                    &sink,
+                                    Some(session),
+                                    KernelEvent::Status("agent 未提供思考强度配置".into()),
+                                ),
                             }
                         }
                         KernelCommand::Authenticate { method_id } => {
@@ -1122,10 +1333,42 @@ fn map_notification(sink: &EventSink, notification: &SessionNotification, shared
             })
         }
         SessionUpdate::CurrentModeUpdate(update) => {
-            Some(KernelEvent::CurrentModeChanged { mode_id: update.current_mode_id.to_string() })
+            let mode_id = update.current_mode_id.to_string();
+            // 思考型 `modes`：改档位等价于改 mode，合成回 `thought_level` 配置项
+            if shared.thinking_mode_sessions.lock().unwrap().contains(&session) {
+                let updated = {
+                    let mut synthesized = shared.mode_thought.lock().unwrap();
+                    synthesized.get_mut(&session).map(|thought| {
+                        thought.current_value = mode_id;
+                        thought.clone()
+                    })
+                };
+                match updated {
+                    Some(thought) => {
+                        let mut options = shared
+                            .configs
+                            .lock()
+                            .unwrap()
+                            .get(&session)
+                            .cloned()
+                            .unwrap_or_default();
+                        match options.iter_mut().find(|option| option.id == MODE_THOUGHT_ID) {
+                            Some(slot) => *slot = thought,
+                            None => options.push(thought),
+                        }
+                        shared.configs.lock().unwrap().insert(session.clone(), options.clone());
+                        Some(KernelEvent::ConfigOptionsChanged { options })
+                    }
+                    // 这个 agent 另报了原生 thought_level：交给下面的 ConfigOptionUpdate
+                    None => None,
+                }
+            } else {
+                Some(KernelEvent::CurrentModeChanged { mode_id })
+            }
         }
         SessionUpdate::ConfigOptionUpdate(update) => {
-            let options = config_views(&update.config_options);
+            let mut options = config_views(&update.config_options);
+            merge_mode_thought(shared, &session, &mut options);
             shared.configs.lock().unwrap().insert(session.clone(), options.clone());
             Some(KernelEvent::ConfigOptionsChanged { options })
         }
@@ -1428,11 +1671,9 @@ fn report_started(
     resumed: bool,
 ) {
     match opened {
-        Ok(OpenedSession { session_id, model, config_options, modes }) => {
-            shared.configs.lock().unwrap().insert(session_id.clone(), config_options.clone());
-            shared.started.lock().unwrap().insert(session_id.clone());
+        Ok(OpenedSession { session_id, model, mut config_options, modes }) => {
             *shared.agent_name.lock().unwrap() = agent_name.to_string();
-            let (modes, current_mode) = match modes {
+            let (mut modes, mut current_mode) = match modes {
                 Some(state) => (
                     state
                         .available_modes
@@ -1447,6 +1688,27 @@ fn report_started(
                 ),
                 None => (Vec::new(), None),
             };
+            // `modes` 报的是思考强度（pi-acp）：并进 `thought_level` 配置项，
+            // 左侧权限模式留空，UI 那边只在模型菜单的 Effort 底栏显示
+            if is_thinking_modes(&modes) {
+                shared.thinking_mode_sessions.lock().unwrap().insert(session_id.clone());
+                let has_native = config_options.iter().any(crate::is_selectable_thought);
+                if has_native {
+                    // 原生配置项优先，别两边各显示一个
+                    shared.mode_thought.lock().unwrap().remove(&session_id);
+                } else {
+                    let thought = thought_option_from_modes(&modes, current_mode.as_deref());
+                    shared.mode_thought.lock().unwrap().insert(session_id.clone(), thought);
+                }
+                modes.clear();
+                current_mode = None;
+            } else {
+                shared.thinking_mode_sessions.lock().unwrap().remove(&session_id);
+                shared.mode_thought.lock().unwrap().remove(&session_id);
+            }
+            merge_mode_thought(shared, &session_id, &mut config_options);
+            shared.configs.lock().unwrap().insert(session_id.clone(), config_options.clone());
+            shared.started.lock().unwrap().insert(session_id.clone());
             emit(
                 sink,
                 Some(session_id.clone()),
@@ -1885,6 +2147,114 @@ mod tests {
         let v = json!({"granted": true, "lines": 148});
         let out = output_text(&v);
         assert!(out.contains("granted") && out.contains("148"), "{out}");
+    }
+
+    fn modes_of(ids: &[&str]) -> Vec<ModeView> {
+        ids.iter()
+            .map(|id| ModeView { id: (*id).into(), name: (*id).into(), description: None })
+            .collect()
+    }
+
+    #[test]
+    fn thinking_modes_are_recognized() {
+        // pi-acp：思考强度
+        assert!(is_thinking_modes(&modes_of(&[
+            "off", "minimal", "low", "medium", "high", "xhigh"
+        ])));
+        // Claude Code / OpenCode / Gemini CLI：权限模式
+        assert!(!is_thinking_modes(&modes_of(&[
+            "default",
+            "acceptEdits",
+            "plan",
+            "dontAsk",
+            "bypassPermissions"
+        ])));
+        assert!(!is_thinking_modes(&modes_of(&["build", "plan"])));
+        assert!(!is_thinking_modes(&modes_of(&["default", "autoEdit", "yolo", "plan"])));
+        // 只有中性词：认不出是不是强度，仍留在左侧模式菜单
+        assert!(!is_thinking_modes(&modes_of(&["default", "auto"])));
+        assert!(!is_thinking_modes(&modes_of(&["off", "on"])));
+        assert!(!is_thinking_modes(&modes_of(&["default", "off"])));
+        // `extra_high` 也是强度档位
+        assert!(is_thinking_modes(&modes_of(&["high", "extra_high"])));
+        assert!(!is_thinking_modes(&[]));
+    }
+
+    fn model_option(value: &str) -> ConfigOptionView {
+        ConfigOptionView {
+            id: "model".into(),
+            name: "模型".into(),
+            description: None,
+            category: "model".into(),
+            current_value: value.into(),
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn synthesized_thought_option_survives_config_refresh() {
+        let shared = AcpShared::default();
+        let thought = thought_option_from_modes(&modes_of(&["off", "low", "high"]), Some("low"));
+        assert_eq!(thought.category, "thought_level");
+        assert_eq!(thought.current_value, "low");
+        assert_eq!(thought.options.len(), 3);
+        shared.mode_thought.lock().unwrap().insert("s1".into(), thought);
+
+        // 换模型：agent 整表刷新，只回一个 model，合成项要合并回去
+        let mut options = vec![model_option("model-b")];
+        merge_mode_thought(&shared, "s1", &mut options);
+        assert!(
+            options.iter().any(|o| o.id == MODE_THOUGHT_ID && o.current_value == "low"),
+            "{options:?}"
+        );
+
+        // 原生 thought_level（可选档位）出现了：合成项让位，两边只留一个
+        options.push(ConfigOptionView {
+            id: "thinking".into(),
+            name: "思考强度".into(),
+            description: None,
+            category: "thought_level".into(),
+            current_value: "high".into(),
+            options: vec![
+                ConfigChoiceView {
+                    id: "low".into(),
+                    name: "低".into(),
+                    description: None,
+                    group: None,
+                },
+                ConfigChoiceView {
+                    id: "high".into(),
+                    name: "高".into(),
+                    description: None,
+                    group: None,
+                },
+            ],
+        });
+        merge_mode_thought(&shared, "s1", &mut options);
+        assert_eq!(options.iter().filter(|o| crate::is_thought_config(o)).count(), 1);
+        assert!(shared.mode_thought.lock().unwrap().get("s1").is_none());
+    }
+
+    #[test]
+    fn boolean_thought_config_does_not_displace_synthesized_effort() {
+        // Boolean 型的 `thinking` 选不出具体档位：它既不能当 Effort 底栏，也不能把合成项挤掉
+        let shared = AcpShared::default();
+        let thought = thought_option_from_modes(&modes_of(&["off", "low", "high"]), Some("low"));
+        shared.mode_thought.lock().unwrap().insert("s1".into(), thought);
+        let mut options = vec![
+            model_option("model-a"),
+            ConfigOptionView {
+                id: "thinking".into(),
+                name: "思考强度".into(),
+                description: None,
+                category: "thought_level".into(),
+                current_value: "true".into(),
+                options: Vec::new(),
+            },
+        ];
+        merge_mode_thought(&shared, "s1", &mut options);
+        assert_eq!(options.iter().filter(|o| crate::is_selectable_thought(o)).count(), 1);
+        assert!(options.iter().any(|o| o.id == MODE_THOUGHT_ID && o.current_value == "low"));
     }
 
     #[cfg(windows)]

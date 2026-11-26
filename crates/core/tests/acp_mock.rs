@@ -301,6 +301,76 @@ fn session_updates_are_structured_and_config_changes_roundtrip() {
 }
 
 #[test]
+fn set_thinking_routes_through_native_thought_level_config() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    let kernel = spawn_mock_with_args("", events.clone());
+    let sid = start_session(&kernel, &events);
+    // mock agent 报的是原生 `thought_level`（id = thinking，低 / 高两档）
+    kernel.set_thinking(&sid, Some("low")).unwrap();
+    wait_for(&events, 20_000, |e| {
+        matches!(
+            e,
+            KernelEvent::ConfigOptionsChanged { options }
+                if options.iter().any(|option| {
+                    option.id == "thinking" && option.current_value == "low"
+                })
+        )
+    });
+    kernel.shutdown();
+}
+
+#[test]
+fn thinking_modes_are_reported_as_effort_and_survive_model_switch() {
+    let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
+    // 像 pi-acp：思考档位报在 `session.modes` 里，没有原生 `thought_level`
+    let kernel = spawn_mock_with_args("--thinking-modes", events.clone());
+    let sid = start_session(&kernel, &events);
+    let started_modes = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            KernelEvent::Started { modes, .. } => Some(modes.len()),
+            _ => None,
+        })
+        .expect("Started");
+    assert_eq!(started_modes, 0, "思考型 modes 不能冒充权限模式交给界面");
+    wait_for(&events, 20_000, |e| {
+        matches!(
+            e,
+            KernelEvent::ConfigOptionsChanged { options }
+                if options.iter().any(|option| option.category == "thought_level"
+                    && option.current_value == "medium"
+                    && option.options.len() == 6)
+        )
+    });
+
+    // 换档：思考型会话走 `session/set_mode`，回来的是 `current_mode_update`
+    kernel.set_thinking(&sid, Some("low")).unwrap();
+    wait_for(&events, 20_000, |e| {
+        matches!(
+            e,
+            KernelEvent::ConfigOptionsChanged { options }
+                if options.iter().any(|option| option.category == "thought_level"
+                    && option.current_value == "low")
+        )
+    });
+
+    // 换模型时 agent 整表刷新（只回 model）：合成的思考项要合并回去，不能消失
+    kernel.set_model(&sid, "model-b").unwrap();
+    wait_for(&events, 20_000, |e| {
+        matches!(
+            e,
+            KernelEvent::ConfigOptionsChanged { options }
+                if options.iter().any(|option| option.id == "model" && option.current_value == "model-b")
+                    && options.iter().any(|option| option.category == "thought_level"
+                        && option.current_value == "low")
+        )
+    });
+    kernel.shutdown();
+}
+
+#[test]
 fn agent_auth_reports_methods_and_allows_retry() {
     let events: Arc<Mutex<Vec<KernelEvent>>> = Arc::default();
     let kernel = spawn_mock_with_args("--require-auth --auth=both", events.clone());

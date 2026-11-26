@@ -33,6 +33,8 @@ const AGENT_NAME =
   'mock-agent';
 const AUTH_MODE = process.argv.find((a) => a.startsWith('--auth='))?.slice('--auth='.length) ?? process.env.MOCK_AUTH ?? '';
 const REQUIRE_AUTH = process.argv.includes('--require-auth') || process.env.MOCK_REQUIRE_AUTH === '1';
+// `--thinking-modes`：像 pi-acp 那样把思考档位报在 `session.modes` 里（不给原生 thought_level）
+const THINKING_MODES = process.argv.includes('--thinking-modes') || process.env.MOCK_THINKING_MODES === '1';
 const AUTH_DELAY = Number(process.argv.find((a) => a.startsWith('--auth-delay='))?.slice('--auth-delay='.length) ?? process.env.MOCK_AUTH_DELAY_MS ?? 0);
 let authenticated = !REQUIRE_AUTH;
 const PIXEL_PNG ='iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAWElEQVR4nGO8Y+P2n2EAAdNAWj7qgNEQGA0BEGAhlE2c5KZRlM32PcoazYZ4ARPDAAOmUQcwjEbBAAOmUQcwjEbBAAOmEe8AxtF+AcNoIhxgwDTqAIYBBgAjBwf7jQE1sAAAAABJRU5ErkJggg==';
@@ -45,7 +47,7 @@ const sessionConfigs = new Map();
 let nextId = 0;
 
 function makeConfig(currentModel) {
-  return [
+  const options = [
     {
       id: 'model',
       name: '模型',
@@ -80,9 +82,20 @@ function makeConfig(currentModel) {
       ],
     },
   ];
+  // 思考型 modes 的 agent 没有原生 thought_level，档位全在 session.modes 里
+  return THINKING_MODES ? options.filter((option) => option.id !== 'thinking') : options;
 }
 
-function sessionModes(currentModeId = 'default') {
+// pi-acp 式：把思考档位报成 `modes`（权限模式另说，这里只报档位）
+const THINKING_MODE_IDS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+
+function sessionModes(currentModeId = THINKING_MODES ? 'medium' : 'default') {
+  if (THINKING_MODES) {
+    return {
+      currentModeId,
+      availableModes: THINKING_MODE_IDS.map((id) => ({ id, name: id })),
+    };
+  }
   return {
     currentModeId,
     availableModes: [

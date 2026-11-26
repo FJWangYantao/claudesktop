@@ -62,6 +62,10 @@ pub struct PlanEntryView {
 /// agent 上报的会话模式（ACP `modes`）。含义由 agent 决定：
 /// Claude 适配器是权限模式（default / acceptEdits / plan …），
 /// pi 适配器是思考强度（off / low / medium / high …）。
+///
+/// 纯思考强度的 `modes`（判据见 `acp::is_thinking_modes`）不会到达 UI：ACP 层把它并成
+/// 一个 `thought_level` 配置项（[`ConfigOptionView`]），由模型菜单的 Effort 底栏统一渲染，
+/// 左侧模式菜单只剩真正的权限 / 工作模式。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModeView {
     pub id: String,
@@ -102,6 +106,23 @@ pub struct ConfigOptionView {
     pub category: String,
     pub current_value: String,
     pub options: Vec<ConfigChoiceView>,
+}
+
+/// 能当分段器用的思考配置：光有分类不够——Boolean 开关（`options` 为空）选不出具体档位，
+/// 界面和内核都不能拿它当 Effort 底栏，否则「显示的那一项」和「改到的那一项」会错位。
+pub fn is_selectable_thought(option: &ConfigOptionView) -> bool {
+    is_thought_config(option) && !option.options.is_empty()
+}
+
+/// 这项配置是不是「思考强度」：ACP 的 `thought_level` 分类，或常见自定义 ID。
+///
+/// 判定口径放在 core 里，ACP 层和桌面端共用，避免两边各认一套。
+pub fn is_thought_config(option: &ConfigOptionView) -> bool {
+    option.category == "thought_level"
+        || matches!(
+            option.id.as_str(),
+            "thought_level" | "reasoning_effort" | "thinking" | "thinking_level"
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -773,6 +794,9 @@ pub enum KernelCommand {
     SetMode { session: String, mode_id: String },
     /// 切换某会话的模型（ACP `session/set_config_option`）
     SetModel { session: String, model: String },
+    /// 切换某会话的思考档位：原生 `thought_level` 走 ACP `session/set_config_option`，
+    /// 把思考强度塞在 `modes` 里的 agent（如 pi-acp）走 `session/set_mode`
+    SetThinking { session: String, level: String },
     /// 按 initialize 上报的方法登录
     Authenticate { method_id: String },
     /// 关闭内核（断开连接、终止子进程）

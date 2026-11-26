@@ -164,6 +164,9 @@ pub struct Session {
     pub thinking: Option<claudesktop_builtin::ThinkingLevel>,
     /// 会话建立前选的档位：`Started` 时再交给内核（和 `pending_model` 一个套路）
     pub pending_thinking: Option<Option<claudesktop_builtin::ThinkingLevel>>,
+    /// ACP 会话在没连上内核（空闲回收 / 内核刚换）时选的思考档位：
+    /// `Started` 时补发给 agent，否则用户这次切换会被重连后的旧值无声盖掉
+    pub pending_acp_thinking: Option<String>,
     /// 本轮累计的 token，一轮结束时写进日志后清零
     pub turn_usage: TurnUsage,
     /// 本轮收到、端点还没数过的输出（正文 + 思考）：流式期间状态行据此估算 token，
@@ -393,6 +396,8 @@ impl Session {
     pub fn of_kind(token: u64, kernel: KernelChoice, cwd: PathBuf, kind: SessionKind) -> Self {
         let kernel_key = kernel.key();
         let is_demo = kernel == KernelChoice::Demo;
+        // ACP agent 有哪些权限模式由它自己报，连上之前不预设（更不该填自研那三个）
+        let is_acp = matches!(kernel, KernelChoice::Acp(_));
         Self {
             title: "新会话".into(),
             kernel,
@@ -423,8 +428,9 @@ impl Session {
             layout_rev: 0,
             last_sync: None,
             body_cache: Default::default(),
-            modes: if kind == SessionKind::Chat {
-                // 聊天没有工具要批，也就没有权限模式（Started 报的也是空表）
+            modes: if kind == SessionKind::Chat || is_acp {
+                // 聊天没有工具要批，也就没有权限模式（Started 报的也是空表）；
+                // ACP 会话连上之前不知道 agent 有哪些模式
                 Vec::new()
             } else {
                 default_modes()
@@ -471,6 +477,7 @@ impl Session {
             pending_mode: None,
             thinking: None,
             pending_thinking: None,
+            pending_acp_thinking: None,
             turn_usage: TurnUsage::default(),
             turn_streamed: Streamed::default(),
             stream_pending: String::new(),
@@ -1275,6 +1282,11 @@ impl Session {
             claudesktop_builtin::permission_modes(auto_available),
             selected.as_deref(),
         );
+    }
+
+    /// ACP 上报的、能当分段器用的思考强度配置项（Boolean 开关没有选项，不算）。
+    pub fn acp_thought_option(&self) -> Option<&ConfigOptionView> {
+        self.config_options.iter().find(|option| claudesktop_core::is_selectable_thought(option))
     }
 
     fn replace_modes(&mut self, modes: Vec<ModeView>, current: Option<&str>) {
@@ -2849,6 +2861,119 @@ mod tests {
         assert_eq!(card.output.as_ref(), "原始预览");
         assert_eq!(card.diffs.len(), 1);
         assert!(card.can_open());
+    }
+
+    #[core::prelude::v1::test]
+    fn acp_sessions_start_without_permission_modes() {
+        // ACP agent 有哪些权限模式由它自己报：连上之前不预设自研那三个假模式
+        let acp = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        assert_eq!(acp.modes.len(), 0, "ACP 会话不该预填自研的权限模式");
+        // 自研内核仍然一上来就有三个
+        let builtin = Session::new(2, KernelChoice::Builtin, PathBuf::from("."));
+        assert!(!builtin.modes.is_empty());
+    }
+
+    #[core::prelude::v1::test]
+    fn empty_modes_from_agent_clear_stale_permission_modes() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        let started = |modes: Vec<ModeView>, current_mode: Option<String>| KernelEvent::Started {
+            token: 1,
+            agent_name: "pi-acp".into(),
+            session_id: "s1".into(),
+            model: None,
+            modes,
+            current_mode,
+            resumed: false,
+        };
+        s.apply_event(
+            started(
+                vec![ModeView {
+                    id: "default".into(), name: "逐项确认".into(), description: None
+                }],
+                Some("default".into()),
+            ),
+            None,
+        );
+        assert_eq!(s.modes.len(), 1);
+        // agent 改用 `thought_level` 报思考强度：`modes` 变空表，旧模式要跟着清掉
+        s.apply_event(started(Vec::new(), None), None);
+        assert_eq!(s.modes.len(), 0, "agent 报空 modes 时要清掉旧模式");
+    }
+
+    #[core::prelude::v1::test]
+    fn acp_thought_option_prefers_thought_level_config() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        s.apply_event(
+            KernelEvent::ConfigOptionsChanged {
+                options: vec![
+                    ConfigOptionView {
+                        id: "model".into(),
+                        name: "模型".into(),
+                        description: None,
+                        category: "model".into(),
+                        current_value: "model-a".into(),
+                        options: Vec::new(),
+                    },
+                    ConfigOptionView {
+                        id: "thinking".into(),
+                        name: "思考强度".into(),
+                        description: None,
+                        category: "thought_level".into(),
+                        current_value: "high".into(),
+                        options: vec![ConfigChoiceView {
+                            id: "low".into(),
+                            name: "低".into(),
+                            description: None,
+                            group: None,
+                        }],
+                    },
+                ],
+            },
+            None,
+        );
+        let option = s.acp_thought_option().expect("thought option");
+        assert_eq!(option.current_value, "high");
+    }
+
+    #[core::prelude::v1::test]
+    fn acp_effort_survives_detach_and_is_replayed_on_started() {
+        let mut s = Session::new(1, KernelChoice::Acp("custom-1".into()), PathBuf::from("."));
+        s.apply_event(
+            KernelEvent::ConfigOptionsChanged {
+                options: vec![ConfigOptionView {
+                    id: "thinking".into(),
+                    name: "思考强度".into(),
+                    description: None,
+                    category: "thought_level".into(),
+                    current_value: "medium".into(),
+                    options: vec![ConfigChoiceView {
+                        id: "low".into(),
+                        name: "低".into(),
+                        description: None,
+                        group: None,
+                    }],
+                }],
+            },
+            None,
+        );
+        // 空闲回收 / 换内核：ACP 档位是进程里的状态，要记下来等新会话补交
+        s.detach_kernel(None);
+        assert_eq!(s.pending_acp_thinking.as_deref(), Some("medium"));
+
+        s.apply_event(
+            KernelEvent::Started {
+                token: 1,
+                agent_name: "mock".into(),
+                session_id: "s2".into(),
+                model: None,
+                modes: Vec::new(),
+                current_mode: None,
+                resumed: false,
+            },
+            None,
+        );
+        // 补交过一次就清掉，别每一轮都重发
+        assert!(s.pending_acp_thinking.is_none());
     }
 
     #[core::prelude::v1::test]

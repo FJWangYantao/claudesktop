@@ -18,6 +18,7 @@ use crate::settings::KernelChoice;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_builtin::ThinkingLevel;
+use claudesktop_core::ConfigChoiceView;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::{PopoverState, Selectable, StyledExt as _};
 use gpui_kit::component::popover::Popover;
@@ -138,12 +139,25 @@ fn cost_column(tier: Option<u8>) -> Div {
     col
 }
 
+/// 面板底部的 Effort 分段器：自研内核按 `ThinkingLevel` 走，ACP 用 agent 上报的档位表。
+enum EffortControl {
+    Builtin { current: Option<ThinkingLevel>, options: Vec<(Option<ThinkingLevel>, &'static str)> },
+    Acp { current: String, options: Vec<ConfigChoiceView> },
+}
+
+/// 点一档时交给谁。
+#[derive(Clone)]
+enum EffortPick {
+    Builtin(Option<ThinkingLevel>),
+    Acp(String),
+}
+
 /// 工具栏 trigger：`[品牌图标] 模型名 档位 ⌃/⌄`，行里放不下时模型名打省略号。
 #[derive(IntoElement)]
 pub(super) struct ModelPickerChip {
     brand: ModelBrand,
     model: SharedString,
-    effort: Option<&'static str>,
+    effort: Option<SharedString>,
     open: bool,
 }
 
@@ -151,7 +165,7 @@ impl ModelPickerChip {
     pub(super) fn new(
         brand: ModelBrand,
         model: impl Into<SharedString>,
-        effort: Option<&'static str>,
+        effort: Option<SharedString>,
     ) -> Self {
         Self { brand, model: model.into(), effort, open: false }
     }
@@ -368,11 +382,20 @@ impl Render for ModelPickerContent {
                 RowEntry::Row(row) if row.active => Some(row.key.clone()),
                 _ => None,
             });
-            // 认不出的模型也给底栏：只有「默认 / 兜底」两项，和设置页、旧输入框菜单一致
-            let effort = builtin.then(|| {
+            let effort = if builtin {
+                // 认不出的模型也给底栏：只有「默认 / 兜底」两项，和设置页、旧输入框菜单一致
                 let spec = session_thinking_spec(app);
-                (active_thinking(&spec, app.session().thinking), thinking_options(&spec))
-            });
+                Some(EffortControl::Builtin {
+                    current: active_thinking(&spec, app.session().thinking),
+                    options: thinking_options(&spec),
+                })
+            } else {
+                // ACP agent 自己报的思考档位（原生 `thought_level`，或从思考型 `modes` 合成）
+                app.session().acp_thought_option().map(|option| EffortControl::Acp {
+                    current: option.current_value.clone(),
+                    options: option.options.clone(),
+                })
+            };
             (rows, hint, effort, default_key, builtin)
         };
 
@@ -450,8 +473,8 @@ impl Render for ModelPickerContent {
         if let Some((detail, caps)) = card {
             panel = panel.child(render_card(detail, caps));
         }
-        if let Some((current, options)) = effort {
-            panel = panel.child(self.render_effort(current, options, cx));
+        if let Some(effort) = effort {
+            panel = panel.child(self.render_effort(effort, cx));
         }
         panel
     }
@@ -525,28 +548,49 @@ impl ModelPickerContent {
             .child(cost_column(tier))
     }
 
-    fn render_effort(
-        &self,
-        current: Option<ThinkingLevel>,
-        options: Vec<(Option<ThinkingLevel>, &'static str)>,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let mut track =
-            div().h_flex().items_center().gap_0p5().p_0p5().rounded_full().bg(rgb(SAND));
-        for (i, (level, _)) in options.iter().enumerate() {
-            let level = *level;
-            let selected = current == level;
-            let label = model_catalog::effort_label_en(level);
+    fn render_effort(&self, control: EffortControl, cx: &mut Context<Self>) -> Div {
+        // 自研 / ACP 归一成同一份 (是否选中, 文案, 点了给谁)，下面的摆版只有一套
+        let segments: Vec<(bool, SharedString, EffortPick)> = match control {
+            EffortControl::Builtin { current, options } => options
+                .into_iter()
+                .map(|(level, _)| {
+                    (
+                        current == level,
+                        SharedString::from(model_catalog::effort_label_en(level)),
+                        EffortPick::Builtin(level),
+                    )
+                })
+                .collect(),
+            EffortControl::Acp { current, options } => options
+                .into_iter()
+                .map(|choice| {
+                    let label = model_catalog::acp_effort_label_en(&choice.id, &choice.name);
+                    (choice.id == current, SharedString::from(label), EffortPick::Acp(choice.id))
+                })
+                .collect(),
+        };
+        let show_label = segments.len() <= 5;
+        // 面板定宽 22.5rem：agent 报的长名字 / 7 档以上排不进一行时就换行，
+        // 宁可分段条占两行，也不能把右边几档裁掉（裁掉的档位点不到）
+        let wraps =
+            effort_wraps(segments.iter().map(|(_, label, _)| label.chars().count()), show_label);
+        let mut track = div().h_flex().items_center().gap_0p5().p_0p5().bg(rgb(SAND));
+        track = if wraps { track.flex_wrap().rounded_lg() } else { track.rounded_full() };
+        for (i, (selected, label, pick)) in segments.iter().enumerate() {
+            let selected = *selected;
+            let pick = pick.clone();
             let mut segment = div()
                 .id(("composer-effort", i))
                 .role(Role::MenuItem)
                 .aria_selected(selected)
+                .flex_shrink_0()
+                .whitespace_nowrap()
                 .px_1p5()
                 .py_0p5()
                 .rounded_full()
                 .cursor_pointer()
                 .text_size(TEXT_META)
-                .child(label);
+                .child(label.clone());
             segment = if selected {
                 segment
                     .bg(rgb(CARD))
@@ -558,12 +602,13 @@ impl ModelPickerContent {
             };
             let segment = segment.on_click(cx.listener(move |this, _, _, cx| {
                 // 换档位不收起面板：接着挑模型
-                this.app.update(cx, |app, cx| app.choose_thinking(level, cx));
+                this.app.update(cx, |app, cx| match pick.clone() {
+                    EffortPick::Builtin(level) => app.choose_thinking(level, cx),
+                    EffortPick::Acp(value) => app.choose_acp_thinking(value, cx),
+                });
             }));
             track = track.child(segment);
         }
-        // 档位多（7、8 档）时省掉标签，先把分段器排下
-        let show_label = options.len() <= 5;
         div()
             .h_flex()
             .items_center()
@@ -581,8 +626,20 @@ impl ModelPickerContent {
                         .child("Effort"),
                 )
             })
-            .child(track)
+            .child(
+                div().min_w_0().flex_shrink_1().when(!wraps, |d| d.overflow_hidden()).child(track),
+            )
     }
+}
+
+/// 分段条一行放不放得下：按 `TEXT_META` 的字宽粗估（7px/字 + 左右 padding）。
+/// 估错顶多多换一行或少换一行，不会丢档位——换行只是兜底。
+fn effort_wraps(widths: impl Iterator<Item = usize>, show_label: bool) -> bool {
+    // 面板 22.5rem = 360px，减去面板 padding 和分段条自己的 padding 后约 320px
+    const ROW: f32 = 320.;
+    const LABEL: f32 = 48.;
+    let text: f32 = widths.map(|chars| chars as f32 * 7.0 + 12.0).sum();
+    text + 8.0 > ROW - if show_label { LABEL } else { 0. }
 }
 
 /// 悬停说明卡：一句话定位 + 能力胶囊。
@@ -640,9 +697,21 @@ impl ChatApp {
         let brand = ModelBrand::detect(&session.model_label, base_url);
         let effort = if builtin {
             let spec = session_thinking_spec(self);
-            Some(model_catalog::effort_label_en(active_thinking(&spec, session.thinking)))
+            Some(SharedString::from(model_catalog::effort_label_en(active_thinking(
+                &spec,
+                session.thinking,
+            ))))
         } else {
-            None
+            // ACP：原生 `thought_level` 或从思考型 `modes` 合成的那一项，名字用 agent 报的
+            session.acp_thought_option().map(|option| {
+                let name = option
+                    .options
+                    .iter()
+                    .find(|choice| choice.id == option.current_value)
+                    .map(|choice| choice.name.as_str())
+                    .unwrap_or_default();
+                SharedString::from(model_catalog::acp_effort_label_en(&option.current_value, name))
+            })
         };
         // ACP 会话在 agent 报模型前 `model_label` 是空的：写「默认模型」，
         // 别留一个空 chip 让人误以为是上一个自研会话的模型

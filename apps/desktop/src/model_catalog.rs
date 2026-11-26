@@ -259,6 +259,30 @@ pub fn effort_label_en(level: Option<ThinkingLevel>) -> &'static str {
     }
 }
 
+/// ACP 上报的思考档位 ID → 分段器 / trigger 上的短文案。
+///
+/// 常见 ID 归一成简洁英文（面板定宽 22.5rem，`minimal` 这种长名会把分段条挤爆），
+/// 认不出的才用 agent 给的 `name`，再退回 ID 本身。返回 `String`：本模块不碰 gpui。
+pub fn acp_effort_label_en(id: &str, name: &str) -> String {
+    let short = match id.to_ascii_lowercase().as_str() {
+        "off" | "none" => Some("Off"),
+        "minimal" | "min" => Some("Min"),
+        "low" => Some("Low"),
+        "medium" | "med" => Some("Medium"),
+        "high" => Some("High"),
+        "xhigh" | "extra_high" => Some("XHigh"),
+        "max" => Some("Max"),
+        "auto" => Some("Auto"),
+        "default" => Some("Default"),
+        _ => None,
+    };
+    match short {
+        Some(label) => label.to_string(),
+        None if !name.trim().is_empty() => name.to_string(),
+        None => id.to_string(),
+    }
+}
+
 /// 按当前模型和能力配置推导能力胶囊，不虚标：
 /// - `Vision`：能力表明确能看图，且没被端点 400 记进 `no_vision_models`
 /// - `Files`：代码模式有 @ 引用 / read_file，聊天模式有文本附件
@@ -288,6 +312,15 @@ pub fn capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_effort_labels_normalize_common_ids() {
+        assert_eq!(acp_effort_label_en("minimal", "Minimal"), "Min");
+        assert_eq!(acp_effort_label_en("xhigh", "Extra High"), "XHigh");
+        assert_eq!(acp_effort_label_en("OFF", "关"), "Off");
+        assert_eq!(acp_effort_label_en("turbo", "涡轮"), "涡轮");
+        assert_eq!(acp_effort_label_en("turbo", ""), "turbo");
+    }
 
     #[test]
     fn detects_brand_from_model_id_before_endpoint() {

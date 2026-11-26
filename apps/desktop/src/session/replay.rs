@@ -335,6 +335,13 @@ impl Session {
         if self.thinking.is_some() {
             self.pending_thinking = Some(self.thinking);
         }
+        // ACP 那套是内核进程里的状态：新进程回到 agent 默认档，界面上那档要补交
+        if self.pending_acp_thinking.is_none()
+            && let Some(level) = self.acp_thought_option().map(|o| o.current_value.clone())
+            && !level.is_empty()
+        {
+            self.pending_acp_thinking = Some(level);
+        }
         // 联网开关也是会话级的：新内核会话默认按设置来，用户在输入框里改过的要重新交回去
         if self.kind == SessionKind::Chat {
             self.pending_web = Some(self.web);
@@ -411,7 +418,8 @@ impl Session {
                     self.model_label =
                         model.rsplit('/').next().unwrap_or(&model).to_string().into();
                 }
-                if !modes.is_empty() {
+                // ACP agent 上报空表时也要照办：它没有权限模式，别留着自研那三个
+                if !modes.is_empty() || matches!(self.kernel, KernelChoice::Acp(_)) {
                     self.replace_modes(modes, current_mode.as_deref());
                 }
                 // 新建对话的默认模式 / 会话建立前选的模式：内核会话建立了才告诉它。
@@ -447,6 +455,17 @@ impl Session {
                     && kernel.set_model(&id, &model).is_ok()
                 {
                     self.model_label = model.into();
+                }
+                // 空闲回收 / 换内核期间在模型菜单里选的思考档位：新会话建立后补交，
+                // 不然会被 agent 上报的旧值无声盖掉
+                if let Some(level) = self.pending_acp_thinking.take() {
+                    let result = match (kernel, self.acp_id.as_deref()) {
+                        (Some(kernel), Some(id)) => kernel.set_thinking(id, Some(&level)),
+                        _ => Ok(()),
+                    };
+                    if let Err(err) = result {
+                        self.note(format!("切换思考强度失败：{err}"));
+                    }
                 }
                 return self.autoprompt.take();
             }
