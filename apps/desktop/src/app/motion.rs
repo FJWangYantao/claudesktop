@@ -1,6 +1,6 @@
 //! 动效：限帧的转圈 / 几何状态指示 / 扫光、展开收起（弹簧 + 高度裁切）、悬停淡入、新内容入场、平滑回到底部。
 //!
-//! 「进行中」使用统一的圆弧转圈（[`spinner`]，`canvas` + `PathBuilder` 矢量画）和少量线性状态图标。
+//! 「进行中」使用统一的弹性双块（[`spinner`]，`canvas` + `paint_quad` 画两块圆角方块）和少量线性状态图标。
 //!
 //! gpui 的动画每一帧都要重画它所在的整个 view（`request_animation_frame` 通知当前 view，
 //! 祖先一并变脏），所以常驻的循环动画（转圈、扫光）不用 `with_animation`：相位按全局时钟算，
@@ -20,7 +20,7 @@ use crate::settings::MotionPref;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
-use gpui_kit::base::animation::ease_out_cubic;
+use gpui_kit::base::animation::{ease_in_out_cubic, ease_out_cubic};
 use gpui_kit::base::motion::{Transition, spring, transition};
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -35,11 +35,21 @@ use std::time::{Duration, Instant};
 const LOOP_INTERVAL: Duration = Duration::from_millis(16);
 /// 帧到来的时刻有抖动：差这么一点也算到了
 const TICK_SLACK: Duration = Duration::from_millis(2);
-// 循环动画的节奏：转圈 0.9 秒一圈，扫光 2 秒一拍
-/// 转圈匀速转一圈的时长
-const SPIN_PERIOD: Duration = Duration::from_millis(900);
-/// 转圈圆弧的固定长度（圈数的比例）：匀速转，不再一伸一缩（忽快忽慢看着像掉帧）
-const SPIN_SWEEP: f32 = 0.30;
+// 循环动画的节奏：双块 3.2 秒走完一圈，扫光 2 秒一拍
+/// 「进行中」双块沿四条边走完一圈的时长（8 个半步，每步 400ms）
+const SPIN_PERIOD: Duration = Duration::from_millis(3200);
+/// 双块的几何，全部相对 `bounds` 内接正方形的边长 `d`
+const TILE_MARGIN: f32 = 0.04;
+/// 单块占活动区边长的比例（剩下的缝隙自动是 `1 - 2 * TILE_LEN`）
+const TILE_LEN: f32 = 0.43;
+/// 圆角占单块短边的比例
+const TILE_RADIUS: f32 = 0.28;
+/// 每个半步里用来位移的比例，剩下的是原地停顿（伸出去贴满、顿一下、收回落位）
+const TILE_MOVE_RATIO: f32 = 0.78;
+/// 副块的透明度：同色压暗一档，深浅两套色板都看得出前后
+const TILE_SECONDARY_ALPHA: f32 = 0.52;
+/// 一圈的半步数：四条边各伸一次、收一次
+const TILE_STEPS: usize = 8;
 /// 扫光扫一遍的时长
 const SHIMMER_PERIOD: Duration = Duration::from_millis(2000);
 
@@ -122,7 +132,7 @@ fn paint_loop_spots(window: &mut Window, cx: &mut App) {
         for spot in spots {
             let mask = ContentMask { bounds: spot.clip };
             window.with_content_mask(Some(mask), |window| match &spot.kind {
-                LoopKind::Spinner => paint_spinner(spot.bounds, spin, SPIN_SWEEP, color, window),
+                LoopKind::Spinner => paint_spinner(spot.bounds, Some(spin), color, window),
                 LoopKind::Shimmer { text, style, base, highlight } => {
                     paint_shimmer(text, style, spot.bounds, shimmer, *base, *highlight, window, cx)
                 }
@@ -224,9 +234,10 @@ pub(super) struct JumpAnim {
     pub last: Instant,
 }
 
-/// 转圈（当前强调色，12px，界面里所有「进行中」共用这一个：工具行、侧栏、压缩上下文）：
-/// 淡色圆环上一段固定长度的圆头圆弧匀速转，矢量画（不是旋转图标，边缘不发虚）。
-/// 减少动态效果时停成一段静止的四分之三圆弧。
+/// 「进行中」的双块（当前强调色，12px，界面里所有「进行中」共用这一个：工具行、侧栏、压缩上下文）：
+/// 对角两块主色 / 半透明方块，沿四条边轮流伸出去贴满、收回下一个角落；一块 `paint_quad` 一支，
+/// 不建路径，圆角在 12px 下也锐利。
+/// 减少动态效果时停在静态的对角双块（`phase = None`），不排节拍。
 /// 这里只是占位，由 [`LoopOverlay`] 画，只能用在内容区里；别的地方用 [`spinner_in_place`]。
 pub(super) fn spinner() -> Div {
     let div = div().size_3().flex_shrink_0();
@@ -249,13 +260,13 @@ pub(super) fn spinner_in_place() -> Div {
             },
             move |bounds, _, window, _| {
                 // 相位取绘制那一刻，而不是 render 时：否则外部重画会把相位钉在旧值上跳一帧
-                let (start, sweep) = if reduced {
-                    (0., 0.75)
+                let phase = if reduced {
+                    None
                 } else {
                     LAST_LOOP_PAINT.with_borrow_mut(|last| *last = Some(Instant::now()));
-                    (loop_phase(SPIN_PERIOD), SPIN_SWEEP)
+                    Some(loop_phase(SPIN_PERIOD))
                 };
-                paint_spinner(bounds, start, sweep, color, window)
+                paint_spinner(bounds, phase, color, window)
             },
         )
         .size_full(),
@@ -281,32 +292,63 @@ pub(super) fn paint_dot(center: Point<Pixels>, r: Pixels, color: Rgba, window: &
     }
 }
 
-fn paint_spinner(bounds: Bounds<Pixels>, start: f32, sweep: f32, color: Rgba, window: &mut Window) {
-    let d = bounds.size.width.min(bounds.size.height);
-    let stroke = d * 0.15;
-    let r = (d - stroke) / 2.;
-    let c = bounds.center();
-    // 轨道：同色的淡圆环，弧短的时候也看得出是个圈
-    let mut ring = PathBuilder::stroke(stroke);
-    ring.move_to(on_circle(c, r, 0.));
-    ring.arc_to(point(r, r), px(0.), false, true, on_circle(c, r, 0.5));
-    ring.arc_to(point(r, r), px(0.), false, true, on_circle(c, r, 0.));
-    if let Ok(path) = ring.build() {
-        window.paint_path(path, Rgba { a: 0.2, ..color });
-    }
-    let (from, to) = (on_circle(c, r, start), on_circle(c, r, start + sweep));
-    let mut arc = PathBuilder::stroke(stroke);
-    arc.move_to(from);
-    arc.arc_to(point(r, r), px(0.), sweep > 0.5, true, to);
-    if let Ok(path) = arc.build() {
-        window.paint_path(path, color);
-    }
-    // 描边是平头：两端各补一个半个线宽的圆点当圆头
-    paint_dot(from, stroke / 2., color, window);
-    paint_dot(to, stroke / 2., color, window);
+/// 双块在一圈里的位置：`[x, y, w, h]` 归一化到活动区（单位是活动区边长，`0..1`）。
+///
+/// 8 个半步一圈：伸出贴满一条边 → 收回角落 → 顺这条边转过 90°。主块顺时针走外圈，
+/// 副块取同一条轨迹错开半步（4 步），于是两块永远在对角、都在动，且首尾完全对上
+/// （`phase = 0` 与 `1` 是同一组矩形），主副块的透明度不会在接缝处跳。
+/// `phase = None`（减少动态效果）停在稳定的对角双块。
+fn twin_block_rects(phase: Option<f32>) -> ([f32; 4], [f32; 4]) {
+    const U: f32 = TILE_LEN;
+    const FAR: f32 = 1. - TILE_LEN;
+    // 关键帧 `[x, y, w, h]`（归一化到活动区），依次是：
+    // 左上 → 上排满 → 右上 → 右列满 → 右下 → 下排满 → 左下 → 左列满
+    const KF: [[f32; 4]; TILE_STEPS] = [
+        [0., 0., U, U],
+        [0., 0., 1., U],
+        [FAR, 0., U, U],
+        [FAR, 0., U, 1.],
+        [FAR, FAR, U, U],
+        [0., FAR, 1., U],
+        [0., FAR, U, U],
+        [0., 0., U, 1.],
+    ];
+    let Some(phase) = phase else {
+        return (KF[0], KF[TILE_STEPS / 2]);
+    };
+    let scaled = phase.rem_euclid(1.) * TILE_STEPS as f32;
+    let idx = (scaled.floor() as usize) % TILE_STEPS;
+    let next = (idx + 1) % TILE_STEPS;
+    let local = scaled - scaled.floor();
+    // 半步里前面一段位移，后面一段原地停顿：伸展贴合后顿一下再收回，像积木落位
+    let t = if local < TILE_MOVE_RATIO { ease_in_out_cubic(local / TILE_MOVE_RATIO) } else { 1. };
+    let lerp = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
+        std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+    };
+    let half = TILE_STEPS / 2;
+    let main = lerp(KF[idx], KF[next]);
+    let secondary = lerp(KF[(idx + half) % TILE_STEPS], KF[(next + half) % TILE_STEPS]);
+    (main, secondary)
 }
 
-/// 运行状态的几何指示器：常规工作使用统一的圆弧，需用户处理或特殊状态用线性图标。
+/// 画「进行中」的双块：`bounds` 内接正方形收进一点外边距当活动区，两块圆角方块按
+/// [`twin_block_rects`] 摆进去。减少动态效果时 `phase = None`，停在静态对角位。
+fn paint_spinner(bounds: Bounds<Pixels>, phase: Option<f32>, color: Rgba, window: &mut Window) {
+    let span = bounds.size.width.min(bounds.size.height) * (1. - 2. * TILE_MARGIN);
+    let origin = bounds.center() - point(span * 0.5, span * 0.5);
+    let (main, secondary) = twin_block_rects(phase);
+    // 先画压暗的副块再画主块：几何上永不重叠，顺序只是保险
+    for (rect, tint) in [(secondary, with_alpha(color, TILE_SECONDARY_ALPHA)), (main, color)] {
+        let [x, y, w, h] = rect.map(|v| span * v);
+        let area = Bounds::from_corners(origin + point(x, y), origin + point(x + w, y + h));
+        let mut quad = fill(area, tint);
+        // 圆角按短边算：伸长的条也是同一种圆角，不会被拉成胶囊
+        quad.corner_radii = Corners::all(w.min(h) * TILE_RADIUS);
+        window.paint_quad(quad);
+    }
+}
+
+/// 运行状态的几何指示器：常规工作使用统一的双块，需用户处理或特殊状态用线性图标。
 pub(super) fn mascot(mood: Mood) -> Div {
     let icon = match mood {
         Mood::Think | Mood::Talk | Mood::Wake | Mood::Scan => {
@@ -619,5 +661,75 @@ impl ChatApp {
             }
         }
         REDUCED.store(cx.reduce_motion(), Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: [f32; 4], b: [f32; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
+    }
+
+    /// 两块矩形重叠的面积（归一化单位，贴边不算重叠）
+    fn overlap(a: [f32; 4], b: [f32; 4]) -> f32 {
+        let w = (a[0] + a[2]).min(b[0] + b[2]) - a[0].max(b[0]);
+        let h = (a[1] + a[3]).min(b[1] + b[3]) - a[1].max(b[1]);
+        w.max(0.) * h.max(0.)
+    }
+
+    #[core::prelude::v1::test]
+    fn twin_blocks_park_on_the_diagonal_when_reduced() {
+        const U: f32 = TILE_LEN;
+        const FAR: f32 = 1. - TILE_LEN;
+        let still = twin_block_rects(None);
+        assert!(close(still.0, [0., 0., U, U]) && close(still.1, [FAR, FAR, U, U]), "{still:?}");
+        // 静态位就是一圈的起点：放开动画时不会先跳一下
+        let start = twin_block_rects(Some(0.));
+        assert!(close(start.0, still.0) && close(start.1, still.1), "{start:?}");
+    }
+
+    #[core::prelude::v1::test]
+    fn twin_blocks_meet_themselves_at_the_loop_seam() {
+        let (start, start_secondary) = twin_block_rects(Some(0.));
+        let (end, end_secondary) = twin_block_rects(Some(1.));
+        assert!(close(start, end) && close(start_secondary, end_secondary), "{start:?} / {end:?}");
+        // 相位往回绕、超出 0..1 也要落在同一个位置（帧时间不会累积漂移）
+        let wrapped = twin_block_rects(Some(-0.125));
+        let forward = twin_block_rects(Some(0.875));
+        assert!(close(wrapped.0, forward.0) && close(wrapped.1, forward.1), "{wrapped:?}");
+    }
+
+    #[core::prelude::v1::test]
+    fn twin_blocks_pause_on_the_next_keyframe() {
+        // 半步尾部是原地停顿：已经贴住下一关键帧，不再漂
+        let at = |idx: usize, local: f32| {
+            twin_block_rects(Some((idx as f32 + local) / TILE_STEPS as f32))
+        };
+        for idx in 0..TILE_STEPS {
+            let paused = at(idx, TILE_MOVE_RATIO + 0.01).0;
+            let late = at(idx, 0.99).0;
+            let landed = at(idx, 1.).0;
+            assert!(close(paused, late), "第 {idx} 步的停顿在漂：{paused:?}");
+            assert!(close(paused, landed), "第 {idx} 步没落在关键帧上：{paused:?} / {landed:?}");
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn twin_blocks_stay_inside_and_apart() {
+        // 采样一整圈（含半步交界）：两块都在活动区里，且永不重叠
+        for i in 0..=800 {
+            let phase = i as f32 / 800.;
+            let (main, secondary) = twin_block_rects(Some(phase));
+            for rect in [main, secondary] {
+                assert!(rect[0] >= -1e-6 && rect[1] >= -1e-6, "越界 {rect:?} @ {phase}");
+                assert!(
+                    rect[0] + rect[2] <= 1. + 1e-6 && rect[1] + rect[3] <= 1. + 1e-6,
+                    "越界 {rect:?} @ {phase}"
+                );
+            }
+            assert!(overlap(main, secondary) <= 0., "两块重叠 @ {phase}");
+        }
     }
 }

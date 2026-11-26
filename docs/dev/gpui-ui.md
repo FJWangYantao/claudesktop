@@ -170,16 +170,18 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   不在 `ChatApp` 键上下文下，派发的动作收不到。
 - **快捷键提示**：用 `ChatApp::kbd(KEY)`（gpui-kit `Kbd`），按键串取 `keys.rs` 里和绑定共用的常量，不写死文案。
 - **动效**一律走 `app/motion.rs`（都遵守「减少动态效果」= 系统「动画效果」或设置页「动画」）：
-  - 「进行中」使用统一的圆弧转圈 `motion::spinner()`（`canvas` + `PathBuilder` 矢量画）和少量线性状态图标；
-    不使用卡通形象或品牌 Logo；左上角标题为「Kimi Code」，运行状态使用线性图标或统一圆弧。
+  - 「进行中」使用统一的弹性双块 `motion::spinner()`（`canvas` + `paint_quad` 画两块圆角方块）和少量线性状态图标；
+    不使用卡通形象或品牌 Logo；左上角标题为「Kimi Code」，运行状态使用线性图标或统一双块。
     思考中和底部进行中状态行的扫光用 `shimmer_text()`（按像素分档着色）。
     内容区里的转圈和扫光只是占位格（prepaint 记位置），由叠在内容区上的 `motion::LoopOverlay` 画，节拍器只重画它、不重画整页对话；
     内容区以外自己就是小覆盖层的 view（侧栏转圈）用 `spinner_in_place`。
     转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
     动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
-    motion 版相位按全局时钟算，节拍器按 60 帧（16ms）跑；圆弧扫过固定 `SPIN_SWEEP`（0.30），
-    不再做粗细 / 长度脉动，看着是匀速转，帧率变化也不改观感。相位锚在上一帧实际画出的时刻
-    （`LAST_LOOP_PAINT`），节拍器晚到也不会漂。
+    motion 版相位按全局时钟算，节拍器按 60 帧（16ms）跑。双块一个 3.2 秒一圈、8 个半步：
+    伸出去贴满一条边、顿一下、收回下一个角位（每步前 78% 位移、后 22% 定格），主块顺时针、
+    副块是同一轨迹错开半步（4 步），所以两块永远在对角、都在动，首尾相位完全一致，透明度不跳；
+    两块几何上永不重叠，副块用 0.52 的同色透明度。圆角按短边取 0.28，伸长的条也不会被拉成胶囊。
+    相位锚在上一帧实际画出的时刻（`LAST_LOOP_PAINT`），节拍器晚到也不会漂。
   - 展开 / 收起：`reveal_progress(id, open, ..)` 拿弹簧进度，内容 `progress > 0` 时包进 `Reveal::new(id, progress, ..)`；
     列表里的一步**即使进度已是 1.0 也一直挂着 `Reveal`**（它要量过一次高度，收起首帧才不按 0 高塌一下）；
     自动收起（新行涌入、正文到达）用 `reveal_progress_when(.., animate=false)` 直接落位，
