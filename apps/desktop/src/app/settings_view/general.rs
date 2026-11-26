@@ -66,20 +66,19 @@ impl ChatApp {
             self.font_scale_row(),
             self.font_family_row(cx),
         ]);
-        let reminders = setting_group([
+        let sidebar = setting_group([
             setting_row(
-                "系统通知",
-                Switch::new("notifications")
-                    .checked(self.settings.notifications)
-                    .color(rgb(CORAL))
-                    .on_change(cx.listener(|this, checked, _, cx| {
-                        let on = *checked;
-                        this.save_ui_pref(move |s| s.notifications = on, cx);
-                        cx.notify();
-                    })),
+                "会话管理",
+                seg_control(
+                    "sidebar-grouping",
+                    SidebarGrouping::ALL.map(|g| (g, g.label())),
+                    self.settings.sidebar_grouping(),
+                    |this, grouping, _, cx| this.set_sidebar_grouping(grouping, cx),
+                    cx,
+                ),
             ),
             setting_row(
-                "侧栏显示内核状态",
+                "显示内核状态",
                 Switch::new("sidebar-kernel-status")
                     .checked(self.settings.sidebar_kernel_status)
                     .color(rgb(CORAL))
@@ -88,10 +87,22 @@ impl ChatApp {
                     })),
             ),
         ]);
+        let reminders = setting_group([setting_row(
+            "系统通知",
+            Switch::new("notifications")
+                .checked(self.settings.notifications)
+                .color(rgb(CORAL))
+                .on_change(cx.listener(|this, checked, _, cx| {
+                    let on = *checked;
+                    this.save_ui_pref(move |s| s.notifications = on, cx);
+                    cx.notify();
+                })),
+        )]);
         div()
             .v_flex()
             .gap_5()
             .child(section("外观", None, appearance))
+            .child(section("侧栏", None, sidebar))
             .child(section("提醒", None, reminders))
             .child(section("数据", None, setting_group([self.settings_file_row(cx)])))
     }

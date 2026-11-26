@@ -230,6 +230,7 @@ fn main() {
                             // 调试钩子：CLAUDESKTOP_OPEN = settings（打开设置页；settings:N 打开第 N 个分类）
                             // / fetch（并获取模型列表）/ restart（重启内核）/ review（审查页）
                             // / rename、ask-delete、delete（对侧栏第 2 个会话）
+                            // / sidebar-project、sidebar-time（侧栏分组方式；加 :flow 连添加 / 移除项目一起验）
                             let open = std::env::var("CLAUDESKTOP_OPEN").unwrap_or_default();
                             match open.as_str() {
                                 "settings" => app.open_settings(window, cx),
@@ -240,6 +241,22 @@ fn main() {
                                 "project-menu" | "project-flow" => {
                                     app.debug_sidebar_projects(open == "project-flow", cx)
                                 }
+                                // 侧栏按项目 / 按时间：sidebar-project / sidebar-time 只换分组方式；
+                                // 加 :flow 走一遍添加 / 移除项目并断言，加 :pending 摆出移除确认条
+                                #[cfg(feature = "headless-screenshot")]
+                                o if o.starts_with("sidebar-project") => {
+                                    app.debug_sidebar_grouping(
+                                        false,
+                                        o.strip_prefix("sidebar-project:").unwrap_or(""),
+                                        cx,
+                                    )
+                                }
+                                #[cfg(feature = "headless-screenshot")]
+                                o if o.starts_with("sidebar-time") => app.debug_sidebar_grouping(
+                                    true,
+                                    o.strip_prefix("sidebar-time:").unwrap_or(""),
+                                    cx,
+                                ),
                                 o if o.starts_with("settings:") => {
                                     let tab = o["settings:".len()..].parse().unwrap_or(0);
                                     app.open_settings_at(tab, window, cx)

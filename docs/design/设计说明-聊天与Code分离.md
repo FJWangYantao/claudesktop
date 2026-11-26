@@ -193,7 +193,7 @@ Write math in LaTeX: $...$ inline and $$...$$ on its own lines for display. Do n
 
 | | 聊天空间 | 代码空间 |
 |---|---|---|
-| 分组 | 按日期（今天 / 昨天 / 最近 7 天 / 更早，复用 `usage::day_bucket`） | 现在那样：项目 → 任务 → 已归档（或者按日期，`sidebar_by_date`） |
+| 分组 | 按日期（今天 / 昨天 / 最近 7 天 / 更早，复用 `usage::day_bucket`） | 现在那样：项目 → 任务 → 已归档；设成 `sidebar_grouping: time` 时和聊天空间一样按日期，任务不再单独成组 |
 | 行 | 标题 + 运行状态 | 现在那样（worktree 图标等） |
 | 已归档 | 末尾一组 | 末尾一组 |
 | 筛选（进行中 / 待查看） | 有 | 有 |

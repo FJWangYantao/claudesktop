@@ -1,7 +1,10 @@
 //! 侧栏：贴满窗口左缘的中性灰面板，含导航、对话历史、设置与内核状态；宽度可拖拽调整。
-//! 对话历史分两区：上面是**项目区**（按工作目录分组，当前项目在前），下面是**任务区**
-//! （[`TASKS_KEY`]：建立时没为它选过文件夹的对话，见 [`Session::task`]），
-//! 最后是「已归档」组。会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
+//! 对话历史默认分两区（「设置 · 通用 · 侧栏 · 会话管理」选**按项目**）：上面是**项目区**
+//! （按工作目录分组，当前项目在前，登记过的空项目也常驻），下面是**任务区**
+//! （[`TASKS_KEY`]：建立时没为它选过文件夹的对话，见 [`Session::task`]），最后是「已归档」组。
+//! 选**按时间**（以及聊天空间）时不再拆任务区，项目和任务的会话一起进
+//! 今天 / 昨天 / 最近 7 天 / 更早，末尾仍是「已归档」。
+//! 会话列表可按状态筛选（[`SidebarFilter`]，第一组组名旁的筛选按钮），筛选时不分组。
 //! 会话多了不占地方：点组名折叠整组（记进设置），每组默认只列最近活动的几个
 //! （[`visible_members`]），当前 / 运行中 / 待查看的会话折叠了也照常露出来。
 //! 用不着又不想删的会话可以归档：收进列表末尾的「已归档」组（默认收起，元信息里记 `archived`）。
@@ -21,7 +24,7 @@ use super::motion;
 use super::widgets::Surface;
 use super::{ChatApp, project_label};
 use crate::session::scroll_handle_edge;
-use crate::settings::{KernelChoice, Space};
+use crate::settings::{KernelChoice, SidebarGrouping, Space, same_project_path};
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::SessionKind;
@@ -58,6 +61,15 @@ pub(crate) const ARCHIVED_KEY: &str = "archived";
 
 /// 「任务」组的 [`SessionGroup::key`]（对话历史的下半区：建立时没选过文件夹的对话）
 pub(crate) const TASKS_KEY: &str = "tasks";
+
+/// 两个折叠键是不是同一组：`dir:` 按项目路径归一比较（Windows 下大小写、斜杠来源不一），
+/// 日期 / 任务 / 已归档这类键精确匹配。
+fn same_group_key(a: &str, b: &str) -> bool {
+    match (a.strip_prefix("dir:"), b.strip_prefix("dir:")) {
+        (Some(x), Some(y)) => same_project_path(Path::new(x), Path::new(y)),
+        _ => a == b,
+    }
+}
 
 /// 一组默认列出几个会话，其余收进「显示其余 N 个」
 const GROUP_PREVIEW: usize = 5;
@@ -112,7 +124,7 @@ impl SidebarFilter {
 
     fn desc(self) -> &'static str {
         match self {
-            Self::All => "按项目或日期分组",
+            Self::All => "显示全部会话",
             Self::Running => "正在运行或等你授权",
             Self::Unread => "等你授权或有新结果",
         }
@@ -269,7 +281,7 @@ impl ChatApp {
         expanded.sort();
         (&self.settings.sidebar_folded, expanded).hash(&mut h);
         (
-            self.settings.sidebar_by_date,
+            self.settings.sidebar_grouping(),
             self.sessions_by_activity,
             self.settings.sidebar_kernel_status,
             self.settings_open,
@@ -286,6 +298,8 @@ impl ChatApp {
         // 列表底部渐隐跟手：档位变了侧栏要重画（缓存 view 不重画就不会跟着变）。
         // 单独 hash：上面那个元组已经 12 项了，`Hash` 只给到 12 元组
         scroll_handle_edge(&self.sidebar_scroll).hash(&mut h);
+        // 登记过的项目（空项目也占一组）和正在确认移除的项目
+        (&self.settings.sidebar_projects, &self.confirm_remove_project).hash(&mut h);
         // 空间切换（分段高亮、小点）和会话类型
         self.settings.space.hash(&mut h);
         for s in &self.sessions {
@@ -375,9 +389,11 @@ impl ChatApp {
         let mut body = v_flex().gap_0().pb_2();
 
         // 会话：按工作目录分组，当前项目在前，其余按最近活动排序（或按日期分组）；
-        // 筛选时按同样的顺序排成一组。第一组的组名行右侧带筛选 / 分组方式 / 排序切换 /
-        // 在资源管理器中打开（悬停才显出来，开着的开关常显）
+        // 筛选时按同样的顺序排成一组。第一组的组名行右侧带筛选 / 排序切换
+        // （悬停才显出来，开着的开关常显）
         let filter = self.sidebar_filter;
+        // 代码空间「按项目」：导航里有「添加项目」，项目组头有移除；其余分法没有
+        let by_project = self.sidebar_by_project();
         let groups = if filter == SidebarFilter::All {
             self.session_groups()
         } else {
@@ -408,7 +424,7 @@ impl ChatApp {
                 && if archive {
                     !self.sidebar_expanded.contains(&key)
                 } else {
-                    self.settings.sidebar_folded.contains(&key)
+                    self.group_folded(&key)
                 };
             let show_all = archive || self.sidebar_expanded.contains(&key);
             let total = members.len();
@@ -479,11 +495,13 @@ impl ChatApp {
                             return;
                         }
                         this.save_ui_pref(
-                            move |s| match s.sidebar_folded.iter().position(|k| *k == key) {
-                                Some(at) => {
-                                    s.sidebar_folded.remove(at);
+                            move |s| {
+                                // 已经按另一种写法记着这一组的折叠：认得出是同一条，别叠一条新的
+                                let had = s.sidebar_folded.iter().any(|k| same_group_key(k, &key));
+                                s.sidebar_folded.retain(|k| !same_group_key(k, &key));
+                                if !had {
+                                    s.sidebar_folded.push(key.clone());
                                 }
-                                None => s.sidebar_folded.push(key.clone()),
                             },
                             cx,
                         );
@@ -513,55 +531,26 @@ impl ChatApp {
             let header = if g == 0 && (filter != SidebarFilter::All || folded) {
                 header.child(self.sidebar_filter_menu(cx))
             } else if g == 0 {
-                // 聊天空间只有按日期这一种分法（没有工作目录），组名旁不给分组 / 排序切换
-                let chat = self.space().kind() == SessionKind::Chat;
                 let sort_on = self.sessions_by_activity;
-                let by_date = self.settings.sidebar_by_date || chat;
-                header
-                    .child(self.sidebar_filter_menu(cx))
-                    .when(!chat, |d| {
-                        d.child(
-                            Self::sidebar_icon_button(
-                                "group-by-date",
-                                IconAll::CalendarDays,
-                                if by_date { "按项目分组" } else { "按日期分组" },
-                                by_date,
-                                cx,
-                            )
-                            .when(!by_date, |d| {
-                                d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
-                            })
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.save_ui_pref(move |s| s.sidebar_by_date = !by_date, cx);
-                                    cx.notify();
-                                },
-                            )),
+                header.child(self.sidebar_filter_menu(cx)).when(by_project, |d| {
+                    // 按时间分组时桶内总是按最近活动排，排序切换没有意义
+                    d.child(
+                        Self::sidebar_icon_button(
+                            "sort-sessions",
+                            IconAll::ArrowDownUp,
+                            if sort_on { "按打开顺序排列" } else { "按最近活动排列" },
+                            sort_on,
+                            cx,
                         )
-                    })
-                    // 按日期分组时组内总是按最近活动排，排序切换没有意义
-                    .when(!by_date, |d| {
-                        d.child(
-                            Self::sidebar_icon_button(
-                                "sort-sessions",
-                                IconAll::ArrowDownUp,
-                                if sort_on {
-                                    "按打开顺序排列"
-                                } else {
-                                    "按最近活动排列"
-                                },
-                                sort_on,
-                                cx,
-                            )
-                            .when(!sort_on, |d| {
-                                d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sessions_by_activity = !this.sessions_by_activity;
-                                cx.notify();
-                            })),
-                        )
-                    })
+                        .when(!sort_on, |d| {
+                            d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sessions_by_activity = !this.sessions_by_activity;
+                            cx.notify();
+                        })),
+                    )
+                })
             } else {
                 header
             };
@@ -570,6 +559,7 @@ impl ChatApp {
             let header = header
                 .when_some(group_dir.clone(), |d, path| {
                     let reveal = path.clone();
+                    let remove = path.clone();
                     d.child(
                         Self::quiet_button(("group-new", g), IconAll::Plus, Surface::Sand, cx)
                             .xsmall()
@@ -594,6 +584,20 @@ impl ChatApp {
                             .on_click(move |_, _, cx: &mut App| cx.reveal_path(&reveal)),
                         )
                     })
+                    .child(
+                        Self::sidebar_icon_button(
+                            ("group-remove", g),
+                            IconAll::X,
+                            "从侧栏移除项目",
+                            false,
+                            cx,
+                        )
+                        .opacity(0.)
+                        .group_hover("group-header", |d| d.opacity(1.))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.request_remove_project(remove.clone(), cx)
+                        })),
+                    )
                 })
                 .when(tasks, |d| {
                     d.child(
@@ -605,7 +609,17 @@ impl ChatApp {
                             .on_click(cx.listener(|this, _, _, cx| this.add_task_session(cx))),
                     )
                 });
-            body = body.child(header);
+            // 移除项目：组头原地换成确认条（组里的真会话会被归档，不是删掉），
+            // 会话行照常列在下面——用户在确认时还能看见这些东西会被怎么处理
+            let confirming = group_dir.clone().filter(|dir| {
+                self.confirm_remove_project.as_deref().is_some_and(|p| same_project_path(p, dir))
+            });
+            body = body.child(match confirming {
+                Some(dir) => {
+                    self.render_remove_project_row(g, &dir, &group_name, cx).into_any_element()
+                }
+                None => header.into_any_element(),
+            });
             // 筛完一个不剩时的提示。「全部」下没有提示（折叠的组、空的当前项目组），
             // 别画空行：空串的行照样占着内边距和行高
             if members.is_empty() && !filter.empty_hint().is_empty() {
@@ -712,6 +726,13 @@ impl ChatApp {
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
                     .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
             )
+            // 添加项目：把目录登记进侧栏（空项目也常驻）。按时间分组的空间里没有项目组，
+            // 这个入口跟着隐藏
+            .when(by_project, |d| {
+                d.child(nav_item("add-project", IconAll::FolderPlus, "添加项目", false).on_click(
+                    cx.listener(|this, _, window, cx| this.pick_and_add_project(window, cx)),
+                ))
+            })
             .child(nav_item("plugins", IconAll::Blocks, "插件", plugins_open).on_click(
                 cx.listener(|this, _, window, cx| {
                     this.open_settings_at(super::settings_view::PLUGINS_TAB, window, cx)
@@ -911,11 +932,15 @@ impl ChatApp {
         let target = self
             .recent_workspaces()
             .into_iter()
-            .find(|dir| *dir != original_dir)
+            .find(|dir| !same_project_path(dir, &original_dir))
             .expect("需要另一个项目目录验证切换");
         let chat_dirs: Vec<_> =
             self.sessions.iter().filter(|s| s.is_chat()).map(|s| s.cwd.clone()).collect();
-        assert!(self.recent_workspaces().iter().all(|dir| !chat_dirs.contains(dir)));
+        assert!(
+            self.recent_workspaces()
+                .iter()
+                .all(|dir| !chat_dirs.iter().any(|c| same_project_path(dir, c)))
+        );
         self.switch_workspace(target.clone(), cx);
         assert_ne!(self.session().token, original);
         assert_eq!(self.session().cwd, target);
@@ -949,6 +974,77 @@ impl ChatApp {
         eprintln!(
             "sidebar projects verified: existing conversation, blank conversation, task, recent projects"
         );
+    }
+
+    /// 侧栏「按项目 / 按时间」和项目增删的自检钩子（`CLAUDESKTOP_OPEN` 里调）。
+    /// `mode` 为空只换分组方式；`flow` 走完整套流程并断言（添加项目 → 空项目常驻 → 移除不动别的会话）；
+    /// `pending` 摆一个「移除项目」确认条出来看排版。
+    ///
+    /// 全程只动内存：截图 / 自检不该改写用户盘上的 `settings.json`（换分组、登记项目、切 workspace
+    /// 平时都走 `save_ui_pref`），所以先把设置文件路径摘掉，跑完再放回去。
+    #[cfg(feature = "headless-screenshot")]
+    pub(crate) fn debug_sidebar_grouping(
+        &mut self,
+        time: bool,
+        mode: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let settings_path = self.settings_path.take();
+        self.debug_sidebar_grouping_in_memory(time, mode, cx);
+        self.settings_path = settings_path;
+    }
+
+    /// [`Self::debug_sidebar_grouping`] 的本体（设置文件路径已经被摘掉）。
+    #[cfg(feature = "headless-screenshot")]
+    fn debug_sidebar_grouping_in_memory(&mut self, time: bool, mode: &str, cx: &mut Context<Self>) {
+        if self.space() != Space::Code {
+            self.switch_space(Space::Code, cx);
+        }
+        let grouping = if time { SidebarGrouping::Time } else { SidebarGrouping::Project };
+        self.settings.sidebar_grouping = Some(grouping);
+        cx.notify();
+        if mode == "pending" {
+            if let Some(dir) = self.session_groups().into_iter().find_map(|g| g.dir) {
+                self.confirm_remove_project = Some(dir);
+                cx.notify();
+            }
+            return;
+        }
+        if mode != "flow" {
+            return;
+        }
+        // 拿当前目录下的一个现成子目录当项目，不往盘上造东西
+        let dir = std::fs::read_dir(&self.cwd)
+            .ok()
+            .and_then(|mut it| {
+                it.find_map(|e| {
+                    let path = e.ok()?.path();
+                    path.is_dir().then_some(path)
+                })
+            })
+            .expect("当前目录下没有可当项目的子目录");
+        let before = self.sessions.len();
+        self.add_project(dir.clone(), cx);
+        let added = self.session().token;
+        assert!(self.settings.sidebar_projects.iter().any(|p| same_project_path(p, &dir)));
+        assert!(
+            self.session_groups()
+                .iter()
+                .any(|g| { g.dir.as_deref().is_some_and(|d| same_project_path(d, &dir)) })
+        );
+        // 项目里只有一条没发过消息的空会话：移除时不用二次确认，别的东西一件不少
+        self.request_remove_project(dir.clone(), cx);
+        assert!(self.confirm_remove_project.is_none());
+        assert!(!self.settings.sidebar_projects.iter().any(|p| same_project_path(p, &dir)));
+        assert!(self.session_index(added).is_none());
+        assert_eq!(self.sessions.len(), before);
+        assert!(
+            !self
+                .session_groups()
+                .iter()
+                .any(|g| { g.dir.as_deref().is_some_and(|d| same_project_path(d, &dir)) })
+        );
+        eprintln!("sidebar grouping verified: add project, empty project group, remove project");
     }
 
     /// 第一组组名旁的筛选按钮：点开选全部 / 进行中 / 待查看。筛选中时图标高亮、常显。
@@ -1015,14 +1111,17 @@ impl ChatApp {
     }
 
     /// 侧栏分组：(组名, 会话下标)，只列**当前空间**的会话。
-    /// 代码空间：上半区是项目，下半区是任务（[`TASKS_KEY`]），最后是已归档；
-    /// 聊天空间没有工作目录，一律按日期分组（见 [`Session::kind`]）。
+    /// 代码空间默认「按项目」：上半区是项目，下半区是任务（[`TASKS_KEY`]），最后是已归档；
+    /// 设成「按时间」或聊天空间（没有工作目录）时一律按日期分组，任务和项目混在一起。
     /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
     pub(super) fn session_groups(&self) -> Vec<SessionGroup> {
         let space = self.space().kind();
         let archived = |i: usize| self.sessions[i].meta.as_ref().is_some_and(|m| m.archived);
         let is_task = |i: usize| self.sessions[i].task;
-        let groups = self.active_session_groups(|i| !archived(i) && !is_task(i));
+        let by_project = self.sidebar_by_project();
+        // 按项目时任务独立成组（下面 `assemble_groups` 补），其余分法把任务混进日期桶
+        let groups =
+            self.active_session_groups(|i| !(archived(i) || by_project && is_task(i)), by_project);
         assemble_groups(
             groups,
             self.sessions.len(),
@@ -1030,7 +1129,19 @@ impl ChatApp {
             is_task,
             archived,
             |i| self.sessions[i].kind == space,
+            by_project,
         )
+    }
+
+    /// 侧栏此刻是不是「按项目」组织（聊天空间没有工作目录，永远是按时间）。
+    pub(super) fn sidebar_by_project(&self) -> bool {
+        self.space().kind() == SessionKind::Code
+            && self.settings.sidebar_grouping() == SidebarGrouping::Project
+    }
+
+    /// 这一组在侧栏里是不是折叠着（`dir:` 键按项目路径归一比较）。
+    fn group_folded(&self, key: &str) -> bool {
+        self.settings.sidebar_folded.iter().any(|k| same_group_key(k, key))
     }
 
     /// 某个会话最近活动的时刻（没落盘的算最新）。
@@ -1039,13 +1150,17 @@ impl ChatApp {
     }
 
     /// 没归档的会话（`listed`）按工作目录或日期分组（只列当前空间的）。
-    fn active_session_groups(&self, listed: impl Fn(usize) -> bool) -> Vec<SessionGroup> {
+    /// `by_project` 为假时按日期分（代码空间的「按时间」和聊天空间都这样）。
+    fn active_session_groups(
+        &self,
+        listed: impl Fn(usize) -> bool,
+        by_project: bool,
+    ) -> Vec<SessionGroup> {
         // 无元信息的会话（刚开、还没落盘）视为最新
         let activity = |i: usize| self.session_activity(i);
         let space = self.space().kind();
         let listed = |i: usize| listed(i) && self.sessions[i].kind == space;
-        // 聊天空间只有按日期这一种分法（没有工作目录）
-        if self.settings.sidebar_by_date || space == SessionKind::Chat {
+        if !by_project {
             let now =
                 SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
             let offset = crate::usage::local_offset_secs();
@@ -1069,16 +1184,24 @@ impl ChatApp {
                 .collect();
         }
         // 当前目录是项目时它一组总在最前（空着也列出）；不是项目（对话都在任务区）就不占位
-        let mut groups: Vec<(&Path, Vec<usize>)> = if self.is_project_dir(&self.cwd) {
-            vec![(self.cwd.as_path(), Vec::new())]
+        let mut groups: Vec<(PathBuf, Vec<usize>)> = if self.is_project_dir(&self.cwd) {
+            vec![(self.cwd.clone(), Vec::new())]
         } else {
             Vec::new()
         };
+        // 显式登记过的项目：一条会话都没有也常驻在侧栏（点组头「+」就能开工）。
+        // 目录暂时不在（外接盘 / 网络盘没挂上）就不占位，插回来自己会出现
+        for dir in &self.settings.sidebar_projects {
+            if !dir.is_dir() || groups.iter().any(|(d, _)| same_project_path(d, dir)) {
+                continue;
+            }
+            groups.push((dir.clone(), Vec::new()));
+        }
         for (i, s) in self.sessions.iter().enumerate().filter(|&(i, _)| listed(i)) {
             let dir = s.group_dir();
-            match groups.iter_mut().find(|(cwd, _)| *cwd == dir) {
+            match groups.iter_mut().find(|(d, _)| same_project_path(d, dir)) {
                 Some((_, members)) => members.push(i),
-                None => groups.push((dir, vec![i])),
+                None => groups.push((dir.to_path_buf(), vec![i])),
             }
         }
         groups
@@ -1087,12 +1210,15 @@ impl ChatApp {
                 if self.sessions_by_activity {
                     members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
                 }
-                let name =
-                    if cwd == self.cwd { self.project_name.clone() } else { project_label(cwd) };
+                let name = if same_project_path(&cwd, &self.cwd) {
+                    self.project_name.clone()
+                } else {
+                    project_label(&cwd)
+                };
                 SessionGroup {
                     key: format!("dir:{}", cwd.display()),
                     name,
-                    dir: Some(cwd.to_path_buf()),
+                    dir: Some(cwd),
                     members,
                 }
             })
@@ -1315,6 +1441,8 @@ impl ChatApp {
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.renaming = None;
+                                    // 侧栏同一时间只留一条编辑 / 确认态
+                                    this.confirm_remove_project = None;
                                     this.confirm_delete = Some(this.sessions[i].token);
                                     cx.notify();
                                 }),
@@ -1327,7 +1455,9 @@ impl ChatApp {
         let s = &self.sessions[idx];
         self.renaming = Some(s.token);
         self.rename_focused = false;
+        // 侧栏同一时间只留一条编辑 / 确认态
         self.confirm_delete = None;
+        self.confirm_remove_project = None;
         let title = s.title.to_string();
         self.rename_input.update(cx, |state, cx| {
             state.set_value(title, window, cx);
@@ -1388,10 +1518,100 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 项目组头的移除确认条：组里的真会话会被归档到「已归档」，不会丢数据。
+    /// 窄侧栏放不下一行「移除 X 并归档 N 个会话？」，所以标题单独一行，
+    /// 后果说明和按钮排第二行（没有真会话时一行就够）。
+    fn render_remove_project_row(
+        &self,
+        g: usize,
+        dir: &Path,
+        name: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let real = self
+            .project_unarchived_sessions(dir)
+            .into_iter()
+            .filter(|&i| self.is_real_session(i))
+            .count();
+        let target = dir.to_path_buf();
+        let small_button = |id: &'static str, label: &'static str, danger: bool| {
+            div()
+                .id((id, g))
+                .flex_shrink_0()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(if danger { WHITE } else { INK_SOFT }))
+                .bg(rgb(if danger { DANGER } else { CARD }))
+                .child(label)
+        };
+        let actions = div()
+            .h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .child(small_button("group-remove-yes", "移除", true).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.remove_project(&target, cx);
+                },
+            )))
+            .child(small_button("group-remove-no", "取消", false).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.confirm_remove_project = None;
+                    cx.notify();
+                },
+            )));
+        let title = div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis()
+            .whitespace_nowrap()
+            .text_size(TEXT_SMALL)
+            .text_color(rgb(RED))
+            .child(format!("移除「{name}」？"));
+        // 内边距跟组头一致（第一组 10、其余 16），确认时整块不上下跳
+        let row = div()
+            .id(("group-remove-confirm", g))
+            .v_flex()
+            .gap_1()
+            .mx_2()
+            .px_2()
+            .pt(px(if g == 0 { 10. } else { 16. }))
+            .pb_1()
+            .child(div().h_flex().items_center().gap_2().child(title));
+        if real == 0 {
+            return row.child(div().h_flex().justify_end().child(actions));
+        }
+        row.child(
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .child(format!("归档 {real} 个会话")),
+                )
+                .child(actions),
+        )
+    }
+
     /// 删除会话：停掉进行中的一轮，删日志和元信息，用量统计里也去掉。
     /// 删到一个不剩时补一个新会话。
     /// 调试钩子：让第 `idx` 个会话进入删除确认。
     pub(crate) fn ask_delete(&mut self, idx: usize, cx: &mut Context<Self>) {
+        // 侧栏同一时间只留一条编辑 / 确认态
+        self.renaming = None;
+        self.confirm_remove_project = None;
         self.confirm_delete = self.sessions.get(idx).map(|s| s.token);
         cx.notify();
     }
@@ -1439,7 +1659,8 @@ impl ChatApp {
 
 /// 侧栏分组的收尾：在项目分组后面补「任务」和「已归档」两组。
 /// `projects` 是 `active_session_groups` 排好的项目分组，其余参数从会话列表里读；
-/// `in_space` 决定一个会话在不在当前空间（聊天空间里没有任务组）。
+/// `in_space` 决定一个会话在不在当前空间；`split_tasks` 为假（按时间 / 聊天空间）时
+/// 不单独拆出任务区——那些会话已经在日期桶里了。
 fn assemble_groups(
     mut projects: Vec<SessionGroup>,
     total: usize,
@@ -1447,11 +1668,15 @@ fn assemble_groups(
     is_task: impl Fn(usize) -> bool,
     archived: impl Fn(usize) -> bool,
     in_space: impl Fn(usize) -> bool,
+    split_tasks: bool,
 ) -> Vec<SessionGroup> {
     // 任务区：建立时没为它选过文件夹的对话，按最近活动排（最近在上）。
     // 聊天会话恒不是任务（没有工作目录），所以只在代码空间里有这一组
-    let mut tasks: Vec<usize> =
-        (0..total).filter(|&i| in_space(i) && !archived(i) && is_task(i)).collect();
+    let mut tasks: Vec<usize> = if split_tasks {
+        (0..total).filter(|&i| in_space(i) && !archived(i) && is_task(i)).collect()
+    } else {
+        Vec::new()
+    };
     if !tasks.is_empty() {
         tasks.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
         projects.push(SessionGroup {
@@ -1580,6 +1805,7 @@ mod tests {
             |i| i == 2 || i == 3,
             |i| i == 4,
             |_| true,
+            true,
         );
         let order: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
         assert_eq!(order, ["dir:a", TASKS_KEY, ARCHIVED_KEY]);
@@ -1587,8 +1813,30 @@ mod tests {
         assert_eq!(groups[1].members, [3, 2]);
         assert_eq!(groups[1].name.as_ref(), "任务");
         // 只有两边都空时才不出现这两组
-        let only_tasks = assemble_groups(Vec::new(), 2, |_| 0, |_| true, |_| false, |_| true);
+        let only_tasks = assemble_groups(Vec::new(), 2, |_| 0, |_| true, |_| false, |_| true, true);
         assert_eq!(only_tasks.len(), 1);
         assert_eq!(only_tasks[0].members, [0, 1]);
+    }
+
+    /// 按时间分组：任务不单独成组（已经混在日期桶里），末尾只补「已归档」。
+    #[core::prelude::v1::test]
+    fn by_time_keeps_tasks_in_the_date_buckets() {
+        let groups = assemble_groups(
+            vec![SessionGroup {
+                key: "date:今天".into(),
+                name: "今天".into(),
+                dir: None,
+                members: vec![0, 1, 2],
+            }],
+            4,
+            |i| i as u64,
+            |i| i == 2,
+            |i| i == 3,
+            |_| true,
+            false,
+        );
+        let order: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(order, ["date:今天", ARCHIVED_KEY]);
+        assert_eq!(groups[0].members, [0, 1, 2]);
     }
 }

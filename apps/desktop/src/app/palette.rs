@@ -36,6 +36,8 @@ enum PaletteCmd {
     SwitchSpace(Space),
     ToggleSidebar,
     PickWorkspace,
+    /// 选一个目录登记成侧栏项目（空项目也常驻）
+    AddProject,
     /// 在当前目录的 git 仓库里建一个 worktree，新对话在那里开始
     Worktree,
     OpenSettings,
@@ -185,8 +187,19 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         )
         .key(TOGGLE_SIDEBAR_KEY),
         Entry::new(IconAll::FolderOpen, "切换工作目录…", PaletteCmd::PickWorkspace),
+    ];
+    // 「添加项目」只在代码空间按项目分组时出现（按时间分组没有项目组，侧栏也没有这个入口）
+    if app.sidebar_by_project() {
+        actions.push(
+            Entry::new(IconAll::FolderPlus, "添加项目…", PaletteCmd::AddProject)
+                .desc("选一个目录登记成项目：没有会话也常驻侧栏"),
+        );
+    }
+    actions.push(
         Entry::new(IconAll::GitBranch, "在新 worktree 中开始", PaletteCmd::Worktree)
             .desc("从当前分支的最新提交开始，未提交的改动不会带过去"),
+    );
+    actions.extend([
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
         Entry::new(IconAll::FolderTree, "文件树与源码预览", PaletteCmd::Files).key(FILES_KEY),
         Entry::new(IconAll::FileDiff, "逐文件改动", PaletteCmd::Changes).key(CHANGES_KEY),
@@ -194,7 +207,7 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         Entry::new(IconAll::FolderOpen, "打开用量网关日志", PaletteCmd::GatewayLogs)
             .desc("每个请求一行的 JSONL"),
         Entry::new(IconAll::Keyboard, "键盘快捷键", PaletteCmd::Shortcuts).key(SHORTCUTS_KEY),
-    ];
+    ]);
     if s.has_user_message() {
         actions.push(Entry::new(IconAll::Share, "导出为 Markdown", PaletteCmd::Export));
         // 聊天没有工作目录：把它接进某个项目的 Code 会话（顶栏 `⋯` 里也有这一项）
@@ -428,6 +441,7 @@ impl ChatApp {
             }
             PaletteCmd::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             PaletteCmd::PickWorkspace => self.pick_workspace(cx),
+            PaletteCmd::AddProject => self.pick_and_add_project(window, cx),
             PaletteCmd::Worktree => {
                 // 空会话就在当前目录里建；已经有对话的先开一个空会话再建
                 self.settings_open = false;

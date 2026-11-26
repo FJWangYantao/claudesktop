@@ -454,8 +454,15 @@ pub struct Settings {
     /// 上次在输入框上方的目录 chip 里选的工作目录（新会话默认在这里开）；
     /// None = 用启动目录。环境变量 `ACP_CWD` 优先于它（启动时处理，不写进这里）
     pub workspace: Option<PathBuf>,
-    /// 侧栏按日期（今天 / 昨天 / 最近 7 天 / 更早）而不是按工作目录分组，侧栏组名旁的按钮切换后写回
-    pub sidebar_by_date: bool,
+    /// 代码空间侧栏的组织方式（按项目 / 按时间）；None = 还没写过，
+    /// 读设置时按旧字段 [`Self::sidebar_by_date`] 迁移，没有旧字段就取默认「按项目」
+    pub sidebar_grouping: Option<SidebarGrouping>,
+    /// 按项目管理时显式登记的项目目录（没有会话的空项目也留在侧栏）
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sidebar_projects: Vec<PathBuf>,
+    /// 老字段：只在读设置时折算成 [`Self::sidebar_grouping`]，不再写盘
+    #[serde(default, skip_serializing)]
+    pub sidebar_by_date: Option<bool>,
     /// 侧栏里折叠起来的组（`SessionGroup::key`：`dir:<工作目录>` 或 `date:<日期组名>`），点组名切换后写回
     pub sidebar_folded: Vec<String>,
     /// 侧栏会话的人工顺序（会话 ID，按先后的显示顺序）：在侧栏里上下拖动会话排出来的。
@@ -612,7 +619,9 @@ impl Default for Settings {
             wide_reading: false,
             sidebar_kernel_status: false,
             workspace: None,
-            sidebar_by_date: false,
+            sidebar_grouping: None,
+            sidebar_projects: Vec::new(),
+            sidebar_by_date: None,
             sidebar_folded: Vec::new(),
             sidebar_order: Vec::new(),
             plugins_enabled: Vec::new(),
@@ -737,6 +746,54 @@ impl ContentAlign {
             Self::Left => "左对齐",
         }
     }
+}
+
+/// 代码空间侧栏的组织方式（聊天空间没有工作目录，始终按时间分组）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarGrouping {
+    /// 按项目管：项目分组 + 「任务」+ 「已归档」
+    #[default]
+    Project,
+    /// 按时间分组（今天 / 昨天 / 最近 7 天 / 更早），项目和任务的会话混在一起
+    Time,
+}
+
+impl SidebarGrouping {
+    pub const ALL: [Self; 2] = [Self::Project, Self::Time];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Project => "按项目",
+            Self::Time => "按时间",
+        }
+    }
+}
+
+/// 两个目录路径是不是同一个项目：Windows 不区分大小写、斜杠方向混用、
+/// 末尾多一个斜杠、`\\?\` 前缀都会让同一个目录走出两个组，比较前先归一。
+pub fn same_project_path(a: &Path, b: &Path) -> bool {
+    project_path_key(a) == project_path_key(b)
+}
+
+fn project_path_key(p: &Path) -> String {
+    let mut s = p.to_string_lossy().replace('/', "\\");
+    // `\\?\D:\…` 和 `\\?\UNC\server\share` 是同一位置的另一种写法
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        s = format!(r"\\{rest}");
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        s = rest.to_string();
+    }
+    // 根（`\`、`D:\`）的斜杠要留着，其余去掉末尾多余的
+    while !is_path_root(&s) && s.ends_with('\\') {
+        s.pop();
+    }
+    if cfg!(windows) { s.to_ascii_lowercase() } else { s }
+}
+
+/// 已经是路径根了（`\`、`D:\`，或空串）。
+fn is_path_root(s: &str) -> bool {
+    s.is_empty() || s == "\\" || (s.len() == 3 && s.ends_with(":\\"))
 }
 
 /// 配色：顺序和 `theme::PALETTES` 一致
@@ -1004,6 +1061,29 @@ impl Settings {
         {
             s.kernel = Some(s.kernel_for(&KernelChoice::Acp(String::new())));
         }
+        // 老设置里的 `sidebar_by_date` → 新的 `sidebar_grouping`（新字段已经有值就以它为准）
+        if s.sidebar_grouping.is_none()
+            && let Some(by_date) = s.sidebar_by_date.take()
+        {
+            s.sidebar_grouping =
+                Some(if by_date { SidebarGrouping::Time } else { SidebarGrouping::Project });
+        }
+        s.sidebar_by_date = None;
+        // 登记过的项目去重（手改过文件、同一目录换了写法都会重复）；暂时不存在的目录先留着——
+        // 外接盘 / 网络盘没挂上时清掉就再也回不来了，渲染空组时再看 `is_dir()`
+        let mut seen_projects: Vec<PathBuf> = Vec::new();
+        s.sidebar_projects.retain(|p| {
+            if p.as_os_str().is_empty() || seen_projects.iter().any(|q| same_project_path(q, p)) {
+                return false;
+            }
+            seen_projects.push(p.clone());
+            true
+        });
+    }
+
+    /// 代码空间侧栏的组织方式（没写过时就是默认的「按项目」）。
+    pub fn sidebar_grouping(&self) -> SidebarGrouping {
+        self.sidebar_grouping.unwrap_or_default()
     }
 
     /// 界面字体族：空串表示用内嵌的默认字体。
@@ -1421,6 +1501,72 @@ mod tests {
         .unwrap();
         assert_eq!((s.appearance, s.view_mode), (Appearance::Dark, ViewMode::Verbose));
         assert!(!s.sidebar_kernel_status);
+    }
+
+    /// 侧栏组织方式：默认按项目；老设置的 `sidebar_by_date` 折算成新字段后不再写盘。
+    #[core::prelude::v1::test]
+    fn sidebar_grouping_migrates_from_by_date() {
+        let s = Settings::default();
+        assert_eq!(s.sidebar_grouping(), SidebarGrouping::Project);
+        assert!(s.sidebar_projects.is_empty());
+
+        let mut by_date: Settings = serde_json::from_str(r#"{"sidebar_by_date":true}"#).unwrap();
+        Settings::normalize(&mut by_date);
+        assert_eq!(by_date.sidebar_grouping(), SidebarGrouping::Time);
+        assert!(!serde_json::to_string(&by_date).unwrap().contains("sidebar_by_date"));
+
+        let mut by_dir: Settings = serde_json::from_str(r#"{"sidebar_by_date":false}"#).unwrap();
+        Settings::normalize(&mut by_dir);
+        assert_eq!(by_dir.sidebar_grouping(), SidebarGrouping::Project);
+
+        // 新字段已经有值就以它为准（手改过的新格式）
+        let mut both: Settings =
+            serde_json::from_str(r#"{"sidebar_by_date":true,"sidebar_grouping":"project"}"#)
+                .unwrap();
+        Settings::normalize(&mut both);
+        assert_eq!(both.sidebar_grouping(), SidebarGrouping::Project);
+    }
+
+    /// 登记过的项目写盘往返，`normalize` 去重时认同一目录的不同写法。
+    #[core::prelude::v1::test]
+    fn sidebar_projects_roundtrip_and_dedup() {
+        let mut s = Settings {
+            sidebar_projects: vec![
+                PathBuf::from(r"D:\code\app"),
+                PathBuf::from("D:/code/app/"),
+                PathBuf::from(r"\\?\D:\Code\App"),
+                PathBuf::new(),
+                PathBuf::from(r"D:\code\other"),
+            ],
+            ..Default::default()
+        };
+        Settings::normalize(&mut s);
+        let expected = if cfg!(windows) { 2 } else { 3 };
+        assert_eq!(s.sidebar_projects.len(), expected);
+        let saved = serde_json::to_string(&s).unwrap();
+        assert!(saved.contains("sidebar_projects"));
+        assert_eq!(
+            serde_json::from_str::<Settings>(&saved).unwrap().sidebar_projects,
+            s.sidebar_projects
+        );
+    }
+
+    /// 同一目录的不同写法算同一个项目（Windows 忽略大小写和斜杠方向）。
+    #[core::prelude::v1::test]
+    fn same_project_path_ignores_case_and_slashes() {
+        // 大小写：只有 Windows 不区分
+        assert_eq!(
+            same_project_path(Path::new(r"D:\code\app"), Path::new(r"d:\CODE\app\")),
+            cfg!(windows)
+        );
+        assert!(same_project_path(Path::new(r"D:\code\app"), Path::new("D:/code/app")));
+        assert!(same_project_path(Path::new(r"\\?\D:\code\app"), Path::new(r"D:\code\app")));
+        assert!(same_project_path(Path::new(r"\\?\UNC\srv\share"), Path::new(r"\\srv\share")));
+        assert!(same_project_path(Path::new(r"D:\"), Path::new(r"D:\")));
+        // 非 Windows 下的根 `/`：末尾斜杠也要归掉
+        assert!(same_project_path(Path::new("/a"), Path::new("/a/")));
+        assert!(!same_project_path(Path::new(r"D:\code\app"), Path::new(r"D:\code\app2")));
+        assert!(!same_project_path(Path::new(r"D:\"), Path::new(r"D:\code")));
     }
 
     /// 跨来源模型清单：所有档案勾选的模型都进 `menu_flat`，每项带档案下标；

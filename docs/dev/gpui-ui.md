@@ -205,18 +205,30 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     展开的工具输出自带限高滚动区：每次内容区渲染把它的区域和句柄登记进 `ChatApp::tool_scroll_regions`，
     滚轮落在上面且还能滚时 `scroll_tool_output` 在 capture 阶段就把这一格滚掉并照常拦下事件
     （只放行不拦会双滚动：`overflow_y_scroll` 和列表的 bubble 监听器都会各滚一次）。
-- **侧栏分区**：对话历史上半区是**项目**（`session_groups` 按工作目录分组，当前项目在前），
-  下半区是**任务**（`TASKS_KEY` 一组：建立时没为它选过文件夹的会话，`Session::task` 落进
-  `SessionMeta::task`），最后是「已归档」。项目组标题右侧悬停出「+」和「打开文件夹」，
-  点「+」直接在该项目里新建对话；任务组的「+」明确新建任务对话。顶部「+ 新会话」跟随当前会话：
-  在项目里就落在同一项目，在任务里就落在任务（判定见 `ChatApp::add_session`）。
+- **侧栏分区**：代码空间默认**按项目**管（`SidebarGrouping::Project`，在「设置 · 通用 · 侧栏 · 会话管理」切换）：
+  上半区是项目（`session_groups` 按工作目录分组，当前项目在前，`same_project_path` 比对路径，
+  Windows 下大小写 / 斜杠 / `\\?\` 不同也算同一项目），下半区是**任务**（`TASKS_KEY` 一组：
+  建立时没为它选过文件夹的会话，`Session::task` 落进 `SessionMeta::task`），最后是「已归档」。
+  设成**按时间**（或聊天空间，没有工作目录）时不再拆任务区：项目和任务的会话一起进
+  `今天 / 昨天 / 最近 7 天 / 更早` 四个桶，桶内按最近活动排，末尾仍补「已归档」。
+  项目组标题右侧悬停出「+」「打开文件夹」「从侧栏移除」；点「+」直接在该项目里新建对话。
+  任务组的「+」明确新建任务对话。顶部「+ 新会话」跟随当前会话：在项目里就落在同一项目，
+  在任务里就落在任务（判定见 `ChatApp::add_session`）。
+  **添加项目**在导航区「新会话」下面（只在按项目时出现，`ChatApp::pick_and_add_project`），
+  登记的目录进 `Settings::sidebar_projects`：一条会话都没有也常驻一组；选文件夹、在项目里继续、
+  组头「+」都会顺手登记（`register_project`）。**移除项目**（组头「X」）不丢数据：有真会话时
+  组头换成行内确认，确认后真会话归档进「已归档」、纯空会话直接丢掉，登记 / 折叠记录和
+  `workspace` 一起清掉；有会话正在跑则拦下来提示。老设置里的 `sidebar_by_date` 读盘时折算进
+  `sidebar_grouping`，不再写回。
   判定在 `ChatApp::new_session`（`is_project_dir`：默认目录 `acp_base.cwd` 以外都算项目，
-  默认目录要在设置里选过 `workspace` 才算；当前目录不是项目时侧栏不列它的空组）。
+  默认目录要在设置里选过 `workspace` 或登记成项目才算；当前目录不是项目时侧栏不列它的空组）。
   输入框上方另有**项目顶盖**：只在尚未发消息的 Code 会话显示，可选项目 / 切本地分支 / 建 worktree；
   发出第一条消息后由 `motion::Reveal` 收起，对话中不再提供切换项目。worktree 会话的收尾入口随之
   交给顶栏分支 chip（`s.has_user_message() && s.worktree.is_some()`），两边不同时出现。
   分支读取、列表和切换都在后台线程跑，缓存进会话的 `git_branch`；菜单打开时才重列分支。
   新增对话行状态时记得把它并进 `sync_sidebar` 的指纹。
+  无头验收：`CLAUDESKTOP_OPEN=sidebar-project|sidebar-time` 切分组方式截图，
+  加 `:flow` 走一遍添加 / 移除项目并断言。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
   否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。
 - **输入框上方的内容区也是缓存 view**（`ContentView`，见 `content.rs`）：`ChatApp` 每次 `cx.notify()` 都让它重画，

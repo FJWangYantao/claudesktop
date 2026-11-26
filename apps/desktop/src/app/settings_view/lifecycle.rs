@@ -537,4 +537,16 @@ impl ChatApp {
         self.save_ui_pref(move |s| s.sidebar_kernel_status = on, cx);
         cx.notify();
     }
+
+    /// 侧栏的组织方式（按项目 / 按时间）：立即生效并写回。
+    pub(crate) fn set_sidebar_grouping(
+        &mut self,
+        grouping: SidebarGrouping,
+        cx: &mut Context<Self>,
+    ) {
+        // 切换分组后项目组头就不在原来那行了，等在确认的「移除项目」条一起收掉
+        self.confirm_remove_project = None;
+        self.save_ui_pref(move |s| s.sidebar_grouping = Some(grouping), cx);
+        cx.notify();
+    }
 }

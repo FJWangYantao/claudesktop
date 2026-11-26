@@ -171,6 +171,8 @@ pub struct ChatApp {
     history: history::InputHistory,
     /// 侧栏里等待确认删除的会话（令牌）
     confirm_delete: Option<u64>,
+    /// 侧栏里等待确认移除的项目目录（组头原地换成确认条）
+    confirm_remove_project: Option<PathBuf>,
     /// 内核槽，按 [`KernelChoice::key`] 找：用到时才启动，可以同时在线，会话各自绑定一个
     kernels: Vec<(String, KernelSlot)>,
     /// 事件从哪条内核来（内核 key：`builtin` / `demo` / `acp:<档案 ID>`）
@@ -602,6 +604,7 @@ impl ChatApp {
             session_stress: None,
             history: Default::default(),
             confirm_delete: None,
+            confirm_remove_project: None,
             kernels: Default::default(),
             ev_tx,
             acp_base,
@@ -1320,6 +1323,7 @@ impl ChatApp {
             }
         };
         // 在代码空间里开出来并切过去（新会话要先续接内核、重建上下文）
+        self.register_project(&dir, cx);
         self.remember_space(self.space());
         self.settings.space = Space::Code;
         self.update_settings(|s| s.space = Space::Code);
@@ -1426,6 +1430,7 @@ impl ChatApp {
 
     /// 侧栏项目组标题的「+」：新对话直接落在这个项目里。
     pub(crate) fn add_session_in_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.register_project(&dir, cx);
         if self.space() != Space::Code {
             self.remember_space(self.space());
             self.settings.space = Space::Code;
@@ -1446,6 +1451,210 @@ impl ChatApp {
         }
         let dir = self.acp_base.cwd.clone();
         self.open_or_reuse_code_session(dir, true, cx);
+    }
+
+    /// 把目录登记进侧栏的项目列表（已经登记过就什么都不做，写盘持久化）。
+    /// 凡是用户明确选过一个目录（选文件夹、在项目里继续、组头「+」）都走这里，
+    /// 这样空项目也能常驻在侧栏。
+    pub(crate) fn register_project(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        if dir.as_os_str().is_empty()
+            || self.settings.sidebar_projects.iter().any(|p| same_project_path(p, dir))
+        {
+            return;
+        }
+        let path = dir.to_path_buf();
+        self.save_ui_pref(
+            move |s| {
+                if !s.sidebar_projects.iter().any(|p| same_project_path(p, &path)) {
+                    s.sidebar_projects.push(path.clone());
+                }
+            },
+            cx,
+        );
+    }
+
+    /// 侧栏导航的「添加项目」：系统对话框选一个目录。
+    pub(crate) fn pick_and_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("添加项目文件夹".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(dir) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |app, _, cx| app.add_project(dir, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// 添加项目：登记进侧栏（没有会话也常驻一组）、顺手展开它那一组，
+    /// 并在里面开一个空会话（立刻能开始干活）。
+    pub(crate) fn add_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.register_project(&dir, cx);
+        // 之前折叠过这个项目：加进来却看不见就说不过去了
+        let folded =
+            self.settings.sidebar_folded.iter().any(|k| {
+                k.strip_prefix("dir:").is_some_and(|p| same_project_path(Path::new(p), &dir))
+            });
+        if folded {
+            let target = dir.clone();
+            self.save_ui_pref(
+                move |s| {
+                    s.sidebar_folded.retain(|k| {
+                        k.strip_prefix("dir:")
+                            .is_none_or(|p| !same_project_path(Path::new(p), &target))
+                    });
+                },
+                cx,
+            );
+        }
+        self.add_session_in_project(dir, cx);
+    }
+
+    /// 某个项目下还没归档的会话（侧栏项目组里的那些，不含任务）。
+    pub(super) fn project_unarchived_sessions(&self, dir: &Path) -> Vec<usize> {
+        (0..self.sessions.len())
+            .filter(|&i| {
+                let s = &self.sessions[i];
+                s.kind == SessionKind::Code
+                    && !s.task
+                    && !s.meta.as_ref().is_some_and(|m| m.archived)
+                    && same_project_path(s.group_dir(), dir)
+            })
+            .collect()
+    }
+
+    /// 这条会话有没有真内容：落过盘或发过消息。纯空会话（刚开、一个字没发）可以随手丢掉。
+    pub(super) fn is_real_session(&self, i: usize) -> bool {
+        self.sessions[i].meta.is_some() || self.sessions[i].has_user_message()
+    }
+
+    /// 项目组头的「X」：没有真会话就直接移除，有就走组头行内确认（真会话会被归档）。
+    pub(crate) fn request_remove_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let indices = self.project_unarchived_sessions(&dir);
+        if indices.iter().any(|&i| self.sessions[i].busy) {
+            self.toast(Notification::warning("这个项目里有会话在跑，等它停下来再移除"), cx);
+            return;
+        }
+        // 空项目（或只剩一条没发过消息的空会话）：没有会丢的东西，不用二次确认
+        if indices.iter().all(|&i| !self.is_real_session(i)) {
+            self.remove_project(&dir, cx);
+            return;
+        }
+        // 侧栏同一时间只留一条编辑 / 确认态
+        self.renaming = None;
+        self.confirm_delete = None;
+        self.confirm_remove_project = Some(dir);
+        cx.notify();
+    }
+
+    /// 把项目从侧栏移除：真会话归档到「已归档」（零丢失），纯空会话丢掉，
+    /// 登记 / 折叠记录一起清掉；当前目录指着它的话切到别的项目，一个都不剩就开个任务对话。
+    pub(crate) fn remove_project(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        self.confirm_remove_project = None;
+        let indices = self.project_unarchived_sessions(dir);
+        if indices.iter().any(|&i| self.sessions[i].busy) {
+            self.toast(Notification::warning("这个项目里有会话在跑，等它停下来再移除"), cx);
+            return;
+        }
+        let active_token = self.sessions[self.active].token;
+        // 真会话归档（不删），空会话丢掉。空会话先只记令牌：连着删几条按下标会错位。
+        // 有用户消息但从没落过盘（数据目录不可用）的会话归不到档，也只能丢掉——
+        // 留着的话下一帧又会从会话列表里长出一组，看着像移除失败
+        let mut blanks: Vec<u64> = Vec::new();
+        let mut archive_error: Option<String> = None;
+        for i in indices {
+            if !self.is_real_session(i) {
+                blanks.push(self.sessions[i].token);
+                continue;
+            }
+            self.cleanup_worktree(i);
+            let s = &mut self.sessions[i];
+            match &mut s.meta {
+                Some(meta) => {
+                    meta.archived = true;
+                    if let Some(store) = &self.store
+                        && let Err(err) = store.save_meta(meta)
+                    {
+                        archive_error.get_or_insert_with(|| err.to_string());
+                    }
+                }
+                None => blanks.push(s.token),
+            }
+        }
+        for token in blanks {
+            if let Some(idx) = self.session_index(token) {
+                self.drop_blank_session(idx, cx);
+            }
+        }
+        if let Some(err) = archive_error {
+            self.toast(Notification::error(format!("会话没能归档：{err}")), cx);
+        }
+        // 登记、折叠记录，以及「新会话默认开在这里」的 workspace 一起清掉
+        let target = dir.to_path_buf();
+        let fallback = self
+            .settings
+            .sidebar_projects
+            .iter()
+            .find(|p| !same_project_path(p, dir) && p.is_dir())
+            .cloned();
+        let keep = target.clone();
+        self.save_ui_pref(
+            move |s| {
+                s.sidebar_projects.retain(|p| !same_project_path(p, &keep));
+                s.sidebar_folded.retain(|k| {
+                    k.strip_prefix("dir:").is_none_or(|p| !same_project_path(Path::new(p), &keep))
+                });
+                if s.workspace.as_deref().is_some_and(|w| same_project_path(w, &keep)) {
+                    s.workspace = fallback.clone();
+                }
+            },
+            cx,
+        );
+        if same_project_path(&self.cwd, dir) {
+            self.cwd = self.settings.workspace.clone().unwrap_or_else(|| self.acp_base.cwd.clone());
+            self.project_name = project_label(&self.cwd);
+        }
+        // 当前会话被删 / 归档了：有干净的空会话就切过去，没有就按空间默认开一个
+        // （别退回某条很久以前的历史对话，那等于替用户切换上下文）
+        let space = self.space();
+        let still_there = self
+            .session_index(active_token)
+            .filter(|&i| !self.sessions[i].meta.as_ref().is_some_and(|m| m.archived));
+        match still_there {
+            Some(idx) => self.active = idx,
+            None => {
+                let blank = self.sessions.iter().position(|s| {
+                    s.kind == space.kind()
+                        && !s.meta.as_ref().is_some_and(|m| m.archived)
+                        && !s.busy
+                        && !s.has_user_message()
+                });
+                match blank {
+                    Some(idx) => self.activate_session(idx, cx),
+                    None => self.open_in_space(space, cx),
+                }
+            }
+        }
+        self.suggestion.clear();
+        cx.notify();
+    }
+
+    /// 丢掉一条还没落盘的空会话（它没有日志文件，只是从内存和内核里撤掉）。
+    fn drop_blank_session(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let kernel = self.session_kernel(idx);
+        let s = &mut self.sessions[idx];
+        s.cancel_pending_permissions(kernel.as_ref());
+        s.cancel_token += 1;
+        if let (Some(kernel), Some(id)) = (&kernel, s.acp_id.clone()) {
+            kernel.close_session(&id);
+        }
+        let removed = self.sessions.remove(idx);
+        self.cleanup_worktree_of(&removed, cx);
     }
 
     /// 在某种内核上开一个 Code 会话，返回下标（`rerun_on` / worktree 那几处用）。
@@ -1498,9 +1707,12 @@ impl ChatApp {
     }
 
     /// 这个目录是不是项目：默认目录（环境变量给的或启动目录）以外的都是用户选过的；
-    /// 默认目录本身只有在侧栏「项目」菜单里明确选过（记进设置）才算。不是项目的，在里面的对话算任务
+    /// 默认目录本身只有在侧栏「项目」菜单里明确选过（记进设置）或登记成项目了才算。
+    /// 不是项目的，在里面的对话算任务
     pub(super) fn is_project_dir(&self, dir: &Path) -> bool {
-        self.settings.workspace.as_deref() == Some(dir) || dir != self.acp_base.cwd
+        self.settings.workspace.as_deref().is_some_and(|w| same_project_path(w, dir))
+            || self.settings.sidebar_projects.iter().any(|p| same_project_path(p, dir))
+            || !same_project_path(dir, &self.acp_base.cwd)
     }
 
     /// 把一个还没对话的会话换到另一种内核上：原地换成新会话，
@@ -1565,6 +1777,7 @@ impl ChatApp {
     /// 当前会话还没对话就原地换到这个目录，已有对话就在那里开一个新会话（对话中途不换目录）。
     /// 选过文件夹之后，在当前这个目录里的对话不再算「任务」（见 `Session::task`）
     pub(crate) fn switch_workspace(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.register_project(&dir, cx);
         self.project_name = project_label(&dir);
         self.cwd = dir.clone();
         self.update_settings(|s| s.workspace = Some(dir.clone()));
@@ -1671,16 +1884,23 @@ impl ChatApp {
     }
 
     /// 侧栏「项目」菜单列出的工作目录：默认目录在前，其余按代码会话最近活动排，最多 8 个。
+    /// 登记过的项目（哪怕还没有会话）也列出来，刚添加的空项目马上能选到。
     /// 不列聊天占位目录和 worktree 目录，已不存在的略去。
     pub(crate) fn recent_workspaces(&self) -> Vec<PathBuf> {
         // 无元信息的会话（刚开、还没落盘）视为最新；排序稳定，默认目录排在同为最新的前面
         let mut dirs: Vec<(&Path, u64)> = vec![(self.cwd.as_path(), u64::MAX)];
+        // 登记过的项目也算候选（没有活动记录，按「刚开」排）
+        for dir in &self.settings.sidebar_projects {
+            if !dirs.iter().any(|(d, _)| same_project_path(d, dir)) {
+                dirs.push((dir.as_path(), u64::MAX));
+            }
+        }
         for s in
             self.sessions.iter().filter(|s| s.kind == SessionKind::Code && s.worktree.is_none())
         {
             let dir = &s.cwd;
             let at = s.meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
-            match dirs.iter_mut().find(|(d, _)| *d == dir.as_path()) {
+            match dirs.iter_mut().find(|(d, _)| same_project_path(d, dir.as_path())) {
                 Some((_, last)) => *last = (*last).max(at),
                 None => dirs.push((dir.as_path(), at)),
             }

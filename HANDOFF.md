@@ -710,3 +710,17 @@
   pi-acp 的 `setTimeout(..., 0)` 可能晚于客户端首轮 Prompt（懒启动 autoprompt）：再用 `agent_name == "pi-acp"`
   + 该会话第一个正文块 + 以 `## Context` / `pi v` 开头兜一层。`session/load` 重放本来就被 `replaying` 丢弃；
   别按 `Retrying (attempt` 前缀硬拦正文（会误伤正常回复）。命令重复校验比较时 Windows 上要剥掉 `cmd /c` 前缀。
+- **侧栏「按项目 / 按时间」与项目管理**（2026-11-26）：`Settings::sidebar_by_date` 降级成只读迁移字段，
+  新字段 `sidebar_grouping`（None = 按项目），`normalize` 里折算完置空、不再写盘；单测覆盖迁移后序列化里没有旧键。
+  路径比较一律走 `settings::same_project_path`（Windows 大小写 / 斜杠 / `\\?\`），否则同一个目录会在侧栏里出现两次。
+  `sync_sidebar` 的 12 元组已满，`sidebar_projects` / `confirm_remove_project` 要单独 `.hash`（漏了侧栏不跟着重画）。
+  `set_sidebar_grouping` 必须 `pub(crate)`：`app::sidebar` 不在 `settings_view` 的子树里，`pub(super)` 编译不过。
+  移除项目要和「幽灵复现」一起处理：真会话归档 + 纯空会话按**令牌**删（按下标连删会错位），
+  否则只删 `sidebar_projects` 里的路径，下一帧 `active_session_groups` 又把这一组带出来。
+  项目组头的移除确认条只替换组头、保留会话行（整组消失会让侧栏跳一下），确认态顺手清掉 `renaming` / `confirm_delete`；
+  窄侧栏一行放不下「移除 X 并归档 N 个会话？」，所以标题一行、后果（`归档 N 个会话`）和按钮排第二行，
+  内边距跟组头一样（第一组 10、其余 16），确认时整块不上下跳。
+  按时间分组不拆「任务」区，任务会话只能从「+ 新会话」（跟随当前会话的 task）或项目顶盖的「不选项目（任务）」进。
+  截图钩子 `CLAUDESKTOP_OPEN=sidebar-project|sidebar-time`（`:flow` 走添加 / 移除项目的断言，`:pending` 摆出移除确认条）
+  全程只动内存：先把 `settings_path` 摘掉再跑，否则换分组 / 登记项目 / 切 workspace 会真的改写用户的 `settings.json`。
+  验收时顺手比一下 `%APPDATA%\claudesktop\settings.json` 的哈希，钩子跑完不能变。
