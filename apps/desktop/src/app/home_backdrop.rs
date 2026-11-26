@@ -174,7 +174,7 @@ impl HomeBackdrop {
             if !self.seeded {
                 self.seeded = true;
                 self.field.splash(seed_x, seed_y, SPLASH_STRENGTH);
-                // 光晕按窗口坐标存（`pack_params` 里再减掉左上角）
+                // 光晕按窗口坐标存（`aura_params` 里再减掉左上角）
                 self.aura = Some((
                     Point {
                         x: bounds.origin.x + px(seed_x),
