@@ -13,6 +13,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -50,6 +51,8 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    // claudesktop patch: 自定义着色器原语（首页背景 / 输入框棱镜描边）。
+    pub prism_effects: Vec<PrismEffect>,
     // claudesktop patch: record a view before applying the viewport clip.
     recording: Option<SceneRecording>,
 }
@@ -78,6 +81,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.prism_effects.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -170,6 +174,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::PrismEffect(effect) => {
+                effect.set_order(order);
+                self.prism_effects.push(effect.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -242,6 +250,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.prism_effects.sort_by_key(|effect| effect.order());
     }
 
     #[cfg_attr(
@@ -269,6 +278,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            prism_effects_start: 0,
+            prism_effects_iter: self.prism_effects.iter().peekable(),
         }
     }
 }
@@ -291,6 +302,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    PrismEffect,
 }
 
 pub(crate) enum PaintOperation {
@@ -310,6 +322,8 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    // claudesktop patch: 自定义着色器原语。
+    PrismEffect(PrismEffect),
 }
 
 #[expect(missing_docs)]
@@ -348,6 +362,11 @@ impl Primitive {
                 }
                 (&mut p.bounds, &mut p.content_mask)
             }
+            Self::PrismEffect(effect) => {
+                // 自带 bounds / mask 一并平移，直接返回，不走下面的通用分支。
+                effect.shift(dy, clip);
+                return;
+            }
         };
         bounds.origin.y += dy;
         shift_mask(mask);
@@ -363,6 +382,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::PrismEffect(effect) => effect.bounds(),
         }
     }
 
@@ -376,6 +396,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::PrismEffect(effect) => effect.content_mask(),
         }
     }
 }
@@ -404,6 +425,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    prism_effects_start: usize,
+    prism_effects_iter: Peekable<slice::Iter<'a, PrismEffect>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -436,6 +459,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.prism_effects_iter.peek().map(|effect| effect.order()),
+                PrimitiveKind::PrismEffect,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -568,6 +595,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                     range: sprites_start..sprites_end,
                 })
             }
+            PrimitiveKind::PrismEffect => {
+                let effects_start = self.prism_effects_start;
+                let mut effects_end = effects_start + 1;
+                self.prism_effects_iter.next();
+                while self
+                    .prism_effects_iter
+                    .next_if(|effect| (effect.order(), batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    effects_end += 1;
+                }
+                self.prism_effects_start = effects_end;
+                Some(PrimitiveBatch::PrismEffects(effects_start..effects_end))
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -614,6 +655,8 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// claudesktop patch: 自定义着色器效果；一个批次里可能混着三种，逐个按类型画。
+    PrismEffects(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -646,6 +689,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::PrismEffects(range) => format!("prism effects ({})", range.len()),
         }
     }
 }
@@ -897,6 +941,311 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+// claudesktop patch: 首页背景 / 输入框棱镜描边用的自定义着色器原语。
+//
+// 这些结构体直接当 D3D11 的 StructuredBuffer 用，布局必须和
+// `vendor/gpui-pre-windows/src/prism_shaders.hlsl` 里的同名 struct 逐字节一致：
+// 字段顺序别动；末尾的 `pad` 是把整体撑到 16 字节整数倍用的，StructuredBuffer 的
+// 元素步长必须是 16 的倍数，否则从第二个元素起全部错位。
+//
+// 为什么要走 Scene 原语而不是自己开一层：gpui 的绘制是「记一遍图元、按 order 排好、
+// 一次性提交」，自己画会在滚动/裁切/重放时漏掉 clip 和 Y 轴平移；接进 Scene 之后
+// 离屏截图（`--features headless-screenshot`）也自动包含这些效果。
+
+/// 输入框棱镜描边：SDF 圆角环 + 跟随指针的径向光谱。
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct PrismRim {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// 指针位置（窗口物理像素），光谱以它为圆心。
+    pub pointer: Point<ScaledPixels>,
+    /// 光谱半径（像素），超出这个距离只剩描边本来的颜色。
+    pub radius: f32,
+    /// 描边宽度（像素）。
+    pub stroke_width: f32,
+    /// 整体不透明度，0 表示不画（View 那边直接不提交即可）。
+    pub alpha: f32,
+    /// 0 = 浅色背景，1 = 深色背景（决定光谱的亮度曲线）。
+    pub dark: u32,
+    /// 调色板：0 = 默认暖白、1 = 暖纸、2 = 钴蓝、3 = 靛紫、4 = 琥珀、5 = 纯灰。
+    pub tone_key: u32,
+    /// 0 = 只画描边，1 = 描边 + 底部反射。
+    pub mode: u32,
+    pub pad: [f32; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<PrismRim>() % 16 == 0);
+
+impl From<PrismRim> for Primitive {
+    fn from(rim: PrismRim) -> Self {
+        Primitive::PrismEffect(PrismEffect::Rim(rim))
+    }
+}
+
+/// 首页地平线极光：fbm 波动 + 透视半调点阵。
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct HorizonGlow {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// 设备像素比：点阵和噪声按物理像素算，换缩放不会变粗。
+    pub dpr: f32,
+    /// 秒（单调时钟），驱动极光的横向漂移。
+    pub time: f32,
+    /// 0 = 浅色，1 = 深色。
+    pub dark: f32,
+    /// 极光从底部往上伸多远（0~1，相对高度）。
+    pub reach: f32,
+    /// 整体强度，0 时 shader 直接 discard。
+    pub intensity: f32,
+    /// 横向拉伸：越小波纹越宽。
+    pub stretch: f32,
+    /// 存在感（半调点阵的疏密与亮度）。
+    pub presence: f32,
+    /// 棱镜色散强度。
+    pub prism: f32,
+    /// 发消息瞬间的脉冲（0~1，会自然衰减）。
+    pub surge: f32,
+    /// 呼吸速度倍率。
+    pub speed: f32,
+    /// 谱宽：极光横跨多少色相。
+    pub spectrum: f32,
+    /// 语义色相（0 = 冷调、1 = 暖调），由配色决定。
+    pub semantic: f32,
+    pub pad: [f32; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<HorizonGlow>() % 16 == 0);
+
+impl From<HorizonGlow> for Primitive {
+    fn from(horizon: HorizonGlow) -> Self {
+        Primitive::PrismEffect(PrismEffect::Horizon(horizon))
+    }
+}
+
+/// ASCII 波动字阵的参数，全部按 `[f32; 4]` 分组打包（见文件头说明）。
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct AsciiRippleParams {
+    /// 0 = 单元格宽、1 = 单元格高、2 = 图集里一格的宽、3 = 字形数量。
+    pub grid: [f32; 4],
+    /// 静止态字色（rgb + 不透明度）。
+    pub ink: [f32; 4],
+    /// 波面字色（rgb + 混合增益）。
+    pub wave: [f32; 4],
+    /// 指针光晕：圆心 x / y（相对 bounds 左上）、半径像素、强度。
+    pub aura: [f32; 4],
+    /// 0 = 色散量、1 = 色相偏转、2 = 半调、3 = 对比。
+    pub optics: [f32; 4],
+    /// 0 = 秒、1 = 深色程度、2 = 整体强度、3 = 云雾相位。
+    pub timing: [f32; 4],
+    /// 0 = 云雾强度、1 = 光晕抬升、2 = 呼吸、3 = 棱镜。
+    pub nebula: [f32; 4],
+    /// 字形图集的像素宽高（0 = 宽、1 = 高，其余占位）。
+    pub atlas_size: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<AsciiRippleParams>() % 16 == 0);
+
+/// ASCII 波动字阵：CPU 算波场与字形索引，GPU 只负责铺格子、取字形、上色。
+#[derive(Clone, Debug)]
+#[expect(missing_docs)]
+pub struct AsciiRipple {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub params: AsciiRippleParams,
+    /// 单元格快照（RGBA8，每格 4 字节）。按 `revision` 判断要不要重传。
+    pub cells: Option<Arc<AsciiCellsUpload>>,
+    /// 62 个字形拼成的水平图集（R8 alpha）。
+    pub atlas: Option<Arc<AsciiAtlasUpload>>,
+    pub pad: [f32; 3],
+}
+
+impl AsciiRipple {
+    /// 传给 GPU 的那一份（去掉 `Arc`，只留 shader 看得见的字段）。
+    pub fn uniform(&self) -> AsciiRippleUniform {
+        AsciiRippleUniform {
+            order: self.order,
+            bounds: self.bounds,
+            content_mask: self.content_mask,
+            params: self.params,
+            pad: self.pad,
+        }
+    }
+}
+
+/// [`AsciiRipple`] 的 GPU 布局（步长 16 字节对齐）。
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct AsciiRippleUniform {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub params: AsciiRippleParams,
+    pub pad: [f32; 3],
+}
+
+const _: () = assert!(std::mem::size_of::<AsciiRippleUniform>() % 16 == 0);
+
+impl From<AsciiRipple> for Primitive {
+    fn from(ripple: AsciiRipple) -> Self {
+        Primitive::PrismEffect(PrismEffect::Ascii(ripple))
+    }
+}
+
+/// 字阵的单元格数据。`revision` 变了才需要重传显存。
+#[derive(Clone, Debug, Default)]
+#[expect(missing_docs)]
+pub struct AsciiCellsUpload {
+    pub width: u32,
+    pub height: u32,
+    pub revision: u64,
+    /// `width * height * 4` 字节，RGBA8。
+    pub rgba: Vec<u8>,
+}
+
+/// 字形图集。`key` 变了（换字体 / 换缩放比）才需要重传显存。
+#[derive(Clone, Debug, Default)]
+#[expect(missing_docs)]
+pub struct AsciiAtlasUpload {
+    pub width: u32,
+    pub height: u32,
+    pub key: u64,
+    /// `width * height` 字节，R8。
+    pub alpha_r8: Vec<u8>,
+}
+
+/// 三种自定义效果共用一条批次，靠 order 和别的图元交错。
+#[derive(Clone, Debug)]
+#[expect(missing_docs)]
+pub enum PrismEffect {
+    Rim(PrismRim),
+    Horizon(HorizonGlow),
+    Ascii(AsciiRipple),
+}
+
+/// [`crate::Window::paint_prism_rim`] 的参数，用户空间单位（`Window` 负责对齐设备像素）。
+#[derive(Clone, Copy, Debug)]
+#[expect(missing_docs)]
+pub struct PrismRimStyle {
+    pub corner_radii: Corners<Pixels>,
+    /// 指针位置（用户空间），光谱以它为圆心。
+    pub pointer: Point<Pixels>,
+    /// 光谱半径。
+    pub radius: Pixels,
+    pub stroke_width: Pixels,
+    pub alpha: f32,
+    pub dark: bool,
+    pub tone_key: u32,
+    pub mode: u32,
+}
+
+impl Default for PrismRimStyle {
+    fn default() -> Self {
+        Self {
+            corner_radii: Corners::default(),
+            pointer: Default::default(),
+            radius: Pixels(192.),
+            stroke_width: Pixels(1.),
+            alpha: 1.,
+            dark: false,
+            tone_key: 0,
+            mode: 0,
+        }
+    }
+}
+
+/// [`crate::Window::paint_horizon_glow`] 的参数，全部无量纲。
+#[derive(Clone, Copy, Debug)]
+#[expect(missing_docs)]
+pub struct HorizonGlowParams {
+    /// 秒（单调时钟）。
+    pub time: f32,
+    pub dark: bool,
+    pub reach: f32,
+    pub intensity: f32,
+    pub stretch: f32,
+    pub presence: f32,
+    pub prism: f32,
+    pub surge: f32,
+    pub speed: f32,
+    pub spectrum: f32,
+    pub semantic: f32,
+}
+
+impl Default for HorizonGlowParams {
+    fn default() -> Self {
+        Self {
+            time: 0.,
+            dark: false,
+            reach: 0.55,
+            intensity: 0.5,
+            stretch: 1.,
+            presence: 0.4,
+            prism: 0.3,
+            surge: 0.,
+            speed: 1.,
+            spectrum: 1.,
+            semantic: 0.,
+        }
+    }
+}
+
+impl PrismEffect {
+    pub(crate) fn order(&self) -> DrawOrder {
+        match self {
+            Self::Rim(rim) => rim.order,
+            Self::Horizon(horizon) => horizon.order,
+            Self::Ascii(ripple) => ripple.order,
+        }
+    }
+
+    fn set_order(&mut self, order: DrawOrder) {
+        match self {
+            Self::Rim(rim) => rim.order = order,
+            Self::Horizon(horizon) => horizon.order = order,
+            Self::Ascii(ripple) => ripple.order = order,
+        }
+    }
+
+    pub(crate) fn bounds(&self) -> &Bounds<ScaledPixels> {
+        match self {
+            Self::Rim(rim) => &rim.bounds,
+            Self::Horizon(horizon) => &horizon.bounds,
+            Self::Ascii(ripple) => &ripple.bounds,
+        }
+    }
+
+    pub(crate) fn content_mask(&self) -> &ContentMask<ScaledPixels> {
+        match self {
+            Self::Rim(rim) => &rim.content_mask,
+            Self::Horizon(horizon) => &horizon.content_mask,
+            Self::Ascii(ripple) => &ripple.content_mask,
+        }
+    }
+
+    /// 平移重放（滚动缓存）时整体下移并重新裁切。
+    fn shift(&mut self, dy: ScaledPixels, clip: &Bounds<ScaledPixels>) {
+        let (bounds, mask) = match self {
+            Self::Rim(rim) => (&mut rim.bounds, &mut rim.content_mask),
+            Self::Horizon(horizon) => (&mut horizon.bounds, &mut horizon.content_mask),
+            Self::Ascii(ripple) => (&mut ripple.bounds, &mut ripple.content_mask),
+        };
+        bounds.origin.y += dy;
+        mask.bounds.origin.y += dy;
+        mask.bounds = mask.bounds.intersect(clip);
     }
 }
 

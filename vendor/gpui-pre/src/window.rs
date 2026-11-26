@@ -6,23 +6,25 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    AsciiAtlasUpload, AsciiCellsUpload, AsciiRipple, AsciiRippleParams, AsyncWindowContext,
+    AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock, Context,
+    Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
+    DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
+    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, HorizonGlow,
+    HorizonGlowParams, Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, PrismRim, PrismRimStyle, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
+    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4789,6 +4791,105 @@ impl Window {
         } else {
             vertical_band
         }
+    }
+
+    /// claudesktop patch：提交一个输入框棱镜描边（SDF 圆角环 + 跟随指针的光谱）。
+    ///
+    /// 单位是用户空间像素，对齐设备像素、圆角缩放、描边宽度取整都在这里做，
+    /// 调用方不用关心 dpr。`style.alpha` 会乘上元素透明度。
+    pub fn paint_prism_rim(&mut self, bounds: Bounds<Pixels>, style: PrismRimStyle) {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let rim = PrismRim {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: style.corner_radii.scale(scale_factor),
+            // 光谱圆心不取整：取整会让光晕在指针移动时一格一格地跳。
+            pointer: point(
+                ScaledPixels(style.pointer.x.0 * scale_factor),
+                ScaledPixels(style.pointer.y.0 * scale_factor),
+            ),
+            radius: ScaledPixels(style.radius.0 * scale_factor),
+            stroke_width: self.snap_stroke(style.stroke_width),
+            alpha: (style.alpha * opacity).clamp(0., 1.),
+            dark: style.dark as u32,
+            tone_key: style.tone_key,
+            mode: style.mode,
+            pad: [0.; 3],
+        };
+        if rim.alpha <= 0. {
+            return;
+        }
+        self.next_frame.scene.insert_primitive(rim);
+    }
+
+    /// claudesktop patch：提交一层首页地平线极光。
+    pub fn paint_horizon_glow(&mut self, bounds: Bounds<Pixels>, params: HorizonGlowParams) {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        let glow = HorizonGlow {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            dpr: self.scale_factor(),
+            time: params.time,
+            dark: if params.dark { 1. } else { 0. },
+            reach: params.reach,
+            intensity: (params.intensity * opacity).clamp(0., 1.),
+            stretch: params.stretch,
+            presence: params.presence,
+            prism: params.prism,
+            surge: params.surge,
+            speed: params.speed,
+            spectrum: params.spectrum,
+            semantic: params.semantic,
+            pad: [0.; 3],
+        };
+        if glow.intensity <= 0. {
+            return;
+        }
+        self.next_frame.scene.insert_primitive(glow);
+    }
+
+    /// claudesktop patch：提交一层 ASCII 波动字阵。
+    ///
+    /// `params` 里带像素单位的量（`grid` 前三个、`aura` 的圆心与半径、
+    /// `atlas_size`）按用户空间给，这里统一乘 dpr，和 CPU 侧按逻辑像素
+    /// 算出的格子、图集对得上。
+    pub fn paint_ascii_ripple(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        mut params: AsciiRippleParams,
+        cells: Option<Arc<AsciiCellsUpload>>,
+        atlas: Option<Arc<AsciiAtlasUpload>>,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        params.grid[0] *= scale_factor;
+        params.grid[1] *= scale_factor;
+        params.grid[2] *= scale_factor;
+        params.aura[0] *= scale_factor;
+        params.aura[1] *= scale_factor;
+        params.aura[2] *= scale_factor;
+        params.atlas_size[0] *= scale_factor;
+        params.atlas_size[1] *= scale_factor;
+        params.timing[2] = (params.timing[2] * opacity).clamp(0., 1.);
+        let ripple = AsciiRipple {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            params,
+            cells,
+            atlas,
+            pad: [0.; 3],
+        };
+        if ripple.params.timing[2] <= 0. {
+            return;
+        }
+        self.next_frame.scene.insert_primitive(ripple);
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.

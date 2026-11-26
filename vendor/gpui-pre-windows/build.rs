@@ -68,6 +68,26 @@ mod shader_compilation {
                 &rust_binding_path,
             );
         }
+
+        // claudesktop patch: 首页背景 / 输入框棱镜描边。三个效果各一份文件，
+        // 入口名仍是 `{module}_vertex` / `{module}_fragment`（见 shader_resources）。
+        for (module, file) in [
+            ("prism_rim", "prism_rim.hlsl"),
+            ("horizon_glow", "horizon_glow.hlsl"),
+            ("ascii_ripple", "ascii_ripple.hlsl"),
+        ] {
+            let path = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("src")
+                .join(file);
+            println!("cargo:rerun-if-changed={}", path.display());
+            compile_shader_for_module(
+                module,
+                &out_dir,
+                &fxc_path,
+                path.to_str().unwrap(),
+                &rust_binding_path,
+            );
+        }
     }
 
     /// Locate `binary` in the newest installed Windows SDK.

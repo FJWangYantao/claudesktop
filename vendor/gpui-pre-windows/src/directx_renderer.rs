@@ -29,6 +29,14 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
+/// claudesktop patch: 这一帧有没有字阵（决定要不要留着那两块显存）。
+fn frame_has_ascii(scene: &Scene) -> bool {
+    scene
+        .prism_effects
+        .iter()
+        .any(|effect| matches!(effect, PrismEffect::Ascii(_)))
+}
+
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
     pub grayscale_enhanced_contrast: f32,
@@ -43,6 +51,8 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
+    // claudesktop patch: 首页背景 / 输入框棱镜描边的管线、纹理与显存回收。
+    prism: PrismGpuResources,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -92,6 +102,181 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+}
+
+/// claudesktop patch: 自定义效果（首页背景 / 输入框棱镜描边）的 GPU 资源。
+///
+/// 三条管线各自带一个 **1 元素** 的实例缓冲：一帧最多三两个效果，逐个上传比维护
+/// 「效果 → 缓冲下标」的映射简单得多，也不会因为顺序变化错位。
+struct PrismGpuResources {
+    rim: Option<PipelineState<PrismRim>>,
+    horizon: Option<PipelineState<HorizonGlow>>,
+    ascii: Option<PipelineState<AsciiRippleUniform>>,
+    /// 字阵图集用 POINT 采样（纹素中心取字形），点阵不会糊也不会串色。
+    sampler: Option<ID3D11SamplerState>,
+    cells: Option<ID3D11Texture2D>,
+    cells_srv: Option<ID3D11ShaderResourceView>,
+    cells_uploaded: Option<(u32, u32, u64)>,
+    atlas: Option<ID3D11Texture2D>,
+    atlas_srv: Option<ID3D11ShaderResourceView>,
+    atlas_uploaded: Option<(u32, u32, u64)>,
+    /// 连续多少帧没见过字阵（切到对话页、关掉背景）。超过 `PRISM_IDLE_FRAMES` 释放显存。
+    idle_frames: u32,
+}
+
+/// 字阵纹理闲置多少帧后回收（约 2 秒 @60fps）。
+const PRISM_IDLE_FRAMES: u32 = 120;
+
+impl PrismGpuResources {
+    /// 设备丢失时先原地放手：这些对象都挂在旧设备上。
+    fn empty() -> Self {
+        Self {
+            rim: None,
+            horizon: None,
+            ascii: None,
+            sampler: None,
+            cells: None,
+            cells_srv: None,
+            cells_uploaded: None,
+            atlas: None,
+            atlas_srv: None,
+            atlas_uploaded: None,
+            idle_frames: 0,
+        }
+    }
+
+    fn new(device: &ID3D11Device) -> Result<Self> {
+        // 三条管线都是预乘 alpha（Src = ONE / Dst = INV_SRC_ALPHA），共用一个状态。
+        let blend_state = create_blend_state_for_path_sprite(device)?;
+        let rim = PipelineState::new(
+            device,
+            "prism_rim_pipeline",
+            ShaderModule::PrismRim,
+            1,
+            blend_state.clone(),
+        )?;
+        let horizon = PipelineState::new(
+            device,
+            "horizon_glow_pipeline",
+            ShaderModule::HorizonGlow,
+            1,
+            blend_state.clone(),
+        )?;
+        let ascii = PipelineState::new(
+            device,
+            "ascii_ripple_pipeline",
+            ShaderModule::AsciiRipple,
+            1,
+            blend_state,
+        )?;
+
+        let sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+            };
+            let mut sampler = None;
+            device.CreateSamplerState(&desc, Some(&mut sampler))?;
+            sampler
+        };
+
+        Ok(Self {
+            rim: Some(rim),
+            horizon: Some(horizon),
+            ascii: Some(ascii),
+            sampler,
+            ..Self::empty()
+        })
+    }
+
+    /// 这一帧有没有字阵：没有就走显存回收倒计时。
+    fn tick_idle(&mut self, has_ascii: bool) {
+        if has_ascii {
+            self.idle_frames = 0;
+            return;
+        }
+        if self.cells.is_none() && self.atlas.is_none() {
+            return;
+        }
+        self.idle_frames = self.idle_frames.saturating_add(1);
+        if self.idle_frames > PRISM_IDLE_FRAMES {
+            self.release_textures();
+        }
+    }
+
+    fn release_textures(&mut self) {
+        self.cells = None;
+        self.cells_srv = None;
+        self.cells_uploaded = None;
+        self.atlas = None;
+        self.atlas_srv = None;
+        self.atlas_uploaded = None;
+        self.idle_frames = 0;
+    }
+
+    /// 把这一帧的单元格与字形图集传到显存。尺寸或版本没变就不重传。
+    fn upload_ascii_textures(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        ripple: &AsciiRipple,
+    ) -> Result<()> {
+        if let Some(cells) = ripple.cells.as_ref() {
+            let (width, height) = (cells.width, cells.height);
+            let expected = width as usize * height as usize * 4;
+            if width > 0 && height > 0 && cells.rgba.len() >= expected {
+                let key = (width, height, cells.revision);
+                let size_changed =
+                    self.cells_uploaded.map(|k| (k.0, k.1)) != Some((width, height));
+                if self.cells.is_none() || size_changed {
+                    let (texture, view) =
+                        create_shader_texture(device, width, height, DXGI_FORMAT_R8G8B8A8_UNORM)?;
+                    self.cells = Some(texture);
+                    self.cells_srv = Some(view);
+                    self.cells_uploaded = None;
+                }
+                if self.cells_uploaded != Some(key) {
+                    if let Some(texture) = self.cells.as_ref() {
+                        update_texture_data(device_context, texture, &cells.rgba, width * 4)?;
+                    }
+                    self.cells_uploaded = Some(key);
+                }
+            }
+        }
+
+        if let Some(atlas) = ripple.atlas.as_ref() {
+            let (width, height) = (atlas.width, atlas.height);
+            let expected = width as usize * height as usize;
+            if width > 0 && height > 0 && atlas.alpha_r8.len() >= expected {
+                let key = (width, height, atlas.key);
+                let size_changed =
+                    self.atlas_uploaded.map(|k| (k.0, k.1)) != Some((width, height));
+                if self.atlas.is_none() || size_changed {
+                    let (texture, view) =
+                        create_shader_texture(device, width, height, DXGI_FORMAT_R8_UNORM)?;
+                    self.atlas = Some(texture);
+                    self.atlas_srv = Some(view);
+                    self.atlas_uploaded = None;
+                }
+                if self.atlas_uploaded != Some(key) {
+                    if let Some(texture) = self.atlas.as_ref() {
+                        update_texture_data(device_context, texture, &atlas.alpha_r8, width)?;
+                    }
+                    self.atlas_uploaded = Some(key);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 struct DirectXGlobalElements {
@@ -170,6 +355,8 @@ impl DirectXRenderer {
             .context("Creating DirectX global elements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectX render pipelines")?;
+        let prism = PrismGpuResources::new(&devices.device)
+            .context("Creating prism effect resources")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -189,6 +376,7 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            prism,
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -271,6 +459,9 @@ impl DirectXRenderer {
                     .log_err();
             }
 
+            // claudesktop patch: 自定义管线与纹理也挂在旧设备上，
+            // 必须在 `devices.take()` 之前放手，否则 debug 层会报 live object 泄漏。
+            self.prism = PrismGpuResources::empty();
             self.resources.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
@@ -300,6 +491,8 @@ impl DirectXRenderer {
             .context("Creating DirectXGlobalElements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectXRenderPipelines")?;
+        let prism = PrismGpuResources::new(&devices.device)
+            .context("Creating prism effect resources")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -322,6 +515,7 @@ impl DirectXRenderer {
         self.resources = Some(resources);
         self.globals = globals;
         self.pipelines = pipelines;
+        self.prism = prism;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
         Ok(())
@@ -356,6 +550,8 @@ impl DirectXRenderer {
             _ => [0.0f32; 4],
         })?;
         self.upload_scene_buffers(scene)?;
+        // claudesktop patch: 这一帧没有字阵就把显存倒计时往下走，切到对话页后自动回收。
+        self.prism.tick_idle(frame_has_ascii(scene));
 
         let annotation = self
             .devices
@@ -385,6 +581,9 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::PrismEffects(range) => {
+                    self.draw_prism_effects(&scene.prism_effects[range])
+                }
             }
             .with_context(|| {
                 format!(
@@ -610,6 +809,101 @@ impl DirectXRenderer {
             start as u32,
             len as u32,
         )
+    }
+
+    /// claudesktop patch: 画一批自定义效果。
+    ///
+    /// 三种效果各自一条管线、各自的实例缓冲都在 `t1`，所以逐个实例画
+    /// （一帧最多三两个，合批省不下什么，代码却要绕一大圈）。
+    fn draw_prism_effects(&mut self, effects: &[PrismEffect]) -> Result<()> {
+        if effects.is_empty() {
+            return Ok(());
+        }
+        for effect in effects {
+            match effect {
+                PrismEffect::Rim(rim) => {
+                    let devices = self.devices.as_ref().context("devices missing")?;
+                    let batch_params = self
+                        .globals
+                        .batch_params_buffer
+                        .as_ref()
+                        .context("batch params buffer missing")?;
+                    let pipeline = self
+                        .prism
+                        .rim
+                        .as_mut()
+                        .context("prism rim pipeline missing")?;
+                    pipeline.update_buffer(
+                        &devices.device,
+                        &devices.device_context,
+                        slice::from_ref(rim),
+                    )?;
+                    pipeline.draw_range(&devices.device_context, batch_params, 0, 1)?;
+                }
+                PrismEffect::Horizon(horizon) => {
+                    let devices = self.devices.as_ref().context("devices missing")?;
+                    let batch_params = self
+                        .globals
+                        .batch_params_buffer
+                        .as_ref()
+                        .context("batch params buffer missing")?;
+                    let pipeline = self
+                        .prism
+                        .horizon
+                        .as_mut()
+                        .context("horizon glow pipeline missing")?;
+                    pipeline.update_buffer(
+                        &devices.device,
+                        &devices.device_context,
+                        slice::from_ref(horizon),
+                    )?;
+                    pipeline.draw_range(&devices.device_context, batch_params, 0, 1)?;
+                }
+                PrismEffect::Ascii(ripple) => {
+                    let devices = self.devices.as_ref().context("devices missing")?;
+                    self.prism.upload_ascii_textures(
+                        &devices.device,
+                        &devices.device_context,
+                        ripple,
+                    )?;
+                    let batch_params = self
+                        .globals
+                        .batch_params_buffer
+                        .as_ref()
+                        .context("batch params buffer missing")?;
+                    let uniform = ripple.uniform();
+                    // 先把纹理句柄取出来（COM 引用，clone 是加一次引用计数）：
+                    // 下面要可变借 `self.prism.ascii`，不能同时借 `self.prism.cells_srv`。
+                    let cells = self.prism.cells_srv.clone();
+                    let atlas = self.prism.atlas_srv.clone();
+                    let sampler = self.prism.sampler.clone();
+                    anyhow::ensure!(
+                        cells.is_some() && atlas.is_some(),
+                        "ascii ripple needs both the cell and the atlas texture"
+                    );
+                    let pipeline = self
+                        .prism
+                        .ascii
+                        .as_mut()
+                        .context("ascii ripple pipeline missing")?;
+                    pipeline.update_buffer(
+                        &devices.device,
+                        &devices.device_context,
+                        slice::from_ref(&uniform),
+                    )?;
+                    pipeline.draw_range_with_textures(
+                        &devices.device_context,
+                        &cells,
+                        &atlas,
+                        &sampler,
+                        batch_params,
+                        0,
+                        1,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -1233,6 +1527,43 @@ impl<T> PipelineState<T> {
         Ok(())
     }
 
+    /// claudesktop patch: 画一整批，同时把两张纹理绑到 `t0` / `t2`。
+    ///
+    /// `t1` 被实例缓冲占着（见 `set_pipeline_state`），所以图集只能放 `t2`，
+    /// 不能图省事把两张纹理挨着绑。
+    fn draw_range_with_textures(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        cells: &Option<ID3D11ShaderResourceView>,
+        atlas: &Option<ID3D11ShaderResourceView>,
+        sampler: &Option<ID3D11SamplerState>,
+        batch_params_buffer: &ID3D11Buffer,
+        first_instance: u32,
+        instance_count: u32,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            first_instance as usize + instance_count as usize <= self.buffer_size,
+            "DirectX instance range exceeds the {} buffer",
+            self.label
+        );
+        update_batch_start(device_context, batch_params_buffer, first_instance)?;
+        set_pipeline_state(
+            device_context,
+            slice::from_ref(&self.view),
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            &self.vertex,
+            &self.fragment,
+            &self.blend_state,
+        );
+        unsafe {
+            device_context.PSSetSamplers(0, Some(slice::from_ref(sampler)));
+            device_context.PSSetShaderResources(0, Some(slice::from_ref(cells)));
+            device_context.PSSetShaderResources(2, Some(slice::from_ref(atlas)));
+            device_context.DrawInstanced(4, instance_count, 0, 0);
+        }
+        Ok(())
+    }
+
     fn draw_range_with_texture(
         &self,
         device_context: &ID3D11DeviceContext,
@@ -1401,6 +1732,60 @@ fn create_render_target_and_its_view(
     let mut render_target_view = None;
     unsafe { device.CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))? };
     Ok((render_target, render_target_view))
+}
+
+/// claudesktop patch: 建一张可被着色器读取的贴图。
+#[inline]
+fn create_shader_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+    let mut view = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut view))? };
+    Ok((texture, view.unwrap()))
+}
+
+/// claudesktop patch: 覆盖整张贴图（尺寸不变时每帧走这条路，不重建资源）。
+#[inline]
+fn update_texture_data(
+    device_context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+    data: &[u8],
+    row_pitch: u32,
+) -> Result<()> {
+    unsafe {
+        device_context.UpdateSubresource(
+            texture,
+            0,
+            None,
+            data.as_ptr() as *const core::ffi::c_void,
+            row_pitch,
+            0,
+        );
+    }
+    Ok(())
 }
 
 #[inline]
@@ -1717,6 +2102,27 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        // claudesktop patch: 自定义效果。三个各自一份 hlsl 文件。
+        PrismRim,
+        HorizonGlow,
+        AsciiRipple,
+    }
+
+    impl ShaderModule {
+        /// claudesktop patch: 这个模块的入口在哪个 hlsl 文件里。
+        ///
+        /// 只有 debug 构建（`D3DCompileFromFile`）用得到；Release 走 `build.rs` 编好的
+        /// 字节码，文件名在构建期就定死了。
+        #[cfg_attr(not(debug_assertions), allow(dead_code))]
+        pub(crate) fn shader_file(self) -> &'static str {
+            match self {
+                ShaderModule::EmojiRasterization => "color_text_raster.hlsl",
+                ShaderModule::PrismRim => "prism_rim.hlsl",
+                ShaderModule::HorizonGlow => "horizon_glow.hlsl",
+                ShaderModule::AsciiRipple => "ascii_ripple.hlsl",
+                _ => "shaders.hlsl",
+            }
+        }
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1794,6 +2200,18 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
                 },
+                ShaderModule::PrismRim => match target {
+                    ShaderTarget::Vertex => PRISM_RIM_VERTEX_BYTES,
+                    ShaderTarget::Fragment => PRISM_RIM_FRAGMENT_BYTES,
+                },
+                ShaderModule::HorizonGlow => match target {
+                    ShaderTarget::Vertex => HORIZON_GLOW_VERTEX_BYTES,
+                    ShaderTarget::Fragment => HORIZON_GLOW_FRAGMENT_BYTES,
+                },
+                ShaderModule::AsciiRipple => match target {
+                    ShaderTarget::Vertex => ASCII_RIPPLE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => ASCII_RIPPLE_FRAGMENT_BYTES,
+                },
             };
             Self { inner: bytes }
         }
@@ -1806,11 +2224,8 @@ pub(crate) mod shader_resources {
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                "color_text_raster.hlsl"
-            } else {
-                "shaders.hlsl"
-            };
+            // claudesktop patch: 每个模块自己声明所在的 hlsl 文件。
+            let shader_name = entry.shader_file();
 
             let entry = format!(
                 "{}_{}\0",
@@ -1881,6 +2296,9 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::PrismRim => "prism_rim",
+                ShaderModule::HorizonGlow => "horizon_glow",
+                ShaderModule::AsciiRipple => "ascii_ripple",
             }
         }
     }

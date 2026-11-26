@@ -35,6 +35,15 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
 
 改动都标了 `claudesktop patch`（`grep -rn "claudesktop patch" vendor/`）：
 
+- **自定义着色器原语**（`src/scene.rs` 的 `PrismRim` / `HorizonGlow` / `AsciiRipple` 与
+  `PrimitiveKind::PrismEffect` / `PrimitiveBatch::PrismEffects`；入口在
+  `src/window.rs` 的 `paint_prism_rim` / `paint_horizon_glow` / `paint_ascii_ripple`）：
+  首页背景和输入框描边走 Scene 的图元流程，跟着 order 排序、跟着滚动重放平移、跟着
+  content mask 裁切，离屏截图（`--features headless-screenshot`）自动包含它们。
+  界面侧只给用户空间像素，对齐设备像素 / 圆角缩放 / 描边取整都在 `Window` 里做。
+  **只接了 Windows**：`gpui-pre-platform`（Linux）不在 vendor 里，那边的
+  `PrimitiveBatch` 少一个分支会编译不过——本项目只出 Windows 包，真有需要就照
+  `vendor/gpui-pre-windows` 的写法补一份。
 - **中文避头尾**（`src/text_system/line_wrapper.rs` 的 `is_cjk_break_forbidden`）：
   收尾标点（`，。、；：？！）」》` …）前不断行，开头标点（`（「《“` …）后不断行，`——` 中间不断开。
   上游在任意两个汉字之间都能断，逗号、右括号会落到行首。
@@ -82,6 +91,22 @@ markdown crate 换版本时：把新版发布包拷进来，重打上面的补�
 删掉本目录和根 `Cargo.toml` 的 patch 行。
 
 ## gpui-pre-windows 0.3.9
+
+- **自定义效果的三条管线**（`src/prism_common.hlsl` / `prism_rim.hlsl` / `horizon_glow.hlsl` /
+  `ascii_ripple.hlsl`，新文件；管线与纹理在 `src/directx_renderer.rs` 的 `PrismGpuResources`）：
+  首页地平线极光、ASCII 波动字阵、输入框棱镜描边各一条管线，入口名仍是 `{module}_vertex/fragment`，
+  所以 `build.rs` 只需要多编三份文件。三条都用 `create_blend_state_for_path_sprite`
+  （Src = ONE / Dst = INV_SRC_ALPHA），片元输出预乘 alpha。
+  * **`t1` 是实例缓冲**（`set_pipeline_state` 写死 `VSSetShaderResources(1, …)`）：字阵的单元格
+    放 `t0`、字形图集放 `t2`，别把两张纹理挨着绑（会盖掉实例缓冲）。
+  * **Y 轴方向不一致**：只有 `horizon_glow` 翻 y（极光从底部升起），另外两个直接用
+    `SV_Position.xy`（D3D 原点在左上角）。翻错的表现是背景从顶上垂下来。
+  * **结构体布局**：StructuredBuffer 按 C 规则紧凑排布（`Shadow` 的 `Hsla` 落在 offset 56
+    就是证据），所以 Rust 侧 `#[repr(C)]` 只要成员全是 f32/u32 就逐字节对上；末尾留
+    `pad` 把总长撑到 16 的整数倍，并有 `const assert!(size_of % 16 == 0)` 兜着。
+  * 设备丢失时 `PrismGpuResources::empty()` 先把旧管线与纹理放手，重建后再建；
+    连续 `PRISM_IDLE_FRAMES`（120 帧）没有字阵就释放那两块纹理（对话态自动 0 显存）。
+  * 用 SDK 的 `fxc.exe` 验证过六个入口（`/T vs_4_1|ps_4_1 /E {module}_{stage} /O3`）。
 
 - **绘制前校验失效区**：`src/events.rs` 的 `draw_window` 拿到绘制锁后立即调用 `ValidateRect`，保留绘制期间下一次 VSync 提交的失效区。重入保护仍校验已收到的 `WM_PAINT`。
 - **Windows VSync 时钟**：`src/vsync.rs` 的 `LatestVsyncClock` 用每窗一个原子槽保留最新的 `DwmFlush` 完成时刻。
