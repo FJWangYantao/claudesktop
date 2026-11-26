@@ -9,8 +9,16 @@ gpui-kit 0.7.3 的基础组件层（Markdown 的 `TextView`、表格、列表都
 删了 `.cargo-ok` / `.cargo_vcs_info.json` / `Cargo.toml.orig` / `benches/` / `tests/`，并把清单里
 对应的 `[[test]]` / `[[bench]]` 条目一并去掉，否则 `cargo` 会去找不存在的文件。
 
-**当前有一处改动**（`grep -rn "claudesktop patch" vendor/gpui-base/` 核对）：
+**当前有两处改动**（`grep -rn "claudesktop patch" vendor/gpui-base/` 核对）：
 
+- **光标滑行**（`src/input/base/smooth_caret.rs`，新文件；接线在 `src/input/base/element.rs` 的 `paint`
+  与 `src/input/base/state.rs` 的 `smooth_caret_frame`）：光标换位置时用 55ms 从旧位置滑过去，
+  曲线 `cubic-bezier(0.22, 1, 0.36, 1)`（二分反解 `x(t)`）；路过的位置对齐设备像素，`paint_quad` 留 1px 圆角。
+  刚聚焦、文档被清空、光标尺寸变化、多光标 / 有选区 / `App::reduce_motion` 为真时直接落位（不滑）；
+  纯滚动按滚动增量整体平移 `from`/`to`，避免滚动时看到光标慢慢追上来。滑行期间只对输入框所在 view
+  `request_animation_frame`，走完即停帧。`blink_cursor.rs` 的 `PAUSE_DELAY` 同时 300ms → 420ms，
+  免得刚追上就闪（对应测试的推进时长同步改过）。
+  单测在 `smooth_caret.rs`（曲线单调、三类瞬移、滚动补偿、设备像素对齐）。
 - **长表格按外层视口虚拟化**（`src/text/node.rs` 的 `render_table` / `VirtualTableRows`）：48 行以上的表格
   只布局、绘制视口内（含上下各 6 行 overscan）的行，轨道高度用行高前缀和整份报出，滚动范围和未改动时一致；
   可见行量出的真实行高缓存在解析出的 `Table` 上，下一帧替换单行估算值（长文本换行不再抖）。

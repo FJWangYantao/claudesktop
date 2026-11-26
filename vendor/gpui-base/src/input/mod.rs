@@ -67,6 +67,8 @@ mod rope_ext;
 mod search;
 #[path = "base/selection.rs"]
 mod selection;
+#[path = "base/smooth_caret.rs"]
+mod smooth_caret;
 #[path = "base/state.rs"]
 mod state;
 mod textarea;

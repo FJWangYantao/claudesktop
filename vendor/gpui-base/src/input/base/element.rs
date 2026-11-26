@@ -3231,9 +3231,45 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }
 
         // Paint blinking cursors (shared blink state for all carets)
+        //
+        // claudesktop patch：光标换位置（打字、方向键、点选）时用 55ms 滑过去，
+        // 见 `input/base/smooth_caret.rs`。位置记在输入框状态里，这里只取这一帧
+        // 该画的矩形；还在滑就为下一帧排一次重绘（只重画输入框所在 view）。
+        let cursor_infos = prepaint.cursor_infos_with_scroll();
+        let single_caret = cursor_infos.len() == 1;
+        let no_selection = selected_range.len() == 0;
+        let smooth = cursor_infos
+            .iter()
+            .find(|info| info.is_active)
+            .map(|active| {
+                let animate =
+                    focused && show_cursor && single_caret && no_selection && !cx.reduce_motion();
+                let scale_factor = window.scale_factor();
+                self.state.update(cx, |state, _| {
+                    state.smooth_caret_frame(
+                        active.bounds,
+                        prepaint.cursor_scroll_offset,
+                        focused,
+                        no_selection,
+                        animate,
+                        scale_factor,
+                    )
+                })
+            });
         if focused && show_cursor {
-            for cursor_info in prepaint.cursor_infos_with_scroll() {
-                window.paint_quad(fill(cursor_info.bounds, editor_style.caret));
+            let smooth = smooth.filter(|_| single_caret);
+            match smooth {
+                Some(frame) => {
+                    paint_caret(window, frame.bounds, editor_style.caret);
+                    if frame.animating {
+                        window.request_animation_frame();
+                    }
+                }
+                None => {
+                    for cursor_info in &cursor_infos {
+                        paint_caret(window, cursor_info.bounds, editor_style.caret);
+                    }
+                }
             }
         }
 
@@ -3353,6 +3389,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         self.paint_mouse_listeners(&prepaint.hitbox, window, cx);
     }
+}
+
+/// claudesktop patch：画一个光标块。
+///
+/// 留 1px 圆角是为了让 2px 宽（Windows/Linux）或 1.5px 宽（macOS）的光标在缩放比
+/// 不整除时走四边形的抗锯齿路径，边不发毛；纯直角在 1.25 倍缩放下是一道硬边。
+fn paint_caret(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla) {
+    let mut quad = fill(bounds, color);
+    quad.corner_radii = Corners::all(px(1.));
+    window.paint_quad(quad);
 }
 
 /// Split placeholder text into display lines and trim runs to each line.

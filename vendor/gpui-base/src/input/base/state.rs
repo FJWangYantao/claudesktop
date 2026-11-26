@@ -438,6 +438,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) wrapping_indent: WrappingIndent,
     pub(super) scroll_beyond_last_line: Option<usize>,
     pub(super) cursor_surrounding_lines: Option<usize>,
+    /// claudesktop patch: 光标滑行的状态（见 `smooth_caret.rs`）。
+    pub(super) smooth_caret: super::smooth_caret::SmoothCaretState,
     pub(super) blink_cursor: Entity<BlinkCursor>,
     pub(super) loading: bool,
     /// The cursors and selections.
@@ -814,6 +816,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
             blink_cursor,
+            smooth_caret: Default::default(),
             undo_manager,
             inline_tokens: None,
             pending_token: None,
@@ -3546,6 +3549,23 @@ impl<M: InputModeKind> InputBaseState<M> {
             && !self.disabled
             && self.blink_cursor.read(cx).visible()
             && window.is_window_active()
+    }
+
+    /// claudesktop patch：这一帧光标画在哪儿，以及要不要为下一帧再排一次重绘。
+    ///
+    /// 位置算法见 `input/base/smooth_caret.rs`。`animate` 由绘制方判断
+    /// （单光标、没有选区、`App::reduce_motion` 为假），传 `false` 时直接落位。
+    pub(super) fn smooth_caret_frame(
+        &mut self,
+        target: Bounds<Pixels>,
+        scroll: Point<Pixels>,
+        focused: bool,
+        empty: bool,
+        animate: bool,
+        scale_factor: f32,
+    ) -> super::smooth_caret::SmoothCaretFrame {
+        self.smooth_caret
+            .advance(target, scroll, focused, empty, animate, scale_factor)
     }
 
     fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {

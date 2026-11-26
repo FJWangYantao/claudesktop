@@ -2,7 +2,9 @@ use gpui::{Context, Pixels, Task, px};
 use instant::Duration;
 
 static INTERVAL: Duration = Duration::from_millis(500);
-static PAUSE_DELAY: Duration = Duration::from_millis(300);
+// claudesktop patch: 300 → 420ms。滑行 55ms 结束时还停在光标上，停顿久一点
+// 才不会「刚追上就开始闪」，和 Claude 输入框的手感一致。
+static PAUSE_DELAY: Duration = Duration::from_millis(420);
 
 // On Windows, Linux, we should use integer to avoid blurry cursor.
 #[cfg(not(target_os = "macos"))]
@@ -138,7 +140,9 @@ mod tests {
             cx.run_until_parked();
             assert!(cursor.read_with(cx, |cursor, _| cursor.visible()));
         }
-        cx.executor().advance_clock(Duration::from_millis(100));
+        // claudesktop patch: PAUSE_DELAY 提到 420ms 后，最后一次要等过 420-200=220ms
+        // 才会重新闪，所以这里多推 250ms。
+        cx.executor().advance_clock(Duration::from_millis(250));
         cx.run_until_parked();
         assert!(!cursor.read_with(cx, |cursor, _| cursor.visible()));
         cx.executor().advance_clock(INTERVAL);
