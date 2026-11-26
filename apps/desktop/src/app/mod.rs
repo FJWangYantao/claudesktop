@@ -29,6 +29,7 @@ mod plugin_versions;
 mod plugins_view;
 mod project_view;
 mod raw_request;
+pub(crate) mod prism_rim;
 pub(crate) mod remote_image;
 mod requests_view;
 mod review;
@@ -245,6 +246,10 @@ pub struct ChatApp {
     content_view: Entity<ContentView>,
     /// 内容区里的转圈 / 呼吸点 / 扫光叠在这上面画（见 motion.rs 文件头）
     loop_overlay: Entity<motion::LoopOverlay>,
+    /// 输入框外沿用棱镜描边跟着指针（见 prism_rim.rs 文件头：只通知它自己）
+    rim_view: Entity<prism_rim::ComposerRimView>,
+    /// 根视图写、描边 view 读的指针位置
+    rim_pointer: std::rc::Rc<std::cell::RefCell<prism_rim::RimPointer>>,
     /// 首页滚动区内容的定宽（见 `MeasuredWidth`）
     home_w: widgets::MeasuredWidth,
     /// 输入框卡片上沿在窗口里的位置（补全面板按它限高，见 `MeasuredTop`）
@@ -576,6 +581,9 @@ impl ChatApp {
         .detach();
 
         let weak = cx.entity().downgrade();
+        // 棱镜描边：指针状态由根视图写、描边 view 读（见 prism_rim.rs 文件头）
+        let rim_pointer = std::rc::Rc::new(std::cell::RefCell::new(prism_rim::RimPointer::default()));
+        let rim_view = cx.new(|_| prism_rim::ComposerRimView::new(rim_pointer.clone()));
         let mut app = Self {
             input,
             pending: Vec::new(),
@@ -644,6 +652,8 @@ impl ChatApp {
             image_cache: image_cache::DecodedImageCache::new(cx),
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             loop_overlay: cx.new(|_| motion::LoopOverlay),
+            rim_view,
+            rim_pointer,
             home_w: Default::default(),
             composer_top: Default::default(),
             home_scroll: ScrollHandle::new(),
@@ -4416,6 +4426,8 @@ impl Render for ChatApp {
             .when(!self.settings_navigation_only(), |d| d.child(self.sidebar_spinners_view.clone()))
             .children(self.render_right_panel_slot(window, cx))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                // 棱镜描边跟随指针：这里只通知描边自己，不让 ChatApp 变脏（见 prism_rim.rs）
+                this.track_rim_pointer(event.position, window, cx);
                 let Some(drag) = this.panel_resizing else { return };
                 let rem = window.rem_size();
                 let dx = (event.position.x - drag.start_x) / rem;

@@ -665,6 +665,8 @@ impl ChatApp {
             }
         }
         REDUCED.store(cx.reduce_motion(), Ordering::Relaxed);
+        // 氛围效果强度跟着设置走：描边 / 首页背景在绘制时不一定拿得到设置
+        super::prism_rim::set_ambient_level(self.settings.ambient_prism.level());
     }
 }
 

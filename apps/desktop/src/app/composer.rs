@@ -132,6 +132,30 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// ACP 会话在模型菜单底栏里选了一档思考强度：原生 `thought_level` 或思考型 `modes`
+    /// 都由内核自己挑通道，这里只管把选中的值交给它并乐观更新界面。
+    pub(crate) fn choose_acp_thinking(&mut self, value: String, cx: &mut Context<Self>) {
+        let kernel = self.session_kernel(self.active);
+        let s = &mut self.sessions[self.active];
+        let Some(index) = s.config_options.iter().position(claudesktop_core::is_selectable_thought)
+        else {
+            return;
+        };
+        let previous = s.config_options[index].current_value.clone();
+        s.config_options[index].current_value = value.clone();
+        match (kernel, s.acp_id.clone()) {
+            (Some(kernel), Some(id)) => {
+                if let Err(err) = kernel.set_thinking(&id, Some(&value)) {
+                    s.config_options[index].current_value = previous;
+                    s.note(format!("切换思考强度失败：{err}"));
+                }
+            }
+            // 空闲回收 / 内核刚换：进程下次发消息才起来，先记着，`Started` 时补交
+            _ => s.pending_acp_thinking = Some(value),
+        }
+        cx.notify();
+    }
+
     /// `Started` 到达：把会话建立前选的档位交给内核（和 `pending_model` / `pending_mode` 一个套路）。
     pub(super) fn flush_pending_thinking(&mut self, idx: usize, kernel: Option<&dyn Kernel>) {
         let (Some(kernel), Some(wanted)) = (kernel, self.sessions[idx].pending_thinking.take())
@@ -649,12 +673,14 @@ impl ChatApp {
         // 中间的空白点了也把焦点给输入框（chip 和按钮自己处理点击，不挂这个）。
         // 聊天空间不画权限模式，换成「联网」开关
         let chat = self.session().is_chat();
+        // 没有权限模式（还没连上的 ACP 会话、把思考强度报在 `modes` 里的 agent）就不画空的盾牌
+        let has_modes = !self.session().modes.is_empty();
         let unviewable = self.pending_images_unviewable();
         let toolbar = div()
             .h_flex()
             .items_center()
             .gap_0p5()
-            .when(!chat, |d| {
+            .when(!chat && has_modes, |d| {
                 d.child(
                     menu_popover(
                         "mode-menu",
@@ -793,7 +819,17 @@ impl ChatApp {
                     self.render_context_bar(cx),
                 ))
             })
-            .child(self.with_completion_keys(card, cx));
+            // 卡片外面叠一层棱镜描边：不接事件、不参与布局，只在指针靠近时亮起来
+            // （见 prism_rim.rs；它自己一个 view，鼠标移动不会让 ChatApp 重排）
+            .child(self.with_completion_keys(
+                div()
+                    .id("composer-rim-host")
+                    .relative()
+                    .w_full()
+                    .child(card)
+                    .child(self.rim_view.clone()),
+                cx,
+            ));
 
         div()
             .v_flex()

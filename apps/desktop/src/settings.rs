@@ -494,6 +494,9 @@ pub struct Settings {
     pub font_family: String,
     /// 动画（跟随系统的「动画效果」/ 总是播放 / 关闭），设置页切换后立即生效并写回
     pub motion: MotionPref,
+    /// 氛围效果（首页地平线极光 + ASCII 波动字阵、输入框棱镜描边）的强度。
+    /// `Off` 时一张额外的帧都不画（首页背景直接不挂载）。
+    pub ambient_prism: AmbientStrength,
     /// 回复里的网络图片自动加载（默认关）。关着时 `![](https://…)` 先摆占位卡
     /// 「图片 · example.com」+「加载」，点了才请求——不点就把用户的 IP 和
     /// 「正在看这条回复」告诉了图片服务器（见「设计说明-聊天与Code分离.md」7.5 节）
@@ -634,6 +637,7 @@ impl Default for Settings {
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
             motion: MotionPref::default(),
+            ambient_prism: AmbientStrength::default(),
             // 默认关：远程图片会把用户的 IP 和「正在看这条回复」告诉图片服务器
             auto_load_images: false,
             suggestions: false,
@@ -978,6 +982,74 @@ impl MotionPref {
             MotionPref::System => "跟随系统",
             MotionPref::On => "开",
             MotionPref::Off => "关",
+        }
+    }
+}
+
+/// 氛围效果强度。乘在描边 / 背景的不透明度上，`Off` 时组件直接不提交，
+/// 首页背景也不挂载（CPU / GPU / 显存全为零）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmbientStrength {
+    Off,
+    Subtle,
+    #[default]
+    Standard,
+    Full,
+}
+
+impl AmbientStrength {
+    pub const ALL: [AmbientStrength; 4] = [
+        AmbientStrength::Off,
+        AmbientStrength::Subtle,
+        AmbientStrength::Standard,
+        AmbientStrength::Full,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AmbientStrength::Off => "关",
+            AmbientStrength::Subtle => "轻",
+            AmbientStrength::Standard => "标准",
+            AmbientStrength::Full => "强",
+        }
+    }
+
+    /// 乘在效果不透明度上的系数。`Off` 的 0 是「别提交」的信号，不是「很淡」。
+    pub fn level(self) -> f32 {
+        match self {
+            AmbientStrength::Off => 0.0,
+            AmbientStrength::Subtle => 0.35,
+            AmbientStrength::Standard => 0.7,
+            AmbientStrength::Full => 1.0,
+        }
+    }
+
+    pub fn is_off(self) -> bool {
+        self == AmbientStrength::Off
+    }
+}
+
+impl ThemeChoice {
+    /// 输入框棱镜描边用的调色板，对应 `prism_rim.hlsl` 里的 `prism_palette`：
+    /// 0 默认暖白 / 1 暖纸 / 2 钴蓝 / 3 靛紫 / 4 琥珀 / 5 纯灰。
+    ///
+    /// 顺序和 `theme::PALETTES` 一致，改配色要两条一起看（`theme::prism_tone` 走这张表）。
+    pub fn prism_tone(self) -> u32 {
+        match self {
+            // Kimi 的强调色是暖橙，默认那组暖白光谱最贴
+            ThemeChoice::Kimi => 0,
+            ThemeChoice::Warm => 1,
+            // Flexoki 的纸是米黄、强调色偏赭
+            ThemeChoice::Flexoki => 4,
+            ThemeChoice::RosePine => 3,
+            // Everforest 是柔和绿，配暖纸那组不跳
+            ThemeChoice::Everforest => 1,
+            ThemeChoice::Nord => 2,
+            ThemeChoice::Catppuccin => 3,
+            ThemeChoice::Github => 2,
+            ThemeChoice::Pure => 5,
+            ThemeChoice::Lavender => 3,
         }
     }
 }

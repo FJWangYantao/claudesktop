@@ -539,6 +539,14 @@ pub fn is_dark() -> bool {
     DARK.load(Ordering::Relaxed)
 }
 
+/// 输入框棱镜描边的调色板编号（0 默认暖白 / 1 暖纸 / 2 钴蓝 / 3 靛紫 / 4 琥珀 / 5 纯灰）。
+///
+/// 走 `ThemeChoice::prism_tone`，这样换配色只有一处要改；
+/// `PALETTES` 与 `ThemeChoice::ALL` 的下标一一对应（见上面的注释）。
+pub fn prism_tone() -> u32 {
+    crate::settings::ThemeChoice::ALL[palette_index()].prism_tone()
+}
+
 /// 某套色板里某个 token 在给定明暗下的取值。
 fn pick(palette: &Palette, color: Color, dark: bool) -> u32 {
     let shade = palette.shade(color);
