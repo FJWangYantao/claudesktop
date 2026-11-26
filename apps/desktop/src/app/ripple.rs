@@ -480,8 +480,9 @@ mod tests {
         assert_eq!(field.pixels().len(), 100 * 30 * 4);
         assert!(!field.is_active());
         // 静止态也要有字形和一点点亮度，否则首页是一整块空白
-        assert!(field.pixels().chunks_exact(4).all(|cell| cell[0] < 62));
-        assert!(field.pixels().chunks_exact(4).any(|cell| cell[1] > 0));
+        let pixels = field.pixels();
+        assert!(pixels.iter().step_by(4).all(|glyph| *glyph < 62));
+        assert!(pixels.iter().skip(1).step_by(4).any(|alpha| *alpha > 0));
     }
 
     #[test]
