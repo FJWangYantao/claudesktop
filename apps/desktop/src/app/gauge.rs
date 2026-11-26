@@ -153,7 +153,7 @@ impl ChatApp {
             )
     }
 
-    /// 小圆环：淡色轨道 + 一段圆头圆弧，矢量画（同 `motion::spinner` 的做法）。
+    /// 小圆环：淡色轨道 + 一段圆头圆弧，矢量画。
     fn context_ring(percent: u32, tone: Color) -> Div {
         let color = rgb(tone);
         let sweep = (percent as f32 / 100.).clamp(0., 1.);

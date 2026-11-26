@@ -295,7 +295,7 @@ pub(super) fn paint_dot(center: Point<Pixels>, r: Pixels, color: Rgba, window: &
 /// 双块在一圈里的位置：`[x, y, w, h]` 归一化到活动区（单位是活动区边长，`0..1`）。
 ///
 /// 8 个半步一圈：伸出贴满一条边 → 收回角落 → 顺这条边转过 90°。主块顺时针走外圈，
-/// 副块取同一条轨迹错开半步（4 步），于是两块永远在对角、都在动，且首尾完全对上
+/// 副块取同一条轨迹错开半圈（4 个半步），于是两块永远在对角、都在动，且首尾完全对上
 /// （`phase = 0` 与 `1` 是同一组矩形），主副块的透明度不会在接缝处跳。
 /// `phase = None`（减少动态效果）停在稳定的对角双块。
 fn twin_block_rects(phase: Option<f32>) -> ([f32; 4], [f32; 4]) {
@@ -335,6 +335,10 @@ fn twin_block_rects(phase: Option<f32>) -> ([f32; 4], [f32; 4]) {
 /// [`twin_block_rects`] 摆进去。减少动态效果时 `phase = None`，停在静态对角位。
 fn paint_spinner(bounds: Bounds<Pixels>, phase: Option<f32>, color: Rgba, window: &mut Window) {
     let span = bounds.size.width.min(bounds.size.height) * (1. - 2. * TILE_MARGIN);
+    // 布局还没量出尺寸的那一帧：没有面积可画，别往场景里塞零尺寸的 quad
+    if span <= px(0.) {
+        return;
+    }
     let origin = bounds.center() - point(span * 0.5, span * 0.5);
     let (main, secondary) = twin_block_rects(phase);
     // 先画压暗的副块再画主块：几何上永不重叠，顺序只是保险
