@@ -1033,9 +1033,10 @@ impl From<HorizonGlow> for Primitive {
 }
 
 /// ASCII 波动字阵的参数，全部按 `[f32; 4]` 分组打包（见文件头说明）。
+///
+/// 八个分组严格对应 `ascii_ripple.hlsl` 里的同名结构体，顺序不能动。
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-#[expect(missing_docs)]
 pub struct AsciiRippleParams {
     /// 0 = 单元格宽、1 = 单元格高、2 = 图集里一格的宽、3 = 字形数量。
     pub grid: [f32; 4],

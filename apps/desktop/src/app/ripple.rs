@@ -570,8 +570,6 @@ mod tests {
             field.pixels()[center + 1] > field.pixels()[far + 1],
             "波心的字阵应当更亮"
         );
-        // 每格的 A 通道必须落在「高 3 bit + 低 5 bit」的范围里
-        assert!(field.pixels().chunks_exact(4).all(|cell| cell[3] <= 0xFF));
     }
 
     #[test]

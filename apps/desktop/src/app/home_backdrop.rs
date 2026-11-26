@@ -72,11 +72,6 @@ impl Default for HomeBackdrop {
 }
 
 impl HomeBackdrop {
-    /// 背景在窗口里的位置（还没画过时是 `None`）。
-    pub(crate) fn bounds(&self) -> Option<Bounds<Pixels>> {
-        self.bounds
-    }
-
     /// 指针移动：注入扰动 + 更新光晕。抖动（位移小于阈值）只续光晕不扰动水面。
     pub(crate) fn pointer(&mut self, position: Point<Pixels>) {
         let Some(bounds) = self.bounds else { return };

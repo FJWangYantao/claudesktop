@@ -1024,10 +1024,6 @@ impl AmbientStrength {
             AmbientStrength::Full => 1.0,
         }
     }
-
-    pub fn is_off(self) -> bool {
-        self == AmbientStrength::Off
-    }
 }
 
 impl ThemeChoice {
