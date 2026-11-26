@@ -13,6 +13,7 @@ mod git_branch;
 #[cfg(feature = "headless-screenshot")]
 mod hibernate_bench;
 mod history;
+pub(crate) mod home_backdrop;
 mod image_cache;
 pub(crate) mod keys;
 mod mascot;
@@ -27,16 +28,15 @@ mod overview;
 mod palette;
 mod plugin_versions;
 mod plugins_view;
+pub(crate) mod prism_rim;
 mod project_view;
 mod raw_request;
-pub(crate) mod home_backdrop;
-pub(crate) mod prism_rim;
-pub(crate) mod ripple;
 pub(crate) mod remote_image;
 mod requests_view;
 mod review;
 mod rewind;
 mod right_panel;
+pub(crate) mod ripple;
 mod search;
 mod settings_kit;
 mod settings_view;
@@ -589,11 +589,11 @@ impl ChatApp {
 
         let weak = cx.entity().downgrade();
         // 棱镜描边：指针状态由根视图写、描边 view 读（见 prism_rim.rs 文件头）
-        let rim_pointer = std::rc::Rc::new(std::cell::RefCell::new(prism_rim::RimPointer::default()));
+        let rim_pointer =
+            std::rc::Rc::new(std::cell::RefCell::new(prism_rim::RimPointer::default()));
         let rim_view = cx.new(|_| prism_rim::ComposerRimView::new(rim_pointer.clone()));
-        let home_backdrop = std::rc::Rc::new(std::cell::RefCell::new(
-            home_backdrop::HomeBackdrop::default(),
-        ));
+        let home_backdrop =
+            std::rc::Rc::new(std::cell::RefCell::new(home_backdrop::HomeBackdrop::default()));
         let home_backdrop_view =
             cx.new(|_| home_backdrop::HomeBackdropView::new(home_backdrop.clone()));
         let mut app = Self {
@@ -4409,9 +4409,7 @@ impl Render for ChatApp {
             .flex_1()
             .min_h_0()
             .w_full()
-            .when(self.home_backdrop_active(), |d| {
-                d.child(self.home_backdrop_view.clone())
-            })
+            .when(self.home_backdrop_active(), |d| d.child(self.home_backdrop_view.clone()))
             .child(self.content_slot())
             .when(!self.settings_open, |d| {
                 d.child(

@@ -138,10 +138,7 @@ impl RippleField {
         self.active = None;
         self.phase = 0;
         self.last_step = None;
-        self.fill_idle(&PackParams {
-            wave_gain: 1.,
-            cloud: IDLE_CLOUD,
-        });
+        self.fill_idle(&PackParams { wave_gain: 1., cloud: IDLE_CLOUD });
     }
 
     /// 整屏铺一遍静止态（云雾 + 字形），只在重建和静止时用。
@@ -242,17 +239,9 @@ impl RippleField {
             for c in c0..=c1 {
                 let i = r * cols + c;
                 let left = if c > 0 { self.height[i - 1] } else { self.height[i] };
-                let right = if c + 1 < cols {
-                    self.height[i + 1]
-                } else {
-                    self.height[i]
-                };
+                let right = if c + 1 < cols { self.height[i + 1] } else { self.height[i] };
                 let up = if r > 0 { self.height[i - cols] } else { self.height[i] };
-                let down = if r + 1 < rows {
-                    self.height[i + cols]
-                } else {
-                    self.height[i]
-                };
+                let down = if r + 1 < rows { self.height[i + cols] } else { self.height[i] };
                 let laplacian = left + right + up + down - 4. * self.height[i];
                 let damping = if c < BORDER_CELLS
                     || c + BORDER_CELLS >= cols
@@ -338,7 +327,15 @@ impl RippleField {
     }
 
     /// 写一格像素。
-    fn write_cell(&mut self, c: usize, r: usize, height: f32, gx: f32, gy: f32, params: &PackParams) {
+    fn write_cell(
+        &mut self,
+        c: usize,
+        r: usize,
+        height: f32,
+        gx: f32,
+        gy: f32,
+        params: &PackParams,
+    ) {
         let cols = self.cols;
         let i = (r * cols + c) * 4;
         if i + 3 >= self.pixels.len() {
@@ -362,7 +359,8 @@ impl RippleField {
             1. - params.cloud * (1. - (0.55 + 0.45 * noise))
         };
 
-        let alpha = ((IDLE_ALPHA + energy * 1400. * params.wave_gain) * cloud).clamp(0., 255.) as u8;
+        let alpha =
+            ((IDLE_ALPHA + energy * 1400. * params.wave_gain) * cloud).clamp(0., 255.) as u8;
 
         let mix = (energy * 520. * params.wave_gain).clamp(0., 1.);
         let mix_byte = (mix * 255.) as u8;
@@ -381,10 +379,7 @@ impl RippleField {
     }
 
     fn cell_at(&self, x: f32, y: f32) -> (isize, isize) {
-        (
-            (x / CELL_W).floor() as isize,
-            (y / CELL_H).floor() as isize,
-        )
+        ((x / CELL_W).floor() as isize, (y / CELL_H).floor() as isize)
     }
 
     fn add_velocity(&mut self, c: isize, r: isize, delta: f32) {
@@ -409,12 +404,9 @@ impl RippleField {
         let (c, r) = (c as usize, r as usize);
         self.active = Some(match self.active {
             None => ActiveRect { c0: c, r0: r, c1: c, r1: r },
-            Some(b) => ActiveRect {
-                c0: b.c0.min(c),
-                r0: b.r0.min(r),
-                c1: b.c1.max(c),
-                r1: b.r1.max(r),
-            },
+            Some(b) => {
+                ActiveRect { c0: b.c0.min(c), r0: b.r0.min(r), c1: b.c1.max(c), r1: b.r1.max(r) }
+            }
         });
     }
 }
@@ -476,10 +468,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn params() -> PackParams {
-        PackParams {
-            wave_gain: 1.,
-            cloud: 0.3,
-        }
+        PackParams { wave_gain: 1., cloud: 0.3 }
     }
 
     #[test]
@@ -552,10 +541,7 @@ mod tests {
         let cols = field.cols();
         let center = ((200. / CELL_H) as usize * cols + (350. / CELL_W) as usize) * 4;
         let far = (2 * cols + 2) * 4;
-        assert!(
-            field.pixels()[center + 1] > field.pixels()[far + 1],
-            "波心的字阵应当更亮"
-        );
+        assert!(field.pixels()[center + 1] > field.pixels()[far + 1], "波心的字阵应当更亮");
     }
 
     #[test]
@@ -575,10 +561,7 @@ mod tests {
             let r = (200. / CELL_H) as isize + dr;
             let c = (350. / CELL_W) as isize + dc;
             let index = (r as usize * cols + c as usize) * 4 + 1;
-            assert!(
-                field.pixels()[index] > 46,
-                "波心附近的格子应当被点亮：({dr}, {dc})"
-            );
+            assert!(field.pixels()[index] > 46, "波心附近的格子应当被点亮：({dr}, {dc})");
         }
     }
 }

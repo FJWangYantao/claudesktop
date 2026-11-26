@@ -52,10 +52,7 @@ pub(crate) struct ComposerRimView {
 
 impl ComposerRimView {
     pub(super) fn new(pointer: Rc<RefCell<RimPointer>>) -> Self {
-        Self {
-            pointer,
-            card_bounds: Rc::new(Cell::new(None)),
-        }
+        Self { pointer, card_bounds: Rc::new(Cell::new(None)) }
     }
 
     /// 卡片上一帧的窗口坐标（还没画过时为 `None`）。

@@ -821,15 +821,17 @@ impl ChatApp {
             })
             // 卡片外面叠一层棱镜描边：不接事件、不参与布局，只在指针靠近时亮起来
             // （见 prism_rim.rs；它自己一个 view，鼠标移动不会让 ChatApp 重排）
-            .child(self.with_completion_keys(
-                div()
-                    .id("composer-rim-host")
-                    .relative()
-                    .w_full()
-                    .child(card)
-                    .child(self.rim_view.clone()),
-                cx,
-            ));
+            .child(
+                self.with_completion_keys(
+                    div()
+                        .id("composer-rim-host")
+                        .relative()
+                        .w_full()
+                        .child(card)
+                        .child(self.rim_view.clone()),
+                    cx,
+                ),
+            );
 
         div()
             .v_flex()

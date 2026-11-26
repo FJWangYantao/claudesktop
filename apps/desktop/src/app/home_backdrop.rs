@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::prism_rim::ambient_level;
-use super::ripple::{CELL_H, CELL_W, GLYPHS, GLYPH_COUNT, IDLE_CLOUD, PackParams, RippleField};
+use super::ripple::{CELL_H, CELL_W, GLYPH_COUNT, GLYPHS, IDLE_CLOUD, PackParams, RippleField};
 
 /// 指针停下之后光晕再留多久。
 const AURA_LINGER: Duration = Duration::from_millis(1200);
@@ -120,27 +120,18 @@ impl HomeBackdrop {
 
     /// 有没有东西还在动（决定要不要排下一帧）。
     pub(crate) fn animating(&self) -> bool {
-        self.field.is_active()
-            || self
-                .aura
-                .is_some_and(|(_, at)| at.elapsed() < AURA_LINGER)
+        self.field.is_active() || self.aura.is_some_and(|(_, at)| at.elapsed() < AURA_LINGER)
     }
 
     fn resize(&mut self, bounds: Bounds<Pixels>) {
         self.bounds = Some(bounds);
-        self.field.resize(
-            f32::from(bounds.size.width),
-            f32::from(bounds.size.height),
-        );
+        self.field.resize(f32::from(bounds.size.width), f32::from(bounds.size.height));
     }
 
     /// CPU 侧的打包参数。指针光晕**不在这里**：它是纯 GPU 叠色，CPU 贴图只存波场，
     /// 否则波纹收敛时会把光斑烤进静止字阵（见 `pack_params_for_gpu`）。
     fn pack_params(&self) -> PackParams {
-        PackParams {
-            wave_gain: 1.,
-            cloud: IDLE_CLOUD,
-        }
+        PackParams { wave_gain: 1., cloud: IDLE_CLOUD }
     }
 
     /// 传给 shader 的指针光晕：圆心（相对背景左上）、半径、强度。
@@ -184,10 +175,7 @@ impl HomeBackdrop {
                 self.field.splash(seed_x, seed_y, SPLASH_STRENGTH);
                 // 光晕按窗口坐标存（`aura_params` 里再减掉左上角）
                 self.aura = Some((
-                    Point {
-                        x: bounds.origin.x + px(seed_x),
-                        y: bounds.origin.y + px(seed_y),
-                    },
+                    Point { x: bounds.origin.x + px(seed_x), y: bounds.origin.y + px(seed_y) },
                     now,
                 ));
                 // 立刻把波推到一个固定相位，否则截图取决于等了多少帧
@@ -249,12 +237,7 @@ impl HomeBackdrop {
                     optics: [0.75, 0.12, 0., 0.6],
                     timing: [seconds, if dark { 1. } else { 0. }, 0.9 * ambient, seconds * 0.15],
                     nebula: [0.4, 0., 0.7, 0.35],
-                    atlas_size: [
-                        atlas.width as f32 / dpr,
-                        atlas.height as f32 / dpr,
-                        0.,
-                        0.,
-                    ],
+                    atlas_size: [atlas.width as f32 / dpr, atlas.height as f32 / dpr, 0., 0.],
                 },
                 Some(cells),
                 Some(atlas),
@@ -357,10 +340,7 @@ fn with_alpha(color: Rgba, alpha: f32) -> [f32; 4] {
 }
 
 fn atlas_key_hash(key: (u64, u32)) -> u64 {
-    key.0
-        .rotate_left(17)
-        .wrapping_mul(0x9E37_79B9)
-        .wrapping_add(key.1 as u64)
+    key.0.rotate_left(17).wrapping_mul(0x9E37_79B9).wrapping_add(key.1 as u64)
 }
 
 /// 首页背景这一层本身。
@@ -405,11 +385,7 @@ impl super::ChatApp {
     }
 
     /// 指针移动：16ms 节流 + 只通知背景 view 自己（`ChatApp` 不变脏）。
-    pub(super) fn track_home_pointer(
-        &mut self,
-        position: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn track_home_pointer(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         if !self.home_backdrop_active() {
             return;
         }
