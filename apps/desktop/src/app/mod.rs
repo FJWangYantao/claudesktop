@@ -29,7 +29,9 @@ mod plugin_versions;
 mod plugins_view;
 mod project_view;
 mod raw_request;
+pub(crate) mod home_backdrop;
 pub(crate) mod prism_rim;
+pub(crate) mod ripple;
 pub(crate) mod remote_image;
 mod requests_view;
 mod review;
@@ -250,6 +252,11 @@ pub struct ChatApp {
     rim_view: Entity<prism_rim::ComposerRimView>,
     /// 根视图写、描边 view 读的指针位置
     rim_pointer: std::rc::Rc<std::cell::RefCell<prism_rim::RimPointer>>,
+    /// 首页背景（地平线极光 + ASCII 波动字阵）的状态，根视图与背景 view 共享
+    home_backdrop: std::rc::Rc<std::cell::RefCell<home_backdrop::HomeBackdrop>>,
+    home_backdrop_view: Entity<home_backdrop::HomeBackdropView>,
+    /// 上一次因指针移动通知首页背景的时刻（16ms 节流，见 `track_home_pointer`）
+    home_pointer_at: Option<Instant>,
     /// 首页滚动区内容的定宽（见 `MeasuredWidth`）
     home_w: widgets::MeasuredWidth,
     /// 输入框卡片上沿在窗口里的位置（补全面板按它限高，见 `MeasuredTop`）
@@ -584,6 +591,11 @@ impl ChatApp {
         // 棱镜描边：指针状态由根视图写、描边 view 读（见 prism_rim.rs 文件头）
         let rim_pointer = std::rc::Rc::new(std::cell::RefCell::new(prism_rim::RimPointer::default()));
         let rim_view = cx.new(|_| prism_rim::ComposerRimView::new(rim_pointer.clone()));
+        let home_backdrop = std::rc::Rc::new(std::cell::RefCell::new(
+            home_backdrop::HomeBackdrop::default(),
+        ));
+        let home_backdrop_view =
+            cx.new(|_| home_backdrop::HomeBackdropView::new(home_backdrop.clone()));
         let mut app = Self {
             input,
             pending: Vec::new(),
@@ -654,6 +666,9 @@ impl ChatApp {
             loop_overlay: cx.new(|_| motion::LoopOverlay),
             rim_view,
             rim_pointer,
+            home_backdrop,
+            home_backdrop_view,
+            home_pointer_at: None,
             home_w: Default::default(),
             composer_top: Default::default(),
             home_scroll: ScrollHandle::new(),
@@ -2913,6 +2928,8 @@ impl ChatApp {
             );
             return;
         }
+        // 发出去之前给首页背景一个脉冲（切到对话页后这层就卸载了，算是收尾的一亮）
+        self.home_backdrop.borrow_mut().surge();
         let queued =
             QueuedPrompt { text, images: self.pending.clone(), files: self.pending_files.clone() };
         // 发出去了：光标后面那句灰字、以及轮结束时猜的下一句都作废
@@ -4428,6 +4445,8 @@ impl Render for ChatApp {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 // 棱镜描边跟随指针：这里只通知描边自己，不让 ChatApp 变脏（见 prism_rim.rs）
                 this.track_rim_pointer(event.position, window, cx);
+                // 首页背景的指针扰动同理（见 home_backdrop.rs）
+                this.track_home_pointer(event.position, cx);
                 let Some(drag) = this.panel_resizing else { return };
                 let rem = window.rem_size();
                 let dx = (event.position.x - drag.start_x) / rem;
@@ -4438,6 +4457,13 @@ impl Render for ChatApp {
                 }
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    // 首页空白处点一下：给字阵丢一个波包
+                    this.home_splash(event.position, cx);
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {

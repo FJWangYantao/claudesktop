@@ -440,6 +440,14 @@
   `user` 消息（`wire_messages`），OpenAI 兼容端点开头多条 `system` 要合并成一条（`request::WireMessages`，
   vLLM / Ollama 模板只认一条）。界面侧目前只允许插纯文字——`SteerInjected` 不带附件，带图 / 文件插话
   会在气泡和续接历史里缺内容。
+- **思考强度统一进模型菜单，`modes` 可能只是思考档位**（2026-11-26）：ACP agent 有两条通道——
+  原生 `config_options[thought_level]`（走 `session/set_config_option`），和把档位塞进 `session.modes`
+  的（pi-acp 的 `off / low / … / xhigh`，只能走 `session/set_mode`）。后者由 `is_thinking_modes`
+  认出来后合成一个 `__mode_thought_level__` 配置项，**左侧权限模式要同时清空**，否则 UI 上会出现
+  「high / off」这种假权限模式。两个必踩的坑：①agent 换模型 / `config_option_update` 会整表覆盖
+  `AcpShared::configs`，合成项必须在 `merge_mode_thought` 里合并回去，否则一换模型 Effort 底栏就消失；
+  ②`merge` 发现原生项时要连 `options` 里那份合成副本一起删（只清 map 会两边各显示一个）。
+  桌面端配套：空白 ACP 会话不再预填自研的三个权限模式，`Started` 收到空 `modes` 也要清空旧表。
 - **`ask_user` 确认要进入自动分类器的上下文**（2026-11-25）。此前主模型收到了工具返回的答案，分类器只读对话消息，用户点了同意后仍会被拦。实时应答和日志重放共用 `auto::UserInput::question_answer`，只提交选中的答案及其题目和描述。沙箱内回环 HTTP 测试报 Windows 10013，可用 `cargo test -p claudesktop-builtin --lib auto`，进程内模拟分类器会检查当前回合、续接和回退的请求内容。
 
 - **提示词里禁止「工具前旁白」会把阶段汇报也一起压掉**（2026-11-24）：10-23 的提速改动加了「don't narrate what you are about to do before a tool call」，
@@ -724,3 +732,44 @@
   截图钩子 `CLAUDESKTOP_OPEN=sidebar-project|sidebar-time`（`:flow` 走添加 / 移除项目的断言，`:pending` 摆出移除确认条）
   全程只动内存：先把 `settings_path` 摘掉再跑，否则换分组 / 登记项目 / 切 workspace 会真的改写用户的 `settings.json`。
   验收时顺手比一下 `%APPDATA%\claudesktop\settings.json` 的哈希，钩子跑完不能变。
+
+## 自定义着色器效果（首页背景 / 输入框棱镜描边）
+
+- **`t1` 是实例缓冲，纹理只能放 `t0` / `t2`**（2026-11-27）：`directx_renderer.rs` 的
+  `set_pipeline_state` 里写死 `VSSetShaderResources(1, …)` / `PSSetShaderResources(1, …)`。
+  字阵的单元格放 `t0`、62 格字形图集放 `t2`；照抄 `draw_range_with_texture` 那样「两张纹理挨着绑」
+  会把槽位 1 的 StructuredBuffer 顶掉（表现是整层不画，或者画出来全是第一格的实例）。
+- **StructuredBuffer 按 C 规则紧凑排布，元素长度必须是 16 的倍数**：证据是上游 `Shadow` 的
+  `Hsla color` 落在 offset 56（若按「float4 必须 16 字节对齐」排，它会在 64，上游的阴影就会错位）。
+  所以 Rust 侧 `#[repr(C)]` 只要成员全是 f32/u32 就逐字节对得上；每个结构体末尾留 `pad` 撑到
+  16 的整数倍，并用 `const _: () = assert!(size_of::<T>() % 16 == 0);` 卡住。
+- **Y 轴方向各效果不一样**：D3D 的 `SV_Position` 原点在左上角。`horizon_glow` 要翻
+  （`uv.y = 1 - local.y / size.y`，极光从底部升起），`ascii_ripple` / `prism_rim` **不能翻**。
+  翻错的表现是背景从顶上垂下来、或描边上下颠倒。
+- **Release 才走 `fxc.exe`**（debug 走 `D3DCompileFromFile`）：新加的着色器一定要编一次 Release，
+  否则 HLSL 的严格错误会漏到最后。本机就有 SDK 里的 fxc，不用等完整构建：
+  `& "C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64\fxc.exe" /nologo /T ps_4_1 /E ascii_ripple_fragment /Fo NUL vendor\gpui-pre-windows\src\ascii_ripple.hlsl`
+  （六个入口：`prism_rim` / `horizon_glow` / `ascii_ripple` × `_vertex` / `_fragment`）。
+  典型报错 `X3014: incorrect number of arguments to numeric-type constructor`——HLSL 不允许
+  `float3(0.)` 这种单参构造，写 `(float3)0` 或三个分量。
+- **`Pixels` / `ScaledPixels` 的 `.0` 只在 gpui-pre / gpui-pre-windows 里可见**：`apps/desktop`
+  里要转成 f32 用 `f32::from(px)`，构造用 `px(v)`；`Rems`（如 `COMPOSER_RADIUS`）用
+  `COMPOSER_RADIUS.to_pixels(window.rem_size())`。
+- **gpui-pre 没有公开的字形光栅化**：首页 62 格字阵需要字形位图，`TextSystem` 把
+  `Arc<dyn PlatformTextSystem>` 藏着。已按 `claudesktop patch` 补了 `TextSystem::rasterize_mono_glyph`
+  （`src/text_system.rs`），返回 `(位图尺寸, 偏移, alpha)`；固定子像素变体 (0,0)、不开子像素渲染。
+- **只接了 Windows 渲染器**：`PrimitiveBatch::PrismEffects` 只在 `vendor/gpui-pre-windows` 里处理。
+  `gpui-pre-platform`（Linux）不在 vendor 里，那边的 `match` 少一个分支会编译不过——本项目只出
+  Windows 包；真要跨平台就照 `directx_renderer.rs` 的写法补一份。
+- **指纹式重绘隔离**：`ComposerRimView` / `HomeBackdropView` 各自是 `Entity`，根视图的
+  `on_mouse_move` 只写共享的 `Rc<RefCell<…>>`，必要时才 `view.update(cx, |_, cx| cx.notify())`。
+  **别在这条路径上调 `ChatApp` 的 `cx.notify()`**：内容区是 `cached` view，`ChatApp` 一变脏整页重排，
+  鼠标一动就掉帧。
+- **首页静止要真 0fps**：`RippleField::step` 在没有能量时返回 `false`、`pack` 也不改像素版本号，
+  背景 view 只有在波纹 / 光圈 / 脉冲三者之一还活着时才 `request_animation_frame()`。
+  想验证就盯 `CLAUDESKTOP_STRESS` 的帧时间，或临时在最外层 `paint` 里打点。
+- **离屏截图要确定性**：`CLAUDESKTOP_PRISM_SEED=<秒,px,py>`（只在 `--features headless-screenshot`
+  构建里生效）固定极光时间、注入一次固定位置的波包、把指针光晕钉在 `(px, py)`，并且不再排帧。
+- **显存回收**：`PrismGpuResources::tick_idle` 在连续 `PRISM_IDLE_FRAMES`（120）帧没有字阵后
+  `take()` 掉单元格与图集纹理；设备丢失时先 `PrismGpuResources::empty()` 再 `devices.take()`，
+  否则 debug 层会报 live object 泄漏。

@@ -532,6 +532,16 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 设置页切「氛围效果」：立即生效并写回。
+    ///
+    /// 首页背景挂不挂载、输入框描边画不画都看这个值（见 `home_backdrop.rs` /
+    /// `prism_rim.rs`）；强度经 `apply_motion_pref` 同步给绘制侧。
+    pub(super) fn set_ambient_prism(&mut self, level: AmbientStrength, cx: &mut Context<Self>) {
+        self.save_ui_pref(move |s| s.ambient_prism = level, cx);
+        self.apply_motion_pref(cx);
+        cx.notify();
+    }
+
     /// 侧栏底部要不要列出内核状态（立即生效，不走「保存」）。
     pub(super) fn set_sidebar_kernel_status(&mut self, on: bool, cx: &mut Context<Self>) {
         self.save_ui_pref(move |s| s.sidebar_kernel_status = on, cx);

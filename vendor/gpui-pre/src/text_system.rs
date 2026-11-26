@@ -429,6 +429,42 @@ impl TextSystem {
         }))
     }
 
+    /// claudesktop patch: 把一个字形光栅化成 alpha 位图。
+    ///
+    /// 给首页 ASCII 字阵拼 62 格图集用（见 `apps/desktop/src/app/home_backdrop.rs`）。
+    /// 只处理「等宽 ASCII、单色、不描边」这一种情况：固定子像素变体 (0,0)、
+    /// 不开子像素渲染，所以同一格字形在任何地方都是同一张位图。
+    ///
+    /// 返回 `(位图尺寸, 位图左上角相对栅格原点的偏移, alpha)`；字形不存在时返回空位图。
+    pub fn rasterize_mono_glyph(
+        &self,
+        font: &Font,
+        font_size: Pixels,
+        ch: char,
+        scale_factor: f32,
+    ) -> Result<(Size<DevicePixels>, Point<DevicePixels>, Vec<u8>)> {
+        let font_id = self.resolve_font(font);
+        let Some(glyph_id) = self.platform_text_system.glyph_for_char(font_id, ch) else {
+            return Ok((Size::default(), Point::default(), Vec::new()));
+        };
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: Point { x: 0, y: 0 },
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let bounds = self.platform_text_system.glyph_raster_bounds(&params)?;
+        if bounds.size.width.0 <= 0 || bounds.size.height.0 <= 0 {
+            return Ok((Size::default(), Point::default(), Vec::new()));
+        }
+        let (size, bitmap) = self.platform_text_system.rasterize_glyph(&params, bounds)?;
+        Ok((size, bounds.origin, bitmap))
+    }
+
     /// Get the advance width for the given character, in the given font and size.
     pub fn advance(&self, font_id: FontId, font_size: Pixels, ch: char) -> Result<Size<Pixels>> {
         let glyph_id = self

@@ -14,6 +14,17 @@ impl ChatApp {
             cx,
         );
         let motion_row = setting_row("动画", motion_control);
+        // 氛围效果：首页背景（极光 + 字阵）与输入框棱镜描边的强度。关掉时两者都不画。
+        let ambient_row = setting_row(
+            "氛围效果",
+            seg_control(
+                "ambient-prism",
+                AmbientStrength::ALL.map(|a| (a, a.label())),
+                self.settings.ambient_prism,
+                |this, level, _, cx| this.set_ambient_prism(level, cx),
+                cx,
+            ),
+        );
         let appearance = setting_group([
             setting_row(
                 "明暗",
@@ -62,6 +73,7 @@ impl ChatApp {
                 ),
             ),
             motion_row,
+            ambient_row,
             self.auto_load_images_row(cx),
             self.font_scale_row(),
             self.font_family_row(cx),

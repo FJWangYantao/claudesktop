@@ -84,6 +84,11 @@ enum LoopKind {
 }
 
 /// 内容区开始重画（`ContentView::render` 开头调）：上一遍记的位置作废，占位格 prepaint 时重记。
+/// 「减少动态效果」当前的值（画首页背景时手里不一定有 `App`）。
+pub(super) fn reduced() -> bool {
+    REDUCED.load(Ordering::Relaxed)
+}
+
 pub(super) fn begin_loop_spots() {
     LOOP_SPOTS.with_borrow_mut(Vec::clear);
 }

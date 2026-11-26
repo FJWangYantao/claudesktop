@@ -166,8 +166,8 @@ impl ChatApp {
     }
 }
 
-/// 「氛围效果」强度；`Off` 时描边一帧都不画。
-fn ambient_level() -> f32 {
+/// 「氛围效果」强度；`Off` 时描边、首页背景一帧都不画。
+pub(super) fn ambient_level() -> f32 {
     AMBIENT_LEVEL.with(|level| level.get())
 }
 
@@ -176,7 +176,12 @@ thread_local! {
     static AMBIENT_LEVEL: Cell<f32> = const { Cell::new(1.) };
 }
 
-/// 设置变更时同步氛围强度（由 `ChatApp` 在换设置 / 换配色时调用）。
+/// 氛围效果这一刻开没开（首页背景据此决定挂不挂载）。
+pub(super) fn ambient_on() -> bool {
+    ambient_level() > 0.001
+}
+
+/// 设置变更时同步氛围强度（由 `ChatApp::apply_motion_pref` 调用）。
 pub(super) fn set_ambient_level(level: f32) {
     AMBIENT_LEVEL.with(|cell| cell.set(level.clamp(0., 1.)));
 }

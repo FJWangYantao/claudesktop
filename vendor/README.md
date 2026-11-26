@@ -35,6 +35,11 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
 
 改动都标了 `claudesktop patch`（`grep -rn "claudesktop patch" vendor/`）：
 
+- **字形光栅化的公开入口**（`src/text_system.rs` 的 `TextSystem::rasterize_mono_glyph`）：
+  首页 ASCII 字阵要把 `0-9A-Za-z` 拼成 62 格图集，但 `TextSystem` 把
+  `Arc<dyn PlatformTextSystem>` 藏成私有字段，应用层拿不到 `rasterize_glyph`。
+  这个方法固定子像素变体 (0,0)、不开子像素渲染，返回 `(位图尺寸, 位图左上角偏移, alpha)`，
+  只服务「等宽 ASCII、单色、不描边」这一种用法（`apps/desktop/src/app/home_backdrop.rs`）。
 - **自定义着色器原语**（`src/scene.rs` 的 `PrismRim` / `HorizonGlow` / `AsciiRipple` 与
   `PrimitiveKind::PrismEffect` / `PrimitiveBatch::PrismEffects`；入口在
   `src/window.rs` 的 `paint_prism_rim` / `paint_horizon_glow` / `paint_ascii_ripple`）：
