@@ -51,6 +51,16 @@ impl ChatApp {
                         cx.notify();
                     })),
             ),
+            setting_row(
+                "对话视图",
+                seg_control(
+                    "view-mode",
+                    ViewMode::ALL.map(|m| (m, m.label())),
+                    self.settings.view_mode,
+                    |this, mode, _, cx| this.set_view_mode(mode, cx),
+                    cx,
+                ),
+            ),
             motion_row,
             self.auto_load_images_row(cx),
             self.font_scale_row(),

@@ -444,6 +444,19 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 顶栏单开关：开着就收起（并退出全宽），关着就打开上次停的 Tab。
+    /// 指定 Tab 的入口仍走 `toggle_right_panel`（`Ctrl+Shift+F` / `Ctrl+Shift+D` / 命令面板）。
+    pub(super) fn toggle_right_panel_open(&mut self, cx: &mut Context<Self>) {
+        if self.right_panel.open {
+            self.right_panel.open = false;
+            self.right_panel.expanded = false;
+        } else {
+            self.settings_open = false;
+            self.right_panel.open = true;
+        }
+        cx.notify();
+    }
+
     pub(super) fn open_right_diff(&mut self, location: DiffLocation, cx: &mut Context<Self>) {
         let session = &self.sessions[self.active];
         let selection = DiffSelection { location, epoch: session.diff_epoch };
@@ -590,19 +603,22 @@ impl ChatApp {
             .child(tab_button(RightTab::Files, cx))
             .child(tab_button(RightTab::Changes, cx))
             .child(drag_area())
-            .child(
-                Self::quiet_button("right-refresh", IconAll::RefreshCw, Surface::Paper, cx)
-                    .small()
-                    .tooltip("刷新")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.right_panel.refresh();
-                        cx.notify();
-                    })),
-            )
+            // 刷新只属于文件树（改动 Tab 上点它会清掉当前 Diff 预览）
+            .when(self.right_panel.tab == RightTab::Files, |d| {
+                d.child(
+                    Self::quiet_button("right-refresh", IconAll::RefreshCw, Surface::Paper, cx)
+                        .small()
+                        .tooltip("刷新")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.right_panel.refresh();
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 Self::quiet_button(
                     "right-expand",
-                    if expanded { IconAll::WindowRestore } else { IconAll::WindowMaximize },
+                    if expanded { IconAll::Minimize } else { IconAll::Maximize },
                     Surface::Paper,
                     cx,
                 )
@@ -623,6 +639,10 @@ impl ChatApp {
                         cx.notify();
                     })),
             )
+            // 面板的 X 和系统的关闭键别贴在一起（都是「关」，容易点错）
+            .when(window_controls(window).is_some(), |d| {
+                d.child(div().w(px(1.)).h(rems(1.)).mx_1().bg(rgb(LINE)))
+            })
             .children(window_controls(window))
     }
 

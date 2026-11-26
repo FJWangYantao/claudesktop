@@ -8,7 +8,7 @@ use super::menu::{
 use super::motion::{self, Reveal};
 use super::settings_kit::*;
 use super::widgets::{MeasuredWidth, Surface};
-use crate::model::FailureKind;
+use crate::model::{FailureKind, ViewMode};
 use crate::settings::*;
 use crate::theme::rgb;
 use crate::theme::*;

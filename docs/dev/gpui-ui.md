@@ -126,6 +126,9 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   `content_slot()` 铺满主区（保证全窗滚轮和右缘滚动条可用），对话行、首页和输入区经
   `ChatApp::reading_column` 限宽（760px，宽阅读模式 920px），默认居中，可在设置里切左对齐；设置 / 用量页独立布局。
   右侧辅助面板在 `app/right_panel.rs`：文件树 / 源码预览 / 逐文件 Diff，可拖拽调宽或展开全宽。
+  顶栏只有一个「工作区面板」开关（`toggle_right_panel_open`，记住上次停的 Tab）；指定 Tab 的入口是
+  `Ctrl+Shift+F` / `Ctrl+Shift+D` 和命令面板。面板自己的头里刷新只在「文件」Tab 出现，展开全宽用
+  `Maximize` / `Minimize`，`X` 和系统三键之间有竖分隔线。
   文件树在目录、展开或筛选变化时重建扁平索引，固定行高用 `uniform_list` 按视口构造。目录在面板绑定会话、刷新或首次展开时读取。
   源码预览只索引前 256 KiB 解码后的源码行，变高 `List` 按视口测量实际换行，宽度或字号变化保留顶部行及行内比例。
   改动清单也用 `uniform_list`，按归一化路径合并完成的改动，按 `Session::diff_revision` 更新并在面板隐藏时释放。

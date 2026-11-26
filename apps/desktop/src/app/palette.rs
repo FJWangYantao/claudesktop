@@ -50,6 +50,8 @@ enum PaletteCmd {
     Shortcuts,
     Export,
     Compact,
+    /// 聊天接到某个项目的 Code 会话里继续（复制日志，见设计说明第八章）
+    ContinueInProject,
     Session(usize),
     /// 跳到某会话的某条消息（会话下标, 行号）
     Message(usize, usize),
@@ -195,6 +197,13 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
     ];
     if s.has_user_message() {
         actions.push(Entry::new(IconAll::Share, "导出为 Markdown", PaletteCmd::Export));
+        // 聊天没有工作目录：把它接进某个项目的 Code 会话（顶栏 `⋯` 里也有这一项）
+        if s.is_chat() {
+            actions.push(
+                Entry::new(IconAll::FolderOpen, "在项目里继续…", PaletteCmd::ContinueInProject)
+                    .desc("复制这段聊天到选定项目的代码会话"),
+            );
+        }
         actions.push(
             Entry::new(IconAll::ListCollapse, "压缩上下文", PaletteCmd::Compact)
                 .desc("把较早的对话换成摘要"),
@@ -437,6 +446,7 @@ impl ChatApp {
                 cx.defer_in(window, |this, window, cx| this.open_shortcuts(window, cx));
             }
             PaletteCmd::Export => self.share_session(window, cx),
+            PaletteCmd::ContinueInProject => self.continue_in_project(window, cx),
             PaletteCmd::Compact => self.compact_session(cx),
             PaletteCmd::Session(i) => {
                 self.settings_open = false;

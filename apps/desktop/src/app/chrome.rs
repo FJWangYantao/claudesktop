@@ -4,16 +4,15 @@
 //! 一律收不到点击。所以拖拽区只能是按钮的**兄弟**（填空白的 flex_1），不能当容器。
 
 use super::ChatApp;
-use super::keys::CYCLE_VIEW_KEY;
-use super::menu::{MenuChip, MenuList, menu_item, menu_popover};
+use super::keys::{CHANGES_KEY, FILES_KEY};
+use super::menu::{MenuList, menu_item, menu_panel};
 use super::project_label;
-use super::right_panel::RightTab;
 use super::widgets::Surface;
-use crate::model::ViewMode;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::base::PopoverState;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -92,7 +91,8 @@ pub(super) fn window_controls(window: &Window) -> Option<Div> {
 }
 
 impl ChatApp {
-    /// 会话区顶栏：「项目 / 会话标题」面包屑 + 视图模式 + 导出 + 窗口按钮。整行除按钮外都能拖动窗口。
+    /// 会话区顶栏：「项目 / 会话标题」面包屑 + 右侧动作（工作区面板、`⋯` 会话菜单）+ 窗口按钮。
+    /// 整行除按钮外都能拖动窗口。
     pub(super) fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let s = self.session();
         let crumb_branch =
@@ -174,7 +174,6 @@ impl ChatApp {
                 )
         };
         let can_export = !self.settings_open && s.has_user_message();
-        let view = self.settings.view_mode;
         // 这个会话在跑的后台命令：顶栏给一个小标（悬停看命令行，点一下停掉）
         let running: Vec<_> = self
             .kernels
@@ -185,6 +184,23 @@ impl ChatApp {
         let running_count = running.len();
         let running_names: Vec<&str> = running.iter().map(|t| t.command.as_str()).collect();
         let running_ids: Vec<String> = running.iter().map(|t| t.id.clone()).collect();
+        // 设置页有自己的页头，右上不挂会话动作；空白聊天也没有可做的动作
+        let has_header_actions = !self.settings_open
+            && (!s.is_chat()
+                || can_export
+                || running_count > 0
+                || (s.has_user_message() && s.worktree.is_some()));
+        let panel_open = self.right_panel_controls();
+        let panel_tip: SharedString = if panel_open {
+            "收起工作区面板".into()
+        } else {
+            format!(
+                "工作区面板（文件 {} / 改动 {}）",
+                Self::key_text(FILES_KEY),
+                Self::key_text(CHANGES_KEY)
+            )
+            .into()
+        };
 
         div()
             .h_flex()
@@ -204,8 +220,8 @@ impl ChatApp {
                 super::worktree::render_worktree_chip(self, &cx.entity(), &self.menu_focus),
                 |d, chip| d.child(div().mr_1().child(chip)),
             )
-            // 后台命令在跑：一个小标（悬停看命令行，点一下停掉）
-            .when(running_count > 0, |d| {
+            // 后台命令在跑：一个小标（悬停看命令行，点一下停掉）；设置页有自己的一块，不残留
+            .when(!self.settings_open && running_count > 0, |d| {
                 d.child(
                     Self::quiet_button("bg-tasks", IconAll::SquareTerminal, Surface::Paper, cx)
                         .mr_1()
@@ -221,101 +237,73 @@ impl ChatApp {
                         })),
                 )
             })
-            // 右侧文件树 / Diff 辅助面板（Ctrl+Shift+D 切换）
+            // 文件 / 改动共用一个开关：开的时候停在上次那个 Tab（对话里的改动卡片仍直达「改动」）
             .when(!self.settings_open && !s.is_chat(), |d| {
                 d.child(
-                    Self::quiet_button("open-files", IconAll::FolderTree, Surface::Paper, cx)
-                        .mr_1()
-                        .tooltip("文件与源码预览")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_right_panel(RightTab::Files, cx)
-                        })),
-                )
-                .child(
-                    Self::quiet_button("open-changes", IconAll::FileDiff, Surface::Paper, cx)
-                        .mr_2()
-                        .tooltip("逐文件改动（Ctrl+Shift+D）")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_right_panel(RightTab::Changes, cx)
-                        })),
-                )
-            })
-            // 视图模式（Ctrl+O 循环）：只在有对话时出现
-            .when(can_export, |d| {
-                d.child(div().mr_1().child(menu_popover(
-                    "view-menu",
-                    Anchor::TopRight,
-                    rems(17.5),
-                    &cx.entity(),
-                    &self.menu_focus,
-                    MenuChip::new(view.icon(), view.label()),
-                    view_menu_items,
-                )))
-            })
-            // 聊天会话：接到某个项目里继续（复制日志成 Code 会话，见设计说明第八章）
-            .when(self.session().is_chat() && can_export, |d| {
-                d.child(
                     Self::quiet_button(
-                        "continue-in-project",
-                        IconAll::FolderOpen,
+                        "toggle-right-panel",
+                        IconAll::PanelRight,
                         Surface::Paper,
                         cx,
                     )
                     .mr_1()
-                    .tooltip("在项目里继续…（把这段聊天接到一个项目的 Code 会话里）")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.continue_in_project(window, cx)),
-                    ),
+                    .tooltip(panel_tip)
+                    .when(panel_open, |b| {
+                        b.icon(Icon::new(IconAll::PanelRight).text_color(rgb(CORAL)))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel_open(cx))),
                 )
             })
-            .when(can_export, |d| {
-                d.child(
-                    Self::quiet_button("share-session", IconAll::Share, Surface::Paper, cx)
-                        .mr_2()
-                        .tooltip("导出为 Markdown")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.share_session(window, cx)),
-                        ),
-                )
+            // 导出 / 在项目里继续这类会话动作收进 `⋯`，只在有对话时出现
+            .when(can_export, |d| d.child(div().mr_1().child(self.render_session_menu(cx))))
+            // 空白 Code 首页（只有面板开关）也要有分隔线；设置页和空白聊天页不画
+            .when(!panel_open && window_controls(window).is_some() && has_header_actions, |d| {
+                d.child(div().w(px(1.)).h(rems(1.)).mr_1().bg(rgb(LINE)))
             })
-            .when(
-                !self.right_panel_controls()
-                    && window_controls(window).is_some()
-                    && (can_export
-                        || running_count > 0
-                        || (self.session().has_user_message()
-                            && self.session().worktree.is_some())),
-                |d| d.child(div().w(px(1.)).h(rems(1.)).mr_1().bg(rgb(LINE))),
-            )
-            .when(!self.right_panel_controls(), |d| d.children(window_controls(window)))
+            .when(!panel_open, |d| d.children(window_controls(window)))
+    }
+
+    /// 顶栏的 `⋯` 会话菜单：在项目里继续（仅聊天）、导出 Markdown。
+    fn render_session_menu(&self, cx: &mut Context<Self>) -> Popover {
+        let handle = cx.entity();
+        let focus = self.menu_focus.clone();
+        let trigger = Self::quiet_button("session-more", IconAll::Ellipsis, Surface::Paper, cx)
+            .tooltip("更多操作");
+        menu_panel(Popover::new("session-more-menu"), &self.menu_focus)
+            .anchor(Anchor::TopRight)
+            .w(rems(15.))
+            .trigger(trigger)
+            .content(move |_, window, cx| {
+                let popover = cx.entity();
+                session_menu_items(handle.read(cx), &handle, &popover).finish(&focus, window, cx)
+            })
     }
 }
 
-/// 视图模式条目：摘要 / 标准 / 详细，末尾提示快捷键。
-fn view_menu_items(
+/// `⋯` 里的会话动作：「在项目里继续…」（聊天才有，接进 Code 会话，见设计说明第八章）、
+/// 「导出为 Markdown」。
+fn session_menu_items(
     app: &ChatApp,
     handle: &Entity<ChatApp>,
     popover: &Entity<PopoverState>,
 ) -> MenuList {
-    let current = app.settings.view_mode;
-    let mut menu = MenuList::new("view-menu-list", handle, popover);
-    for (i, mode) in ViewMode::ALL.into_iter().enumerate() {
-        menu = menu.pick(
-            menu_item(("view-item", i), mode.icon(), mode.label(), mode.desc(), mode == current),
-            move |this, cx| this.set_view_mode(mode, cx),
+    let chat = app.session().is_chat();
+    let mut menu = MenuList::new("session-menu-list", handle, popover);
+    if chat {
+        menu = menu.pick_in(
+            menu_item(
+                "session-continue",
+                IconAll::FolderOpen,
+                "在项目里继续…",
+                "复制到代码空间的新会话",
+                false,
+            ),
+            |this, window, cx| this.continue_in_project(window, cx),
         );
     }
-    menu.child(
-        div()
-            .h_flex()
-            .items_center()
-            .gap_1p5()
-            .px_2p5()
-            .py_1p5()
-            .text_size(TEXT_META)
-            .text_color(rgb(INK_SOFT))
-            .child(ChatApp::kbd(CYCLE_VIEW_KEY))
-            .child("循环切换"),
+    menu.pick_in(
+        menu_item("session-export", IconAll::Share, "导出为 Markdown", "", false),
+        |this, window, cx| this.share_session(window, cx),
     )
 }
 
