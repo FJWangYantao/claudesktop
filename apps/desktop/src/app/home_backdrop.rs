@@ -357,9 +357,11 @@ impl HomeBackdropView {
 impl Render for HomeBackdropView {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let backdrop = self.backdrop.clone();
+        // 两个闭包各要一份 Rc：`move` 会把变量整个搬进第一个闭包，第二个就拿不到了。
+        let measure = backdrop.clone();
         canvas(
             move |bounds, _, _| {
-                backdrop.borrow_mut().bounds = Some(bounds);
+                measure.borrow_mut().bounds = Some(bounds);
             },
             move |bounds, _, window, _| {
                 backdrop.borrow_mut().paint(bounds, window);
