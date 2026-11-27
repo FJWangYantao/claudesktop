@@ -14,6 +14,7 @@ use crate::settings::ContentAlign;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::DiffView;
+use claudesktop_core::UserPrompt;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
@@ -1738,11 +1739,12 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 底栏「发送」：把批注拼成 `<user-review>` 块，**用发送时注入**的方式带走。    ///
-    /// 不能直接把 XML 当 `UserPrompt.text` 发：用户气泡里会露出一坨原始标签。
-    /// 这里只往输入框里放一句可读摘要，说明挂在 `diff_comment_note` 上，由
-    /// `submit_to` 在发给内核的文本前面拼进去（和逐块撤回的说明同一个注入点）。
-    pub(crate) fn send_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 底栏「发送」：把批注拼成 `<user-review>` 块，**用发送时注入**的方式带走。
+    ///
+    /// 直接 `submit_to` 一句可读摘要：说明挂在 `diff_comment_note` 上，由 `submit_to`
+    /// 拼进发给内核的文本。这样既不会把原始 XML 露在气泡里，也**不碰主输入框的草稿**，
+    /// 还不依赖调用方手里的 `window`（从弹出窗点发送时那是弹出窗）。
+    pub(crate) fn send_comments(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let token = self.session().token;
         let comments = self.comments.of(token).to_vec();
         let Some(note) = comments_note(&comments) else { return };
@@ -1752,8 +1754,17 @@ impl ChatApp {
         }
         self.diff_comment_note = Some((token, note));
         let summary = format!("（{} 条行内批注）", comments.len());
-        self.input.update(cx, |state, cx| state.set_value(summary, window, cx));
-        self.send(window, cx);
+        let idx = self.active;
+        let sent = self.submit_to(
+            idx,
+            UserPrompt { text: summary, images: Vec::new(), attachments: Vec::new() },
+            cx,
+        );
+        if !sent {
+            // 没发出去：说明不能留着（会被下一条手写消息带走），批注本身留着
+            self.diff_comment_note = None;
+            return;
+        }
         self.comments.clear(token);
         cx.notify();
     }
