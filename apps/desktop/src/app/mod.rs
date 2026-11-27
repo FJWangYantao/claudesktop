@@ -144,6 +144,8 @@ pub struct ChatApp {
     layout_save: Option<Task<()>>,
     /// 已经弹出的独立窗（面板跨窗迁移的账本，见 pane/popout.rs）
     popouts: Vec<pane::popout::PopoutEntry>,
+    /// 改动 Pane 的行内批注草稿（按会话令牌归属，见 right_panel.rs）
+    pub(crate) comments: right_panel::CommentDraft,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -635,6 +637,7 @@ impl ChatApp {
             dock_skin,
             layout_save: None,
             popouts: Vec::new(),
+            comments: right_panel::CommentDraft::default(),
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),

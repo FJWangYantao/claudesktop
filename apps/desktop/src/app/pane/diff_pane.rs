@@ -152,6 +152,12 @@ impl ClaudesktopPane for DiffPane {
         }
         vec![div().h_flex().items_center().gap_0p5().mr_1().children(items).into_any_element()]
     }
+    /// 换窗口（弹出 / 吸回）：底栏的批注输入框绑的是旧 `Window`，重建并保留草稿。
+    fn on_window_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(app) = self.app.upgrade() {
+            app.update(cx, |app, cx| app.rebuild_comment_input(window, cx));
+        }
+    }
 }
 
 impl Panel for DiffPane {

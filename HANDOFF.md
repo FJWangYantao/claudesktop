@@ -893,6 +893,16 @@
   用户手改文件不会递增 `diff_revision`，所以「未提交 / 基线」两档有手动刷新按钮。
 - **diff 正文里的 `---` / `+++` 不是文件头**：只在 hunk 之外（`in_hunk == false`）才按
   头部跳过，否则 Markdown 分割线、`--flag`、`++i` 这些真实代码行会被整行吞掉。
+- **行内批注的输入框放面板底栏，别嵌进虚拟列表的行里**：diff 正文走变高虚拟滚动，
+  行滚出视口就整个卸载，`InputState` 会丢焦点、而且每一帧都在整表重测（8ms 滚动红线）。
+  做法是「行上点 `+` → 记下 `(path, line, tag, snippet)` → 底栏聚焦输入框」，
+  列表行最多标一个小圆点表示已经有批注。
+- **批注按 `session.token` 归属**：不然切到另一个会话会把 A 的批注发进 B 的下一轮。
+  发送走 `submit_to`（和 `take_review_note` 同一个注入点），拼成 `<user-review>` 时
+  带上「file:line (kind) `code`」和批注正文，空批注不进去。
+- **批注输入框绑的是创建它的 `Window`**：Pane 弹出 / 吸回之后要在 `on_window_changed` 里
+  重建并回填草稿（`rebuild_comment_input`），否则在弹出窗里打字会绑到主窗。
+
 
 
 

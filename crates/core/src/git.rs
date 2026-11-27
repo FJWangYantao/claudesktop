@@ -404,14 +404,23 @@ pub fn default_base(dir: &Path) -> Option<String> {
     .filter(|name| !name.is_empty())
     .collect();
     for name in candidates {
-        if current.as_deref() == Some(name.as_str()) {
+        if current.as_deref() == Some(name.as_str()) || name.starts_with('-') {
             continue;
         }
-        if branch_exists(dir, &name) {
+        // 用 `rev-parse --verify` 而不是 `branch_exists`：候选里可能是 `origin/main`
+        // 这种远端跟踪引用，后者只查 `refs/heads/` 会误判成不存在
+        if rev_exists(dir, &name) {
             return Some(name);
         }
     }
     None
+}
+
+/// 这个 rev（分支名 / `origin/x` / 提交号）在这里解析得出来吗。
+pub fn rev_exists(dir: &Path, rev: &str) -> bool {
+    !rev.trim().is_empty()
+        && !rev.starts_with('-')
+        && git(dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok()
 }
 
 /// 跑一条 git 命令：不弹黑框、不问密码；失败时带上 git 的报错（译成中文）。

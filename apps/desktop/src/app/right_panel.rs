@@ -14,6 +14,7 @@ use crate::settings::ContentAlign;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::DiffView;
+use claudesktop_core::UserPrompt;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
@@ -299,9 +300,85 @@ impl DiffScope {
 
 /// git diff 解析出来的一行：文件头 / 正文行 / 说明
 pub(super) enum GitRow {
-    File { path: String, added: u32, removed: u32 },
-    Line(claudesktop_core::DiffLineView),
+    File {
+        path: String,
+        added: u32,
+        removed: u32,
+    },
+    /// 正文行带上它所属的文件（行内批注要按 `(path, line)` 定位）
+    Line {
+        path: String,
+        line: claudesktop_core::DiffLineView,
+    },
     Note(SharedString),
+}
+
+/// 一条行内批注（哪一行、什么上下文、用户写了什么）
+#[derive(Clone, Debug)]
+pub(crate) struct DiffComment {
+    /// 相对工作目录的路径
+    pub(crate) path: String,
+    /// 行号（新增行是新文件行号，删除行是旧文件行号）
+    pub(crate) line: u32,
+    /// `'+'` / `'-'` / `' '`
+    pub(crate) tag: char,
+    /// 那一行的内容（发送时给模型当上下文）
+    pub(crate) snippet: String,
+    pub(crate) text: String,
+}
+
+/// 正在写批注的那一行（点了行上的 `+` 之后）
+#[derive(Clone, Debug)]
+pub(crate) struct CommentTarget {
+    pub(crate) path: String,
+    pub(crate) line: u32,
+    pub(crate) tag: char,
+    pub(crate) snippet: String,
+}
+
+impl CommentTarget {
+    /// 一句话描述：`src/a.rs:42 +`
+    pub(crate) fn label(&self) -> String {
+        format!("{}:{} {}", self.path, self.line, self.tag)
+    }
+}
+
+/// 批注发出去时的 `<user-review>` 块。
+///
+/// 和 `review::review_note`（逐块撤回的说明）是同一套约定：都要求模型**别重做**这些改动，
+/// 只按批注调。两条说明会一起拼在用户这条消息前面（见 `ChatApp::submit_to` 的注入点）。
+pub(crate) fn comments_note(comments: &[DiffComment]) -> Option<String> {
+    if comments.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(comments.len());
+    for comment in comments {
+        let tag = match comment.tag {
+            '+' => "added",
+            '-' => "removed",
+            _ => "context",
+        };
+        let text = comment.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "- {}:{} ({tag}) `{}`\n  {}",
+            comment.path,
+            comment.line,
+            comment.snippet.trim(),
+            text
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<user-review>\nThe user reviewed the diff and left comments on specific lines \
+         (file:line (kind) `code`, then the comment):\n{}\nAddress these comments; do not redo \
+         changes the user did not ask about.\n</user-review>",
+        lines.join("\n")
+    ))
 }
 
 /// git 两档的取数结果。
@@ -325,8 +402,9 @@ struct GitDiff {
 pub(super) struct GitDiffRequest {
     pub(super) scope: DiffScope,
     pub(super) dir: PathBuf,
-    /// 基线档要比对的分支（worktree 会话用创建时记下的 base）
-    pub(super) base: Option<String>,
+    /// worktree 会话的基线（`WorktreeMeta::base`）：有它就一定用它，
+    /// 普通仓库的基线在后台线程里现算（见 `compute_git_diff`）
+    pub(super) worktree_base: Option<String>,
 }
 
 impl GitDiff {
@@ -381,8 +459,11 @@ pub(super) fn compute_git_diff(request: &GitDiffRequest) -> (Vec<GitRow>, Option
     }
     let text = match request.scope {
         DiffScope::WorkingTree => claudesktop_core::git::working_tree_diff(dir),
+        // 基线在这里现算：`default_base` 要起好几次 git 子进程，不能放在 UI 线程
         DiffScope::BranchBase => {
-            request.base.as_deref().and_then(|base| claudesktop_core::git::branch_diff(dir, base))
+            let base =
+                request.worktree_base.clone().or_else(|| claudesktop_core::git::default_base(dir));
+            base.and_then(|base| claudesktop_core::git::branch_diff(dir, &base))
         }
         _ => None,
     };
@@ -458,11 +539,10 @@ fn parse_unified_diff(text: &str) -> Vec<GitRow> {
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(0);
             }
-            body.push(GitRow::Line(claudesktop_core::DiffLineView {
-                tag: '~',
-                no: 0,
-                text: line.to_string(),
-            }));
+            body.push(GitRow::Line {
+                path: path.clone().unwrap_or_default(),
+                line: claudesktop_core::DiffLineView { tag: '~', no: 0, text: line.to_string() },
+            });
             continue;
         }
         if !in_hunk && (line.starts_with("+++") || line.starts_with("---")) {
@@ -497,7 +577,10 @@ fn parse_unified_diff(text: &str) -> Vec<GitRow> {
             new_no += 1;
             (' ', rest, no)
         };
-        body.push(GitRow::Line(claudesktop_core::DiffLineView { tag, no, text: text.to_string() }));
+        body.push(GitRow::Line {
+            path: path.clone().unwrap_or_default(),
+            line: claudesktop_core::DiffLineView { tag, no, text: text.to_string() },
+        });
     }
     flush_file(&mut rows, &mut path, &mut body, &mut added, &mut removed);
     rows
@@ -542,6 +625,30 @@ pub(super) struct RightPanelState {
     pub(crate) scope: DiffScope,
     /// git 两档的取数结果
     git: GitDiff,
+}
+
+/// 行内批注的状态（按会话令牌归属：切会话不会把 A 的批注发进 B）
+#[derive(Default)]
+pub(crate) struct CommentDraft {
+    pub(crate) by_session: HashMap<u64, Vec<DiffComment>>,
+    /// 正在写的那一行
+    pub(crate) target: Option<CommentTarget>,
+    /// 输入框绑定的窗口；弹出到别的窗时要重建（见 `on_window_changed`）
+    pub(crate) input: Option<Entity<InputState>>,
+}
+
+impl CommentDraft {
+    pub(crate) fn of(&self, token: u64) -> &[DiffComment] {
+        self.by_session.get(&token).map_or(&[], |list| list.as_slice())
+    }
+
+    pub(crate) fn push(&mut self, token: u64, comment: DiffComment) {
+        self.by_session.entry(token).or_default().push(comment);
+    }
+
+    pub(crate) fn clear(&mut self, token: u64) {
+        self.by_session.remove(&token);
+    }
 }
 
 impl RightPanelState {
@@ -811,10 +918,22 @@ impl ChatApp {
     pub(super) fn render_diff_tab(
         &mut self,
         width_rem: Option<f32>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.right_panel.split = width_rem.is_some_and(|w| w >= 36.);
+        let body = self.render_diff_body(&*window, cx);
+        // 批注底栏固定在面板底部（不放进虚拟列表，见 `render_comment_bar`）
+        let bar = self.render_comment_bar(window, cx);
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(body)
+            .when_some(bar, |d, bar| d.child(bar))
+            .into_any_element()
+    }
+
+    fn render_diff_body(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let session = &self.sessions[self.active];
         self.right_panel.sync_session(session.token, &session.cwd);
         self.refresh_changed_file_count();
@@ -849,10 +968,16 @@ impl ChatApp {
         let row_height = LEADING.to_pixels(font_size.into(), rem);
         list(
             panel.git.list(rem),
-            cx.processor(move |this, index, _, _| {
-                let panel = &this.right_panel;
-                match panel.git.rows.get(index) {
-                    Some(GitRow::File { path, added, removed }) => div()
+            cx.processor(move |this, index, _window, cx| {
+                // 先把这一行要用的东西拷出来：下面要 `&mut this` 建监听器
+                let file = match this.right_panel.git.rows.get(index) {
+                    Some(GitRow::File { path, added, removed }) => {
+                        Some((path.clone(), *added, *removed))
+                    }
+                    _ => None,
+                };
+                if let Some((path, added, removed)) = file {
+                    return div()
                         .h_flex()
                         .w_full()
                         .items_center()
@@ -870,32 +995,80 @@ impl ChatApp {
                                 .font_family(MONO)
                                 .text_size(TEXT_SMALL)
                                 .text_color(rgb(INK))
-                                .child(path.clone()),
+                                .child(path),
                         )
-                        .child(diff_stat(*added, *removed))
-                        .into_any_element(),
-                    Some(GitRow::Line(line)) => diff_line(line).w_full().into_any_element(),
-                    Some(GitRow::Note(text)) => {
-                        panel_note(text.clone()).px_3().py_1().into_any_element()
-                    }
-                    None => div().into_any_element(),
+                        .child(diff_stat(added, removed))
+                        .into_any_element();
                 }
+                let note = match this.right_panel.git.rows.get(index) {
+                    Some(GitRow::Note(text)) => Some(text.clone()),
+                    _ => None,
+                };
+                if let Some(text) = note {
+                    return panel_note(text).px_3().py_1().into_any_element();
+                }
+                let Some((path, line)) = (match this.right_panel.git.rows.get(index) {
+                    Some(GitRow::Line { path, line }) => Some((path.clone(), line.clone())),
+                    _ => None,
+                }) else {
+                    return div().into_any_element();
+                };
+                // 删除行不在新文件里，挂批注容易对不上；只在新增 / 上下文行上给 `+`
+                let can_comment = line.tag != '-';
+                let token = this.session().token;
+                let has_comment = this
+                    .comments
+                    .of(token)
+                    .iter()
+                    .any(|comment| comment.path == path && comment.line == line.no);
+                let target = CommentTarget {
+                    path: path.clone(),
+                    line: line.no,
+                    tag: line.tag,
+                    snippet: line.text.clone(),
+                };
+                div()
+                    .group("diff-line")
+                    .relative()
+                    .w_full()
+                    .child(diff_line(&line))
+                    .when(has_comment, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left_1()
+                                .top_1()
+                                .size(px(4.))
+                                .rounded_full()
+                                .bg(rgb(CORAL)),
+                        )
+                    })
+                    .when(can_comment, |d| {
+                        let id = format!("diff-comment-{path}-{}", line.no);
+                        d.child(
+                            div()
+                                .id(ElementId::Name(id.into()))
+                                .absolute()
+                                .right_1()
+                                .top_0()
+                                .px_1()
+                                .rounded_sm()
+                                .opacity(0.)
+                                .cursor_pointer()
+                                .group_hover("diff-line", |d| d.opacity(1.))
+                                .child(Icon::new(IconAll::Plus).size_3().text_color(rgb(INK_SOFT)))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_comment(target.clone(), window, cx)
+                                })),
+                        )
+                    })
+                    .into_any_element()
             }),
         )
         .with_estimated_item_height(row_height)
         // 外层（DiffPane）是块级容器，不认 `flex_1`：直接铺满
         .size_full()
         .into_any_element()
-    }
-
-    /// 基线档要比的分支：worktree 会话用它创建时记下的 base，
-    /// 普通仓库走 `git::default_base`（上游 / origin/HEAD / main / master，且不等于当前分支）。
-    fn git_baseline(&self) -> Option<String> {
-        let session = self.session();
-        if let Some(worktree) = &session.worktree {
-            return Some(worktree.base.clone());
-        }
-        claudesktop_core::git::default_base(&session.cwd)
     }
 
     /// 在后台线程拉一次 git 改动（同一份请求不重复发）。
@@ -913,10 +1086,12 @@ impl ChatApp {
             return;
         }
         self.right_panel.git.pending = Some(key);
+        let session = &self.sessions[self.active];
         let request = GitDiffRequest {
             scope,
-            dir: self.sessions[self.active].cwd.clone(),
-            base: self.git_baseline(),
+            dir: session.cwd.clone(),
+            // 只取 worktree 元信息里现成的 base（读内存）；普通仓库的基线交给后台线程算
+            worktree_base: session.worktree.as_ref().map(|w| w.base.clone()),
         };
         cx.spawn(async move |this, cx| {
             let (rows, error) =
@@ -1465,6 +1640,210 @@ fn panel_note(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
+/// 行内批注：选中一行 → 底栏写 → 发给模型。
+///
+/// 底栏固定挂在面板底部，**不嵌进虚拟列表的行里**：列表是变高虚拟滚动的，行滚出视口
+/// 就整个卸载，`InputState` 会丢焦点且每一帧都在整表重测（8ms 滚动红线）。
+impl ChatApp {
+    /// 行内批注的输入框：用到时才建（跟着窗口走，弹出窗里会重建，见 `on_window_changed`）。
+    pub(crate) fn ensure_comment_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = &self.comments.input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("对这几行说点什么…"));
+        self.comments.input = Some(input.clone());
+        input
+    }
+
+    /// 点了 diff 行上的 `+`：记下目标并把焦点送进底栏输入框。
+    pub(crate) fn begin_comment(
+        &mut self,
+        target: CommentTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.ensure_comment_input(window, cx);
+        self.comments.target = Some(target);
+        input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// 取消这一条（目标和草稿都清掉）。
+    pub(crate) fn cancel_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.comments.target = None;
+        if let Some(input) = &self.comments.input {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// 底栏「添加」：把输入框里的字存进当前会话。
+    pub(crate) fn add_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.comments.target.clone() else { return };
+        let Some(input) = self.comments.input.clone() else { return };
+        let text = input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let token = self.session().token;
+        self.comments.push(
+            token,
+            DiffComment {
+                path: target.path,
+                line: target.line,
+                tag: target.tag,
+                snippet: target.snippet,
+                text,
+            },
+        );
+        self.comments.target = None;
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// 底栏「发送」：把批注拼成 `<user-review>` 块发出去（和逐块撤回的说明共用注入点）。
+    pub(crate) fn send_comments(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let token = self.session().token;
+        let comments = self.comments.of(token).to_vec();
+        let Some(note) = comments_note(&comments) else { return };
+        let idx = self.active;
+        if !self.submit_to(
+            idx,
+            UserPrompt { text: note, images: Vec::new(), attachments: Vec::new() },
+            cx,
+        ) {
+            // 内核忙 / 起不来：`submit_to` 已经给了提示，批注留着别丢
+            return;
+        }
+        self.comments.clear(token);
+        cx.notify();
+    }
+
+    /// 丢掉这一会话的批注草稿。
+    pub(crate) fn clear_comments(&mut self, cx: &mut Context<Self>) {
+        let token = self.session().token;
+        self.comments.clear(token);
+        self.comments.target = None;
+        cx.notify();
+    }
+
+    /// 换窗口之后重建输入框，**保留还没提交的草稿**（绑定旧 `Window` 的 InputState 不能再用）。
+    pub(crate) fn rebuild_comment_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self
+            .comments
+            .input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        self.comments.input = None;
+        let input = self.ensure_comment_input(window, cx);
+        if !draft.is_empty() {
+            input.update(cx, |state, cx| state.set_value(draft, window, cx));
+        }
+    }
+
+    /// 改动 Pane 的底栏：正在写的那一行 + 已有批注数 + 发送。
+    fn render_comment_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        let token = self.session().token;
+        let count = self.comments.of(token).len();
+        let target = self.comments.target.clone();
+        if target.is_none() && count == 0 {
+            return None;
+        }
+        let input = target.as_ref().map(|_| self.ensure_comment_input(window, cx));
+        let mut bar = div()
+            .v_flex()
+            .flex_shrink_0()
+            .w_full()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .text_size(TEXT_SMALL);
+        if let Some(target) = &target {
+            bar = bar.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .font_family(MONO)
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child(target.label())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(target.snippet.trim().to_string()),
+                    ),
+            );
+            if let Some(input) = input {
+                bar = bar.child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().child(Input::new(&input).small()))
+                        .child(
+                            Self::quiet_button("comment-add", IconAll::Check, Surface::Paper, cx)
+                                .small()
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.add_comment(window, cx)),
+                                ),
+                        )
+                        .child(
+                            Self::quiet_button("comment-cancel", IconAll::X, Surface::Paper, cx)
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_comment(window, cx)
+                                })),
+                        ),
+                );
+            }
+        }
+        if count > 0 {
+            bar = bar.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(rgb(INK_SOFT))
+                            .child(format!("{count} 条批注 · 发给模型")),
+                    )
+                    .child(
+                        Self::quiet_button("comments-clear", IconAll::X, Surface::Paper, cx)
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_comments(cx))),
+                    )
+                    .child(
+                        Self::quiet_button("comments-send", IconAll::ArrowUp, Surface::Paper, cx)
+                            .small()
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.send_comments(window, cx)),
+                            ),
+                    ),
+            );
+        }
+        Some(bar)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1586,7 +1965,7 @@ mod tests {
         let body: Vec<&str> = rows
             .iter()
             .filter_map(|row| match row {
-                GitRow::Line(line) if line.tag != '~' => Some(line.text.as_str()),
+                GitRow::Line { line, .. } if line.tag != '~' => Some(line.text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1597,6 +1976,34 @@ mod tests {
         assert!(body.contains(&"--- new separator"), "hunk 里以 `---` 开头的新增行被吞掉了");
         assert!(body.contains(&"- comment"), "以 `--` 开头的上下文行被吞掉了");
         assert!(body.contains(&"+counter"), "以 `++` 开头的新增行被吞掉了");
+    }
+
+    /// 批注拼成 `<user-review>` 块：带上路径、行号、增删标记和那一行的内容；
+    /// 空批注（只有空格）不进去，免得给模型一堆空条目。
+    #[core::prelude::v1::test]
+    fn comments_note_lists_only_written_comments() {
+        let comments = vec![
+            DiffComment {
+                path: "src/a.rs".into(),
+                line: 42,
+                tag: '+',
+                snippet: "let x = 1;".into(),
+                text: "这里改成 unwrap_or_default".into(),
+            },
+            DiffComment {
+                path: "src/b.rs".into(),
+                line: 7,
+                tag: ' ',
+                snippet: "}".into(),
+                text: "   ".into(),
+            },
+        ];
+        let note = comments_note(&comments).expect("有批注就该有说明");
+        assert!(note.starts_with("<user-review>"), "沿用和逐块撤回同一套标签");
+        assert!(note.contains("src/a.rs:42 (added)"), "路径 / 行号 / 增删标记都要带上");
+        assert!(note.contains("这里改成 unwrap_or_default"));
+        assert!(!note.contains("src/b.rs"), "空批注不该发给模型");
+        assert!(comments_note(&[]).is_none(), "没有批注就不注入任何东西");
     }
 
     /// `git diff` 的解析：文件头要落在它那段正文**前面**，增删行数按整段统计。
@@ -1624,12 +2031,12 @@ mod tests {
         assert_eq!(path, "src/a.rs");
         assert_eq!((*added, *removed), (2, 1));
         // hunk 头画成一条分隔
-        assert!(matches!(&rows[1], GitRow::Line(line) if line.tag == '~'));
+        assert!(matches!(&rows[1], GitRow::Line { line, .. } if line.tag == '~'));
         // 第二个文件也有自己的头
         assert!(rows.iter().any(|row| matches!(row, GitRow::File { path, .. } if path == "b.rs")));
         // `index` / `---` / `+++` 这些不该变成正文行
-        assert!(!rows.iter().any(|row| matches!(row, GitRow::Line(l)
-            if l.text.starts_with("index ") || l.text.starts_with("---"))));
+        assert!(!rows.iter().any(|row| matches!(row, GitRow::Line { line, .. }
+            if line.text.starts_with("index ") || line.text.starts_with("---"))));
     }
 
     #[core::prelude::v1::test]
