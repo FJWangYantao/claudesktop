@@ -157,6 +157,45 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 某块对话 Pane 被关掉：丢掉它的草稿、从名册里划掉，必要时把焦点交给剩下的一块。
+    ///
+    /// 按**实体 id** 划名册：重排布局时新旧两块可能绑同一个会话，
+    /// 按令牌划会把刚建好的那块一起划掉。
+    pub(crate) fn forget_chat_pane(
+        &mut self,
+        entity: EntityId,
+        token: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat_panes.retain(|pane| pane.entity_id() != entity);
+        // 删草稿前确认确实没有同会话的别的 pane 了
+        let still_open = self
+            .chat_panes
+            .iter()
+            .filter_map(|pane| pane.upgrade())
+            .any(|pane| pane.read(cx).token() == token);
+        if !still_open {
+            self.chat_drafts.remove(&token);
+        }
+        if self.focused_chat != Some(token) {
+            cx.notify();
+            return;
+        }
+        // 关掉的正好是挂着输入框的那块：把焦点交给剩下的任意一块
+        self.focused_chat = None;
+        let next = self.chat_panes.iter().filter_map(|pane| pane.upgrade()).next();
+        if let Some(next) = next {
+            let next_token = next.read(cx).token();
+            self.focused_chat = Some(next_token);
+            if let Some(idx) = self.index_of_token(next_token) {
+                self.active = idx;
+            }
+            self.restore_composer(next_token, window, cx);
+        }
+        cx.notify();
+    }
+
     /// 一块对话 Pane 的正文：聚焦的那块挂真输入框，其余画同款占位卡（点它切过来）。
     pub(crate) fn render_chat_pane_view(
         &mut self,

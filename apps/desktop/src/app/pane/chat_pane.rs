@@ -64,6 +64,12 @@ impl ChatPane {
     }
 }
 
+/// 主窗里还开着几块对话 Pane（`Panel::closable` 靠它判断「是不是最后一块」）
+fn chat_pane_count(app: Option<&Entity<ChatApp>>, cx: &App) -> usize {
+    app.map(|app| app.read(cx).chat_panes.iter().filter(|pane| pane.upgrade().is_some()).count())
+        .unwrap_or(0)
+}
+
 impl ClaudesktopPane for ChatPane {
     fn pane_kind(&self) -> PaneKind {
         PaneKind::Chat
@@ -94,10 +100,24 @@ impl Panel for ChatPane {
         PaneKind::Chat.panel_name()
     }
 
-    /// 主对话 Pane 不给关：它复用主窗那一份内容区与输入状态实体，
-    /// 关掉或弹出都会让主窗失去对话区（要关的是**会话**，走侧栏）。
-    fn closable(&self, _cx: &App) -> bool {
-        false
+    /// 对话 Pane 什么时候能关：**主窗还剩不止一块对话 Pane** 才行。
+    ///
+    /// 关掉最后一块等于主窗没有对话区（要关的是会话，走侧栏）；关得掉的那块在关之前
+    /// 要把草稿和「聚焦」交出去，见 `on_removed`。
+    fn closable(&self, cx: &App) -> bool {
+        chat_pane_count(self.app.upgrade().as_ref(), cx) > 1
+    }
+
+    /// 这块被关掉（不是拖动换组）：
+    /// - 它的草稿和 `pending` 一起丢掉（用户已经不要这块了）；
+    /// - 焦点交给剩下任意一块，否则接下来没有输入框可挂；
+    /// - 从 `chat_panes` 名册里划掉（按实体 id，不按会话令牌：重排布局时新旧两块可能同会话）。
+    fn on_removed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let token = self.token;
+        let entity = cx.entity_id();
+        if let Some(app) = self.app.upgrade() {
+            app.update(cx, |app, cx| app.forget_chat_pane(entity, token, window, cx));
+        }
     }
 
     /// 同一个道理：这个 Pane 不能搬窗（见 `popout.rs` 文件头的第 3 条）
@@ -106,7 +126,7 @@ impl Panel for ChatPane {
     }
 
     fn dump(&self, _cx: &App) -> PanelState {
-        // 一个主对话 Pane：会话由 `ChatApp` 的活跃会话决定，这里不用记
+        // 会话由 `ChatPane` 自己绑的 token 决定，布局里不用记
         super::pane_state(PaneKind::Chat, serde_json::json!({ "kind": "chat" }))
     }
 }
