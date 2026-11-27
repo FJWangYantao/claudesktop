@@ -24,7 +24,7 @@ use gpui_kit::base::animation::{ease_in_out_cubic, ease_out_cubic};
 use gpui_kit::base::motion::{Transition, spring, transition};
 use gpui_kit::component::*;
 use gpui_kit::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::panic::Location;
 use std::sync::OnceLock;
@@ -63,8 +63,8 @@ thread_local! {
     /// 认领发生在**构建**时而不是 prepaint 时——prepaint 在整棵树布局完才跑，
     /// 那时已经分不清这个格是哪个内容区建的了。
     static CURRENT_SPOTS: RefCell<Option<LoopSpots>> = const { RefCell::new(None) };
-    /// 最近一次真正画出循环动画的时刻：节拍按它算间隔，外部重画（打字、滚动）不会把拍子挤短
-    static LAST_LOOP_PAINT: RefCell<Option<Instant>> = const { RefCell::new(None) };
+    /// 最近一次发出动画重画通知的时刻，所有登记的视图共用。
+    static LAST_LOOP_TICK: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// 一块内容区记下的循环动画位置（画什么、画在哪、裁到哪；窗口坐标）。
@@ -81,6 +81,14 @@ impl LoopSpots {
 
     fn clear(&self) {
         self.0.borrow_mut().clear();
+    }
+
+    /// 同一面板的延迟行构建会多次进入这里，保留其他行已登记的位置。
+    pub(super) fn with_current<T>(&self, build: impl FnOnce() -> T) -> T {
+        let previous = CURRENT_SPOTS.with_borrow_mut(|current| current.replace(self.clone()));
+        let out = build();
+        CURRENT_SPOTS.with_borrow_mut(|current| *current = previous);
+        out
     }
 
     fn is_empty(&self) -> bool {
@@ -123,10 +131,7 @@ pub(super) fn reduced() -> bool {
 /// prepaint 时按认领到的池记位置。退出时还原外层那份，嵌套的内容区不会互相污染。
 pub(super) fn with_loop_spots<T>(spots: &LoopSpots, build: impl FnOnce() -> T) -> T {
     spots.clear();
-    let previous = CURRENT_SPOTS.with_borrow_mut(|current| current.replace(spots.clone()));
-    let out = build();
-    CURRENT_SPOTS.with_borrow_mut(|current| *current = previous);
-    out
+    spots.with_current(build)
 }
 
 /// 循环动画的占位格：prepaint 时把位置和裁切范围记下，交给 [`LoopOverlay`] 画。
@@ -182,8 +187,6 @@ fn paint_loop_spots(spots: &LoopSpots, window: &mut Window, cx: &mut App) {
     if spots.is_empty() {
         return;
     }
-    // 记「这一帧真画了循环动画」：空画（只有别处的转圈）不算，免得打字刷新把节拍挤短
-    LAST_LOOP_PAINT.with_borrow_mut(|last| *last = Some(Instant::now()));
     for spot in spots.iter() {
         let mask = ContentMask { bounds: spot.clip };
         window.with_content_mask(Some(mask), |window| match &spot.kind {
@@ -207,7 +210,7 @@ fn loop_clock() -> Duration {
     EPOCH.get_or_init(Instant::now).elapsed()
 }
 
-/// 约 33ms 后让当前 view 重画一次（prepaint 里调）。各个 view 共用一拍：同一拍里
+/// 为当前 view 登记下一拍重画（prepaint 里调）。各个 view 共用一拍：同一拍里
 /// 多次调用只排一次，到点时把这期间登记过的 view 一起通知（同一帧里重画）。
 /// 靠 `on_next_frame` 逐帧数时间，不走计时器：拍子落在垂直同步上，和别的重画对齐。
 fn request_loop_tick(window: &mut Window) {
@@ -223,20 +226,21 @@ fn request_loop_tick(window: &mut Window) {
         first
     });
     if first {
-        wait_for_tick(Instant::now(), window);
+        wait_for_tick(window);
     }
 }
 
-fn wait_for_tick(since: Instant, window: &Window) {
-    window.on_next_frame(move |window, cx| {
-        // 从上一帧真正画出来算起：外部原因多画的那几帧不会把一拍挤短
-        let anchor = LAST_LOOP_PAINT.with(|c| c.borrow().map_or(since, |t| t.max(since)));
-        if anchor.elapsed() + TICK_SLACK >= LOOP_INTERVAL {
+fn wait_for_tick(window: &Window) {
+    window.on_next_frame(|window, cx| {
+        // 在同一帧阶段比较时间：布局和绘制花掉的几毫秒不应让下一拍再等一帧。
+        let now = Instant::now();
+        if LAST_LOOP_TICK.get().is_none_or(|last| now - last + TICK_SLACK >= LOOP_INTERVAL) {
+            LAST_LOOP_TICK.set(Some(now));
             for view in TICK_VIEWS.take() {
                 cx.notify(view);
             }
         } else {
-            wait_for_tick(since, window);
+            wait_for_tick(window);
         }
     });
 }
@@ -314,12 +318,7 @@ pub(super) fn spinner_in_place() -> Div {
             },
             move |bounds, _, window, _| {
                 // 相位取绘制那一刻，而不是 render 时：否则外部重画会把相位钉在旧值上跳一帧
-                let phase = if reduced {
-                    None
-                } else {
-                    LAST_LOOP_PAINT.with_borrow_mut(|last| *last = Some(Instant::now()));
-                    Some(loop_phase(SPIN_PERIOD))
-                };
+                let phase = (!reduced).then(|| loop_phase(SPIN_PERIOD));
                 paint_spinner(bounds, phase, color, window)
             },
         )

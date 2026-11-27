@@ -60,10 +60,7 @@ impl SideChatPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        if let Some(upgraded) = app.upgrade() {
-            let hub = upgraded.read(cx).hub.clone();
-            super::follow_hub(&hub, cx);
-        }
+        super::follow_hub(app.clone(), cx);
         let spots = LoopSpots::new();
         let content = cx.new(|_| ContentView::side(app.clone(), session, spots.clone()));
         let overlay = cx.new(|_| LoopOverlay::new(spots));

@@ -35,10 +35,7 @@ impl ChatPane {
         cx: &mut Context<Self>,
     ) -> Self {
         // 跟 hub 事件走：弹出窗里没人替它重画（见 `pane::follow_hub`）
-        if let Some(upgraded) = app.upgrade() {
-            let hub = upgraded.read(cx).hub.clone();
-            super::follow_hub(&hub, cx);
-        }
+        super::follow_hub(app.clone(), cx);
         Self { app, token, focus_handle: cx.focus_handle(), content, overlay, draft: String::new() }
     }
 

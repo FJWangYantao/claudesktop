@@ -340,12 +340,11 @@ impl ChatApp {
     /// 启动时按 `layout.json` 的 `popouts` 把独立窗开回来。
     ///
     /// 面板由注册表按 `panel_name` 重建（不是原来那个实体，但状态在 `dump` 里）；
-    /// 主窗起来之后再调（`init_workspace` 里挂了 0ms 的延迟任务），免得在构造函数里
-    /// 又开一个窗口。
+    /// 在主窗构造完成后调用；仅在登记新窗口时借用主窗。
     pub(crate) fn restore_popouts(
-        &mut self,
+        main_app: &Entity<Self>,
         states: Vec<super::persist::PopoutLayoutState>,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) {
         for state in states {
             let skin = ClaudesktopDockSkin::new();
@@ -367,7 +366,7 @@ impl ChatApp {
             let slot: Rc<std::cell::RefCell<Option<Entity<DockArea>>>> =
                 Rc::new(std::cell::RefCell::new(None));
             let slot_in = slot.clone();
-            let main = cx.entity().downgrade();
+            let main = main_app.downgrade();
             let main_in = main.clone();
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {
                 let dock = cx.new(|cx| {
@@ -396,16 +395,18 @@ impl ChatApp {
                 dock.read(cx).layout(DockPlacement::Center).and_then(|tree| tree.panels().next());
             let view = panel.and_then(|id| dock.read(cx).panel(id).cloned());
             if let (Some(panel), Some(view)) = (panel, view) {
-                self.popouts.push(PopoutEntry {
-                    window: window_handle,
-                    dock,
-                    panel,
-                    view,
-                    home: None,
+                main_app.update(cx, |app, cx| {
+                    app.popouts.push(PopoutEntry {
+                        window: window_handle,
+                        dock,
+                        panel,
+                        view,
+                        home: None,
+                    });
+                    cx.notify();
                 });
             }
         }
-        cx.notify();
     }
 }
 
