@@ -333,6 +333,8 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 struct ViewElementState {
+    // claudesktop patch: 父视图整块重放时，子视图仍保留更早帧的区间。
+    painted_generation: Option<u64>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
@@ -574,6 +576,8 @@ fn prepaint_view(
                 let scroll_cache = scroll_cache.filter(|_| !window.scroll_prepaint_recording);
 
                 if let Some(mut element_state) = element_state
+                    && element_state.painted_generation
+                        == Some(window.draw_generation.wrapping_sub(1))
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                 {
@@ -664,6 +668,7 @@ fn prepaint_view(
                 (
                     Some(element),
                     ViewElementState {
+                        painted_generation: None,
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -747,6 +752,7 @@ fn paint_view(
 
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;
+                    element_state.painted_generation = Some(window.draw_generation);
 
                     ((), element_state)
                 },
@@ -921,6 +927,38 @@ mod scroll_cache_tests {
             window.draw(cx).clear(cx);
         });
         assert_eq!(rendered.get(), before_force + 1);
+    }
+
+    struct CachedParent(Entity<Scroller>);
+
+    impl Render for CachedParent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone().cached(StyleRefinement::default().w(px(120.)).h(px(80.)))
+        }
+    }
+
+    #[gpui::test]
+    fn nested_scroll_cache_redraws_after_parent_replays(cx: &mut TestAppContext) {
+        let rendered = Rc::new(Cell::new(0));
+        let (root, cx) = cx.add_window_view(|_, cx| {
+            let body = cx.new(|_| Body {
+                rendered: rendered.clone(),
+                top: Rc::new(Cell::new(px(0.))),
+                clicked_at: Rc::new(Cell::new(None)),
+            });
+            CachedParent(cx.new(|_| Scroller { body, top: px(0.), moving: false }))
+        });
+        let before = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let initial = rendered.get();
+            window.draw(cx).clear(cx);
+            assert_eq!(rendered.get(), initial);
+            let parent = root.read(cx).0.clone();
+            parent.update(cx, |_, cx| cx.notify());
+            initial
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(rendered.get(), before + 1);
     }
 
     struct CachedList {

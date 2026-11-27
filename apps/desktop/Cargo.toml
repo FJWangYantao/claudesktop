@@ -15,6 +15,10 @@ headless-screenshot = ["gpui-screenshot/test-support", "gpui-platform-screenshot
 [dependencies]
 gpui-kit = { workspace = true }
 gpui-base = "=0.7.3"
+# 终端 Pane：ConPTY + 终端状态机（见 app/pane/terminal_pane.rs）
+# 不要引 crates.io 的 gpui-terminal：它依赖上游 gpui，和 vendor 的 gpui-pre 版本冲突
+portable-pty = "0.9"
+alacritty_terminal = "0.25"
 gpui-screenshot = { package = "gpui-pre", version = "=0.3.9", default-features = false, optional = true }
 gpui-platform-screenshot = { package = "gpui-pre-platform", version = "=0.3.9", default-features = false, optional = true }
 claudesktop-core = { path = "../../crates/core" }

@@ -19,10 +19,7 @@ pub(crate) struct PlanPane {
 
 impl PlanPane {
     pub(crate) fn new(app: WeakEntity<ChatApp>, cx: &mut Context<Self>) -> Self {
-        if let Some(upgraded) = app.upgrade() {
-            let hub = upgraded.read(cx).hub.clone();
-            super::follow_hub(&hub, cx);
-        }
+        super::follow_hub(app.clone(), cx);
         Self { app, focus_handle: cx.focus_handle() }
     }
 }

@@ -353,29 +353,27 @@ impl ChatApp {
 
         // 上次的布局优先；读不懂 / 没存过 / 恢复出来一个没有对话 Pane 的布局，都用默认布局。
         // （没有对话 Pane 的窗口等于空壳，宁可丢一次布局）
-        let saved = persist::read();
-        let restored = saved
-            .as_ref()
-            .map(|file| {
-                let state = file.main.clone();
-                self.dock.update(cx, |dock, cx| dock.load(state, window, cx).is_ok())
-            })
-            .unwrap_or(false);
-        if !restored || !self.focus_pane_of_kind(PaneKind::Chat, window, cx) {
+        let Some(file) = persist::read() else {
             self.install_default_layout(window, cx);
-        } else if let Some(file) = saved {
-            // 弹出窗等主窗起来之后再开：在构造函数里开新窗口是重入
-            let states = file.popouts;
-            if !states.is_empty() {
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_millis(0)).await;
-                    let _ = this.update(cx, |app, cx| app.restore_popouts(states, cx));
-                })
-                .detach();
+            self.sync_right_dock(window, cx);
+            return;
+        };
+        // 注册表重建对话面板时会读取会话、登记面板。加载主布局和独立窗时都要释放主窗借用。
+        let main = cx.entity();
+        window.defer(cx, move |window, cx| {
+            let restored = dock.update(cx, |dock, cx| dock.load(file.main, window, cx).is_ok());
+            let keep_popouts = main.update(cx, |app, cx| {
+                let has_chat = restored && app.focus_pane_of_kind(PaneKind::Chat, window, cx);
+                if !has_chat {
+                    app.install_default_layout(window, cx);
+                }
+                app.sync_right_dock(window, cx);
+                has_chat
+            });
+            if keep_popouts && !file.popouts.is_empty() {
+                Self::restore_popouts(&main, file.popouts, cx);
             }
-        }
-        // 右侧那一列跟着 `right_panel.open` 走（会话切到聊天空间时会收起）
-        self.sync_right_dock(window, cx);
+        });
     }
 
     /// 内置默认布局：中间一个对话 Pane，右侧文件 / 改动两个 Tab。
@@ -433,6 +431,10 @@ impl ChatApp {
             PaneKind::Subagent => {
                 Arc::new(PaneHandle::new(cx.new(|cx| SubagentPane::new(app, cx))))
             }
+            // 终端：布局里存下来就重开一块（历史不恢复，进程重启后是新 shell）
+            PaneKind::Terminal => Arc::new(PaneHandle::new(
+                cx.new(|cx| super::terminal_pane::TerminalPane::new(app, cx)),
+            )),
             // 侧问不落盘，恢复时给一块**空的新侧问**（影子会话是新建的），
             // 而不是像以前那样兜底成一块莫名其妙的文件面板
             PaneKind::SideChat => {
@@ -640,13 +642,21 @@ impl ChatApp {
         }
         self.layout_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(LAYOUT_SAVE_DEBOUNCE).await;
-            let _ = this.update(cx, |app, cx| {
+            let Ok((dock, popouts)) = this.update(cx, |app, _| {
                 app.layout_save = None;
-                let mut file = persist::snapshot(app.dock.read(cx), cx);
+                let popouts =
+                    app.popouts.iter().map(|p| (p.dock.clone(), p.window)).collect::<Vec<_>>();
+                (app.dock.clone(), popouts)
+            }) else {
+                return;
+            };
+            // 面板序列化时会读取主窗的文件树和差异状态，必须先结束对主窗的更新。
+            cx.update(|cx| {
+                let mut file = persist::snapshot(dock.read(cx), cx);
                 // 弹出窗也记一笔（位置 + 内部布局），下次打开时能照原样摆回去
-                for entry in &app.popouts {
-                    let area = entry.dock.read(cx).dump(cx);
-                    let bounds = entry.window.update(cx, |_, window, _| window.bounds());
+                for (dock, window) in popouts {
+                    let area = dock.read(cx).dump(cx);
+                    let bounds = window.update(cx, |_, window, _| window.bounds());
                     if let Ok(bounds) = bounds {
                         let bounds = persist::PersistedBounds {
                             x: f32::from(bounds.origin.x),
@@ -655,8 +665,6 @@ impl ChatApp {
                             height: f32::from(bounds.size.height),
                         };
                         file.popouts.push(persist::PopoutLayoutState { bounds, area });
-                        // 面板 id 与它原来所在的组另存一份，吸回时用得着
-                        let _ = entry.panel;
                     }
                 }
                 persist::write(&file);

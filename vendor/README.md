@@ -84,6 +84,7 @@ gpui-kit 0.7.3 依赖的 gpui 快照（lib 名 `gpui`）。拷自 crates.io 发�
   `src/scene.rs` 录制未受外层视口裁切的图元，`src/window.rs` 接力上一帧的布局、元素状态和输入处理器。
   每帧沿 Y 轴按物理像素平移，再应用当前视口裁切。指针按下、抬起或纯横向滚动前同步正文布局，
   避免命中回调使用旧坐标。整窗刷新、缩放变化和 atlas 失效都会更新快照。
+  缓存视图只从紧邻的上一帧复用索引。父视图整块重放时，子视图没有更新自己的索引，下次单独绘制时需重建。
 - **合成器帧时间戳**：`PlatformWindow::frame_vsync_at` 提供默认空值，`Window::frame_vsync_at` 将它转发给滚轮控制器。
   时间戳独立于 `RequestFrameOptions` 和 profiler。
 

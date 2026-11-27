@@ -19,6 +19,7 @@ pub(crate) mod popout;
 pub(crate) mod side_chat_pane;
 pub(crate) mod skin;
 pub(crate) mod subagent_pane;
+pub(crate) mod terminal_pane;
 pub(crate) mod workspace;
 
 use gpui_base::dock::Panel as BasePanel;
@@ -298,18 +299,14 @@ pub(crate) fn pane_state(kind: PaneKind, info: serde_json::Value) -> PanelState 
 /// 主窗里的 Pane 靠 `ChatApp` 每帧重绘顺带刷新，但**弹出到独立窗之后就没人管它**了：
 /// 主窗流式生成、切会话、改文件时那张窗会完全静止。所以每个 Pane 建的时候都订一次，
 /// 事件类型先不细挑——Pane 的渲染都是便宜的投影，重画一次比漏一次刷新划算。
-pub(crate) fn follow_hub<T: 'static>(
-    hub: &Entity<crate::app::hub::WorkspaceHub>,
-    cx: &mut Context<T>,
-) {
-    cx.subscribe(
-        hub,
-        |_: &mut T,
-         _: Entity<crate::app::hub::WorkspaceHub>,
-         _: &crate::app::hub::HubEvent,
-         cx: &mut Context<T>| {
-            cx.notify();
-        },
-    )
-    .detach();
+pub(crate) fn follow_hub<T: 'static>(app: WeakEntity<crate::app::ChatApp>, cx: &mut Context<T>) {
+    // 面板常在主窗的构造或更新期间创建；这轮结束后才能读取主窗实体。
+    let pane = cx.weak_entity();
+    cx.defer(move |cx| {
+        let Some(app) = app.upgrade() else { return };
+        let hub = app.read(cx).hub.clone();
+        let _ = pane.update(cx, |_, cx| {
+            cx.subscribe(&hub, |_, _, _: &crate::app::hub::HubEvent, cx| cx.notify()).detach();
+        });
+    });
 }
