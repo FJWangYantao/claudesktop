@@ -141,6 +141,11 @@
   背景：`reading_markdown` 流式时补齐半截标记，交给 TextView 的文本每帧都不是上一帧的前缀，
   gpui-kit 的增量解析（`push_str`）用不上，不合批就是整篇 markdown 每个 chunk 重解析一次。
 
+## 后台命令完成后续办
+
+- 主 Code 会话的 `shell_background` 传 `on_complete` 会在整批工具结果提交后以 `waiting_for_task` 收轮。普通后台命令仍可只传 `command`。`shell_followup` 按任务 ID 改指示，空字符串撤销续办；`shell_stop` 同时停止命令并撤销续办。
+- 退出时先收管道尾部，再由 `BackgroundTasks` 快照提示桌面端领取。收到快照、轮末和会话显示恢复时检查，已排队的用户消息优先。`Kernel::resume_background` 在同一会话空闲时领取一次；结果最多附 8 KiB 日志。`BackgroundResumed` 记日志，重放恢复上下文和轮次边界，不计入自动审批的用户授权。回退、关闭会话或退出内核会撤销待续办。等待不占模型请求，任务只在当前应用进程内有效。
+
 ## 工具输出、审查、记忆、检查点
 
 - 命令运行中的输出：`run_shell` 每 0.5 秒把最新几行经 `KernelEvent::ToolCallProgress` 报给界面（不进日志），跑完由最终的 `ToolCallUpdated` 覆盖；

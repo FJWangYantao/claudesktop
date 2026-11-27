@@ -1,7 +1,7 @@
 //! claudesktop patch: 输入框光标滑行。
 //!
-//! 光标换位置时（打字、方向键、跨行、点选）不再瞬移，用 55ms 从旧位置滑到新位置，
-//! 曲线取 CSS 的 `cubic-bezier(0.22, 1, 0.36, 1)`（快起、长尾，末尾几乎停住）。
+//! 光标换位置时（打字、方向键、跨行、点选）不再瞬移，用 100ms 从旧位置滑到新位置，
+//! 曲线取 `cubic-bezier(0.22, 0.90, 0.36, 1)`（60Hz 下首帧约推进 45%，中段轨迹清晰、末尾迅速收稳）。
 //!
 //! 三类情况必须**直接落位**，滑行会变成穿帮的拖尾：
 //!
@@ -18,11 +18,11 @@ use gpui::{Bounds, Pixels, Point, point, px, size};
 use std::time::{Duration, Instant};
 
 /// 一程滑行走完的时间。
-pub(crate) const DURATION: Duration = Duration::from_millis(55);
+pub(crate) const DURATION: Duration = Duration::from_millis(100);
 
-// cubic-bezier(0.22, 1.0, 0.36, 1.0) 的两个控制点。
+// cubic-bezier(0.22, 0.90, 0.36, 1.0) 的两个控制点。
 const CONTROL_X1: f32 = 0.22;
-const CONTROL_Y1: f32 = 1.0;
+const CONTROL_Y1: f32 = 0.90;
 const CONTROL_X2: f32 = 0.36;
 const CONTROL_Y2: f32 = 1.0;
 
@@ -90,6 +90,7 @@ impl SmoothCaretState {
         scale_factor: f32,
     ) -> SmoothCaretFrame {
         let snap = !animate
+            || !focused
             || !self.primed
             || !self.focused
             || target.size != self.to.size
@@ -173,11 +174,11 @@ fn snap_to_device_pixels(bounds: Bounds<Pixels>, scale_factor: f32) -> Bounds<Pi
     )
 }
 
-/// `cubic-bezier(0.22, 1, 0.36, 1)`：给定时间进度（0~1）返回位移进度。
+/// `cubic-bezier(0.22, 0.90, 0.36, 1)`：给定时间进度（0~1）返回位移进度。
 ///
 /// CSS 的曲线是参数方程，横轴也是三次的，所以要先反解 `x(t) = u` 再取 `y(t)`。
 /// 用二分而不上牛顿：这条曲线在两端斜率很大，牛顿容易过冲，二分八步的精度（1/256）
-/// 在 55ms、几十像素的位移上小于 0.2px，够用。
+/// 在 100ms、几十像素的位移上小于 0.2px，够用。
 fn cubic_bezier_ease(progress: f32) -> f32 {
     let u = progress.clamp(0., 1.);
     if u <= 0. {
@@ -257,12 +258,12 @@ mod tests {
         assert!(start.animating);
 
         let middle =
-            state.advance_at(at(127), caret(100.), Point::default(), true, false, true, 1.);
+            state.advance_at(at(140), caret(100.), Point::default(), true, false, true, 1.);
         let x = f32::from(middle.bounds.origin.x);
         assert!((40.0..100.0).contains(&x), "中途应在起终点之间：{x}");
         assert!(middle.animating);
 
-        let end = state.advance_at(at(200), caret(100.), Point::default(), true, false, true, 1.);
+        let end = state.advance_at(at(220), caret(100.), Point::default(), true, false, true, 1.);
         assert_eq!(end.bounds.origin.x, gpui::px(100.));
         assert!(!end.animating, "走完这一程就不该再排帧");
     }

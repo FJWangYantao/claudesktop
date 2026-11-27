@@ -12,8 +12,9 @@ gpui-kit 0.7.3 的基础组件层（Markdown 的 `TextView`、表格、列表都
 **当前有两处改动**（`grep -rn "claudesktop patch" vendor/gpui-base/` 核对）：
 
 - **光标滑行**（`src/input/base/smooth_caret.rs`，新文件；接线在 `src/input/base/element.rs` 的 `paint`
-  与 `src/input/base/state.rs` 的 `smooth_caret_frame`）：光标换位置时用 55ms 从旧位置滑过去，
-  曲线 `cubic-bezier(0.22, 1, 0.36, 1)`（二分反解 `x(t)`）；路过的位置对齐设备像素，`paint_quad` 留 1px 圆角。
+  与 `src/input/base/state.rs` 的 `smooth_caret_frame`）：光标换位置时用 100ms 从旧位置滑过去，
+  曲线 `cubic-bezier(0.22, 0.90, 0.36, 1)`（二分反解 `x(t)`）；路过的位置对齐设备像素，`paint_quad` 留 1px 圆角，
+  单光标且开着动效时叠一层 3px 外发光（对应 CSS 6px glow）。
   刚聚焦、文档被清空、光标尺寸变化、多光标 / 有选区 / `App::reduce_motion` 为真时直接落位（不滑）；
   纯滚动按滚动增量整体平移 `from`/`to`，避免滚动时看到光标慢慢追上来。滑行期间只对输入框所在 view
   `request_animation_frame`，走完即停帧。`blink_cursor.rs` 的 `PAUSE_DELAY` 同时 300ms → 420ms，

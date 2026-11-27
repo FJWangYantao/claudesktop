@@ -36,8 +36,20 @@ pub(super) fn shell_rule(command: &str) -> Option<String> {
 }
 
 /// `shell_background`：起一条后台命令，立刻回任务 ID。
-pub(super) fn start_background(command: &str, cwd: &Path) -> ToolOutput {
-    match crate::bgtasks::start(command, cwd) {
+pub(crate) fn start_background(
+    command: &str,
+    cwd: &Path,
+    followup: Option<crate::bgtasks::Followup>,
+) -> ToolOutput {
+    let waiting = followup.is_some();
+    match crate::bgtasks::start(command, cwd, followup) {
+        Ok(id) if waiting => ToolOutput {
+            wait_background: true,
+            ..ToolOutput::ok(
+                format!("Started {id}. Completion will resume this session."),
+                format!("后台 {id} · 完成后继续"),
+            )
+        },
         Ok(id) => ToolOutput::ok(
             format!(
                 "Started {id} in the background. Read its output with `shell_output` \

@@ -538,6 +538,23 @@ impl Inner {
         let before = target.as_deref().and_then(checkpoint::read_snapshot);
         // 后台任务记在这个会话名下（事件里按会话分组）
         bgtasks::set_current(self.kernel_id, session);
+        if let Action::ShellBackground { command, cwd, on_complete: Some(instruction) } = action {
+            if self.is_subagent(session) {
+                return ToolOutput::fail(
+                    "Automatic follow-up requires a main session.",
+                    "子会话不支持自动续办",
+                );
+            }
+            let origin = self.sessions.lock().unwrap().get(session).and_then(|s| s.turn.clone());
+            let Some(origin) = origin.filter(|_| !stopped()) else {
+                return ToolOutput::fail("cancelled", "已中断");
+            };
+            return tools::start_background(
+                command,
+                cwd,
+                Some(bgtasks::Followup { instruction: instruction.clone(), origin }),
+            );
+        }
         let output = action.run(
             stopped,
             &|output| {

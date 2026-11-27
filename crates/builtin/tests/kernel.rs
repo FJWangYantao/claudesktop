@@ -21,6 +21,8 @@ enum Reply {
     Sse { lines: Vec<String>, gap_ms: u64 },
     /// 非 2xx + JSON 错误体
     Status(u16, &'static str),
+    /// 从真实工具结果取任务 ID，多个测试并行时也能跟进自己的命令。
+    BackgroundTool(&'static str, &'static str, serde_json::Value),
 }
 
 /// 按顺序回放剧本的本地服务器；返回 (base_url, 收到的请求体)。
@@ -35,6 +37,27 @@ fn serve(script: Vec<Reply>) -> (String, Arc<Mutex<Vec<String>>>) {
                 return;
             };
             let body = read_request(&stream);
+            let reply = match reply {
+                Reply::BackgroundTool(call, name, mut args) => {
+                    let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let id = request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .filter(|m| m["role"] == "tool")
+                        .filter_map(|m| m["content"].as_str())
+                        .find_map(|s| {
+                            s.strip_prefix("Started ")?
+                                .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                                .next()
+                        })
+                        .expect("后台启动结果");
+                    args["id"] = id.into();
+                    tool_call(call, name, args)
+                }
+                reply => reply,
+            };
             seen.lock().unwrap().push(body);
             let _ = respond(stream, reply);
         }
@@ -65,6 +88,7 @@ fn respond(mut stream: TcpStream, reply: Reply) -> std::io::Result<()> {
     // 每行立刻发出去（不让 Nagle 攒包），流式的时间间隔才准
     stream.set_nodelay(true)?;
     match reply {
+        Reply::BackgroundTool(..) => unreachable!("已替换任务 ID"),
         Reply::Status(code, body) => write!(
             stream,
             "HTTP/1.1 {code} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -3635,8 +3659,8 @@ fn background_shell_runs_reads_and_stops() {
             "shell_background",
             serde_json::json!({ "command": "echo hello; sleep 5" }),
         ),
-        tool_call("b2", "shell_output", serde_json::json!({ "id": "bg-1", "wait_secs": 10 })),
-        tool_call("b3", "shell_stop", serde_json::json!({ "id": "bg-1" })),
+        Reply::BackgroundTool("b2", "shell_output", serde_json::json!({ "wait_secs": 10 })),
+        Reply::BackgroundTool("b3", "shell_stop", serde_json::json!({})),
         happy_stream("好了"),
     ]);
     let h = Harness::with_cwd(base, dir.clone());
@@ -3669,6 +3693,132 @@ fn background_shell_runs_reads_and_stops() {
     // 停掉之后状态行是完成
     assert_eq!(h.tool_status("b3").as_deref(), Some("completed"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 用文件精确控制完成时机；第二轮在等权限，后台结果不能抢走会话。
+#[test]
+fn background_followup_yields_and_resumes_once_after_user_turn() {
+    let dir = workdir("bg-resume");
+    let command = if cfg!(windows) {
+        "while (!(Test-Path release)) { Start-Sleep -Milliseconds 30 }; Write-Output final-marker; exit 7"
+    } else {
+        "while [ ! -f release ]; do sleep 0.03; done; echo final-marker; exit 7"
+    };
+    let (base, bodies) = serve(vec![
+        tool_call(
+            "launch",
+            "shell_background",
+            serde_json::json!({"command":command, "on_complete":"analyze failures"}),
+        ),
+        Reply::BackgroundTool(
+            "edit",
+            "shell_followup",
+            serde_json::json!({"instruction":"only report the status"}),
+        ),
+        tool_call("other", "shell", serde_json::json!({"command":"echo user-work"})),
+        happy_stream("用户这一轮完成"),
+        happy_stream("测试退出码为 7"),
+    ]);
+    let h = Harness::with_cwd(base, dir.clone());
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("后台跑测试")).unwrap();
+    let (id, _) = h.permission(1);
+    h.kernel.resolve_permission(id, Some("allow_once".into())).unwrap();
+    h.wait("释放会话", |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "waiting_for_task"));
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+    assert!(!h.kernel.resume_background(&sid).unwrap());
+    h.kernel.send_prompt(&sid, UserPrompt::text("只报状态，先做另一件事")).unwrap();
+    let (id, _) = h.permission(2);
+    std::fs::write(dir.join("release"), "").unwrap();
+    h.wait("回调就绪", |e| matches!(e, KernelEvent::BackgroundTasks {tasks} if tasks.iter().any(|t| t.ready_to_resume)));
+    assert!(!h.kernel.resume_background(&sid).unwrap());
+    h.kernel.resolve_permission(id, Some("allow_once".into())).unwrap();
+    h.wait(
+        "用户轮结束",
+        |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn"),
+    );
+    assert!(h.kernel.resume_background(&sid).unwrap());
+    h.wait(
+        "自动续办",
+        |e| matches!(e, KernelEvent::AgentMessageChunk {text} if text.contains("退出码为 7")),
+    );
+    assert!(!h.kernel.resume_background(&sid).unwrap());
+    let request: serde_json::Value =
+        serde_json::from_str(bodies.lock().unwrap().last().unwrap()).unwrap();
+    let last = request["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();
+    assert!(
+        last.contains("only report the status")
+            && last.contains("final-marker")
+            && last.contains("\"exit_code\":7"),
+        "{last}"
+    );
+    h.kernel.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn background_followup_finishing_before_launch_turn_ends_is_retained() {
+    let (base, bodies) = serve(vec![
+        tool_calls(&[
+            (
+                "launch",
+                "shell_background",
+                serde_json::json!({"command":"echo immediate", "on_complete":"report"}),
+            ),
+            ("gate", "shell", serde_json::json!({"command":"echo authorized"})),
+        ]),
+        happy_stream("回报结果"),
+    ]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("启动任务")).unwrap();
+    let (id, _) = h.permission(1);
+    h.kernel.resolve_permission(id, Some("allow_once".into())).unwrap();
+    let (id, _) = h.permission(2);
+    h.wait("先到的完成通知", |e| matches!(e, KernelEvent::BackgroundTasks {tasks} if tasks.iter().any(|t| t.ready_to_resume)));
+    assert!(!h.kernel.resume_background(&sid).unwrap());
+    h.kernel.resolve_permission(id, Some("allow_once".into())).unwrap();
+    h.wait(
+        "提交本批工具",
+        |e| matches!(e, KernelEvent::TurnEnded {stop_reason} if stop_reason == "waiting_for_task"),
+    );
+    assert!(h.kernel.resume_background(&sid).unwrap());
+    h.wait(
+        "完成",
+        |e| matches!(e, KernelEvent::TurnEnded {stop_reason} if stop_reason == "end_turn"),
+    );
+    assert!(!h.kernel.resume_background(&sid).unwrap());
+    assert_eq!(bodies.lock().unwrap().len(), 2);
+    h.kernel.shutdown();
+}
+
+#[test]
+fn background_followup_can_be_revoked_after_an_immediate_exit() {
+    let (base, bodies) = serve(vec![
+        tool_call(
+            "launch",
+            "shell_background",
+            serde_json::json!({"command":"echo done", "on_complete":"report"}),
+        ),
+        Reply::BackgroundTool("revoke", "shell_followup", serde_json::json!({"instruction":""})),
+        happy_stream("已取消续办"),
+    ]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("后台跑")).unwrap();
+    let (id, _) = h.permission(1);
+    h.kernel.resolve_permission(id, Some("allow_once".into())).unwrap();
+    h.wait("释放会话", |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "waiting_for_task"));
+    h.wait("完成通知", |e| matches!(e, KernelEvent::BackgroundTasks {tasks} if tasks.iter().any(|t| t.ready_to_resume)));
+    h.kernel.send_prompt(&sid, UserPrompt::text("取消续办")).unwrap();
+    h.wait(
+        "撤销",
+        |e| matches!(e, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn"),
+    );
+    assert_eq!(h.tool_status("revoke").as_deref(), Some("completed"));
+    assert!(!h.kernel.resume_background(&sid).unwrap());
+    assert_eq!(bodies.lock().unwrap().len(), 3);
+    h.kernel.shutdown();
 }
 
 /// 第一轮正常结束后让模型起标题：单独一次请求（不带工具），标题从流里取。

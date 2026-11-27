@@ -8,10 +8,12 @@
 //! 内容区里的动画（展开、悬停淡入、平滑滚动）通知的是当前 view，也就是内容区自己；
 //! 常驻的循环动画（转圈、呼吸点、扫光）例外，由叠在上面的 `motion::LoopOverlay` 画（见 motion.rs 文件头）。
 
+use super::chat::WheelMotion;
 use super::widgets::edge_fade;
 use super::{ChatApp, motion};
 use crate::model::ChatItem;
 use crate::session::{ListMetrics, Row, WheelScroll, scroll_handle_fades};
+use crate::settings::WheelMotionPref;
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
@@ -294,6 +296,9 @@ impl ChatApp {
             measured: list_w > px(0.),
         });
         self.sessions[active].sync_list(view);
+        let trace_wheel = !settling
+            && self.sessions[active].wheel.is_some()
+            && crate::session::wheel_trace::enabled();
         // 滚轮在列表状态（行数、定位）都更新完之后才推进这一帧，免得和跳转、补行抢
         if !settling {
             moved_this_frame |= self.step_wheel(window, cx);
@@ -471,14 +476,42 @@ impl ChatApp {
                     }
                     let precise = event.delta.precise()
                         || std::env::var_os("CLAUDESKTOP_WHEEL").is_some_and(|v| v == "direct");
-                    // 指针在展开的工具输出上、那个框还能往这个方向滚：capture 阶段就把它滚掉，
-                    // 外层对话列表不再接这一格（放给 bubble 的话列表也会跟着硬跳一次）
                     let pos = event.position;
                     let handled = app
                         .update(cx, |this, cx| {
-                            // 内层滚到底之后，余量交给外层；没交还就是内层吃掉（见 `scroll_tool_output`）
-                            if let Some(rest) = this.scroll_tool_output(pos, dy, cx) {
-                                this.wheel_by(-rest, precise, cx);
+                            let motion = match this.settings.wheel_motion {
+                                _ if precise => WheelMotion::Direct,
+                                WheelMotionPref::Off => WheelMotion::Direct,
+                                WheelMotionPref::Short => WheelMotion::Short,
+                                WheelMotionPref::Smooth => WheelMotion::Smooth,
+                                WheelMotionPref::Follow if cx.reduce_motion() => {
+                                    WheelMotion::Direct
+                                }
+                                WheelMotionPref::Follow => WheelMotion::Smooth,
+                            };
+                            let rest = this.scroll_tool_output(pos, dy, cx);
+                            // 短程档三行一格走 64 逻辑像素。只缩短正文收到的位移。
+                            let outer = if motion == WheelMotion::Short {
+                                rest * (px(64. / 3.) / line)
+                            } else {
+                                rest
+                            };
+                            if crate::session::wheel_trace::enabled() {
+                                crate::session::wheel_trace::record(
+                                    "input",
+                                    serde_json::json!({
+                                        "session": this.sessions[this.active].token,
+                                        "dy": (-dy).as_f32(),
+                                        "nested": (rest - dy).as_f32(),
+                                        "outer": (-outer).as_f32(),
+                                        "precise": event.delta.precise(),
+                                        "direct": motion == WheelMotion::Direct,
+                                        "short": motion == WheelMotion::Short,
+                                    }),
+                                );
+                            }
+                            if outer != px(0.) {
+                                this.wheel_by(-outer, motion, cx);
                             }
                             true
                         })
@@ -491,6 +524,22 @@ impl ChatApp {
         )
         .absolute()
         .inset_0();
+        let trace_paint = trace_wheel.then(|| {
+            let token = self.sessions[active].token;
+            canvas(
+                |_, _, _| {},
+                move |_, _, _, _| {
+                    crate::session::wheel_trace::record(
+                        "paint",
+                        serde_json::json!({
+                            "session": token,
+                        }),
+                    );
+                },
+            )
+            .absolute()
+            .size_0()
+        });
         // 按会话划开元素状态：展开进度、悬停淡入这些按行号记的状态不串到别的会话
         div()
             .id(("transcript", self.sessions[active].token))
@@ -505,6 +554,7 @@ impl ChatApp {
             .child(edge_fade(fade_top, paper, clear).top_0())
             .child(edge_fade(fade_bottom, clear, paper).bottom_0())
             .children(self.render_jump_to_bottom(window, cx))
+            .children(trace_paint)
             .into_any_element()
     }
 }

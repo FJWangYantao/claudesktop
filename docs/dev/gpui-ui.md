@@ -193,9 +193,11 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   - 一次性过渡的时长 / 曲线取 `cx.theme().motion_tokens()`，不自己写数字。
   - 对话列表的滚轮在 `content.rs` 的 capture 阶段截住，走 `ChatApp::wheel_by` / `step_wheel`
     （gpui `List` 自己一格硬跳）。`session::WheelInput` 按剩余位移推进，补量上方行高后滚动距离不变。
-    默认根字号下 Windows 三行一格走 96px。同向累加并继承速度，反向清空，到边界作废朝外的余量。
-    Chromium 156 的滚轮参考是 `EASE_IN_OUT + INVERSE_DELTA`，Impulse 已移除。横向控制点固定为 0.42 和 0.58，
-    用缩短时长约束继承速度。允许 `x1 > x2` 会在连滚时放大速度起伏。段长默认 100–200ms，单帧最多 48px。
+    默认根字号下 Windows 三行一格走 96px。同向输入叠加独立曲线，反向清空，到边界作废朝外的余量。
+    单格曲线按实测拟合为 184ms。连滚时按相邻输入间隔为新曲线选择 156–184ms，单帧最多 48px。
+    「对话滚轮动画」默认跟随全局动画，也可以单独选标准、短程或关。短程档的正文鼠标滚轮
+    三行一格走 64 逻辑像素、120ms 收尾，步长独立于界面字号。精确滚动输入直接应用位移。
+    `CLAUDESKTOP_WHEEL_TRACE=<路径>` 记录输入分配、列表位移与内容区 paint 时间，适用于隔离窗口验收。
     Windows 优先用 `Window::frame_vsync_at()`，合成器同周期内的额外重画跳过。没有时间戳时用墙钟滞回量化。
     最后一步仍标记为 `transcript_scrolling`，避免落定时一帧重排整屏正文。精确输入前静态重排命中区，
     消息操作栏在停稳 120ms 后从当前光标位置淡入（见 HANDOFF）。
@@ -203,7 +205,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     按指针位置和边界选择内层或外层，切分类 / 来源要清掉对应的 `*_wheel`。新的程序化滚动（跳转、跟随底部）
     也要清掉对应滚动状态，否则两边抢。
     展开的工具输出自带限高滚动区：每次内容区渲染把它的区域和句柄登记进 `ChatApp::tool_scroll_regions`，
-    滚轮落在上面且还能滚时 `scroll_tool_output` 在 capture 阶段就把这一格滚掉并照常拦下事件
+    滚轮落在上面时 `scroll_tool_output` 在 capture 阶段先消耗内层能滚的距离，余量接给外层并照常拦下事件
     （只放行不拦会双滚动：`overflow_y_scroll` 和列表的 bubble 监听器都会各滚一次）。
 - **侧栏分区**：代码空间默认**按项目**管（`SidebarGrouping::Project`，在「设置 · 通用 · 侧栏 · 会话管理」切换）：
   上半区是项目（`session_groups` 按工作目录分组，当前项目在前，`same_project_path` 比对路径，

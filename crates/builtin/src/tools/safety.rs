@@ -54,6 +54,7 @@ pub(super) struct ShellArgs {
     command: String,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    on_complete: Option<String>,
 }
 
 impl Action {
@@ -117,7 +118,20 @@ impl Action {
                 if a.command.trim().is_empty() {
                     return Err("shell_background: `command` is empty".into());
                 }
-                Self::ShellBackground { command: a.command, cwd: cwd.to_path_buf() }
+                Self::ShellBackground {
+                    command: a.command,
+                    cwd: cwd.to_path_buf(),
+                    on_complete: a.on_complete.filter(|s| !s.trim().is_empty()),
+                }
+            }
+            SHELL_FOLLOWUP => {
+                #[derive(Deserialize)]
+                struct Args {
+                    id: String,
+                    instruction: String,
+                }
+                let a: Args = de(name, args)?;
+                Self::ShellFollowup { id: a.id, instruction: a.instruction }
             }
             SHELL_OUTPUT => {
                 let a: ShellOutputArgs = de(name, args)?;
@@ -218,7 +232,9 @@ impl Action {
             | Self::Grep { .. }
             | Self::Task { .. } => Access::Read,
             // 读后台输出 / 停任务是对已有调用的跟进，不再问
-            Self::ShellOutput { .. } | Self::ShellStop { .. } => Access::Read,
+            Self::ShellOutput { .. } | Self::ShellFollowup { .. } | Self::ShellStop { .. } => {
+                Access::Read
+            }
             Self::Write { .. } | Self::Edit { .. } => Access::Edit,
             Self::Shell { .. } | Self::ShellBackground { .. } => Access::Exec,
             Self::Fetch { .. } | Self::Search { .. } => Access::Fetch,
@@ -233,7 +249,9 @@ impl Action {
             Self::Glob { .. } | Self::Grep { .. } => "search",
             Self::Write { .. } | Self::Edit { .. } => "edit",
             Self::Shell { .. } | Self::ShellBackground { .. } => "execute",
-            Self::ShellOutput { .. } | Self::ShellStop { .. } => "read",
+            Self::ShellOutput { .. } | Self::ShellFollowup { .. } | Self::ShellStop { .. } => {
+                "read"
+            }
             Self::Fetch { .. } | Self::Search { .. } => "fetch",
             Self::Mcp { .. } => "other",
             Self::Task { .. } => "think",
@@ -250,6 +268,7 @@ impl Action {
             Self::Shell { command, .. } => format!("`{}`", command.trim()),
             Self::ShellBackground { command, .. } => format!("`{}`（后台）", command.trim()),
             Self::ShellOutput { id, .. } => format!("后台输出 {id}"),
+            Self::ShellFollowup { id, .. } => format!("修改后台续办 {id}"),
             Self::ShellStop { id } => format!("结束后台任务 {id}"),
             Self::Fetch { url, .. } => format!("Fetch {url}"),
             Self::Search { query } => format!("Search {query}"),
@@ -376,7 +395,13 @@ impl Action {
             Self::Shell { command, timeout, cwd } => {
                 run_shell(command, cwd, *timeout, should_stop, progress)
             }
-            Self::ShellBackground { command, cwd } => start_background(command, cwd),
+            Self::ShellBackground { command, cwd, .. } => start_background(command, cwd, None),
+            Self::ShellFollowup { id, instruction } => {
+                match crate::bgtasks::update_followup(id, instruction) {
+                    Ok(text) => ToolOutput::ok(text, text),
+                    Err(e) => ToolOutput::fail(e, "无法更新续办"),
+                }
+            }
             Self::ShellOutput { id, wait_secs } => {
                 match crate::bgtasks::output(id, Duration::from_secs(*wait_secs), should_stop) {
                     Ok(text) => {
@@ -389,7 +414,7 @@ impl Action {
                     Err(e) => ToolOutput::fail(e, "没有这个任务"),
                 }
             }
-            Self::ShellStop { id } => match crate::bgtasks::stop(id) {
+            Self::ShellStop { id } => match crate::bgtasks::stop_owned(id) {
                 Ok(text) => ToolOutput::ok(text.clone(), text),
                 Err(e) => ToolOutput::fail(e, "没有这个任务"),
             },

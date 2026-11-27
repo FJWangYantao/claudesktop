@@ -73,6 +73,20 @@ impl ChatApp {
                 ),
             ),
             motion_row,
+            setting_row(
+                "对话滚轮动画",
+                seg_control(
+                    "wheel-motion",
+                    WheelMotionPref::ALL.map(|m| (m, m.label())),
+                    self.settings.wheel_motion,
+                    |this, mode, _, cx| {
+                        this.sessions[this.active].wheel = None;
+                        this.save_ui_pref(move |s| s.wheel_motion = mode, cx);
+                        cx.notify();
+                    },
+                    cx,
+                ),
+            ),
             ambient_row,
             self.auto_load_images_row(cx),
             self.font_scale_row(),

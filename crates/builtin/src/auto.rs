@@ -225,7 +225,7 @@ pub fn action_section(title: &str, action: &Action, cwd: &Path) -> String {
     out.push_str(&format!("working directory: {}\n", cwd.display()));
     out.push_str(&format!("tool: {} ({})\n", action.kind(), title));
     match action {
-        Action::Shell { command, cwd, .. } | Action::ShellBackground { command, cwd } => {
+        Action::Shell { command, cwd, .. } | Action::ShellBackground { command, cwd, .. } => {
             out.push_str(&format!("shell command (in {}):\n{command}\n", cwd.display()));
         }
         Action::Fetch { url, .. } => out.push_str(&format!("fetch URL (read-only): {url}\n")),

@@ -18,7 +18,8 @@ struct PrismRim {
     uint dark;
     uint tone_key;
     uint mode;
-    float3 pad;
+    float inset;
+    float2 pad;
 };
 
 StructuredBuffer<PrismRim> rims: register(t1);
@@ -67,37 +68,36 @@ float4 prism_rim_fragment(PrismRimFragmentInput input): SV_Target {
         discard;
     }
 
-    float2 half_size = max(rim.bounds.size * 0.5, float2(0.5, 0.5));
-    float2 center_to_point = (input.position.xy - rim.bounds.origin) - half_size;
+    // `rim.bounds` 四边向卡片外扩了 `rim.inset` 像素，这里把半宽半高缩回卡片真实边缘，
+    // 这样描边环（sdf == 0）外半截和柔和微光都不会被 quad 边界裁掉。
+    float2 full_half = max(rim.bounds.size * 0.5, float2(0.5, 0.5));
+    float2 center_to_point = (input.position.xy - rim.bounds.origin) - full_half;
+    float2 card_half = max(full_half - rim.inset, float2(0.5, 0.5));
     float corner_radius = rim_corner_radius(center_to_point, rim.corner_radii);
-    float sdf = rounded_rect_sdf(center_to_point, half_size, corner_radius);
+    float sdf = rounded_rect_sdf(center_to_point, card_half, corner_radius);
 
-    // 只在描边环上画：环心在 sdf == 0，宽度 stroke_width，边缘 1px 抗锯齿。
-    float coverage = saturate(rim.stroke_width * 0.5 - abs(sdf) + 0.5);
-    if (coverage <= 0.002) {
+    // 指针归一化半径：只渲染光谱覆盖的区域，离开半径外直接丢弃。
+    float dist_to_pointer = length(input.position.xy - rim.pointer);
+    float r = dist_to_pointer / max(rim.radius, 1.);
+    if (r >= 1.) {
         discard;
     }
 
-    // 指针光谱：距离归一化后既决定「有没有颜色」也决定色相偏移，
-    // 指针离得远时只剩描边自身的淡墨色。
-    float2 to_pointer = input.position.xy - rim.pointer;
-    float distance_to_pointer = length(to_pointer);
-    float proximity = saturate(1. - distance_to_pointer / max(rim.radius, 1.));
-    proximity *= proximity;
+    // 完整描边 + 随 inset 归一化的柔和玻璃微光（到外扩边界处衰减到近零，无硬切边）。
+    float stroke_cov = saturate(rim.stroke_width * 0.5 - abs(sdf) + 0.5);
+    float halo_scale = max(rim.inset * 0.35, 1.);
+    float halo_cov = exp(-abs(sdf) / halo_scale) * (rim.dark > 0.5 ? 0.36 : 0.22);
+    float shape = saturate(stroke_cov + halo_cov);
+    if (shape <= 0.004) {
+        discard;
+    }
 
-    float angle = atan2(to_pointer.y, to_pointer.x) / 6.2831853 + 0.5;
-    float hue_t = frac(angle + distance_to_pointer / max(rim.radius, 1.) * 0.35);
-    float3 spectral = prism_palette(rim.tone_key, hue_t, rim.dark);
+    float4 spec = prism_rim_sample(rim.tone_key, r, rim.dark > 0.5 ? 1. : 0.);
+    float mono_mul = rim.tone_key == 5u ? 0.62 : 1.;
+    float alpha = shape * spec.a * rim.alpha * mono_mul;
+    if (alpha <= 0.002) {
+        discard;
+    }
 
-    // 底色：浅色底用淡墨，深色底用亮白；指针越近越吃光谱色。
-    float3 base = rim.dark > 0.5 ? float3(0.97, 0.96, 0.95) : float3(0.20, 0.19, 0.18);
-    float3 color = lerp(base, spectral, saturate(proximity * 0.9 + 0.06));
-    float alpha = coverage * rim.alpha * (0.34 + 0.66 * proximity);
-
-    // 说明：结构体里的 `mode` 目前恒为 0（只在描边环上画）。原先这里有个
-    // `mode == 1` 的底部反射分支，但上面已经 `discard` 掉环外的像素，那一段永远
-    // 走不到；而且 D3D 的 y 向下，`1 - normalized.y` 算的其实是顶边。真要做，
-    // 得把 discard 挪到反射计算之后重写，先留字段不实现。
-
-    return float4(color * alpha, alpha);
+    return float4(spec.rgb * alpha, alpha);
 }

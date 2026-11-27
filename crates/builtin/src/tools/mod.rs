@@ -30,13 +30,14 @@ use shell::*;
 pub(crate) use files::KeepHunks;
 pub(crate) use safety::{hard_block, reads_only};
 pub use shell::run_command;
-pub(crate) use shell::{background_command, kill_tree, shell_rule_matches};
+pub(crate) use shell::{background_command, kill_tree, shell_rule_matches, start_background};
 
 const READ_FILE: &str = "read_file";
 const LIST_DIR: &str = "list_dir";
 const WRITE_FILE: &str = "write_file";
 const EDIT_FILE: &str = "edit_file";
 const SHELL: &str = "shell";
+const SHELL_FOLLOWUP: &str = "shell_followup";
 const SHELL_BACKGROUND: &str = "shell_background";
 const SHELL_OUTPUT: &str = "shell_output";
 const SHELL_STOP: &str = "shell_stop";
@@ -145,6 +146,11 @@ pub enum Action {
     ShellBackground {
         command: String,
         cwd: PathBuf,
+        on_complete: Option<String>,
+    },
+    ShellFollowup {
+        id: String,
+        instruction: String,
     },
     /// 取后台任务的增量输出（最多等一会儿）
     ShellOutput {
@@ -216,12 +222,15 @@ pub struct ToolOutput {
     pub images: Vec<OutputImage>,
     /// 这一轮到此为止：工具结果已经写好，不要再请求模型（用户选了「自己说」/ 取消提问）
     pub stop_turn: bool,
+    /// 这批工具结果提交后，释放会话等待后台通知。
+    pub wait_background: bool,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>, summary: impl Into<String>) -> Self {
         Self {
             ok: true,
+            wait_background: false,
             content: content.into(),
             summary: summary.into(),
             images: Vec::new(),
@@ -232,6 +241,7 @@ impl ToolOutput {
     pub fn fail(content: impl Into<String>, summary: impl Into<String>) -> Self {
         Self {
             ok: false,
+            wait_background: false,
             content: content.into(),
             summary: summary.into(),
             images: Vec::new(),
@@ -276,10 +286,11 @@ const DEFERRED: &[&str] = &[
     MEMORY_SEARCH,
     MEMORY_WRITE,
     MEMORY_FORGET,
-    // `shell` 的三个配套工具：搜到其中一个，`search` 会把三个一起给
+    // 后台命令的配套工具按组加载。
     SHELL_BACKGROUND,
     SHELL_OUTPUT,
     SHELL_STOP,
+    SHELL_FOLLOWUP,
     "task",
 ];
 
@@ -595,7 +606,7 @@ fn build_specs(writable: bool) -> Vec<Value> {
             format!(
                 "Run a command in {} with the working directory as cwd. stdin is closed; \
                  do not run interactive programs. Timeout defaults to {SHELL_TIMEOUT_DEFAULT}s (max {SHELL_TIMEOUT_MAX}s). \
-                 Returns stdout, stderr and the exit code.{}",
+                 For long jobs, find shell_background with tool_search and set on_complete to resume when done. Returns stdout, stderr and the exit code.{}",
                 shell_name(),
                 DETACH_HINT,
             ),
@@ -614,13 +625,13 @@ fn build_specs(writable: bool) -> Vec<Value> {
                 "Start a long-running command ({}) in the background and return immediately with a \
                  task id. Use it for dev servers, watchers and anything that does not finish \
                  quickly; read what it printed with `{SHELL_OUTPUT}`, stop it with `{SHELL_STOP}`. \
-                 The process is killed when the application exits.{}",
+                 In a main session set on_complete for a finite job when its result is needed: this ends the current turn and wakes you automatically. Omit for servers or fire-and-forget. The process is killed when the application exits.{}",
                 shell_name(),
                 DETACH_HINT,
             ),
             json!({
                 "type": "object",
-                "properties": { "command": { "type": "string" } },
+                "properties": { "command": { "type": "string" }, "on_complete": { "type": "string", "description": "What to do once the command exits. Later user directions take priority." } },
                 "required": ["command"]
             }),
         ));
@@ -640,6 +651,15 @@ fn build_specs(writable: bool) -> Vec<Value> {
                     "wait_secs": { "type": "integer" }
                 },
                 "required": ["id"]
+            }),
+        ));
+        tools.push(f(
+            SHELL_FOLLOWUP,
+            "Change the pending follow-up of a background job in this session. Set instruction to an empty string to cancel the callback and leave the process running.".into(),
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" }, "instruction": { "type": "string" } },
+                "required": ["id", "instruction"]
             }),
         ));
         tools.push(f(
@@ -1235,9 +1255,9 @@ pub fn search(query: &str, candidates: &[(String, String)]) -> Vec<String> {
     scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
     let mut names: Vec<String> =
         scored.into_iter().take(SEARCH_MAX).map(|(_, name)| name.to_string()).collect();
-    // `shell` 的三个配套工具是一套：搜到其中一个就把三个一起给。只拿到 `shell_background`
+    // 后台命令的配套工具是一套：搜到其中一个就一起给。只拿到 `shell_background`
     // 的模型不知道怎么读输出，等于没给。它们同属一套，所以不占 [`SEARCH_MAX`] 的名额。
-    const SHELL_FAMILY: [&str; 3] = [SHELL_BACKGROUND, SHELL_OUTPUT, SHELL_STOP];
+    const SHELL_FAMILY: [&str; 4] = [SHELL_BACKGROUND, SHELL_OUTPUT, SHELL_STOP, SHELL_FOLLOWUP];
     if names.iter().any(|name| SHELL_FAMILY.contains(&name.as_str())) {
         for name in SHELL_FAMILY {
             if !names.iter().any(|found| found == name) {
@@ -1928,6 +1948,7 @@ y
             ("shell_background", "Start a command in the background"),
             ("shell_output", "Read the new output of a background command"),
             ("shell_stop", "Stop a background command"),
+            ("shell_followup", "Change a background follow-up"),
             ("task", "Launch a subagent"),
         ]
         .iter()
@@ -1982,11 +2003,11 @@ y
         assert!(search("", &candidates()).is_empty());
     }
 
-    /// 搜到 `shell` 的配套工具就把三个一起给（只给一个等于没给）。
+    /// 搜到后台命令时，它的配套工具一起给。
     #[test]
     fn search_brings_the_shell_family_together() {
         let found = search("background", &candidates());
-        for name in [SHELL_BACKGROUND, SHELL_OUTPUT, SHELL_STOP] {
+        for name in [SHELL_BACKGROUND, SHELL_OUTPUT, SHELL_STOP, SHELL_FOLLOWUP] {
             assert!(found.iter().any(|f| f == name), "{name} 没一起给：{found:?}");
         }
         // `task` 不影响别的

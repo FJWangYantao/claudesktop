@@ -3232,12 +3232,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         // Paint blinking cursors (shared blink state for all carets)
         //
-        // claudesktop patch：光标换位置（打字、方向键、点选）时用 55ms 滑过去，
+        // claudesktop patch：光标换位置（打字、方向键、点选）时用 100ms 滑过去，
         // 见 `input/base/smooth_caret.rs`。位置记在输入框状态里，这里只取这一帧
         // 该画的矩形；还在滑就为下一帧排一次重绘（只重画输入框所在 view）。
         let cursor_infos = prepaint.cursor_infos_with_scroll();
         let single_caret = cursor_infos.len() == 1;
         let no_selection = selected_range.len() == 0;
+        let caret_glow = single_caret && !cx.reduce_motion();
         let smooth = cursor_infos
             .iter()
             .find(|info| info.is_active)
@@ -3263,14 +3264,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
             let smooth = smooth.filter(|_| single_caret);
             match smooth {
                 Some(frame) => {
-                    paint_caret(window, frame.bounds, editor_style.caret);
+                    paint_caret(window, frame.bounds, editor_style.caret, caret_glow);
                     if frame.animating {
                         window.request_animation_frame();
                     }
                 }
                 None => {
                     for cursor_info in &cursor_infos {
-                        paint_caret(window, cursor_info.bounds, editor_style.caret);
+                        paint_caret(window, cursor_info.bounds, editor_style.caret, false);
                     }
                 }
             }
@@ -3398,9 +3399,21 @@ impl<M: InputModeKind> Element for TextElement<M> {
 ///
 /// 留 1px 圆角是为了让 2px 宽（Windows/Linux）或 1.5px 宽（macOS）的光标在缩放比
 /// 不整除时走四边形的抗锯齿路径，边不发毛；纯直角在 1.25 倍缩放下是一道硬边。
-fn paint_caret(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla) {
+/// 单光标且开着动效时叠一层柔和外发光（对应 CSS 的 6px glow），让滑行轨迹更清晰。
+fn paint_caret(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla, glow: bool) {
+    let corners = Corners::all(px(1.));
+    if glow {
+        let shadow = gpui::BoxShadow {
+            color: color.opacity(0.5),
+            offset: point(px(0.), px(0.)),
+            blur_radius: px(3.),
+            spread_radius: px(0.),
+            inset: false,
+        };
+        window.paint_drop_shadows(bounds, corners, &[shadow]);
+    }
     let mut quad = fill(bounds, color);
-    quad.corner_radii = Corners::all(px(1.));
+    quad.corner_radii = corners;
     window.paint_quad(quad);
 }
 

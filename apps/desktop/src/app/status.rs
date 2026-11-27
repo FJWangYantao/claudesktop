@@ -394,11 +394,7 @@ impl ChatApp {
                         canvas(
                             move |bounds, window, _| {
                                 let visible = bounds.intersect(&window.content_mask().bounds);
-                                regions.borrow_mut().push((
-                                    visible,
-                                    paint_handle.clone(),
-                                    usize::MAX,
-                                ))
+                                regions.borrow_mut().push((visible, paint_handle.clone()))
                             },
                             |_, _, _, _| {},
                         )

@@ -978,7 +978,10 @@ pub struct PrismRim {
     pub tone_key: u32,
     /// 0 = 只画描边，1 = 描边 + 底部反射。
     pub mode: u32,
-    pub pad: [f32; 3],
+    /// 画布四边向卡片外扩的像素（物理像素）：SDF 矩形内缩这段距离，让环中心落回卡片真实边框上，
+    /// 避免外半截描边被自身 quad 边界裁掉。
+    pub inset: f32,
+    pub pad: [f32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<PrismRim>() % 16 == 0);
@@ -1151,6 +1154,8 @@ pub struct PrismRimStyle {
     pub dark: bool,
     pub tone_key: u32,
     pub mode: u32,
+    /// 画布相对卡片真实外沿外扩的像素，shader 据此把 SDF 矩形内缩回卡片边界。
+    pub inset: Pixels,
 }
 
 impl Default for PrismRimStyle {
@@ -1164,6 +1169,7 @@ impl Default for PrismRimStyle {
             dark: false,
             tone_key: 0,
             mode: 0,
+            inset: Pixels(0.),
         }
     }
 }

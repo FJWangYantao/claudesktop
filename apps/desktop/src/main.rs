@@ -66,6 +66,7 @@ fn log_panics() {
 }
 
 fn main() {
+    session::wheel_trace::init();
     #[cfg(not(feature = "headless-screenshot"))]
     if std::env::var_os("CLAUDESKTOP_SCREENSHOT").is_some()
         || std::env::var_os("CLAUDESKTOP_HIBERNATE_BENCH").is_some()
@@ -551,4 +552,5 @@ fn main() {
                 cx.activate(true);
             }
         });
+    session::wheel_trace::flush();
 }

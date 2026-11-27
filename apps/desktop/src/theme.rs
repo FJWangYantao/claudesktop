@@ -807,7 +807,7 @@ fn apply_colors(t: &mut gpui_kit::component::theme::ThemeColor, pal: &Palette, d
     t.border = p(LINE);
     t.input = p(COMPOSER_LINE);
     t.ring = p(CORAL);
-    t.caret = p(INK);
+    t.caret = p(CORAL);
     t.selection = p(SELECTION);
     t.muted = p(SAND);
     t.muted_foreground = p(INK_SOFT);

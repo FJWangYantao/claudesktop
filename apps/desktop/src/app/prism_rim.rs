@@ -20,12 +20,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+/// 画布四边向卡片外扩的像素：给完整 `1.6px` 描边外半截和外溢微光留出空间，不被 quad 裁掉。
+const RIM_OUTSET: f32 = 3.;
 /// 指针进到这个距离以内，描边就已经是满亮。
-const FADE_START: f32 = 24.;
+const FADE_START: f32 = 40.;
 /// 指针超过这个距离就完全熄灭（连重绘都不排）。
-const FADE_END: f32 = 220.;
-/// 光谱半径：指针离边框这么近时，绕一圈的色相铺满。
-const SPECTRUM_RADIUS: f32 = 200.;
+const FADE_END: f32 = 280.;
+/// 光谱半径：指针离边框这么近时，径向多色标光谱完整展开。
+const SPECTRUM_RADIUS: f32 = 240.;
 /// 两次重绘之间至少隔这么久（约 60Hz），鼠标回报率再高也不刷爆。
 const MIN_FRAME_GAP: Duration = Duration::from_millis(16);
 /// 指针位移小于这个值就当作没动。
@@ -91,30 +93,30 @@ impl Render for ComposerRimView {
                     return;
                 }
                 let rem = window.rem_size();
-                // 描边铺在卡片外沿 1px 上：画布比卡片各边多 1px，圆角跟着多 1px 保持同心。
-                let radii = COMPOSER_RADIUS.to_pixels(rem) + px(1.);
+                // 传卡片真实圆角：shader 已经按 `inset` 把矩形缩回卡片边框，外半截和微光落在外扩区。
+                let radii = COMPOSER_RADIUS.to_pixels(rem);
                 window.paint_prism_rim(
                     bounds,
                     PrismRimStyle {
                         corner_radii: Corners::all(radii),
                         pointer: position,
                         radius: px(SPECTRUM_RADIUS),
-                        stroke_width: px(1.),
-                        alpha: alpha * ambient * ambient_level(),
+                        stroke_width: px(1.6),
+                        alpha: alpha * ambient * ambient_level().sqrt(),
                         dark,
                         tone_key: tone,
                         mode: 0,
+                        inset: px(RIM_OUTSET),
                     },
                 );
             },
         )
-        // 四边各外扩 1px：圆角环骑在卡片边上，里外各占一半，太窄会被自己的
-        // quad 裁掉、看起来像贴着内侧的一条线。
+        // 四边各外扩 `RIM_OUTSET`：留足外半截描边和外溢玻璃微光空间，不被自身 quad 裁掉。
         .absolute()
-        .top(px(-1.))
-        .left(px(-1.))
-        .right(px(-1.))
-        .bottom(px(-1.))
+        .top(px(-RIM_OUTSET))
+        .left(px(-RIM_OUTSET))
+        .right(px(-RIM_OUTSET))
+        .bottom(px(-RIM_OUTSET))
     }
 }
 

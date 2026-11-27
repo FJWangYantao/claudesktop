@@ -494,6 +494,8 @@ pub struct Settings {
     pub font_family: String,
     /// 动画（跟随系统的「动画效果」/ 总是播放 / 关闭），设置页切换后立即生效并写回
     pub motion: MotionPref,
+    /// 对话正文的鼠标滚轮过渡，可独立于其它界面动画。
+    pub wheel_motion: WheelMotionPref,
     /// 氛围效果（首页地平线极光 + ASCII 波动字阵、输入框棱镜描边）的强度。
     /// `Off` 时一张额外的帧都不画（首页背景直接不挂载）。
     pub ambient_prism: AmbientStrength,
@@ -637,6 +639,7 @@ impl Default for Settings {
             font_scale: crate::theme::FONT_SCALE_DEFAULT,
             font_family: String::new(),
             motion: MotionPref::default(),
+            wheel_motion: WheelMotionPref::default(),
             ambient_prism: AmbientStrength::default(),
             // 默认关：远程图片会把用户的 IP 和「正在看这条回复」告诉图片服务器
             auto_load_images: false,
@@ -986,6 +989,30 @@ impl MotionPref {
     }
 }
 
+/// 对话滚轮动画。旧配置缺这一项时继续跟随全局动画。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WheelMotionPref {
+    #[default]
+    Follow,
+    Smooth,
+    Short,
+    Off,
+}
+
+impl WheelMotionPref {
+    pub const ALL: [Self; 4] = [Self::Follow, Self::Smooth, Self::Short, Self::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Follow => "跟随动画",
+            Self::Smooth => "标准",
+            Self::Short => "短程",
+            Self::Off => "关",
+        }
+    }
+}
+
 /// 氛围效果强度。乘在描边 / 背景的不透明度上，`Off` 时组件直接不提交，
 /// 首页背景也不挂载（CPU / GPU / 显存全为零）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1033,8 +1060,8 @@ impl ThemeChoice {
     /// 顺序和 `theme::PALETTES` 一致，改配色要两条一起看（`theme::prism_tone` 走这张表）。
     pub fn prism_tone(self) -> u32 {
         match self {
-            // Kimi 的强调色是电光蓝（`0x1783FF`），配钴蓝那组光谱
-            ThemeChoice::Kimi => 2,
+            // Kimi（中性灰 + 电光蓝）用 0 档四色宝石光谱：钴蓝起手 → 虹紫 → 珊瑚 → 琥珀
+            ThemeChoice::Kimi => 0,
             ThemeChoice::Warm => 1,
             // Flexoki 的纸是米黄、强调色偏赭
             ThemeChoice::Flexoki => 4,

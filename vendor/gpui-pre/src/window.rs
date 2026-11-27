@@ -4811,15 +4811,16 @@ impl Window {
                 ScaledPixels(style.pointer.x.0 * scale_factor),
                 ScaledPixels(style.pointer.y.0 * scale_factor),
             ),
-            // `radius` / `stroke_width` 在 `PrismRim` 里是裸 f32（HLSL 那侧也是
-            // `float`），所以这里把 `Pixels` / `ScaledPixels` 里的 f32 取出来写。
+            // `radius` / `stroke_width` / `inset` 在 `PrismRim` 里是裸 f32（HLSL 那侧也是
+            // `float`），这里直接乘缩放比保留精确亚像素宽度，交给 SDF 抗锯齿。
             radius: style.radius.0 * scale_factor,
-            stroke_width: self.snap_stroke(style.stroke_width).0,
+            stroke_width: (style.stroke_width.0 * scale_factor).max(1.0),
             alpha: (style.alpha * opacity).clamp(0., 1.),
             dark: style.dark as u32,
             tone_key: style.tone_key,
             mode: style.mode,
-            pad: [0.; 3],
+            inset: style.inset.0 * scale_factor,
+            pad: [0.; 2],
         };
         if rim.alpha <= 0. {
             return;

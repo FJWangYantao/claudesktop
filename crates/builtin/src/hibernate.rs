@@ -377,7 +377,7 @@ impl super::Inner {
                 || state.history_activity != 0
                 || state.agent.is_some()
                 || !matches!(&state.history_storage, super::HistoryStorage::Resident)
-                || super::bgtasks::has_running(session)
+                || super::bgtasks::has_running(self.kernel_id, session)
             {
                 return Ok(());
             }
