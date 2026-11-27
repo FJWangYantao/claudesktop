@@ -57,13 +57,14 @@ impl Panel for DiffPane {
         super::pane_state(PaneKind::Diff, serde_json::json!({ "kind": "diff", "scope": "turn" }))
     }
 
-    /// 切到后台：Diff 预览的虚拟列表缓存放掉（后台 Tab 不该继续占行高缓存）
+    /// 切到后台：Diff 预览的虚拟列表缓存放掉（后台 Tab 不该继续占行高缓存）。
+    /// 只放自己这一份：文件 Pane 可能正并排开着。
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         if active {
             return;
         }
         if let Some(app) = self.app.upgrade() {
-            app.update(cx, |app, _| app.release_lists());
+            app.update(cx, |app, _| app.release_diff_list());
         }
     }
 }

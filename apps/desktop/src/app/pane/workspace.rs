@@ -59,7 +59,11 @@ impl ChatApp {
             DockEvent::LayoutChanged => this.schedule_layout_save(cx),
             DockEvent::DragOutside { panel, position } => {
                 let (panel, position) = (*panel, *position);
-                this.popout_pane(panel, Some(position), window, cx);
+                // `position` 是主窗客户区坐标；开窗要的是**屏幕**坐标，左/上拖出时
+                // 不加上主窗原点，窗口会飞到屏幕外
+                let origin = window.bounds().origin;
+                let at = point(position.x + origin.x, position.y + origin.y);
+                this.popout_pane(panel, Some(at), window, cx);
             }
             _ => {}
         })
@@ -243,7 +247,12 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let dock = self.dock.clone();
-        let mut found = None;
+        // (区域, 面板 id, 它在哪个窗口里；None = 主窗)
+        let mut found: Option<(
+            Entity<gpui_base::dock::DockArea>,
+            gpui_base::dock::PanelId,
+            Option<AnyWindowHandle>,
+        )> = None;
         // 四个区域都找一遍：Pane 可能被拖到左侧或底部，也可能已经弹到独立窗
         for placement in [
             DockPlacement::Right,
@@ -256,7 +265,7 @@ impl ChatApp {
             for id in ids {
                 let handle = dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
                 if handle == Some(kind) {
-                    found = Some((dock.clone(), id));
+                    found = Some((dock.clone(), id, None));
                     break;
                 }
             }
@@ -264,7 +273,7 @@ impl ChatApp {
                 break;
             }
         }
-        // 弹出窗里也算「已经在工作区里」：直接在那个窗里把它选中
+        // 弹出窗里也算「已经在工作区里」：在那个窗里选中，并把它唤到前台
         if found.is_none() {
             for entry in &self.popouts {
                 let ids: Vec<_> = entry
@@ -277,7 +286,7 @@ impl ChatApp {
                     let handle =
                         entry.dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
                     if handle == Some(kind) {
-                        found = Some((entry.dock.clone(), id));
+                        found = Some((entry.dock.clone(), id, Some(entry.window)));
                         break;
                     }
                 }
@@ -286,11 +295,21 @@ impl ChatApp {
                 }
             }
         }
-        if let Some((area, id)) = found {
-            area.update(cx, |dock, cx| dock.select_panel(id, window, cx));
-            return true;
+        match found {
+            Some((area, id, Some(popout))) => {
+                // 面板在别的窗口里：选中要在**那个**窗口的上下文里做（手里这个 window 是主窗）
+                let _ = popout.update(cx, |_, popout_window, cx| {
+                    popout_window.activate_window();
+                    area.update(cx, |dock, cx| dock.select_panel(id, popout_window, cx));
+                });
+                true
+            }
+            Some((area, id, None)) => {
+                area.update(cx, |dock, cx| dock.select_panel(id, window, cx));
+                true
+            }
+            None => false,
         }
-        false
     }
 
     /// 右侧那一列：开着就保证 dock 里有这组 Tab 并展开，收起就折起来。

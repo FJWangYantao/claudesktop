@@ -164,6 +164,8 @@ impl super::ChatApp {
     /// （以前每帧 clone 一次 `Settings` 再重建一遍 `Vec<SessionSummary>` + 每个 `PathBuf`，
     /// 100 个会话就是每帧几百次分配）。浮层只有一个 bool，顺手比掉。
     pub(super) fn sync_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 改动 Pane 的 badge 也要在面板收起时跟上（它不渲染就不会自己刷新）
+        self.refresh_changed_file_count();
         let active = self.session().token;
         // 浮层：命令面板 / 设置 / 审查页 / 回退浮层都是「盖住工作区」的那一类。
         // 命令面板是 gpui 的 dialog，靠窗口状态问出来；其余是 ChatApp 自己的标记。
@@ -227,8 +229,11 @@ impl super::ChatApp {
         }
     }
 
-    /// 会话清单的便宜指纹：只算已有字段，不分配。`dir` 用长度近似
-    /// （同一个会话的工作目录不会在运行中换成「同长度的另一个路径」而不动其它字段）。
+    /// 会话清单的便宜指纹：只算已有字段，不分配。
+    ///
+    /// 除了「有几个会话、标题变没变」，还要带上**活跃会话的推进量**：Agent 跑一轮时
+    /// `busy` 从头到尾都是 `true`，只看它的话，这一整轮里改文件、推进计划、子代理前进一步
+    /// 都不会让指纹变，弹出窗里的 Diff / Plan / Subagent 就得等整轮结束才刷。
     fn hub_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -242,6 +247,18 @@ impl super::ChatApp {
             if !session.is_chat() {
                 session.group_dir().as_os_str().len().hash(&mut hasher);
             }
+        }
+        // 活跃会话的推进量：都是整数，零分配
+        let active = self.session();
+        active.diff_revision.hash(&mut hasher);
+        active.diff_epoch.hash(&mut hasher);
+        active.transcript.len().hash(&mut hasher);
+        // 子代理的进度（步数和条目数）：按 id 排序后累加，避免 HashMap 顺序抖动
+        let mut ids: Vec<&String> = active.subagents.keys().collect();
+        ids.sort();
+        for id in ids {
+            id.len().hash(&mut hasher);
+            active.subagents[id].items.len().hash(&mut hasher);
         }
         hasher.finish()
     }

@@ -261,9 +261,9 @@ pub(super) struct RightPanelState {
     diff_list_scroll: UniformListScrollHandle,
     /// 这一帧这个面板够不够宽、要不要并排双栏（由各 Pane 自己量的宽度算，见 `render_files_tab`）
     split: bool,
-    /// 本轮改动文件数（改动 Pane 的 Tab badge 用，按 `diff_revision` 缓存）
+    /// 本轮改动文件数（改动 Pane 的 Tab badge 用，按 `(会话令牌, diff_revision)` 缓存）
     pub(crate) changed_count: usize,
-    changed_count_rev: u64,
+    changed_count_key: Option<(u64, u64)>,
 }
 
 impl RightPanelState {
@@ -301,7 +301,7 @@ impl RightPanelState {
             diff_list_scroll: UniformListScrollHandle::new(),
             split: false,
             changed_count: 0,
-            changed_count_rev: u64::MAX,
+            changed_count_key: None,
         }
     }
 
@@ -538,27 +538,34 @@ impl ChatApp {
         self.render_diff_workspace(window, cx)
     }
 
-    /// 这个面板被切到后台 / 收起时把虚拟列表缓存放掉：
-    /// 后台 Tab 不该继续占着行高缓存（见 `HANDOFF.md` 的内存预算一节）。
-    pub(crate) fn release_lists(&mut self) {
-        if let Some(preview) = &mut self.right_panel.preview {
-            preview.release_list();
-        }
-        if let Some(preview) = &mut self.right_panel.diff_preview {
-            preview.release_list();
-        }
-    }
-
-    /// 本轮改动文件数：按 `diff_revision` 缓存。
-    /// 以前每个 Tab 栏重画都全量扫一遍记录（千文件实测中位 59ms）。
+    /// 本轮改动文件数：按 `(会话令牌, diff_revision)` 缓存。
+    ///
+    /// 只按 `diff_revision` 判脏不够：切到另一个恰好同 revision（都是 0 或 2）的会话，
+    /// 会沿用上一个会话的 badge 数字。以前每个 Tab 栏重画都全量扫一遍记录
+    /// （千文件实测中位 59ms），所以这份缓存也不能省。
     pub(crate) fn refresh_changed_file_count(&mut self) {
         let session = &self.sessions[self.active];
-        if self.right_panel.changed_count_rev == session.diff_revision {
+        let key = (session.token, session.diff_revision);
+        if self.right_panel.changed_count_key == Some(key) {
             return;
         }
         let count = crate::model::turn_files(&session.transcript, 0).len();
         self.right_panel.changed_count = count;
-        self.right_panel.changed_count_rev = session.diff_revision;
+        self.right_panel.changed_count_key = Some(key);
+    }
+
+    /// 文件 Pane 切到后台：只放它自己的预览列表。
+    pub(crate) fn release_file_list(&mut self) {
+        if let Some(preview) = &mut self.right_panel.preview {
+            preview.release_list();
+        }
+    }
+
+    /// 改动 Pane 切到后台：只放它自己的 Diff 预览列表。
+    pub(crate) fn release_diff_list(&mut self) {
+        if let Some(preview) = &mut self.right_panel.diff_preview {
+            preview.release_list();
+        }
     }
 
     fn panel_split(&self) -> bool {

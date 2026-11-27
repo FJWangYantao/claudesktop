@@ -87,13 +87,13 @@ impl Panel for FilesPane {
     }
 
     /// 切到后台（别的 Tab 顶上来）：把文件树的虚拟列表缓存放掉，
-    /// 否则后台 Tab 会一直占着行高缓存
+    /// 否则后台 Tab 会一直占着行高缓存。只放自己这一份（Diff Pane 可能并排开着）
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         if active {
             return;
         }
         if let Some(app) = self.app.upgrade() {
-            app.update(cx, |app, _| app.release_lists());
+            app.update(cx, |app, _| app.release_file_list());
         }
     }
 }

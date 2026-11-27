@@ -865,6 +865,18 @@
   「这里是不是 git 仓库」。
 - **`git diff <base>...HEAD` 的 `base` 会进参数位**：先拒绝以 `-` 开头的值，并统一带
   `--no-ext-diff`（仓库里配了外部 diff 工具时输出会完全变样）。
+- **hub 指纹必须带活跃会话的推进量**：只看「几个会话 / 标题 / busy」的话，Agent 跑一轮
+  期间 `busy` 一直是 `true`，这一整轮里改文件、推进计划、子代理前进一步都不会让指纹变，
+  弹出窗里的 Diff / Plan / Subagent 得等整轮结束才刷。所以 `diff_revision` / `diff_epoch` /
+  `transcript.len()` / 子代理条目数都要哈希进去（都是整数，零分配）。
+- **吸回时 `home` 要记「哪个区域 + 哪个组」**：`FilesPane` / `DiffPane` 默认在
+  `DockPlacement::Right`，只查 Center 会把它吸到中间和对话并成 Tab。
+  `InsertTarget::Tabs { node }` 只带组、不带区域，靠 `add_panel_view_at` 自己按 node 找区域——
+  所以前提是「这个 node 还在树里」，四个区域都要查一遍。
+- **在别的窗口里选中面板要用那个窗口的上下文**：`focus_pane_of_kind` 手里是主窗的
+  `window`，弹出窗里的 Pane 必须走 `entry.window.update(cx, |_, pop_window, cx| ...)`，
+  顺手 `activate_window()` 把它唤到前台。
+
 
 
 

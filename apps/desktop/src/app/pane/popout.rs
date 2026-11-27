@@ -156,12 +156,21 @@ impl ChatApp {
             return;
         }
 
-        // 弹出前记一下它原来在哪个 Tab 组：吸回时回到原位，而不是塞进第一个组
-        let home = self
-            .dock
-            .read(cx)
-            .layout(DockPlacement::Center)
-            .and_then(|tree| tree.find_panel_node(panel));
+        // 弹出前记一下它原来在哪个 Tab 组（四个区域都找）：吸回时回到原位，
+        // 而不是塞进主区第一个组
+        let mut home = None;
+        for placement in [
+            DockPlacement::Center,
+            DockPlacement::Right,
+            DockPlacement::Left,
+            DockPlacement::Bottom,
+        ] {
+            let Some(tree) = self.dock.read(cx).layout(placement) else { continue };
+            if let Some(node) = tree.find_panel_node(panel) {
+                home = Some(node);
+                break;
+            }
+        }
         let Some(view) = self.dock.update(cx, |dock, cx| dock.detach_panel(panel, window, cx))
         else {
             return;
@@ -255,7 +264,8 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 把面板插回主窗：优先回到它原来那个 Tab 组，那个组没了就进主区第一个组。
+    /// 把面板插回主窗：优先回到它原来那个 Tab 组（四个区域都看），
+    /// 那个组没了就进主区第一个组，中区一个组都没有就整片换掉。
     fn adopt_into_main(
         &mut self,
         view: Arc<dyn PanelView>,
@@ -265,14 +275,29 @@ impl ChatApp {
         let main_window = self.window_handle;
         let dock = self.dock.clone();
         let _ = main_window.update(cx, |_, window, cx| {
-            let target = dock.read(cx).layout(DockPlacement::Center).and_then(|tree| {
-                if let Some(node) = home.filter(|node| tree.find_node(*node).is_some()) {
-                    return Some(gpui_base::dock::InsertTarget::Tabs {
-                        node,
-                        ix: None,
-                        activate: true,
-                    });
+            let target = dock.read(cx).layout(DockPlacement::Center).and_then(|_| {
+                let area = dock.read(cx);
+                // 原来那个组还在（可能在左 / 右 / 底部）：插回原位
+                if let Some(node) = home {
+                    let alive = [
+                        DockPlacement::Center,
+                        DockPlacement::Right,
+                        DockPlacement::Left,
+                        DockPlacement::Bottom,
+                    ]
+                    .into_iter()
+                    .filter_map(|placement| area.layout(placement))
+                    .any(|tree| tree.find_node(node).is_some());
+                    if alive {
+                        return Some(gpui_base::dock::InsertTarget::Tabs {
+                            node,
+                            ix: None,
+                            activate: true,
+                        });
+                    }
                 }
+                // 否则进中区第一个 Tab 组
+                let tree = area.layout(DockPlacement::Center)?;
                 let mut first = None;
                 tree.root().walk(&mut |node| {
                     if first.is_none()
@@ -325,17 +350,25 @@ impl ChatApp {
         for state in states {
             let skin = ClaudesktopDockSkin::new();
             let renderer: Rc<dyn DockAreaRenderer> = skin.clone();
+            // 标题按恢复出来的第一个面板定（和弹出时一样是 `claudesktop · <Pane 标题>`）
+            let title: SharedString = first_panel_kind(&state.area.center)
+                .map(|kind| kind.title())
+                .unwrap_or_else(|| "面板".into());
             let mut options = TitleBar::window_options();
             options.focus = false;
             options.window_bounds = Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(state.bounds.x), px(state.bounds.y)),
                 size: size(px(state.bounds.width), state_size(state.bounds.height)),
             }));
+            if let Some(tb) = options.titlebar.as_mut() {
+                tb.title = Some(format!("claudesktop · {title}").into());
+            }
             let area_state = state.area.clone();
             let slot: Rc<std::cell::RefCell<Option<Entity<DockArea>>>> =
                 Rc::new(std::cell::RefCell::new(None));
             let slot_in = slot.clone();
             let main = cx.entity().downgrade();
+            let main_in = main.clone();
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {
                 let dock = cx.new(|cx| {
                     DockArea::new(
@@ -347,11 +380,14 @@ impl ChatApp {
                     .with_renderer(renderer)
                 });
                 skin.attach_area(dock.downgrade());
+                // 恢复出来的窗也要能「弹出别的面板」（Tab 栏那个按钮读它）
+                skin.attach_main(main_in);
                 dock.update(cx, |dock, cx| {
                     let _ = dock.load(area_state, window, cx);
                 });
                 *slot_in.borrow_mut() = Some(dock.clone());
-                cx.new(|cx| PopoutWindow::new(main, dock, "claudesktop · 面板".into(), cx))
+                let popout_title = title.clone();
+                cx.new(|cx| PopoutWindow::new(main, dock, popout_title, cx))
             });
             let Ok((window_handle, _)) = opened else { continue };
             let Some(dock) = slot.borrow().clone() else { continue };
@@ -376,4 +412,12 @@ impl ChatApp {
 /// 恢复时的高度做一次下限保护：存进来的如果是 0（窗口被最小化时写的），开出来是个点不动的条
 fn state_size(height: f32) -> Pixels {
     px(height.max(320.))
+}
+
+/// 存档里第一个面板的种类（弹出窗标题按它写）。
+fn first_panel_kind(state: &gpui_base::dock::PanelState) -> Option<PaneKind> {
+    if let Some(kind) = PaneKind::from_panel_name(&state.panel_name) {
+        return Some(kind);
+    }
+    state.children.iter().find_map(first_panel_kind)
 }
