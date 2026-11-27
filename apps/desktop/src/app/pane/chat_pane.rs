@@ -42,8 +42,12 @@ impl ChatPane {
         Self { app, token, focus_handle: cx.focus_handle(), content, overlay, draft: String::new() }
     }
 
+    /// 这块对话的内容区（`observe_self` 里要通知它重画，见 `ChatApp::new`）
+    pub(crate) fn content(&self) -> Entity<ContentView> {
+        self.content.clone()
+    }
+
     /// 这块对话在看哪个会话
-    #[allow(dead_code)] // 多 ChatPane 的焦点切换（本分支下一笔）用它
     pub(crate) fn token(&self) -> u64 {
         self.token
     }
@@ -120,8 +124,13 @@ impl Render for ChatPane {
         let Some(app) = self.app.upgrade() else {
             return div().size_full().into_any_element();
         };
+        let token = self.token;
         let content = self.content.clone();
         let overlay = self.overlay.clone();
-        app.update(cx, |app, cx| app.render_chat_body(content, overlay, window, cx))
+        app.update(cx, |app, cx| {
+            // 焦点在这块才挂真输入框（同一时刻只有一块），其余画占位卡
+            let focused = app.focused_chat == Some(token) || app.focused_chat.is_none();
+            app.render_chat_pane_view(token, focused, content, overlay, window, cx)
+        })
     }
 }

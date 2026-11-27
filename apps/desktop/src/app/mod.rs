@@ -149,6 +149,12 @@ pub struct ChatApp {
     /// 待随下一条消息注入的批注说明（会话令牌, `<user-review>` 块）：
     /// 气泡里只显示一句摘要，说明在发送时拼进真正发出去的文本
     diff_comment_note: Option<(u64, String)>,
+    /// 多对话 Pane：每块不聚焦时的输入草稿（按会话令牌；同一时刻只有一块挂着真输入框）
+    chat_drafts: std::collections::HashMap<u64, pane::workspace::ChatDraft>,
+    /// 现在挂着真输入框的是哪一块（按会话令牌）
+    focused_chat: Option<u64>,
+    /// 已经打开的对话 Pane（同一个会话最多一块：`Session::list` 只有一份）
+    chat_panes: Vec<WeakEntity<pane::chat_pane::ChatPane>>,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -670,6 +676,9 @@ impl ChatApp {
             popouts: Vec::new(),
             comments: right_panel::CommentDraft::default(),
             diff_comment_note: None,
+            chat_drafts: std::collections::HashMap::new(),
+            focused_chat: None,
+            chat_panes: Vec::new(),
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),
@@ -791,8 +800,17 @@ impl ChatApp {
             magpie_child: None,
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
-        cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
-            .detach();
+        cx.observe_self(|this: &mut ChatApp, cx| {
+            this.content_view.update(cx, |_, cx| cx.notify());
+            // 多开的对话 Pane 各有一份 `.cached()` 内容区：没人通知它们就会冻在旧帧上
+            for pane in &this.chat_panes {
+                if let Some(pane) = pane.upgrade() {
+                    let content = pane.read(cx).content();
+                    content.update(cx, |_, cx| cx.notify());
+                }
+            }
+        })
+        .detach();
         // 第一个会话用当前空间的内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
         let space = app.settings.space;
@@ -4558,6 +4576,8 @@ impl Render for ChatApp {
             }
         }
 
+        // 侧栏 / 命令面板切了会话：让聚焦的那块对话 Pane 跟上（多开时尤其要）
+        self.sync_focus_to_active(cx);
         // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
         self.sync_sidebar(cx);
         // 共享态的投影同理：没变就不发事件（见 hub.rs）
