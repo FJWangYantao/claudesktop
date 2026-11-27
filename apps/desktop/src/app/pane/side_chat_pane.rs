@@ -16,7 +16,7 @@ use crate::theme::rgb;
 use crate::theme::*;
 use gpui_base::dock::{Panel, PanelEvent, PanelState};
 use gpui_kit::assets::IconName as IconAll;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -30,6 +30,27 @@ pub(crate) struct SideChatPane {
     overlay: Entity<LoopOverlay>,
     /// 这块 Pane 自己的输入框（不抢主窗那份）
     input: Entity<InputState>,
+}
+
+/// 侧问输入框的回车发送（两处创建点都要挂：首建和换窗口重建）。
+fn subscribe_side_chat_enter(
+    input: &Entity<InputState>,
+    session: u64,
+    window: &mut Window,
+    cx: &mut Context<SideChatPane>,
+) {
+    cx.subscribe_in(
+        input,
+        window,
+        move |this: &mut SideChatPane, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { secondary, .. } if !secondary)
+                && let Some(app) = this.app.upgrade()
+            {
+                app.update(cx, |app, cx| app.send_side_chat(session, window, cx));
+            }
+        },
+    )
+    .detach();
 }
 
 impl SideChatPane {
@@ -47,7 +68,14 @@ impl SideChatPane {
         let content = cx.new(|_| ContentView::side(app.clone(), session, spots.clone()));
         let overlay = cx.new(|_| LoopOverlay::new(spots));
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("围绕主会话提问…"));
+        // 回车即发送（和底栏的箭头按钮等价）
+        subscribe_side_chat_enter(&input, session, window, cx);
         Self { app, session, focus_handle: cx.focus_handle(), content, overlay, input }
+    }
+
+    /// 这块 Pane 的内容区（`observe_self` 里要通知它重画，见 `ChatApp::new`）
+    pub(crate) fn content(&self) -> Entity<ContentView> {
+        self.content.clone()
     }
 
     /// 这块 Pane 的输入框（`ChatApp` 发送时要读它）
@@ -58,7 +86,9 @@ impl SideChatPane {
     /// 换窗口之后重建输入框，保留草稿（绑定旧 `Window` 的 InputState 不能再用）
     fn rebuild_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let draft = self.input.read(cx).value().to_string();
-        self.input = cx.new(|cx| InputState::new(window, cx).placeholder("围绕主会话提问…"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("围绕主会话提问…"));
+        subscribe_side_chat_enter(&input, self.session, window, cx);
+        self.input = input;
         if !draft.is_empty() {
             self.input.update(cx, |state, cx| state.set_value(draft, window, cx));
         }
@@ -129,6 +159,45 @@ impl Render for SideChatPane {
 }
 
 impl ChatApp {
+    /// 造一份影子会话（侧问用）：抄当前会话的内核与模型，标 `ephemeral`，不落盘。
+    pub(crate) fn spawn_side_chat_session(&mut self, cx: &mut Context<Self>) -> u64 {
+        let (kernel, model, cwd, source_token) = {
+            let session = self.session();
+            (
+                session.kernel.clone(),
+                session.model_label.clone(),
+                session.cwd.clone(),
+                session.token,
+            )
+        };
+        let token = self.next_token;
+        self.next_token += 1;
+        let mut shadow = crate::session::Session::of_kind(
+            token,
+            kernel,
+            cwd,
+            claudesktop_core::SessionKind::Chat,
+        );
+        shadow.ephemeral = true;
+        shadow.title = "侧问".into();
+        shadow.model_label = model;
+        shadow.ready = false;
+        self.sessions.push(shadow);
+        let shadow_token = self.sessions.last().map(|s| s.token).unwrap_or(token);
+        self.side_chat_sources.insert(shadow_token, source_token);
+        cx.notify();
+        shadow_token
+    }
+
+    /// 登记侧问 Pane（`observe_self` 靠它通知内容区重画）
+    pub(crate) fn register_side_chat(
+        &mut self,
+        session: u64,
+        pane: WeakEntity<super::side_chat_pane::SideChatPane>,
+    ) {
+        self.side_chats.insert(session, pane);
+    }
+
     /// 打开侧问（`Ctrl+;`）：给当前会话造一份影子会话，并在中心区右边并排开一块。
     pub(crate) fn open_side_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let source_token = self.session().token;
@@ -148,30 +217,11 @@ impl ChatApp {
             return;
         }
         // 主会话的当前配置照抄：同一个内核槽、同一个模型，只是临时
-        let (kernel, model, cwd) = {
-            let session = self.session();
-            (session.kernel.clone(), session.model_label.clone(), session.cwd.clone())
-        };
-        let token = self.next_token;
-        self.next_token += 1;
-        let mut shadow = crate::session::Session::of_kind(
-            token,
-            kernel,
-            cwd,
-            claudesktop_core::SessionKind::Chat,
-        );
-        shadow.ephemeral = true;
-        shadow.title = "侧问".into();
-        shadow.model_label = model;
-        shadow.ready = false;
-        self.sessions.push(shadow);
-        let shadow_token = self.sessions.last().map(|s| s.token).unwrap_or(token);
-        self.side_chat_sources.insert(shadow_token, source_token);
-
+        let shadow_token = self.spawn_side_chat_session(cx);
         let app = cx.entity().downgrade();
         let pane =
             cx.new(|cx| super::side_chat_pane::SideChatPane::new(app, shadow_token, window, cx));
-        self.side_chats.insert(shadow_token, pane.downgrade());
+        self.register_side_chat(shadow_token, pane.downgrade());
         let dock = self.dock.clone();
         let root =
             dock.read(cx).layout(gpui_base::dock::DockPlacement::Center).map(|t| t.root().id());
@@ -218,7 +268,7 @@ impl ChatApp {
         let busy = self.index_of_token(session).is_some_and(|idx| self.sessions[idx].busy);
         let send =
             div()
-                .id("side-chat-send")
+                .id(("side-chat-send", session))
                 .size_7()
                 .flex_shrink_0()
                 .flex()
@@ -280,25 +330,27 @@ impl ChatApp {
         if text.is_empty() || self.sessions[idx].busy {
             return;
         }
-        // 首条消息带上主会话的上下文（之后影子会话自己就有历史了）
-        let prompt = if self.sessions[idx].has_user_message() {
-            text
+        // 首条消息带上主会话的上下文。走**文本附件**而不是拼进 `UserPrompt.text`：
+        // 附件内容只发给内核，气泡里只显示文件名（拼进正文会把几万字符的
+        // `<main-session-context>` 原样画在对话里）
+        let attachments = if self.sessions[idx].has_user_message() {
+            Vec::new()
         } else {
             let context = self.side_chat_context(session);
-            format!(
-                "<main-session-context>\n{context}\n</main-session-context>\n\n\
-                 以下只是针对主会话的旁支提问：只回答问题，不要修改任何文件或执行改动，\
-                 用户没有要求就别提议改代码。\n\n{text}"
-            )
+            vec![claudesktop_core::attach::TextAttachment {
+                name: "主会话上下文.md".into(),
+                path: std::path::PathBuf::from("main-session-context.md"),
+                text: format!(
+                    "<main-session-context>\n{context}\n</main-session-context>\n\n\
+                     以上是主会话的上下文。下面只是针对它的旁支提问：只回答问题，\
+                     不要修改任何文件或执行改动，用户没有要求就别提议改代码。"
+                ),
+            }]
         };
         input.update(cx, |state, cx| state.set_value("", window, cx));
         self.submit_to(
             idx,
-            claudesktop_core::UserPrompt {
-                text: prompt,
-                images: Vec::new(),
-                attachments: Vec::new(),
-            },
+            claudesktop_core::UserPrompt { text, images: Vec::new(), attachments },
             cx,
         );
     }

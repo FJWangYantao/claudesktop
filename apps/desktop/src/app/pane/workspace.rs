@@ -406,29 +406,48 @@ impl ChatApp {
     fn build_pane(
         kind: PaneKind,
         app: WeakEntity<ChatApp>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Arc<dyn PanelView> {
         match kind {
             PaneKind::Chat => {
-                // 对话 Pane 复用主窗那一份内容区与覆盖层（它们已经挂在 `ChatApp` 上）
+                // 恢复出来的每一块对话 Pane 都建**自己的**内容区与覆盖层：
+                // 共用主窗那份会让两块画同一个 `Session::list`（而且漏注册名册）
                 let Some(upgraded) = app.upgrade() else {
                     return Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx))));
                 };
-                let (content, overlay, token) = {
-                    let app = upgraded.read(cx);
-                    (app.content_view.clone(), app.loop_overlay.clone(), app.session().token)
-                };
-                content.update(cx, |view, cx| view.set_token(token, cx));
-                Arc::new(PaneHandle::new(
-                    cx.new(|cx| ChatPane::new(app.clone(), token, content, overlay, cx)),
-                ))
+                let token = upgraded.read(cx).session().token;
+                let spots = crate::app::motion::LoopSpots::new();
+                let content = cx.new(|_| ContentView::new(app.clone(), token, spots.clone()));
+                let overlay = cx.new(|_| LoopOverlay::new(spots));
+                let pane = cx.new(|cx| ChatPane::new(app.clone(), token, content, overlay, cx));
+                let entered = pane.clone();
+                upgraded.update(cx, |app, _| {
+                    app.register_chat_pane(entered.downgrade());
+                });
+                Arc::new(PaneHandle::new(pane))
             }
             PaneKind::Files => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
             PaneKind::Diff => Arc::new(PaneHandle::new(cx.new(|cx| DiffPane::new(app, cx)))),
             PaneKind::Plan => Arc::new(PaneHandle::new(cx.new(|cx| PlanPane::new(app, cx)))),
             PaneKind::Subagent => {
                 Arc::new(PaneHandle::new(cx.new(|cx| SubagentPane::new(app, cx))))
+            }
+            // 侧问不落盘，恢复时给一块**空的新侧问**（影子会话是新建的），
+            // 而不是像以前那样兜底成一块莫名其妙的文件面板
+            PaneKind::SideChat => {
+                let Some(upgraded) = app.upgrade() else {
+                    return Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx))));
+                };
+                let session = upgraded.update(cx, |app, cx| app.spawn_side_chat_session(cx));
+                let pane = cx.new(|cx| {
+                    super::side_chat_pane::SideChatPane::new(app.clone(), session, window, cx)
+                });
+                let registered = pane.clone();
+                upgraded.update(cx, |app, _| {
+                    app.register_side_chat(session, registered.downgrade());
+                });
+                Arc::new(PaneHandle::new(pane))
             }
             // 其余 Pane 在后续阶段接上；先按文件面板兜底，别让旧布局整份作废
             _ => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),

@@ -819,6 +819,15 @@ impl ChatApp {
                     content.update(cx, |_, cx| cx.notify());
                 }
             }
+            // 侧问同理，而且还要通知 Pane 自己（发送按钮的 busy 态要跟着变；
+            // hub 事件里过滤掉了 ephemeral 会话，所以这里不能指望它）
+            for pane in this.side_chats.values() {
+                if let Some(pane) = pane.upgrade() {
+                    let content = pane.read(cx).content();
+                    content.update(cx, |_, cx| cx.notify());
+                    pane.update(cx, |_, cx| cx.notify());
+                }
+            }
         })
         .detach();
         // 第一个会话用当前空间的内核：连接就绪（Connected）后统一补发 session/new；
