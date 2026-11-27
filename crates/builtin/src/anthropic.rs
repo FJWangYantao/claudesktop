@@ -8,8 +8,8 @@
 
 use crate::provider::{
     ChatMessage, ChatProvider, ModelInfo, ProviderConfig, RequestParams, StreamEvent,
-    StreamOutcome, ToolCall, ToolSpec, debug_http, finish_stream, get_json, parse_model_list,
-    post_sse_with_retry, read_sse,
+    StreamOutcome, ToolCall, ToolSpec, Usage, debug_http, finish_stream, get_json,
+    parse_model_list, post_sse_with_retry, read_sse,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -75,14 +75,12 @@ impl ChatProvider for AnthropicProvider {
             post_sse_with_retry(&self.agent, &route, &headers, &body, should_stop, on_event)?;
 
         let mut outcome = StreamOutcome::default();
-        let mut usage = crate::provider::Usage::default();
-        let mut usage_seen = false;
+        let mut usage = AnthropicUsage::default();
         let mut blocks = ToolBlocks::default();
         let end = read_sse(reader, should_stop, &mut |payload| match parse_event(
             payload,
             &mut blocks,
             &mut usage,
-            &mut usage_seen,
             on_event,
         ) {
             Ok(Some(finish)) => {
@@ -96,7 +94,7 @@ impl ChatProvider for AnthropicProvider {
             }
         })?;
         outcome.completed = finish_stream(end, outcome.finish_reason.is_some())?;
-        outcome.usage = usage_seen.then_some(usage);
+        outcome.usage = usage.total();
         outcome.thinking = blocks.take_thinking();
         outcome.tool_calls = blocks.finish();
         Ok(outcome)
@@ -478,27 +476,53 @@ fn finish_reason(stop: &str) -> &'static str {
 /// `server_tool_use` 本身（只要执行什么）不送，参数我们也不需要（结果块里带 `tool_use_id`）。
 type Parsed = Result<Option<String>, String>;
 
+/// Anthropic 分项报告累计输入，流尾可能只更新其中几项。
+#[derive(Default)]
+pub(crate) struct AnthropicUsage {
+    seen: bool,
+    uncached: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+}
+
+impl AnthropicUsage {
+    pub(crate) fn record(&mut self, usage: Option<&Value>) {
+        let Some(usage) = usage.filter(|u| u.is_object()) else {
+            return;
+        };
+        let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        self.seen = true;
+        self.uncached = self.uncached.max(n("input_tokens"));
+        self.cache_read = self.cache_read.max(n("cache_read_input_tokens"));
+        self.cache_write = self.cache_write.max(n("cache_creation_input_tokens"));
+        self.output = self.output.max(n("output_tokens"));
+    }
+
+    pub(crate) fn total(&self) -> Option<Usage> {
+        self.seen.then_some(Usage {
+            input_tokens: self
+                .uncached
+                .saturating_add(self.cache_read)
+                .saturating_add(self.cache_write),
+            output_tokens: self.output,
+            cache_read_tokens: self.cache_read,
+            reasoning_tokens: 0,
+        })
+    }
+}
+
 fn parse_event(
     payload: &str,
     blocks: &mut ToolBlocks,
-    usage: &mut crate::provider::Usage,
-    usage_seen: &mut bool,
+    usage: &mut AnthropicUsage,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Parsed {
     let value: Value =
         serde_json::from_str(payload).map_err(|e| format!("无法解析流数据（{e}）: {payload}"))?;
     match value.get("type").and_then(Value::as_str).unwrap_or("") {
         "message_start" => {
-            // 开了提示缓存时 input_tokens 只是没命中缓存的部分；三项加起来才是整个提示
-            // （和 OpenAI 的 prompt_tokens 同口径，上下文用量据此计算）
-            if let Some(u) = value.pointer("/message/usage").filter(|u| u.is_object()) {
-                let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-                usage.input_tokens = n("input_tokens")
-                    + n("cache_read_input_tokens")
-                    + n("cache_creation_input_tokens");
-                usage.cache_read_tokens = n("cache_read_input_tokens");
-                *usage_seen = true;
-            }
+            usage.record(value.pointer("/message/usage"));
             Ok(None)
         }
         "content_block_start" => {
@@ -549,10 +573,7 @@ fn parse_event(
             Ok(None)
         }
         "message_delta" => {
-            if let Some(output) = value.pointer("/usage/output_tokens").and_then(Value::as_u64) {
-                usage.output_tokens = output;
-                *usage_seen = true;
-            }
+            usage.record(value.get("usage"));
             Ok(value
                 .pointer("/delta/stop_reason")
                 .and_then(Value::as_str)
@@ -865,11 +886,10 @@ mod tests {
     #[test]
     fn parses_stream_lifecycle() {
         let mut blocks = ToolBlocks::default();
-        let mut usage = crate::provider::Usage::default();
-        let mut seen = false;
+        let mut usage = AnthropicUsage::default();
         let mut events = Vec::new();
         let lines = [
-            r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":12,"cache_creation_input_tokens":8}}}"#,
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":0}}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
@@ -878,19 +898,18 @@ mod tests {
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"a\"}"}}"#,
             r#"{"type":"ping"}"#,
-            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":41}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":5,"cache_read_input_tokens":12,"cache_creation_input_tokens":8,"output_tokens":41}}"#,
             r#"{"type":"message_stop"}"#,
         ];
         let mut finish = None;
         for line in lines {
-            let out =
-                parse_event(line, &mut blocks, &mut usage, &mut seen, &mut |e| events.push(e))
-                    .unwrap();
+            let out = parse_event(line, &mut blocks, &mut usage, &mut |e| events.push(e)).unwrap();
             if out.is_some() {
                 finish = out;
             }
         }
         assert_eq!(finish.as_deref(), Some("tool_calls"));
+        let usage = usage.total().unwrap();
         assert_eq!(usage.input_tokens, 25);
         assert_eq!(usage.cache_read_tokens, 12);
         assert_eq!(usage.output_tokens, 41);
@@ -911,6 +930,28 @@ mod tests {
     }
 
     #[test]
+    fn preserves_cache_when_message_delta_only_updates_uncached_input() {
+        let mut blocks = ToolBlocks::default();
+        let mut usage = AnthropicUsage::default();
+        for line in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":12000,"cache_creation_input_tokens":8}}}"#,
+            r#"{"type":"message_delta","usage":{"input_tokens":10,"output_tokens":41}}"#,
+            r#"{"type":"message_delta","usage":{"input_tokens":0,"output_tokens":0}}"#,
+        ] {
+            parse_event(line, &mut blocks, &mut usage, &mut |_| {}).unwrap();
+        }
+        assert_eq!(
+            usage.total(),
+            Some(Usage {
+                input_tokens: 12_018,
+                cache_read_tokens: 12_000,
+                output_tokens: 41,
+                reasoning_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
     fn maps_stop_reasons_and_stream_errors() {
         assert_eq!(finish_reason("end_turn"), "stop");
         assert_eq!(finish_reason("tool_use"), "tool_calls");
@@ -918,13 +959,11 @@ mod tests {
         assert_eq!(finish_reason("stop_sequence"), "stop");
 
         let mut blocks = ToolBlocks::default();
-        let mut usage = crate::provider::Usage::default();
-        let mut seen = false;
+        let mut usage = AnthropicUsage::default();
         let err = parse_event(
             r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
             &mut blocks,
             &mut usage,
-            &mut seen,
             &mut |_| {},
         )
         .unwrap_err();
@@ -1061,8 +1100,7 @@ mod tests {
     #[test]
     fn parses_server_tool_blocks_into_text_events() {
         let mut blocks = ToolBlocks::default();
-        let mut usage = crate::provider::Usage::default();
-        let mut seen = false;
+        let mut usage = AnthropicUsage::default();
         let mut events = Vec::new();
         let lines = [
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"}}"#,
@@ -1074,9 +1112,7 @@ mod tests {
         ];
         let mut finish = None;
         for line in lines {
-            let out =
-                parse_event(line, &mut blocks, &mut usage, &mut seen, &mut |e| events.push(e))
-                    .unwrap();
+            let out = parse_event(line, &mut blocks, &mut usage, &mut |e| events.push(e)).unwrap();
             if out.is_some() {
                 finish = out;
             }

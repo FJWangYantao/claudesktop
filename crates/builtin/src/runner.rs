@@ -429,13 +429,19 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
                 return Steps::Failed(message);
             }
         };
-        // 这一步的用量当场报：输入 + 输出就是此刻上下文的大小（之前各步都含在这次的输入里），
-        // 界面跑着的时候就能看到上下文涨到多少，不用等整轮结束
-        let mut step_tokens = 0;
-        if let Some(u) = outcome.usage {
-            step_tokens = u.input_tokens + u.output_tokens;
-            inner.report_usage(session, u, step_tokens);
-        }
+        // 界面按请求刷新上下文；端点只报输出时，按实际发出的消息估算输入。
+        // 只有完整用量才能作为自动压缩的测量基准。
+        let measured_tokens = outcome.usage.map_or(0, |u| {
+            let measured =
+                if u.input_tokens > 0 { u.input_tokens.saturating_add(u.output_tokens) } else { 0 };
+            let context = if measured > 0 {
+                measured
+            } else {
+                compact::estimate_tokens(&messages).saturating_add(u.output_tokens)
+            };
+            inner.report_usage(session, u, context);
+            measured
+        });
         if !text.trim().is_empty() {
             reply = text.clone();
         }
@@ -497,7 +503,7 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
             if !inner.commit(session, flag, step) {
                 return Steps::Stopped;
             }
-            inner.measure(session, step_tokens, unmeasured);
+            inner.measure(session, measured_tokens, unmeasured);
             inner.count_step(session, false);
             // 继续循环，让模型下一步重发完整的调用
             continue;
@@ -513,7 +519,7 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
             {
                 return Steps::Stopped;
             }
-            inner.measure(session, step_tokens, 0);
+            inner.measure(session, measured_tokens, 0);
             stop = stop_reason(outcome.finish_reason.as_deref());
             // 模型这一轮只说完了话，但用户插了话：再跑一步把它当成新的用户消息发出去，
             // 别让输入框已清空的插话落空（步数用尽时才交给 `finish` 明确提示丢掉）
@@ -581,7 +587,7 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
             return Steps::Stopped;
         }
         // 工具结果还没被端点数过
-        inner.measure(session, step_tokens, unmeasured);
+        inner.measure(session, measured_tokens, unmeasured);
         inner.count_step(session, wrote_todo);
         if waiting && !inner.has_steer(session) {
             stop = "waiting_for_task".into();

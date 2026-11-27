@@ -366,24 +366,36 @@ fn apply_event(
     Ok(())
 }
 
-fn parse_usage(usage: &Value) -> Option<Usage> {
+pub(crate) fn parse_usage(usage: &Value) -> Option<Usage> {
     let n = |path: &str| usage.pointer(path).and_then(Value::as_u64).unwrap_or(0);
     let input = n("/input_tokens");
-    let output = n("/output_tokens");
-    if input == 0 && output == 0 {
-        return None;
-    }
-    Some(Usage {
-        input_tokens: input,
-        output_tokens: output,
+    let cache_read = n("/input_tokens_details/cached_tokens");
+    let usage = Usage {
+        input_tokens: if input < cache_read { input.saturating_add(cache_read) } else { input },
+        output_tokens: n("/output_tokens"),
         reasoning_tokens: n("/output_tokens_details/reasoning_tokens"),
-        cache_read_tokens: n("/input_tokens_details/cached_tokens"),
-    })
+        cache_read_tokens: cache_read,
+    };
+    (usage != Usage::default()).then_some(usage)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repairs_input_below_reported_cache_without_double_counting_standard_usage() {
+        for input_tokens in [100, 1000] {
+            let usage = parse_usage(&serde_json::json!({
+                "input_tokens": input_tokens,
+                "input_tokens_details": {"cached_tokens": 900},
+                "output_tokens": 10,
+            }))
+            .unwrap();
+            assert_eq!(usage.input_tokens, 1000);
+            assert_eq!(usage.cache_read_tokens, 900);
+        }
+    }
 
     fn call() -> ToolCall {
         ToolCall {

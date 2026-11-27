@@ -1178,6 +1178,14 @@ impl Usage {
         self.reasoning_tokens += other.reasoning_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
     }
+
+    /// 合并同一次请求的累计用量。尾包可能只补报部分字段。
+    pub(crate) fn merge_cumulative(&mut self, other: Usage) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.output_tokens = self.output_tokens.max(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
+    }
 }
 
 /// 端点模型列表里的一项。

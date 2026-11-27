@@ -75,8 +75,8 @@ impl ChatProvider for OpenAiProvider {
                 if chunk.finish_reason.is_some() {
                     outcome.finish_reason = chunk.finish_reason;
                 }
-                if chunk.usage.is_some() {
-                    outcome.usage = chunk.usage;
+                if let Some(usage) = chunk.usage {
+                    outcome.usage.get_or_insert_default().merge_cumulative(usage);
                 }
                 Ok(())
             }
@@ -253,24 +253,61 @@ pub(crate) fn parse_chunk(payload: &str) -> Result<Chunk, String> {
         }
         chunk.finish_reason = choice["finish_reason"].as_str().map(str::to_owned);
     }
-    if let Some(u) = value.get("usage").filter(|u| u.is_object()) {
-        let n = |p: &str| u.pointer(p).and_then(Value::as_u64).unwrap_or(0);
-        chunk.usage = Some(Usage {
-            input_tokens: n("/prompt_tokens"),
-            output_tokens: n("/completion_tokens"),
-            reasoning_tokens: n("/completion_tokens_details/reasoning_tokens"),
-            // OpenAI 报在 prompt_tokens_details 里，DeepSeek 用自己的字段名
-            cache_read_tokens: n("/prompt_tokens_details/cached_tokens")
-                .max(n("/prompt_cache_hit_tokens")),
-        });
-    }
+    chunk.usage = value.get("usage").and_then(parse_usage);
     Ok(chunk)
+}
+
+pub(crate) fn parse_usage(usage: &Value) -> Option<Usage> {
+    let n = |p: &str| usage.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+    let raw_input = n("/prompt_tokens").max(n("/input_tokens"));
+    let cache_read = n("/prompt_tokens_details/cached_tokens")
+        .max(n("/input_tokens_details/cached_tokens"))
+        .max(n("/prompt_cache_hit_tokens"))
+        .max(n("/cache_read_input_tokens"))
+        .max(n("/cached_tokens"));
+    let cache_miss = n("/prompt_cache_miss_tokens");
+    let cache_write = n("/cache_creation_input_tokens");
+    let cache_total = cache_read.saturating_add(cache_write);
+    // 标准端点的总输入已经包含缓存。兼容层有时把未命中数填进总输入，
+    // 可用 hit + miss 补齐，或在总输入不足以覆盖缓存时加回分项。
+    let input_tokens = if cache_miss == 0 && raw_input < cache_total {
+        raw_input.saturating_add(cache_total)
+    } else {
+        raw_input.max(cache_read.saturating_add(cache_miss))
+    };
+    let usage = Usage {
+        input_tokens,
+        output_tokens: n("/completion_tokens").max(n("/output_tokens")),
+        reasoning_tokens: n("/completion_tokens_details/reasoning_tokens")
+            .max(n("/output_tokens_details/reasoning_tokens")),
+        cache_read_tokens: cache_read,
+    };
+    (usage != Usage::default()).then_some(usage)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::StreamEvent;
+
+    #[test]
+    fn normalizes_cached_input_for_standard_and_compat_usage() {
+        use serde_json::json;
+
+        for payload in [
+            json!({"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 900}}),
+            json!({"prompt_tokens": 1000, "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}),
+            json!({"prompt_tokens": 100, "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}),
+            json!({"input_tokens": 80, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 20}),
+        ] {
+            let usage = parse_usage(&payload).unwrap();
+            assert_eq!(usage.input_tokens, 1000, "{payload}");
+            assert_eq!(usage.cache_read_tokens, 900, "{payload}");
+        }
+        assert_eq!(parse_usage(&json!({"output_tokens": 50})).unwrap().output_tokens, 50);
+        assert_eq!(parse_chunk(r#"{"choices":[],"usage":{}}"#).unwrap().usage, None);
+        assert_eq!(parse_usage(&json!({"prompt_tokens": 0, "completion_tokens": 0})), None);
+    }
 
     #[test]
     fn parses_model_list() {

@@ -27,6 +27,8 @@ mod socket;
 
 pub use logs::{LogChange, LogCursor, LogUpdate, read_logs};
 
+use crate::anthropic::AnthropicUsage;
+use crate::provider::Usage;
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -497,10 +499,8 @@ struct StreamStats {
     anthropic: bool,
     line: Vec<u8>,
     first_token_ms: Option<u64>,
-    input: u64,
-    output: u64,
-    reasoning: u64,
-    cache_read: u64,
+    usage: Usage,
+    anthropic_usage: AnthropicUsage,
     finish_reason: Option<String>,
 }
 
@@ -510,10 +510,8 @@ impl StreamStats {
             anthropic,
             line: Vec::new(),
             first_token_ms: None,
-            input: 0,
-            output: 0,
-            reasoning: 0,
-            cache_read: 0,
+            usage: Usage::default(),
+            anthropic_usage: AnthropicUsage::default(),
             finish_reason: None,
         }
     }
@@ -548,24 +546,17 @@ impl StreamStats {
         // Responses API（Codex 这类 agent 用）：用量在 response.completed 里，正文是 *.delta 事件
         if let Some(kind) = value.get("type").and_then(Value::as_str) {
             if let Some(usage) = value.pointer("/response/usage").filter(|u| u.is_object()) {
-                let n = |p: &str| usage.pointer(p).and_then(Value::as_u64).unwrap_or(0);
-                self.input = n("/input_tokens");
-                self.output = n("/output_tokens");
-                self.reasoning = n("/output_tokens_details/reasoning_tokens");
-                self.cache_read = n("/input_tokens_details/cached_tokens");
+                if let Some(usage) = crate::responses::parse_usage(usage) {
+                    self.usage.merge_cumulative(usage);
+                }
                 if let Some(status) = value.pointer("/response/status").and_then(Value::as_str) {
                     self.finish_reason = Some(status.to_string());
                 }
             }
             return kind.ends_with(".delta");
         }
-        if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
-            let n = |p: &str| usage.pointer(p).and_then(Value::as_u64).unwrap_or(0);
-            self.input = n("/prompt_tokens");
-            self.output = n("/completion_tokens");
-            self.reasoning = n("/completion_tokens_details/reasoning_tokens");
-            self.cache_read =
-                n("/prompt_tokens_details/cached_tokens").max(n("/prompt_cache_hit_tokens"));
+        if let Some(usage) = value.get("usage").and_then(crate::openai::parse_usage) {
+            self.usage.merge_cumulative(usage);
         }
         let Some(choice) = value.pointer("/choices/0") else {
             return false;
@@ -585,19 +576,11 @@ impl StreamStats {
     fn anthropic_event(&mut self, value: &Value) -> bool {
         match value.get("type").and_then(Value::as_str).unwrap_or("") {
             "message_start" => {
-                if let Some(u) = value.pointer("/message/usage") {
-                    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-                    self.input = n("input_tokens")
-                        + n("cache_read_input_tokens")
-                        + n("cache_creation_input_tokens");
-                    self.cache_read = n("cache_read_input_tokens");
-                }
+                self.anthropic_usage.record(value.pointer("/message/usage"));
                 false
             }
             "message_delta" => {
-                if let Some(n) = value.pointer("/usage/output_tokens").and_then(Value::as_u64) {
-                    self.output = n;
-                }
+                self.anthropic_usage.record(value.get("usage"));
                 if let Some(stop) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     self.finish_reason = Some(stop.to_string());
                 }
@@ -610,10 +593,11 @@ impl StreamStats {
 
     fn fill(&self, entry: &mut RequestLog) {
         entry.first_token_ms = self.first_token_ms;
-        entry.input = self.input;
-        entry.output = self.output;
-        entry.reasoning = self.reasoning;
-        entry.cache_read = self.cache_read;
+        let usage = self.anthropic_usage.total().unwrap_or(self.usage);
+        entry.input = usage.input_tokens;
+        entry.output = usage.output_tokens;
+        entry.reasoning = usage.reasoning_tokens;
+        entry.cache_read = usage.cache_read_tokens;
         entry.finish_reason = self.finish_reason.as_deref().map(Arc::from);
     }
 }
@@ -819,16 +803,19 @@ mod tests {
         s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"con", t0);
         assert_eq!(s.first_token_ms, None);
         s.feed(b"tent\":\"hi\"},\"finish_reason\":\"stop\"}]}\r\n\r\n", t0);
-        s.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":60}}}\n\ndata: [DONE]\n\n", t0);
+        s.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"prompt_cache_hit_tokens\":60,\"prompt_cache_miss_tokens\":40}}\n\ndata: {\"usage\":{\"completion_tokens\":7}}\n\ndata: {\"usage\":{}}\n\ndata: [DONE]\n\n", t0);
         assert!(s.first_token_ms.is_some());
-        assert_eq!((s.input, s.output, s.cache_read), (100, 7, 60));
+        let mut log = RequestLog::default();
+        s.fill(&mut log);
+        assert_eq!((log.input, log.output, log.cache_read), (100, 7, 60));
         assert_eq!(s.finish_reason.as_deref(), Some("stop"));
 
         let mut a = StreamStats::new(true);
-        a.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":90}}}\n\n", t0);
+        a.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\n", t0);
         a.feed(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n", t0);
-        a.feed(b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n", t0);
-        assert_eq!((a.input, a.output, a.cache_read), (95, 12, 90));
+        a.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":5}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":6,\"output_tokens\":12}}\n\n", t0);
+        a.fill(&mut log);
+        assert_eq!((log.input, log.output, log.cache_read), (101, 12, 90));
         assert_eq!(a.finish_reason.as_deref(), Some("end_turn"));
         assert!(a.first_token_ms.is_some());
     }

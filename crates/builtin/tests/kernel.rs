@@ -2066,6 +2066,81 @@ fn compacts_before_the_request_when_context_is_nearly_full() {
 }
 
 #[test]
+fn estimates_context_and_still_compacts_when_provider_only_reports_output() {
+    let (base, bodies) = serve(vec![
+        Reply::Sse {
+            lines: vec![
+                delta("content", "第一轮的回答"),
+                finish("stop"),
+                r#"data: {"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":50}}"#.into(),
+                "data: [DONE]".into(),
+            ],
+            gap_ms: 0,
+        },
+        happy_stream("## 摘要\n第一轮的内容"),
+        happy_stream("第二轮的回答"),
+    ]);
+    let h = Harness::with_windows(
+        provider(base),
+        std::env::temp_dir(),
+        HashMap::from([("mock-model".to_string(), 20_000)]),
+    );
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("a".repeat(40_000))).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(
+        h.count(|e| matches!(
+            e,
+            KernelEvent::UsageUpdated { input_tokens: 0, output_tokens: 50, context_tokens, .. }
+            if *context_tokens >= 10_050
+        )),
+        1,
+        "上下文用量应覆盖第一轮用户消息，账单输入仍是端点上报的 0"
+    );
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Compacting)), 0);
+
+    // 两轮的上下文超过 80%；如果只记上一轮的 50 个输出，触不到压缩阈值。
+    h.kernel.send_prompt(&sid, UserPrompt::text("b".repeat(32_000))).unwrap();
+    h.wait_n("turn end", 2, |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(h.count(|e| matches!(e, KernelEvent::Compacted { .. })), 1);
+    let (system, _) = conversation(&bodies, 2);
+    assert!(system.contains("第一轮的内容"), "{system}");
+}
+
+#[test]
+fn combines_openai_usage_chunks_without_clearing_input_at_the_tail() {
+    let (base, _) = serve(vec![Reply::Sse {
+        lines: vec![
+            delta("content", "你好"),
+            finish("stop"),
+            r#"data: {"usage":{"prompt_tokens":100,"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100}}"#.into(),
+            r#"data: {"usage":{"completion_tokens":50,"completion_tokens_details":{"reasoning_tokens":25}}}"#.into(),
+            r#"data: {"usage":{}}"#.into(),
+            r#"data: {"usage":{"prompt_tokens":0,"completion_tokens":0}}"#.into(),
+            "data: [DONE]".into(),
+        ],
+        gap_ms: 0,
+    }]);
+    let h = Harness::new(base);
+    let sid = h.start();
+    h.kernel.send_prompt(&sid, UserPrompt::text("打个招呼")).unwrap();
+    h.wait("turn end", |e| matches!(e, KernelEvent::TurnEnded { .. }));
+    assert_eq!(
+        h.count(|e| matches!(
+            e,
+            KernelEvent::UsageUpdated {
+                input_tokens: 1000,
+                output_tokens: 50,
+                reasoning_tokens: 25,
+                context_tokens: 1050,
+                cache_read_tokens: 900,
+            }
+        )),
+        1
+    );
+}
+
+#[test]
 fn context_overflow_error_compacts_and_resends_once() {
     let (base, bodies) = serve(vec![
         happy_stream("第一轮的回答"),

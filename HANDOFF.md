@@ -655,7 +655,9 @@
   默认开启版本已重新通过 workspace 604 项测试、普通构建和 release 截图构建；默认路径混合快查也通过（31 次请求、17 次内容校验）。
 - **测试用 `BuiltinConfig::new` 要隔离默认路径**：它会带上用户的 MCP / 说明 / 记忆 / 规则文件。测试显式设对应字段为 `None`，否则会连真实 MCP，Windows 上还可能因子进程占着临时工作目录导致清理报 os error 32。
 - **每一步的用量当场报**：`run_steps` 里每次 `stream_chat` 拿到用量就 `Inner::report_usage`，
-  `context_tokens` = 这一步的输入 + 输出（`Steps::Done` 不再带用量）。原来攒到轮末才报一次，
+  `context_tokens` = 这一步的输入 + 输出（`Steps::Done` 不再带用量）。端点只报输出时按发出的
+  消息估算输入，只更新圆环，自动压缩继续沿用已有测量或本地估算。Anthropic 流尾可能分项补报
+  输入与缓存，内核和网关共用解析，累计计数逐项保留。原来攒到轮末才报一次，
   表现是用量环跑着的时候不动、轮末跳一下。压缩和子会话报 `context = 0`，
   界面把 0 当「这次不更新上下文」（只并进本轮累计）。
 - **自动模式改不了本程序自己的配置**（`%APPDATA%\claudesktop\mcp.json`、`settings.json`、插件里的 `plugin.json`）：
