@@ -64,6 +64,10 @@ pub(crate) struct WorkspaceHub {
     settings: Settings,
     /// 主窗上有没有浮层挡着（命令面板 / 对话 / 设置 / 弹层 / 重看浮层）
     overlay_visible: bool,
+    /// 会话清单的指纹（主窗算、这里存，没变就不重建摘要）
+    fingerprint: u64,
+    /// 设置的修订号（主窗设置一变就 +1，这里存已发布的那个）
+    settings_rev: u64,
 }
 
 impl EventEmitter<HubEvent> for WorkspaceHub {}
@@ -73,7 +77,14 @@ impl EventEmitter<HubEvent> for WorkspaceHub {}
 #[allow(dead_code)]
 impl WorkspaceHub {
     pub(crate) fn new(settings: Settings) -> Self {
-        Self { active_session: None, sessions: Vec::new(), settings, overlay_visible: false }
+        Self {
+            active_session: None,
+            sessions: Vec::new(),
+            settings,
+            overlay_visible: false,
+            fingerprint: 0,
+            settings_rev: 0,
+        }
     }
 
     pub(crate) fn new_entity(cx: &mut App, settings: Settings) -> Entity<Self> {
@@ -100,23 +111,32 @@ impl WorkspaceHub {
         self.active_session = token;
     }
 
-    /// 主窗把会话摘要同步过来。返回摘要是否真的变了——没变就不发事件，
-    /// 免得每帧一次的全量同步把订阅者白白叫醒。
-    pub(crate) fn sync_sessions(&mut self, sessions: Vec<SessionSummary>) -> bool {
-        if self.sessions == sessions {
-            return false;
-        }
-        self.sessions = sessions;
-        true
+    /// 会话清单指纹（主窗算好交进来，只用来判断「要不要重建摘要」）。
+    pub(crate) fn fingerprint(&self) -> u64 {
+        self.fingerprint
     }
 
-    /// 设置变了（主题 / 字号 / 模型）：返回是否真的变了。
-    pub(crate) fn sync_settings(&mut self, settings: Settings) -> bool {
-        if self.settings == settings {
-            return false;
-        }
+    pub(crate) fn set_fingerprint(&mut self, fingerprint: u64) {
+        self.fingerprint = fingerprint;
+    }
+
+    /// 设置修订号：主窗设置一变就 +1，比 `Settings` 本身便宜得多。
+    pub(crate) fn settings_rev(&self) -> u64 {
+        self.settings_rev
+    }
+
+    pub(crate) fn set_settings_rev(&mut self, rev: u64) {
+        self.settings_rev = rev;
+    }
+
+    /// 整体换掉会话摘要（只在指纹变了之后调）。
+    pub(crate) fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        self.sessions = sessions;
+    }
+
+    /// 整体换掉设置（只在修订号变了之后调）。
+    pub(crate) fn replace_settings(&mut self, settings: Settings) {
         self.settings = settings;
-        true
     }
 
     /// 主窗把「现在有浮层吗」的结论交进来（命令面板 / 设置 / 重看浮层 / 审查页）：
@@ -132,7 +152,6 @@ impl WorkspaceHub {
         self.overlay_visible = visible;
         was != visible
     }
-
     pub(crate) fn overlay_visible(&self) -> bool {
         self.overlay_visible
     }
@@ -141,51 +160,90 @@ impl WorkspaceHub {
 impl super::ChatApp {
     /// 把主窗的会话清单 / 活跃会话 / 设置投影到 hub，并把变了的那几样广播出去。
     ///
-    /// 每帧调一次（和 `sync_sidebar` 同一个位置）：内部只做一次 Vec 比较，
-    /// 没变化时不发事件、不通知任何订阅者，所以稳态下是零成本。
+    /// 每帧都会被 `render` 叫到，所以先比指纹：会话清单和设置都没变时**不分配**
+    /// （以前每帧 clone 一次 `Settings` 再重建一遍 `Vec<SessionSummary>` + 每个 `PathBuf`，
+    /// 100 个会话就是每帧几百次分配）。浮层只有一个 bool，顺手比掉。
     pub(super) fn sync_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.session().token;
-        let settings = self.settings.clone();
-        let summaries: Vec<super::hub::SessionSummary> = self
-            .sessions
-            .iter()
-            .map(|s| super::hub::SessionSummary {
-                token: s.token,
-                title: s.title.clone(),
-                chat: s.is_chat(),
-                task: s.task,
-                busy: s.busy,
-                dir: (!s.is_chat()).then(|| s.group_dir().to_path_buf()),
-            })
-            .collect();
-
-        let hub = self.hub.clone();
-        let mut events = Vec::new();
         // 浮层：命令面板 / 设置 / 审查页 / 回退浮层都是「盖住工作区」的那一类。
         // 命令面板是 gpui 的 dialog，靠窗口状态问出来；其余是 ChatApp 自己的标记。
         let overlay = self.settings_open
             || self.review.is_some()
             || self.rewind.is_some()
             || window.has_active_dialog(cx);
+        let fingerprint = self.hub_fingerprint();
+        let settings_rev = self.settings_rev;
+
+        let hub = self.hub.clone();
+        let mut events = Vec::new();
+        let mut overlay_flipped = false;
         hub.update(cx, |hub, _| {
+            overlay_flipped = hub.sync_overlay(overlay);
             let active_changed = hub.active_session() != Some(active);
-            hub.set_active_session(Some(active));
-            if hub.sync_sessions(summaries) || active_changed {
-                events.push(HubEvent::SessionUpdated(active));
+            if !active_changed
+                && fingerprint == hub.fingerprint()
+                && settings_rev == hub.settings_rev()
+            {
+                return;
             }
+            hub.set_active_session(Some(active));
+            hub.set_fingerprint(fingerprint);
+            hub.set_settings_rev(settings_rev);
             if active_changed {
                 events.push(HubEvent::ActiveSessionChanged(active));
             }
-            if hub.sync_settings(settings) {
+            events.push(HubEvent::SessionUpdated(active));
+        });
+        if overlay_flipped {
+            events.push(HubEvent::OverlayVisibilityChanged(overlay));
+        }
+        // 摘要 / 设置只在真有变化时才重建，重建完写进 hub
+        let rebuild = events.iter().any(|e| matches!(e, HubEvent::SessionUpdated(_)));
+        if rebuild {
+            let summaries: Vec<super::hub::SessionSummary> = self
+                .sessions
+                .iter()
+                .map(|s| super::hub::SessionSummary {
+                    token: s.token,
+                    title: s.title.clone(),
+                    chat: s.is_chat(),
+                    task: s.task,
+                    busy: s.busy,
+                    dir: (!s.is_chat()).then(|| s.group_dir().to_path_buf()),
+                })
+                .collect();
+            let settings = self.settings.clone();
+            hub.update(cx, |hub, _| {
+                hub.replace_sessions(summaries);
+                hub.replace_settings(settings);
+            });
+            if settings_rev != self.hub_settings_published {
+                self.hub_settings_published = settings_rev;
                 events.push(HubEvent::ThemeOrFontChanged);
             }
-            if hub.sync_overlay(overlay) {
-                events.push(HubEvent::OverlayVisibilityChanged(overlay));
-            }
-        });
+        }
         for event in events {
             hub.update(cx, |_, cx| cx.emit(event));
         }
+    }
+
+    /// 会话清单的便宜指纹：只算已有字段，不分配。`dir` 用长度近似
+    /// （同一个会话的工作目录不会在运行中换成「同长度的另一个路径」而不动其它字段）。
+    fn hub_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.sessions.len().hash(&mut hasher);
+        for session in &self.sessions {
+            session.token.hash(&mut hasher);
+            session.title.len().hash(&mut hasher);
+            session.busy.hash(&mut hasher);
+            session.task.hash(&mut hasher);
+            session.is_chat().hash(&mut hasher);
+            if !session.is_chat() {
+                session.group_dir().as_os_str().len().hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
 }
 
@@ -197,9 +255,10 @@ mod tests {
         WorkspaceHub::new(Settings::default())
     }
 
-    /// 同一批摘要同步两次，第二次不算变化（否则每帧都会惊动订阅者）。
+    /// 指纹一样就不重建摘要：`replace_sessions` 只在主窗算出新指纹之后才调，
+    /// 这里断言「同一批摘要 + 同一指纹」不会让 hub 里多出东西。
     #[core::prelude::v1::test]
-    fn syncing_the_same_sessions_twice_reports_no_change() {
+    fn replacing_sessions_keeps_the_fingerprint_it_was_given() {
         let mut hub = hub();
         let one = vec![SessionSummary {
             token: 1,
@@ -209,19 +268,22 @@ mod tests {
             busy: false,
             dir: None,
         }];
-        assert!(hub.sync_sessions(one.clone()));
-        assert!(!hub.sync_sessions(one));
+        hub.replace_sessions(one);
+        hub.set_fingerprint(7);
+        assert_eq!(hub.fingerprint(), 7);
+        assert_eq!(hub.sessions().len(), 1);
+        assert_eq!(hub.session(1).map(|s| s.title.as_ref()), Some("会话"));
     }
 
-    /// 浮层深度是计数：开着两层时关掉一层，仍然是「被遮挡」。
+    /// 浮层是绝对值：重复设同一个值不算翻转，只有跨过边界那一次才广播。
     #[core::prelude::v1::test]
     fn overlay_visibility_only_flips_at_the_edges() {
         let mut hub = hub();
-        assert!(hub.set_overlay_visible(true));
-        assert!(!hub.set_overlay_visible(true), "第二层不算翻转");
+        assert!(hub.set_overlay_visible(true), "第一次露出浮层");
+        assert!(!hub.set_overlay_visible(true), "还是开着，不算翻转");
         assert!(hub.overlay_visible());
-        assert!(!hub.set_overlay_visible(false), "关掉一层仍然被遮挡");
-        assert!(hub.set_overlay_visible(false), "最后一层关掉才算露出");
+        assert!(hub.set_overlay_visible(false), "关掉算翻转");
         assert!(!hub.overlay_visible());
+        assert!(!hub.set_overlay_visible(false), "已经关了，不算翻转");
     }
 }

@@ -23,8 +23,11 @@ use std::time::Duration;
 /// 拖分割条时 `LayoutChanged` 每帧都来，写盘要防抖（和滚轮落定一个量级）。
 const LAYOUT_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// 右侧那一列的默认宽度
-const RIGHT_DOCK_W: Pixels = px(320.);
+/// 右侧那一列的默认宽度：沿用原来辅助面板的 460px（`PANEL_DEFAULT_W`），
+/// 换算成像素是因为 dock 的尺寸不跟字号缩放走。
+fn right_dock_w(window: &Window) -> Pixels {
+    crate::theme::PANEL_DEFAULT_W.to_pixels(window.rem_size())
+}
 
 impl ChatApp {
     /// 建 dock 的皮肤与面板注册、恢复上次布局、挂写盘订阅。
@@ -78,12 +81,28 @@ impl ChatApp {
         })
         .detach();
 
-        // 上次的布局优先；读不懂 / 没存过就用默认布局
-        let restored = persist::read()
-            .map(|file| self.dock.update(cx, |dock, cx| dock.load(file.main, window, cx).is_ok()))
+        // 上次的布局优先；读不懂 / 没存过 / 恢复出来一个没有对话 Pane 的布局，都用默认布局。
+        // （没有对话 Pane 的窗口等于空壳，宁可丢一次布局）
+        let saved = persist::read();
+        let restored = saved
+            .as_ref()
+            .map(|file| {
+                let state = file.main.clone();
+                self.dock.update(cx, |dock, cx| dock.load(state, window, cx).is_ok())
+            })
             .unwrap_or(false);
-        if !restored {
+        if !restored || !self.focus_pane_of_kind(PaneKind::Chat, window, cx) {
             self.install_default_layout(window, cx);
+        } else if let Some(file) = saved {
+            // 弹出窗等主窗起来之后再开：在构造函数里开新窗口是重入
+            let states = file.popouts;
+            if !states.is_empty() {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(0)).await;
+                    let _ = this.update(cx, |app, cx| app.restore_popouts(states, cx));
+                })
+                .detach();
+            }
         }
         // 右侧那一列跟着 `right_panel.open` 走（会话切到聊天空间时会收起）
         self.sync_right_dock(window, cx);
@@ -109,7 +128,7 @@ impl ChatApp {
                 window,
                 cx,
             );
-            dock.set_dock_size(DockPlacement::Right, RIGHT_DOCK_W, window, cx);
+            dock.set_dock_size(DockPlacement::Right, right_dock_w(window), window, cx);
         });
     }
 
@@ -225,13 +244,19 @@ impl ChatApp {
     ) -> bool {
         let dock = self.dock.clone();
         let mut found = None;
-        for placement in [DockPlacement::Right, DockPlacement::Center] {
+        // 四个区域都找一遍：Pane 可能被拖到左侧或底部，也可能已经弹到独立窗
+        for placement in [
+            DockPlacement::Right,
+            DockPlacement::Center,
+            DockPlacement::Left,
+            DockPlacement::Bottom,
+        ] {
             let Some(tree) = dock.read(cx).layout(placement) else { continue };
             let ids: Vec<_> = tree.panels().collect();
             for id in ids {
                 let handle = dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
                 if handle == Some(kind) {
-                    found = Some(id);
+                    found = Some((dock.clone(), id));
                     break;
                 }
             }
@@ -239,8 +264,30 @@ impl ChatApp {
                 break;
             }
         }
-        if let Some(id) = found {
-            dock.update(cx, |dock, cx| dock.select_panel(id, window, cx));
+        // 弹出窗里也算「已经在工作区里」：直接在那个窗里把它选中
+        if found.is_none() {
+            for entry in &self.popouts {
+                let ids: Vec<_> = entry
+                    .dock
+                    .read(cx)
+                    .layout(DockPlacement::Center)
+                    .map(|tree| tree.panels().collect())
+                    .unwrap_or_default();
+                for id in ids {
+                    let handle =
+                        entry.dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
+                    if handle == Some(kind) {
+                        found = Some((entry.dock.clone(), id));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+        }
+        if let Some((area, id)) = found {
+            area.update(cx, |dock, cx| dock.select_panel(id, window, cx));
             return true;
         }
         false
@@ -263,7 +310,7 @@ impl ChatApp {
                     window,
                     cx,
                 );
-                dock.set_dock_size(DockPlacement::Right, RIGHT_DOCK_W, window, cx);
+                dock.set_dock_size(DockPlacement::Right, right_dock_w(window), window, cx);
             });
         }
         // 展开 / 收起：只有本区域的 open 状态和想要的不一样才动它（避免每帧写布局）

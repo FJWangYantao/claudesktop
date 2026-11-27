@@ -851,6 +851,21 @@
   的，直接把唯一的 Arc 移进去，后面 `window_changed` 就没得用了（E0382）。
 - **不要用 `Window::window_id()`**：这版 gpui 只有 `Window::window_handle()` 和
   `AnyWindowHandle::window_id()`。
+- **弹出窗必须走 `gpui_kit::open_window`**：裸 `cx.open_window` 不会在根上包
+  `base::Root`，后果是 rem 不跟设置缩放、`Popover` / `Tooltip` / `Dialog` 全都画不出来。
+- **跨窗迁移时窗口上下文必须跟着换**：往主窗插面板要用
+  `self.window_handle.update(cx, |_, window, cx| ...)`，不能拿弹出窗的 `window`
+  （它下一行就 `remove_window()` 了）；反过来 `window_changed` 要传给**新**窗口。
+- **Tab 栏空白别放 `chrome::drag_area()`**：那是 `WindowControlArea::Drag`，在窗口中下部
+  分屏时双击 Tab 空白会触发系统最大化。窗口标题栏才需要它。
+- **`DropIndicator::bounds()` 是窗口绝对坐标**，而皮肤把这个元素塞进 Tab 组的内容区当
+  子元素——直接用会偏出面板、左/右分屏也永远整块高亮。只用 `placement()` 自己算相对矩形。
+- **`repo_root()` 在 worktree 里给的是主仓库目录**：拿它当 `git diff` 的工作目录会把主仓库
+  的改动当成 worktree 会话的。diff 一律用会话自己的 `dir` 跑，`repo_root` 只用来判断
+  「这里是不是 git 仓库」。
+- **`git diff <base>...HEAD` 的 `base` 会进参数位**：先拒绝以 `-` 开头的值，并统一带
+  `--no-ext-diff`（仓库里配了外部 diff 工具时输出会完全变样）。
+
 
 
 

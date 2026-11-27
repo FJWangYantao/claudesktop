@@ -400,14 +400,20 @@ pub fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, String> {
 ///
 /// 非 Git 目录返回 `None`（调用方据此把 Git 相关档位隐掉），空仓库（还没有 HEAD）
 /// 退回 `git diff` + `git diff --cached`。
+///
+/// **工作目录用 `dir` 本身，不用 [`repo_root`]**：在 worktree 会话里 `repo_root` 给的是
+/// 主仓库目录（见它自己的注释），拿它跑 diff 会把主仓库的改动当成这个会话的。
 pub fn working_tree_diff(dir: &Path) -> Option<String> {
-    let repo = repo_root(dir)?;
-    let mut out = git_stdout(&repo, &["diff", "HEAD", "--no-color"]).unwrap_or_else(|_| {
-        // 还没有第一个 commit：HEAD 不存在，分开取「工作区 vs 索引」和「索引 vs HEAD」
-        let work = git_stdout(&repo, &["diff", "--no-color"]).unwrap_or_default();
-        let staged = git_stdout(&repo, &["diff", "--cached", "--no-color"]).unwrap_or_default();
-        format!("{work}{staged}")
-    });
+    repo_root(dir)?;
+    let mut out =
+        git_stdout(dir, &["--no-ext-diff", "diff", "HEAD", "--no-color"]).unwrap_or_else(|_| {
+            // 还没有第一个 commit：HEAD 不存在，分开取「工作区 vs 索引」和「索引 vs HEAD」
+            let work =
+                git_stdout(dir, &["--no-ext-diff", "diff", "--no-color"]).unwrap_or_default();
+            let staged = git_stdout(dir, &["--no-ext-diff", "diff", "--cached", "--no-color"])
+                .unwrap_or_default();
+            format!("{work}{staged}")
+        });
     if out.trim().is_empty() {
         out = String::new();
     }
@@ -416,25 +422,26 @@ pub fn working_tree_diff(dir: &Path) -> Option<String> {
 
 /// 相对基线分支的改动（Git Scope 的「相对基线」档）：`git diff <base>...HEAD`，
 /// 三点比较的是「从共同祖先到 HEAD」，也就是这条分支自己加的东西。
+///
+/// `base` 会进命令行参数位，所以拒绝以 `-` 开头的值（`git diff --output=...` 那种注入）。
 pub fn branch_diff(dir: &Path, base: &str) -> Option<String> {
-    let repo = repo_root(dir)?;
-    if base.trim().is_empty() {
+    let base = base.trim();
+    if base.is_empty() || base.starts_with('-') || repo_root(dir).is_none() {
         return None;
     }
-    git_stdout(&repo, &["diff", &format!("{base}...HEAD"), "--no-color"]).ok()
+    let range = format!("{base}...HEAD");
+    git_stdout(dir, &["--no-ext-diff", "diff", &range, "--no-color"]).ok()
 }
 
 /// 未跟踪的文件（相对仓库根的路径）。它们没有 base 版本，只有整份内容。
 pub fn untracked_files(dir: &Path) -> Vec<PathBuf> {
-    let Some(repo) = repo_root(dir) else { return Vec::new() };
-    let Ok(text) = git_stdout(&repo, &["ls-files", "--others", "--exclude-standard"]) else {
+    if repo_root(dir).is_none() {
+        return Vec::new();
+    }
+    let Ok(text) = git_stdout(dir, &["ls-files", "--others", "--exclude-standard"]) else {
         return Vec::new();
     };
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| repo.join(line))
-        .collect()
+    text.lines().map(str::trim).filter(|line| !line.is_empty()).map(|line| dir.join(line)).collect()
 }
 
 /// 跑 git，成功时返回 (stdout, stderr)。

@@ -248,9 +248,7 @@ impl ChangedFiles {
 
 pub(super) struct RightPanelState {
     pub open: bool,
-    pub expanded: bool,
     pub tab: RightTab,
-    pub width_delta: f32,
     seen_token: Option<u64>,
     root: PathBuf,
     file_tree: FileTree,
@@ -261,6 +259,11 @@ pub(super) struct RightPanelState {
     filter_input: Entity<InputState>,
     file_scroll: UniformListScrollHandle,
     diff_list_scroll: UniformListScrollHandle,
+    /// 这一帧这个面板够不够宽、要不要并排双栏（由各 Pane 自己量的宽度算，见 `render_files_tab`）
+    split: bool,
+    /// 本轮改动文件数（改动 Pane 的 Tab badge 用，按 `diff_revision` 缓存）
+    pub(crate) changed_count: usize,
+    changed_count_rev: u64,
 }
 
 impl RightPanelState {
@@ -285,9 +288,7 @@ impl RightPanelState {
         .detach();
         Self {
             open: false,
-            expanded: false,
             tab: RightTab::Files,
-            width_delta: 0.,
             seen_token: None,
             root: PathBuf::new(),
             file_tree: FileTree::default(),
@@ -298,11 +299,10 @@ impl RightPanelState {
             filter_input,
             file_scroll: UniformListScrollHandle::new(),
             diff_list_scroll: UniformListScrollHandle::new(),
+            split: false,
+            changed_count: 0,
+            changed_count_rev: u64::MAX,
         }
-    }
-
-    fn width_rem(&self) -> f32 {
-        (PANEL_DEFAULT_W.0 + self.width_delta).clamp(20., 48.)
     }
 
     fn sync_session(&mut self, token: u64, cwd: &Path) {
@@ -435,7 +435,6 @@ impl ChatApp {
     ) {
         if self.right_panel.open && self.right_panel.tab == tab {
             self.right_panel.open = false;
-            self.right_panel.expanded = false;
         } else {
             self.settings_open = false;
             self.right_panel.open = true;
@@ -451,7 +450,6 @@ impl ChatApp {
     pub(super) fn toggle_right_panel_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_panel.open {
             self.right_panel.open = false;
-            self.right_panel.expanded = false;
         } else {
             self.settings_open = false;
             self.right_panel.open = true;
@@ -507,40 +505,64 @@ impl ChatApp {
     }
 
     /// 文件 Pane 的正文（外壳是 dock 的 Tab 栏，这里不再画自己的顶栏）。
+    /// `width_rem` 是这个面板**实测**宽度（rem），双栏阈值按它判——以前读的是那个
+    /// 已经废弃的固定宽度，结果拖宽 / Zoom / 弹成 900px 独立窗都进不了双栏。
     pub(super) fn render_files_tab(
         &mut self,
+        width_rem: Option<f32>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.right_panel.split = width_rem.is_some_and(|w| w >= 36.);
         let session = &self.sessions[self.active];
         self.right_panel.sync_session(session.token, &session.cwd);
         let showing_preview = self.panel_split() || self.right_panel.selected_file.is_some();
         if !showing_preview && let Some(preview) = &mut self.right_panel.preview {
             preview.release_list();
         }
+        self.refresh_changed_file_count();
         self.render_file_workspace(window, cx)
     }
 
     /// 改动 Pane 的正文。
     pub(super) fn render_diff_tab(
         &mut self,
+        width_rem: Option<f32>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.right_panel.split = width_rem.is_some_and(|w| w >= 36.);
         let session = &self.sessions[self.active];
         self.right_panel.sync_session(session.token, &session.cwd);
+        self.refresh_changed_file_count();
         self.render_diff_workspace(window, cx)
     }
 
-    /// 这一轮改了几个文件（改动 Pane 的 Tab badge）。
-    pub(super) fn right_panel_changed_file_count(&self, _cx: &App) -> usize {
+    /// 这个面板被切到后台 / 收起时把虚拟列表缓存放掉：
+    /// 后台 Tab 不该继续占着行高缓存（见 `HANDOFF.md` 的内存预算一节）。
+    pub(crate) fn release_lists(&mut self) {
+        if let Some(preview) = &mut self.right_panel.preview {
+            preview.release_list();
+        }
+        if let Some(preview) = &mut self.right_panel.diff_preview {
+            preview.release_list();
+        }
+    }
+
+    /// 本轮改动文件数：按 `diff_revision` 缓存。
+    /// 以前每个 Tab 栏重画都全量扫一遍记录（千文件实测中位 59ms）。
+    pub(crate) fn refresh_changed_file_count(&mut self) {
         let session = &self.sessions[self.active];
-        // 和改动清单同一口径（`ChangedFiles::sync` 读的就是这份记录）
-        turn_files(&session.transcript, 0).len()
+        if self.right_panel.changed_count_rev == session.diff_revision {
+            return;
+        }
+        let count = crate::model::turn_files(&session.transcript, 0).len();
+        self.right_panel.changed_count = count;
+        self.right_panel.changed_count_rev = session.diff_revision;
     }
 
     fn panel_split(&self) -> bool {
-        self.right_panel.expanded || self.right_panel.width_rem() >= 36.
+        self.right_panel.split
     }
 
     fn render_file_workspace(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -964,7 +986,6 @@ impl ChatApp {
             "expanded" => {
                 let path = self.session().cwd.join("apps/desktop/src/main.rs");
                 self.right_panel.open = true;
-                self.right_panel.expanded = true;
                 self.right_panel.tab = RightTab::Files;
                 self.right_panel.open_file(path);
                 cx.notify();

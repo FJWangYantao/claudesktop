@@ -196,6 +196,10 @@ pub struct ChatApp {
     acp_base: AcpKernelConfig,
     /// 生效中的设置（启动时已合并环境变量）
     settings: Settings,
+    /// 设置修订号：设置一变就 +1，hub 的投影据此判断要不要重建（见 hub.rs）
+    settings_rev: u64,
+    /// 已经发布给 hub 的修订号
+    hub_settings_published: u64,
     settings_path: Option<PathBuf>,
     settings_open: bool,
     /// 设置页的焦点锚（设置页没有输入框可以兜底，快捷键靠它留在 `ChatApp` 键上下文里）
@@ -664,6 +668,8 @@ impl ChatApp {
             acp_base,
             settings,
             settings_path,
+            settings_rev: 1,
+            hub_settings_published: 0,
             settings_open: false,
             settings_focus: cx.focus_handle(),
             menu_focus: cx.focus_handle(),
@@ -4560,11 +4566,9 @@ impl Render for ChatApp {
                 let Some(drag) = this.panel_resizing else { return };
                 let rem = window.rem_size();
                 let dx = (event.position.x - drag.start_x) / rem;
-                if drag.right {
-                    this.right_panel.width_delta = drag.start_width - PANEL_DEFAULT_W.0 - dx;
-                } else {
-                    this.sidebar_width_delta = drag.start_width - SIDEBAR_W.0 + dx;
-                }
+                // 只有左侧栏还能拖宽度：右侧那一列现在是 dock 的右区域，拖拽由 base 管
+                this.sidebar_width_delta = drag.start_width - SIDEBAR_W.0 + dx;
+                let _ = drag.right;
                 cx.notify();
             }))
             .on_mouse_down(

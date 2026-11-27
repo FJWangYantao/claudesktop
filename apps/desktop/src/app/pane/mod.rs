@@ -291,3 +291,24 @@ pub(crate) fn pane_state(kind: PaneKind, info: serde_json::Value) -> PanelState 
         info: PanelInfo::panel(info),
     }
 }
+
+/// 让一个 Pane 跟着 `WorkspaceHub` 的事件自己重画。
+///
+/// 主窗里的 Pane 靠 `ChatApp` 每帧重绘顺带刷新，但**弹出到独立窗之后就没人管它**了：
+/// 主窗流式生成、切会话、改文件时那张窗会完全静止。所以每个 Pane 建的时候都订一次，
+/// 事件类型先不细挑——Pane 的渲染都是便宜的投影，重画一次比漏一次刷新划算。
+pub(crate) fn follow_hub<T: 'static>(
+    hub: &Entity<crate::app::hub::WorkspaceHub>,
+    cx: &mut Context<T>,
+) {
+    cx.subscribe(
+        hub,
+        |_: &mut T,
+         _: Entity<crate::app::hub::WorkspaceHub>,
+         _: &crate::app::hub::HubEvent,
+         cx: &mut Context<T>| {
+            cx.notify();
+        },
+    )
+    .detach();
+}

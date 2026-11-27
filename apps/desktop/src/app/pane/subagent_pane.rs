@@ -20,6 +20,10 @@ pub(crate) struct SubagentPane {
 
 impl SubagentPane {
     pub(crate) fn new(app: WeakEntity<ChatApp>, cx: &mut Context<Self>) -> Self {
+        if let Some(upgraded) = app.upgrade() {
+            let hub = upgraded.read(cx).hub.clone();
+            super::follow_hub(&hub, cx);
+        }
         Self { app, focus_handle: cx.focus_handle() }
     }
 }

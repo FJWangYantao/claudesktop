@@ -16,11 +16,17 @@ use gpui_kit::*;
 pub(crate) struct FilesPane {
     app: WeakEntity<ChatApp>,
     focus_handle: FocusHandle,
+    /// 上一帧量到的面板宽度（决定要不要并排双栏；见 `render_file_workspace`）
+    width: crate::app::widgets::MeasuredWidth,
 }
 
 impl FilesPane {
     pub(crate) fn new(app: WeakEntity<ChatApp>, cx: &mut Context<Self>) -> Self {
-        Self { app, focus_handle: cx.focus_handle() }
+        if let Some(upgraded) = app.upgrade() {
+            let hub = upgraded.read(cx).hub.clone();
+            super::follow_hub(&hub, cx);
+        }
+        Self { app, focus_handle: cx.focus_handle(), width: Default::default() }
     }
 }
 
@@ -79,6 +85,17 @@ impl Panel for FilesPane {
             serde_json::json!({ "kind": "files", "selected": selected }),
         )
     }
+
+    /// 切到后台（别的 Tab 顶上来）：把文件树的虚拟列表缓存放掉，
+    /// 否则后台 Tab 会一直占着行高缓存
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if active {
+            return;
+        }
+        if let Some(app) = self.app.upgrade() {
+            app.update(cx, |app, _| app.release_lists());
+        }
+    }
 }
 
 impl EventEmitter<PanelEvent> for FilesPane {}
@@ -94,6 +111,13 @@ impl Render for FilesPane {
         let Some(app) = self.app.upgrade() else {
             return div().size_full().into_any_element();
         };
-        app.update(cx, |app, cx| app.render_files_tab(window, cx))
+        let width_rem = self.width.get().map(|w| f32::from(w) / f32::from(window.rem_size()));
+        div()
+            .relative()
+            .size_full()
+            .min_h_0()
+            .child(self.width.probe())
+            .child(app.update(cx, |app, cx| app.render_files_tab(width_rem, window, cx)))
+            .into_any_element()
     }
 }

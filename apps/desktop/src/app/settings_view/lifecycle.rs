@@ -469,6 +469,8 @@ impl ChatApp {
         }
         // 外观之后再套字号 / 字体：`Theme::change` 会载入主题文件里的字号，盖掉我们设的值
         self.apply_font(cx);
+        // 主题 / 字号变了：让 hub 知道（弹出窗里的 Pane 靠它重画）
+        self.settings_rev = self.settings_rev.wrapping_add(1);
         cx.notify();
     }
 
@@ -506,6 +508,7 @@ impl ChatApp {
     pub(crate) fn set_font_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
         self.save_ui_pref(move |s| s.font_scale = scale, cx);
         self.apply_font(cx);
+        self.settings_rev = self.settings_rev.wrapping_add(1);
     }
 
     /// 设置页换界面字体族；None = 回到内嵌的 Inter。

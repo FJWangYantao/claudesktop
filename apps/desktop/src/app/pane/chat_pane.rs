@@ -28,6 +28,11 @@ impl ChatPane {
         overlay: Entity<LoopOverlay>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // 跟 hub 事件走：弹出窗里没人替它重画（见 `pane::follow_hub`）
+        if let Some(upgraded) = app.upgrade() {
+            let hub = upgraded.read(cx).hub.clone();
+            super::follow_hub(&hub, cx);
+        }
         Self { app, focus_handle: cx.focus_handle(), content, overlay }
     }
 }
@@ -57,6 +62,17 @@ impl ClaudesktopPane for ChatPane {
 impl Panel for ChatPane {
     fn panel_name(&self) -> &'static str {
         PaneKind::Chat.panel_name()
+    }
+
+    /// 主对话 Pane 不给关：它复用主窗那一份内容区与输入状态实体，
+    /// 关掉或弹出都会让主窗失去对话区（要关的是**会话**，走侧栏）。
+    fn closable(&self, _cx: &App) -> bool {
+        false
+    }
+
+    /// 同一个道理：这个 Pane 不能搬窗（见 `popout.rs` 文件头的第 3 条）
+    fn zoomable(&self, _cx: &App) -> bool {
+        true
     }
 
     fn dump(&self, _cx: &App) -> PanelState {

@@ -12,11 +12,17 @@ use gpui_kit::*;
 pub(crate) struct DiffPane {
     app: WeakEntity<ChatApp>,
     focus_handle: FocusHandle,
+    /// 上一帧量到的面板宽度（双栏 Diff 的阈值按它判）
+    width: crate::app::widgets::MeasuredWidth,
 }
 
 impl DiffPane {
     pub(crate) fn new(app: WeakEntity<ChatApp>, cx: &mut Context<Self>) -> Self {
-        Self { app, focus_handle: cx.focus_handle() }
+        if let Some(upgraded) = app.upgrade() {
+            let hub = upgraded.read(cx).hub.clone();
+            super::follow_hub(&hub, cx);
+        }
+        Self { app, focus_handle: cx.focus_handle(), width: Default::default() }
     }
 }
 
@@ -33,11 +39,11 @@ impl ClaudesktopPane for DiffPane {
         self.app.upgrade().map(|app| app.read(cx).session().token)
     }
 
-    /// Tab 上的 badge：这一轮改了几个文件（和侧栏 / 顶栏的口径一致）
+    /// Tab 上的 badge：这一轮改了几个文件（读缓存，不在这里扫记录）
     fn badge(&self, cx: &App) -> Option<SharedString> {
         let app = self.app.upgrade()?;
         let app = app.read(cx);
-        let count = app.right_panel_changed_file_count(cx);
+        let count = app.right_panel.changed_count;
         (count > 0).then(|| SharedString::from(count.to_string()))
     }
 }
@@ -49,6 +55,16 @@ impl Panel for DiffPane {
 
     fn dump(&self, _cx: &App) -> PanelState {
         super::pane_state(PaneKind::Diff, serde_json::json!({ "kind": "diff", "scope": "turn" }))
+    }
+
+    /// 切到后台：Diff 预览的虚拟列表缓存放掉（后台 Tab 不该继续占行高缓存）
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if active {
+            return;
+        }
+        if let Some(app) = self.app.upgrade() {
+            app.update(cx, |app, _| app.release_lists());
+        }
     }
 }
 
@@ -65,6 +81,13 @@ impl Render for DiffPane {
         let Some(app) = self.app.upgrade() else {
             return div().size_full().into_any_element();
         };
-        app.update(cx, |app, cx| app.render_diff_tab(window, cx))
+        let width_rem = self.width.get().map(|w| f32::from(w) / f32::from(window.rem_size()));
+        div()
+            .relative()
+            .size_full()
+            .min_h_0()
+            .child(self.width.probe())
+            .child(app.update(cx, |app, cx| app.render_diff_tab(width_rem, window, cx)))
+            .into_any_element()
     }
 }

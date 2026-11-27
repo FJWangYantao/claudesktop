@@ -4,7 +4,7 @@
 //! 和右侧面板、侧栏的观感对齐。这里只做外观与命中区：
 //! 选中 / 关闭 / zoom / 拖拽的行为都是 `TabGroupContext` 的回调，分屏拖动是 base 自己的。
 
-use super::PaneHandle;
+use super::{PaneHandle, PaneKind};
 use crate::theme::rgb;
 use crate::theme::*;
 use gpui_base::dock::{
@@ -115,25 +115,30 @@ struct ClaudesktopTabGroup {
 }
 
 impl TabGroupRenderer for ClaudesktopTabGroup {
-    fn frame(&self, _group: &TabGroupContext, window: &mut Window, _cx: &mut App) -> Stateful<Div> {
+    fn frame(&self, group: &TabGroupContext, _window: &mut Window, _cx: &mut App) -> Stateful<Div> {
+        // 高度由 base 的 `.size_full()` 定，这里只画底：多写一条 `.h()` 会和它打架
         div()
-            .id("claudesktop-tab-group")
+            .id(("claudesktop-tab-group", group.node().as_u64()))
             .v_flex()
             .size_full()
             .min_h_0()
             .overflow_hidden()
             .bg(rgb(PAPER))
             .text_size(TEXT_SMALL)
-            .map(|d| d.h(TAB_STRIP_H.to_pixels(window.rem_size())))
     }
 
     fn content_frame(
         &self,
-        _group: &TabGroupContext,
+        group: &TabGroupContext,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Stateful<Div> {
-        div().id("claudesktop-tab-content").flex_1().min_h_0().w_full().overflow_hidden()
+        div()
+            .id(("claudesktop-tab-content", group.node().as_u64()))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
     }
 
     fn render_tab_bar(
@@ -157,9 +162,10 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
             .unwrap_or_default();
 
         let zoomed = group.is_zoomed();
+        let node = group.node().as_u64();
         let zoom_handle = group.clone();
         let zoom_button = div()
-            .id("claudesktop-tab-zoom")
+            .id(("claudesktop-tab-zoom", node))
             .h_full()
             .flex_shrink_0()
             .px_1p5()
@@ -172,13 +178,17 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
                 zoom_handle.toggle_zoom(window, cx);
             });
 
-        // 「弹出独立窗」：把这个 Tab 搬到一个新的操作系统窗口里（Phase 2）
-        let active_id = group.active_panel().map(|panel| panel.panel_id(cx));
+        // 「弹出独立窗」：把这个 Tab 搬到一个新的操作系统窗口里（Phase 2）。
+        // 主对话 Pane 不参与：它复用主窗的输入状态实体（见 popout.rs 文件头）
+        let active = group.active_panel();
+        let active_id = active.map(|panel| panel.panel_id(cx));
+        let active_is_chat =
+            active.and_then(PaneHandle::of).is_some_and(|handle| handle.kind(cx) == PaneKind::Chat);
         let main = self.main.borrow().clone();
-        let popout_button = active_id.map(move |panel| {
+        let popout_button = active_id.filter(|_| !active_is_chat).map(move |panel| {
             let main = main.clone();
             div()
-                .id("claudesktop-tab-popout")
+                .id(("claudesktop-tab-popout", node))
                 .h_full()
                 .flex_shrink_0()
                 .px_1p5()
@@ -205,8 +215,9 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
             .bg(rgb(PAPER))
             .overflow_hidden()
             .children(tabs)
-            // Tab 之后的空白也能拖窗口（这一条不是按钮区）
-            .child(crate::app::chrome::drag_area())
+            // Tab 之后的空白只是空白：**不能**放 `chrome::drag_area()`，
+            // 那是给窗口标题栏用的 `WindowControlArea::Drag`，中下部分屏时双击它会最大化窗口
+            .child(div().flex_1().min_w_0().h_full())
             .children(active_actions)
             .children(popout_button)
             .child(zoom_button)
@@ -223,23 +234,27 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
         div().size_full().min_h_0().child(panel).into_any_element()
     }
 
-    /// 拖到某个 Tab 组上：目标区用强调色的低透明度填充，边框标出落点。
+    /// 拖到某个 Tab 组上：落点那半区用强调色的低透明度填充、边框标出。
+    ///
+    /// 坐标必须是**相对本组内容区**的：这个元素被塞进 `content_frame` 里当子元素，
+    /// 而 `indicator.bounds()` 是窗口绝对坐标（右侧 / 下方分组会整个偏出面板）。
+    /// 所以只取 `placement`（落点是左/右/上/下/合并），自己算相对矩形。
     fn render_drop_indicator(
         &self,
         indicator: DropIndicator,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<AnyElement> {
-        let bounds = indicator.bounds();
-        let overlay = div()
-            .absolute()
-            .left(bounds.origin.x)
-            .top(bounds.origin.y)
-            .w(bounds.size.width)
-            .h(bounds.size.height)
-            .bg(with_alpha(rgb(CORAL), 0.10))
-            .border_1()
-            .border_color(rgb(CORAL));
+        let overlay =
+            div().absolute().bg(with_alpha(rgb(CORAL), 0.10)).border_1().border_color(rgb(CORAL));
+        let overlay = match indicator.placement() {
+            Some(Placement::Left) => overlay.left_0().top_0().w(relative(0.5)).h_full(),
+            Some(Placement::Right) => overlay.right_0().top_0().w(relative(0.5)).h_full(),
+            Some(Placement::Top) => overlay.left_0().top_0().w_full().h(relative(0.5)),
+            Some(Placement::Bottom) => overlay.left_0().bottom_0().w_full().h(relative(0.5)),
+            // 没有方位 = 并进这个 Tab 组：整块高亮
+            None => overlay.left_0().top_0().size_full(),
+        };
         Some(overlay.into_any_element())
     }
 }
@@ -270,9 +285,11 @@ fn tab_element(
     let drag = group.drag_panel(ix, cx);
     // 拖拽开始要告诉 DockArea 一声，它才能在区域外松手时发 DragOutside
     let area = area.clone();
+    // 元素 id 要带上组：分屏出两个 Tab 组时，光用下标会撞车
+    let node = group.node().as_u64();
 
     div()
-        .id(("claudesktop-tab", ix))
+        .id(ElementId::Name(format!("dock-tab-{node}-{ix}").into()))
         .h_full()
         .flex_shrink_0()
         .max_w(rems(13.))
@@ -295,7 +312,7 @@ fn tab_element(
         .when(can_close, |d| {
             d.child(
                 div()
-                    .id(("claudesktop-tab-close", ix))
+                    .id(ElementId::Name(format!("dock-tab-close-{node}-{ix}").into()))
                     .flex_shrink_0()
                     .size_4()
                     .flex()

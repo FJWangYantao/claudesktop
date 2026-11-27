@@ -125,6 +125,8 @@ impl ChatApp {
             return;
         }
         let new = self.form_settings(cx);
+        // 设置改了：hub 的投影据此重建（主题 / 字号 / 模型等 Pane 读的字段）
+        self.settings_rev = self.settings_rev.wrapping_add(1);
         // 自定义命令和已启用预设的命令一样：菜单里会出现两个一模一样的内核
         if let Some(preset) = duplicate_agent_command(&new) {
             self.settings_form.message = Some((
