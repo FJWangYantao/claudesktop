@@ -19,6 +19,7 @@ pub(crate) mod popout;
 pub(crate) mod side_chat_pane;
 pub(crate) mod skin;
 pub(crate) mod subagent_pane;
+pub(crate) mod terminal_pane;
 pub(crate) mod workspace;
 
 use gpui_base::dock::Panel as BasePanel;

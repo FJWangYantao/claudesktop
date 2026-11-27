@@ -108,10 +108,10 @@
 
 ## UI / gpui
 
+- **命令运行中的双块 / 扫光跳帧**（2026-11-27）：原先在绘制阶段记时，下一拍却在绘制前检查 14ms 门槛。60Hz 下，前一帧从回调到画出动画若用了 3ms，下一拍只过去约 13.7ms，就再等一拍。现由 `wait_for_tick` 在发出通知时更新 `LAST_LOOP_TICK`，正文、侧栏和并排面板的绘制都不改这个时刻。真实 PowerShell + 隐藏窗口的两对对照，持续输出时绘制间隔 p95 从 32.1–35.2ms 降到 17.8–18.3ms（`.claudesktop/bench/command-frame-1127/native-summary.json`）。
 - **`Reveal` 必须一直挂着，自动收起不能播弹簧**（2026-11-24）：只在 `reveal < 1.0` 时包 `Reveal`，展开期间它的高度从没量过（`height == None`），一收起第一帧按 0 排，整页塌一下再弹回。列表里 `layout.member` 的行一律挂 `Reveal::new(..)`，进度 1.0 也挂。反过来，自动收起（新行涌入、正文到达、`apply_event`）得走 `reveal_progress_when(.., animate=false)`（内部 `Spring::with_travel(false)`，直接落位、不请求帧），否则每出一行列表高度都一涨一缩。只有用户点过的组（`Session::animated_group`）才播。
 - **折叠态工具的 `ToolCallProgress` 会每 500ms 重排整页**（2026-11-24）：`run_shell` 跑着时每 0.5 秒报一次最新几行，原来每次进 `apply_event` 都改 `ToolCard.output` 并 `cx.notify()`——那条工具收在折叠组里看不见，却让虚拟列表重测行高、内容区整页重排，还把滚动的转圈画了一帧就重置。现在两条一起：`ChatApp` 收到进度先按 `is_tool_output_visible` 判断这条展开着没有，不可见就不通知；`ChatItem::fingerprint` 不再把 `output.len()` 编进去（改在 `Session::row_key` 里只对**展开中**的工具行算长度），折叠行的指纹不随输出变。
 - **内层滚动区不能在 capture 阶段「放行」，要自己滚掉**（2026-11-24）：展开的工具输出靠 `overflow_y_scroll` 自己滚，`div` 的内置处理**不调用** `stop_propagation`，同一条 `ScrollWheelEvent` 会继续走 bubble 到外层对话 `List`，两边各滚一次（双滚动、整页跟着硬跳）。正确做法是在 capture 阶段按指针命中的句柄直接 `set_offset`，并**照常** `cx.stop_propagation()`；登记命中区时要和 `window.content_mask().bounds` 求交，卡片被视口裁掉的那半不能再命中。
-- **60 FPS 的循环动画要锚在「上一帧真正画出的时刻」**（2026-11-24）：：`LoopOverlay` 从 30 帧提到 60 帧（`LOOP_INTERVAL = 16ms`）后，相位若按「计划时刻」推，计时器晚到会累积漂移、转圈一顿一顿。现在 `paint_loop_spots` 每次画完记 `LAST_LOOP_PAINT`，`wait_for_tick` 取它和本次唤醒时刻的较大者当锚。圆弧扫过固定 `SPIN_SWEEP`（0.30），不做脉冲——相位和形状都只跟时钟走。
 
 - **12px 的小图形直接 `paint_quad` 比 `PathBuilder` 干净**（2026-11-26）：转圈换成弹性双块后就画两支圆角方块——
   `fill(bounds, rgba)` 得到 `PaintQuad`，改 `corner_radii = Corners::all(px)` 再 `window.paint_quad(quad)`，
@@ -923,6 +923,17 @@
   休眠快照五个入口都要看这一位；`persist` 和 `ensure_log` 短路之后它永远保持 `meta = None`，
   所以 `save_meta` 那些间接路径也自动安全。关掉 Pane 时先 `stop`（和 Esc 同一个入口），
   再从 `sessions` 里 `remove`，并修 `active`。
+- **终端 Pane 用 `portable-pty` + `alacritty_terminal`**：不要引 crates.io 的 `gpui-terminal`
+  （它依赖上游 `gpui`，和 vendor 的 `gpui-pre = 0.3.9` 冲突）。`alacritty_terminal` 0.25 的两个签名坑：
+  `Term::new(config, &dimensions, listener)`（尺寸在前、监听器在后），
+  `vte::ansi::Processor::<StdSyncHandler>::new()`（泛型参数是 timeout 处理器，不是 Handler）。
+- **终端读取不碰 UI**：读线程只做 `read → vte.advance → 置 AtomicBool 脏标`；UI 侧按 16ms
+  合并重画，拖分割条触发的 resize 50ms 去抖（`on_prepaint` 量到尺寸再折算行列数）。
+  回滚缓冲 `SCROLLBACK = 5000` 行。子进程在 `PtySession::drop` 里 `kill + wait`，
+  主进程级的兜底是 `process_guard` 的 Job Object。
+- **本机磁盘只剩十几 GB**：`D:/t3` 的 `debug/incremental` 曾吃到 19.7 GB，编不动时报
+  `os error 112`（磁盘空间不足），清掉 incremental 就能继续（见这一轮的处理）。
+
 
 
 

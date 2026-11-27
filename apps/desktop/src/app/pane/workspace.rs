@@ -433,6 +433,10 @@ impl ChatApp {
             PaneKind::Subagent => {
                 Arc::new(PaneHandle::new(cx.new(|cx| SubagentPane::new(app, cx))))
             }
+            // 终端：布局里存下来就重开一块（历史不恢复，进程重启后是新 shell）
+            PaneKind::Terminal => Arc::new(PaneHandle::new(
+                cx.new(|cx| super::terminal_pane::TerminalPane::new(app, cx)),
+            )),
             // 侧问不落盘，恢复时给一块**空的新侧问**（影子会话是新建的），
             // 而不是像以前那样兜底成一块莫名其妙的文件面板
             PaneKind::SideChat => {
