@@ -4577,7 +4577,7 @@ impl Render for ChatApp {
         }
 
         // 侧栏 / 命令面板切了会话：让聚焦的那块对话 Pane 跟上（多开时尤其要）
-        self.sync_focus_to_active(cx);
+        self.sync_focus_to_active(window, cx);
         // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
         self.sync_sidebar(cx);
         // 共享态的投影同理：没变就不发事件（见 hub.rs）

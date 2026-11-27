@@ -96,7 +96,7 @@ impl ChatApp {
     ///
     /// 目标会话已经在别的 Pane 里开着 → 聚焦那一块（**不能**让两块 Pane 画同一个
     /// `Session::list`）；否则把聚焦的那块换绑到新会话。
-    pub(crate) fn sync_focus_to_active(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sync_focus_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.chat_panes.is_empty() {
             return;
         }
@@ -110,18 +110,20 @@ impl ChatApp {
             self.content_view.update(cx, |view, cx| view.set_token(active, cx));
             return;
         }
-        if let Some(existing) = self.chat_pane_of_token(active, cx) {
-            self.focused_chat = Some(active);
-            let content = existing.read(cx).content();
-            content.update(cx, |view, cx| view.set_token(active, cx));
+        if self.chat_pane_of_token(active, cx).is_some() {
+            // 那个会话已经在另一块 Pane 里开着：聚焦它（草稿也要热换进去）
+            self.focus_chat(active, window, cx);
             return;
         }
-        // 换绑聚焦的那块
+        // 换绑聚焦的那块：`set_token` 会把它**自己的**内容区跟着换，
+        // 这里不要再动 `self.content_view`（那是第一块 Pane 的，焦点在第二块时会误改它）
         if let Some(pane) = self.focused_chat.and_then(|token| self.chat_pane_of_token(token, cx)) {
             pane.update(cx, |pane, cx| pane.set_token(active, cx));
         }
         self.focused_chat = Some(active);
-        self.content_view.update(cx, |view, cx| view.set_token(active, cx));
+        if let Some(idx) = self.index_of_token(active) {
+            self.active = idx;
+        }
     }
 
     /// 侧栏 `Ctrl+点击`：在右边新开一块对话 Pane（这个会话已经开着就直接聚焦它）。
@@ -143,15 +145,32 @@ impl ChatApp {
         let overlay = cx.new(|_| LoopOverlay::new(spots));
         let pane = cx.new(|cx| super::chat_pane::ChatPane::new(app, token, content, overlay, cx));
         self.register_chat_pane(pane.downgrade());
+        // 直接和中间那块并排 Split：不受右侧文件 / 改动栏开合的影响
+        // （塞进 Right 区域的话，右栏收着时新开的对话会藏在折叠栏里）
         let dock = self.dock.clone();
-        dock.update(cx, |dock, cx| {
-            dock.add_panel_view(
-                Arc::new(PaneHandle::new(pane)) as Arc<dyn PanelView>,
-                DockPlacement::Right,
-                None,
-                window,
-                cx,
-            );
+        let root = dock.read(cx).layout(DockPlacement::Center).map(|tree| tree.root().id());
+        dock.update(cx, |dock, cx| match root {
+            Some(node) => {
+                dock.add_panel_view_at(
+                    Arc::new(PaneHandle::new(pane)) as Arc<dyn PanelView>,
+                    gpui_base::dock::InsertTarget::Split {
+                        node,
+                        placement: gpui_base::Placement::Right,
+                        size: None,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            None => {
+                dock.add_panel_view(
+                    Arc::new(PaneHandle::new(pane)) as Arc<dyn PanelView>,
+                    DockPlacement::Center,
+                    None,
+                    window,
+                    cx,
+                );
+            }
         });
         self.focus_chat(token, window, cx);
         cx.notify();
@@ -216,9 +235,9 @@ impl ChatApp {
             .size_full()
             .min_h_0()
             .when(!focused, |d| {
-                // 点进这块就切焦点（先于子元素的 on_click：鼠标按下阶段就切好）
-                d.on_mouse_down(
-                    MouseButton::Left,
+                // 点进这块就切焦点。用**捕获阶段**：对话里的按钮（复制 / 点 Diff / 权限）
+                // 很多会 `stop_propagation`，冒泡阶段的监听器永远不会先跑
+                d.capture_any_mouse_down(
                     cx.listener(move |this, _, window, cx| this.focus_chat(token, window, cx)),
                 )
             })
@@ -265,8 +284,7 @@ impl ChatApp {
                         .child(format!("附 {images} 张图 / {files} 个文件")),
                 )
             })
-            .on_mouse_down(
-                MouseButton::Left,
+            .capture_any_mouse_down(
                 cx.listener(move |this, _, window, cx| this.focus_chat(token, window, cx)),
             )
             .into_any_element()
