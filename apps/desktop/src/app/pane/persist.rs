@@ -9,7 +9,7 @@
 use gpui_base::dock::{DockArea, DockAreaState};
 use std::path::PathBuf;
 
-pub(crate) const LAYOUT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const LAYOUT_SCHEMA_VERSION: u32 = 2;
 
 /// 弹出窗的位置与内部布局（Phase 2 起写入）
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

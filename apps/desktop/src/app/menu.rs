@@ -161,7 +161,7 @@ impl RenderOnce for MenuChip {
 }
 
 /// 增删行数：绿 +N、红 −M，等宽数字。
-pub(super) fn diff_stat(added: u32, removed: u32) -> Div {
+pub(crate) fn diff_stat(added: u32, removed: u32) -> Div {
     div()
         .flex_shrink_0()
         .h_flex()

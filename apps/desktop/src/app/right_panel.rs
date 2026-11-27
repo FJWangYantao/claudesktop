@@ -623,6 +623,8 @@ pub(super) struct RightPanelState {
     split: bool,
     /// 本轮改动文件数（改动 Pane 的 Tab badge 用，按 `(会话令牌, diff_revision)` 缓存）
     pub(crate) changed_count: usize,
+    /// 本轮改过的文件明细（概览 Pane 的 Outputs 卡片复用）
+    pub(crate) turn_changes: Vec<TurnFile>,
     changed_count_key: Option<(u64, u64)>,
     /// 改动 Pane 顶部选的范围
     pub(crate) scope: DiffScope,
@@ -689,6 +691,7 @@ impl RightPanelState {
             diff_list_scroll: UniformListScrollHandle::new(),
             split: false,
             changed_count: 0,
+            turn_changes: Vec::new(),
             changed_count_key: None,
             scope: DiffScope::default(),
             git: GitDiff::default(),
@@ -851,7 +854,7 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(super) fn open_right_diff(
+    pub(crate) fn open_right_diff(
         &mut self,
         location: DiffLocation,
         window: &mut Window,
@@ -1127,8 +1130,9 @@ impl ChatApp {
         if self.right_panel.changed_count_key == Some(key) {
             return;
         }
-        let count = crate::model::turn_files(&session.transcript, 0).len();
-        self.right_panel.changed_count = count;
+        let files = crate::model::turn_files(&session.transcript, 0);
+        self.right_panel.changed_count = files.len();
+        self.right_panel.turn_changes = files;
         self.right_panel.changed_count_key = Some(key);
     }
 

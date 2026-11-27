@@ -14,6 +14,7 @@ pub(crate) mod browser_pane;
 pub(crate) mod chat_pane;
 pub(crate) mod diff_pane;
 pub(crate) mod files_pane;
+pub(crate) mod overview_pane;
 pub(crate) mod persist;
 pub(crate) mod plan_pane;
 pub(crate) mod popout;
@@ -35,6 +36,7 @@ use std::{any::Any, sync::Arc};
 pub(crate) enum PaneKind {
     Chat,
     SideChat,
+    Overview,
     Diff,
     Files,
     Plan,
@@ -49,6 +51,7 @@ impl PaneKind {
         match self {
             Self::Chat => "claudesktop-chat",
             Self::SideChat => "claudesktop-side-chat",
+            Self::Overview => "claudesktop-overview",
             Self::Diff => "claudesktop-diff",
             Self::Files => "claudesktop-files",
             Self::Plan => "claudesktop-plan",
@@ -64,6 +67,7 @@ impl PaneKind {
         [
             Self::Chat,
             Self::SideChat,
+            Self::Overview,
             Self::Diff,
             Self::Files,
             Self::Plan,
@@ -79,6 +83,7 @@ impl PaneKind {
         match self {
             Self::Chat => "对话".into(),
             Self::SideChat => "侧问".into(),
+            Self::Overview => "概览".into(),
             Self::Diff => "改动".into(),
             Self::Files => "文件".into(),
             Self::Plan => "计划".into(),
@@ -91,6 +96,7 @@ impl PaneKind {
     pub(crate) fn icon(self) -> IconAll {
         match self {
             Self::Chat | Self::SideChat => IconAll::MessageSquare,
+            Self::Overview => IconAll::LayoutDashboard,
             Self::Diff => IconAll::FileDiff,
             Self::Files => IconAll::FolderTree,
             Self::Plan => IconAll::ListTodo,
