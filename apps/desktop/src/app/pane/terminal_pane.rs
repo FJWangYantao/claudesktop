@@ -285,11 +285,8 @@ impl ClaudesktopPane for TerminalPane {
         IconAll::Terminal
     }
 
-    fn title(&self, cx: &App) -> SharedString {
-        self.app
-            .upgrade()
-            .map(|app| app.read(cx).session().title.clone())
-            .unwrap_or_else(|| PaneKind::Terminal.title())
+    fn title(&self, _cx: &App) -> SharedString {
+        PaneKind::Terminal.title()
     }
 
     fn on_window_changed(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -305,6 +302,12 @@ impl Panel for TerminalPane {
 
     fn dump(&self, _cx: &App) -> PanelState {
         super::pane_state(PaneKind::Terminal, serde_json::json!({ "kind": "terminal" }))
+    }
+
+    fn on_removed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.session = None;
+        self.pending_frame = None;
+        cx.notify();
     }
 }
 
@@ -420,6 +423,14 @@ impl ChatApp {
     /// `Ctrl+\``：起一块（或聚焦已有的）终端 Pane，落在当前会话的工作目录。
     pub(crate) fn open_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.focus_pane_of_kind(PaneKind::Terminal, window, cx) {
+            let dock = self.dock.clone();
+            dock.update(cx, |dock, cx| {
+                if dock.has_dock(gpui_base::dock::DockPlacement::Bottom)
+                    && !dock.is_dock_open(gpui_base::dock::DockPlacement::Bottom)
+                {
+                    dock.toggle_dock(gpui_base::dock::DockPlacement::Bottom, window, cx);
+                }
+            });
             return;
         }
         let app = cx.entity().downgrade();

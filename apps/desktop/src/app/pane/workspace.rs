@@ -336,7 +336,11 @@ impl ChatApp {
                 // 不加上主窗原点，窗口会飞到屏幕外
                 let origin = window.bounds().origin;
                 let at = point(position.x + origin.x, position.y + origin.y);
-                this.popout_pane(panel, Some(at), window, cx);
+                // subscribe_in 正借用着 `ChatApp`，必须延后到退出借用后再调 popout_pane
+                let main = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    ChatApp::popout_pane(main, panel, Some(at), window, cx);
+                });
             }
             _ => {}
         })
@@ -348,13 +352,11 @@ impl ChatApp {
         let main_id = window.window_handle().window_id();
         cx.on_window_closed(move |cx, id| {
             let Some(app) = this.upgrade() else { return };
-            app.update(cx, |app, cx| {
-                if id == main_id {
-                    app.close_popouts(cx);
-                } else {
-                    app.forget_popout(id, cx);
-                }
-            });
+            if id == main_id {
+                app.update(cx, |app, cx| app.close_popouts(cx));
+            } else {
+                ChatApp::forget_popout(app, id, cx);
+            }
         })
         .detach();
 

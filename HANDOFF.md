@@ -977,6 +977,8 @@
   已在 `vendor/gpui-pre-windows/src/events.rs` 的 `handle_mouse_down_msg` 加上 `GetForegroundWindow()
   == handle && GetFocus() != handle` 时 `SetFocus(Some(handle))`，并在切走 Tab / 遮挡隐藏 / 关闭时
   `return_gui_focus`。
+- **弹出独立窗 / 吸回禁止持有 `ChatApp` 借用**：`popout_pane` / `reclaim_popout` / `forget_popout` 必须写成接收 `Entity<ChatApp>` + `&mut App` 的关联函数（`DockEvent::DragOutside` 回调在 `subscribe_in` 内部，须经 `window.defer` 退出 `ChatApp` 借用后再调用），否则内部调 `PaneHandle::display_title` / `on_window_changed`（如 `DiffPane` 重建批注输入框）或同步 `open_window` 会对 `ChatApp` 触发 `double_lease_panic`。另外 `reclaim_popout` 本身就在弹出窗点击栈里执行，销毁自己必须直接调传入 `window.remove_window()`，不能对 `entry.window` 再次 `update`。
+- **非中心 Dock 最后一个面板关闭 / 弹走须 `remove_dock`**：`gpui_base::dock::TabGroup::is_last_panel` 会对只有单个面板的边缘区域（如底部 `TerminalPane`）把 `is_panel_closable` 设为 `false`，`group.close()` 也是空操作；关闭这类面板或把它弹出独立窗导致原 dock 变空时，应调 `DockArea::remove_dock(placement, window, cx)` 连同空 dock 一起清理并触发 `on_removed`（且关闭 `Right` 时同步清 `right_panel.open`）。
 
 
 

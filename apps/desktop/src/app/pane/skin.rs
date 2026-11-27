@@ -246,10 +246,13 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
                 zoom_handle.toggle_zoom(window, cx);
             });
 
-        // 主对话 Pane 不参与弹出独立窗：它复用主窗的输入状态实体（见 popout.rs）
+        // 主对话 Pane 不参与弹出独立窗：它复用主窗的输入状态实体（见 popout.rs）；
+        // 已经在独立窗里的面板也不再套娃显示「弹出独立窗」与「关闭」按钮（顶部已有「吸回主窗」）
         let active_is_chat = kind == Some(PaneKind::Chat);
-        let main = self.main.borrow().clone();
-        let popout_button = (!active_is_chat).then(|| {
+        let main_weak = self.main.borrow().clone();
+        let is_main = main_weak.is_some();
+        let popout_button = (!active_is_chat && is_main).then(|| {
+            let main_weak = main_weak.clone();
             div()
                 .id(("claudesktop-tab-popout", node))
                 .h_full()
@@ -261,19 +264,43 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
                 .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
                 .child(Icon::new(IconAll::ArrowUpRight).small())
                 .on_click(move |_, window, cx| {
-                    if let Some(main) = main.as_ref().and_then(|main| main.upgrade()) {
-                        main.update(cx, |app, cx| app.popout_pane(panel_id, None, window, cx));
+                    if let Some(main) = main_weak.as_ref().and_then(|main| main.upgrade()) {
+                        crate::app::ChatApp::popout_pane(main, panel_id, None, window, cx);
                     }
                 })
         });
 
+        // 非中心区最后一个面板（如底部终端）的 `is_panel_closable` 会被 `TabGroup::is_last_panel`
+        // 判成 false，导致关闭按钮不画、且 `group.close` 为空操作；关掉这类面板需要连 dock 一并移除
+        let sole_dock_placement =
+            (!can_close && active.closable(cx) && !group.is_locked() && is_main)
+                .then(|| {
+                    let area = self.area.borrow().as_ref()?.upgrade()?;
+                    let area = area.read(cx);
+                    [DockPlacement::Bottom, DockPlacement::Left, DockPlacement::Right]
+                        .into_iter()
+                        .find(|&placement| {
+                            area.layout(placement)
+                                .is_some_and(|tree| tree.find_panel_node(panel_id).is_some())
+                        })
+                })
+                .flatten();
+
         let close_group = group.clone();
+        let close_area = self.area.borrow().clone();
+        let close_main = main_weak;
         // 概览组里的固定视图（文件 / 改动 / 计划 / 子代理）只靠「‹ 概览」返回，不直接从组里删掉；
         // 临时 / 独立面板（浏览器 / 终端 / 侧问 / 多开对话）给一个关闭按钮
-        let show_close = can_close
+        let show_close = (can_close || sole_dock_placement.is_some())
             && !matches!(
                 kind,
-                Some(PaneKind::Files | PaneKind::Diff | PaneKind::Plan | PaneKind::Subagent)
+                Some(
+                    PaneKind::Overview
+                        | PaneKind::Files
+                        | PaneKind::Diff
+                        | PaneKind::Plan
+                        | PaneKind::Subagent
+                )
             );
         let close_button = show_close.then(|| {
             div()
@@ -286,7 +313,23 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
                 .text_color(rgb(INK_SOFT))
                 .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
                 .child(Icon::new(IconAll::X).small())
-                .on_click(move |_, window, cx| close_group.close(panel_id, window, cx))
+                .on_click(move |_, window, cx| {
+                    if let Some(placement) = sole_dock_placement {
+                        if let Some(area) = close_area.as_ref().and_then(|area| area.upgrade()) {
+                            area.update(cx, |dock, cx| dock.remove_dock(placement, window, cx));
+                        }
+                        if placement == DockPlacement::Right
+                            && let Some(main) = close_main.as_ref().and_then(|main| main.upgrade())
+                        {
+                            main.update(cx, |app, cx| {
+                                app.right_panel.open = false;
+                                cx.notify();
+                            });
+                        }
+                    } else {
+                        close_group.close(panel_id, window, cx);
+                    }
+                })
         });
 
         div()
