@@ -52,6 +52,12 @@ const TILE_SECONDARY_ALPHA: f32 = 0.52;
 const TILE_STEPS: usize = 8;
 /// 扫光扫一遍的时长
 const SHIMMER_PERIOD: Duration = Duration::from_millis(2000);
+/// 侧栏运行中会话闪烁圆点的呼吸周期
+const PULSE_DOT_PERIOD: Duration = Duration::from_millis(1400);
+/// 闪烁圆点最暗时的透明度（保留清晰可见的底色）
+const PULSE_DOT_MIN_ALPHA: f32 = 0.18;
+/// 闪烁圆点的直径（与侧栏未读实心点同宽）
+const PULSE_DOT_DIAMETER: Pixels = px(7.);
 
 /// `App::reduce_motion` 的镜像：画转圈 / 扫光时手里没有 `App`（由 [`ChatApp::apply_motion_pref`] 同步）
 static REDUCED: AtomicBool = AtomicBool::new(false);
@@ -213,7 +219,7 @@ fn loop_clock() -> Duration {
 /// 为当前 view 登记下一拍重画（prepaint 里调）。各个 view 共用一拍：同一拍里
 /// 多次调用只排一次，到点时把这期间登记过的 view 一起通知（同一帧里重画）。
 /// 靠 `on_next_frame` 逐帧数时间，不走计时器：拍子落在垂直同步上，和别的重画对齐。
-fn request_loop_tick(window: &mut Window) {
+pub(super) fn request_loop_tick(window: &mut Window) {
     if REDUCED.load(Ordering::Relaxed) {
         return;
     }
@@ -403,6 +409,39 @@ fn paint_spinner(bounds: Bounds<Pixels>, phase: Option<f32>, color: Rgba, window
         quad.corner_radii = Corners::all(w.min(h) * TILE_RADIUS);
         window.paint_quad(quad);
     }
+}
+
+/// 侧栏运行中闪烁圆点在这一刻的相位（减少动态效果时返回 `None`，停在实心最亮态）。
+pub(super) fn pulse_dot_phase() -> Option<f32> {
+    (!REDUCED.load(Ordering::Relaxed)).then(|| loop_phase(PULSE_DOT_PERIOD))
+}
+
+/// 闪烁圆点在给定相位下的透明度：余弦平滑起伏，`None` 与周期接缝处均为 `1.0`。
+pub(super) fn pulse_dot_alpha(phase: Option<f32>) -> f32 {
+    let Some(phase) = phase else {
+        return 1.0;
+    };
+    let t = 0.5 + 0.5 * (phase.rem_euclid(1.) * TAU).cos();
+    PULSE_DOT_MIN_ALPHA + (1. - PULSE_DOT_MIN_ALPHA) * t
+}
+
+/// 在 `bounds` 中心绘制一个闪烁圆点（以 `paint_quad` 全圆角实现，减少动态效果时停在最亮实心点）。
+pub(super) fn paint_pulse_dot(
+    bounds: Bounds<Pixels>,
+    phase: Option<f32>,
+    color: Rgba,
+    window: &mut Window,
+) {
+    let d = PULSE_DOT_DIAMETER.min(bounds.size.width).min(bounds.size.height);
+    if d <= px(0.) {
+        return;
+    }
+    let r = d * 0.5;
+    let center = bounds.center();
+    let area = Bounds::from_corners(center - point(r, r), center + point(r, r));
+    let mut quad = fill(area, with_alpha(color, pulse_dot_alpha(phase)));
+    quad.corner_radii = Corners::all(r);
+    window.paint_quad(quad);
 }
 
 /// 运行状态的几何指示器：常规工作使用统一的双块，需用户处理或特殊状态用线性图标。
@@ -792,6 +831,30 @@ mod tests {
                 );
             }
             assert!(overlap(main, secondary) <= 0., "两块重叠 @ {phase}");
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn pulse_dot_reduced_matches_cycle_peak() {
+        let still = pulse_dot_alpha(None);
+        assert!((still - 1.0).abs() < 1e-6, "{still}");
+        assert!((pulse_dot_alpha(Some(0.)) - still).abs() < 1e-6);
+        assert!((pulse_dot_alpha(Some(1.)) - still).abs() < 1e-6);
+    }
+
+    #[core::prelude::v1::test]
+    fn pulse_dot_wraps_and_stays_in_range() {
+        let wrapped = pulse_dot_alpha(Some(-0.25));
+        let forward = pulse_dot_alpha(Some(0.75));
+        assert!((wrapped - forward).abs() < 1e-6, "{wrapped} vs {forward}");
+        let trough = pulse_dot_alpha(Some(0.5));
+        assert!((trough - PULSE_DOT_MIN_ALPHA).abs() < 1e-6, "{trough}");
+        for i in 0..=200 {
+            let alpha = pulse_dot_alpha(Some(i as f32 / 200.));
+            assert!(
+                (PULSE_DOT_MIN_ALPHA - 1e-6..=1.0 + 1e-6).contains(&alpha),
+                "透明度越界：{alpha} @ {i}"
+            );
         }
     }
 }
