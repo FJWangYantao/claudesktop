@@ -1309,7 +1309,10 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // claudesktop patch: `topmost = false`，让 `WS_CHILD` 子窗口（浏览器 Pane 的 WebView2）
+        // 能盖在 DirectComposition 交换链之上。没有子窗口时两者渲染结果等价；
+        // 代价是子窗口永远在最上层，需要浮层避让（见 apps/desktop/src/app/pane/browser_pane.rs）。
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {

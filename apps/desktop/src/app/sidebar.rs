@@ -14,9 +14,10 @@
 //! （`ChatApp::render` 每帧比一次指纹，见 [`ChatApp::sync_sidebar`]）。
 //! 新加侧栏要显示的状态时，记得把它并进 `sync_sidebar` 的指纹，否则侧栏不会跟着变。
 //!
-//! 运行中那行的转圈不画在侧栏里（它每拍都要重画，会把整个侧栏一起带上——缓存 view 重画时
-//! 里面嵌套的缓存 view 也不复用），而是行里只留个占位、记下位置，由叠在上面的小 view
-//! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
+//! 运行中那行的闪烁圆点不画在侧栏里（它每拍都要重画，会把整个侧栏一起带上——缓存 view 重画时
+//! 里面嵌套的缓存 view 也不复用），而是行里只留个占位、记下窗口坐标，由叠在上面的小 view
+//! [`SidebarSpinners`] 在 `canvas` 里直接按窗口坐标画（避免受顶栏 `CHROME_H` 偏移）。
+//! 它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
 use super::chrome::{CHROME_H, drag_area};
 use super::menu::{MenuList, menu_item, menu_panel};
@@ -170,7 +171,7 @@ impl Render for SidebarView {
     }
 }
 
-/// 侧栏转圈的覆盖层：铺满窗口、不挂事件，按 [`SpinnerSpots`] 记下的位置画转圈。
+/// 侧栏运行中指示器的覆盖层：铺满内容区容器、不挂事件，按 [`SpinnerSpots`] 记下的窗口坐标画闪烁圆点。
 pub(crate) struct SidebarSpinners {
     app: WeakEntity<ChatApp>,
 }
@@ -182,28 +183,82 @@ impl SidebarSpinners {
 }
 
 impl Render for SidebarSpinners {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let spinners = self.app.upgrade().map(|app| app.read(cx).render_sidebar_spinners());
-        div().absolute().top_0().left_0().size_full().children(spinners.into_iter().flatten())
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let app = self.app.clone();
+        canvas(
+            move |_, window, cx| {
+                let spots = app
+                    .upgrade()
+                    .map(|app| app.read(cx).sidebar_spinner_spots())
+                    .unwrap_or_default();
+                if !spots.is_empty() {
+                    motion::request_loop_tick(window);
+                }
+                spots
+            },
+            |_, spots, window, _| {
+                if spots.is_empty() {
+                    return;
+                }
+                let phase = motion::pulse_dot_phase();
+                let color = rgb(CORAL);
+                for (bounds, clip) in spots {
+                    window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                        motion::paint_pulse_dot(bounds, phase, color, window);
+                    });
+                }
+            },
+        )
+        .absolute()
+        .size_full()
     }
 }
 
-/// 侧栏里一个运行中会话的转圈该画在哪：占位格的位置和它所在的裁切范围（窗口坐标）。
+/// 侧栏里一个运行中会话的闪烁圆点该画在哪：占位格的位置和它所在的裁切范围（窗口坐标）。
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct SpinnerSpot {
     token: u64,
     bounds: Bounds<Pixels>,
     clip: Bounds<Pixels>,
+    /// 记录该点时侧栏的横向滑移量，用于开合动画期间平滑跟手不重算
+    recorded_dx: Pixels,
 }
 
-/// 侧栏这次和上次重画时记下的转圈位置。侧栏复用缓存时不重画、也不重记，位置照旧有效。
+/// 侧栏记下的闪烁圆点位置与侧栏开合滑移状态。侧栏复用缓存时不重画、也不重记，位置照旧有效。
 #[derive(Default)]
 pub(super) struct SpinnerSpots {
     now: Vec<SpinnerSpot>,
-    before: Vec<SpinnerSpot>,
+    slide_dx: Pixels,
+    visible_w: Pixels,
 }
 
 pub(super) type SharedSpots = Rc<RefCell<SpinnerSpots>>;
+
+/// 把记录到的占位格位置按当前侧栏滑移量平移，并裁切到当前可见范围；滑出视野或滚动裁掉时返回 `None`。
+fn clipped_spot_bounds(
+    spot: SpinnerSpot,
+    slide_dx: Pixels,
+    visible_w: Pixels,
+) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
+    let dx = slide_dx - spot.recorded_dx;
+    let mut bounds = spot.bounds;
+    bounds.origin.x += dx;
+    let left = (spot.clip.origin.x + dx).max(px(0.));
+    let right = (spot.clip.right() + dx).min(visible_w);
+    let top = spot.clip.top();
+    let bottom = spot.clip.bottom();
+    if right <= left || bottom <= top {
+        return None;
+    }
+    if bounds.right() <= left
+        || bounds.left() >= right
+        || bounds.bottom() <= top
+        || bounds.top() >= bottom
+    {
+        return None;
+    }
+    Some((bounds, Bounds::from_corners(point(left, top), point(right, bottom))))
+}
 
 impl ChatApp {
     /// 侧栏的位置：宽度随开合在 180ms 里滑动（收到 0 后不画），里面是缓存的侧栏 view。
@@ -216,11 +271,8 @@ impl ChatApp {
             let motion = cx.theme().motion_tokens();
             (motion.duration_normal, motion.easing_move.clone())
         };
-        let target = if self.sidebar_open {
-            self.sidebar_width().to_pixels(window.rem_size())
-        } else {
-            px(0.)
-        };
+        let full_w = self.sidebar_width().to_pixels(window.rem_size());
+        let target = if self.sidebar_open { full_w } else { px(0.) };
         let width = transition(
             "sidebar-width",
             target,
@@ -228,22 +280,24 @@ impl ChatApp {
             window,
             cx,
         );
-        if width <= px(0.) {
-            // 完全收起时侧栏不画，记下的转圈位置作废
-            self.sidebar_spinners.borrow_mut().now.clear();
+        let slide_dx = width - full_w;
+        {
+            let mut spots = self.sidebar_spinners.borrow_mut();
+            spots.slide_dx = slide_dx;
+            spots.visible_w = width;
+            if width <= px(0.) {
+                // 完全收起时侧栏不画，记下的闪烁圆点位置作废
+                spots.now.clear();
+            }
         }
         // 侧栏按全宽画、整块从左边滑进滑出（外层裁切），开合过程中它自己的尺寸不变
         (width > px(0.)).then(|| {
             div().w(width).h_full().flex_shrink_0().overflow_hidden().child(
-                div()
-                    .relative()
-                    .left(width - self.sidebar_width().to_pixels(window.rem_size()))
-                    .h_full()
-                    .child(
-                        self.sidebar_view
-                            .clone()
-                            .cached(StyleRefinement::default().w(self.sidebar_width()).h_full()),
-                    ),
+                div().relative().left(slide_dx).h_full().child(
+                    self.sidebar_view
+                        .clone()
+                        .cached(StyleRefinement::default().w(self.sidebar_width()).h_full()),
+                ),
             )
         })
     }
@@ -334,9 +388,9 @@ impl ChatApp {
         }
     }
 
-    /// 侧栏里运行中会话的转圈：叠在侧栏上、画在各行占位格记下的位置（见文件头）。
-    /// 侧栏这一帧重画、行挪了位置时，占位格会要下一帧，这里跟着挪过去。
-    pub(super) fn render_sidebar_spinners(&self) -> Vec<Div> {
+    /// 侧栏里运行中会话的闪烁圆点位置与裁切范围（窗口坐标）。
+    /// `SidebarSpinners` 的 `canvas` 在 `SidebarView` prepaint 之后取这里算好的位置直接绘制。
+    pub(super) fn sidebar_spinner_spots(&self) -> Vec<(Bounds<Pixels>, Bounds<Pixels>)> {
         let spots = self.sidebar_spinners.borrow();
         spots
             .now
@@ -344,28 +398,7 @@ impl ChatApp {
             .filter(|spot| {
                 self.sessions.iter().any(|s| s.token == spot.token && s.busy && !s.waiting_user())
             })
-            .map(|spot| {
-                let (b, clip) = (spot.bounds, spot.clip);
-                div()
-                    .absolute()
-                    .left(clip.origin.x)
-                    .top(clip.origin.y)
-                    .w(clip.size.width)
-                    .h(clip.size.height)
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .absolute()
-                            .left(b.origin.x - clip.origin.x)
-                            .top(b.origin.y - clip.origin.y)
-                            .w(b.size.width)
-                            .h(b.size.height)
-                            .flex()
-                            .justify_center()
-                            .items_center()
-                            .child(motion::spinner_in_place()),
-                    )
-            })
+            .filter_map(|spot| clipped_spot_bounds(*spot, spots.slide_dx, spots.visible_w))
             .collect()
     }
 
@@ -385,11 +418,8 @@ impl ChatApp {
     }
 
     pub(super) fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        // 这一遍重新记转圈的位置（各行的占位格在 prepaint 时记）
-        {
-            let mut spots = self.sidebar_spinners.borrow_mut();
-            spots.before = std::mem::take(&mut spots.now);
-        }
+        // 这一遍重新记闪烁圆点的位置（各行的占位格在 prepaint 时记）
+        self.sidebar_spinners.borrow_mut().now.clear();
         let mut body = v_flex().gap_0().pb_2();
 
         // 会话：按工作目录分组，当前项目在前，其余按最近活动排序（或按日期分组）；
@@ -1308,25 +1338,27 @@ impl ChatApp {
                 )));
         }
 
-        // 状态标记的优先级：等授权红点 > 运行中转圈 > 待查看赤陶点 > 后台命令终端微标
+        // 状态标记的优先级：等授权红点 > 运行中闪烁圆点 > 待查看赤陶点 > 后台命令终端微标
         let bg_running = !s.busy && self.session_has_running_bg(i);
         let marker = if s.busy && s.waiting_user() {
             div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
         } else if s.busy {
-            // 转圈由 ChatApp 叠在这里画（见文件头）：这里只记位置，挪了位置就要下一帧让它跟上
+            // 闪烁圆点由 SidebarSpinners 叠在这里画（见文件头）：这里只记窗口坐标，居中对齐 14px 槽位
             let (spots, token) = (self.sidebar_spinners.clone(), s.token);
             canvas(
                 move |bounds, window, _| {
-                    let spot = SpinnerSpot { token, bounds, clip: window.content_mask().bounds };
                     let mut spots = spots.borrow_mut();
-                    if spots.before.get(spots.now.len()) != Some(&spot) {
-                        window.request_animation_frame();
-                    }
-                    spots.now.push(spot);
+                    let recorded_dx = spots.slide_dx;
+                    spots.now.push(SpinnerSpot {
+                        token,
+                        bounds,
+                        clip: window.content_mask().bounds,
+                        recorded_dx,
+                    });
                 },
                 |_, _, _, _| {},
             )
-            .size(px(12.))
+            .size_full()
             .into_any_element()
         } else if s.unread {
             // 有还没看的新结果：赤陶实心点
@@ -1851,5 +1883,41 @@ mod tests {
         let order: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
         assert_eq!(order, ["date:今天", ARCHIVED_KEY]);
         assert_eq!(groups[0].members, [0, 1, 2]);
+    }
+
+    #[core::prelude::v1::test]
+    fn clipped_spot_bounds_keeps_stationary_spot_and_tracks_slide() {
+        let spot = SpinnerSpot {
+            token: 1,
+            bounds: Bounds::from_corners(point(px(20.), px(160.)), point(px(34.), px(174.))),
+            clip: Bounds::from_corners(point(px(0.), px(100.)), point(px(256.), px(700.))),
+            recorded_dx: px(0.),
+        };
+        // 静止时保留原窗口坐标
+        assert_eq!(clipped_spot_bounds(spot, px(0.), px(256.)), Some((spot.bounds, spot.clip)));
+        // 侧栏向左轻微滑出 10px：圆点跟着左移 10px，裁切框右界收进到 246
+        let slid = clipped_spot_bounds(spot, px(-10.), px(246.)).expect("完全在裁切框内应绘制");
+        assert_eq!(slid.0.origin.x, px(10.));
+        assert_eq!(
+            slid.1,
+            Bounds::from_corners(point(px(0.), px(100.)), point(px(246.), px(700.)))
+        );
+        // 滑到贴近左缘被裁掉一半（20 - 25 = -5，右缘 9 > 0）时仍绘制并裁切
+        let half = clipped_spot_bounds(spot, px(-25.), px(231.)).expect("半露出左缘时仍应绘制");
+        assert_eq!(half.0.origin.x, px(-5.));
+        assert_eq!(
+            half.1,
+            Bounds::from_corners(point(px(0.), px(100.)), point(px(231.), px(700.)))
+        );
+        // 向左滑出左缘（right = 34 - 100 = -66 <= 0）后不绘制
+        assert_eq!(clipped_spot_bounds(spot, px(-100.), px(156.)), None);
+        // 完全滑出侧栏可见宽度后不绘制
+        assert_eq!(clipped_spot_bounds(spot, px(-256.), px(0.)), None);
+        // 滚动到列表裁切框之外后不绘制
+        let scrolled_out = SpinnerSpot {
+            bounds: Bounds::from_corners(point(px(20.), px(80.)), point(px(34.), px(94.))),
+            ..spot
+        };
+        assert_eq!(clipped_spot_bounds(scrolled_out, px(0.), px(256.)), None);
     }
 }

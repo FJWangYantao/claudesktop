@@ -177,7 +177,7 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
     不使用卡通形象或品牌 Logo；左上角标题为「Kimi Code」，运行状态使用线性图标或统一双块。
     思考中和底部进行中状态行的扫光用 `shimmer_text()`（按像素分档着色）。
     内容区里的转圈和扫光只是占位格（prepaint 记位置），由叠在内容区上的 `motion::LoopOverlay` 画，节拍器只重画它、不重画整页对话；
-    内容区以外自己就是小覆盖层的 view（侧栏转圈）用 `spinner_in_place`。
+    侧栏运行中会话行用闪烁圆点（占位格记窗口坐标，由 `SidebarSpinners` 的 `canvas` 调 `motion::paint_pulse_dot` 绘制），其余内容区外小覆盖层（`bgtasks_view` / `composer`）用 `spinner_in_place`。
     转圈换成结果图标用 `motion::settle` 淡入。**不用** gpui-kit 的 `Spinner` / `ShimmerText`：
     动画每帧都要重画它所在的整个 view，这两个按满帧率重画 `ChatApp`（实测回合中单核 50%+）；
     motion 版相位按全局时钟算，节拍器按 60 帧（16ms）跑。双块一个 3.2 秒一圈、8 个半步：
@@ -233,10 +233,10 @@ Tooltip / Switch / Tabs / theme / virtual_list / chart / dock 等 60 余个模�
   无头验收：`CLAUDESKTOP_OPEN=sidebar-project|sidebar-time` 切分组方式截图，
   加 `:flow` 走一遍添加 / 移除项目并断言。
 - **侧栏是缓存 view**（`SidebarView`，`.cached()`）：侧栏要显示新状态时，把它并进 `sync_sidebar` 的指纹，
-  否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的转圈）不画在侧栏里，见 `sidebar.rs` 文件头。
+  否则侧栏不会跟着变。侧栏里会动的东西（运行中会话的闪烁圆点）不画在侧栏里，见 `sidebar.rs` 文件头。
 - **输入框上方的内容区也是缓存 view**（`ContentView`，见 `content.rs`）：`ChatApp` 每次 `cx.notify()` 都让它重画，
   打字时只有输入区重画。所以**只影响输入区的刷新**（补全、发送键、聚焦边框）用 `ChatApp::refresh_composer`，
-  不用 `cx.notify()`；画在 `ChatApp` 里的循环动画要包成单独的小 view（如侧栏转圈的 `SidebarSpinners`），
+  不用 `cx.notify()`；画在 `ChatApp` 里的循环动画要包成单独的小 view（如侧栏闪烁圆点的 `SidebarSpinners`），
   否则节拍器每拍通知 `ChatApp`，内容区跟着重画。
 
 ### gpui-kit 踩坑备忘

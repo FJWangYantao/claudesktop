@@ -108,6 +108,7 @@
 
 ## UI / gpui
 
+- **侧栏覆盖层不能拿窗口坐标直接当绝对定位 `top/left`**：全局顶栏 `chrome_bar` 独立占顶部 `CHROME_H` 后，主体 `h_flex` 容器的原点在 `(0, CHROME_H)`。`SidebarSpinners` 若按 `prepaint` 记下的窗口坐标去摆 `div().absolute().top(clip.origin.y)`，会把 `CHROME_H` 再加一遍（往下偏约 48px）。现改由 `SidebarSpinners` 在 `canvas` 的 `paint` 阶段直接用窗口坐标绘制闪烁圆点（`motion::paint_pulse_dot`），并在 `prepaint` 取数、同时按侧栏开合滑移量 `slide_dx` 裁切平移，既消除了顶栏高度偏移也省掉了 `render` 时的 1 帧滞后。
 - **命令运行中的双块 / 扫光跳帧**（2026-11-27）：原先在绘制阶段记时，下一拍却在绘制前检查 14ms 门槛。60Hz 下，前一帧从回调到画出动画若用了 3ms，下一拍只过去约 13.7ms，就再等一拍。现由 `wait_for_tick` 在发出通知时更新 `LAST_LOOP_TICK`，正文、侧栏和并排面板的绘制都不改这个时刻。真实 PowerShell + 隐藏窗口的两对对照，持续输出时绘制间隔 p95 从 32.1–35.2ms 降到 17.8–18.3ms（`.claudesktop/bench/command-frame-1127/native-summary.json`）。
 - **`Reveal` 必须一直挂着，自动收起不能播弹簧**（2026-11-24）：只在 `reveal < 1.0` 时包 `Reveal`，展开期间它的高度从没量过（`height == None`），一收起第一帧按 0 排，整页塌一下再弹回。列表里 `layout.member` 的行一律挂 `Reveal::new(..)`，进度 1.0 也挂。反过来，自动收起（新行涌入、正文到达、`apply_event`）得走 `reveal_progress_when(.., animate=false)`（内部 `Spring::with_travel(false)`，直接落位、不请求帧），否则每出一行列表高度都一涨一缩。只有用户点过的组（`Session::animated_group`）才播。
 - **折叠态工具的 `ToolCallProgress` 会每 500ms 重排整页**（2026-11-24）：`run_shell` 跑着时每 0.5 秒报一次最新几行，原来每次进 `apply_event` 都改 `ToolCard.output` 并 `cx.notify()`——那条工具收在折叠组里看不见，却让虚拟列表重测行高、内容区整页重排，还把滚动的转圈画了一帧就重置。现在两条一起：`ChatApp` 收到进度先按 `is_tool_output_visible` 判断这条展开着没有，不可见就不通知；`ChatItem::fingerprint` 不再把 `output.len()` 编进去（改在 `Session::row_key` 里只对**展开中**的工具行算长度），折叠行的指纹不随输出变。
@@ -937,6 +938,19 @@
 - **命令动画验收要数正文覆盖层的实际绘制**：侧栏也能单独启动节拍器。虚拟列表在布局时才创建行，需要在行回调内绑定所属会话和位置池；双面板同时跑命令时应能数到两份覆盖层。
   `.claudesktop/bench/command-frame-fix/results.json`：隐藏窗口按 60 Hz 驱动，持续输出 P95 为 18.01 ms，同时运行两条命令时两侧分别为 18.04 / 18.15 ms。普通构建的空目录和双面板存档启动均已验证。
 - **嵌套视图缓存只能重放紧邻上一帧的区间**：外层重放整页时，正文子视图保留的是更早的文本、图元和输入索引。父视图下次重新布局时要检查子视图的绘制帧号，否则输出变化时可能在 `LineLayoutCache::reuse_layouts` 越界。
+- **WebView2 子窗口必须让合成目标不置顶**：`vendor/gpui-pre-windows` 的 `DirectComposition::new` 原本是
+  `CreateTargetForHwnd(hwnd, true)`，整条交换链盖在所有 `WS_CHILD` 子窗口之上，`wry::build_as_child`
+  建出来的网页会被画死（看不见，不是崩溃）。已改成 `false`（见 vendor/README）。代价是子窗口永远在最上层
+  （Airspace），凡是盖在它上面的东西都得让它躲：不在活跃 Tab（`set_active(false)`）、对话框
+  （`window.has_active_dialog`：命令面板 / 快捷键速查 / 原始请求）、设置页 / 审查页 / 回退浮层。
+- **wry 建窗口会泵消息，但不会打崩 gpui**：`webview2_com::wait_with_pump` 用 `GetMessage(None,0,0)`
+  泵掉所有消息。gpui 的 `App` 虽是 `RefCell`，但消息回调走 `AsyncApp::update_window` 的
+  `try_borrow_mut`（忙时丢消息）而不是硬借，`draw_window` 还有 `try_begin_draw` 重入守卫，
+  所以嵌套泵消息的后果只是丢掉那一小段时间的输入。即便如此，`BrowserPane` 仍在
+  `spawn_in` + `update_in` 的前台任务里建，别在 `render` 里建。
+- **原生子窗口换窗口就得重建**：`WebView` 绑死在创建时的 HWND 上，弹出 / 吸回（`on_window_changed`）
+  只能丢掉重建；位置和尺寸按 prepaint 量到的窗口坐标 × `scale_factor()` 换算成父客户区物理像素，
+  并且只在值真的变了才 `set_bounds` / `set_visible`（每次都是跨进程 COM 调用）。
 
 
 

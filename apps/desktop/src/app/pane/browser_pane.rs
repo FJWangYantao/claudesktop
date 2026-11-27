@@ -1,0 +1,523 @@
+//! 浏览器 Pane：GPUI 画的地址栏外壳 + `wry`（WebView2）的原生子窗口。
+//!
+//! ## 为什么是原生子窗口
+//!
+//! WebView2 只有两种嵌法：`WS_CHILD` 子窗口（wry 的 `build_as_child`）或
+//! `ICoreWebView2CompositionController` 的视觉树。后者没有 HWND，等于要自己把鼠标 /
+//! 键盘 / IME / DPI 全手工转发进去，工程量远超一个 Pane。所以走子窗口，并给
+//! `vendor/gpui-pre-windows` 打了一行补丁（合成目标不再置顶），否则整条交换链会盖在
+//! 子窗口上面，网页永远看不见。
+//!
+//! ## 代价：Airspace
+//!
+//! 子窗口永远浮在 GPUI 画的内容之上，所以凡是「盖在它上面」的东西都得让它先躲开：
+//! 不在活跃 Tab（`set_active(false)`）、命令面板 / 快捷键速查 / 原始请求（都是对话框）、
+//! 设置页 / 审查页 / 回退浮层（`ChatApp` 自己的标记）。判据在 prepaint 里算一次，
+//! 位置 / 可见性跟上次写进去的值比一遍，变了才跨进程调用。
+//!
+//! ## 创建时机
+//!
+//! wry 建 WebView2 时用 `webview2_com::wait_with_pump`，会**泵掉所有消息**。GPUI 的
+//! `App` 是 `RefCell`，但消息回调用的是 `try_borrow_mut`（忙就丢消息，不 panic），
+//! `draw_window` 本身也有重入守卫，所以在绘制栈里泵消息不会崩，只会丢掉那一小段时间的输入。
+//! 为了连这点代价都省掉，创建放进前台任务（`spawn_in` + `update_in`），那时已经退出绘制栈。
+
+use super::{ClaudesktopPane, PaneKind};
+use crate::app::ChatApp;
+use crate::theme::rgb;
+use crate::theme::*;
+use gpui_base::dock::{Panel, PanelEvent, PanelState};
+use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
+use wry::dpi::{PhysicalPosition, PhysicalSize};
+use wry::{Rect, WebContext, WebView, WebViewBuilder};
+
+/// 地址栏空着时的落地页：本地空白页，不联网
+const START_URL: &str = "about:blank";
+
+/// WebView2 的用户数据目录名（放系统数据目录下；写 exe 旁边在只读安装目录会直接失败）
+const DATA_DIR: &str = "webview2";
+
+/// 物理矩形（父窗口客户区像素）：`wry::Rect` 的坐标是枚举，自己存一份平铺的更好比
+type Physical = (i32, i32, u32, u32);
+
+pub(crate) struct BrowserPane {
+    app: WeakEntity<ChatApp>,
+    focus_handle: FocusHandle,
+    /// 地址栏（Pane 自己的输入框，不抢主输入框）
+    address: Entity<InputState>,
+    /// 当前地址：地址栏回车、页面内跳转都会更新它，退出时靠它恢复
+    url: String,
+    /// 页内跳转（点链接 / 重定向）由导航回调写进这里，下一帧取走更新地址栏
+    seen: Rc<RefCell<Option<String>>>,
+    webview: Option<WebView>,
+    /// 已经排过一次创建（防止每帧都排）
+    creating: bool,
+    /// 建不起来的原因（缺 WebView2 运行时最常见），画在占位底上
+    error: Option<SharedString>,
+    /// 上一次量到的正文区物理矩形
+    body: Option<Physical>,
+    /// 上一次写给 WebView2 的值：没变就不跨进程调用
+    applied: Option<(Physical, bool)>,
+    /// 是不是所在 Tab 的活跃页（切走时立刻把子窗口藏起来）
+    active: bool,
+}
+
+impl BrowserPane {
+    pub(crate) fn new(
+        app: WeakEntity<ChatApp>,
+        url: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        super::follow_hub(app.clone(), cx);
+        let address = cx.new(|cx| InputState::new(window, cx).placeholder("输入网址或搜索…"));
+        // 地址栏回车 = 导航（和右侧 → 按钮等价）
+        cx.subscribe_in(&address, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { secondary, .. } if !secondary) {
+                this.navigate(window, cx);
+            }
+        })
+        .detach();
+        let url = url.unwrap_or_default();
+        if !url.is_empty() {
+            let initial = url.clone();
+            address.update(cx, |state, cx| state.set_value(initial, window, cx));
+        }
+        Self {
+            app,
+            focus_handle: cx.focus_handle(),
+            address,
+            url,
+            seen: Rc::new(RefCell::new(None)),
+            webview: None,
+            creating: false,
+            error: None,
+            body: None,
+            applied: None,
+            active: true,
+        }
+    }
+
+    // ---------- 起 WebView2 ----------
+
+    /// 排一次创建；真正的构建在前台任务里做（见文件头「创建时机」）。
+    fn start_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating || self.webview.is_some() || self.error.is_some() || headless() {
+            return;
+        }
+        // 拿不到原生窗口（无头测试平台）时 build_as_child 会返回错误，走 error 分支即可
+        self.creating = true;
+        cx.spawn_in(window, async move |this, cx| {
+            // 让出一拍：退出绘制栈后再建，泵消息不会和正在绘制的帧抢渲染器
+            cx.background_executor().timer(Duration::ZERO).await;
+            let _ = this.update_in(cx, |pane, window, cx| pane.build_webview(window, cx));
+        })
+        .detach();
+    }
+
+    fn build_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.creating = false;
+        if self.webview.is_some() || headless() {
+            return;
+        }
+        let Some(dir) = data_dir() else {
+            self.error = Some("找不到可写的用户数据目录".into());
+            cx.notify();
+            return;
+        };
+        let urlish = if self.url.is_empty() { START_URL.to_string() } else { self.url.clone() };
+        let (x, y, w, h) = self.body.unwrap_or((0, 0, 1, 1));
+        let seen = self.seen.clone();
+        let mut context = WebContext::new(Some(dir));
+        let built = WebViewBuilder::new_with_web_context(&mut context)
+            .with_url(urlish)
+            .with_bounds(Rect {
+                position: PhysicalPosition::new(x, y).into(),
+                size: PhysicalSize::new(w.max(1), h.max(1)).into(),
+            })
+            .with_background_color((0, 0, 0, 0))
+            .with_navigation_handler(move |url| {
+                // 页内跳转：记下来，下一帧把地址栏跟上
+                *seen.borrow_mut() = Some(url);
+                true
+            })
+            .build_as_child(&*window);
+        match built {
+            Ok(webview) => {
+                self.webview = Some(webview);
+                self.applied = None;
+                cx.notify();
+            }
+            Err(err) => {
+                self.error = Some(format!("WebView2 启动失败：{err}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// prepaint 量到的正文区 + 这一帧该不该露面。值没变就不碰 WebView2。
+    fn on_body(&mut self, rect: Physical, covered: bool) {
+        self.body = Some(rect);
+        let visible = self.active && !covered;
+        let next = (rect, visible);
+        if self.applied == Some(next) {
+            return;
+        }
+        if let Some(webview) = &self.webview {
+            let _ = webview.set_bounds(Rect {
+                position: PhysicalPosition::new(rect.0, rect.1).into(),
+                size: PhysicalSize::new(rect.2.max(1), rect.3.max(1)).into(),
+            });
+            let _ = webview.set_visible(visible);
+            self.applied = Some(next);
+        }
+    }
+
+    // ---------- 导航 ----------
+
+    /// 地址栏回车：裸域名补 `https://`，其余当搜索词
+    fn navigate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = self.address.read(cx).value().trim().to_string();
+        if typed.is_empty() {
+            return;
+        }
+        let target = normalize_url(&typed);
+        self.url = target.clone();
+        if let Some(webview) = &self.webview {
+            let _ = webview.load_url(&target);
+        }
+        self.address.update(cx, |state, cx| state.set_value(target, window, cx));
+        cx.notify();
+    }
+
+    fn run_js(&mut self, js: &str, cx: &mut Context<Self>) {
+        if let Some(webview) = &self.webview {
+            let _ = webview.evaluate_script(js);
+        }
+        cx.notify();
+    }
+
+    // ---------- 地址栏按钮 ----------
+
+    fn nav_button(&self, id: &'static str, icon: IconAll, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(id)
+            .h_full()
+            .flex_shrink_0()
+            .px_1()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .text_color(rgb(INK_SOFT))
+            .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+            .child(Icon::new(icon).small())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let js = match id {
+                    "browser-back" => "history.back()",
+                    "browser-forward" => "history.forward()",
+                    _ => "location.reload()",
+                };
+                this.run_js(js, cx);
+            }))
+            .into_any_element()
+    }
+}
+
+impl ClaudesktopPane for BrowserPane {
+    fn pane_kind(&self) -> PaneKind {
+        PaneKind::Browser
+    }
+
+    fn icon(&self, _cx: &App) -> IconAll {
+        IconAll::Globe
+    }
+
+    fn title(&self, _cx: &App) -> SharedString {
+        host_of(&self.url).map_or_else(|| PaneKind::Browser.title(), |host| host.into())
+    }
+
+    /// 换窗口（弹出 / 吸回）：WebView2 绑死在创建时的 HWND 上，只能丢掉等下一帧重建
+    fn on_window_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.webview = None;
+        self.applied = None;
+        self.body = None;
+        self.active = true;
+        self.creating = false;
+        self.start_webview(window, cx);
+    }
+}
+
+impl Panel for BrowserPane {
+    fn panel_name(&self) -> &'static str {
+        PaneKind::Browser.panel_name()
+    }
+
+    /// 切走 Tab：子窗口必须立刻藏起来，否则它会浮在别的 Pane 上面
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if let Some(webview) = &self.webview {
+            let _ = webview.set_visible(active);
+            if active {
+                let _ = webview.focus();
+            }
+        }
+        // 记下来，免得下一帧又原样写一遍
+        if let Some((rect, _)) = self.applied {
+            self.applied = Some((rect, active));
+        }
+        cx.notify();
+    }
+
+    fn dump(&self, _cx: &App) -> PanelState {
+        super::pane_state(PaneKind::Browser, serde_json::json!({ "url": self.url }))
+    }
+
+    /// 关掉 Pane：立刻放掉 WebView2（连同它的子窗口和渲染进程）
+    fn on_removed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.webview = None;
+        self.applied = None;
+        self.creating = false;
+        cx.notify();
+    }
+}
+
+impl EventEmitter<PanelEvent> for BrowserPane {}
+
+impl Focusable for BrowserPane {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for BrowserPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 懒起：一进来就排一次创建（真正的构建在前台任务里）
+        if self.webview.is_none() && !self.creating && self.error.is_none() {
+            self.start_webview(window, cx);
+        }
+        // 页面自己跳走过：把地址栏跟上（改别的实体放这轮之后，别在 render 里做）
+        if let Some(url) = self.seen.borrow_mut().take()
+            && url != self.url
+        {
+            self.url = url.clone();
+            let address = self.address.clone();
+            window.defer(cx, move |window, cx| {
+                address.update(cx, |state, cx| state.set_value(url, window, cx));
+            });
+        }
+
+        let address = self.address.clone();
+        let error = self.error.clone();
+        let has_webview = self.webview.is_some();
+        let chrome = h_flex()
+            .h(px(30.))
+            .flex_shrink_0()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(CARD))
+            .child(self.nav_button("browser-back", IconAll::ChevronLeft, cx))
+            .child(self.nav_button("browser-forward", IconAll::ChevronRight, cx))
+            .child(self.nav_button("browser-reload", IconAll::RotateCw, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px_1()
+                    .child(Input::new(&address).appearance(false).bordered(false).small()),
+            )
+            .child(
+                div()
+                    .id("browser-go")
+                    .h_full()
+                    .flex_shrink_0()
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .text_color(rgb(INK_SOFT))
+                    .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                    .child(Icon::new(IconAll::ArrowUpRight).small())
+                    .on_click(cx.listener(|this, _, window, cx| this.navigate(window, cx))),
+            );
+
+        // 正文区：WebView2 是原生子窗口，这里只画「它不在时」的占位底
+        let placeholder: Option<SharedString> = match (&error, has_webview) {
+            (Some(error), _) => Some(error.clone()),
+            (None, false) if headless() => Some("无头模式不启动浏览器".into()),
+            (None, false) => Some("正在启动 WebView2…".into()),
+            (None, true) => None,
+        };
+        let app = self.app.clone();
+        let body = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .bg(rgb(PAPER))
+            .on_prepaint({
+                let handle = cx.entity();
+                move |bounds, window, cx| {
+                    let scale = window.scale_factor();
+                    let rect: Physical = (
+                        (f32::from(bounds.origin.x) * scale).round() as i32,
+                        (f32::from(bounds.origin.y) * scale).round() as i32,
+                        (f32::from(bounds.size.width) * scale).round().max(1.) as u32,
+                        (f32::from(bounds.size.height) * scale).round().max(1.) as u32,
+                    );
+                    // 盖在子窗口上面的东西：对话框（命令面板等）+ ChatApp 自己的浮层
+                    let dialogs = window.has_active_dialog(cx);
+                    let covered = dialogs
+                        || app.upgrade().is_some_and(|app| {
+                            let app = app.read(cx);
+                            app.settings_open || app.review.is_some() || app.rewind.is_some()
+                        });
+                    handle.update(cx, |pane, _| pane.on_body(rect, covered));
+                }
+            })
+            .when_some(placeholder, |d, text| {
+                d.child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px_6()
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK_FAINT))
+                        .child(text),
+                )
+            });
+
+        div()
+            .id("browser-pane")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .overflow_hidden()
+            .v_flex()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_handle.focus(window, cx);
+                    // 点正文区：键盘焦点交给网页（子窗口自己收按键）
+                    if let Some(webview) = &this.webview {
+                        let _ = webview.focus();
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(chrome)
+            .child(body)
+    }
+}
+
+impl ChatApp {
+    /// `Ctrl+Shift+B`：起一块（或聚焦已有的）浏览器 Pane。
+    pub(crate) fn open_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_pane_of_kind(PaneKind::Browser, window, cx) {
+            return;
+        }
+        let app = cx.entity().downgrade();
+        let pane = cx.new(|cx| BrowserPane::new(app, None, window, cx));
+        let dock = self.dock.clone();
+        let handle = std::sync::Arc::new(super::PaneHandle::new(pane))
+            as std::sync::Arc<dyn gpui_base::dock::PanelView>;
+        dock.update(cx, |dock, cx| {
+            dock.add_panel_view(handle, gpui_base::dock::DockPlacement::Center, None, window, cx);
+        });
+        cx.notify();
+    }
+}
+
+/// `CLAUDESKTOP_HEADLESS` / 截图模式下不拉 WebView2：验收和截图不该起 Edge 进程
+fn headless() -> bool {
+    ["CLAUDESKTOP_SCREENSHOT", "CLAUDESKTOP_HEADLESS"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|v| v != "0"))
+}
+
+/// WebView2 用户数据目录：跟设置同一个数据根，不写 exe 旁边
+fn data_dir() -> Option<PathBuf> {
+    let base = claudesktop_core::default_data_dir().ok()?;
+    let dir = base.join(DATA_DIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// 地址栏输入 → 真正的 URL：带 scheme 的原样用，像域名的补 https，其余当搜索词
+fn normalize_url(typed: &str) -> String {
+    if typed.contains("://") || typed.starts_with("about:") || typed.starts_with("file:") {
+        return typed.to_string();
+    }
+    let looks_like_host = !typed.contains(char::is_whitespace)
+        && (typed.contains('.') || typed.eq_ignore_ascii_case("localhost"));
+    if looks_like_host {
+        return format!("https://{typed}");
+    }
+    // 搜索：不做「猜你想搜什么」的追踪，直接走关键词页
+    format!("https://duckduckgo.com/?q={}", percent_encode(typed))
+}
+
+/// 查询串编码：ASCII 里除了保留字符原样，其余（中文、空格）都转义
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() * 3);
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// URL 里的主机名，用来当 Pane 标题
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    (!host.is_empty() && url != "about:blank").then(|| host.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `use gpui_kit::*` 把 gpui 的 `test` 宏也带进来了，裸 `#[test]` 会展开成无限递归
+    #[core::prelude::v1::test]
+    fn address_bar_input_becomes_a_url() {
+        assert_eq!(normalize_url("example.com"), "https://example.com");
+        assert_eq!(normalize_url("https://example.com/a"), "https://example.com/a");
+        assert_eq!(normalize_url("localhost"), "https://localhost");
+        // 带空格的一律当搜索词
+        assert!(normalize_url("rust borrow checker").starts_with("https://duckduckgo.com/?q="));
+        // 中文必须百分号编码，不能原样塞进查询串
+        assert!(!normalize_url("生命周期").contains('生'));
+    }
+
+    #[core::prelude::v1::test]
+    fn title_falls_back_to_the_host() {
+        assert_eq!(host_of("https://example.com/a/b").as_deref(), Some("example.com"));
+        assert_eq!(host_of("https://user@example.com:8080/x").as_deref(), Some("example.com"));
+        assert_eq!(host_of("about:blank"), None);
+    }
+}

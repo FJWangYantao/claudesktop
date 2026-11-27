@@ -49,6 +49,8 @@ actions!(
         ToggleSideChat,
         /// 打开或聚焦终端（ConPTY）
         ToggleTerminal,
+        /// 打开或聚焦浏览器（WebView2 子窗口）
+        ToggleBrowser,
         /// 打开快捷键速查
         ShowShortcuts,
         /// 应答最早一条待定的权限请求：选第 1 / 2 / 3 / 4 个按钮
@@ -82,6 +84,8 @@ pub(super) const CHANGES_KEY: &str = "ctrl-shift-d";
 pub(super) const SIDE_CHAT_KEY: &str = "ctrl-;";
 /// 终端（`Ctrl+\``）
 pub(super) const TERMINAL_KEY: &str = "ctrl-`";
+/// 浏览器（`Ctrl+Shift+B`）
+pub(super) const BROWSER_KEY: &str = "ctrl-shift-b";
 pub(super) const SHORTCUTS_KEY: &str = "secondary-/";
 pub(super) const RAW_FIND_KEY: &str = "secondary-f";
 /// 停止 / 循环权限模式 / 前后切会话
@@ -135,6 +139,7 @@ pub(crate) fn bind(cx: &mut App) {
         KeyBinding::new(CHANGES_KEY, ToggleChanges, Some(CONTEXT)),
         KeyBinding::new(SIDE_CHAT_KEY, ToggleSideChat, Some(CONTEXT)),
         KeyBinding::new(TERMINAL_KEY, ToggleTerminal, Some(CONTEXT)),
+        KeyBinding::new(BROWSER_KEY, ToggleBrowser, Some(CONTEXT)),
         KeyBinding::new(SHORTCUTS_KEY, ShowShortcuts, Some(CONTEXT)),
         KeyBinding::new(
             RAW_FIND_KEY,
@@ -211,6 +216,9 @@ impl ChatApp {
             )
             .on_action(
                 cx.listener(|this, _: &ToggleTerminal, window, cx| this.open_terminal(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleBrowser, window, cx| this.open_browser(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;

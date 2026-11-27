@@ -10,6 +10,7 @@
 //! 所以面板统一包一层具体类型 [`PaneHandle`]，皮肤用
 //! `panel.as_any().downcast_ref::<PaneHandle>()` 拿回来。
 
+pub(crate) mod browser_pane;
 pub(crate) mod chat_pane;
 pub(crate) mod diff_pane;
 pub(crate) mod files_pane;
