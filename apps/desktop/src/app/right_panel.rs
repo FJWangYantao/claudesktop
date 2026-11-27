@@ -5,7 +5,7 @@
 
 use super::ChatApp;
 use super::chat::{diff_line, diff_truncated};
-use super::chrome::{CHROME_H, drag_area, window_controls};
+use super::chrome::{CHROME_H, drag_area};
 use super::menu::diff_stat;
 use super::widgets::Surface;
 use crate::model::{DiffLocation, TurnFile, same_path, turn_files};
@@ -567,7 +567,7 @@ impl ChatApp {
         )
     }
 
-    fn render_right_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+    fn render_right_header(&self, _window: &Window, cx: &mut Context<Self>) -> Div {
         let tab_button = |tab: RightTab, cx: &mut Context<Self>| {
             let active = self.right_panel.tab == tab;
             div()
@@ -639,11 +639,8 @@ impl ChatApp {
                         cx.notify();
                     })),
             )
-            // 面板的 X 和系统的关闭键别贴在一起（都是「关」，容易点错）
-            .when(window_controls(window).is_some(), |d| {
-                d.child(div().w(px(1.)).h(rems(1.)).mx_1().bg(rgb(LINE)))
-            })
-            .children(window_controls(window))
+            // 面板的 X 和窗口按钮隔开（以前这里带着窗口按钮，现在它们在全局顶栏）
+            .child(div().w(px(1.)).h(rems(1.)).mx_1().bg(rgb(LINE)))
     }
 
     fn panel_split(&self) -> bool {

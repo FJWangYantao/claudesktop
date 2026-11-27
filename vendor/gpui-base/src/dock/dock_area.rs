@@ -11,9 +11,9 @@ use std::{
 use anyhow::Result;
 use gpui::{
     AnyElement, AnyView, App, AppContext as _, Axis, Bounds, Context, Div, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement,
-    Pixels, Point, Render, SharedString, Stateful, Styled as _, Subscription, WeakEntity, Window,
-    div, prelude::FluentBuilder as _, px,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, MouseButton,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, SharedString, Stateful, Styled as _,
+    Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -42,6 +42,18 @@ pub enum DockEvent {
     LayoutChanged,
     /// A host-owned drag item was dropped inside the dock.
     DragDrop { item: AnyDrag, target: DropTarget },
+    /// A tab drag ended outside the area's own bounds, so no drop target took
+    /// it. The panel is still in the dock — the host decides whether to tear
+    /// it out into another window ([`DockArea::detach_panel`]) or ignore it.
+    ///
+    /// Only a drag the host announced through
+    /// [`DockArea::begin_panel_drag`] can produce this: base cannot see a
+    /// drag that its own skin started. claudesktop patch.
+    DragOutside {
+        panel: PanelId,
+        /// Where the pointer was released, in window coordinates.
+        position: Point<Pixels>,
+    },
 }
 
 /// What fills the whole area, when something does.
@@ -111,6 +123,10 @@ pub struct DockArea {
 
     locked: bool,
     zoomed: Option<Zoomed>,
+    /// The panel whose tab drag is in flight, once the host told us about it.
+    /// A drag released outside `bounds` becomes [`DockEvent::DragOutside`].
+    /// claudesktop patch.
+    dragging: Option<PanelId>,
     focus_handle: FocusHandle,
     renderer: Rc<dyn DockAreaRenderer>,
 }
@@ -143,6 +159,7 @@ impl DockArea {
             panels: HashMap::new(),
             locked: false,
             zoomed: None,
+            dragging: None,
             focus_handle: cx.focus_handle(),
             renderer: Rc::new(BareDockArea),
         }
@@ -473,6 +490,83 @@ impl DockArea {
         cx: &mut Context<Self>,
     ) {
         self.remove_panel_id(PanelId::from(panel.entity_id()), window, cx);
+    }
+
+    /// Take a panel out of the dock alive: the caller gets the handle back and
+    /// the panel is **not** told [`Panel::on_removed`], so its entities, scroll
+    /// positions and background state survive the trip to another window.
+    ///
+    /// `remove_panel_id` cannot be reused for this. It leaves the view in
+    /// `self.panels` until `commit` → `reconcile`, and `reconcile` reports
+    /// every panel that no tree holds any more as *departed* — which is the one
+    /// path that fires `on_removed`. So the registration is dropped here,
+    /// before the commit, and the reconcile that follows finds nothing to
+    /// prune. claudesktop patch.
+    pub fn detach_panel(
+        &mut self,
+        panel: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<dyn PanelView>> {
+        let region = self.placement_of_panel(panel)?;
+        let tree = self.tree_mut(region)?;
+        let result = tree.remove_panel(panel);
+        if !result.changed() {
+            return None;
+        }
+        // Before the commit, so `reconcile` never sees a panel in the map that
+        // no tree holds.
+        let detached = self.panels.remove(&panel);
+        self.commit(result, window, cx);
+        detached
+    }
+
+    /// Insert an already-wrapped panel at a specific target — a tab group, or
+    /// beside a node — rather than at the region's first tab group the way
+    /// [`Self::add_panel_view`] does.
+    ///
+    /// This is what a popout being closed back into the main window needs: the
+    /// panel must return to the group it left, not to whatever group happens to
+    /// be first. Returns whether anything was placed. claudesktop patch.
+    pub fn add_panel_view_at(
+        &mut self,
+        panel: Arc<dyn PanelView>,
+        target: InsertTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let id = panel.panel_id(cx);
+        let Some(region) = self.placement_of_node(target_node(&target)) else {
+            return false;
+        };
+        // A split divides an existing slot, so the tree needs the pixels the
+        // slot is actually drawn at — same reason as `move_panel`.
+        if matches!(target, InsertTarget::Split { .. }) {
+            self.adopt_measured_sizes(region, cx);
+        }
+        let previous = self.panels.insert(id, panel);
+        let Some(tree) = self.tree_mut(region) else {
+            self.restore_registration(id, previous);
+            return false;
+        };
+        let result = tree.insert_panel(id, target);
+        if !result.changed() {
+            self.restore_registration(id, previous);
+            return false;
+        }
+        self.commit(result, window, cx);
+        true
+    }
+
+    /// Tell the area that a tab drag is in flight, so releasing the pointer
+    /// outside the area can become [`DockEvent::DragOutside`].
+    ///
+    /// The drag itself is the skin's: base attaches no drag source to a tab it
+    /// did not draw. So a skin calls this from the `on_drag` it wires onto the
+    /// tab, and the area watches its own bounds for the release. claudesktop
+    /// patch.
+    pub fn begin_panel_drag(&mut self, panel: PanelId) {
+        self.dragging = Some(panel);
     }
 
     /// Move a panel to a new home. The panel never leaves the dock, so it is
@@ -1561,6 +1655,23 @@ impl Render for DockArea {
             .on_prepaint(move |bounds, _, cx| {
                 area.update(cx, |area, _| area.bounds = bounds);
             })
+            // A tab drag released outside the area belongs to the host: it
+            // either tears the panel out into another window or does nothing.
+            // The release is the only signal available — this gpui has no
+            // drag-end callback, and a drop outside every target reports
+            // nothing at all. claudesktop patch.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    let Some(panel) = this.dragging.take() else {
+                        return;
+                    };
+                    if this.bounds.contains(&event.position) {
+                        return;
+                    }
+                    cx.emit(DockEvent::DragOutside { panel, position: event.position });
+                }),
+            )
             .track_focus(&self.focus_handle)
             .map(|frame| match self.zoomed_view() {
                 Some(view) => frame.child(view),
@@ -2374,6 +2485,91 @@ mod tests {
         assert!(
             !drain(&log).contains(&("Alpha", PanelSignal::Removed)),
             "moving a panel between groups must never deliver on_removed"
+        );
+    }
+
+    /// Taking a panel out alive keeps it out of `on_removed`: that is the whole
+    /// point of a detach over a remove, and the reconcile right after is what
+    /// would otherwise report it.
+    #[gpui::test]
+    fn detaching_a_panel_does_not_tell_it_it_was_removed(cx: &mut TestAppContext) {
+        let log = log_of();
+        let (area, alpha, cx) = two_groups(&log, cx);
+        cx.run_until_parked();
+        drain(&log);
+
+        let id = panel_id_of(&alpha);
+        let detached = cx.update(|window, cx| {
+            area.update(cx, |area, cx| area.detach_panel(id, window, cx))
+        });
+
+        assert!(detached.is_some(), "the detach hands the handle back");
+        assert!(
+            !drain(&log).contains(&("Alpha", PanelSignal::Removed)),
+            "a detached panel is still alive and must not hear on_removed"
+        );
+        assert!(
+            cx.read(|cx| area.read(cx).panel(id).is_none()),
+            "the area no longer holds the panel"
+        );
+        let state = cx.read(|cx| area.read(cx).dump(cx));
+        assert_eq!(
+            state.center.children.len(),
+            1,
+            "the group it left collapsed out of the split"
+        );
+    }
+
+    /// A detached panel can be put back at a group it is told about, rather
+    /// than at the region's first group.
+    #[gpui::test]
+    fn a_detached_panel_rejoins_at_the_target_it_is_given(cx: &mut TestAppContext) {
+        let log = log_of();
+        let (area, alpha, cx) = two_groups(&log, cx);
+        cx.run_until_parked();
+
+        let id = panel_id_of(&alpha);
+        let detached = cx.update(|window, cx| {
+            area.update(cx, |area, cx| area.detach_panel(id, window, cx))
+        });
+        let Some(detached) = detached else {
+            panic!("detach returned nothing")
+        };
+
+        // The surviving group, after the emptied one collapsed away.
+        let target = cx.read(|cx| {
+            let area = area.read(cx);
+            let PaneRef::Split { children, .. } =
+                area.layout(DockPlacement::Center).unwrap().root().kind()
+            else {
+                panic!("center root is a split")
+            };
+            children[0].id()
+        });
+        let placed = cx.update(|window, cx| {
+            area.update(cx, |area, cx| {
+                area.add_panel_view_at(
+                    detached,
+                    InsertTarget::Tabs {
+                        node: target,
+                        ix: None,
+                        activate: true,
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        assert!(placed, "the panel went back in");
+        assert!(
+            cx.read(|cx| area
+                .read(cx)
+                .layout(DockPlacement::Center)
+                .unwrap()
+                .find_panel_node(id))
+                .is_some(),
+            "the panel is in the tree again"
         );
     }
 

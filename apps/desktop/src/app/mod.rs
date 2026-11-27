@@ -15,6 +15,7 @@ mod git_branch;
 mod hibernate_bench;
 mod history;
 pub(crate) mod home_backdrop;
+pub(crate) mod hub;
 mod image_cache;
 pub(crate) mod keys;
 mod mascot;
@@ -132,6 +133,8 @@ impl SessionStress {
 type ToolScrollRegions = std::rc::Rc<std::cell::RefCell<Vec<(Bounds<Pixels>, ScrollHandle)>>>;
 
 pub struct ChatApp {
+    /// 跨窗口共享的那一层（活跃会话、会话摘要、设置、浮层开合；见 hub.rs）
+    pub(crate) hub: Entity<hub::WorkspaceHub>,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -245,6 +248,10 @@ pub struct ChatApp {
     content_view: Entity<ContentView>,
     /// 内容区里的转圈 / 呼吸点 / 扫光叠在这上面画（见 motion.rs 文件头）
     loop_overlay: Entity<motion::LoopOverlay>,
+    /// 内容区这一遍记下的循环动画位置（每块内容区一份，见 `motion::LoopSpots`）。
+    /// 现在只有一块内容区，所以这里只是把同一份池子留给 Phase 1 的 `ChatPane` 复用。
+    #[allow(dead_code)]
+    loop_spots: motion::LoopSpots,
     /// 输入框外沿用棱镜描边跟着指针（见 prism_rim.rs 文件头：只通知它自己）
     rim_view: Entity<prism_rim::ComposerRimView>,
     /// 根视图写、描边 view 读的指针位置
@@ -593,6 +600,8 @@ impl ChatApp {
         .detach();
 
         let weak = cx.entity().downgrade();
+        // 循环动画位置池：内容区和叠在它上面的覆盖层共用这一份（见 motion.rs 的 LoopSpots）
+        let spots = motion::LoopSpots::new();
         // 棱镜描边：指针状态由根视图写、描边 view 读（见 prism_rim.rs 文件头）
         let rim_pointer =
             std::rc::Rc::new(std::cell::RefCell::new(prism_rim::RimPointer::default()));
@@ -602,6 +611,7 @@ impl ChatApp {
         let home_backdrop_view =
             cx.new(|_| home_backdrop::HomeBackdropView::new(home_backdrop.clone()));
         let mut app = Self {
+            hub: hub::WorkspaceHub::new_entity(cx, settings.clone()),
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),
@@ -668,8 +678,9 @@ impl ChatApp {
             bg: bgtasks_view::BgTasksUi::initial(),
             bg_spinner: cx.new(|_| bgtasks_view::BgSpinner),
             image_cache: image_cache::DecodedImageCache::new(cx),
-            content_view: cx.new(|_| ContentView::new(weak.clone())),
-            loop_overlay: cx.new(|_| motion::LoopOverlay),
+            loop_spots: spots.clone(),
+            content_view: cx.new(|_| ContentView::new(weak.clone(), spots.clone())),
+            loop_overlay: cx.new(|_| motion::LoopOverlay::new(spots)),
             rim_view,
             rim_pointer,
             home_backdrop,
@@ -4479,6 +4490,8 @@ impl Render for ChatApp {
 
         // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
         self.sync_sidebar(cx);
+        // 共享态的投影同理：没变就不发事件（见 hub.rs）
+        self.sync_hub(window, cx);
         self.sync_placeholder(window, cx);
 
         // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
@@ -4498,36 +4511,48 @@ impl Render for ChatApp {
                         .child(self.render_composer(window, cx)),
                 )
             });
+        // 顶栏是主窗的固定一条（见 chrome.rs）：侧栏、对话区、辅助面板都在它下面，
+        // 窗口按钮只挂在它最右侧，所以面板开合时位置不会跳
+        let chrome_bar = self.render_header(window, cx);
         let main = v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .relative()
-            .child(self.render_header(window, cx))
             .child(body)
             .when(!self.settings_open, |d| self.with_file_drop(d, cx));
 
         let mut root = div();
         // 中文回退字体：根上设一次，子元素换 font_family 时继承
         root.text_style().font_fallbacks = Some(cjk_fallbacks());
-        // 不用系统标题栏：侧栏顶到窗口顶，会话区与右侧辅助面板各自有顶栏
+        // 不用系统标题栏：顶上一条全局薄顶栏兼做标题栏，下面整片交给侧栏 + 工作区
         let show_main =
             !self.right_panel_controls() || !self.right_panel.expanded || self.settings_open;
         let root = root
-            .h_flex()
+            .v_flex()
             .size_full()
             .font_family(sans())
             .text_size(TEXT_BODY)
             .bg(rgb(PAPER))
             .text_color(rgb(INK))
             .relative()
-            .when(!self.settings_navigation_only(), |d| {
-                d.children(self.render_sidebar_slot(window, cx))
-                    .child(self.render_sidebar_handle(cx))
-            })
-            .when(show_main, |d| d.child(main))
-            .when(!self.settings_navigation_only(), |d| d.child(self.sidebar_spinners_view.clone()))
-            .children(self.render_right_panel_slot(window, cx))
+            .child(chrome_bar)
+            .child(
+                div()
+                    .h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .when(!self.settings_navigation_only(), |d| {
+                        d.children(self.render_sidebar_slot(window, cx))
+                            .child(self.render_sidebar_handle(cx))
+                    })
+                    .when(show_main, |d| d.child(main))
+                    .when(!self.settings_navigation_only(), |d| {
+                        d.child(self.sidebar_spinners_view.clone())
+                    })
+                    .children(self.render_right_panel_slot(window, cx)),
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 // 棱镜描边跟随指针：这里只通知描边自己，不让 ChatApp 变脏（见 prism_rim.rs）
                 this.track_rim_pointer(event.position, window, cx);

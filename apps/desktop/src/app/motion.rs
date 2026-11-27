@@ -59,13 +59,44 @@ static REDUCED: AtomicBool = AtomicBool::new(false);
 thread_local! {
     /// 这一拍到点时要重画的 view（非空 = 已经排了一拍、还没到点）
     static TICK_VIEWS: RefCell<Vec<EntityId>> = const { RefCell::new(Vec::new()) };
-    /// 内容区这一遍记下的循环动画位置（内容区重画时清空重记，复用缓存时照旧有效）
-    static LOOP_SPOTS: RefCell<Vec<LoopSpot>> = const { RefCell::new(Vec::new()) };
+    /// 正在构建的那块内容区（[`with_loop_spots`] 期间有效）：占位格在这时候认领位置池。
+    /// 认领发生在**构建**时而不是 prepaint 时——prepaint 在整棵树布局完才跑，
+    /// 那时已经分不清这个格是哪个内容区建的了。
+    static CURRENT_SPOTS: RefCell<Option<LoopSpots>> = const { RefCell::new(None) };
     /// 最近一次真正画出循环动画的时刻：节拍按它算间隔，外部重画（打字、滚动）不会把拍子挤短
     static LAST_LOOP_PAINT: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }
 
-/// 内容区里的一个循环动画：画什么、画在哪、裁到哪（窗口坐标）。
+/// 一块内容区记下的循环动画位置（画什么、画在哪、裁到哪；窗口坐标）。
+///
+/// 每块内容区一份：两个 `ChatPane` 同帧渲染时各记各的，谁也清不掉对方的转圈位置
+/// （只有一块时行为和以前的全局表一模一样）。
+#[derive(Clone, Default)]
+pub(crate) struct LoopSpots(std::rc::Rc<RefCell<Vec<LoopSpot>>>);
+
+impl LoopSpots {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
+    fn push(&self, spot: LoopSpot) {
+        self.0.borrow_mut().push(spot);
+    }
+
+    fn borrow(&self) -> std::cell::Ref<'_, Vec<LoopSpot>> {
+        self.0.borrow()
+    }
+}
+
+/// 内容区里的一个循环动画。
 struct LoopSpot {
     kind: LoopKind,
     bounds: Bounds<Pixels>,
@@ -83,22 +114,31 @@ enum LoopKind {
     },
 }
 
-/// 内容区开始重画（`ContentView::render` 开头调）：上一遍记的位置作废，占位格 prepaint 时重记。
 /// 「减少动态效果」当前的值（画首页背景时手里不一定有 `App`）。
 pub(super) fn reduced() -> bool {
     REDUCED.load(Ordering::Relaxed)
 }
 
-pub(super) fn begin_loop_spots() {
-    LOOP_SPOTS.with_borrow_mut(Vec::clear);
+/// 内容区构建这一遍时把位置池切到自己这份（上一遍记的作废）：占位格在构建时认领它，
+/// prepaint 时按认领到的池记位置。退出时还原外层那份，嵌套的内容区不会互相污染。
+pub(super) fn with_loop_spots<T>(spots: &LoopSpots, build: impl FnOnce() -> T) -> T {
+    spots.clear();
+    let previous = CURRENT_SPOTS.with_borrow_mut(|current| current.replace(spots.clone()));
+    let out = build();
+    CURRENT_SPOTS.with_borrow_mut(|current| *current = previous);
+    out
 }
 
 /// 循环动画的占位格：prepaint 时把位置和裁切范围记下，交给 [`LoopOverlay`] 画。
 fn loop_spot(kind: LoopKind) -> Canvas<()> {
+    // 认领在这一刻：构建占位格的就是要画它的那块内容区
+    let spots = CURRENT_SPOTS.with_borrow(Clone::clone);
     canvas(
         move |bounds, window, _| {
             let clip = window.content_mask().bounds;
-            LOOP_SPOTS.with_borrow_mut(|spots| spots.push(LoopSpot { kind, bounds, clip }));
+            if let Some(spots) = &spots {
+                spots.push(LoopSpot { kind, bounds, clip });
+            }
         },
         |_, _, _, _| {},
     )
@@ -107,43 +147,52 @@ fn loop_spot(kind: LoopKind) -> Canvas<()> {
 /// 内容区里循环动画的覆盖层：叠在内容区上、不挂事件，按占位格记下的位置画。
 /// 它排在内容区后面，prepaint 时内容区这一帧的位置已经记好（滚动时不会慢一帧）；
 /// 节拍器只通知它自己，内容区复用缓存。
-pub(crate) struct LoopOverlay;
+pub(crate) struct LoopOverlay {
+    spots: LoopSpots,
+}
+
+impl LoopOverlay {
+    pub(crate) fn new(spots: LoopSpots) -> Self {
+        Self { spots }
+    }
+}
 
 impl Render for LoopOverlay {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let ticks = self.spots.clone();
+        let paint = self.spots.clone();
         canvas(
-            |_, window, _| {
-                if LOOP_SPOTS.with_borrow(|spots| !spots.is_empty()) {
+            move |_, window, _| {
+                if !ticks.is_empty() {
                     request_loop_tick(window);
                 }
             },
-            |_, _, window, cx| paint_loop_spots(window, cx),
+            move |_, _, window, cx| paint_loop_spots(&paint, window, cx),
         )
         .absolute()
         .size_full()
     }
 }
 
-fn paint_loop_spots(window: &mut Window, cx: &mut App) {
+fn paint_loop_spots(spots: &LoopSpots, window: &mut Window, cx: &mut App) {
     let spin = loop_phase(SPIN_PERIOD);
     let shimmer = loop_phase(SHIMMER_PERIOD);
     let color = rgb(CORAL);
-    LOOP_SPOTS.with_borrow(|spots| {
-        if spots.is_empty() {
-            return;
-        }
-        // 记「这一帧真画了循环动画」：空画（只有别处的转圈）不算，免得打字刷新把节拍挤短
-        LAST_LOOP_PAINT.with_borrow_mut(|last| *last = Some(Instant::now()));
-        for spot in spots {
-            let mask = ContentMask { bounds: spot.clip };
-            window.with_content_mask(Some(mask), |window| match &spot.kind {
-                LoopKind::Spinner => paint_spinner(spot.bounds, Some(spin), color, window),
-                LoopKind::Shimmer { text, style, base, highlight } => {
-                    paint_shimmer(text, style, spot.bounds, shimmer, *base, *highlight, window, cx)
-                }
-            });
-        }
-    });
+    let spots = spots.borrow();
+    if spots.is_empty() {
+        return;
+    }
+    // 记「这一帧真画了循环动画」：空画（只有别处的转圈）不算，免得打字刷新把节拍挤短
+    LAST_LOOP_PAINT.with_borrow_mut(|last| *last = Some(Instant::now()));
+    for spot in spots.iter() {
+        let mask = ContentMask { bounds: spot.clip };
+        window.with_content_mask(Some(mask), |window| match &spot.kind {
+            LoopKind::Spinner => paint_spinner(spot.bounds, Some(spin), color, window),
+            LoopKind::Shimmer { text, style, base, highlight } => {
+                paint_shimmer(text, style, spot.bounds, shimmer, *base, *highlight, window, cx)
+            }
+        });
+    }
 }
 
 /// 循环动画在这一刻的相位（0..1），所有转圈 / 扫光共用一个时钟，彼此同步。
@@ -384,12 +433,15 @@ pub(super) fn shimmer_text(text: impl Into<SharedString>, base: Color, highlight
     let (base, highlight) = (rgb(base), rgb(highlight));
     // 排版靠透明的同样文字；字体字号在 prepaint 时取（和这份文字继承同一串祖先的样式）
     let layout = text.clone();
+    let spots = CURRENT_SPOTS.with_borrow(Clone::clone);
     div().relative().child(div().text_color(transparent_black()).child(layout)).child(
         canvas(
             move |bounds, window, _| {
                 let (style, clip) = (Box::new(window.text_style()), window.content_mask().bounds);
                 let kind = LoopKind::Shimmer { text, style, base, highlight };
-                LOOP_SPOTS.with_borrow_mut(|spots| spots.push(LoopSpot { kind, bounds, clip }));
+                if let Some(spots) = &spots {
+                    spots.push(LoopSpot { kind, bounds, clip });
+                }
             },
             |_, _, _, _| {},
         )

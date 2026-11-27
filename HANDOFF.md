@@ -806,3 +806,27 @@
   4. 观感旋钮都在两处：极光底部白化 `0.22 * (1. - glow.dark)`（`horizon_glow.hlsl`）、
      字阵 ink / 波面色配比（`home_backdrop.rs` 里 `with_alpha(rgb(INK_FAINT), 0.9)` /
      `with_alpha(rgb(CORAL), 0.8)`）。浅色纸面上觉得抢眼就先调这两个，别动 shader 结构。
+
+## 模块化 Pane 工作台（dock / 弹出窗 / 终端 / 浏览器）
+
+- **gpui-base 的测试目标跑不起来**（2026-11-28）：`cargo check -p gpui-base --all-targets` 报约
+  1600 条既有错误（`simulate_next_frame` / `advance_clock` / `HitboxId::placeholder` 这些 API
+  和 vendor 里的 gpui-pre 对不上），lib 本身是干净的。所以 `cargo test -p gpui-base dock` 这条路
+  不存在，`src/dock/dock_area.rs` 里新加的 `detach_panel` 用例只是随源码放着，真正的验收在
+  桌面端；改 dock 别指望那里能跑测试。
+- **`detach_panel` 必须先把 `PanelId` 从 `panels` 表里删掉再 `commit`**：`commit` → `reconcile`
+  会把「树里没有、表里还留着」的面板当成本轮离开的面板去调 `on_removed`，活体剥离（弹出窗、
+  吸回）就变成关一次面板——PTY 被杀、虚拟滚动归零。`remove_panel_id` 走的是那条路，别拿它当
+  剥离用。
+- **拖出成独立窗只能靠「宿主报一声 + 松手看落点」**：这版 gpui 没有拖拽结束回调，丢在所有
+  drop target 之外什么事件都不发。所以 `DockArea::begin_panel_drag`（skin 在 Tab 的 `on_drag`
+  里调）+ 区域根上的 `on_mouse_up` 比较 `bounds` 才凑出 `DockEvent::DragOutside`；`bounds` 是
+  上一帧 prepaint 记的，第一帧还没画过时是默认值（= 永远「在外面」），别在窗口刚打开时判拖出。
+- **循环动画位置池必须每块内容区一份**：`motion` 里的占位格在 **构建** 时认领池子
+  （`with_loop_spots` 期间生效），不是 prepaint 时——prepaint 在整棵树布局完才跑，那时分不清
+  这个格属于哪块内容区。两块内容区共用一张全局表时，只重画其中一块就会把另一块记的位置清掉，
+  表现为「另一个窗口的转圈消失」。
+- **窗口按钮只留在全局顶栏**：`right_panel.rs` 的顶栏以前也挂 `window_controls`，右侧面板一开
+  关按钮就跳位置。现在主窗根是 `v_flex[固定顶栏 CHROME_H, h_flex[侧栏, 工作区, 面板]]`，
+  侧栏头部不再放 macOS 红绿灯占位（它在顶栏里）。
+

@@ -91,7 +91,9 @@ pub(super) fn window_controls(window: &Window) -> Option<Div> {
 }
 
 impl ChatApp {
-    /// 会话区顶栏：「项目 / 会话标题」面包屑 + 右侧动作（工作区面板、`⋯` 会话菜单）+ 窗口按钮。
+    /// 主窗顶上那一条固定薄顶栏（`CHROME_H`）：会话面包屑 + 面板/后台命令/会话动作 +
+    /// 固定在最右的窗口按钮。侧栏、对话区、辅助面板都在它下面，所以面板开合、
+    /// Tab 拖拽都不会让窗口按钮移位（见 docs/dev/gpui-ui.md 的顶栏约定）。
     /// 整行除按钮外都能拖动窗口。
     pub(super) fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let s = self.session();
@@ -243,10 +245,11 @@ impl ChatApp {
             // 导出 / 在项目里继续这类会话动作收进 `⋯`，只在有对话时出现
             .when(can_export, |d| d.child(div().mr_1().child(self.render_session_menu(cx))))
             // 空白 Code 首页（只有面板开关）也要有分隔线；设置页和空白聊天页不画
-            .when(!panel_open && window_controls(window).is_some() && has_header_actions, |d| {
+            .when(window_controls(window).is_some() && has_header_actions, |d| {
                 d.child(div().w(px(1.)).h(rems(1.)).mr_1().bg(rgb(LINE)))
             })
-            .when(!panel_open, |d| d.children(window_controls(window)))
+            // 窗口按钮只在这条顶栏里，且永远在最右（不再跟着右侧面板的开合搬家）
+            .children(window_controls(window))
     }
 
     /// 顶栏的 `⋯` 会话菜单：在项目里继续（仅聊天）、导出 Markdown。

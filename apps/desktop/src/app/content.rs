@@ -27,21 +27,23 @@ pub(super) const MESSAGE_HOVER_SETTLE: Duration = Duration::from_millis(120);
 /// 内容区的缓存 view：内容全由 `ChatApp::render_content` 画，这里只是把它隔成一块单独重画的区域。
 pub(crate) struct ContentView {
     app: WeakEntity<ChatApp>,
+    /// 这块内容区自己的循环动画位置池（见 `motion::LoopSpots`）
+    spots: motion::LoopSpots,
 }
 
 impl ContentView {
-    pub(super) fn new(app: WeakEntity<ChatApp>) -> Self {
-        Self { app }
+    pub(super) fn new(app: WeakEntity<ChatApp>, spots: motion::LoopSpots) -> Self {
+        Self { app, spots }
     }
 }
 
 impl Render for ContentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        motion::begin_loop_spots();
-        match self.app.upgrade() {
+        // 构建这一遍时把位置池切到自己这份：别的内容区（将来的第二个 ChatPane）同帧渲染也清不掉它
+        motion::with_loop_spots(&self.spots, || match self.app.upgrade() {
             Some(app) => app.update(cx, |app, cx| app.render_content(window, cx)),
             None => div().into_any_element(),
-        }
+        })
     }
 }
 

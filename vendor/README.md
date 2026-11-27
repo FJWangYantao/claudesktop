@@ -9,7 +9,18 @@ gpui-kit 0.7.3 的基础组件层（Markdown 的 `TextView`、表格、列表都
 删了 `.cargo-ok` / `.cargo_vcs_info.json` / `Cargo.toml.orig` / `benches/` / `tests/`，并把清单里
 对应的 `[[test]]` / `[[bench]]` 条目一并去掉，否则 `cargo` 会去找不存在的文件。
 
-**当前有两处改动**（`grep -rn "claudesktop patch" vendor/gpui-base/` 核对）：
+**当前有三处改动**（`grep -rn "claudesktop patch" vendor/gpui-base/` 核对）：
+
+- **Dock 跨窗原语**（`src/dock/dock_area.rs`）：给 `crate::dock` 补三样宿主需要、上游没给的东西，
+  撑起「拖出成独立窗 / 再吸回原处」：`DockArea::detach_panel`（活着剥离，返回值就是面板句柄，
+  **不触发** `Panel::on_removed`，虚拟滚动和 PTY 都活着）、`DockArea::add_panel_view_at`
+  （按 `InsertTarget` 精确插回某个 Tab 组 / Split 边，而不是塞进区域里第一个组）、
+  `DockEvent::DragOutside { panel, position }` 配 `DockArea::begin_panel_drag`（skin 在 Tab 的
+  `on_drag` 里报一声，拖拽在区域外松手时由宿主接管）。注意 `detach_panel` 必须在 `commit` 之前
+  从 `panels` 表里删掉该 `PanelId`，否则 `reconcile` 会把它当成本轮离开的面板去调 `on_removed`。
+  另：本 crate 的测试目标对着 vendor 里的 gpui-pre 编译不过（`simulate_next_frame` /
+  `HitboxId::placeholder` 之类 API 不一致，约 1600 条既有错误），所以 `cargo test -p gpui-base`
+  跑不起来，`dock` 的新用例只是随源码放着，验证靠桌面端那边。
 
 - **光标滑行**（`src/input/base/smooth_caret.rs`，新文件；接线在 `src/input/base/element.rs` 的 `paint`
   与 `src/input/base/state.rs` 的 `smooth_caret_frame`）：光标换位置时用 100ms 从旧位置滑过去，

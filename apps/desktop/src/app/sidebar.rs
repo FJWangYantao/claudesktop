@@ -18,7 +18,7 @@
 //! 里面嵌套的缓存 view 也不复用），而是行里只留个占位、记下位置，由叠在上面的小 view
 //! [`SidebarSpinners`] 画。它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
-use super::chrome::{CHROME_H, drag_area, traffic_light_gap};
+use super::chrome::{CHROME_H, drag_area};
 use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
@@ -712,14 +712,13 @@ impl ChatApp {
             .border_color(rgb(LINE))
             .overflow_hidden()
             .child(
-                // 头部：侧栏开关 + 品牌，其余是拖拽区（与会话区顶栏同高）
+                // 头部：侧栏开关 + 品牌，其余是拖拽区（顶栏在它上面一格，窗口按钮不在这里）
                 div()
                     .h_flex()
                     .h(CHROME_H.to_pixels(window.rem_size()))
                     .flex_shrink_0()
                     .items_center()
                     .pl_2()
-                    .children(traffic_light_gap())
                     .child(self.sidebar_toggle("sidebar-toggle", cx))
                     .child(drag_area().h_flex().items_center().child(brand)),
             )
