@@ -30,6 +30,7 @@ pub(super) const SHORTCUTS: &[(&str, &[Row])] = &[
             ("逐文件改动", &[CHANGES_KEY]),
             ("侧问（不写入主线）", &[SIDE_CHAT_KEY]),
             ("终端", &[TERMINAL_KEY]),
+            ("浏览器", &[BROWSER_KEY]),
             ("下一个会话", &[NEXT_SESSION_KEY]),
             ("上一个会话", &[PREV_SESSION_KEY]),
         ],

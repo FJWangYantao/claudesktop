@@ -308,10 +308,19 @@ impl ChatApp {
             PaneKind::SideChat,
             PaneKind::Plan,
             PaneKind::Subagent,
+            PaneKind::Terminal,
+            PaneKind::Browser,
         ] {
             let weak = cx.entity().downgrade();
-            gpui_base::dock::register_panel(cx, kind.panel_name(), move |_ctx, window, cx| {
-                ChatApp::build_pane(kind, weak.clone(), window, cx)
+            gpui_base::dock::register_panel(cx, kind.panel_name(), move |build, window, cx| {
+                // 存下来的载荷：浏览器记地址，其余暂时不用
+                let url = match build.info() {
+                    gpui_base::dock::PanelInfo::Panel(value) => {
+                        value.get("url").and_then(|url| url.as_str()).map(str::to_string)
+                    }
+                    _ => None,
+                };
+                ChatApp::build_pane(kind, weak.clone(), url, window, cx)
             });
         }
 
@@ -404,6 +413,7 @@ impl ChatApp {
     fn build_pane(
         kind: PaneKind,
         app: WeakEntity<ChatApp>,
+        url: Option<String>,
         window: &mut Window,
         cx: &mut App,
     ) -> Arc<dyn PanelView> {
@@ -435,6 +445,10 @@ impl ChatApp {
             PaneKind::Terminal => Arc::new(PaneHandle::new(
                 cx.new(|cx| super::terminal_pane::TerminalPane::new(app, cx)),
             )),
+            // 浏览器：恢复上次的地址（子窗口在第一次 prepaint 量到尺寸后才建）
+            PaneKind::Browser => Arc::new(PaneHandle::new(
+                cx.new(|cx| super::browser_pane::BrowserPane::new(app, url, window, cx)),
+            )),
             // 侧问不落盘，恢复时给一块**空的新侧问**（影子会话是新建的），
             // 而不是像以前那样兜底成一块莫名其妙的文件面板
             PaneKind::SideChat => {
@@ -451,8 +465,6 @@ impl ChatApp {
                 });
                 Arc::new(PaneHandle::new(pane))
             }
-            // 其余 Pane 在后续阶段接上；先按文件面板兜底，别让旧布局整份作废
-            _ => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
         }
     }
 

@@ -7,8 +7,8 @@
 
 use super::ChatApp;
 use super::keys::{
-    CHANGES_KEY, FILES_KEY, NEW_SESSION_KEY, SHORTCUTS_KEY, SIDE_CHAT_KEY, TERMINAL_KEY,
-    TOGGLE_SIDEBAR_KEY,
+    BROWSER_KEY, CHANGES_KEY, FILES_KEY, NEW_SESSION_KEY, SHORTCUTS_KEY, SIDE_CHAT_KEY,
+    TERMINAL_KEY, TOGGLE_SIDEBAR_KEY,
 };
 use super::project_label;
 use super::right_panel::RightTab;
@@ -56,6 +56,8 @@ enum PaletteCmd {
     SideChat,
     /// 终端（ConPTY）
     Terminal,
+    /// 浏览器（WebView2 原生子窗口）
+    Browser,
     /// 工作区布局回到默认（对话居中，文件 / 改动在右侧）
     ResetLayout,
     /// 用量页
@@ -223,6 +225,9 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         Entry::new(IconAll::MessageSquare, "侧问主会话", PaletteCmd::SideChat)
             .key(SIDE_CHAT_KEY)
             .desc("不写入主线，关闭即清除"),
+        Entry::new(IconAll::Globe, "打开浏览器", PaletteCmd::Browser)
+            .key(BROWSER_KEY)
+            .desc("WebView2 内嵌在面板里"),
         Entry::new(IconAll::Terminal, "打开终端", PaletteCmd::Terminal)
             .key(TERMINAL_KEY)
             .desc("落在当前会话的目录里"),
@@ -484,6 +489,7 @@ impl ChatApp {
             }
             PaletteCmd::SideChat => self.open_side_chat(window, cx),
             PaletteCmd::Terminal => self.open_terminal(window, cx),
+            PaletteCmd::Browser => self.open_browser(window, cx),
             PaletteCmd::ResetLayout => self.reset_workspace_layout(window, cx),
             PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),
