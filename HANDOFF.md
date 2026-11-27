@@ -956,11 +956,19 @@
   （它的语义就是「当前有 deferred popover 持有 token」）。少这一条，菜单会被子窗口盖住。
 - **焦点进网页后快捷键全失效**：子窗口自己收按键，GPUI 一条也收不到。建好 WebView2 后挂
   `ICoreWebView2Controller::add_AcceleratorKeyPressed`，把带 Ctrl / Alt 的组合键翻成 `Keystroke`
-  交给 `Window::dispatch_keystroke`，**只有 GPUI 真消费了才 `Handled(true)`**，否则网页连
-  `Ctrl+C` 都用不了。回调里没有 `&mut App`：要用 `AsyncApp::update_window`（`try_borrow_mut`，
-  忙就返回 Err 放弃转发），别用会直接 `borrow_mut` 的 `AsyncApp::update`。
-  另：`webview2-com 0.39` 的 `Handled` 收 `*mut BOOL`（不是 `&BOOL`），`controller()` 要
+  交给 `Window::dispatch_keystroke`。两个必须一起做的配套：
+  - **分发前先 `focus_handle.focus()` 把 GPUI 焦点交给这个 Pane**：点进网页时鼠标被 WebView2
+    子窗口截走，GPUI 的焦点还停在主输入框，直接分发会让网页里的 `Ctrl+V` / `Ctrl+Z` 改到聊天草稿；
+  - **GPUI 收下后要把系统焦点还回主窗口**（`SetFocus(Some(主窗 HWND))`，HWND 从
+    `raw_window_handle::HasWindowHandle::window_handle(window)` 取），否则用户接着打字会打进网页。
+  只有 GPUI 真消费了才 `SetHandled(true)`，否则网页连 `Ctrl+C` 都用不了。
+  **坑**：`args.Handled(&mut b)` 是 propget（把 WebView2 里的值读出来），设置必须用
+  `args.SetHandled(true)`。回调里没有 `&mut App`：用 `AsyncApp::update_window`（`try_borrow_mut`，
+  忙就放弃转发），别用会直接 `borrow_mut` 的 `AsyncApp::update`。`controller()` 要
   `use wry::WebViewExtWindows`。
+- **子窗口会把地址栏的点击一块吃掉**：`on_mouse_down`（点正文 → 把焦点交给网页）只能挂在正文
+  容器上。挂在包着地址栏的外层 `div` 时，点地址栏的点击会冒泡上来立刻 `webview.focus()`，
+  光标一进去就被抢走、地址栏根本打不了字。
 
 
 

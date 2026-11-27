@@ -89,19 +89,8 @@ impl BrowserPane {
         cx: &mut Context<Self>,
     ) -> Self {
         super::follow_hub(app.clone(), cx);
-        let address = cx.new(|cx| InputState::new(window, cx).placeholder("输入网址或搜索…"));
-        // 地址栏回车 = 导航（和右侧 → 按钮等价）
-        cx.subscribe_in(&address, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
-            if matches!(event, InputEvent::PressEnter { secondary, .. } if !secondary) {
-                this.navigate(window, cx);
-            }
-        })
-        .detach();
         let url = url.unwrap_or_default();
-        if !url.is_empty() {
-            let initial = url.clone();
-            address.update(cx, |state, cx| state.set_value(initial, window, cx));
-        }
+        let address = address_input(&url, window, cx);
         Self {
             app,
             focus_handle: cx.focus_handle(),
@@ -118,6 +107,11 @@ impl BrowserPane {
     }
 
     // ---------- 起 WebView2 ----------
+
+    /// 换窗口时地址栏也要重建（`InputState` 绑着旧 `Window`）
+    fn rebuild_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.address = address_input(&self.url, window, cx);
+    }
 
     /// 排一次创建；真正的构建在前台任务里做（见文件头「创建时机」）。
     fn start_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -147,6 +141,12 @@ impl BrowserPane {
         let urlish = if self.url.is_empty() { START_URL.to_string() } else { self.url.clone() };
         let (x, y, w, h) = self.body.unwrap_or((0, 0, 1, 1));
         let seen = self.seen.clone();
+        // 页内跳转也要唤醒界面（地址栏 / Tab 标题才跟得上）。回调在 WebView2 的消息里跑，
+        // 只能 try_borrow 拿 App：建窗口那一下 App 正被借走，这时宁可不唤醒也不能 panic。
+        let pane = cx.entity().downgrade();
+        // 导航回调是 `Fn`（会反复调用），`AsyncApp::update_window` 要 `&mut`，用 RefCell 兜一层
+        let notify_app = std::cell::RefCell::new(cx.to_async());
+        let notify_window = window.window_handle();
         let mut context = WebContext::new(Some(dir));
         let built = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(urlish)
@@ -156,15 +156,20 @@ impl BrowserPane {
             })
             .with_background_color((0, 0, 0, 0))
             .with_navigation_handler(move |url| {
-                // 页内跳转：记下来，下一帧把地址栏跟上
                 *seen.borrow_mut() = Some(url);
+                let _ = notify_app.borrow_mut().update_window(notify_window, |_, _, cx| {
+                    if let Some(pane) = pane.upgrade() {
+                        pane.update(cx, |_, cx| cx.notify());
+                    }
+                });
                 true
             })
             .build_as_child(&*window);
         match built {
             Ok(webview) => {
                 // 焦点进网页后按键不再经过 GPUI，建好就把组合键接回来（见文件头）
-                install_accelerators(&webview, window, cx);
+                let focus = self.focus_handle.clone();
+                install_accelerators(&webview, window, &focus, cx);
                 self.webview = Some(webview);
                 self.applied = None;
                 cx.notify();
@@ -222,7 +227,7 @@ impl BrowserPane {
 
     fn nav_button(&self, id: &'static str, icon: IconAll, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .id(id)
+            .id((id, cx.entity_id()))
             .h_full()
             .flex_shrink_0()
             .px_1()
@@ -257,13 +262,15 @@ impl ClaudesktopPane for BrowserPane {
         host_of(&self.url).map_or_else(|| PaneKind::Browser.title(), |host| host.into())
     }
 
-    /// 换窗口（弹出 / 吸回）：WebView2 绑死在创建时的 HWND 上，只能丢掉等下一帧重建
+    /// 换窗口（弹出 / 吸回）：WebView2 绑死在创建时的 HWND 上，只能丢掉等下一帧重建；
+    /// 地址栏的 `InputState` 同样绑着旧 `Window`（焦点 / 测量 / IME 都在那边），一并重建。
     fn on_window_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.webview = None;
         self.applied = None;
         self.body = None;
         self.active = true;
         self.creating = false;
+        self.rebuild_address(window, cx);
         self.start_webview(window, cx);
     }
 }
@@ -357,7 +364,7 @@ impl Render for BrowserPane {
             )
             .child(
                 div()
-                    .id("browser-go")
+                    .id(("browser-go", cx.entity_id()))
                     .h_full()
                     .flex_shrink_0()
                     .px_1()
@@ -384,6 +391,18 @@ impl Render for BrowserPane {
             .min_h_0()
             .w_full()
             .bg(rgb(PAPER))
+            // 点正文区把键盘焦点交给网页。只挂在正文上：挂在包着地址栏的外层会把
+            // 「点地址栏」的点击冒泡到这里，光标一进去就被抢回 WebView2。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_handle.focus(window, cx);
+                    if let Some(webview) = &this.webview {
+                        let _ = webview.focus();
+                    }
+                    cx.notify();
+                }),
+            )
             .on_prepaint({
                 let handle = cx.entity();
                 move |bounds, window, cx| {
@@ -394,9 +413,9 @@ impl Render for BrowserPane {
                         (f32::from(bounds.size.width) * scale).round().max(1.) as u32,
                         (f32::from(bounds.size.height) * scale).round().max(1.) as u32,
                     );
-                    // 盖在子窗口上面的东西：对话框（命令面板等）+ 下拉菜单 + ChatApp 自己的浮层
-                    let dialogs = window.has_active_dialog(cx);
-                    let covered = dialogs
+                    // 盖在子窗口上面的东西：对话框（命令面板等）+ 下拉菜单 + Dock 拖拽的落点预览
+                    let covered = window.has_active_dialog(cx)
+                        || cx.has_active_drag()
                         || gpui_base::GlobalState::is_in_deferred_context(cx)
                         || app.upgrade().is_some_and(|app| {
                             let app = app.read(cx);
@@ -420,22 +439,11 @@ impl Render for BrowserPane {
             });
 
         div()
-            .id("browser-pane")
+            .id(("browser-pane", cx.entity_id()))
             .track_focus(&self.focus_handle)
             .size_full()
             .overflow_hidden()
             .v_flex()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.focus_handle.focus(window, cx);
-                    // 点正文区：键盘焦点交给网页（子窗口自己收按键）
-                    if let Some(webview) = &this.webview {
-                        let _ = webview.focus();
-                    }
-                    cx.notify();
-                }),
-            )
             .child(chrome)
             .child(body)
     }
@@ -459,19 +467,49 @@ impl ChatApp {
     }
 }
 
+/// 地址栏：建 `InputState` + 回车导航的订阅。首建和换窗口都走它，
+// 因为 `InputState` 绑着创建时的 `Window`（焦点 / 测量 / IME 都在那边）。
+fn address_input(
+    url: &str,
+    window: &mut Window,
+    cx: &mut Context<BrowserPane>,
+) -> Entity<InputState> {
+    let address = cx.new(|cx| InputState::new(window, cx).placeholder("输入网址或搜索…"));
+    // 地址栏回车 = 导航（和右侧 → 按钮等价）
+    cx.subscribe_in(
+        &address,
+        window,
+        |this: &mut BrowserPane, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { secondary, .. } if !secondary) {
+                this.navigate(window, cx);
+            }
+        },
+    )
+    .detach();
+    if !url.is_empty() {
+        address.update(cx, |state, cx| state.set_value(url.to_string(), window, cx));
+    }
+    address
+}
+
 // ---------- 快捷键透传 ----------
 
 /// 挂 `AcceleratorKeyPressed`：焦点在网页里时把工作区级组合键交回 GPUI。
 ///
 /// 只在 GPUI 真处理了才 `Handled(true)`，其余（`Ctrl+C`、页面自己的快捷键）原样留给网页。
 #[cfg(target_os = "windows")]
-fn install_accelerators(webview: &WebView, window: &mut Window, cx: &mut Context<BrowserPane>) {
+fn install_accelerators(
+    webview: &WebView,
+    window: &mut Window,
+    focus: &FocusHandle,
+    cx: &mut Context<BrowserPane>,
+) {
     use webview2_com::AcceleratorKeyPressedEventHandler;
-    use windows::core::BOOL;
     use wry::WebViewExtWindows as _;
 
     let mut app = cx.to_async();
     let handle = window.window_handle();
+    let focus = focus.clone();
     let mut token = 0i64;
     // SAFETY: controller() 来自建好的 WebView2；回调只在这一条 webview 的键事件里跑，
     // 且 App 是 try_borrow（忙则放弃转发），不会与绘制栈抢借用。
@@ -483,11 +521,24 @@ fn install_accelerators(webview: &WebView, window: &mut Window, cx: &mut Context
                     return Ok(());
                 };
                 let consumed = app
-                    .update_window(handle, |_, window, cx| window.dispatch_keystroke(keystroke, cx))
+                    .update_window(handle, |_, window, cx| {
+                        // 先让 GPUI 的焦点落到 Pane 自己身上：点进网页时鼠标被 WebView2
+                        // 的子窗口截走，GPUI 的焦点还停在主输入框上，直接分发会让
+                        // Ctrl+V / Ctrl+Z 改到聊天草稿；Pane 不是输入框，它只会把键往
+                        // 上冒到 ChatApp 键上下文。
+                        focus.focus(window, cx);
+                        let consumed = window.dispatch_keystroke(keystroke, cx);
+                        if consumed {
+                            // GPUI 收下了这条键，系统键盘焦点还在子窗口上：
+                            // 交还主窗口，否则用户接着打字会打进网页
+                            return_gui_focus(window);
+                        }
+                        consumed
+                    })
                     .unwrap_or(false);
                 if consumed {
-                    let mut handled = BOOL::from(true);
-                    let _ = args.Handled(&mut handled);
+                    // `Handled` 是 propget（读回 WebView2 的当前值），设置要用 SetHandled
+                    let _ = args.SetHandled(true);
                 }
                 Ok(())
             })),
@@ -497,7 +548,33 @@ fn install_accelerators(webview: &WebView, window: &mut Window, cx: &mut Context
 }
 
 #[cfg(not(target_os = "windows"))]
-fn install_accelerators(_: &WebView, _: &mut Window, _: &mut Context<BrowserPane>) {}
+fn install_accelerators(
+    _: &WebView,
+    _: &mut Window,
+    _: &FocusHandle,
+    _: &mut Context<BrowserPane>,
+) {
+}
+
+/// 把系统键盘焦点从 WebView2 子窗口交还主窗口的客户区
+#[cfg(target_os = "windows")]
+fn return_gui_focus(window: &Window) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    if let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() {
+        // SAFETY: hwnd 是 GPUI 自己的窗口（同线程），SetFocus 对它安全
+        unsafe {
+            let _ = SetFocus(Some(HWND(win32.hwnd.get() as *mut _)));
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn return_gui_focus(_: &Window) {}
 
 /// 这一条按键要不要交给 GPUI：只接「按住 Ctrl 或 Alt」的组合键，纯打字留给网页。
 #[cfg(target_os = "windows")]
@@ -564,18 +641,32 @@ fn data_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// 地址栏输入 → 真正的 URL：带 scheme 的原样用，像域名的补 https，其余当搜索词
+/// 地址栏输入 → 真正的 URL：带 scheme 的原样用，本机地址补 `http://`，
+/// 像域名的补 `https://`，其余当搜索词
 fn normalize_url(typed: &str) -> String {
     if typed.contains("://") || typed.starts_with("about:") || typed.starts_with("file:") {
         return typed.to_string();
     }
-    let looks_like_host = !typed.contains(char::is_whitespace)
-        && (typed.contains('.') || typed.eq_ignore_ascii_case("localhost"));
+    let looks_like_host =
+        !typed.contains(char::is_whitespace) && (typed.contains('.') || is_local(typed));
     if looks_like_host {
-        return format!("https://{typed}");
+        // 本地 dev server 基本跑 plain http，补 https 会直接连不上
+        let scheme = if is_local(typed) { "http" } else { "https" };
+        return format!("{scheme}://{typed}");
     }
     // 搜索：不做「猜你想搜什么」的追踪，直接走关键词页
     format!("https://duckduckgo.com/?q={}", percent_encode(typed))
+}
+
+/// 本机地址：`localhost` / `localhost:3000` / `127.0.0.1:8080` / `[::1]:3000`
+fn is_local(typed: &str) -> bool {
+    let authority = typed.split('/').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        // IPv6 字面量：[::1]:3000
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 /// 查询串编码：ASCII 里除了保留字符原样，其余（中文、空格）都转义
@@ -611,11 +702,24 @@ mod tests {
     fn address_bar_input_becomes_a_url() {
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(normalize_url("https://example.com/a"), "https://example.com/a");
-        assert_eq!(normalize_url("localhost"), "https://localhost");
         // 带空格的一律当搜索词
         assert!(normalize_url("rust borrow checker").starts_with("https://duckduckgo.com/?q="));
         // 中文必须百分号编码，不能原样塞进查询串
         assert!(!normalize_url("生命周期").contains('生'));
+    }
+
+    #[core::prelude::v1::test]
+    fn local_dev_servers_get_plain_http() {
+        // 本机地址补 https 会直接连不上（dev server 基本没有证书）
+        assert_eq!(normalize_url("localhost"), "http://localhost");
+        assert_eq!(normalize_url("localhost:3000"), "http://localhost:3000");
+        assert_eq!(normalize_url("LOCALHOST:8080/app"), "http://LOCALHOST:8080/app");
+        assert_eq!(normalize_url("127.0.0.1:5173"), "http://127.0.0.1:5173");
+        assert_eq!(normalize_url("[::1]:3000"), "http://[::1]:3000");
+        // 普通站点仍是 https
+        assert_eq!(normalize_url("example.com:8443"), "https://example.com:8443");
+        // 带空格的 localhost 不是地址，是搜索词
+        assert!(normalize_url("localhost 端口").starts_with("https://duckduckgo.com/?q="));
     }
 
     #[core::prelude::v1::test]
