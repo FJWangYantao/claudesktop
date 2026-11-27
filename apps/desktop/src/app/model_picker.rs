@@ -1,8 +1,7 @@
 //! 输入框工具栏的模型选择器：品牌图标 + 模型名 + 思考档位的 trigger，
-//! 面板里是模型列表（图标 / 上下文 / 价格档位）、悬停说明卡和 Effort 分段器。
+//! 面板里是搜索框、模型列表（图标 / 上下文 / 价格档位）、悬停说明卡和 Effort 分段器。
 //!
-//! 和设置页的默认模型下拉（`settings_view/model.rs`）互不影响：那边仍是中文的
-//! `MenuChip`，这里专给输入框用，文案是英文。
+//! 设置页的默认模型下拉（`settings_view/model.rs`）使用独立的搜索框和列表。
 //!
 //! 面板内容是独立 entity（`ModelPickerContent`）：悬停换说明卡时只重绘这一块，
 //! 不连带会话内容区一起重画——`Popover::content` 每次父视图渲染都会重跑，
@@ -20,8 +19,11 @@ use crate::theme::*;
 use claudesktop_builtin::ThinkingLevel;
 use claudesktop_core::ConfigChoiceView;
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::base::actions::Confirm;
 use gpui_kit::base::{PopoverState, Selectable, StyledExt as _};
+use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -74,6 +76,11 @@ fn group_header(name: SharedString) -> Div {
 
 fn hint_line(text: SharedString) -> Div {
     div().px_2p5().py_2().text_size(TEXT_SMALL).text_color(rgb(INK_SOFT)).child(text)
+}
+
+fn model_name_tooltip(name: &SharedString, window: &mut Window, cx: &mut App) -> AnyView {
+    let name = name.clone();
+    Tooltip::element(move |_, _| div().max_w(rems(28.)).child(name.clone())).build(window, cx)
 }
 
 /// 说明卡的整体定高（两行文案 + 胶囊 + 内边距）：每行卡片一样高，面板不会跟着伸缩。
@@ -184,6 +191,7 @@ impl Selectable for ModelPickerChip {
 
 impl RenderOnce for ModelPickerChip {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let name = self.model.clone();
         let mut chip = div()
             .id(ElementId::Name(format!("composer-model-chip-{}", self.model).into()))
             .role(Role::Button)
@@ -196,6 +204,9 @@ impl RenderOnce for ModelPickerChip {
             .py_1()
             .px_2()
             .rounded_md()
+            .when(!self.open, |d| {
+                d.tooltip(move |window, cx| model_name_tooltip(&name, window, cx))
+            })
             // 一行排不下时先缩它：图标 / 档位 / 箭头固定，只有模型名让宽度
             .flex_shrink_1()
             .min_w(rems(5.5));
@@ -229,6 +240,8 @@ impl RenderOnce for ModelPickerChip {
 pub(super) struct ModelPickerContent {
     app: Entity<ChatApp>,
     popover: Entity<PopoverState>,
+    search: Entity<InputState>,
+    scroll: ScrollHandle,
     hovered: Option<PreviewTarget>,
     /// 第一次打开时把当前模型滚进可视区，之后不再打扰用户的手动滚动
     scrolled_to_current: bool,
@@ -236,16 +249,32 @@ pub(super) struct ModelPickerContent {
     scroll_attempts: u8,
     _app_observed: Subscription,
     _popover_observed: Subscription,
+    _search_changed: Subscription,
 }
 
 impl ModelPickerContent {
-    fn new(app: Entity<ChatApp>, popover: Entity<PopoverState>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        app: Entity<ChatApp>,
+        popover: Entity<PopoverState>,
+        search: Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let _app_observed = cx.observe(&app, |_, _, cx| cx.notify());
+        let _search_changed = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.scroll = ScrollHandle::new();
+                this.scrolled_to_current = false;
+                this.scroll_attempts = 0;
+                this.hovered = None;
+                cx.notify();
+            }
+        });
         // 收起时清掉残留的悬停预览，下次打开从当前模型开始
         let _popover_observed = cx.observe(&popover, |this, _, cx| {
             if !this.popover.read(cx).is_open() {
                 this.scrolled_to_current = false;
                 this.scroll_attempts = 0;
+                this.scroll = ScrollHandle::new();
                 if this.hovered.take().is_some() {
                     cx.notify();
                 }
@@ -254,11 +283,14 @@ impl ModelPickerContent {
         Self {
             app,
             popover,
+            search,
+            scroll: ScrollHandle::new(),
             hovered: None,
             scrolled_to_current: false,
             scroll_attempts: 0,
             _app_observed,
             _popover_observed,
+            _search_changed,
         }
     }
 
@@ -273,8 +305,12 @@ impl ModelPickerContent {
     }
 }
 
+fn matches_model_query(name: &str, query: &str) -> bool {
+    query.is_empty() || name.to_lowercase().contains(query)
+}
+
 /// 自研内核：所有来源里进菜单的模型平铺成行（设置里勾掉的除外）。
-fn builtin_rows(app: &ChatApp) -> (Vec<RowEntry>, Option<String>) {
+fn builtin_rows(app: &ChatApp, query: &str) -> (Vec<RowEntry>, Option<String>) {
     let session = app.session();
     let current = session.model_label.clone();
     let is_chat = session.is_chat();
@@ -289,11 +325,15 @@ fn builtin_rows(app: &ChatApp) -> (Vec<RowEntry>, Option<String>) {
             continue;
         }
         any = true;
-        if multi {
-            rows.push(RowEntry::Header(profile.display_name().into()));
-        }
+        let mut header = multi.then(|| profile.display_name());
         let protocol = serde_json::to_string(&profile.protocol).unwrap_or_default();
         for (i, model) in models.iter().enumerate() {
+            if !matches_model_query(model, query) {
+                continue;
+            }
+            if let Some(name) = header.take() {
+                rows.push(RowEntry::Header(name.into()));
+            }
             let banned =
                 app.settings.no_vision_models.iter().any(|m| m.eq_ignore_ascii_case(model));
             rows.push(RowEntry::Row(RowData {
@@ -327,7 +367,7 @@ fn builtin_rows(app: &ChatApp) -> (Vec<RowEntry>, Option<String>) {
 }
 
 /// 外部 ACP agent：列出它上报的 model 配置项。
-fn agent_rows(app: &ChatApp) -> (Vec<RowEntry>, Option<String>) {
+fn agent_rows(app: &ChatApp, query: &str) -> (Vec<RowEntry>, Option<String>) {
     let session = app.session();
     let Some(config) = session
         .config_options
@@ -340,13 +380,18 @@ fn agent_rows(app: &ChatApp) -> (Vec<RowEntry>, Option<String>) {
         );
     };
     let mut rows = Vec::new();
-    let mut group: Option<String> = None;
+    let mut group = None;
+    let mut header = None;
     for (i, choice) in config.options.iter().enumerate() {
-        if choice.group != group {
-            group = choice.group.clone();
-            if let Some(name) = &group {
-                rows.push(RowEntry::Header(name.clone().into()));
-            }
+        if choice.group.as_deref() != group {
+            group = choice.group.as_deref();
+            header = group;
+        }
+        if !matches_model_query(&choice.name, query) && !matches_model_query(&choice.id, query) {
+            continue;
+        }
+        if let Some(name) = header.take() {
+            rows.push(RowEntry::Header(name.into()));
         }
         rows.push(RowEntry::Row(RowData {
             key: format!("agent-{i}"),
@@ -374,14 +419,21 @@ fn agent_rows(app: &ChatApp) -> (Vec<RowEntry>, Option<String>) {
 impl Render for ModelPickerContent {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 先把数据读成自有值，后面的 `cx.listener` 要可变借用 cx
+        let query = self.search.read(cx).value().trim().to_lowercase();
         let (rows, hint, effort, default_key, builtin) = {
             let app = self.app.read(cx);
             let builtin = app.session().kernel == KernelChoice::Builtin;
-            let (rows, hint) = if builtin { builtin_rows(app) } else { agent_rows(app) };
-            let default_key = rows.iter().find_map(|entry| match entry {
-                RowEntry::Row(row) if row.active => Some(row.key.clone()),
-                _ => None,
+            let (rows, hint) =
+                if builtin { builtin_rows(app, &query) } else { agent_rows(app, &query) };
+            let mut models = rows.iter().filter_map(|entry| match entry {
+                RowEntry::Row(row) => Some(row),
+                RowEntry::Header(_) => None,
             });
+            let default_key = models
+                .clone()
+                .find(|row| row.active)
+                .or_else(|| if query.is_empty() { None } else { models.next() })
+                .map(|row| row.key.clone());
             let effort = if builtin {
                 // 认不出的模型也给底栏：只有「默认 / 兜底」两项，和设置页、旧输入框菜单一致
                 let spec = session_thinking_spec(app);
@@ -409,17 +461,13 @@ impl Render for ModelPickerContent {
             })
         });
 
-        let scroll = window
-            .use_keyed_state("model-menu-scroll", cx, |_, _| ScrollHandle::new())
-            .read(cx)
-            .clone();
         let mut list = div()
             .id("composer-model-list")
             .v_flex()
             .gap_0p5()
             .max_h(rems(15.))
             .overflow_y_scroll()
-            .track_scroll(&scroll);
+            .track_scroll(&self.scroll);
         let mut visible = false;
         let mut current_index = None;
         for (index, entry) in rows.into_iter().enumerate() {
@@ -437,39 +485,60 @@ impl Render for ModelPickerContent {
         // 当前模型可能在折叠区外：第一次打开时滚到它那儿。
         // 首帧还没有子元素的位置，滚动请求会被丢掉，所以头几帧重复请求直到位移生效
         // （GPUI 向下滚之后 offset.y 是负的，别拿 `> 0` 判断）。
-        if self.scrolled_to_current || scroll.offset().y != px(0.) {
-            self.scrolled_to_current = true;
-        } else if self.scroll_attempts < 3
-            && let Some(index) = current_index
-        {
-            scroll.scroll_to_item(index);
-            // 内容没脏时不会重新 prepaint，滚动位置就落不了地：补一帧
-            window.request_animation_frame();
-            self.scroll_attempts += 1;
+        if query.is_empty() {
+            if self.scrolled_to_current || self.scroll.offset().y != px(0.) {
+                self.scrolled_to_current = true;
+            } else if self.scroll_attempts < 3
+                && let Some(index) = current_index
+            {
+                self.scroll.scroll_to_item(index);
+                // 内容没脏时不会重新 prepaint，滚动位置就落不了地：补一帧
+                window.request_animation_frame();
+                self.scroll_attempts += 1;
+            }
         }
-        if !visible && let Some(hint) = hint {
+        if !visible
+            && let Some(hint) =
+                hint.or_else(|| (!query.is_empty()).then(|| "没有匹配的模型".into()))
+        {
             list = list.child(hint_line(hint.into()));
         }
 
-        let mut panel = div().v_flex().gap_0p5();
+        let mut header = div().h_flex().flex_shrink_0().gap_2().pb_1().child(
+            div().flex_1().min_w_0().child(
+                Input::new(&self.search)
+                    .small()
+                    .cleanable(true)
+                    .prefix(Icon::new(IconAll::Search).size_3p5().text_color(rgb(INK_SOFT))),
+            ),
+        );
         if builtin {
-            panel = panel.child(
-                div().h_flex().justify_end().px_1().child(
-                    ChatApp::quiet_button(
-                        "composer-model-refresh",
-                        IconAll::RefreshCw,
-                        Surface::Paper,
-                        cx,
-                    )
-                    .xsmall()
-                    .tooltip("刷新模型列表")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.app.update(cx, |app, cx| app.fetch_models(false, cx));
-                    })),
-                ),
+            header = header.child(
+                ChatApp::quiet_button(
+                    "composer-model-refresh",
+                    IconAll::RefreshCw,
+                    Surface::Paper,
+                    cx,
+                )
+                .xsmall()
+                .tooltip("刷新模型列表")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.app.update(cx, |app, cx| app.fetch_models(false, cx));
+                })),
             );
         }
-        panel = panel.child(list);
+        let mut panel = div()
+            .v_flex()
+            .gap_0p5()
+            // 打字时已经更新列表，回车留在搜索框里。
+            .on_action(|_: &Enter, _, cx| cx.stop_propagation())
+            // Popover 还会把回车解释成 Confirm，必须在关闭监听之前把它截住。
+            .on_action(|_: &Confirm, _, cx| cx.stop_propagation())
+            .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                this.popover.update(cx, |state, cx| state.dismiss(window, cx));
+            }))
+            .child(header)
+            .child(list);
         if let Some((detail, caps)) = card {
             panel = panel.child(render_card(detail, caps));
         }
@@ -484,6 +553,8 @@ impl ModelPickerContent {
     fn render_row(&self, row: RowData, cx: &mut Context<Self>) -> Stateful<Div> {
         let RowData { key, profile, value, name, brand, context, tier, active, detail: _, caps: _ } =
             row;
+        let name = SharedString::from(name);
+        let full_name = name.clone();
         let target = PreviewTarget { key: key.clone() };
         let id = ElementId::Name(format!("composer-model-{key}").into());
         let click_value = value.clone();
@@ -498,6 +569,7 @@ impl ModelPickerContent {
             .py_1p5()
             .rounded_lg()
             .cursor_pointer()
+            .tooltip(move |window, cx| model_name_tooltip(&full_name, window, cx))
             .when(active, |d| d.bg(rgb(SELECTED)).hover(|d| d.bg(rgb(SELECTED))))
             .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER))))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -689,7 +761,11 @@ fn render_card(detail: Option<SharedString>, caps: Vec<&'static str>) -> Div {
 impl ChatApp {
     /// 输入框工具栏的模型下拉：trigger 上带品牌图标、当前模型和生效的思考档位。
     /// 打开时顺手获取一次模型列表；面板宽 22.5rem。
-    pub(super) fn render_model_picker(&self, cx: &mut Context<Self>) -> Popover {
+    pub(super) fn render_model_picker(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let session = self.session();
         let builtin = session.kernel == KernelChoice::Builtin;
         // ACP 会话不借自研档案的端点认品牌，认不出就用中性图标
@@ -724,15 +800,25 @@ impl ChatApp {
         let handle = cx.entity();
         let fetch = handle.clone();
         let content_app = handle.clone();
-        menu_panel(Popover::new("model-menu"), &self.menu_focus)
+        let search = window
+            .use_keyed_state("model-menu-search", cx, |window, cx| {
+                cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型"))
+            })
+            .read(cx)
+            .clone();
+        let focus = search.read(cx).focus_handle(cx);
+        let content_search = search.clone();
+        menu_panel(Popover::new("model-menu"), &focus)
             .anchor(Anchor::BottomRight)
             .w(rems(22.5))
             .p_2()
             .trigger_style(StyleRefinement::default().flex_shrink_1().min_w(rems(5.5)))
             .trigger(chip)
-            .on_open_change(move |open, _, cx| {
+            .on_open_change(move |open, window, cx| {
                 if *open {
                     fetch.update(cx, |app, cx| app.fetch_models_for_menu(cx));
+                } else {
+                    search.update(cx, |state, cx| state.set_value("", window, cx));
                 }
             })
             .default_open(
@@ -743,7 +829,14 @@ impl ChatApp {
                 let popover = cx.entity();
                 // 面板内容只建一次：悬停换说明卡时由它自己 notify，不惊动会话区
                 let content = window.use_keyed_state("model-menu-content", cx, |_, cx| {
-                    cx.new(|cx| ModelPickerContent::new(content_app.clone(), popover, cx))
+                    cx.new(|cx| {
+                        ModelPickerContent::new(
+                            content_app.clone(),
+                            popover,
+                            content_search.clone(),
+                            cx,
+                        )
+                    })
                 });
                 content.read(cx).clone()
             })

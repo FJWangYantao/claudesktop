@@ -695,6 +695,9 @@
   （`ModelPickerContent`），让它观察 `ChatApp` 并在自己的 `Render` 里读状态；否则只能通知整个
   `ChatApp`，会话区跟着重画。注意 `use_keyed_state` 返回的是 `Entity<Entity<T>>`（init 的返回值外面
   再包一层），要 `.read(cx).clone()` 取里面的 entity。
+- **弹层内的单行搜索框要同时消费 `Enter` 和 `Confirm`**（2026-11-27）。输入组件会让 `Enter`
+  继续冒泡，而 `Popover` 又把回车绑成 `Confirm`；只在输入框上拦 `Enter` 仍会偶发收起菜单。
+  即时筛选面板要在 `Popover` 内容节点上把两者都截住。
 - **`ScrollHandle::scroll_to_item` 在首帧会被丢掉**：新弹层第一次渲染时还没有子元素的 bounds，
   active_item 被消费掉但滚不动。要连着请求几帧（`scroll_attempts`）直到 `offset().y != 0`
   （GPUI 向下滚是**负**的，别写 `> 0`），并补 `window.request_animation_frame()` 让 prepaint

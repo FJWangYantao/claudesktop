@@ -717,7 +717,7 @@ impl ChatApp {
             ))
             .children(self.render_context_gauge())
             // 模型名（尤其带端点标签的）比别的 chip 长得多：允许压窄、末尾打省略号
-            .child(self.render_model_picker(cx))
+            .child(self.render_model_picker(window, cx))
             // 发送键不参与收缩：一行排不下时先让 chip 让路，它永远在最右边
             .child(div().pl_1().flex_shrink_0().child(send));
 
