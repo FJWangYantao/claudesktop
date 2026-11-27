@@ -29,6 +29,268 @@ fn right_dock_w(window: &Window) -> Pixels {
     crate::theme::PANEL_DEFAULT_W.to_pixels(window.rem_size())
 }
 
+/// 一块对话 Pane 不聚焦时的输入草稿：文本 + 待发附件。
+///
+/// 同一时刻只有一块挂真输入框（`ChatApp::input`），其余存这里。用户切过来时热换进去，
+/// 这样两个并排的 Pane 不会在同一帧里各自挂一份 `TextareaState`（光标 / 选区 / IME 会打架）。
+pub(crate) struct ChatDraft {
+    text: String,
+    pending: Vec<crate::model::PendingImage>,
+    pending_files: Vec<claudesktop_core::attach::TextAttachment>,
+}
+
+impl ChatApp {
+    /// 记下这块 Pane（同一会话最多一块：`Session::list` 只有一份）。
+    pub(crate) fn register_chat_pane(&mut self, pane: WeakEntity<super::chat_pane::ChatPane>) {
+        self.chat_panes.push(pane);
+    }
+
+    /// 某个会话现在有没有开着的对话 Pane
+    pub(crate) fn chat_pane_of_token(
+        &self,
+        token: u64,
+        cx: &App,
+    ) -> Option<Entity<super::chat_pane::ChatPane>> {
+        self.chat_panes
+            .iter()
+            .filter_map(|pane| pane.upgrade())
+            .find(|pane| pane.read(cx).token() == token)
+    }
+
+    /// 把真输入框里的东西存回它所属的会话。
+    fn stash_composer(&mut self, token: u64, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).value().to_string();
+        let pending = std::mem::take(&mut self.pending);
+        let pending_files = std::mem::take(&mut self.pending_files);
+        self.chat_drafts.insert(token, ChatDraft { text, pending, pending_files });
+    }
+
+    /// 把某个会话的草稿装进真输入框。
+    fn restore_composer(&mut self, token: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.chat_drafts.remove(&token).unwrap_or(ChatDraft {
+            text: String::new(),
+            pending: Vec::new(),
+            pending_files: Vec::new(),
+        });
+        self.input.update(cx, |state, cx| state.set_value(draft.text, window, cx));
+        self.pending = draft.pending;
+        self.pending_files = draft.pending_files;
+    }
+
+    /// 把焦点交给某一块对话 Pane：草稿热切换（旧的那块存回去，这块的装进来）。
+    pub(crate) fn focus_chat(&mut self, token: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focused_chat == Some(token) {
+            return;
+        }
+        let previous = self.focused_chat.unwrap_or_else(|| self.session().token);
+        self.stash_composer(previous, cx);
+        self.focused_chat = Some(token);
+        if let Some(idx) = self.index_of_token(token) {
+            self.active = idx;
+        }
+        self.restore_composer(token, window, cx);
+        cx.notify();
+    }
+
+    /// 主窗切了活跃会话（侧栏点击 / 命令面板 / 切空间）：让聚焦的那块 Pane 跟上。
+    ///
+    /// 目标会话已经在别的 Pane 里开着 → 聚焦那一块（**不能**让两块 Pane 画同一个
+    /// `Session::list`）；否则把聚焦的那块换绑到新会话。
+    pub(crate) fn sync_focus_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_panes.is_empty() {
+            return;
+        }
+        let active = self.session().token;
+        if self.focused_chat == Some(active) {
+            return;
+        }
+        // 没聚焦过（启动时）：直接认活跃会话
+        if self.focused_chat.is_none() {
+            self.focused_chat = Some(active);
+            self.content_view.update(cx, |view, cx| view.set_token(active, cx));
+            return;
+        }
+        if self.chat_pane_of_token(active, cx).is_some() {
+            // 那个会话已经在另一块 Pane 里开着：聚焦它（草稿也要热换进去）
+            self.focus_chat(active, window, cx);
+            return;
+        }
+        // 换绑聚焦的那块：`set_token` 会把它**自己的**内容区跟着换，
+        // 这里不要再动 `self.content_view`（那是第一块 Pane 的，焦点在第二块时会误改它）
+        if let Some(pane) = self.focused_chat.and_then(|token| self.chat_pane_of_token(token, cx)) {
+            pane.update(cx, |pane, cx| pane.set_token(active, cx));
+        }
+        self.focused_chat = Some(active);
+        if let Some(idx) = self.index_of_token(active) {
+            self.active = idx;
+        }
+    }
+
+    /// 侧栏 `Ctrl+点击`：在右边新开一块对话 Pane（这个会话已经开着就直接聚焦它）。
+    pub(crate) fn open_chat_in_pane(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(token) = self.sessions.get(idx).map(|session| session.token) else { return };
+        if self.chat_pane_of_token(token, cx).is_some() {
+            self.focus_chat(token, window, cx);
+            return;
+        }
+        // 每一块都要自己的位置池 / 内容区 / 覆盖层：共用会互相清空转圈、也会抢滚动状态
+        let spots = crate::app::motion::LoopSpots::new();
+        let app = cx.entity().downgrade();
+        let content = cx.new(|_| ContentView::new(app.clone(), token, spots.clone()));
+        let overlay = cx.new(|_| LoopOverlay::new(spots));
+        let pane = cx.new(|cx| super::chat_pane::ChatPane::new(app, token, content, overlay, cx));
+        self.register_chat_pane(pane.downgrade());
+        // 直接和中间那块并排 Split：不受右侧文件 / 改动栏开合的影响
+        // （塞进 Right 区域的话，右栏收着时新开的对话会藏在折叠栏里）
+        let dock = self.dock.clone();
+        let root = dock.read(cx).layout(DockPlacement::Center).map(|tree| tree.root().id());
+        dock.update(cx, |dock, cx| match root {
+            Some(node) => {
+                dock.add_panel_view_at(
+                    Arc::new(PaneHandle::new(pane)) as Arc<dyn PanelView>,
+                    gpui_base::dock::InsertTarget::Split {
+                        node,
+                        placement: gpui_base::Placement::Right,
+                        size: None,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            None => {
+                dock.add_panel_view(
+                    Arc::new(PaneHandle::new(pane)) as Arc<dyn PanelView>,
+                    DockPlacement::Center,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+        });
+        self.focus_chat(token, window, cx);
+        cx.notify();
+    }
+
+    /// 某块对话 Pane 被关掉：丢掉它的草稿、从名册里划掉，必要时把焦点交给剩下的一块。
+    ///
+    /// 按**实体 id** 划名册：重排布局时新旧两块可能绑同一个会话，
+    /// 按令牌划会把刚建好的那块一起划掉。
+    pub(crate) fn forget_chat_pane(
+        &mut self,
+        entity: EntityId,
+        token: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat_panes.retain(|pane| pane.entity_id() != entity);
+        // 删草稿前确认确实没有同会话的别的 pane 了
+        let still_open = self
+            .chat_panes
+            .iter()
+            .filter_map(|pane| pane.upgrade())
+            .any(|pane| pane.read(cx).token() == token);
+        if !still_open {
+            self.chat_drafts.remove(&token);
+        }
+        if self.focused_chat != Some(token) {
+            cx.notify();
+            return;
+        }
+        // 关掉的正好是挂着输入框的那块：把焦点交给剩下的任意一块
+        self.focused_chat = None;
+        let next = self.chat_panes.iter().filter_map(|pane| pane.upgrade()).next();
+        if let Some(next) = next {
+            let next_token = next.read(cx).token();
+            self.focused_chat = Some(next_token);
+            if let Some(idx) = self.index_of_token(next_token) {
+                self.active = idx;
+            }
+            self.restore_composer(next_token, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 一块对话 Pane 的正文：聚焦的那块挂真输入框，其余画同款占位卡（点它切过来）。
+    pub(crate) fn render_chat_pane_view(
+        &mut self,
+        token: u64,
+        focused: bool,
+        content: Entity<ContentView>,
+        overlay: Entity<LoopOverlay>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // 设置页也是一块内容区，两块 Pane 各画一份会共用 settings_scroll：只让聚焦的这块画
+        if self.settings_open && !focused {
+            return div().size_full().into_any_element();
+        }
+        let body = self.render_chat_body_with(token, focused, content, overlay, window, cx);
+        div()
+            .relative()
+            .size_full()
+            .min_h_0()
+            .when(!focused, |d| {
+                // 点进这块就切焦点。用**捕获阶段**：对话里的按钮（复制 / 点 Diff / 权限）
+                // 很多会 `stop_propagation`，冒泡阶段的监听器永远不会先跑
+                d.capture_any_mouse_down(
+                    cx.listener(move |this, _, window, cx| this.focus_chat(token, window, cx)),
+                )
+            })
+            .child(body)
+            .into_any_element()
+    }
+
+    /// 非聚焦 Pane 的输入占位卡：显示它的草稿，点一下切过去。
+    fn render_inactive_composer(&mut self, token: u64, cx: &mut Context<Self>) -> AnyElement {
+        let draft = self
+            .chat_drafts
+            .get(&token)
+            .map(|draft| (draft.text.clone(), draft.pending.len(), draft.pending_files.len()))
+            .unwrap_or_default();
+        let (text, images, files) = draft;
+        let placeholder = text.trim().is_empty();
+        div()
+            .w_full()
+            .max_w(crate::theme::READING_W)
+            .px_3()
+            .py_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(crate::theme::rgb(crate::theme::LINE))
+            .bg(crate::theme::rgb(crate::theme::PAPER))
+            .text_size(crate::theme::TEXT_BODY)
+            .text_color(crate::theme::rgb(if placeholder {
+                crate::theme::INK_FAINT
+            } else {
+                crate::theme::INK
+            }))
+            .cursor_text()
+            .child(if placeholder {
+                SharedString::from("点这里在这块对话里输入…")
+            } else {
+                SharedString::from(text)
+            })
+            .when(images + files > 0, |d| {
+                d.child(
+                    div()
+                        .pt_1()
+                        .text_size(crate::theme::TEXT_META)
+                        .text_color(crate::theme::rgb(crate::theme::INK_SOFT))
+                        .child(format!("附 {images} 张图 / {files} 个文件")),
+                )
+            })
+            .capture_any_mouse_down(
+                cx.listener(move |this, _, window, cx| this.focus_chat(token, window, cx)),
+            )
+            .into_any_element()
+    }
+}
+
 impl ChatApp {
     /// 建 dock 的皮肤与面板注册、恢复上次布局、挂写盘订阅。
     /// 由 [`ChatApp::new`] 在会话恢复之后调一次。
@@ -84,6 +346,10 @@ impl ChatApp {
             });
         })
         .detach();
+
+        // 内容区绑到当前活跃会话（多 ChatPane 之后每块各带自己的那份，见 content.rs）
+        let token = self.session().token;
+        self.content_view.update(cx, |view, cx| view.set_token(token, cx));
 
         // 上次的布局优先；读不懂 / 没存过 / 恢复出来一个没有对话 Pane 的布局，都用默认布局。
         // （没有对话 Pane 的窗口等于空壳，宁可丢一次布局）
@@ -149,12 +415,13 @@ impl ChatApp {
                 let Some(upgraded) = app.upgrade() else {
                     return Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx))));
                 };
-                let (content, overlay) = {
+                let (content, overlay, token) = {
                     let app = upgraded.read(cx);
-                    (app.content_view.clone(), app.loop_overlay.clone())
+                    (app.content_view.clone(), app.loop_overlay.clone(), app.session().token)
                 };
+                content.update(cx, |view, cx| view.set_token(token, cx));
                 Arc::new(PaneHandle::new(
-                    cx.new(|cx| ChatPane::new(app.clone(), content, overlay, cx)),
+                    cx.new(|cx| ChatPane::new(app.clone(), token, content, overlay, cx)),
                 ))
             }
             PaneKind::Files => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
@@ -170,9 +437,17 @@ impl ChatApp {
 
     pub(crate) fn new_chat_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
         let app = cx.entity().downgrade();
+        let token = self.session().token;
         let content = self.content_view.clone();
+        content.update(cx, |view, cx| view.set_token(token, cx));
         let overlay = self.loop_overlay.clone();
-        PaneHandle::new(cx.new(|cx| ChatPane::new(app, content, overlay, cx)))
+        let pane = cx.new(|cx| ChatPane::new(app, token, content, overlay, cx));
+        self.register_chat_pane(pane.downgrade());
+        // 第一块对话 Pane 默认就是焦距
+        if self.focused_chat.is_none() {
+            self.focused_chat = Some(token);
+        }
+        PaneHandle::new(pane)
     }
 
     pub(crate) fn new_files_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
@@ -384,26 +659,32 @@ impl ChatApp {
     }
 
     /// 对话 Pane 的正文：首页背景 + 内容区 + 输入框（顶栏在外面，见 chrome.rs）。
-    pub(crate) fn render_chat_body(
+    pub(crate) fn render_chat_body_with(
         &mut self,
+        token: u64,
+        focused: bool,
         content: Entity<ContentView>,
         overlay: Entity<LoopOverlay>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let body = v_flex()
-            .relative()
-            .size_full()
-            .min_h_0()
-            .w_full()
-            .when(self.home_backdrop_active(), |d| d.child(self.home_backdrop_view.clone()))
-            .child(self.content_slot_with(content, overlay))
-            .when(!self.settings_open, |d| {
-                d.child(
-                    self.reading_column(div().pb_4().pt_2())
-                        .child(self.render_composer(window, cx)),
-                )
-            });
-        body.when(!self.settings_open, |d| self.with_file_drop(d, cx)).into_any_element()
+        // 这一段里 `self.session()` 指向这块 pane 的会话（画完还原）
+        self.with_active(token, |app| {
+            let composer = if focused {
+                app.reading_column(div().pb_4().pt_2()).child(app.render_composer(window, cx))
+            } else {
+                app.reading_column(div().pb_4().pt_2())
+                    .child(app.render_inactive_composer(token, cx))
+            };
+            let body = v_flex()
+                .relative()
+                .size_full()
+                .min_h_0()
+                .w_full()
+                .when(app.home_backdrop_active(), |d| d.child(app.home_backdrop_view.clone()))
+                .child(app.content_slot_with(content, overlay))
+                .when(!app.settings_open, |d| d.child(composer));
+            body.when(!app.settings_open, |d| app.with_file_drop(d, cx)).into_any_element()
+        })
     }
 }

@@ -1162,7 +1162,8 @@ impl ChatApp {
         // 无元信息的会话（刚开、还没落盘）视为最新
         let activity = |i: usize| self.session_activity(i);
         let space = self.space().kind();
-        let listed = |i: usize| listed(i) && self.sessions[i].kind == space;
+        let listed =
+            |i: usize| listed(i) && !self.sessions[i].ephemeral && self.sessions[i].kind == space;
         if !by_project {
             let now =
                 SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
@@ -1361,8 +1362,13 @@ impl ChatApp {
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.set_sidebar_hover(token, *hovered, cx)
             }))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.activate_session(i, cx);
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // Ctrl+点击：在右边另开一块对话 Pane（同一个会话已经开着就只是聚焦它）
+                if event.modifiers().control {
+                    this.open_chat_in_pane(i, window, cx);
+                } else {
+                    this.activate_session(i, cx);
+                }
             }))
             .child(
                 div()

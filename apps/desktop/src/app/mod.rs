@@ -149,6 +149,19 @@ pub struct ChatApp {
     /// 待随下一条消息注入的批注说明（会话令牌, `<user-review>` 块）：
     /// 气泡里只显示一句摘要，说明在发送时拼进真正发出去的文本
     diff_comment_note: Option<(u64, String)>,
+    /// 多对话 Pane：每块不聚焦时的输入草稿（按会话令牌；同一时刻只有一块挂着真输入框）
+    chat_drafts: std::collections::HashMap<u64, pane::workspace::ChatDraft>,
+    /// 现在挂着真输入框的是哪一块（按会话令牌）
+    focused_chat: Option<u64>,
+    /// 已经打开的对话 Pane（同一个会话最多一块：`Session::list` 只有一份）
+    chat_panes: Vec<WeakEntity<pane::chat_pane::ChatPane>>,
+    /// 侧问 Pane 的内容区正在画（只画对话流，跳过首页 / 设置 / 审查 / 子任务详情）。
+    /// 由 `ContentView::render` 按它自己那份 `side_chat` 置位，画完还原
+    side_chat_render: bool,
+    /// 开着的侧问：影子会话令牌 → Pane
+    side_chats: std::collections::HashMap<u64, WeakEntity<pane::side_chat_pane::SideChatPane>>,
+    /// 影子会话令牌 → 它是从哪个主会话问出来的（拼上下文快照用）
+    side_chat_sources: std::collections::HashMap<u64, u64>,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -422,6 +435,34 @@ fn copy_image(store: &SessionStore, id: &str, path: &Path) -> Option<String> {
 }
 
 impl ChatApp {
+    /// 会话令牌 → 下标（找不到就是那个会话已经关了）。
+    pub(crate) fn index_of_token(&self, token: u64) -> Option<usize> {
+        self.sessions.iter().position(|session| session.token == token)
+    }
+
+    /// 在「把 `active` 临时切到 `token` 所指的会话」的前提下跑一段渲染。
+    ///
+    /// 这是多 `ChatPane` 的地基：几百处 `self.session()` 都读 `self.active`，
+    /// 与其全部改成显式按 token 取数，不如在**画某一块 pane 的那一段**里把 `active` 指过去，
+    /// 画完还原。前提是同一块 pane 一帧里只处理一个会话（见 `ChatPane`）。
+    ///
+    /// 注意：只有**同步栈内**的取数能看见这个切换。`ContentView` 是独立实体、渲染时机在
+    /// 后面，所以它自己也存了 token，在它的 `render` 里再包一次（见 `content.rs`）。
+    pub(crate) fn with_active<R>(&mut self, token: u64, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(target) = self.index_of_token(token) else {
+            // 会话已经没了（关了 / 归档）：让调用方按当前 active 画，别 panic
+            return f(self);
+        };
+        let previous = self.active;
+        self.active = target;
+        let out = f(self);
+        // 渲染期间可能又切了会话（比如点了侧栏），以那次为准，不硬盖回去
+        if self.active == target {
+            self.active = previous;
+        }
+        out
+    }
+
     /// 按槽的 key 找（只读）。
     pub(crate) fn slot(&self, key: &str) -> Option<&KernelSlot> {
         self.kernels.iter().find(|(k, _)| k == key).map(|(_, s)| s)
@@ -642,6 +683,12 @@ impl ChatApp {
             popouts: Vec::new(),
             comments: right_panel::CommentDraft::default(),
             diff_comment_note: None,
+            chat_drafts: std::collections::HashMap::new(),
+            focused_chat: None,
+            chat_panes: Vec::new(),
+            side_chat_render: false,
+            side_chats: std::collections::HashMap::new(),
+            side_chat_sources: std::collections::HashMap::new(),
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),
@@ -711,7 +758,10 @@ impl ChatApp {
             bg_spinner: cx.new(|_| bgtasks_view::BgSpinner),
             image_cache: image_cache::DecodedImageCache::new(cx),
             loop_spots: spots.clone(),
-            content_view: cx.new(|_| ContentView::new(weak.clone(), spots.clone())),
+            content_view: cx.new(|_| {
+                // 会话还没读出来（下面才恢复历史）：先绑 0，`init_workspace` 里再对齐
+                ContentView::new(weak.clone(), 0, spots.clone())
+            }),
             loop_overlay: cx.new(|_| motion::LoopOverlay::new(spots)),
             rim_view,
             rim_pointer,
@@ -760,8 +810,17 @@ impl ChatApp {
             magpie_child: None,
         };
         // 内容区缓存的失效规则：`ChatApp` 有任何变化都让它重画（只动输入区的走 `refresh_composer`）
-        cx.observe_self(|this: &mut ChatApp, cx| this.content_view.update(cx, |_, cx| cx.notify()))
-            .detach();
+        cx.observe_self(|this: &mut ChatApp, cx| {
+            this.content_view.update(cx, |_, cx| cx.notify());
+            // 多开的对话 Pane 各有一份 `.cached()` 内容区：没人通知它们就会冻在旧帧上
+            for pane in &this.chat_panes {
+                if let Some(pane) = pane.upgrade() {
+                    let content = pane.read(cx).content();
+                    content.update(cx, |_, cx| cx.notify());
+                }
+            }
+        })
+        .detach();
         // 第一个会话用当前空间的内核：连接就绪（Connected）后统一补发 session/new；
         // 其他内核等有会话用到时再启动
         let space = app.settings.space;
@@ -1041,7 +1100,8 @@ impl ChatApp {
     }
 
     fn hibernate_display(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if std::env::var_os("CLAUDESKTOP_DISABLE_RECLAIM").is_some()
+        if self.sessions[idx].ephemeral
+            || std::env::var_os("CLAUDESKTOP_DISABLE_RECLAIM").is_some()
             || std::env::var_os("CLAUDESKTOP_DISABLE_DISPLAY_RECLAIM").is_some()
             || !self.sessions[idx].display_evictable()
             || self.slot(&self.sessions[idx].kernel_key).is_some_and(|slot| {
@@ -1465,7 +1525,8 @@ impl ChatApp {
         // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」；
         // 它要是建过一个没动过的 worktree，顺手清掉（见 worktree.rs）
         let blank = self.sessions.iter().position(|s| {
-            !s.has_user_message()
+            !s.ephemeral
+                && !s.has_user_message()
                 && !s.busy
                 && !s.renamed
                 && s.kernel == kind
@@ -1489,7 +1550,8 @@ impl ChatApp {
     fn open_or_reuse_code_session(&mut self, dir: PathBuf, task: bool, cx: &mut Context<Self>) {
         let kind = self.settings.kernel_for_space(Space::Code);
         let blank = self.sessions.iter().position(|s| {
-            !s.has_user_message()
+            !s.ephemeral
+                && !s.has_user_message()
                 && !s.busy
                 && !s.renamed
                 && s.kind == SessionKind::Code
@@ -1717,7 +1779,8 @@ impl ChatApp {
             Some(idx) => self.active = idx,
             None => {
                 let blank = self.sessions.iter().position(|s| {
-                    s.kind == space.kind()
+                    !s.ephemeral
+                        && s.kind == space.kind()
                         && !s.meta.as_ref().is_some_and(|m| m.archived)
                         && !s.busy
                         && !s.has_user_message()
@@ -4241,7 +4304,8 @@ impl ChatApp {
 
     /// 确保第 `idx` 个会话的日志已打开（首次写入时建档）；失败时提示并停用存储。
     fn ensure_log(&mut self, idx: usize) {
-        if self.sessions[idx].log.is_some() {
+        if self.sessions[idx].log.is_some() || self.sessions[idx].ephemeral {
+            // 侧问影子会话不开日志、不建档
             return;
         }
         // 存储可能已在别处停用（写盘失败）。这里取局部引用，不再 `unwrap`——
@@ -4282,7 +4346,8 @@ impl ChatApp {
     /// 往第 `idx` 个会话的日志追加一条记录；首次写入时建档。
     /// 写盘失败只提示一次，不影响对话本身。
     fn persist(&mut self, idx: usize, record: Record) {
-        if self.store.is_none() {
+        if self.store.is_none() || self.sessions[idx].ephemeral {
+            // 侧问影子会话：整份都不落盘（不建档、不开日志、不写记录）
             return;
         }
         self.ensure_log(idx);
@@ -4527,6 +4592,8 @@ impl Render for ChatApp {
             }
         }
 
+        // 侧栏 / 命令面板切了会话：让聚焦的那块对话 Pane 跟上（多开时尤其要）
+        self.sync_focus_to_active(window, cx);
         // 侧栏是缓存 view：它用到的状态变了才让它重画（每帧比一次指纹，很便宜）
         self.sync_sidebar(cx);
         // 共享态的投影同理：没变就不发事件（见 hub.rs）
