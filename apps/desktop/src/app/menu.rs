@@ -192,7 +192,7 @@ const MAX_KEYED: usize = 9;
 
 /// 菜单面板里的条目列表。[`pick`](Self::pick) 加可选条目（点了执行动作并收起面板，
 /// 前 9 个标数字），[`child`](Self::child) 加别的内容（提示、不收起面板的操作）。
-pub(super) struct MenuList {
+pub(crate) struct MenuList {
     id: ElementId,
     handle: Entity<ChatApp>,
     popover: Entity<PopoverState>,
@@ -207,7 +207,7 @@ pub(super) struct MenuList {
 }
 
 impl MenuList {
-    pub(super) fn new(
+    pub(crate) fn new(
         id: impl Into<ElementId>,
         handle: &Entity<ChatApp>,
         popover: &Entity<PopoverState>,
@@ -228,7 +228,7 @@ impl MenuList {
     }
 
     /// 在添加条目前调用：不显示数字键帽，也不绑定数字快捷键。
-    pub(super) fn without_shortcuts(mut self) -> Self {
+    pub(crate) fn without_shortcuts(mut self) -> Self {
         self.shortcuts = false;
         self
     }
@@ -261,7 +261,7 @@ impl MenuList {
     }
 
     /// 同 [`pick`](Self::pick)，动作里要用 `Window`（如给输入框填值）时用它。
-    pub(super) fn pick_in(
+    pub(crate) fn pick_in(
         mut self,
         row: Stateful<Div>,
         action: impl Fn(&mut ChatApp, &mut Window, &mut Context<ChatApp>) + 'static,
@@ -322,7 +322,7 @@ impl MenuList {
     }
 
     /// 收尾：外层挂上 `focus`（面板打开时焦点在这里），数字键选对应条目。
-    pub(super) fn finish(self, focus: &FocusHandle, window: &mut Window, cx: &mut App) -> Div {
+    pub(crate) fn finish(self, focus: &FocusHandle, window: &mut Window, cx: &mut App) -> Div {
         let picks = self.picks;
         let footer = self.footer;
         let body = if self.scrollbar {
@@ -366,7 +366,7 @@ impl MenuList {
 
 /// 两行式菜单条目：图标 + 名称（+ 灰色说明，空串不显示），当前项右侧打赤陶色对勾。
 /// 交给 [`MenuList::pick`]，点击动作由它挂。
-pub(super) fn menu_item(
+pub(crate) fn menu_item(
     id: impl Into<ElementId>,
     icon: impl Into<Icon>,
     name: impl Into<SharedString>,
@@ -620,6 +620,6 @@ pub(super) fn menu_popover(
 /// 描边语言。这里只把内边距收成 `p_1`（`refine_style` 在 `popover_style` 之后合并，
 /// 所以能盖掉它默认的 `p_3`）。底色、圆角都从组件主题取，**不要**在调用处写
 /// `bg(rgb(CARD))` / `border_color(rgb(LINE))`——配色不对就去 `theme::apply_colors` 补映射。
-pub(super) fn menu_panel(popover: Popover, focus: &FocusHandle) -> Popover {
+pub(crate) fn menu_panel(popover: Popover, focus: &FocusHandle) -> Popover {
     popover.track_focus(focus).p_1()
 }

@@ -56,7 +56,7 @@ pub(super) struct UsagePage {
 
 impl ChatApp {
     /// 打开用量页，不带筛选（侧栏、命令面板、首页摘要条）。
-    pub(super) fn open_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_usage_filter(None, None, None);
         if self.settings_form.tab != USAGE_TAB {
             self.usage_page.settings_tab = self.settings_form.tab;

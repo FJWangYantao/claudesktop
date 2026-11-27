@@ -12,8 +12,15 @@ use super::subagent_pane::SubagentPane;
 use super::{PaneHandle, PaneKind};
 use crate::app::ChatApp;
 use crate::app::content::ContentView;
+use crate::app::keys::{BROWSER_KEY, CHANGES_KEY, FILES_KEY, SIDE_CHAT_KEY, TERMINAL_KEY};
+use crate::app::menu::{MenuList, menu_item, menu_panel};
 use crate::app::motion::LoopOverlay;
+use crate::app::widgets::Surface;
+use crate::theme::rgb;
+use crate::theme::*;
 use gpui_base::dock::{DockEvent, DockLayout, DockPlacement, PanelView};
+use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -375,6 +382,10 @@ impl ChatApp {
                 let has_chat = restored && app.focus_pane_of_kind(PaneKind::Chat, window, cx);
                 if !has_chat {
                     app.install_default_layout(window, cx);
+                } else if app.dock.read(cx).has_dock(DockPlacement::Right) {
+                    // 单一真相：恢复出的布局里右侧栏是开是合，反写回 right_panel.open，
+                    // 避免启动时按默认值 false 把用户上次展开的右侧栏强行折起
+                    app.right_panel.open = app.dock.read(cx).is_dock_open(DockPlacement::Right);
                 }
                 app.sync_right_dock(window, cx);
                 has_chat
@@ -385,11 +396,19 @@ impl ChatApp {
         });
     }
 
-    /// 内置默认布局：中间一个对话 Pane，右侧文件 / 改动两个 Tab。
+    /// 默认右侧检视区的 4 个零进程开销 Tab：文件 / 改动 / 计划 / 子代理。
+    fn default_right_tabs(&mut self, cx: &mut Context<Self>) -> DockLayout {
+        DockLayout::tabs()
+            .panel_view(Arc::new(self.new_files_pane(cx)) as Arc<dyn PanelView>, cx)
+            .panel_view(Arc::new(self.new_diff_pane(cx)) as Arc<dyn PanelView>, cx)
+            .panel_view(Arc::new(self.new_plan_pane(cx)) as Arc<dyn PanelView>, cx)
+            .panel_view(Arc::new(self.new_subagent_pane(cx)) as Arc<dyn PanelView>, cx)
+    }
+
+    /// 内置默认布局：中间一个对话 Pane，右侧文件 / 改动 / 计划 / 子代理四个 Tab。
     fn install_default_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let chat = self.new_chat_pane(cx);
-        let files = self.new_files_pane(cx);
-        let diff = self.new_diff_pane(cx);
+        let right = self.default_right_tabs(cx);
         let dock = self.dock.clone();
         dock.update(cx, |dock, cx| {
             dock.set_center(
@@ -397,14 +416,7 @@ impl ChatApp {
                 window,
                 cx,
             );
-            dock.set_dock(
-                DockPlacement::Right,
-                DockLayout::tabs()
-                    .panel_view(Arc::new(files) as Arc<dyn PanelView>, cx)
-                    .panel_view(Arc::new(diff) as Arc<dyn PanelView>, cx),
-                window,
-                cx,
-            );
+            dock.set_dock(DockPlacement::Right, right, window, cx);
             dock.set_dock_size(DockPlacement::Right, right_dock_w(window), window, cx);
         });
     }
@@ -520,13 +532,20 @@ impl ChatApp {
     }
 
     /// 打开（或聚焦）某个种类的 Pane：已经在这个工作区里就选中它，
-    /// 否则在右侧那一列新起一个 Tab。命令面板 / 快捷键都走这里。
+    /// 否则在右侧那一列新起一个 Tab。命令面板 / 快捷键 / `+` 菜单都走这里。
     pub(crate) fn open_pane(
         &mut self,
         kind: PaneKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 先展开右侧栏：避免目标面板（如预装的计划 / 子代理）正藏在折叠着的 Right 里
+        if matches!(kind, PaneKind::Files | PaneKind::Diff | PaneKind::Plan | PaneKind::Subagent)
+            && !self.right_panel.open
+        {
+            self.right_panel.open = true;
+            self.sync_right_dock(window, cx);
+        }
         if self.focus_pane_of_kind(kind, window, cx) {
             return;
         }
@@ -546,21 +565,17 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 把某个种类的 Pane 显示出来（右侧那一列里可能和别的 Pane 并成 Tab）。
-    /// 返回是否找到了它。
-    pub(crate) fn focus_pane_of_kind(
-        &mut self,
+    /// 在主窗或任意弹出窗里按种类找面板：返回 `(DockArea, PanelId, 所在弹出窗句柄)`。
+    fn find_pane_of_kind(
+        &self,
         kind: PaneKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+        cx: &App,
+    ) -> Option<(
+        Entity<gpui_base::dock::DockArea>,
+        gpui_base::dock::PanelId,
+        Option<AnyWindowHandle>,
+    )> {
         let dock = self.dock.clone();
-        // (区域, 面板 id, 它在哪个窗口里；None = 主窗)
-        let mut found: Option<(
-            Entity<gpui_base::dock::DockArea>,
-            gpui_base::dock::PanelId,
-            Option<AnyWindowHandle>,
-        )> = None;
         // 四个区域都找一遍：Pane 可能被拖到左侧或底部，也可能已经弹到独立窗
         for placement in [
             DockPlacement::Right,
@@ -569,41 +584,41 @@ impl ChatApp {
             DockPlacement::Bottom,
         ] {
             let Some(tree) = dock.read(cx).layout(placement) else { continue };
-            let ids: Vec<_> = tree.panels().collect();
-            for id in ids {
+            for id in tree.panels() {
                 let handle = dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
                 if handle == Some(kind) {
-                    found = Some((dock.clone(), id, None));
-                    break;
-                }
-            }
-            if found.is_some() {
-                break;
-            }
-        }
-        // 弹出窗里也算「已经在工作区里」：在那个窗里选中，并把它唤到前台
-        if found.is_none() {
-            for entry in &self.popouts {
-                let ids: Vec<_> = entry
-                    .dock
-                    .read(cx)
-                    .layout(DockPlacement::Center)
-                    .map(|tree| tree.panels().collect())
-                    .unwrap_or_default();
-                for id in ids {
-                    let handle =
-                        entry.dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
-                    if handle == Some(kind) {
-                        found = Some((entry.dock.clone(), id, Some(entry.window)));
-                        break;
-                    }
-                }
-                if found.is_some() {
-                    break;
+                    return Some((dock, id, None));
                 }
             }
         }
-        match found {
+        // 弹出窗里也算「已经在工作区里」
+        for entry in &self.popouts {
+            let Some(tree) = entry.dock.read(cx).layout(DockPlacement::Center) else { continue };
+            for id in tree.panels() {
+                let handle =
+                    entry.dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
+                if handle == Some(kind) {
+                    return Some((entry.dock.clone(), id, Some(entry.window)));
+                }
+            }
+        }
+        None
+    }
+
+    /// 工作区（含弹出窗）里现在是否已经开着某种面板。
+    pub(crate) fn has_pane_of_kind(&self, kind: PaneKind, cx: &App) -> bool {
+        self.find_pane_of_kind(kind, cx).is_some()
+    }
+
+    /// 把某个种类的 Pane 显示出来（右侧那一列里可能和别的 Pane 并成 Tab）。
+    /// 返回是否找到了它。
+    pub(crate) fn focus_pane_of_kind(
+        &mut self,
+        kind: PaneKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.find_pane_of_kind(kind, cx) {
             Some((area, id, Some(popout))) => {
                 // 面板在别的窗口里：选中要在**那个**窗口的上下文里做（手里这个 window 是主窗）
                 let _ = popout.update(cx, |_, popout_window, cx| {
@@ -626,17 +641,9 @@ impl ChatApp {
         let dock = self.dock.clone();
         let has = dock.read(cx).has_dock(DockPlacement::Right);
         if want && !has {
-            let files = self.new_files_pane(cx);
-            let diff = self.new_diff_pane(cx);
+            let right = self.default_right_tabs(cx);
             dock.update(cx, |dock, cx| {
-                dock.set_dock(
-                    DockPlacement::Right,
-                    DockLayout::tabs()
-                        .panel_view(Arc::new(files) as Arc<dyn PanelView>, cx)
-                        .panel_view(Arc::new(diff) as Arc<dyn PanelView>, cx),
-                    window,
-                    cx,
-                );
+                dock.set_dock(DockPlacement::Right, right, window, cx);
                 dock.set_dock_size(DockPlacement::Right, right_dock_w(window), window, cx);
             });
         }
@@ -726,4 +733,232 @@ impl ChatApp {
             body.when(!app.settings_open, |d| app.with_file_drop(d, cx)).into_any_element()
         })
     }
+}
+
+/// Tab 栏末尾的 `+` 菜单：一次性列出除主对话外的 7 种工作区面板，已打开的标对勾。
+pub(crate) fn render_add_pane_menu(node: u64, main: Entity<ChatApp>, cx: &App) -> AnyElement {
+    let focus = main.read(cx).menu_focus.clone();
+    let list_focus = focus.clone();
+    let trigger =
+        ChatApp::quiet_button(("claudesktop-tab-add", node), IconAll::Plus, Surface::Paper, cx)
+            .xsmall()
+            .tooltip("添加面板");
+    let handle = main;
+    menu_panel(Popover::new(("claudesktop-tab-add-menu", node)), &focus)
+        .anchor(Anchor::TopLeft)
+        .w(rems(15.5))
+        .trigger(trigger)
+        .content(move |_, window, cx| {
+            let popover = cx.entity();
+            let app = handle.read(cx);
+            let items = [
+                (PaneKind::Files, FILES_KEY),
+                (PaneKind::Diff, CHANGES_KEY),
+                (PaneKind::Plan, ""),
+                (PaneKind::Subagent, ""),
+                (PaneKind::Terminal, TERMINAL_KEY),
+                (PaneKind::Browser, BROWSER_KEY),
+                (PaneKind::SideChat, SIDE_CHAT_KEY),
+            ];
+            let mut list =
+                MenuList::new(("tab-add-list", node), &handle, &popover).without_shortcuts();
+            for (ix, (kind, key)) in items.into_iter().enumerate() {
+                let active = app.has_pane_of_kind(kind, cx);
+                let shortcut = (!key.is_empty()).then(|| ChatApp::key_text(key));
+                let mut row = menu_item(
+                    ("tab-add-item", node.wrapping_mul(16).wrapping_add(ix as u64)),
+                    kind.icon(),
+                    kind.title(),
+                    "",
+                    active,
+                );
+                if let Some(key) = shortcut {
+                    row = row.child(
+                        div()
+                            .flex_shrink_0()
+                            .font_family(MONO)
+                            .text_size(TEXT_META)
+                            .text_color(rgb(INK_FAINT))
+                            .child(key),
+                    );
+                }
+                list = list.pick_in(row, move |this, window, cx| match kind {
+                    PaneKind::Terminal => this.open_terminal(window, cx),
+                    PaneKind::Browser => this.open_browser(window, cx),
+                    PaneKind::SideChat => this.open_side_chat(window, cx),
+                    other => this.open_pane(other, window, cx),
+                });
+            }
+            list.finish(&list_focus, window, cx)
+        })
+        .into_any_element()
+}
+
+/// 右侧检视区顶部状态卡：当前分支 + Git 改动数（点击直达改动）+ 上下文用量/费用（点击直达用量）。
+/// 只读内存里已缓存的字段，不在渲染期间调 git 或写盘。
+pub(crate) fn render_right_status_card(main: Entity<ChatApp>, cx: &App) -> Option<AnyElement> {
+    let app = main.read(cx);
+    if app.settings_open || app.session().is_chat() {
+        return None;
+    }
+    let s = app.session();
+    let branch: SharedString = if let Some(wt) = s.worktree.as_ref() {
+        wt.branch.clone().into()
+    } else if let Some(b) = s.git_branch.as_ref() {
+        b.clone()
+    } else if s.git_detached {
+        "HEAD".into()
+    } else if s.task {
+        "任务".into()
+    } else {
+        crate::app::project_label(s.group_dir())
+    };
+    let changed = app.right_panel.changed_count;
+    let diff_label: SharedString =
+        if changed > 0 { format!("{changed} 个改动").into() } else { "无改动".into() };
+    let gauge = app.context_gauge();
+    let cost = s.context_cost.clone();
+
+    let diff_app = main.clone();
+    let diff_button = div()
+        .id("right-status-diff")
+        .flex_shrink_0()
+        .h_flex()
+        .items_center()
+        .gap_1()
+        .px_1p5()
+        .py_0p5()
+        .rounded_md()
+        .cursor_pointer()
+        .text_size(TEXT_META)
+        .text_color(rgb(if changed > 0 { CORAL_DEEP } else { INK_SOFT }))
+        .hover(|d| d.bg(rgb(SELECTED)).text_color(rgb(INK)))
+        .child(Icon::new(IconAll::FileDiff).size_3p5())
+        .child(diff_label)
+        .on_click(move |_, window, cx| {
+            diff_app.update(cx, |app, cx| app.open_pane(PaneKind::Diff, window, cx));
+        });
+
+    let branch_row = div()
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_1()
+        .child(
+            div()
+                .h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_1p5()
+                .text_color(rgb(INK))
+                .child(Icon::new(IconAll::GitBranch).size_3p5().text_color(rgb(INK_SOFT)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .font_family(MONO)
+                        .text_size(TEXT_SMALL)
+                        .child(branch),
+                ),
+        )
+        .child(diff_button);
+
+    let usage_app = main;
+    let fill_pct = gauge.as_ref().and_then(|g| g.percent).map(|p| p.min(100) as f32 / 100.);
+    let fill_color = match gauge.as_ref().and_then(|g| g.percent) {
+        Some(p) if p >= 90 => RED,
+        Some(p) if p >= 70 => CORAL_DEEP,
+        _ => CORAL,
+    };
+    let usage_text: SharedString = match &gauge {
+        Some(g) => match g.window {
+            Some(w) => format!(
+                "{} · {}/{}",
+                g.label,
+                crate::usage::short_tokens(g.used),
+                crate::usage::short_tokens(w),
+            )
+            .into(),
+            None => format!("{} token", crate::usage::short_tokens(g.used)).into(),
+        },
+        None => "尚无用量".into(),
+    };
+    let usage_row = div()
+        .id("right-status-usage")
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_1()
+        .py_0p5()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(SELECTED)))
+        .child(
+            div()
+                .h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_1p5()
+                .when_some(fill_pct, |d, pct| {
+                    d.child(
+                        div()
+                            .w(rems(3.5))
+                            .h(px(4.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(rgb(LINE))
+                            .overflow_hidden()
+                            .child(div().h_full().w(rems(3.5 * pct)).bg(rgb(fill_color))),
+                    )
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(if gauge.is_some() { INK_SOFT } else { INK_FAINT }))
+                        .font_features(tabular_nums())
+                        .child(usage_text),
+                ),
+        )
+        .when_some(cost, |d, cost| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .font_features(tabular_nums())
+                    .child(format!("{:.3} {}", cost.amount, cost.currency)),
+            )
+        })
+        .on_click(move |_, window, cx| {
+            usage_app.update(cx, |app, cx| app.open_usage(window, cx));
+        });
+
+    Some(
+        div()
+            .v_flex()
+            .gap_1()
+            .mx_2()
+            .mt_2()
+            .mb_1()
+            .px_1p5()
+            .py_1p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(SAND))
+            .child(branch_row)
+            .child(usage_row)
+            .into_any_element(),
+    )
 }

@@ -1463,6 +1463,19 @@ impl ChatApp {
                             .rounded_r_md()
                             .bg(rgb(SELECTED))
                             .child(
+                                icon_button(
+                                    "session-split",
+                                    IconAll::PanelRight,
+                                    "在右侧并排打开（Ctrl+点击）",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_chat_in_pane(i, window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
                                 icon_button("session-rename", IconAll::SquarePen, "重命名")
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();

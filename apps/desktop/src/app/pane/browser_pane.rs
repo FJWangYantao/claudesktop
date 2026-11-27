@@ -461,19 +461,37 @@ impl Render for BrowserPane {
 }
 
 impl ChatApp {
-    /// `Ctrl+Shift+B`：起一块（或聚焦已有的）浏览器 Pane。
+    /// `Ctrl+Shift+B`：起一块（或聚焦已有的）浏览器 Pane（默认落右侧检视区）。
     pub(crate) fn open_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 先确保右侧检视区处于展开状态：否则从折叠态聚焦 / 写入 Right 会藏在折叠栏里
+        if !self.right_panel.open {
+            self.right_panel.open = true;
+            self.sync_right_dock(window, cx);
+        }
+        let dock = self.dock.clone();
         if self.focus_pane_of_kind(PaneKind::Browser, window, cx) {
+            dock.update(cx, |dock, cx| {
+                if dock.has_dock(gpui_base::dock::DockPlacement::Right)
+                    && !dock.is_dock_open(gpui_base::dock::DockPlacement::Right)
+                {
+                    dock.toggle_dock(gpui_base::dock::DockPlacement::Right, window, cx);
+                }
+            });
             return;
         }
         let app = cx.entity().downgrade();
         let pane = cx.new(|cx| BrowserPane::new(app, None, window, cx));
         let focus_pane = pane.clone();
-        let dock = self.dock.clone();
         let handle = std::sync::Arc::new(super::PaneHandle::new(pane))
             as std::sync::Arc<dyn gpui_base::dock::PanelView>;
         dock.update(cx, |dock, cx| {
-            dock.add_panel_view(handle, gpui_base::dock::DockPlacement::Center, None, window, cx);
+            dock.add_panel_view(handle, gpui_base::dock::DockPlacement::Right, None, window, cx);
+            // 聊天空间下 `sync_right_dock` 保持右栏收起，但主动开浏览器时仍应展开右侧区
+            if dock.has_dock(gpui_base::dock::DockPlacement::Right)
+                && !dock.is_dock_open(gpui_base::dock::DockPlacement::Right)
+            {
+                dock.toggle_dock(gpui_base::dock::DockPlacement::Right, window, cx);
+            }
         });
         focus_pane.update(cx, |pane, cx| pane.focus_address(window, cx));
         cx.notify();

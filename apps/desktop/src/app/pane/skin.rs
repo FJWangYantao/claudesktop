@@ -78,13 +78,13 @@ impl DockAreaRenderer for ClaudesktopDockSkin {
         Some(line.into_any_element())
     }
 
-    /// 侧边 dock 顶上一条 1px 分隔线；底部 dock 同理。折叠把手在 Tab 栏里。
+    /// 侧边 dock 顶上一条 1px 分隔线；底部 dock 同理。右侧栏顶部附一张当前会话状态卡。
     fn render_dock(
         &self,
         dock: &DockContext,
         content: AnyElement,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> AnyElement {
         let extent = dock_extent(dock);
         if extent <= px(0.) {
@@ -96,11 +96,27 @@ impl DockAreaRenderer for ClaudesktopDockSkin {
             DockPlacement::Bottom => div().w_full().h(px(1.)).flex_shrink_0().bg(rgb(LINE)),
             DockPlacement::Center => div(),
         };
+        let status_card = (dock.placement() == DockPlacement::Right)
+            .then(|| self.main.borrow().as_ref().and_then(|main| main.upgrade()))
+            .flatten()
+            .and_then(|main| super::workspace::render_right_status_card(main, cx));
+        let body = if status_card.is_some() {
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .children(status_card)
+                .child(div().flex_1().min_h_0().w_full().child(content))
+                .into_any_element()
+        } else {
+            content
+        };
         let frame = match dock.placement() {
             DockPlacement::Bottom => div().v_flex().size_full().overflow_hidden(),
             _ => div().h_flex().size_full().overflow_hidden(),
         };
-        frame.child(line).child(content).into_any_element()
+        frame.child(line).child(body).into_any_element()
     }
 
     fn tab_group_renderer(&self) -> Rc<dyn TabGroupRenderer> {
@@ -185,6 +201,10 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
         let active_is_chat =
             active.and_then(PaneHandle::of).is_some_and(|handle| handle.kind(cx) == PaneKind::Chat);
         let main = self.main.borrow().clone();
+        let add_button = main
+            .as_ref()
+            .and_then(|main| main.upgrade())
+            .map(|main| super::workspace::render_add_pane_menu(node, main, cx));
         let popout_button = active_id.filter(|_| !active_is_chat).map(move |panel| {
             let main = main.clone();
             div()
@@ -215,6 +235,7 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
             .bg(rgb(PAPER))
             .overflow_hidden()
             .children(tabs)
+            .children(add_button)
             // Tab 之后的空白只是空白：**不能**放 `chrome::drag_area()`，
             // 那是给窗口标题栏用的 `WindowControlArea::Drag`，中下部分屏时双击它会最大化窗口
             .child(div().flex_1().min_w_0().h_full())

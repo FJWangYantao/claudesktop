@@ -223,7 +223,7 @@ pub struct ChatApp {
     /// 设置页的焦点锚（设置页没有输入框可以兜底，快捷键靠它留在 `ChatApp` 键上下文里）
     settings_focus: FocusHandle,
     /// 下拉菜单打开时的焦点（同一时间只开一个菜单，共用；见 menu.rs）
-    menu_focus: FocusHandle,
+    pub(crate) menu_focus: FocusHandle,
     settings_form: SettingsForm,
     /// 正在后台获取模型列表
     fetching_models: bool,

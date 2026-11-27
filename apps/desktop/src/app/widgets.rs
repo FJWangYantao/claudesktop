@@ -15,7 +15,7 @@ use std::rc::Rc;
 /// 按钮所在的底，决定透明按钮的悬停色：纸底 / 卡片上用 `HOVER`，
 /// 沙色底（侧栏、代码块、chip）上用 `SELECTED`。
 #[derive(Clone, Copy)]
-pub(super) enum Surface {
+pub(crate) enum Surface {
     Paper,
     Sand,
 }
@@ -24,7 +24,7 @@ impl ChatApp {
     /// 透明底的按钮（gpui-kit `Button` 的自定义变体）：静止透明、悬停按所在底色出底，前景 `INK_SOFT`。
     /// 只有图标时是方形图标按钮：默认 32 格 16 图标，`.small()` 24 / 14，`.xsmall()` 20 / 12；
     /// 再加 `.label()` 就是图标 + 文字的小按钮（消息下方的复制 / 编辑）。
-    pub(super) fn quiet_button(
+    pub(crate) fn quiet_button(
         id: impl Into<ElementId>,
         icon: IconAll,
         on: Surface,
@@ -82,7 +82,7 @@ impl ChatApp {
     }
 
     /// 按键串的文字写法（如「Ctrl+=」），放进悬停提示这类只收文字的地方。
-    pub(super) fn key_text(key: &str) -> String {
+    pub(crate) fn key_text(key: &str) -> String {
         Kbd::format(&Keystroke::parse(key).expect("keys.rs 里的按键串应能解析"))
     }
 }

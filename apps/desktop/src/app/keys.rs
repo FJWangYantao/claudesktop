@@ -78,14 +78,14 @@ actions!(
 pub(super) const NEW_SESSION_KEY: &str = "secondary-n";
 pub(super) const TOGGLE_SIDEBAR_KEY: &str = "secondary-b";
 pub(super) const PALETTE_KEY: &str = "secondary-k";
-pub(super) const FILES_KEY: &str = "ctrl-shift-f";
-pub(super) const CHANGES_KEY: &str = "ctrl-shift-d";
+pub(crate) const FILES_KEY: &str = "ctrl-shift-f";
+pub(crate) const CHANGES_KEY: &str = "ctrl-shift-d";
 /// 侧问（`Ctrl+;`）
-pub(super) const SIDE_CHAT_KEY: &str = "ctrl-;";
+pub(crate) const SIDE_CHAT_KEY: &str = "ctrl-;";
 /// 终端（`Ctrl+\``）
-pub(super) const TERMINAL_KEY: &str = "ctrl-`";
+pub(crate) const TERMINAL_KEY: &str = "ctrl-`";
 /// 浏览器（`Ctrl+Shift+B`）
-pub(super) const BROWSER_KEY: &str = "ctrl-shift-b";
+pub(crate) const BROWSER_KEY: &str = "ctrl-shift-b";
 pub(super) const SHORTCUTS_KEY: &str = "secondary-/";
 pub(super) const RAW_FIND_KEY: &str = "secondary-f";
 /// 停止 / 循环权限模式 / 前后切会话

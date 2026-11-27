@@ -25,7 +25,7 @@ const CARD_W: Rems = rems(17.);
 
 impl ChatApp {
     /// 输入框下方的上下文用量；没报告过用量时为 None（只有自研内核报告，窗口大小也只有它知道）。
-    pub(super) fn context_gauge(&self) -> Option<ContextGauge> {
+    pub(crate) fn context_gauge(&self) -> Option<ContextGauge> {
         let s = self.session();
         if s.context_tokens == 0 {
             return None;
