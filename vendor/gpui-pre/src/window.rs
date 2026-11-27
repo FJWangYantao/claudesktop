@@ -1296,6 +1296,8 @@ pub struct Window {
     pub(crate) refreshing_window: bool,
     pub(crate) scroll_prepaint_recording: bool,
     pub(crate) scroll_atlas_revision: u64,
+    // claudesktop patch: 只从上一帧重放视图的布局和绘制区间。
+    pub(crate) draw_generation: u64,
     settling_cached_scroll: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
@@ -2201,6 +2203,7 @@ impl Window {
             refreshing_window: false,
             scroll_prepaint_recording: false,
             scroll_atlas_revision: 0,
+            draw_generation: 0,
             settling_cached_scroll: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
@@ -3438,6 +3441,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.draw_generation = self.draw_generation.wrapping_add(1);
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
