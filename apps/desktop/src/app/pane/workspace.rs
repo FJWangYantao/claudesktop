@@ -13,15 +13,8 @@ use super::subagent_pane::SubagentPane;
 use super::{PaneHandle, PaneKind};
 use crate::app::ChatApp;
 use crate::app::content::ContentView;
-use crate::app::keys::{BROWSER_KEY, CHANGES_KEY, FILES_KEY, SIDE_CHAT_KEY, TERMINAL_KEY};
-use crate::app::menu::{MenuList, menu_item, menu_panel};
 use crate::app::motion::LoopOverlay;
-use crate::app::widgets::Surface;
-use crate::theme::rgb;
-use crate::theme::*;
 use gpui_base::dock::{DockEvent, DockLayout, DockPlacement, PanelView};
-use gpui_kit::assets::IconName as IconAll;
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -628,11 +621,6 @@ impl ChatApp {
         None
     }
 
-    /// 工作区（含弹出窗）里现在是否已经开着某种面板。
-    pub(crate) fn has_pane_of_kind(&self, kind: PaneKind, cx: &App) -> bool {
-        self.find_pane_of_kind(kind, cx).is_some()
-    }
-
     /// 把某个种类的 Pane 显示出来（右侧那一列里可能和别的 Pane 并成 Tab）。
     /// 返回是否找到了它。
     pub(crate) fn focus_pane_of_kind(
@@ -756,64 +744,4 @@ impl ChatApp {
             body.when(!app.settings_open, |d| app.with_file_drop(d, cx)).into_any_element()
         })
     }
-}
-
-/// Tab 栏末尾的 `+` 菜单：一次性列出工作区面板，已打开的标对勾。
-pub(crate) fn render_add_pane_menu(node: u64, main: Entity<ChatApp>, cx: &App) -> AnyElement {
-    let focus = main.read(cx).menu_focus.clone();
-    let list_focus = focus.clone();
-    let trigger =
-        ChatApp::quiet_button(("claudesktop-tab-add", node), IconAll::Plus, Surface::Paper, cx)
-            .xsmall()
-            .tooltip("添加面板");
-    let handle = main;
-    menu_panel(Popover::new(("claudesktop-tab-add-menu", node)), &focus)
-        .anchor(Anchor::TopLeft)
-        .w(rems(15.5))
-        .trigger(trigger)
-        .content(move |_, window, cx| {
-            let popover = cx.entity();
-            let app = handle.read(cx);
-            let items = [
-                (PaneKind::Overview, ""),
-                (PaneKind::Files, FILES_KEY),
-                (PaneKind::Diff, CHANGES_KEY),
-                (PaneKind::Plan, ""),
-                (PaneKind::Subagent, ""),
-                (PaneKind::Terminal, TERMINAL_KEY),
-                (PaneKind::Browser, BROWSER_KEY),
-                (PaneKind::SideChat, SIDE_CHAT_KEY),
-            ];
-            let mut list =
-                MenuList::new(("tab-add-list", node), &handle, &popover).without_shortcuts();
-            for (ix, (kind, key)) in items.into_iter().enumerate() {
-                let active = app.has_pane_of_kind(kind, cx);
-                let shortcut = (!key.is_empty()).then(|| ChatApp::key_text(key));
-                let mut row = menu_item(
-                    ("tab-add-item", node.wrapping_mul(16).wrapping_add(ix as u64)),
-                    kind.icon(),
-                    kind.title(),
-                    "",
-                    active,
-                );
-                if let Some(key) = shortcut {
-                    row = row.child(
-                        div()
-                            .flex_shrink_0()
-                            .font_family(MONO)
-                            .text_size(TEXT_META)
-                            .text_color(rgb(INK_FAINT))
-                            .child(key),
-                    );
-                }
-                list = list.pick_in(row, move |this, window, cx| match kind {
-                    PaneKind::Terminal => this.open_terminal(window, cx),
-                    PaneKind::Browser => this.open_browser(window, cx),
-                    PaneKind::SideChat => this.open_side_chat(window, cx),
-                    other => this.open_pane(other, window, cx),
-                });
-            }
-            list.finish(&list_focus, window, cx)
-        })
-        .into_any_element()
 }

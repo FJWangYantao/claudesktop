@@ -75,9 +75,17 @@ impl Render for OverviewPane {
     }
 }
 
-/// 一张独立圆角矩形卡片的外壳：纸卡底 + 1px 细边 + 大圆角。
+/// 一张独立圆角矩形卡片的外壳：纸卡底 + 1px 细边 + 贴地阴影，融入与中间聊天区统一的 PAPER 画布。
 fn card_box() -> Div {
-    div().v_flex().rounded_xl().border_1().border_color(rgb(LINE)).bg(rgb(CARD)).p_3().gap_2()
+    div()
+        .v_flex()
+        .rounded_xl()
+        .border_1()
+        .border_color(rgb(LINE))
+        .bg(rgb(CARD))
+        .shadow(raised_shadow())
+        .p_3()
+        .gap_2()
 }
 
 /// 卡片内可点行：悬停高亮 + 右侧 chevron。
@@ -437,11 +445,47 @@ impl ChatApp {
             card_box().child(head).child(list)
         });
 
+        let tool_chip = |kind: PaneKind| {
+            div()
+                .id(ElementId::Name(format!("overview-quick-{}", kind.panel_name()).into()))
+                .h_flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(CARD))
+                .cursor_pointer()
+                .text_size(TEXT_META)
+                .text_color(rgb(INK_SOFT))
+                .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                .child(Icon::new(kind.icon()).size_3p5())
+                .child(kind.title())
+        };
+        let quick_row = div()
+            .h_flex()
+            .flex_wrap()
+            .gap_1p5()
+            .child(tool_chip(PaneKind::Files).on_click(cx.listener(|this, _, window, cx| {
+                this.open_pane(PaneKind::Files, window, cx);
+            })))
+            .child(tool_chip(PaneKind::Browser).on_click(cx.listener(|this, _, window, cx| {
+                this.open_browser(window, cx);
+            })))
+            .child(tool_chip(PaneKind::Terminal).on_click(cx.listener(|this, _, window, cx| {
+                this.open_terminal(window, cx);
+            })))
+            .child(tool_chip(PaneKind::SideChat).on_click(cx.listener(|this, _, window, cx| {
+                this.open_side_chat(window, cx);
+            })));
+
         div()
             .id("overview-scroll")
             .size_full()
             .overflow_y_scroll()
-            .bg(rgb(SIDEBAR))
+            .bg(rgb(PAPER))
             .p_3()
             .v_flex()
             .gap_3()
@@ -449,6 +493,7 @@ impl ChatApp {
             .when_some(plan_card, |d, card| d.child(card))
             .when_some(outputs_card, |d, card| d.child(card))
             .when_some(subagent_card, |d, card| d.child(card))
+            .child(quick_row)
             .into_any_element()
     }
 }

@@ -60,16 +60,19 @@ impl DockAreaRenderer for ClaudesktopDockSkin {
         div().id("claudesktop-dock-center")
     }
 
-    /// 分屏之间的那条线：命中区和拖拽都是 base 的，这里只换画法
-    /// （1px 细线，拖拽中变成强调色）。
+    /// 分屏之间的那条线：静止时完全隐形，让对话区和右侧卡片融在同一块画布里；
+    /// 悬停时显出 1px 细线提示可拖宽度，拖拽中变成强调色。
     fn render_split_handle(
         &self,
         handle: &ResizeHandleContext,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<AnyElement> {
-        let active = handle.state() == ResizeHandleState::Dragging;
-        let color = if active { rgb(CORAL) } else { rgb(LINE) };
+        let color = match handle.state() {
+            ResizeHandleState::Idle => return None,
+            ResizeHandleState::Hovered => rgb(LINE),
+            _ => rgb(CORAL),
+        };
         let line = div().bg(color).absolute();
         let line = match handle.axis() {
             Axis::Horizontal => line.top_0().bottom_0().left(px(2.5)).w(px(1.)),
@@ -78,7 +81,7 @@ impl DockAreaRenderer for ClaudesktopDockSkin {
         Some(line.into_any_element())
     }
 
-    /// 侧边 dock 顶上一条 1px 分隔线；底部 dock 同理。折叠把手在 Tab 栏里。
+    /// 只有底部终端保留顶上 1px 分隔线；左右面板直接与中间画布融在一起，不再竖线割裂。
     fn render_dock(
         &self,
         dock: &DockContext,
@@ -87,20 +90,16 @@ impl DockAreaRenderer for ClaudesktopDockSkin {
         _cx: &mut App,
     ) -> AnyElement {
         let extent = dock_extent(dock);
-        if extent <= px(0.) {
+        if extent <= px(0.) || dock.placement() != DockPlacement::Bottom {
             return content;
         }
-        let line = match dock.placement() {
-            DockPlacement::Left => div().h_full().w(px(1.)).flex_shrink_0().bg(rgb(LINE)),
-            DockPlacement::Right => div().h_full().w(px(1.)).flex_shrink_0().bg(rgb(LINE)),
-            DockPlacement::Bottom => div().w_full().h(px(1.)).flex_shrink_0().bg(rgb(LINE)),
-            DockPlacement::Center => div(),
-        };
-        let frame = match dock.placement() {
-            DockPlacement::Bottom => div().v_flex().size_full().overflow_hidden(),
-            _ => div().h_flex().size_full().overflow_hidden(),
-        };
-        frame.child(line).child(content).into_any_element()
+        div()
+            .v_flex()
+            .size_full()
+            .overflow_hidden()
+            .child(div().w_full().h(px(1.)).flex_shrink_0().bg(rgb(LINE)))
+            .child(content)
+            .into_any_element()
     }
 
     fn tab_group_renderer(&self) -> Rc<dyn TabGroupRenderer> {
@@ -141,28 +140,97 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
             .overflow_hidden()
     }
 
+    /// 去掉传统多 Tab 栏：
+    /// - 右侧「概览」卡片栈与唯一主对话完全无栏（0px）；
+    /// - 点进详情页（改动 / 文件 / 计划 / 子代理 / 浏览器）或独立分屏（终端 / 侧问 / 第 2 块对话）时，
+    ///   只画一条同画布底色的轻页头：左侧 `‹ 概览` 返回 + 当前视图标题（可拖），右侧专属控件 / 弹出 / 放大 / 关闭。
     fn render_tab_bar(
         &self,
         group: &TabGroupContext,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let mut tabs: Vec<AnyElement> = Vec::new();
-        for (ix, panel) in group.panels().iter().enumerate() {
-            if !panel.visible(cx) {
-                continue;
-            }
-            tabs.push(tab_element(group, panel, ix, &self.area, cx));
+        let Some(active) = group.active_panel() else {
+            return Empty.into_any_element();
+        };
+        let handle = PaneHandle::of(active);
+        let kind = handle.map(|h| h.kind(cx));
+        let panel_id = active.panel_id(cx);
+        let can_close =
+            active.closable(cx) && group.is_panel_closable(panel_id, cx) && !group.is_locked();
+        if matches!(kind, Some(PaneKind::Overview))
+            || (matches!(kind, Some(PaneKind::Chat)) && !can_close)
+        {
+            return Empty.into_any_element();
         }
 
-        let active_actions = group
-            .active_panel()
-            .and_then(PaneHandle::of)
-            .map(|handle| handle.actions(window, cx))
-            .unwrap_or_default();
-
-        let zoomed = group.is_zoomed();
         let node = group.node().as_u64();
+        // 同组里有「概览」说明这是右侧检视区钻进来的详情页：给一个一键退回按钮
+        let overview_ix = group.panels().iter().position(|panel| {
+            PaneHandle::of(panel).is_some_and(|h| h.kind(cx) == PaneKind::Overview)
+        });
+        let back_button = overview_ix.map(|ix| {
+            let select = group.clone();
+            div()
+                .id(("claudesktop-pane-back", node))
+                .h_full()
+                .flex_shrink_0()
+                .px_2()
+                .h_flex()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .text_size(TEXT_SMALL)
+                .text_color(rgb(INK_SOFT))
+                .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                .child(Icon::new(IconAll::ChevronLeft).small())
+                .child("概览")
+                .on_click(move |_, window, cx| select.select_tab(ix, window, cx))
+        });
+
+        let title = handle
+            .map(|h| h.display_title(cx))
+            .unwrap_or_else(|| SharedString::from(active.panel_name(cx)));
+        let badge = handle.and_then(|h| h.display_badge(cx));
+        let icon = kind.map_or(IconAll::Square, PaneKind::icon);
+        let active_ix = group.active_ix();
+        let drag = group.drag_panel(active_ix, cx);
+        let area = self.area.clone();
+        let title_pill = div()
+            .id(("claudesktop-pane-title", node))
+            .h_full()
+            .min_w_0()
+            .px_2()
+            .h_flex()
+            .items_center()
+            .gap_1p5()
+            .text_size(TEXT_SMALL)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(INK))
+            .child(Icon::new(icon).size_3p5().text_color(rgb(INK_SOFT)))
+            .child(div().min_w_0().overflow_hidden().text_ellipsis().child(title))
+            .when_some(badge, |d, badge| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .font_features(tabular_nums())
+                        .child(badge),
+                )
+            })
+            .when_some(drag, |d, drag| {
+                d.on_drag(drag, move |drag, offset, _, cx| {
+                    drag.set_drag_offset(offset);
+                    if let Some(area) = area.borrow().clone() {
+                        let _ = area.update(cx, |area, _| area.begin_panel_drag(panel_id));
+                    }
+                    cx.new(|_| drag.clone())
+                })
+            });
+
+        let active_actions = handle.map(|h| h.actions(window, cx)).unwrap_or_default();
+        let zoomed = group.is_zoomed();
         let zoom_handle = group.clone();
         let zoom_button = div()
             .id(("claudesktop-tab-zoom", node))
@@ -178,19 +246,10 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
                 zoom_handle.toggle_zoom(window, cx);
             });
 
-        // 「弹出独立窗」：把这个 Tab 搬到一个新的操作系统窗口里（Phase 2）。
-        // 主对话 Pane 不参与：它复用主窗的输入状态实体（见 popout.rs 文件头）
-        let active = group.active_panel();
-        let active_id = active.map(|panel| panel.panel_id(cx));
-        let active_is_chat =
-            active.and_then(PaneHandle::of).is_some_and(|handle| handle.kind(cx) == PaneKind::Chat);
+        // 主对话 Pane 不参与弹出独立窗：它复用主窗的输入状态实体（见 popout.rs）
+        let active_is_chat = kind == Some(PaneKind::Chat);
         let main = self.main.borrow().clone();
-        let add_button = main
-            .as_ref()
-            .and_then(|main| main.upgrade())
-            .map(|main| super::workspace::render_add_pane_menu(node, main, cx));
-        let popout_button = active_id.filter(|_| !active_is_chat).map(move |panel| {
-            let main = main.clone();
+        let popout_button = (!active_is_chat).then(|| {
             div()
                 .id(("claudesktop-tab-popout", node))
                 .h_full()
@@ -203,9 +262,31 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
                 .child(Icon::new(IconAll::ArrowUpRight).small())
                 .on_click(move |_, window, cx| {
                     if let Some(main) = main.as_ref().and_then(|main| main.upgrade()) {
-                        main.update(cx, |app, cx| app.popout_pane(panel, None, window, cx));
+                        main.update(cx, |app, cx| app.popout_pane(panel_id, None, window, cx));
                     }
                 })
+        });
+
+        let close_group = group.clone();
+        // 概览组里的固定视图（文件 / 改动 / 计划 / 子代理）只靠「‹ 概览」返回，不直接从组里删掉；
+        // 临时 / 独立面板（浏览器 / 终端 / 侧问 / 多开对话）给一个关闭按钮
+        let show_close = can_close
+            && !matches!(
+                kind,
+                Some(PaneKind::Files | PaneKind::Diff | PaneKind::Plan | PaneKind::Subagent)
+            );
+        let close_button = show_close.then(|| {
+            div()
+                .id(("claudesktop-pane-close", node))
+                .h_full()
+                .flex_shrink_0()
+                .px_1p5()
+                .flex()
+                .items_center()
+                .text_color(rgb(INK_SOFT))
+                .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                .child(Icon::new(IconAll::X).small())
+                .on_click(move |_, window, cx| close_group.close(panel_id, window, cx))
         });
 
         div()
@@ -218,14 +299,13 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
             .border_color(rgb(LINE))
             .bg(rgb(PAPER))
             .overflow_hidden()
-            .children(tabs)
-            .children(add_button)
-            // Tab 之后的空白只是空白：**不能**放 `chrome::drag_area()`，
-            // 那是给窗口标题栏用的 `WindowControlArea::Drag`，中下部分屏时双击它会最大化窗口
+            .children(back_button)
+            .child(title_pill)
             .child(div().flex_1().min_w_0().h_full())
             .children(active_actions)
             .children(popout_button)
             .child(zoom_button)
+            .children(close_button)
             .into_any_element()
     }
 
@@ -262,94 +342,6 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
         };
         Some(overlay.into_any_element())
     }
-}
-
-/// 一个 Tab：图标 + 标题 + badge + 关闭按钮；可拖到别的组或别的窗口。
-fn tab_element(
-    group: &TabGroupContext,
-    panel: &std::sync::Arc<dyn gpui_base::dock::PanelView>,
-    ix: usize,
-    area: &Rc<RefCell<Option<WeakEntity<DockArea>>>>,
-    cx: &mut App,
-) -> AnyElement {
-    let active = group.active_ix() == ix && !group.is_collapsed();
-    let (kind, title, badge, closable) = match PaneHandle::of(panel) {
-        Some(handle) => (
-            Some(handle.kind(cx)),
-            handle.display_title(cx),
-            handle.display_badge(cx),
-            panel.closable(cx),
-        ),
-        // base 自己的占位面板（这个版本认不出的 panel_name）：用它的名字兜底
-        None => (None, SharedString::from(panel.panel_name(cx)), None, panel.closable(cx)),
-    };
-    let icon = kind.map_or(IconAll::Square, |kind| kind.icon());
-    let panel_id = panel.panel_id(cx);
-    let can_close = closable && group.is_panel_closable(panel_id, cx) && !group.is_locked();
-    let close_group = group.clone();
-    let drag = group.drag_panel(ix, cx);
-    // 拖拽开始要告诉 DockArea 一声，它才能在区域外松手时发 DragOutside
-    let area = area.clone();
-    // 元素 id 要带上组：分屏出两个 Tab 组时，光用下标会撞车
-    let node = group.node().as_u64();
-
-    div()
-        .id(ElementId::Name(format!("dock-tab-{node}-{ix}").into()))
-        .h_full()
-        .flex_shrink_0()
-        .max_w(rems(13.))
-        .h_flex()
-        .items_center()
-        .gap_1p5()
-        .px_2p5()
-        .border_r_1()
-        .border_color(rgb(LINE))
-        .text_color(if active { rgb(INK) } else { rgb(INK_SOFT) })
-        .when(active, |d| d.bg(rgb(SAND_ACTIVE)))
-        .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK))))
-        .child(Icon::new(icon).size_3p5())
-        .child(div().min_w_0().overflow_hidden().text_ellipsis().child(title))
-        .when_some(badge, |d, badge| {
-            d.child(
-                div().flex_shrink_0().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(badge),
-            )
-        })
-        .when(can_close, |d| {
-            d.child(
-                div()
-                    .id(ElementId::Name(format!("dock-tab-close-{node}-{ix}").into()))
-                    .flex_shrink_0()
-                    .size_4()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .text_color(rgb(INK_FAINT))
-                    .hover(|d| d.bg(rgb(HOVER_STRONG)).text_color(rgb(INK)))
-                    .child(Icon::new(IconAll::X).size_3())
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        close_group.close(panel_id, window, cx);
-                    }),
-            )
-        })
-        .when(!active, |d| {
-            let select = group.clone();
-            d.on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                select.select_tab(ix, window, cx)
-            })
-        })
-        .when_some(drag, |d, drag| {
-            d.on_drag(drag, move |drag, offset, _, cx| {
-                drag.set_drag_offset(offset);
-                let area = area.borrow().clone();
-                if let Some(area) = area {
-                    let _ = area.update(cx, |area, _| area.begin_panel_drag(panel_id));
-                }
-                cx.new(|_| drag.clone())
-            })
-        })
-        .into_any_element()
 }
 
 #[cfg(test)]
