@@ -1661,10 +1661,10 @@ impl ChatApp {
                         .group_hover("changes-file", |d| d.opacity(1.))
                         .child(Icon::new(IconAll::ChevronRight).size_3().text_color(rgb(INK_SOFT))),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     let session = this.session();
                     if (session.token, session.diff_epoch) == origin {
-                        this.reveal_change(location, cx);
+                        this.reveal_change(location, window, cx);
                     }
                 }))
         });
@@ -1722,12 +1722,17 @@ impl ChatApp {
     /// 从改动卡片跳到某个文件的 diff：摘要视图里 diff 卡片是收起的。
     /// 只在内存里换回标准视图——这是「为看一眼」的临时切换，不能当成偏好写回设置文件
     /// （见 [`Self::set_view_mode`]）。
-    fn reveal_change(&mut self, location: DiffLocation, cx: &mut Context<Self>) {
+    fn reveal_change(
+        &mut self,
+        location: DiffLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings.view_mode == ViewMode::Summary {
             self.settings.view_mode = ViewMode::Normal;
             self.view_changed(cx);
         }
-        self.open_right_diff(location, cx);
+        self.open_right_diff(location, window, cx);
     }
 
     /// 一个文件的 diff 卡片；`preview` = 默认露出的行数（None = 全部）。

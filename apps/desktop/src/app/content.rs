@@ -48,20 +48,24 @@ impl Render for ContentView {
 }
 
 impl ChatApp {
-    /// 内容区在 `ChatApp` 里的位置：占满输入区以上的高度（按 style 排版，不按内容量），
-    /// 上面叠着画循环动画的覆盖层。
-    pub(super) fn content_slot(&self) -> impl IntoElement + use<> {
+    /// 内容区在对话 Pane 里的位置：占满输入区以上的高度（按 style 排版，不按内容量），
+    /// 上面叠着画循环动画的覆盖层。内容区与覆盖层由调用方给（每个 Pane 一份）。
+    pub(super) fn content_slot_with(
+        &self,
+        content: Entity<ContentView>,
+        overlay: Entity<motion::LoopOverlay>,
+    ) -> impl IntoElement + use<> {
         div()
             .relative()
             .flex_1()
             .min_h_0()
             .w_full()
             .child(
-                image_cache(self.image_cache.clone()).size_full().child(
-                    self.content_view.clone().cached(StyleRefinement::default().size_full()),
-                ),
+                image_cache(self.image_cache.clone())
+                    .size_full()
+                    .child(content.cached(StyleRefinement::default().size_full())),
             )
-            .child(self.loop_overlay.clone())
+            .child(overlay)
     }
 
     /// 设置页 / 模型清单的平滑滚动（指数逼近，参数见 `motion::WHEEL_*`）；模型清单有独立的内层滚动区。

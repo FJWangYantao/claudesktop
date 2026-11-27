@@ -975,6 +975,7 @@ dependencies = [
  "claudesktop-core",
  "embed-resource",
  "futures",
+ "gpui-base",
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-platform",

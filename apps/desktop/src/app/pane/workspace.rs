@@ -1,0 +1,245 @@
+//! 把工作区装进主窗：默认布局、恢复 / 保存、右侧 dock 的开合、以及每个 Pane 的正文。
+//!
+//! 布局的真相在 `DockArea` 里（`layout/` 里的树）；这里只负责
+//! 「建哪些面板」「什么时候读 / 写 `layout.json`」「右侧那一列开着还是收起」。
+
+use super::chat_pane::ChatPane;
+use super::diff_pane::DiffPane;
+use super::files_pane::FilesPane;
+use super::persist;
+use super::{PaneHandle, PaneKind};
+use crate::app::ChatApp;
+use crate::app::content::ContentView;
+use crate::app::motion::LoopOverlay;
+use gpui_base::dock::{DockEvent, DockLayout, DockPlacement, PanelView};
+use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// 拖分割条时 `LayoutChanged` 每帧都来，写盘要防抖（和滚轮落定一个量级）。
+const LAYOUT_SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// 右侧那一列的默认宽度
+const RIGHT_DOCK_W: Pixels = px(320.);
+
+impl ChatApp {
+    /// 建 dock 的皮肤与面板注册、恢复上次布局、挂写盘订阅。
+    /// 由 [`ChatApp::new`] 在会话恢复之后调一次。
+    pub(crate) fn init_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 皮肤要反手告诉 dock「哪个面板在拖」（拖出区域松手 → DragOutside）
+        self.dock_skin.attach_area(self.dock.downgrade());
+
+        // 恢复布局时按 panel_name 重建面板：注册表是全局的，主窗每建一次覆盖一次
+        for kind in [
+            PaneKind::Chat,
+            PaneKind::Files,
+            PaneKind::Diff,
+            PaneKind::SideChat,
+            PaneKind::Plan,
+            PaneKind::Subagent,
+        ] {
+            let weak = cx.entity().downgrade();
+            gpui_base::dock::register_panel(cx, kind.panel_name(), move |_ctx, window, cx| {
+                ChatApp::build_pane(kind, weak.clone(), window, cx)
+            });
+        }
+
+        // 布局变了就（防抖）写盘
+        let dock = self.dock.clone();
+        cx.subscribe_in(&dock, window, |this, _, event: &DockEvent, _, cx| {
+            if matches!(event, DockEvent::LayoutChanged) {
+                this.schedule_layout_save(cx);
+            }
+        })
+        .detach();
+
+        // 上次的布局优先；读不懂 / 没存过就用默认布局
+        let restored = persist::read()
+            .map(|file| self.dock.update(cx, |dock, cx| dock.load(file.main, window, cx).is_ok()))
+            .unwrap_or(false);
+        if !restored {
+            self.install_default_layout(window, cx);
+        }
+        // 右侧那一列跟着 `right_panel.open` 走（会话切到聊天空间时会收起）
+        self.sync_right_dock(window, cx);
+    }
+
+    /// 内置默认布局：中间一个对话 Pane，右侧文件 / 改动两个 Tab。
+    fn install_default_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chat = self.new_chat_pane(cx);
+        let files = self.new_files_pane(cx);
+        let diff = self.new_diff_pane(cx);
+        let dock = self.dock.clone();
+        dock.update(cx, |dock, cx| {
+            dock.set_center(
+                DockLayout::tabs().panel_view(Arc::new(chat) as Arc<dyn PanelView>, cx),
+                window,
+                cx,
+            );
+            dock.set_dock(
+                DockPlacement::Right,
+                DockLayout::tabs()
+                    .panel_view(Arc::new(files) as Arc<dyn PanelView>, cx)
+                    .panel_view(Arc::new(diff) as Arc<dyn PanelView>, cx),
+                window,
+                cx,
+            );
+            dock.set_dock_size(DockPlacement::Right, RIGHT_DOCK_W, window, cx);
+        });
+    }
+
+    /// 按 `panel_name` 重建一个面板（读布局时用）。
+    fn build_pane(
+        kind: PaneKind,
+        app: WeakEntity<ChatApp>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Arc<dyn PanelView> {
+        match kind {
+            PaneKind::Chat => {
+                // 对话 Pane 复用主窗那一份内容区与覆盖层（它们已经挂在 `ChatApp` 上）
+                let Some(upgraded) = app.upgrade() else {
+                    return Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx))));
+                };
+                let (content, overlay) = {
+                    let app = upgraded.read(cx);
+                    (app.content_view.clone(), app.loop_overlay.clone())
+                };
+                Arc::new(PaneHandle::new(
+                    cx.new(|cx| ChatPane::new(app.clone(), content, overlay, cx)),
+                ))
+            }
+            PaneKind::Files => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
+            PaneKind::Diff => Arc::new(PaneHandle::new(cx.new(|cx| DiffPane::new(app, cx)))),
+            // 其余 Pane 在后续阶段接上；先按文件面板兜底，别让旧布局整份作废
+            _ => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
+        }
+    }
+
+    pub(crate) fn new_chat_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
+        let app = cx.entity().downgrade();
+        let content = self.content_view.clone();
+        let overlay = self.loop_overlay.clone();
+        PaneHandle::new(cx.new(|cx| ChatPane::new(app, content, overlay, cx)))
+    }
+
+    pub(crate) fn new_files_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
+        let app = cx.entity().downgrade();
+        PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))
+    }
+
+    pub(crate) fn new_diff_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
+        let app = cx.entity().downgrade();
+        PaneHandle::new(cx.new(|cx| DiffPane::new(app, cx)))
+    }
+
+    /// 把某个种类的 Pane 显示出来（右侧那一列里可能和别的 Pane 并成 Tab）。
+    /// 找不到就什么都不做：这个会话没有那个面板（比如聊天空间没有文件）。
+    pub(crate) fn focus_pane_of_kind(
+        &mut self,
+        kind: PaneKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dock = self.dock.clone();
+        let mut found = None;
+        for placement in [DockPlacement::Right, DockPlacement::Center] {
+            let Some(tree) = dock.read(cx).layout(placement) else { continue };
+            let ids: Vec<_> = tree.panels().collect();
+            for id in ids {
+                let handle = dock.read(cx).panel(id).and_then(PaneHandle::of).map(|h| h.kind(cx));
+                if handle == Some(kind) {
+                    found = Some(id);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        if let Some(id) = found {
+            dock.update(cx, |dock, cx| dock.select_panel(id, window, cx));
+        }
+    }
+
+    /// 右侧那一列：开着就保证 dock 里有这组 Tab 并展开，收起就折起来。
+    pub(crate) fn sync_right_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let want = self.right_panel_controls();
+        let dock = self.dock.clone();
+        let has = dock.read(cx).has_dock(DockPlacement::Right);
+        if want && !has {
+            let files = self.new_files_pane(cx);
+            let diff = self.new_diff_pane(cx);
+            dock.update(cx, |dock, cx| {
+                dock.set_dock(
+                    DockPlacement::Right,
+                    DockLayout::tabs()
+                        .panel_view(Arc::new(files) as Arc<dyn PanelView>, cx)
+                        .panel_view(Arc::new(diff) as Arc<dyn PanelView>, cx),
+                    window,
+                    cx,
+                );
+                dock.set_dock_size(DockPlacement::Right, RIGHT_DOCK_W, window, cx);
+            });
+        }
+        // 展开 / 收起：只有本区域的 open 状态和想要的不一样才动它（避免每帧写布局）
+        let open = dock.read(cx).is_dock_open(DockPlacement::Right);
+        if want != open && dock.read(cx).has_dock(DockPlacement::Right) {
+            dock.update(cx, |dock, cx| dock.toggle_dock(DockPlacement::Right, window, cx));
+        }
+    }
+
+    /// 布局写盘：拖分割条时会被每帧叫到，300ms 内的连续变化合成一次写。
+    pub(crate) fn schedule_layout_save(&mut self, cx: &mut Context<Self>) {
+        if self.layout_save.is_some() {
+            return;
+        }
+        self.layout_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LAYOUT_SAVE_DEBOUNCE).await;
+            let _ = this.update(cx, |app, cx| {
+                app.layout_save = None;
+                let snapshot = persist::snapshot(app.dock.read(cx), cx);
+                persist::write(&snapshot);
+            });
+        }));
+    }
+
+    /// 命令面板的「重置工作区布局」：丢掉存档，按默认布局重排。
+    pub(crate) fn reset_workspace_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dock = self.dock.clone();
+        dock.update(cx, |dock, cx| {
+            dock.remove_dock(DockPlacement::Right, window, cx);
+            dock.set_zoomed_out(window, cx);
+        });
+        self.install_default_layout(window, cx);
+        self.right_panel.open = true;
+        self.sync_right_dock(window, cx);
+        cx.notify();
+    }
+
+    /// 对话 Pane 的正文：首页背景 + 内容区 + 输入框（顶栏在外面，见 chrome.rs）。
+    pub(crate) fn render_chat_body(
+        &mut self,
+        content: Entity<ContentView>,
+        overlay: Entity<LoopOverlay>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = v_flex()
+            .relative()
+            .size_full()
+            .min_h_0()
+            .w_full()
+            .when(self.home_backdrop_active(), |d| d.child(self.home_backdrop_view.clone()))
+            .child(self.content_slot_with(content, overlay))
+            .when(!self.settings_open, |d| {
+                d.child(
+                    self.reading_column(div().pb_4().pt_2())
+                        .child(self.render_composer(window, cx)),
+                )
+            });
+        body.when(!self.settings_open, |d| self.with_file_drop(d, cx)).into_any_element()
+    }
+}

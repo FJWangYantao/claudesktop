@@ -14,6 +14,7 @@ headless-screenshot = ["gpui-screenshot/test-support", "gpui-platform-screenshot
 
 [dependencies]
 gpui-kit = { workspace = true }
+gpui-base = "=0.7.3"
 gpui-screenshot = { package = "gpui-pre", version = "=0.3.9", default-features = false, optional = true }
 gpui-platform-screenshot = { package = "gpui-pre-platform", version = "=0.3.9", default-features = false, optional = true }
 claudesktop-core = { path = "../../crates/core" }

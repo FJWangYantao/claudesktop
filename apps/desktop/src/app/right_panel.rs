@@ -5,7 +5,7 @@
 
 use super::ChatApp;
 use super::chat::{diff_line, diff_truncated};
-use super::chrome::{CHROME_H, drag_area};
+use super::chrome::CHROME_H;
 use super::menu::diff_stat;
 use super::widgets::Surface;
 use crate::model::{DiffLocation, TurnFile, same_path, turn_files};
@@ -27,6 +27,7 @@ const PREVIEW_LIMIT: usize = 256 * 1024;
 const MAX_DEPTH: usize = 8;
 const FILE_ROW_H: Rems = rems(1.75);
 
+/// 右侧那一列停在哪一类 Pane 上（顶栏开关 / 快捷键 / 命令面板都走这个）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum RightTab {
     #[default]
@@ -35,17 +36,11 @@ pub(super) enum RightTab {
 }
 
 impl RightTab {
-    fn label(self) -> &'static str {
+    /// 对应的 Pane 种类：Tab 的标题和图标由 `PaneKind` 给，不再各写一份。
+    pub(super) fn pane_kind(self) -> crate::app::pane::PaneKind {
         match self {
-            Self::Files => "文件",
-            Self::Changes => "改动",
-        }
-    }
-
-    fn icon(self) -> IconAll {
-        match self {
-            Self::Files => IconAll::FolderTree,
-            Self::Changes => IconAll::FileDiff,
+            Self::Files => crate::app::pane::PaneKind::Files,
+            Self::Changes => crate::app::pane::PaneKind::Diff,
         }
     }
 }
@@ -259,7 +254,7 @@ pub(super) struct RightPanelState {
     seen_token: Option<u64>,
     root: PathBuf,
     file_tree: FileTree,
-    selected_file: Option<PathBuf>,
+    pub(crate) selected_file: Option<PathBuf>,
     preview: Option<FilePreview>,
     diff_preview: Option<DiffPreview>,
     changed_files: Option<ChangedFiles>,
@@ -432,7 +427,12 @@ impl ChatApp {
         self.right_panel.open && !self.settings_open && !self.session().is_chat()
     }
 
-    pub(super) fn toggle_right_panel(&mut self, tab: RightTab, cx: &mut Context<Self>) {
+    pub(super) fn toggle_right_panel(
+        &mut self,
+        tab: RightTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.right_panel.open && self.right_panel.tab == tab {
             self.right_panel.open = false;
             self.right_panel.expanded = false;
@@ -441,12 +441,14 @@ impl ChatApp {
             self.right_panel.open = true;
             self.right_panel.tab = tab;
         }
+        self.sync_right_dock(window, cx);
+        self.focus_pane_of_kind(tab.pane_kind(), window, cx);
         cx.notify();
     }
 
     /// 顶栏单开关：开着就收起（并退出全宽），关着就打开上次停的 Tab。
     /// 指定 Tab 的入口仍走 `toggle_right_panel`（`Ctrl+Shift+F` / `Ctrl+Shift+D` / 命令面板）。
-    pub(super) fn toggle_right_panel_open(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_right_panel_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_panel.open {
             self.right_panel.open = false;
             self.right_panel.expanded = false;
@@ -454,10 +456,17 @@ impl ChatApp {
             self.settings_open = false;
             self.right_panel.open = true;
         }
+        self.sync_right_dock(window, cx);
+        self.focus_pane_of_kind(self.right_panel.tab.pane_kind(), window, cx);
         cx.notify();
     }
 
-    pub(super) fn open_right_diff(&mut self, location: DiffLocation, cx: &mut Context<Self>) {
+    pub(super) fn open_right_diff(
+        &mut self,
+        location: DiffLocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let session = &self.sessions[self.active];
         let selection = DiffSelection { location, epoch: session.diff_epoch };
         if selection.resolve(session).is_none() {
@@ -471,6 +480,8 @@ impl ChatApp {
         if panel.diff_preview.as_ref().is_none_or(|preview| preview.selection != selection) {
             panel.diff_preview = Some(DiffPreview::new(selection));
         }
+        self.sync_right_dock(window, cx);
+        self.focus_pane_of_kind(RightTab::Changes.pane_kind(), window, cx);
         cx.notify();
     }
 
@@ -495,152 +506,37 @@ impl ChatApp {
             )
     }
 
-    fn render_right_handle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        div()
-            .id("right-panel-resize")
-            .w(px(6.))
-            .h_full()
-            .flex_shrink_0()
-            .cursor_ew_resize()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    this.panel_resizing = Some(PanelResize {
-                        start_x: event.position.x,
-                        start_width: this.right_panel.width_rem(),
-                        right: true,
-                    });
-                    window.prevent_default();
-                    cx.stop_propagation();
-                }),
-            )
-    }
-
-    pub(super) fn render_right_panel_slot(
+    /// 文件 Pane 的正文（外壳是 dock 的 Tab 栏，这里不再画自己的顶栏）。
+    pub(super) fn render_files_tab(
         &mut self,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<Self>,
-    ) -> Option<Div> {
-        let visible = self.right_panel_controls();
-        let showing_preview = visible
-            && self.right_panel.tab == RightTab::Files
-            && (self.panel_split() || self.right_panel.selected_file.is_some());
+    ) -> AnyElement {
+        let session = &self.sessions[self.active];
+        self.right_panel.sync_session(session.token, &session.cwd);
+        let showing_preview = self.panel_split() || self.right_panel.selected_file.is_some();
         if !showing_preview && let Some(preview) = &mut self.right_panel.preview {
             preview.release_list();
         }
-        if !visible || self.right_panel.tab != RightTab::Changes {
-            self.right_panel.changed_files = None;
-            if let Some(preview) = &mut self.right_panel.diff_preview {
-                preview.release_list();
-            }
-        }
-        if !visible {
-            return None;
-        }
-        let session = &self.sessions[self.active];
-        self.right_panel.sync_session(session.token, &session.cwd);
-        let expanded = self.right_panel.expanded;
-        let body = match self.right_panel.tab {
-            RightTab::Files => self.render_file_workspace(window, cx),
-            RightTab::Changes => self.render_diff_workspace(window, cx),
-        };
-        let header = self.render_right_header(window, cx);
-        Some(
-            div()
-                .h_flex()
-                .h_full()
-                .flex_shrink_0()
-                .when(!expanded, |d| d.w(rems(self.right_panel.width_rem())))
-                .when(expanded, |d| d.flex_1().min_w_0())
-                .child(self.render_right_handle(cx))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .bg(rgb(PAPER))
-                        .border_l_1()
-                        .border_color(rgb(LINE))
-                        .child(header)
-                        .child(body),
-                ),
-        )
+        self.render_file_workspace(window, cx)
     }
 
-    fn render_right_header(&self, _window: &Window, cx: &mut Context<Self>) -> Div {
-        let tab_button = |tab: RightTab, cx: &mut Context<Self>| {
-            let active = self.right_panel.tab == tab;
-            div()
-                .id(ElementId::Name(format!("right-tab-{}", tab.label()).into()))
-                .h_flex()
-                .items_center()
-                .gap_1p5()
-                .h(rems(1.75))
-                .px_2p5()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(TEXT_SMALL)
-                .line_height(LEADING_UI)
-                .text_color(rgb(if active { INK } else { INK_SOFT }))
-                .bg(if active { rgb(SELECTED) } else { rgba(CLEAR) })
-                .when(!active, |d| d.hover(|d| d.bg(rgb(HOVER))))
-                .child(Icon::new(tab.icon()).size_3p5())
-                .child(tab.label())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.right_panel.tab = tab;
-                    cx.notify();
-                }))
-        };
-        let expanded = self.right_panel.expanded;
-        div()
-            .h_flex()
-            .h(CHROME_H)
-            .flex_shrink_0()
-            .items_center()
-            .pl_3()
-            .border_b_1()
-            .border_color(rgb(LINE))
-            .child(tab_button(RightTab::Files, cx))
-            .child(tab_button(RightTab::Changes, cx))
-            .child(drag_area())
-            // 刷新只属于文件树（改动 Tab 上点它会清掉当前 Diff 预览）
-            .when(self.right_panel.tab == RightTab::Files, |d| {
-                d.child(
-                    Self::quiet_button("right-refresh", IconAll::RefreshCw, Surface::Paper, cx)
-                        .small()
-                        .tooltip("刷新")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.right_panel.refresh();
-                            cx.notify();
-                        })),
-                )
-            })
-            .child(
-                Self::quiet_button(
-                    "right-expand",
-                    if expanded { IconAll::Minimize } else { IconAll::Maximize },
-                    Surface::Paper,
-                    cx,
-                )
-                .small()
-                .tooltip(if expanded { "恢复对话并排" } else { "展开到全宽" })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.right_panel.expanded = !this.right_panel.expanded;
-                    cx.notify();
-                })),
-            )
-            .child(
-                Self::quiet_button("right-close", IconAll::X, Surface::Paper, cx)
-                    .small()
-                    .tooltip("关闭辅助面板")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.right_panel.open = false;
-                        this.right_panel.expanded = false;
-                        cx.notify();
-                    })),
-            )
-            // 面板的 X 和窗口按钮隔开（以前这里带着窗口按钮，现在它们在全局顶栏）
-            .child(div().w(px(1.)).h(rems(1.)).mx_1().bg(rgb(LINE)))
+    /// 改动 Pane 的正文。
+    pub(super) fn render_diff_tab(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session = &self.sessions[self.active];
+        self.right_panel.sync_session(session.token, &session.cwd);
+        self.render_diff_workspace(window, cx)
+    }
+
+    /// 这一轮改了几个文件（改动 Pane 的 Tab badge）。
+    pub(super) fn right_panel_changed_file_count(&self, _cx: &App) -> usize {
+        let session = &self.sessions[self.active];
+        // 和改动清单同一口径（`ChangedFiles::sync` 读的就是这份记录）
+        turn_files(&session.transcript, 0).len()
     }
 
     fn panel_split(&self) -> bool {
@@ -956,10 +852,10 @@ impl ChatApp {
                     .child(path),
             )
             .child(diff_stat(file.added, file.removed))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 let session = this.session();
                 if (session.token, session.diff_epoch) == origin {
-                    this.open_right_diff(location, cx);
+                    this.open_right_diff(location, window, cx);
                 }
             }))
     }
@@ -1063,7 +959,7 @@ impl ChatApp {
                     "fn main() {\n    println!(\"new\");\n    println!(\"ready\");\n}\n",
                 ));
                 session.apply_mock(&MockAction::ToolDone("已更新"));
-                self.open_right_diff(DiffLocation { item, diff: 0 }, cx);
+                self.open_right_diff(DiffLocation { item, diff: 0 }, window, cx);
             }
             "expanded" => {
                 let path = self.session().cwd.join("apps/desktop/src/main.rs");

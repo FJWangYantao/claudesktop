@@ -829,4 +829,19 @@
 - **窗口按钮只留在全局顶栏**：`right_panel.rs` 的顶栏以前也挂 `window_controls`，右侧面板一开
   关按钮就跳位置。现在主窗根是 `v_flex[固定顶栏 CHROME_H, h_flex[侧栏, 工作区, 面板]]`，
   侧栏头部不再放 macOS 红绿灯占位（它在顶栏里）。
+- **Pane 句柄必须包一层具体类型**（`pane/mod.rs` 的 `PaneHandle`）：base 只存
+  `Arc<dyn PanelView>`，而 `Arc<dyn 子 trait>` 收窄成父 trait object 之后**回不去**，皮肤要读
+  标题 / 图标只能靠 `as_any().downcast_ref::<PaneHandle>()`。副作用：base 自己的占位面板
+  （`PlaceholderPanel`）还原不出来，皮肤要有一条「认不出就用 panel_name 兜底」的分支。
+- **`PanelState::panel()` 不存在**：`PanelInfo::panel(json)` 是 `PanelInfo` 的构造函数，
+  `PanelState` 得整个结构体字面量写（`pane_state()` 里就是），`children` 必须给空 Vec。
+- **皮肤拿不到自己的 `DockArea`**：`with_renderer` 会把 `Rc` 拿走，Tab 的 `on_drag` 闭包又要
+  反手报 `begin_panel_drag`。做法是皮肤持 `Rc<RefCell<Option<WeakEntity<DockArea>>>>`，
+  `init_workspace` 里建完 area 再 `attach_area` 回填；别用 thread_local 传（Tab 是构建期抓的值，
+  渲染顺序一变就抓错）。
+- **`render_tab_bar` 的 `cx` 是 `&mut App` 而不是 `Context<Self>`**：那里没有 `cx.listener`，
+  要用裸闭包（`|_, window, cx| ...`）；`cx.stop_propagation()` 在 `App` 上有。
+- **`div().tooltip(...)` 收的是闭包**，不是字符串（只有 gpui-kit 的按钮收 `SharedString`）。
+  给裸 div 加悬停说明要么走 `Tooltip` 组件，要么干脆别加。
+
 

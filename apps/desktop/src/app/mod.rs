@@ -28,6 +28,7 @@ mod motion;
 mod notify;
 mod overview;
 mod palette;
+pub(crate) mod pane;
 mod plugin_versions;
 mod plugins_view;
 pub(crate) mod prism_rim;
@@ -135,6 +136,12 @@ type ToolScrollRegions = std::rc::Rc<std::cell::RefCell<Vec<(Bounds<Pixels>, Scr
 pub struct ChatApp {
     /// 跨窗口共享的那一层（活跃会话、会话摘要、设置、浮层开合；见 hub.rs）
     pub(crate) hub: Entity<hub::WorkspaceHub>,
+    /// 工作区的自由分屏底座（见 pane/mod.rs）
+    pub(crate) dock: Entity<gpui_base::dock::DockArea>,
+    /// dock 的皮肤；Tab 拖拽要把「哪个面板在拖」反手告诉 dock，所以这里留一份
+    dock_skin: std::rc::Rc<pane::skin::ClaudesktopDockSkin>,
+    /// 布局写盘的防抖任务（拖分割条时每帧都会 LayoutChanged）
+    layout_save: Option<Task<()>>,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -610,8 +617,17 @@ impl ChatApp {
             std::rc::Rc::new(std::cell::RefCell::new(home_backdrop::HomeBackdrop::default()));
         let home_backdrop_view =
             cx.new(|_| home_backdrop::HomeBackdropView::new(home_backdrop.clone()));
+        // 工作区底座先建：它不依赖 `ChatApp`，但面板的注册与恢复要靠 `ChatApp` 的弱引用（见 init_workspace）
+        let dock_skin = pane::skin::ClaudesktopDockSkin::new();
+        let renderer: std::rc::Rc<dyn gpui_base::dock::DockAreaRenderer> = dock_skin.clone();
+        let dock = cx.new(|cx| {
+            gpui_base::dock::DockArea::new("workspace", Some(1), window, cx).with_renderer(renderer)
+        });
         let mut app = Self {
             hub: hub::WorkspaceHub::new_entity(cx, settings.clone()),
+            dock,
+            dock_skin,
+            layout_save: None,
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),
@@ -770,6 +786,8 @@ impl ChatApp {
         app.refresh_git_branch(0, cx);
         app.apply_motion_pref(cx);
         app.init_notifications(window, cx);
+        // 工作区：先按上次的布局恢复（读不到就默认布局），再挂拖拽/写盘
+        app.init_workspace(window, cx);
         // 启动时的会话里，worktree 目录没了的（用户删了 / 换了电脑）：现在就把分支接回来
         for idx in 0..app.sessions.len() {
             if ChatApp::worktree_is_missing(&app.sessions[idx]) {
@@ -4498,36 +4516,15 @@ impl Render for ChatApp {
         // 首页背景（地平线极光 + ASCII 波动字阵）铺在「内容区 + 输入区」整块背后，
         // 所以挂在这个 relative 容器的最底层而不是 content_slot 里——挂在后者会让
         // 极光在输入框上沿被一刀截断。对话态整块不挂载（0 CPU / 0 GPU，显存自动回收）。
-        let body = v_flex()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .when(self.home_backdrop_active(), |d| d.child(self.home_backdrop_view.clone()))
-            .child(self.content_slot())
-            .when(!self.settings_open, |d| {
-                d.child(
-                    self.reading_column(div().pb_4().pt_2())
-                        .child(self.render_composer(window, cx)),
-                )
-            });
-        // 顶栏是主窗的固定一条（见 chrome.rs）：侧栏、对话区、辅助面板都在它下面，
-        // 窗口按钮只挂在它最右侧，所以面板开合时位置不会跳
+        // 顶栏是主窗的固定一条（见 chrome.rs）：侧栏、工作区、弹出面板都在它下面
         let chrome_bar = self.render_header(window, cx);
-        let main = v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .relative()
-            .child(body)
-            .when(!self.settings_open, |d| self.with_file_drop(d, cx));
+        // 工作区 = 自由分屏的 DockArea：对话 / 文件 / 改动都是里面的 Pane
+        let workspace = div().flex_1().min_w_0().h_full().relative().child(self.dock.clone());
 
         let mut root = div();
         // 中文回退字体：根上设一次，子元素换 font_family 时继承
         root.text_style().font_fallbacks = Some(cjk_fallbacks());
         // 不用系统标题栏：顶上一条全局薄顶栏兼做标题栏，下面整片交给侧栏 + 工作区
-        let show_main =
-            !self.right_panel_controls() || !self.right_panel.expanded || self.settings_open;
         let root = root
             .v_flex()
             .size_full()
@@ -4547,11 +4544,10 @@ impl Render for ChatApp {
                         d.children(self.render_sidebar_slot(window, cx))
                             .child(self.render_sidebar_handle(cx))
                     })
-                    .when(show_main, |d| d.child(main))
+                    .child(workspace)
                     .when(!self.settings_navigation_only(), |d| {
                         d.child(self.sidebar_spinners_view.clone())
-                    })
-                    .children(self.render_right_panel_slot(window, cx)),
+                    }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 // 棱镜描边跟随指针：这里只通知描边自己，不让 ChatApp 变脏（见 prism_rim.rs）

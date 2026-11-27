@@ -45,6 +45,8 @@ enum PaletteCmd {
     Files,
     /// 逐文件改动
     Changes,
+    /// 工作区布局回到默认（对话居中，文件 / 改动在右侧）
+    ResetLayout,
     /// 用量页
     Usage,
     /// 在资源管理器里打开用量网关的日志目录
@@ -203,6 +205,8 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
         Entry::new(IconAll::FolderTree, "文件树与源码预览", PaletteCmd::Files).key(FILES_KEY),
         Entry::new(IconAll::FileDiff, "逐文件改动", PaletteCmd::Changes).key(CHANGES_KEY),
+        Entry::new(IconAll::LayoutDashboard, "重置工作区布局", PaletteCmd::ResetLayout)
+            .desc("对话回到中间，文件 / 改动回到右侧"),
         Entry::new(IconAll::ChartColumn, "查看用量", PaletteCmd::Usage),
         Entry::new(IconAll::FolderOpen, "打开用量网关日志", PaletteCmd::GatewayLogs)
             .desc("每个请求一行的 JSONL"),
@@ -451,8 +455,9 @@ impl ChatApp {
                 self.start_in_worktree(cx);
             }
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
-            PaletteCmd::Files => self.toggle_right_panel(RightTab::Files, cx),
-            PaletteCmd::Changes => self.toggle_right_panel(RightTab::Changes, cx),
+            PaletteCmd::Files => self.toggle_right_panel(RightTab::Files, window, cx),
+            PaletteCmd::Changes => self.toggle_right_panel(RightTab::Changes, window, cx),
+            PaletteCmd::ResetLayout => self.reset_workspace_layout(window, cx),
             PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),
             // 面板的对话框刚关，同一帧里还算开着：等下一帧再开速查

@@ -239,7 +239,9 @@ impl ChatApp {
                     .when(panel_open, |b| {
                         b.icon(Icon::new(IconAll::PanelRight).text_color(rgb(CORAL)))
                     })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_right_panel_open(cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_right_panel_open(window, cx)),
+                    ),
                 )
             })
             // 导出 / 在项目里继续这类会话动作收进 `⋯`，只在有对话时出现

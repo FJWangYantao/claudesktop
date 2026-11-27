@@ -190,11 +190,11 @@ impl ChatApp {
             .on_action(
                 cx.listener(|this, _: &ShowShortcuts, window, cx| this.open_shortcuts(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &ToggleFiles, _, cx| {
-                this.toggle_right_panel(RightTab::Files, cx)
+            .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
+                this.toggle_right_panel(RightTab::Files, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
-                this.toggle_right_panel(RightTab::Changes, cx)
+            .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
+                this.toggle_right_panel(RightTab::Changes, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
