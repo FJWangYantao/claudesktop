@@ -1162,7 +1162,8 @@ impl ChatApp {
         // 无元信息的会话（刚开、还没落盘）视为最新
         let activity = |i: usize| self.session_activity(i);
         let space = self.space().kind();
-        let listed = |i: usize| listed(i) && self.sessions[i].kind == space;
+        let listed =
+            |i: usize| listed(i) && !self.sessions[i].ephemeral && self.sessions[i].kind == space;
         if !by_project {
             let now =
                 SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);

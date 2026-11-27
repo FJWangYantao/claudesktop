@@ -1090,7 +1090,8 @@ impl ChatApp {
     }
 
     fn hibernate_display(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if std::env::var_os("CLAUDESKTOP_DISABLE_RECLAIM").is_some()
+        if self.sessions[idx].ephemeral
+            || std::env::var_os("CLAUDESKTOP_DISABLE_RECLAIM").is_some()
             || std::env::var_os("CLAUDESKTOP_DISABLE_DISPLAY_RECLAIM").is_some()
             || !self.sessions[idx].display_evictable()
             || self.slot(&self.sessions[idx].kernel_key).is_some_and(|slot| {
@@ -1514,7 +1515,8 @@ impl ChatApp {
         // 已经有一个还没开始的空会话（启动时开的、刚点过的）就切过去，别在侧栏堆一串「新会话」；
         // 它要是建过一个没动过的 worktree，顺手清掉（见 worktree.rs）
         let blank = self.sessions.iter().position(|s| {
-            !s.has_user_message()
+            !s.ephemeral
+                && !s.has_user_message()
                 && !s.busy
                 && !s.renamed
                 && s.kernel == kind
@@ -1538,7 +1540,8 @@ impl ChatApp {
     fn open_or_reuse_code_session(&mut self, dir: PathBuf, task: bool, cx: &mut Context<Self>) {
         let kind = self.settings.kernel_for_space(Space::Code);
         let blank = self.sessions.iter().position(|s| {
-            !s.has_user_message()
+            !s.ephemeral
+                && !s.has_user_message()
                 && !s.busy
                 && !s.renamed
                 && s.kind == SessionKind::Code
@@ -1766,7 +1769,8 @@ impl ChatApp {
             Some(idx) => self.active = idx,
             None => {
                 let blank = self.sessions.iter().position(|s| {
-                    s.kind == space.kind()
+                    !s.ephemeral
+                        && s.kind == space.kind()
                         && !s.meta.as_ref().is_some_and(|m| m.archived)
                         && !s.busy
                         && !s.has_user_message()
@@ -4290,7 +4294,8 @@ impl ChatApp {
 
     /// 确保第 `idx` 个会话的日志已打开（首次写入时建档）；失败时提示并停用存储。
     fn ensure_log(&mut self, idx: usize) {
-        if self.sessions[idx].log.is_some() {
+        if self.sessions[idx].log.is_some() || self.sessions[idx].ephemeral {
+            // 侧问影子会话不开日志、不建档
             return;
         }
         // 存储可能已在别处停用（写盘失败）。这里取局部引用，不再 `unwrap`——
@@ -4331,7 +4336,8 @@ impl ChatApp {
     /// 往第 `idx` 个会话的日志追加一条记录；首次写入时建档。
     /// 写盘失败只提示一次，不影响对话本身。
     fn persist(&mut self, idx: usize, record: Record) {
-        if self.store.is_none() {
+        if self.store.is_none() || self.sessions[idx].ephemeral {
+            // 侧问影子会话：整份都不落盘（不建档、不开日志、不写记录）
             return;
         }
         self.ensure_log(idx);
