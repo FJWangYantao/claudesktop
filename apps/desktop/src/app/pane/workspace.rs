@@ -85,6 +85,10 @@ impl ChatApp {
         })
         .detach();
 
+        // 内容区绑到当前活跃会话（多 ChatPane 之后每块各带自己的那份，见 content.rs）
+        let token = self.session().token;
+        self.content_view.update(cx, |view, cx| view.set_token(token, cx));
+
         // 上次的布局优先；读不懂 / 没存过 / 恢复出来一个没有对话 Pane 的布局，都用默认布局。
         // （没有对话 Pane 的窗口等于空壳，宁可丢一次布局）
         let saved = persist::read();
@@ -149,12 +153,13 @@ impl ChatApp {
                 let Some(upgraded) = app.upgrade() else {
                     return Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx))));
                 };
-                let (content, overlay) = {
+                let (content, overlay, token) = {
                     let app = upgraded.read(cx);
-                    (app.content_view.clone(), app.loop_overlay.clone())
+                    (app.content_view.clone(), app.loop_overlay.clone(), app.session().token)
                 };
+                content.update(cx, |view, cx| view.set_token(token, cx));
                 Arc::new(PaneHandle::new(
-                    cx.new(|cx| ChatPane::new(app.clone(), content, overlay, cx)),
+                    cx.new(|cx| ChatPane::new(app.clone(), token, content, overlay, cx)),
                 ))
             }
             PaneKind::Files => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
@@ -170,9 +175,11 @@ impl ChatApp {
 
     pub(crate) fn new_chat_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
         let app = cx.entity().downgrade();
+        let token = self.session().token;
         let content = self.content_view.clone();
+        content.update(cx, |view, cx| view.set_token(token, cx));
         let overlay = self.loop_overlay.clone();
-        PaneHandle::new(cx.new(|cx| ChatPane::new(app, content, overlay, cx)))
+        PaneHandle::new(cx.new(|cx| ChatPane::new(app, token, content, overlay, cx)))
     }
 
     pub(crate) fn new_files_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {

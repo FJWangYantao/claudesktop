@@ -14,16 +14,22 @@ use gpui_kit::*;
 
 pub(crate) struct ChatPane {
     app: WeakEntity<ChatApp>,
+    /// 这块对话绑的会话：多块并排时各绑各的（同一 token 最多一块，见 `workspace.rs`）
+    token: u64,
     focus_handle: FocusHandle,
     /// 这块对话自己的内容区缓存 view（主窗只有一块时就是 `ChatApp` 的那一份）
     content: Entity<ContentView>,
     /// 叠在内容区上画转圈 / 扫光的覆盖层（和 `content` 共用一份位置池）
     overlay: Entity<LoopOverlay>,
+    /// 焦点不在这块时,输入框里的草稿存在这儿（同一时刻只有一块挂着真正的输入框）
+    #[allow(dead_code)] // 单活跃 Composer 的草稿热切换（本分支下一笔）
+    draft: String,
 }
 
 impl ChatPane {
     pub(crate) fn new(
         app: WeakEntity<ChatApp>,
+        token: u64,
         content: Entity<ContentView>,
         overlay: Entity<LoopOverlay>,
         cx: &mut Context<Self>,
@@ -33,7 +39,24 @@ impl ChatPane {
             let hub = upgraded.read(cx).hub.clone();
             super::follow_hub(&hub, cx);
         }
-        Self { app, focus_handle: cx.focus_handle(), content, overlay }
+        Self { app, token, focus_handle: cx.focus_handle(), content, overlay, draft: String::new() }
+    }
+
+    /// 这块对话在看哪个会话
+    #[allow(dead_code)] // 多 ChatPane 的焦点切换（本分支下一笔）用它
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// 换绑会话（侧栏「在右边打开」时用）：内容区跟着换，草稿存回旧会话。
+    #[allow(dead_code)]
+    pub(crate) fn set_token(&mut self, token: u64, cx: &mut Context<Self>) {
+        if self.token == token {
+            return;
+        }
+        self.token = token;
+        self.content.update(cx, |view, cx| view.set_token(token, cx));
+        cx.notify();
     }
 }
 
@@ -42,11 +65,14 @@ impl ClaudesktopPane for ChatPane {
         PaneKind::Chat
     }
 
-    /// Tab 上的标题就是会话标题（切会话时跟着变，见 `ChatApp::sync_hub`）
+    /// Tab 上的标题就是这块 pane 绑的会话标题（不是全局活跃会话的）
     fn title(&self, cx: &App) -> SharedString {
         self.app
             .upgrade()
-            .map(|app| app.read(cx).session().title.clone())
+            .and_then(|app| {
+                let app = app.read(cx);
+                app.index_of_token(self.token).map(|idx| app.sessions[idx].title.clone())
+            })
             .unwrap_or_else(|| PaneKind::Chat.title())
     }
 
@@ -54,8 +80,8 @@ impl ClaudesktopPane for ChatPane {
         IconAll::MessageSquare
     }
 
-    fn session_token(&self, cx: &App) -> Option<u64> {
-        self.app.upgrade().map(|app| app.read(cx).session().token)
+    fn session_token(&self, _cx: &App) -> Option<u64> {
+        Some(self.token)
     }
 }
 

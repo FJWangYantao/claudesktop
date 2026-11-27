@@ -27,21 +27,37 @@ pub(super) const MESSAGE_HOVER_SETTLE: Duration = Duration::from_millis(120);
 /// 内容区的缓存 view：内容全由 `ChatApp::render_content` 画，这里只是把它隔成一块单独重画的区域。
 pub(crate) struct ContentView {
     app: WeakEntity<ChatApp>,
+    /// 这块内容区画的是哪个会话：多 `ChatPane` 时靠它把 `active` 在这段渲染里指过去
+    /// （`ContentView` 是独立实体，渲染时机在 `ChatPane::render` 之后，所以 token 必须存在它自己身上）
+    token: u64,
     /// 这块内容区自己的循环动画位置池（见 `motion::LoopSpots`）
     spots: motion::LoopSpots,
 }
 
 impl ContentView {
-    pub(super) fn new(app: WeakEntity<ChatApp>, spots: motion::LoopSpots) -> Self {
-        Self { app, spots }
+    pub(super) fn new(app: WeakEntity<ChatApp>, token: u64, spots: motion::LoopSpots) -> Self {
+        Self { app, token, spots }
+    }
+
+    /// 绑到另一个会话（多 `ChatPane` 里每块内容区各绑各的；单窗时跟着活跃会话走）
+    pub(crate) fn set_token(&mut self, token: u64, cx: &mut Context<Self>) {
+        if self.token == token {
+            return;
+        }
+        self.token = token;
+        cx.notify();
     }
 }
 
 impl Render for ContentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 构建这一遍时把位置池切到自己这份：别的内容区（将来的第二个 ChatPane）同帧渲染也清不掉它
+        let token = self.token;
+        // 构建这一遍时把位置池切到自己这份：别的内容区（第二个 ChatPane）同帧渲染也清不掉它
         motion::with_loop_spots(&self.spots, || match self.app.upgrade() {
-            Some(app) => app.update(cx, |app, cx| app.render_content(window, cx)),
+            Some(app) => app.update(cx, |app, cx| {
+                // 这一段里 `self.session()` 指向**这块 pane 的会话**（画完还原）
+                app.with_active(token, |app| app.render_content(window, cx))
+            }),
             None => div().into_any_element(),
         })
     }

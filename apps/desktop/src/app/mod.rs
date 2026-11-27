@@ -422,6 +422,34 @@ fn copy_image(store: &SessionStore, id: &str, path: &Path) -> Option<String> {
 }
 
 impl ChatApp {
+    /// 会话令牌 → 下标（找不到就是那个会话已经关了）。
+    pub(crate) fn index_of_token(&self, token: u64) -> Option<usize> {
+        self.sessions.iter().position(|session| session.token == token)
+    }
+
+    /// 在「把 `active` 临时切到 `token` 所指的会话」的前提下跑一段渲染。
+    ///
+    /// 这是多 `ChatPane` 的地基：几百处 `self.session()` 都读 `self.active`，
+    /// 与其全部改成显式按 token 取数，不如在**画某一块 pane 的那一段**里把 `active` 指过去，
+    /// 画完还原。前提是同一块 pane 一帧里只处理一个会话（见 `ChatPane`）。
+    ///
+    /// 注意：只有**同步栈内**的取数能看见这个切换。`ContentView` 是独立实体、渲染时机在
+    /// 后面，所以它自己也存了 token，在它的 `render` 里再包一次（见 `content.rs`）。
+    pub(crate) fn with_active<R>(&mut self, token: u64, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(target) = self.index_of_token(token) else {
+            // 会话已经没了（关了 / 归档）：让调用方按当前 active 画，别 panic
+            return f(self);
+        };
+        let previous = self.active;
+        self.active = target;
+        let out = f(self);
+        // 渲染期间可能又切了会话（比如点了侧栏），以那次为准，不硬盖回去
+        if self.active == target {
+            self.active = previous;
+        }
+        out
+    }
+
     /// 按槽的 key 找（只读）。
     pub(crate) fn slot(&self, key: &str) -> Option<&KernelSlot> {
         self.kernels.iter().find(|(k, _)| k == key).map(|(_, s)| s)
@@ -711,7 +739,10 @@ impl ChatApp {
             bg_spinner: cx.new(|_| bgtasks_view::BgSpinner),
             image_cache: image_cache::DecodedImageCache::new(cx),
             loop_spots: spots.clone(),
-            content_view: cx.new(|_| ContentView::new(weak.clone(), spots.clone())),
+            content_view: cx.new(|_| {
+                // 会话还没读出来（下面才恢复历史）：先绑 0，`init_workspace` 里再对齐
+                ContentView::new(weak.clone(), 0, spots.clone())
+            }),
             loop_overlay: cx.new(|_| motion::LoopOverlay::new(spots)),
             rim_view,
             rim_pointer,
