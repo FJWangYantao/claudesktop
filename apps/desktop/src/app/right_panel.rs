@@ -830,17 +830,17 @@ impl ChatApp {
     ) {
         if self.right_panel.open && self.right_panel.tab == tab {
             self.right_panel.open = false;
+            self.sync_right_dock(window, cx);
         } else {
             self.settings_open = false;
             self.right_panel.open = true;
             self.right_panel.tab = tab;
+            self.open_pane(tab.pane_kind(), window, cx);
         }
-        self.sync_right_dock(window, cx);
-        self.focus_pane_of_kind(tab.pane_kind(), window, cx);
         cx.notify();
     }
 
-    /// 顶栏单开关：开着就收起（并退出全宽），关着就打开上次停的 Tab。
+    /// 顶栏单开关：开着就收起，关着就按停留在哪一页的原样展开（不强行切到 Files）。
     /// 指定 Tab 的入口仍走 `toggle_right_panel`（`Ctrl+Shift+F` / `Ctrl+Shift+D` / 命令面板）。
     pub(super) fn toggle_right_panel_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.right_panel.open {
@@ -850,7 +850,6 @@ impl ChatApp {
             self.right_panel.open = true;
         }
         self.sync_right_dock(window, cx);
-        self.focus_pane_of_kind(self.right_panel.tab.pane_kind(), window, cx);
         cx.notify();
     }
 
@@ -873,8 +872,7 @@ impl ChatApp {
         if panel.diff_preview.as_ref().is_none_or(|preview| preview.selection != selection) {
             panel.diff_preview = Some(DiffPreview::new(selection));
         }
-        self.sync_right_dock(window, cx);
-        self.focus_pane_of_kind(RightTab::Changes.pane_kind(), window, cx);
+        self.open_pane(RightTab::Changes.pane_kind(), window, cx);
         cx.notify();
     }
 
