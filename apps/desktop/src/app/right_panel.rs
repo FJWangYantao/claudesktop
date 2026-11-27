@@ -14,9 +14,9 @@ use crate::settings::ContentAlign;
 use crate::theme::rgb;
 use crate::theme::*;
 use claudesktop_core::DiffView;
-use claudesktop_core::UserPrompt;
 use gpui_kit::assets::IconName as IconAll;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -330,6 +330,8 @@ pub(crate) struct DiffComment {
 /// 正在写批注的那一行（点了行上的 `+` 之后）
 #[derive(Clone, Debug)]
 pub(crate) struct CommentTarget {
+    /// 点这一行时是哪个会话：切会话之后这条目标就作废（不然会写进另一个会话）
+    pub(crate) token: u64,
     pub(crate) path: String,
     pub(crate) line: u32,
     pub(crate) tag: char,
@@ -1022,6 +1024,7 @@ impl ChatApp {
                     .iter()
                     .any(|comment| comment.path == path && comment.line == line.no);
                 let target = CommentTarget {
+                    token,
                     path: path.clone(),
                     line: line.no,
                     tag: line.tag,
@@ -1568,7 +1571,12 @@ impl ChatApp {
             .child(div().id("right-diff-preview").v_flex().flex_1().min_h_0().p_3().child(card))
     }
     #[cfg(feature = "headless-screenshot")]
-    pub(crate) fn debug_right_panel(&mut self, preview: &str, cx: &mut Context<Self>) {
+    pub(crate) fn debug_right_panel(
+        &mut self,
+        preview: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (token, cwd) = (self.session().token, self.session().cwd.clone());
         self.right_panel.sync_session(token, &cwd);
         match preview {
@@ -1645,6 +1653,15 @@ fn panel_note(text: impl Into<SharedString>) -> Div {
 /// 底栏固定挂在面板底部，**不嵌进虚拟列表的行里**：列表是变高虚拟滚动的，行滚出视口
 /// 就整个卸载，`InputState` 会丢焦点且每一帧都在整表重测（8ms 滚动红线）。
 impl ChatApp {
+    /// 取下一条消息要注入的批注说明（会话对不上就丢掉：那是给别的会话留的）。
+    pub(crate) fn take_comment_note(&mut self, idx: usize) -> Option<String> {
+        let token = self.sessions.get(idx)?.token;
+        match self.diff_comment_note.take() {
+            Some((owner, note)) if owner == token => Some(note),
+            _ => None,
+        }
+    }
+
     /// 行内批注的输入框：用到时才建（跟着窗口走，弹出窗里会重建，见 `on_window_changed`）。
     pub(crate) fn ensure_comment_input(
         &mut self,
@@ -1655,6 +1672,13 @@ impl ChatApp {
             return input.clone();
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("对这几行说点什么…"));
+        // 写完直接回车就收下（和底栏的 ✓ 等价）
+        cx.subscribe_in(&input, window, |this: &mut ChatApp, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { secondary, .. } if !secondary) {
+                this.add_comment(window, cx);
+            }
+        })
+        .detach();
         self.comments.input = Some(input.clone());
         input
     }
@@ -1684,15 +1708,21 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 底栏「添加」：把输入框里的字存进当前会话。
+    /// 底栏「添加」：把输入框里的字存进**点这一行时**的那个会话（切会话后目标作废）。
     pub(crate) fn add_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self.comments.target.clone() else { return };
+        let token = self.session().token;
+        if target.token != token {
+            // 目标属于别的会话：丢掉，别把 A 的批注写进 B
+            self.comments.target = None;
+            cx.notify();
+            return;
+        }
         let Some(input) = self.comments.input.clone() else { return };
         let text = input.read(cx).value().trim().to_string();
         if text.is_empty() {
             return;
         }
-        let token = self.session().token;
         self.comments.push(
             token,
             DiffComment {
@@ -1708,20 +1738,22 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 底栏「发送」：把批注拼成 `<user-review>` 块发出去（和逐块撤回的说明共用注入点）。
-    pub(crate) fn send_comments(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// 底栏「发送」：把批注拼成 `<user-review>` 块，**用发送时注入**的方式带走。    ///
+    /// 不能直接把 XML 当 `UserPrompt.text` 发：用户气泡里会露出一坨原始标签。
+    /// 这里只往输入框里放一句可读摘要，说明挂在 `diff_comment_note` 上，由
+    /// `submit_to` 在发给内核的文本前面拼进去（和逐块撤回的说明同一个注入点）。
+    pub(crate) fn send_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let token = self.session().token;
         let comments = self.comments.of(token).to_vec();
         let Some(note) = comments_note(&comments) else { return };
-        let idx = self.active;
-        if !self.submit_to(
-            idx,
-            UserPrompt { text: note, images: Vec::new(), attachments: Vec::new() },
-            cx,
-        ) {
-            // 内核忙 / 起不来：`submit_to` 已经给了提示，批注留着别丢
+        if self.session().busy {
+            self.toast(Notification::warning("正在生成回答：等这一轮结束再发批注"), cx);
             return;
         }
+        self.diff_comment_note = Some((token, note));
+        let summary = format!("（{} 条行内批注）", comments.len());
+        self.input.update(cx, |state, cx| state.set_value(summary, window, cx));
+        self.send(window, cx);
         self.comments.clear(token);
         cx.notify();
     }
@@ -1753,7 +1785,8 @@ impl ChatApp {
     fn render_comment_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let token = self.session().token;
         let count = self.comments.of(token).len();
-        let target = self.comments.target.clone();
+        // 目标属于别的会话（点了 `+` 又切走）：当作没有目标，别把批注写进这个会话
+        let target = self.comments.target.clone().filter(|target| target.token == token);
         if target.is_none() && count == 0 {
             return None;
         }

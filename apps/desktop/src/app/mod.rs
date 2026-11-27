@@ -146,6 +146,9 @@ pub struct ChatApp {
     popouts: Vec<pane::popout::PopoutEntry>,
     /// 改动 Pane 的行内批注草稿（按会话令牌归属，见 right_panel.rs）
     pub(crate) comments: right_panel::CommentDraft,
+    /// 待随下一条消息注入的批注说明（会话令牌, `<user-review>` 块）：
+    /// 气泡里只显示一句摘要，说明在发送时拼进真正发出去的文本
+    diff_comment_note: Option<(u64, String)>,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -638,6 +641,7 @@ impl ChatApp {
             layout_save: None,
             popouts: Vec::new(),
             comments: right_panel::CommentDraft::default(),
+            diff_comment_note: None,
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),
@@ -3560,14 +3564,19 @@ impl ChatApp {
                 Some(text) => text.clone(),
                 None => full,
             };
-            // 上一轮在审查页里撤回过块：发给内核的文字前面附上说明，气泡里照常只显示用户写的
-            let reviewed = match self.take_review_note(idx) {
-                Some(note) => {
-                    sent = format!("{note}\n\n{sent}");
-                    true
-                }
-                None => false,
-            };
+            // 上一轮在审查页里撤回过块 / 这批消息带了行内批注：发给内核的文字前面附上说明，
+            // 气泡里照常只显示用户写的（或那句「（N 条行内批注）」摘要）
+            let mut notes = Vec::new();
+            if let Some(note) = self.take_review_note(idx) {
+                notes.push(note);
+            }
+            if let Some(note) = self.take_comment_note(idx) {
+                notes.push(note);
+            }
+            let reviewed = !notes.is_empty();
+            if reviewed {
+                sent = format!("{}\n\n{sent}", notes.join("\n\n"));
+            }
             // 和用户写的一样就不必另存一份（`sent` 只在不一样时进日志）
             let sent = (reviewed || expanded.is_some() || has_attachments).then_some(sent);
             if kernel.is_some() {

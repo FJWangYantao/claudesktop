@@ -902,6 +902,14 @@
   带上「file:line (kind) `code`」和批注正文，空批注不进去。
 - **批注输入框绑的是创建它的 `Window`**：Pane 弹出 / 吸回之后要在 `on_window_changed` 里
   重建并回填草稿（`rebuild_comment_input`），否则在弹出窗里打字会绑到主窗。
+- **批注不能直接当 `UserPrompt.text` 发**：`<user-review>` 那一坨原始 XML 会露在用户气泡里。
+  做法是输入框里只放一句「（N 条行内批注）」摘要，说明挂在 `diff_comment_note` 上，
+  由 `submit_to` 把说明拼进**发给内核**的文本（和 `take_review_note` 同一条注入路径）。
+- **`CommentTarget` 必须带会话令牌**：点了会话 A 的某行 `+` 又切到 B，底栏还留着 A 的目标，
+  点 ✓ 就会写进 B 的批注列表。
+- **改 `debug_*` 调试钩子的签名时记得开 `--features headless-screenshot` 编一次**：
+  那些函数只在特性里被 `main.rs` 调用，普通 `cargo check` 扫不到。
+
 
 
 

@@ -326,7 +326,7 @@ fn main() {
                                 ),
                                 #[cfg(feature = "headless-screenshot")]
                                 "files" | "file-preview" | "changes" | "expanded" => {
-                                    app.debug_right_panel(open.as_str(), cx)
+                                    app.debug_right_panel(open.as_str(), window, cx)
                                 }
                                 _ => {}
                             }
