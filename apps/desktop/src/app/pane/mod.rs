@@ -14,6 +14,7 @@ pub(crate) mod chat_pane;
 pub(crate) mod diff_pane;
 pub(crate) mod files_pane;
 pub(crate) mod persist;
+pub(crate) mod popout;
 pub(crate) mod skin;
 pub(crate) mod workspace;
 

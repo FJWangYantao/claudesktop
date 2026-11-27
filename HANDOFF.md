@@ -843,5 +843,14 @@
   要用裸闭包（`|_, window, cx| ...`）；`cx.stop_propagation()` 在 `App` 上有。
 - **`div().tooltip(...)` 收的是闭包**，不是字符串（只有 gpui-kit 的按钮收 `SharedString`）。
   给裸 div 加悬停说明要么走 `Tooltip` 组件，要么干脆别加。
+- **弹出窗要靠 `AnyWindowHandle` 才管得住**：`cx.open_window(options, cx, |window, cx| 根视图)`
+  返回 `WindowHandle<V>`（`.into()` 成 `AnyWindowHandle`）。要在主窗里杀掉弹出窗，用
+  `handle.update(cx, |_, window, _| window.remove_window())`；`on_window_closed` 回的是
+  `WindowId`，主窗要拿 `window.window_handle().window_id()` 比。
+- **跨窗搬面板时 `Arc<dyn PanelView>` 得先 clone 一份给新窗口**：`open_window` 的闭包是 `move`
+  的，直接把唯一的 Arc 移进去，后面 `window_changed` 就没得用了（E0382）。
+- **不要用 `Window::window_id()`**：这版 gpui 只有 `Window::window_handle()` 和
+  `AnyWindowHandle::window_id()`。
+
 
 

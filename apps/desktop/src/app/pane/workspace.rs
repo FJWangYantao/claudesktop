@@ -28,8 +28,10 @@ impl ChatApp {
     /// 建 dock 的皮肤与面板注册、恢复上次布局、挂写盘订阅。
     /// 由 [`ChatApp::new`] 在会话恢复之后调一次。
     pub(crate) fn init_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 皮肤要反手告诉 dock「哪个面板在拖」（拖出区域松手 → DragOutside）
+        // 皮肤要反手告诉 dock「哪个面板在拖」（拖出区域松手 → DragOutside），
+        // 也要能叫主窗弹窗（Tab 栏上的「弹出独立窗」按钮）
         self.dock_skin.attach_area(self.dock.downgrade());
+        self.dock_skin.attach_main(cx.entity().downgrade());
 
         // 恢复布局时按 panel_name 重建面板：注册表是全局的，主窗每建一次覆盖一次
         for kind in [
@@ -46,12 +48,31 @@ impl ChatApp {
             });
         }
 
-        // 布局变了就（防抖）写盘
+        // 布局变了就（防抖）写盘；Tab 拖出区域就弹成独立窗
         let dock = self.dock.clone();
-        cx.subscribe_in(&dock, window, |this, _, event: &DockEvent, _, cx| {
-            if matches!(event, DockEvent::LayoutChanged) {
-                this.schedule_layout_save(cx);
+        cx.subscribe_in(&dock, window, |this, _, event: &DockEvent, window, cx| match event {
+            DockEvent::LayoutChanged => this.schedule_layout_save(cx),
+            DockEvent::DragOutside { panel, position } => {
+                let (panel, position) = (*panel, *position);
+                this.popout_pane(panel, Some(position), window, cx);
             }
+            _ => {}
+        })
+        .detach();
+
+        // 窗口关掉的两种情况：主窗关了 → 把弹出窗一起收掉（别留孤儿窗口）；
+        // 某个弹出窗被用户关了 → 从账本里划掉
+        let this = cx.entity().downgrade();
+        let main_id = window.window_handle().window_id();
+        cx.on_window_closed(move |cx, id| {
+            let Some(app) = this.upgrade() else { return };
+            app.update(cx, |app, cx| {
+                if id == main_id {
+                    app.close_popouts(cx);
+                } else {
+                    app.forget_popout(id, cx);
+                }
+            });
         })
         .detach();
 
@@ -200,8 +221,24 @@ impl ChatApp {
             cx.background_executor().timer(LAYOUT_SAVE_DEBOUNCE).await;
             let _ = this.update(cx, |app, cx| {
                 app.layout_save = None;
-                let snapshot = persist::snapshot(app.dock.read(cx), cx);
-                persist::write(&snapshot);
+                let mut file = persist::snapshot(app.dock.read(cx), cx);
+                // 弹出窗也记一笔（位置 + 内部布局），下次打开时能照原样摆回去
+                for entry in &app.popouts {
+                    let area = entry.dock.read(cx).dump(cx);
+                    let bounds = entry.window.update(cx, |_, window, _| window.bounds());
+                    if let Ok(bounds) = bounds {
+                        let bounds = persist::PersistedBounds {
+                            x: f32::from(bounds.origin.x),
+                            y: f32::from(bounds.origin.y),
+                            width: f32::from(bounds.size.width),
+                            height: f32::from(bounds.size.height),
+                        };
+                        file.popouts.push(persist::PopoutLayoutState { bounds, area });
+                        // 面板 id 与它原来所在的组另存一份，吸回时用得着
+                        let _ = entry.panel;
+                    }
+                }
+                persist::write(&file);
             });
         }));
     }

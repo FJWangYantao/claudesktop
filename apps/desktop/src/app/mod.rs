@@ -142,6 +142,8 @@ pub struct ChatApp {
     dock_skin: std::rc::Rc<pane::skin::ClaudesktopDockSkin>,
     /// 布局写盘的防抖任务（拖分割条时每帧都会 LayoutChanged）
     layout_save: Option<Task<()>>,
+    /// 已经弹出的独立窗（面板跨窗迁移的账本，见 pane/popout.rs）
+    popouts: Vec<pane::popout::PopoutEntry>,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -628,6 +630,7 @@ impl ChatApp {
             dock,
             dock_skin,
             layout_save: None,
+            popouts: Vec::new(),
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),

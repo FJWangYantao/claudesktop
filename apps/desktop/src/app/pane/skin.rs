@@ -27,16 +27,23 @@ pub(crate) struct ClaudesktopDockSkin {
     /// 拖出区域松手才能变成 `DockEvent::DragOutside`（见 vendor 的补丁说明）。
     /// 用 `Rc<RefCell<_>>` 而不是普通字段：Tab 组渲染器要拿同一份。
     area: Rc<RefCell<Option<WeakEntity<DockArea>>>>,
+    /// 主窗：Tab 栏上的「弹出独立窗」按钮从这里叫（皮肤只拿得到 `&mut App`）。
+    main: Rc<RefCell<Option<WeakEntity<crate::app::ChatApp>>>>,
 }
 
 impl ClaudesktopDockSkin {
     pub(crate) fn new() -> Rc<Self> {
-        Rc::new(Self { area: Rc::new(RefCell::new(None)) })
+        Rc::new(Self { area: Rc::new(RefCell::new(None)), main: Rc::new(RefCell::new(None)) })
     }
 
     /// 区域建好之后回填（`with_renderer` 要拿走 Rc，只能建完再告诉它）。
     pub(crate) fn attach_area(&self, area: WeakEntity<DockArea>) {
         *self.area.borrow_mut() = Some(area);
+    }
+
+    /// 主窗建好之后回填（弹出按钮要用）。
+    pub(crate) fn attach_main(&self, main: WeakEntity<crate::app::ChatApp>) {
+        *self.main.borrow_mut() = Some(main);
     }
 }
 
@@ -97,13 +104,14 @@ impl DockAreaRenderer for ClaudesktopDockSkin {
     }
 
     fn tab_group_renderer(&self) -> Rc<dyn TabGroupRenderer> {
-        Rc::new(ClaudesktopTabGroup { area: self.area.clone() })
+        Rc::new(ClaudesktopTabGroup { area: self.area.clone(), main: self.main.clone() })
     }
 }
 
 /// Tab 组的外观：Tab 栏 + 面板区域的排布。
 struct ClaudesktopTabGroup {
     area: Rc<RefCell<Option<WeakEntity<DockArea>>>>,
+    main: Rc<RefCell<Option<WeakEntity<crate::app::ChatApp>>>>,
 }
 
 impl TabGroupRenderer for ClaudesktopTabGroup {
@@ -164,6 +172,28 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
                 zoom_handle.toggle_zoom(window, cx);
             });
 
+        // 「弹出独立窗」：把这个 Tab 搬到一个新的操作系统窗口里（Phase 2）
+        let active_id = group.active_panel().map(|panel| panel.panel_id(cx));
+        let main = self.main.borrow().clone();
+        let popout_button = active_id.map(move |panel| {
+            let main = main.clone();
+            div()
+                .id("claudesktop-tab-popout")
+                .h_full()
+                .flex_shrink_0()
+                .px_1p5()
+                .flex()
+                .items_center()
+                .text_color(rgb(INK_SOFT))
+                .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                .child(Icon::new(IconAll::ArrowUpRight).small())
+                .on_click(move |_, window, cx| {
+                    if let Some(main) = main.as_ref().and_then(|main| main.upgrade()) {
+                        main.update(cx, |app, cx| app.popout_pane(panel, None, window, cx));
+                    }
+                })
+        });
+
         div()
             .h_flex()
             .h(TAB_STRIP_H.to_pixels(window.rem_size()))
@@ -178,6 +208,7 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
             // Tab 之后的空白也能拖窗口（这一条不是按钮区）
             .child(crate::app::chrome::drag_area())
             .children(active_actions)
+            .children(popout_button)
             .child(zoom_button)
             .into_any_element()
     }
