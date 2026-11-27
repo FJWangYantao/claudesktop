@@ -113,6 +113,11 @@ impl BrowserPane {
         self.address = address_input(&self.url, window, cx);
     }
 
+    /// 把键盘焦点放进地址栏（新开浏览器 Pane 时直接可输网址）
+    pub(crate) fn focus_address(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.address.update(cx, |state, cx| state.focus(window, cx));
+    }
+
     /// 排一次创建；真正的构建在前台任务里做（见文件头「创建时机」）。
     fn start_webview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.creating || self.webview.is_some() || self.error.is_some() || headless() {
@@ -150,6 +155,7 @@ impl BrowserPane {
         let mut context = WebContext::new(Some(dir));
         let built = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(urlish)
+            .with_focused(false)
             .with_bounds(Rect {
                 position: PhysicalPosition::new(x, y).into(),
                 size: PhysicalSize::new(w.max(1), h.max(1)).into(),
@@ -182,7 +188,8 @@ impl BrowserPane {
     }
 
     /// prepaint 量到的正文区 + 这一帧该不该露面。值没变就不碰 WebView2。
-    fn on_body(&mut self, rect: Physical, covered: bool) {
+    fn on_body(&mut self, rect: Physical, covered: bool, window: &Window) {
+        let was_visible = self.applied.map(|(_, visible)| visible);
         self.body = Some(rect);
         let visible = self.active && !covered;
         let next = (rect, visible);
@@ -195,6 +202,9 @@ impl BrowserPane {
                 size: PhysicalSize::new(rect.2.max(1), rect.3.max(1)).into(),
             });
             let _ = webview.set_visible(visible);
+            if was_visible == Some(true) && !visible {
+                return_gui_focus(window);
+            }
             self.applied = Some(next);
         }
     }
@@ -281,15 +291,15 @@ impl Panel for BrowserPane {
     }
 
     /// 切走 Tab：子窗口必须立刻藏起来，否则它会浮在别的 Pane 上面
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.active == active {
             return;
         }
         self.active = active;
         if let Some(webview) = &self.webview {
             let _ = webview.set_visible(active);
-            if active {
-                let _ = webview.focus();
+            if !active {
+                return_gui_focus(window);
             }
         }
         // 记下来，免得下一帧又原样写一遍
@@ -304,10 +314,11 @@ impl Panel for BrowserPane {
     }
 
     /// 关掉 Pane：立刻放掉 WebView2（连同它的子窗口和渲染进程）
-    fn on_removed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_removed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.webview = None;
         self.applied = None;
         self.creating = false;
+        return_gui_focus(window);
         cx.notify();
     }
 }
@@ -421,7 +432,7 @@ impl Render for BrowserPane {
                             let app = app.read(cx);
                             app.settings_open || app.review.is_some() || app.rewind.is_some()
                         });
-                    handle.update(cx, |pane, _| pane.on_body(rect, covered));
+                    handle.update(cx, |pane, _| pane.on_body(rect, covered, window));
                 }
             })
             .when_some(placeholder, |d, text| {
@@ -457,12 +468,14 @@ impl ChatApp {
         }
         let app = cx.entity().downgrade();
         let pane = cx.new(|cx| BrowserPane::new(app, None, window, cx));
+        let focus_pane = pane.clone();
         let dock = self.dock.clone();
         let handle = std::sync::Arc::new(super::PaneHandle::new(pane))
             as std::sync::Arc<dyn gpui_base::dock::PanelView>;
         dock.update(cx, |dock, cx| {
             dock.add_panel_view(handle, gpui_base::dock::DockPlacement::Center, None, window, cx);
         });
+        focus_pane.update(cx, |pane, cx| pane.focus_address(window, cx));
         cx.notify();
     }
 }
@@ -560,15 +573,19 @@ fn install_accelerators(
 #[cfg(target_os = "windows")]
 fn return_gui_focus(window: &Window) {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
         return;
     };
     if let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() {
-        // SAFETY: hwnd 是 GPUI 自己的窗口（同线程），SetFocus 对它安全
+        let hwnd = HWND(win32.hwnd.get() as *mut _);
+        // SAFETY: hwnd 是 GPUI 自己的窗口（同线程），只在它已是前台且焦点被子窗口拿走时收回
         unsafe {
-            let _ = SetFocus(Some(HWND(win32.hwnd.get() as *mut _)));
+            if GetForegroundWindow() == hwnd && GetFocus() != hwnd {
+                let _ = SetFocus(Some(hwnd));
+            }
         }
     }
 }

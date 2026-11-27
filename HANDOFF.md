@@ -969,6 +969,14 @@
 - **子窗口会把地址栏的点击一块吃掉**：`on_mouse_down`（点正文 → 把焦点交给网页）只能挂在正文
   容器上。挂在包着地址栏的外层 `div` 时，点地址栏的点击会冒泡上来立刻 `webview.focus()`，
   光标一进去就被抢走、地址栏根本打不了字。
+- **跨进程 `WS_CHILD` 子窗口拿走系统焦点后，`WM_LBUTTONDOWN` 不会自动收回**（2026-11-27 实机复现）：
+  `wry` 默认 `with_focused(true)`（需显式 `.with_focused(false)`），且一旦用户点进 WebView2
+  （`Chrome_RenderWidgetHostHWND` 属浏览器子进程），GPUI 窗口本身的 `handle_mouse_down_msg`
+  只调 `SetCapture`、不调 `SetFocus(Some(handle))`——结果再点地址栏或原 AI 输入框时，GPUI 内部画出了
+  光标，但本线程 `GetFocus()` 仍为 `NULL`、系统按键全被 WebView2 截走，所有输入框都打不了字。
+  已在 `vendor/gpui-pre-windows/src/events.rs` 的 `handle_mouse_down_msg` 加上 `GetForegroundWindow()
+  == handle && GetFocus() != handle` 时 `SetFocus(Some(handle))`，并在切走 Tab / 遮挡隐藏 / 关闭时
+  `return_gui_focus`。
 
 
 

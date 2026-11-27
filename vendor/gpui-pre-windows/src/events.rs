@@ -474,6 +474,16 @@ impl WindowsWindowInner {
         lparam: LPARAM,
     ) -> Option<isize> {
         unsafe { SetCapture(handle) };
+        // claudesktop patch: 点击 GPUI 客户区时，若窗口已在前台但系统键盘焦点不在本窗口
+        // （例如被 WebView2 跨进程子窗口拿走，本线程 GetFocus() 会返回 NULL 或子 HWND），
+        // 必须主动 SetFocus 把系统焦点收回来，否则后续按键与 IME 仍落进子窗口，
+        // 地址栏与主输入框全部无法输入。要求 GetForegroundWindow() == handle，
+        // 避免无头隐藏窗口验收（CLAUDESKTOP_HEADLESS=1）发鼠标消息时误拉前台。
+        unsafe {
+            if GetForegroundWindow() == handle && GetFocus() != handle {
+                let _ = SetFocus(Some(handle));
+            }
+        }
 
         let Some(mut func) = self.state.callbacks.input.take() else {
             return Some(1);

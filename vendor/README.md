@@ -131,6 +131,10 @@ markdown crate 换版本时：把新版发布包拷进来，重打上面的补�
   改成 `false`。原值是让整条交换链盖在所有 `WS_CHILD` 子窗口之上，浏览器 Pane 的 WebView2（原生子窗口）会被
   画死、看不见；没有子窗口时两者结果等价。代价是子窗口永远在最上层，需要靠隐藏避让（见
   `apps/desktop/src/app/pane/browser_pane.rs` 的遮挡保护）。
+- **鼠标按下时收回被跨进程子窗口拿走的系统焦点**：`src/events.rs` 的 `handle_mouse_down_msg`
+  加上 `GetForegroundWindow() == handle && GetFocus() != handle` 时调 `SetFocus(Some(handle))`。
+  WebView2 是跨进程 `WS_CHILD` 子窗口，用户点进网页后主线程的 `GetFocus()` 为空或指向子窗，
+  仅靠 `SetCapture` 不会把系统键盘焦点还给 GPUI，导致随后点击地址栏或主输入框全部无法打字。
 - **Windows VSync 时钟**：`src/vsync.rs` 的 `LatestVsyncClock` 用每窗一个原子槽保留最新的 `DwmFlush` 完成时刻。
   `draw_window` 在校验失效区后取出时间戳，限当次 `request_frame` 回调使用。隐藏、最小化和 `DwmFlush` 回退时清空槽，
   离屏节拍测量可用自己的时钟。profiler 继续使用独立的 `PlatformFrameSignal` 记录首个未消费信号。
