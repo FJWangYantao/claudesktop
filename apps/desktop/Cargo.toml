@@ -35,6 +35,16 @@ ureq = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 wry = "0.58.2"
 
+# 浏览器 Pane 的快捷键透传：焦点在网页里时把组合键交回 GPUI（见 app/pane/browser_pane.rs）。
+# 版本跟 wry 依赖的保持一致，避免同一套 COM 接口出现两份互不兼容的定义。
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 embed-resource = "3"
 

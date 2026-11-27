@@ -951,6 +951,16 @@
 - **原生子窗口换窗口就得重建**：`WebView` 绑死在创建时的 HWND 上，弹出 / 吸回（`on_window_changed`）
   只能丢掉重建；位置和尺寸按 prepaint 量到的窗口坐标 × `scale_factor()` 换算成父客户区物理像素，
   并且只在值真的变了才 `set_bounds` / `set_visible`（每次都是跨进程 COM 调用）。
+- **Popover 不是 dialog**：`window.has_active_dialog(cx)` 抓不到 gpui-kit 的下拉菜单，
+  遮挡判据必须再带一条 `gpui_base::GlobalState::is_in_deferred_context(cx)`
+  （它的语义就是「当前有 deferred popover 持有 token」）。少这一条，菜单会被子窗口盖住。
+- **焦点进网页后快捷键全失效**：子窗口自己收按键，GPUI 一条也收不到。建好 WebView2 后挂
+  `ICoreWebView2Controller::add_AcceleratorKeyPressed`，把带 Ctrl / Alt 的组合键翻成 `Keystroke`
+  交给 `Window::dispatch_keystroke`，**只有 GPUI 真消费了才 `Handled(true)`**，否则网页连
+  `Ctrl+C` 都用不了。回调里没有 `&mut App`：要用 `AsyncApp::update_window`（`try_borrow_mut`，
+  忙就返回 Err 放弃转发），别用会直接 `borrow_mut` 的 `AsyncApp::update`。
+  另：`webview2-com 0.39` 的 `Handled` 收 `*mut BOOL`（不是 `&BOOL`），`controller()` 要
+  `use wry::WebViewExtWindows`。
 
 
 

@@ -12,8 +12,19 @@
 //!
 //! 子窗口永远浮在 GPUI 画的内容之上，所以凡是「盖在它上面」的东西都得让它先躲开：
 //! 不在活跃 Tab（`set_active(false)`）、命令面板 / 快捷键速查 / 原始请求（都是对话框）、
+//! 下拉菜单（`gpui_base::GlobalState::is_in_deferred_context` 就是「当前有 Popover 打开」）、
 //! 设置页 / 审查页 / 回退浮层（`ChatApp` 自己的标记）。判据在 prepaint 里算一次，
 //! 位置 / 可见性跟上次写进去的值比一遍，变了才跨进程调用。
+//!
+//! ## 焦点在网页里时的快捷键
+//!
+//! 子窗口拿到键盘焦点后，按键走的是 WebView2 自己的窗口过程，GPUI 一条也收不到，
+//! `Ctrl+K` / `Ctrl+;` / `Ctrl+\`` 这类全局快捷键会突然失灵。所以建好 WebView2 时挂一次
+//! `AcceleratorKeyPressed`，把「按住 Ctrl 或 Alt」的组合键按当前键盘布局翻成
+//! [`Keystroke`] 再 `Window::dispatch_keystroke` 回 GPUI；GPUI 真处理了才 `Handled(true)`，
+//! 没人接的键仍归网页（不然网页连自己的 `Ctrl+C` 都用不了）。
+//! 转发只在消息回调里做，那一层 App 没被借出（`AsyncApp::update_window` 是 `try_borrow_mut`，
+//! 忙就返回 Err 并原样让给网页），不会打崩。
 //!
 //! ## 创建时机
 //!
@@ -152,6 +163,8 @@ impl BrowserPane {
             .build_as_child(&*window);
         match built {
             Ok(webview) => {
+                // 焦点进网页后按键不再经过 GPUI，建好就把组合键接回来（见文件头）
+                install_accelerators(&webview, window, cx);
                 self.webview = Some(webview);
                 self.applied = None;
                 cx.notify();
@@ -381,9 +394,10 @@ impl Render for BrowserPane {
                         (f32::from(bounds.size.width) * scale).round().max(1.) as u32,
                         (f32::from(bounds.size.height) * scale).round().max(1.) as u32,
                     );
-                    // 盖在子窗口上面的东西：对话框（命令面板等）+ ChatApp 自己的浮层
+                    // 盖在子窗口上面的东西：对话框（命令面板等）+ 下拉菜单 + ChatApp 自己的浮层
                     let dialogs = window.has_active_dialog(cx);
                     let covered = dialogs
+                        || gpui_base::GlobalState::is_in_deferred_context(cx)
                         || app.upgrade().is_some_and(|app| {
                             let app = app.read(cx);
                             app.settings_open || app.review.is_some() || app.rewind.is_some()
@@ -443,6 +457,96 @@ impl ChatApp {
         });
         cx.notify();
     }
+}
+
+// ---------- 快捷键透传 ----------
+
+/// 挂 `AcceleratorKeyPressed`：焦点在网页里时把工作区级组合键交回 GPUI。
+///
+/// 只在 GPUI 真处理了才 `Handled(true)`，其余（`Ctrl+C`、页面自己的快捷键）原样留给网页。
+#[cfg(target_os = "windows")]
+fn install_accelerators(webview: &WebView, window: &mut Window, cx: &mut Context<BrowserPane>) {
+    use webview2_com::AcceleratorKeyPressedEventHandler;
+    use windows::core::BOOL;
+    use wry::WebViewExtWindows as _;
+
+    let mut app = cx.to_async();
+    let handle = window.window_handle();
+    let mut token = 0i64;
+    // SAFETY: controller() 来自建好的 WebView2；回调只在这一条 webview 的键事件里跑，
+    // 且 App 是 try_borrow（忙则放弃转发），不会与绘制栈抢借用。
+    unsafe {
+        let _ = webview.controller().add_AcceleratorKeyPressed(
+            &AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let Some(keystroke) = shortcut_of(&args) else {
+                    return Ok(());
+                };
+                let consumed = app
+                    .update_window(handle, |_, window, cx| window.dispatch_keystroke(keystroke, cx))
+                    .unwrap_or(false);
+                if consumed {
+                    let mut handled = BOOL::from(true);
+                    let _ = args.Handled(&mut handled);
+                }
+                Ok(())
+            })),
+            &mut token,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_accelerators(_: &WebView, _: &mut Window, _: &mut Context<BrowserPane>) {}
+
+/// 这一条按键要不要交给 GPUI：只接「按住 Ctrl 或 Alt」的组合键，纯打字留给网页。
+#[cfg(target_os = "windows")]
+fn shortcut_of(
+    args: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2AcceleratorKeyPressedEventArgs,
+) -> Option<Keystroke> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+
+    let mut kind = Default::default();
+    // SAFETY: args 在这个回调里有效
+    unsafe { args.KeyEventKind(&mut kind).ok()? };
+    if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN {
+        return None;
+    }
+    let mut vk = 0u32;
+    // SAFETY: 同上
+    unsafe { args.VirtualKey(&mut vk).ok()? };
+    // SAFETY: GetKeyState 只是查当前线程的键状态
+    let down = |vk: u16| unsafe { GetKeyState(vk as i32) } < 0;
+    let modifiers = Modifiers {
+        control: down(VK_CONTROL.0),
+        alt: down(VK_MENU.0),
+        shift: down(VK_SHIFT.0),
+        ..Modifiers::none()
+    };
+    if !modifiers.control && !modifiers.alt {
+        return None;
+    }
+    Some(Keystroke { modifiers, key: key_name(vk)?, key_char: None })
+}
+
+/// 虚拟键 → GPUI 认的键名。走 `MapVirtualKeyW` 跟着用户的键盘布局走，
+/// 不写死「VK 0xBA 就是分号」这种美式键盘假设。
+#[cfg(target_os = "windows")]
+fn key_name(vk: u32) -> Option<String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_CHAR, MapVirtualKeyW};
+
+    // SAFETY: 纯查表，不改任何状态
+    let raw = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) };
+    // 最高位表示死键（等下一个键才出字符），这种不转发
+    if raw & 0x8000_0000 != 0 {
+        return None;
+    }
+    let ch = char::from_u32(raw & 0xFFFF)?;
+    if !ch.is_ascii() || ch.is_ascii_control() {
+        return None;
+    }
+    Some(ch.to_ascii_lowercase().to_string())
 }
 
 /// `CLAUDESKTOP_HEADLESS` / 截图模式下不拉 WebView2：验收和截图不该起 Edge 进程
