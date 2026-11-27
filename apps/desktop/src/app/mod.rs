@@ -665,7 +665,7 @@ impl ChatApp {
             sidebar_key: 0,
             sidebar_spinners: Default::default(),
             sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
-            bg: Default::default(),
+            bg: bgtasks_view::BgTasksUi::initial(),
             bg_spinner: cx.new(|_| bgtasks_view::BgSpinner),
             image_cache: image_cache::DecodedImageCache::new(cx),
             content_view: cx.new(|_| ContentView::new(weak.clone())),

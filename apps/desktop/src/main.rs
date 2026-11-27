@@ -232,6 +232,8 @@ fn main() {
                             // / fetch（并获取模型列表）/ restart（重启内核）/ review（审查页）
                             // / rename、ask-delete、delete（对侧栏第 2 个会话）
                             // / sidebar-project、sidebar-time（侧栏分组方式；加 :flow 连添加 / 移除项目一起验）
+                            // 后台任务停靠条 / 顶栏胶囊的截图用 CLAUDESKTOP_BG_PREVIEW
+                            // = dock | dock-open | menu（只在 headless-screenshot 构建里有效）
                             let open = std::env::var("CLAUDESKTOP_OPEN").unwrap_or_default();
                             match open.as_str() {
                                 "settings" => app.open_settings(window, cx),

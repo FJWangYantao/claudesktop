@@ -56,6 +56,62 @@ impl Default for BgTasksUi {
     }
 }
 
+impl BgTasksUi {
+    /// 初始状态：正常运行是收起；截图钩子（`CLAUDESKTOP_BG_PREVIEW`）下按模式预先展开。
+    pub(super) fn initial() -> Self {
+        #[allow(unused_mut)]
+        let mut ui = Self::default();
+        #[cfg(feature = "headless-screenshot")]
+        if let Some(mode) = preview() {
+            ui.dock_open = mode != "dock";
+            ui.log_open = (mode == "dock-open").then(|| "bg-3".to_string());
+        }
+        ui
+    }
+}
+
+/// 截图钩子：`CLAUDESKTOP_BG_PREVIEW = dock | dock-open | menu` 时用几条假任务渲染停靠条
+/// 和顶栏弹层（只在 `--features headless-screenshot` 的构建里存在）。
+#[cfg(feature = "headless-screenshot")]
+pub(super) fn preview() -> Option<&'static str> {
+    match std::env::var("CLAUDESKTOP_BG_PREVIEW").ok().as_deref() {
+        Some("dock") => Some("dock"),
+        Some("dock-open") => Some("dock-open"),
+        Some("menu") => Some("menu"),
+        _ => None,
+    }
+}
+
+/// 截图钩子用的假任务：一条挂了续办、一条纯后台、一条刚结束。
+#[cfg(feature = "headless-screenshot")]
+fn preview_tasks() -> Vec<BackgroundTaskView> {
+    let build_tail = "   Compiling claudesktop-core v0.19.1\n   Compiling claudesktop-builtin v0.19.1\n   Compiling claudesktop v0.19.1\n    Finished `dev` profile in 41.62s\n\ntest result: ok. 312 passed; 0 failed; 0 ignored\nrunning 225 tests\n   Doc-tests claudesktop-core";
+    vec![
+        BackgroundTaskView {
+            id: "bg-3".into(),
+            session: "preview".into(),
+            command: "cargo test --workspace".into(),
+            running: true,
+            ready_to_resume: false,
+            exit_code: None,
+            duration_secs: 96,
+            output_tail: build_tail.into(),
+            followup: Some("跑完把失败的用例整理出来".into()),
+        },
+        BackgroundTaskView {
+            id: "bg-2".into(),
+            session: "preview".into(),
+            command: "npm run dev".into(),
+            running: true,
+            ready_to_resume: false,
+            exit_code: None,
+            duration_secs: 245,
+            output_tail: "VITE v5.4.2  ready in 412 ms\n\n  ➜  Local:   http://localhost:5173/\n  ➜  press h + enter to show help".into(),
+            followup: None,
+        },
+    ]
+}
+
 /// 刚结束、还在停靠条上停一会儿的任务。
 pub(super) struct BgLinger {
     pub task: BackgroundTaskView,
@@ -112,6 +168,13 @@ impl Render for BgTasksContent {
 impl ChatApp {
     /// 当前会话拉起的后台任务（快照顺序：新的在前）。
     pub(crate) fn session_tasks(&self) -> Vec<BackgroundTaskView> {
+        // 截图钩子：给停靠条 / 弹层塞几条假任务，别的路径还是读内核快照
+        #[cfg(feature = "headless-screenshot")]
+        {
+            if preview().is_some() {
+                return preview_tasks();
+            }
+        }
         let Some(session) = self.sessions.get(self.active) else { return Vec::new() };
         let id = session.acp_id.clone();
         let key = session.kernel.key();
@@ -215,71 +278,85 @@ impl ChatApp {
         let running = tasks.iter().filter(|task| task.running).count();
         let open = self.bg.dock_open;
         let handle = cx.entity();
-        let elapsed = elapsed_secs(self, &first);
-        let followup = first.followup.clone();
-        // 收起态那一句：单任务 / 只剩驻留都给命令，多任务给条数 + 第一条命令
-        let headline: SharedString = if running > 1 {
-            format!("{running} 个后台任务 · {}", first_line(&first.command)).into()
-        } else {
-            first_line(&first.command).into()
-        };
-        let (icon, color) = if running > 0 {
-            (IconAll::SquareTerminal, CORAL)
-        } else if first.exit_code == Some(0) {
-            (IconAll::Check, GREEN)
-        } else {
-            (IconAll::X, RED)
-        };
+        let toggle = row_id(DOCK_SCOPE, "toggle", self.session().token as usize);
 
-        let head = div()
-            .h_flex()
-            .items_center()
-            .gap_1p5()
-            .min_w_0()
-            .px_2p5()
-            .py_1()
-            .when(running > 0, |d| d.child(self.bg_spinner.clone()))
-            .when(running == 0, |d| d.child(Icon::new(icon).size_3().text_color(rgb(color))))
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .font_family(MONO)
-                    .text_size(TEXT_SMALL)
-                    .text_color(rgb(INK))
-                    .child(headline),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(TEXT_META)
-                    .text_color(rgb(INK_SOFT))
-                    .font_features(tabular_nums())
-                    .child(secs_label(elapsed)),
-            )
-            .when_some(followup, |d, text| {
-                d.child(followup_chip(row_id(DOCK_SCOPE, "followup", 0), &text))
-            })
-            .child(div().flex_1())
-            .child(
-                small_chip(
-                    row_id(DOCK_SCOPE, "toggle", self.session().token as usize),
-                    if open { "收起" } else { "展开" },
+        // 展开态：标题行只说有几条在跑，具体命令和按钮都在下面的任务行里
+        // （收起态那一行整块换掉，不重复画同一条任务的元素 id）
+        let head = if open {
+            let title: SharedString = if running > 0 {
+                format!("后台任务 · {running} 运行中").into()
+            } else {
+                "后台任务 · 已结束".into()
+            };
+            div()
+                .h_flex()
+                .items_center()
+                .gap_1p5()
+                .min_w_0()
+                .px_2p5()
+                .py_1()
+                .child(div().text_size(TEXT_META).text_color(rgb(INK_SOFT)).child(title))
+                .child(div().flex_1())
+                .child(
+                    small_chip(toggle, "收起")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_bg_dock(cx))),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.bg.dock_open = !this.bg.dock_open;
-                    if !this.bg.dock_open {
-                        this.bg.log_open = None;
-                    }
-                    this.refresh_composer(cx);
-                })),
-            )
-            .when(running == 1, |d| {
-                let id = first.id.clone();
-                d.child(stop_action(row_id(DOCK_SCOPE, "stop", 0), &id, &handle))
-            });
+        } else {
+            let elapsed = elapsed_secs(self, &first);
+            // 收起态那一句：单任务 / 只剩驻留都给命令，多任务给条数 + 第一条命令
+            let headline: SharedString = if running > 1 {
+                format!("{running} 个后台任务 · {}", first_line(&first.command)).into()
+            } else {
+                first_line(&first.command).into()
+            };
+            let (icon, color) = if running > 0 {
+                (IconAll::SquareTerminal, CORAL)
+            } else if first.exit_code == Some(0) {
+                (IconAll::Check, GREEN)
+            } else {
+                (IconAll::X, RED)
+            };
+            div()
+                .h_flex()
+                .items_center()
+                .gap_1p5()
+                .min_w_0()
+                .px_2p5()
+                .py_1()
+                .when(running > 0, |d| d.child(self.bg_spinner.clone()))
+                .when(running == 0, |d| d.child(Icon::new(icon).size_3().text_color(rgb(color))))
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .font_family(MONO)
+                        .text_size(TEXT_SMALL)
+                        .text_color(rgb(INK))
+                        .child(headline),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(TEXT_META)
+                        .text_color(rgb(INK_SOFT))
+                        .font_features(tabular_nums())
+                        .child(secs_label(elapsed)),
+                )
+                .when_some(first.followup.clone(), |d, text| {
+                    d.child(followup_chip(row_id(DOCK_SCOPE, "head-followup", 0), &text))
+                })
+                .child(div().flex_1())
+                .child(
+                    small_chip(toggle, "展开")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_bg_dock(cx))),
+                )
+                .when(running == 1, |d| {
+                    let id = first.id.clone();
+                    d.child(stop_action(row_id(DOCK_SCOPE, "head-stop", 0), &id, &handle))
+                })
+        };
 
         let log_open = self.bg.log_open.clone();
         let scroll = self.bg.log_scroll.clone();
@@ -309,6 +386,15 @@ impl ChatApp {
         )
     }
 
+    /// 收起 / 展开停靠条（收起时顺手清掉正在看的尾日志）。
+    fn toggle_bg_dock(&mut self, cx: &mut Context<Self>) {
+        self.bg.dock_open = !self.bg.dock_open;
+        if !self.bg.dock_open {
+            self.bg.log_open = None;
+        }
+        self.refresh_composer(cx);
+    }
+
     /// 顶栏的状态胶囊：个数 + 点开的任务清单（和停靠条同时出现）。
     pub(super) fn render_bg_tasks_pill(&self, cx: &mut Context<Self>) -> Option<Popover> {
         let running = self.session_tasks().iter().filter(|task| task.running).count();
@@ -326,6 +412,7 @@ impl ChatApp {
                 .w(rems(22.))
                 .p_2()
                 .trigger(trigger)
+                .default_open(preview_menu_open())
                 .content(move |_, window, cx| {
                     let content = window.use_keyed_state("bg-tasks-content", cx, |_, cx| {
                         cx.new(|cx| BgTasksContent::new(app.clone(), cx))
@@ -333,6 +420,18 @@ impl ChatApp {
                     content.read(cx).clone()
                 }),
         )
+    }
+}
+
+/// 截图钩子：这个构建要不要默认展开顶栏弹层（正常运行恒为 false）。
+fn preview_menu_open() -> bool {
+    #[cfg(feature = "headless-screenshot")]
+    {
+        preview() == Some("menu")
+    }
+    #[cfg(not(feature = "headless-screenshot"))]
+    {
+        false
     }
 }
 
@@ -382,7 +481,7 @@ fn task_row(
                     d.child(followup_chip(row_id(scope, "followup", index), &text))
                 })
                 .child(log_action(app, &task.id, row_id(scope, "log", index), log_open))
-                // 跑着的时候更要能撤续办（进程照跑）；跑完了才有「停止」可点
+                // 跑着的时候更要能撤续办（进程照跑）；「停止」只给在跑的
                 .when(task.followup.is_some(), |d| {
                     let id = task.id.clone();
                     let app = app.clone();
@@ -408,7 +507,7 @@ fn task_row(
         row = row.child(div().text_size(TEXT_META).text_color(rgb(color)).child(label));
     }
     if log_open {
-        row = row.child(log_panel(task, row_id(scope, "log", index), scroll));
+        row = row.child(log_panel(task, row_id(scope, "log-panel", index), scroll));
     }
     row
 }
