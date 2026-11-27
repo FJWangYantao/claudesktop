@@ -395,6 +395,48 @@ pub fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, String> {
     run(cwd, args).map(|(out, _)| out)
 }
 
+/// 工作区未提交的改动（Git Scope 的「未提交」档）：已跟踪文件的 staged + unstaged 合并，
+/// 未跟踪文件另由 [`untracked_files`] 列出（它们没有 base 版本可 diff，不硬造一条）。
+///
+/// 非 Git 目录返回 `None`（调用方据此把 Git 相关档位隐掉），空仓库（还没有 HEAD）
+/// 退回 `git diff` + `git diff --cached`。
+pub fn working_tree_diff(dir: &Path) -> Option<String> {
+    let repo = repo_root(dir)?;
+    let mut out = git_stdout(&repo, &["diff", "HEAD", "--no-color"]).unwrap_or_else(|_| {
+        // 还没有第一个 commit：HEAD 不存在，分开取「工作区 vs 索引」和「索引 vs HEAD」
+        let work = git_stdout(&repo, &["diff", "--no-color"]).unwrap_or_default();
+        let staged = git_stdout(&repo, &["diff", "--cached", "--no-color"]).unwrap_or_default();
+        format!("{work}{staged}")
+    });
+    if out.trim().is_empty() {
+        out = String::new();
+    }
+    Some(out)
+}
+
+/// 相对基线分支的改动（Git Scope 的「相对基线」档）：`git diff <base>...HEAD`，
+/// 三点比较的是「从共同祖先到 HEAD」，也就是这条分支自己加的东西。
+pub fn branch_diff(dir: &Path, base: &str) -> Option<String> {
+    let repo = repo_root(dir)?;
+    if base.trim().is_empty() {
+        return None;
+    }
+    git_stdout(&repo, &["diff", &format!("{base}...HEAD"), "--no-color"]).ok()
+}
+
+/// 未跟踪的文件（相对仓库根的路径）。它们没有 base 版本，只有整份内容。
+pub fn untracked_files(dir: &Path) -> Vec<PathBuf> {
+    let Some(repo) = repo_root(dir) else { return Vec::new() };
+    let Ok(text) = git_stdout(&repo, &["ls-files", "--others", "--exclude-standard"]) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| repo.join(line))
+        .collect()
+}
+
 /// 跑 git，成功时返回 (stdout, stderr)。
 fn run(cwd: &Path, args: &[&str]) -> Result<(String, String), String> {
     let mut command = Command::new("git");

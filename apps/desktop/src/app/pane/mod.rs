@@ -14,8 +14,10 @@ pub(crate) mod chat_pane;
 pub(crate) mod diff_pane;
 pub(crate) mod files_pane;
 pub(crate) mod persist;
+pub(crate) mod plan_pane;
 pub(crate) mod popout;
 pub(crate) mod skin;
+pub(crate) mod subagent_pane;
 pub(crate) mod workspace;
 
 use gpui_base::dock::Panel as BasePanel;

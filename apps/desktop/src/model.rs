@@ -300,7 +300,7 @@ impl PlanStatus {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlanRow {
     pub text: SharedString,
     pub status: PlanStatus,

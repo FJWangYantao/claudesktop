@@ -7,6 +7,8 @@ use super::chat_pane::ChatPane;
 use super::diff_pane::DiffPane;
 use super::files_pane::FilesPane;
 use super::persist;
+use super::plan_pane::PlanPane;
+use super::subagent_pane::SubagentPane;
 use super::{PaneHandle, PaneKind};
 use crate::app::ChatApp;
 use crate::app::content::ContentView;
@@ -134,6 +136,10 @@ impl ChatApp {
             }
             PaneKind::Files => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
             PaneKind::Diff => Arc::new(PaneHandle::new(cx.new(|cx| DiffPane::new(app, cx)))),
+            PaneKind::Plan => Arc::new(PaneHandle::new(cx.new(|cx| PlanPane::new(app, cx)))),
+            PaneKind::Subagent => {
+                Arc::new(PaneHandle::new(cx.new(|cx| SubagentPane::new(app, cx))))
+            }
             // 其余 Pane 在后续阶段接上；先按文件面板兜底，别让旧布局整份作废
             _ => Arc::new(PaneHandle::new(cx.new(|cx| FilesPane::new(app, cx)))),
         }
@@ -156,14 +162,67 @@ impl ChatApp {
         PaneHandle::new(cx.new(|cx| DiffPane::new(app, cx)))
     }
 
-    /// 把某个种类的 Pane 显示出来（右侧那一列里可能和别的 Pane 并成 Tab）。
-    /// 找不到就什么都不做：这个会话没有那个面板（比如聊天空间没有文件）。
-    pub(crate) fn focus_pane_of_kind(
+    pub(crate) fn new_plan_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
+        let app = cx.entity().downgrade();
+        PaneHandle::new(cx.new(|cx| PlanPane::new(app, cx)))
+    }
+
+    pub(crate) fn new_subagent_pane(&mut self, cx: &mut Context<Self>) -> PaneHandle {
+        let app = cx.entity().downgrade();
+        PaneHandle::new(cx.new(|cx| SubagentPane::new(app, cx)))
+    }
+
+    /// 按种类新起一个面板（计划 / 子代理这些「按需打开」的 Pane 用）。
+    pub(crate) fn new_pane_of_kind(
+        &mut self,
+        kind: PaneKind,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneHandle> {
+        Some(match kind {
+            PaneKind::Chat => self.new_chat_pane(cx),
+            PaneKind::Files => self.new_files_pane(cx),
+            PaneKind::Diff => self.new_diff_pane(cx),
+            PaneKind::Plan => self.new_plan_pane(cx),
+            PaneKind::Subagent => self.new_subagent_pane(cx),
+            _ => return None,
+        })
+    }
+
+    /// 打开（或聚焦）某个种类的 Pane：已经在这个工作区里就选中它，
+    /// 否则在右侧那一列新起一个 Tab。命令面板 / 快捷键都走这里。
+    pub(crate) fn open_pane(
         &mut self,
         kind: PaneKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.focus_pane_of_kind(kind, window, cx) {
+            return;
+        }
+        let Some(handle) = self.new_pane_of_kind(kind, cx) else { return };
+        self.right_panel.open = true;
+        let dock = self.dock.clone();
+        dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                Arc::new(handle) as Arc<dyn PanelView>,
+                DockPlacement::Right,
+                None,
+                window,
+                cx,
+            );
+        });
+        self.focus_pane_of_kind(kind, window, cx);
+        cx.notify();
+    }
+
+    /// 把某个种类的 Pane 显示出来（右侧那一列里可能和别的 Pane 并成 Tab）。
+    /// 返回是否找到了它。
+    pub(crate) fn focus_pane_of_kind(
+        &mut self,
+        kind: PaneKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let dock = self.dock.clone();
         let mut found = None;
         for placement in [DockPlacement::Right, DockPlacement::Center] {
@@ -182,7 +241,9 @@ impl ChatApp {
         }
         if let Some(id) = found {
             dock.update(cx, |dock, cx| dock.select_panel(id, window, cx));
+            return true;
         }
+        false
     }
 
     /// 右侧那一列：开着就保证 dock 里有这组 Tab 并展开，收起就折起来。

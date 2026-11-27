@@ -45,6 +45,10 @@ enum PaletteCmd {
     Files,
     /// 逐文件改动
     Changes,
+    /// 会话计划 / 待办
+    Plan,
+    /// 子代理一览
+    Subagent,
     /// 工作区布局回到默认（对话居中，文件 / 改动在右侧）
     ResetLayout,
     /// 用量页
@@ -205,6 +209,10 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
         Entry::new(IconAll::Settings, "打开设置", PaletteCmd::OpenSettings),
         Entry::new(IconAll::FolderTree, "文件树与源码预览", PaletteCmd::Files).key(FILES_KEY),
         Entry::new(IconAll::FileDiff, "逐文件改动", PaletteCmd::Changes).key(CHANGES_KEY),
+        Entry::new(IconAll::ListTodo, "查看会话计划", PaletteCmd::Plan)
+            .desc("把待办从对话里抽出来单独看"),
+        Entry::new(IconAll::GitBranch, "查看子代理", PaletteCmd::Subagent)
+            .desc("正在跑的子任务一览"),
         Entry::new(IconAll::LayoutDashboard, "重置工作区布局", PaletteCmd::ResetLayout)
             .desc("对话回到中间，文件 / 改动回到右侧"),
         Entry::new(IconAll::ChartColumn, "查看用量", PaletteCmd::Usage),
@@ -457,6 +465,10 @@ impl ChatApp {
             PaletteCmd::OpenSettings => self.open_settings(window, cx),
             PaletteCmd::Files => self.toggle_right_panel(RightTab::Files, window, cx),
             PaletteCmd::Changes => self.toggle_right_panel(RightTab::Changes, window, cx),
+            PaletteCmd::Plan => self.open_pane(crate::app::pane::PaneKind::Plan, window, cx),
+            PaletteCmd::Subagent => {
+                self.open_pane(crate::app::pane::PaneKind::Subagent, window, cx)
+            }
             PaletteCmd::ResetLayout => self.reset_workspace_layout(window, cx),
             PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),
