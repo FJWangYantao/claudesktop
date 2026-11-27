@@ -19,7 +19,7 @@
 //! [`SidebarSpinners`] 在 `canvas` 里直接按窗口坐标画（避免受顶栏 `CHROME_H` 偏移）。
 //! 它不画在 `ChatApp` 里：节拍器通知 `ChatApp` 会连内容区一起重画（见 content.rs）。
 
-use super::chrome::{CHROME_H, drag_area};
+use super::chrome::CHROME_H;
 use super::menu::{MenuList, menu_item, menu_panel};
 use super::motion;
 use super::widgets::Surface;
@@ -40,6 +40,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -78,12 +79,12 @@ const GROUP_PREVIEW: usize = 5;
 /// 一组在侧栏里列出哪些会话、藏起来几个，列出的保持组内原来的顺序。
 /// 折叠时只列要紧的（`keep`：当前、运行中、待查看）；没点「显示全部」时列最近活动的
 /// [`GROUP_PREVIEW`] 个加上要紧的。只多出一两个时不值得收，全列。
-fn visible_members(
+fn visible_members<K: Ord>(
     members: &[usize],
     folded: bool,
     show_all: bool,
     keep: impl Fn(usize) -> bool,
-    activity: impl Fn(usize) -> u64,
+    activity: impl Fn(usize) -> K,
 ) -> (Vec<usize>, usize) {
     if !folded && (show_all || members.len() <= GROUP_PREVIEW + 2) {
         return (members.to_vec(), 0);
@@ -92,13 +93,29 @@ fn visible_members(
         HashSet::new()
     } else {
         let mut by_activity = members.to_vec();
-        by_activity.sort_by_key(|&i| std::cmp::Reverse(activity(i)));
+        by_activity.sort_by_key(|&i| Reverse(activity(i)));
         by_activity.into_iter().take(GROUP_PREVIEW).collect()
     };
     let shown: Vec<usize> =
         members.iter().copied().filter(|&i| recent.contains(&i) || keep(i)).collect();
     let hidden = members.len() - shown.len();
     (shown, hidden)
+}
+
+fn order_projects(
+    groups: &mut [(PathBuf, Vec<usize>)],
+    current_first: bool,
+    sessions_by_activity: bool,
+    activity: impl Fn(usize) -> (u64, u64),
+) {
+    // 稳定排序：组内没有会话的项目排在后面，保留登记顺序。
+    groups[usize::from(current_first)..]
+        .sort_by_cached_key(|(_, members)| Reverse(members.iter().map(|&i| activity(i).0).max()));
+    if sessions_by_activity {
+        for (_, members) in groups {
+            members.sort_by_key(|&i| Reverse(activity(i)));
+        }
+    }
 }
 
 /// 侧栏只列哪些会话。不写进设置：筛选是一时的（看一眼谁在跑、谁有结果），重启回到全部。
@@ -424,7 +441,7 @@ impl ChatApp {
 
         // 会话：按工作目录分组，当前项目在前，其余按最近活动排序（或按日期分组）；
         // 筛选时按同样的顺序排成一组。第一组的组名行右侧带筛选 / 排序切换
-        // （悬停才显出来，开着的开关常显）
+        // （悬停才显出来，偏离默认状态时常显）
         let filter = self.sidebar_filter;
         // 代码空间「按项目」：导航里有「添加项目」，项目组头有移除；其余分法没有
         let by_project = self.sidebar_by_project();
@@ -440,7 +457,6 @@ impl ChatApp {
             let name = format!("{} · {}", filter.label(), members.len()).into();
             vec![SessionGroup { key: String::new(), name, dir: None, members }]
         };
-        let activity = |i: usize| self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms);
         let keep = |i: usize| {
             let s = &self.sessions[i];
             i == self.active || s.busy || s.unread
@@ -464,7 +480,7 @@ impl ChatApp {
             let total = members.len();
             let more_key = key.clone();
             let (members, hidden) = if foldable {
-                visible_members(&members, folded, show_all, keep, activity)
+                visible_members(&members, folded, show_all, keep, |i| self.session_activity(i))
             } else {
                 (members, 0)
             };
@@ -565,18 +581,22 @@ impl ChatApp {
             let header = if g == 0 && (filter != SidebarFilter::All || folded) {
                 header.child(self.sidebar_filter_menu(cx))
             } else if g == 0 {
-                let sort_on = self.sessions_by_activity;
+                let by_open_order = !self.sessions_by_activity;
                 header.child(self.sidebar_filter_menu(cx)).when(by_project, |d| {
                     // 按时间分组时桶内总是按最近活动排，排序切换没有意义
                     d.child(
                         Self::sidebar_icon_button(
                             "sort-sessions",
                             IconAll::ArrowDownUp,
-                            if sort_on { "按打开顺序排列" } else { "按最近活动排列" },
-                            sort_on,
+                            if by_open_order {
+                                "按最近活动排列"
+                            } else {
+                                "按打开顺序排列"
+                            },
+                            by_open_order,
                             cx,
                         )
-                        .when(!sort_on, |d| {
+                        .when(!by_open_order, |d| {
                             d.opacity(0.).group_hover("group-header", |d| d.opacity(1.))
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -726,14 +746,6 @@ impl ChatApp {
             self.settings_open && self.settings_form.tab == super::settings_view::PLUGINS_TAB;
         let usage_open =
             self.settings_open && self.settings_form.tab == super::usage_view::USAGE_TAB;
-        // 品牌：极简几何标记 + 名称，摆在拖拽区里
-        let brand = div().pl_2().child(
-            div()
-                .text_size(TEXT_BODY)
-                .font_weight(WEIGHT_STRONG)
-                .text_color(rgb(INK))
-                .child("Kimi Code"),
-        );
         // 贴边的面板：沙色底 + 右侧一条分隔线，占满窗口左缘，靠面差把视觉重心让给主区
         let panel = v_flex()
             .size_full()
@@ -742,19 +754,17 @@ impl ChatApp {
             .border_color(rgb(LINE))
             .overflow_hidden()
             .child(
-                // 头部：侧栏开关 + 品牌，其余是拖拽区（顶栏在它上面一格，窗口按钮不在这里）
+                // 侧栏开关和空间切换共用一行。
                 div()
                     .h_flex()
                     .h(CHROME_H.to_pixels(window.rem_size()))
                     .flex_shrink_0()
                     .items_center()
-                    .pl_2()
+                    .gap_2()
+                    .px_2()
                     .child(self.sidebar_toggle("sidebar-toggle", cx))
-                    .child(drag_area().h_flex().items_center().child(brand)),
+                    .child(self.render_space_switch(cx)),
             )
-            // 空间切换：聊天 | 代码（品牌行下面一格，见「设计说明-聊天与Code分离.md」5.1）。
-            // 另一个空间有会话在跑 / 等授权时，那一格带个小点，别切走了就忘了它
-            .child(self.render_space_switch(cx))
             .child(
                 nav_item("new-chat", IconAll::Plus, "新会话", false)
                     .on_click(cx.listener(|this, _, _, cx| this.add_session(cx))),
@@ -849,7 +859,7 @@ impl ChatApp {
         div().w(self.sidebar_width()).flex_shrink_0().h_full().child(panel)
     }
 
-    /// 空间切换（品牌行下面那格）：聊天 | 代码。
+    /// 侧栏头部的空间切换：聊天 | 代码。
     /// 另一个空间里有会话在跑 / 等授权时，那一格带个小点（等授权红、其余赤陶），
     /// 别切走了就忘了它在跑。
     fn render_space_switch(&self, cx: &mut Context<Self>) -> Div {
@@ -903,17 +913,17 @@ impl ChatApp {
                     .on_click(cx.listener(move |this, _, _, cx| this.switch_space(space, cx))),
             );
         }
-        div().px_2().pb_1().child(
-            div()
-                .h_flex()
-                .items_center()
-                .rounded_md()
-                .bg(rgb(PAPER))
-                .border_1()
-                .border_color(rgb(LINE))
-                .p_0p5()
-                .child(segs),
-        )
+        div()
+            .h_flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .rounded_md()
+            .bg(rgb(PAPER))
+            .border_1()
+            .border_color(rgb(LINE))
+            .p_0p5()
+            .child(segs)
     }
 
     /// 侧栏分组标题上的小图标按钮（带提示）；`on` = 开关处于打开状态（图标高亮）。
@@ -1146,7 +1156,7 @@ impl ChatApp {
     /// 侧栏分组：(组名, 会话下标)，只列**当前空间**的会话。
     /// 代码空间默认「按项目」：上半区是项目，下半区是任务（[`TASKS_KEY`]），最后是已归档；
     /// 设成「按时间」或聊天空间（没有工作目录）时一律按日期分组，任务和项目混在一起。
-    /// 组内默认按打开顺序，按活动排序时新会话在前、其余按最近更新。
+    /// 项目组内默认按最近活动倒序排列，可切换为打开顺序。
     pub(super) fn session_groups(&self) -> Vec<SessionGroup> {
         let space = self.space().kind();
         let archived = |i: usize| self.sessions[i].meta.as_ref().is_some_and(|m| m.archived);
@@ -1158,7 +1168,7 @@ impl ChatApp {
         assemble_groups(
             groups,
             self.sessions.len(),
-            |i| self.session_activity(i),
+            |i| self.session_activity(i).0,
             is_task,
             archived,
             |i| self.sessions[i].kind == space,
@@ -1177,9 +1187,10 @@ impl ChatApp {
         self.settings.sidebar_folded.iter().any(|k| same_group_key(k, key))
     }
 
-    /// 某个会话最近活动的时刻（没落盘的算最新）。
-    fn session_activity(&self, i: usize) -> u64 {
-        self.sessions[i].meta.as_ref().map_or(u64::MAX, |m| m.updated_ms)
+    /// 最近活动时间；同毫秒按会话令牌排序，让后打开的会话在前。
+    fn session_activity(&self, i: usize) -> (u64, u64) {
+        let session = &self.sessions[i];
+        (session.meta.as_ref().map_or(session.opened_ms, |m| m.updated_ms), session.token)
     }
 
     /// 没归档的会话（`listed`）按工作目录或日期分组（只列当前空间的）。
@@ -1189,7 +1200,6 @@ impl ChatApp {
         listed: impl Fn(usize) -> bool,
         by_project: bool,
     ) -> Vec<SessionGroup> {
-        // 无元信息的会话（刚开、还没落盘）视为最新
         let activity = |i: usize| self.session_activity(i);
         let space = self.space().kind();
         let listed =
@@ -1200,14 +1210,14 @@ impl ChatApp {
             let offset = crate::usage::local_offset_secs();
             let mut buckets: [Vec<usize>; 4] = Default::default();
             for i in (0..self.sessions.len()).filter(|&i| listed(i)) {
-                buckets[crate::usage::day_bucket(activity(i).min(now), now, offset)].push(i);
+                buckets[crate::usage::day_bucket(activity(i).0.min(now), now, offset)].push(i);
             }
             return buckets
                 .into_iter()
                 .zip(crate::usage::DAY_BUCKETS)
                 .filter(|(members, _)| !members.is_empty())
                 .map(|(mut members, name)| {
-                    members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
+                    members.sort_by_key(|&i| Reverse(activity(i)));
                     SessionGroup {
                         key: format!("date:{name}"),
                         name: name.into(),
@@ -1218,11 +1228,9 @@ impl ChatApp {
                 .collect();
         }
         // 当前目录是项目时它一组总在最前（空着也列出）；不是项目（对话都在任务区）就不占位
-        let mut groups: Vec<(PathBuf, Vec<usize>)> = if self.is_project_dir(&self.cwd) {
-            vec![(self.cwd.clone(), Vec::new())]
-        } else {
-            Vec::new()
-        };
+        let current_first = self.is_project_dir(&self.cwd);
+        let mut groups: Vec<(PathBuf, Vec<usize>)> =
+            if current_first { vec![(self.cwd.clone(), Vec::new())] } else { Vec::new() };
         // 显式登记过的项目：一条会话都没有也常驻在侧栏（点组头「+」就能开工）。
         // 目录暂时不在（外接盘 / 网络盘没挂上）就不占位，插回来自己会出现
         for dir in &self.settings.sidebar_projects {
@@ -1238,12 +1246,10 @@ impl ChatApp {
                 None => groups.push((dir.to_path_buf(), vec![i])),
             }
         }
+        order_projects(&mut groups, current_first, self.sessions_by_activity, activity);
         groups
             .into_iter()
-            .map(|(cwd, mut members)| {
-                if self.sessions_by_activity {
-                    members.sort_by_key(|i| std::cmp::Reverse(activity(*i)));
-                }
+            .map(|(cwd, members)| {
                 let name = if same_project_path(&cwd, &self.cwd) {
                     self.project_name.clone()
                 } else {
@@ -1791,6 +1797,41 @@ mod tests {
         // 折叠：只剩要紧的，「显示全部」也不管用
         assert_eq!(shown(3, true, false, &[]), (vec![], 3));
         assert_eq!(shown(10, true, true, &[2, 8]), (vec![2, 8], 8));
+    }
+
+    #[core::prelude::v1::test]
+    fn project_preview_shows_new_and_recently_reused_sessions_first() {
+        let mut activity =
+            [(150, 1), (140, 2), (130, 3), (120, 4), (110, 5), (100, 6), (160, 7), (160, 8)];
+        let mut groups = [(PathBuf::from("current"), (0..activity.len()).collect())];
+        order_projects(&mut groups, true, true, |i| activity[i]);
+        let (shown, hidden) =
+            visible_members(&groups[0].1, false, false, |_| false, |i| activity[i]);
+        // 下标靠后的两个空会话同毫秒创建，后开的先显示。
+        assert_eq!((shown, hidden), (vec![7, 6, 0, 1, 2], 3));
+
+        activity[5].0 = 170;
+        order_projects(&mut groups, true, true, |i| activity[i]);
+        let (shown, hidden) =
+            visible_members(&groups[0].1, false, false, |_| false, |i| activity[i]);
+        assert_eq!((shown, hidden), (vec![5, 7, 6, 0, 1], 3));
+    }
+
+    #[core::prelude::v1::test]
+    fn current_project_stays_first_and_other_projects_follow_latest_activity() {
+        let mut groups = [
+            (PathBuf::from("current"), vec![]),
+            (PathBuf::from("empty-first"), vec![]),
+            (PathBuf::from("older"), vec![1]),
+            (PathBuf::from("empty-second"), vec![]),
+            (PathBuf::from("newer"), vec![0, 2]),
+        ];
+        order_projects(&mut groups, true, false, |i| (i as u64, i as u64));
+        assert_eq!(
+            groups.each_ref().map(|(dir, _)| dir.to_str().unwrap()),
+            ["current", "newer", "older", "empty-first", "empty-second"],
+        );
+        assert_eq!(groups[1].1, [0, 2], "切到打开顺序时仍保留组内顺序");
     }
 
     #[core::prelude::v1::test]

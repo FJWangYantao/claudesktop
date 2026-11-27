@@ -41,6 +41,8 @@ pub struct Session {
     pub kernel_key: String,
     /// 创建时的令牌，用来把内核回的 Started / SessionFailed 对回这个会话
     pub token: u64,
+    /// 未落盘会话按打开时间参与侧栏排序。
+    pub(crate) opened_ms: u64,
     /// 临时会话（侧问用）：不进侧栏、不落盘、不建 `SessionMeta`、不写休眠快照，
     /// 关掉 Pane 就从内存里删掉。**所有落盘 / 列表入口都要先看这一位**
     pub ephemeral: bool,
@@ -407,6 +409,7 @@ impl Session {
             kernel,
             kernel_key,
             token,
+            opened_ms: crate::app::now_ms(),
             ephemeral: false,
             acp_id: None,
             requested: false,

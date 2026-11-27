@@ -708,7 +708,7 @@ impl ChatApp {
             overview_range: 0,
             usage_page: Default::default(),
             sidebar_open: true,
-            sessions_by_activity: false,
+            sessions_by_activity: true,
             renaming: None,
             rename_input,
             rename_focused: false,
@@ -3651,11 +3651,13 @@ impl ChatApp {
             }
             // 和用户写的一样就不必另存一份（`sent` 只在不一样时进日志）
             let sent = (reviewed || expanded.is_some() || has_attachments).then_some(sent);
-            if kernel.is_some() {
-                self.persist(
+            if kernel.is_some()
+                && self.persist(
                     idx,
                     Record::User { text: shown.clone(), images: stored, sent: sent.clone() },
-                );
+                )
+            {
+                self.touch_meta(idx);
             }
             let prompt = match sent {
                 // 附件内容已经在 `sent` 里了，内核不必再拼一遍
@@ -4352,17 +4354,15 @@ impl ChatApp {
         }
     }
 
-    /// 往第 `idx` 个会话的日志追加一条记录；首次写入时建档。
+    /// 往第 `idx` 个会话的日志追加一条记录；首次写入时建档。返回是否写入成功。
     /// 写盘失败只提示一次，不影响对话本身。
-    fn persist(&mut self, idx: usize, record: Record) {
+    fn persist(&mut self, idx: usize, record: Record) -> bool {
         if self.store.is_none() || self.sessions[idx].ephemeral {
             // 侧问影子会话：整份都不落盘（不建档、不开日志、不写记录）
-            return;
+            return false;
         }
         self.ensure_log(idx);
-        if let Some(log) = &mut self.sessions[idx].log {
-            let _ = log.append(record);
-        }
+        self.sessions[idx].log.as_mut().is_some_and(|log| log.append(record).is_ok())
     }
 
     /// 内核改了文件：改动前后的内容存成 blob，日志里记哈希（回退时还原，见 rewind.rs）。
@@ -4384,7 +4384,7 @@ impl ChatApp {
         let save = |text: Option<String>| text.map(|t| store.save_blob(&meta.id, &t)).transpose();
         match (save(before), save(after)) {
             (Ok(before), Ok(after)) => {
-                self.persist(idx, Record::FileChanged { path, before, after, reverted: None })
+                self.persist(idx, Record::FileChanged { path, before, after, reverted: None });
             }
             (Err(err), _) | (_, Err(err)) => {
                 self.sessions[idx].note(format!("检查点没存上（回退时还原不了 {path}）：{err}"))
@@ -4490,7 +4490,7 @@ impl ChatApp {
         all.into()
     }
 
-    /// 一轮结束：刷新日志，更新元信息（标题 / 内核会话 ID / 更新时间）。
+    /// 发出消息或一轮结束时，刷新日志并保存元信息（标题 / 内核会话 ID / 更新时间）。
     fn touch_meta(&mut self, idx: usize) {
         let Some(store) = &self.store else {
             return;
@@ -4698,7 +4698,7 @@ pub(crate) fn short_path(dir: &Path) -> String {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
