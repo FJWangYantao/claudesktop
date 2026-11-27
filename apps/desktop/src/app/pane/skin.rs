@@ -49,7 +49,7 @@ impl ClaudesktopDockSkin {
 
 impl DockAreaRenderer for ClaudesktopDockSkin {
     fn frame(&self, _window: &mut Window, _cx: &mut App) -> Stateful<Div> {
-        div().id("claudesktop-dock").bg(rgb(PAPER))
+        div().id("claudesktop-dock")
     }
 
     fn split_frame(&self, node: NodeId, _axis: Axis, _: &mut Window, _: &mut App) -> Stateful<Div> {
@@ -114,7 +114,8 @@ struct ClaudesktopTabGroup {
 }
 
 impl TabGroupRenderer for ClaudesktopTabGroup {
-    fn frame(&self, group: &TabGroupContext, _window: &mut Window, _cx: &mut App) -> Stateful<Div> {
+    fn frame(&self, group: &TabGroupContext, _window: &mut Window, cx: &mut App) -> Stateful<Div> {
+        let kind = group.active_panel().and_then(PaneHandle::of).map(|pane| pane.kind(cx));
         // 高度由 base 的 `.size_full()` 定，这里只画底：多写一条 `.h()` 会和它打架
         div()
             .id(("claudesktop-tab-group", group.node().as_u64()))
@@ -122,7 +123,8 @@ impl TabGroupRenderer for ClaudesktopTabGroup {
             .size_full()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(PAPER))
+            // 对话和概览自己按会话状态决定是否露出工作区底层。
+            .when(!matches!(kind, Some(PaneKind::Chat | PaneKind::Overview)), |d| d.bg(rgb(PAPER)))
             .text_size(TEXT_SMALL)
     }
 

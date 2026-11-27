@@ -77,7 +77,7 @@ impl Render for OverviewPane {
     }
 }
 
-/// 一张独立圆角矩形卡片的外壳：纸卡底 + 1px 细边 + 贴地阴影，融入与中间聊天区统一的 PAPER 画布。
+/// 一张独立圆角矩形卡片的外壳：纸卡底 + 1px 细边 + 贴地阴影，浮在工作区画布上。
 fn card_box() -> Div {
     div()
         .v_flex()
@@ -751,7 +751,7 @@ impl ChatApp {
             .id("overview-scroll")
             .size_full()
             .overflow_y_scroll()
-            .bg(rgb(PAPER))
+            .when(self.session().has_user_message(), |d| d.bg(rgb(PAPER)))
             .p_3()
             .v_flex()
             .gap_3()

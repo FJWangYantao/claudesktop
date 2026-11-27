@@ -4609,14 +4609,9 @@ impl Render for ChatApp {
         self.sync_hub(window, cx);
         self.sync_placeholder(window, cx);
 
-        // 输入框上方是缓存的内容区（见 content.rs）；设置页没有输入框
-        // 首页背景（地平线极光 + ASCII 波动字阵）铺在「内容区 + 输入区」整块背后，
-        // 所以挂在这个 relative 容器的最底层而不是 content_slot 里——挂在后者会让
-        // 极光在输入框上沿被一刀截断。对话态整块不挂载（0 CPU / 0 GPU，显存自动回收）。
         // 顶栏是主窗的固定一条（见 chrome.rs）：侧栏、工作区、弹出面板都在它下面
         let chrome_bar = self.render_header(window, cx);
-        // 工作区 = 自由分屏的 DockArea：对话 / 文件 / 改动都是里面的 Pane
-        let workspace = div().flex_1().min_w_0().h_full().relative().child(self.dock.clone());
+        let workspace = self.render_workspace(cx);
 
         let mut root = div();
         // 中文回退字体：根上设一次，子元素换 font_family 时继承

@@ -23,6 +23,7 @@ use gpui_kit::*;
 use std::time::{Duration, Instant};
 
 pub(super) const MESSAGE_HOVER_SETTLE: Duration = Duration::from_millis(120);
+pub(super) const TRANSCRIPT_SCROLLBAR_WIDTH: Pixels = px(16.);
 
 /// 内容区的缓存 view：内容全由 `ChatApp::render_content` 画，这里只是把它隔成一块单独重画的区域。
 pub(crate) struct ContentView {
@@ -413,7 +414,34 @@ impl ChatApp {
             }
         }
         let state = self.sessions[active].list.clone();
-        let scrollbar_state = state.clone();
+        let scrollbar = Scrollbar::vertical(&state).mode(ScrollbarMode::Scrolling);
+        let scrollbar = if !side_chat
+            && self.focused_chat == Some(self.sessions[active].token)
+            && self.window_handle.window_id() == window.window_handle().window_id()
+            && self.right_panel_controls()
+        {
+            // 跨过右侧 dock 绘制；纵向仍取本帧对话视口，输入框增高时拖动范围也跟着缩短。
+            deferred(
+                canvas(
+                    move |bounds, window, cx| {
+                        let origin = point(
+                            window.viewport_size().width - TRANSCRIPT_SCROLLBAR_WIDTH,
+                            bounds.top(),
+                        );
+                        let size = size(TRANSCRIPT_SCROLLBAR_WIDTH, bounds.size.height);
+                        let mut bar = scrollbar.viewport_from_layout().into_any_element();
+                        bar.prepaint_as_root(origin, size.into(), window, cx);
+                        bar
+                    },
+                    |_, mut bar, window, cx| bar.paint(window, cx),
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .into_any_element()
+        } else {
+            scrollbar.into_any_element()
+        };
         // 列表在布局时才构建可见行，此时外层渲染已结束。每行沿用所属面板的会话和动画位置池。
         let token = self.sessions[active].token;
         let spots = spots.clone();
@@ -542,9 +570,7 @@ impl ChatApp {
             .v_flex()
             .child(scroll)
             .child(wheel)
-            // 滚动 / 悬停浮现的滚动条：叠在内容之上（不挤占阅读列宽度），
-            // 拖动时列表内部冻结总高，拖到底自动恢复跟随（见 `ListState::set_offset_from_scrollbar`）
-            .child(Scrollbar::vertical(&scrollbar_state).mode(ScrollbarMode::Scrolling))
+            .child(scrollbar)
             .child(edge_fade(fade_top, paper, clear).top_0())
             .child(edge_fade(fade_bottom, clear, paper).bottom_0())
             .children(self.render_jump_to_bottom(window, cx))

@@ -10,6 +10,8 @@
 - **本机 cargo 在 `D:\dev\cargo\bin`，不在 PATH 里**（2026-11-25）：`cargo`/`rustfmt` 直接敲会报「无法将 cargo 项识别为 cmdlet」。先 `$env:Path="D:\dev\cargo\bin;$env:Path"` 再构建；目标目录固定 `$env:CARGO_TARGET_DIR="D:/t3"`，否则 `ring` 在项目内 `target` 下报 D8050。
 - **lld 链接器要用 `rust-lld.exe`，不是 `gcc-ld\lld-link.exe`**（2026-11-25）：本机 `D:\dev\cargo\config.toml` 里配 `linker` 时，`lib/rustlib\x86_64-pc-windows-msvc\bin\gcc-ld\lld-link.exe` 是固定 link flavor 的构建，会忽略并拒绝 rustc 传来的 `-flavor link`（报 `could not open 'link'`）；同目录树的 `...\bin\rust-lld.exe` 是多路复用器，接受该参数。链接器配好后 debug PDB 从 660 MB 降到 120 MB。`[profile.dev]` 与 `[profile.dev.package."*"]` 都设 `debug = false` / `line-tables-only`；`D:/t3/debug` 清理旧增量后从 20.8 GB 降到约 3.8 GB。裁剪 tree-sitter feature 后 debug exe 117.5 → 107.6 MB，`syntax.rs` 的别名表对缺失语言自动跳过，不用改代码。
 - **桌面端没有 lib target**：`cargo test -p claudesktop --lib` 报 "no library targets found"，单测入口是 `cargo test -p claudesktop --bin claudesktop`。
+- **全量测试链接时盘满**：保留 `D:/t3`，用 `compact.exe /C` 无损压缩明确列出的旧 exe / PDB，
+  再用 `CARGO_INCREMENTAL=0` 和 `cargo test --workspace -j 1` 串行重跑，不用清掉整个缓存。
 - **程序自己正跑着时编不了桌面端 exe**（2026-11-27）：`cargo build -p claudesktop` 报
   `failed to remove ...\debug\claudesktop.exe`（os error 5），因为 `D:/t3/debug/claudesktop.exe`
   就是正在运行的这个应用。Windows 允许**重命名**正在运行的 exe：先
@@ -142,6 +144,7 @@
 - **慢速连滚要量整格内的速度起伏**（2026-11-26，旧曲线基线）：相邻两帧速度连续，下一格到来前仍可能已经大幅减速。按 80/120/160ms 间隔各推 14 格，用相邻两帧（60Hz）或四帧（180Hz）的累计位移比较巡航速度。60Hz 单格前 50ms 从 12 增至 21 逻辑像素。180Hz、150% 缩放下，160ms 一格的峰谷比由 2.17 降至 1.22，单格前三帧由 0/1/1 变为 3/3/3 物理像素。
   隐藏窗口载入 30 轮纯文本后，用 Windows 滚轮消息先上滚一格，停稳后再以 160ms 间隔上滚两格，离屏正文分别移动 144、288 物理像素（144 DPI，每格三行），下滚三格回到原位。前台呈现节拍与 Kimi 的实机对照仍待测量。
   起步截图和总位移用两次独立输入。debug 离屏截图在 UI 线程读回并保存 PNG，本机一次请求约 0.9–1.8s，超过滚轮的 500ms 过期阈值。在同一格中途截图会干扰后续推进，实测曾只走首步 3 物理像素。
+- **短程滚轮的主观迟滞先查位移换算和曲线**（2026-11-27）：`wheel_motion=short` 时三行一格固定为 64px，再用 120ms、`y1=0.03` 的慢启动曲线推进。144 DPI / 180Hz release 实测首步约 5.2ms，但只走 0.667px；过半 p50 为 60.5ms，收尾 p50 为 115.2ms。单步到内容 paint 的 p50/p95 为 2.11/2.83ms，阻塞步为 0，说明普通短会话不是掉帧或列表卡住。「关」会把 100.8px 当帧走完，「标准」同样 100.8px 但收尾 p50 为 194.3ms。不要拿无节拍隐藏窗口约 260ms 的 paint 间隔当用户时延。脚本和摘要见 `.claudesktop/bench/wheel-latency-20261127/`。
 - **滚轮曲线与落定帧**（2026-11-24）：Chromium 在 2024 年移除了 Impulse，156 的鼠标滚轮参考曲线为
   `EASE_IN_OUT + INVERSE_DELTA`。默认一格 96px、200ms，欠量从 120px 增至 480px 时默认段长线性缩至 100ms。
   旧控制点横坐标 `x1 > x2` 会在中慢速连滚时放大速度起伏。固定横坐标 0.42/0.58，继承速度过大时缩短段长以压住 `y1`，
@@ -800,8 +803,9 @@
 - **指针光晕是 GPU 的事，别烤进 CPU 贴图**。CPU 侧把光斑写进像素后，波纹收敛时
   `fill_idle` 会把那个亮斑永久留在静止字阵里；光晕只走 `ascii_ripple.hlsl` 的
   `params.aura`（圆心 / 半径 / 强度），强度按停留时间 `smoothstep` 归零。
-- **首页背景要挂在 `body`（内容区 + 输入区）的底层**，不是 `content_slot()` 里：
-  后者在输入框上沿就结束了，极光会被一刀截断。
+- **首页背景挂在主工作区的底层**：`content_slot()` 会在输入框上沿截断字阵；挂在对话 Pane 里，
+  打开右侧概览又会在 Dock 接缝截断。Dock 框架透出整张画布，新会话和概览的空白处共用它，
+  卡片、历史对话和详情页各自画实底。
 - **弹出式提示别用「同帧就卸载」的脉冲**：`surge` 曾经在发送消息时触发，但同一帧
   `home_backdrop_active()` 就变假、整块卸载，一帧都画不出来——已删掉。
 - **出图验收清单**（`--features headless-screenshot` + `CLAUDESKTOP_PRISM_SEED=<秒,px,py>`）：

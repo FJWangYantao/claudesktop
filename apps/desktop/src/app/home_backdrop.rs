@@ -1,8 +1,8 @@
 //! 首页背景：地平线极光 + ASCII 波动字阵。
 //!
-//! 只在「还没发过消息的首页」挂载（见 `ChatApp::home_backdrop_active`）。一进对话
-//! 就整块卸载：图元不再提交、显存由 `PrismGpuResources` 在 120 帧后回收，
-//! 所以对话态的背景开销是 0 CPU / 0 GPU / 0 VRAM。
+//! 主工作区里有「还没发过消息的首页」时才挂载（见 `ChatApp::render_workspace`）。
+//! 首页离开视口后整块卸载：图元不再提交、显存由 `PrismGpuResources` 在 120 帧后回收，
+//! 也不再安排背景动画帧。
 //!
 //! 帧循环是**自调度**的，不是常驻：只有波纹还在跑、指针光晕还没消退、或者刚发过消息
 //! 的脉冲还没播完时，才在 paint 里 `request_animation_frame()`。三者都停下之后
@@ -70,6 +70,13 @@ impl Default for HomeBackdrop {
 }
 
 impl HomeBackdrop {
+    /// 卸载后作废上一帧的命中区和指针轨迹。
+    pub(super) fn clear_bounds(&mut self) {
+        self.bounds = None;
+        self.last_wake = None;
+        self.aura = None;
+    }
+
     /// 指针移动：注入扰动 + 更新光晕。抖动（位移小于阈值）只续光晕不扰动水面。
     ///
     /// 返回是否落在背景范围内（侧栏 / 顶栏上的鼠标不该搅动首页水面）。
@@ -375,15 +382,12 @@ impl Render for HomeBackdropView {
 }
 
 impl super::ChatApp {
-    /// 首页背景该不该挂载：还没发过消息、没开设置页、氛围效果和动画都开着。
-    ///
-    /// 挂在 `content_slot` 里，一进对话这层就整块不挂载了（图元不再提交，
-    /// 显存在 120 帧后由渲染器回收）。
-    pub(super) fn home_backdrop_active(&self) -> bool {
-        !self.settings_open
-            && !super::motion::reduced()
-            && super::prism_rim::ambient_on()
-            && !self.session().has_user_message()
+    pub(super) fn home_backdrop_enabled(&self) -> bool {
+        !self.settings_open && !super::motion::reduced() && super::prism_rim::ambient_on()
+    }
+
+    fn home_backdrop_active(&self) -> bool {
+        self.home_backdrop_enabled() && !self.session().has_user_message()
     }
 
     /// 指针移动：16ms 节流 + 只通知背景 view 自己（`ChatApp` 不变脏）。

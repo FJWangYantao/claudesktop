@@ -12,9 +12,12 @@ use super::plan_pane::PlanPane;
 use super::subagent_pane::SubagentPane;
 use super::{PaneHandle, PaneKind};
 use crate::app::ChatApp;
-use crate::app::content::ContentView;
+use crate::app::content::{ContentView, TRANSCRIPT_SCROLLBAR_WIDTH};
 use crate::app::motion::LoopOverlay;
-use gpui_base::dock::{DockEvent, DockLayout, DockPlacement, PanelView};
+use crate::theme::{PAPER, rgb};
+use gpui_base::dock::{
+    DockArea, DockEvent, DockLayout, DockPlacement, PaneNode, PaneRef, PanelView,
+};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -717,7 +720,70 @@ impl ChatApp {
         cx.notify();
     }
 
-    /// 对话 Pane 的正文：首页背景 + 内容区 + 输入框（顶栏在外面，见 chrome.rs）。
+    /// 主工作区：首页背景一张铺在整个 DockArea 下方，概览卡片之间透出同一片字阵。
+    pub(crate) fn render_workspace(&self, cx: &App) -> Div {
+        let show_backdrop = self.home_backdrop_enabled() && self.workspace_has_home_chat(cx);
+        if !show_backdrop {
+            self.home_backdrop.borrow_mut().clear_bounds();
+        }
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            // 给聊天滚动条留出独立热区，右栏的文件列表和原生网页都能用到各自的右缘。
+            .when(self.right_panel_controls() && self.session().has_user_message(), |d| {
+                d.pr(TRANSCRIPT_SCROLLBAR_WIDTH)
+            })
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .when(show_backdrop, |d| d.child(self.home_backdrop_view.clone()))
+                    .child(self.dock.clone()),
+            )
+    }
+
+    fn workspace_has_home_chat(&self, cx: &App) -> bool {
+        let dock = self.dock.read(cx);
+        let zoomed = dock.zoomed_group();
+        [DockPlacement::Center, DockPlacement::Left, DockPlacement::Right, DockPlacement::Bottom]
+            .into_iter()
+            .filter(|&placement| {
+                zoomed.is_some()
+                    || placement == DockPlacement::Center
+                    || dock.is_dock_open(placement)
+            })
+            .filter_map(|placement| dock.layout(placement))
+            .filter_map(|tree| match zoomed {
+                Some(node) => tree.find_node(node),
+                None => Some(tree.root()),
+            })
+            .any(|node| self.dock_node_has_home_chat(dock, node, cx))
+    }
+
+    fn dock_node_has_home_chat(&self, dock: &DockArea, node: &PaneNode, cx: &App) -> bool {
+        match node.kind() {
+            PaneRef::Split { children, .. } => {
+                children.iter().any(|child| self.dock_node_has_home_chat(dock, child, cx))
+            }
+            PaneRef::Tabs { panels, active_ix } => panels
+                .get(active_ix)
+                .and_then(|active| {
+                    // 和 TabGroup 一致：当前标签隐藏时，实际画第一个可见标签。
+                    std::iter::once(active)
+                        .chain(panels)
+                        .filter_map(|&id| dock.panel(id))
+                        .find(|panel| panel.visible(cx))
+                })
+                .and_then(PaneHandle::of)
+                .filter(|pane| pane.kind(cx) == PaneKind::Chat)
+                .and_then(|pane| pane.token(cx))
+                .and_then(|token| self.index_of_token(token))
+                .is_some_and(|idx| !self.sessions[idx].has_user_message()),
+        }
+    }
+
+    /// 对话 Pane 的正文：内容区 + 输入框（顶栏在外面，见 chrome.rs）。
     pub(crate) fn render_chat_body_with(
         &mut self,
         token: u64,
@@ -740,7 +806,7 @@ impl ChatApp {
                 .size_full()
                 .min_h_0()
                 .w_full()
-                .when(app.home_backdrop_active(), |d| d.child(app.home_backdrop_view.clone()))
+                .when(app.session().has_user_message(), |d| d.bg(rgb(PAPER)))
                 .child(app.content_slot_with(content, overlay))
                 .when(!app.settings_open, |d| d.child(composer));
             body.when(!app.settings_open, |d| app.with_file_drop(d, cx)).into_any_element()
