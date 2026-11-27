@@ -26,6 +26,9 @@ use std::time::Instant;
 const LINGER_SECS: u64 = 4;
 /// 展开的尾日志最高多少（超出内部滚动，不顶出窗口）
 const LOG_MAX_H: Pixels = px(120.);
+/// 停靠条的行 / 弹层的行用不同前缀：两处同帧出现时元素 id 不能撞
+const DOCK_SCOPE: &str = "bgd";
+const POP_SCOPE: &str = "bgp";
 
 /// 后台任务的界面状态：只在内存里，不进会话持久化。
 pub(crate) struct BgTasksUi {
@@ -68,32 +71,38 @@ impl Render for BgSpinner {
     }
 }
 
-/// 顶栏胶囊的弹层内容：独立 entity，`ChatApp` 变了才跟着重画。
+/// 顶栏胶囊的弹层内容：独立 entity，`ChatApp` 或输入框变了才跟着重画。
 pub(super) struct BgTasksContent {
     app: Entity<ChatApp>,
+    /// 弹层自己的尾日志滚动位置（和停靠条那个不是同一个元素，别共用句柄）
+    log_scroll: ScrollHandle,
     _app_observed: Subscription,
+    /// 秒数和尾日志更新走 `refresh_composer`（只通知输入框），弹层也得跟着刷
+    _input_observed: Subscription,
 }
 
 impl BgTasksContent {
     fn new(app: Entity<ChatApp>, cx: &mut Context<Self>) -> Self {
+        let input = app.read(cx).input.clone();
         let _app_observed = cx.observe(&app, |_, _, cx| cx.notify());
-        Self { app, _app_observed }
+        let _input_observed = cx.observe(&input, |_, _, cx| cx.notify());
+        Self { app, log_scroll: ScrollHandle::new(), _app_observed, _input_observed }
     }
 }
 
 impl Render for BgTasksContent {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let handle = self.app.clone();
+        let scroll = self.log_scroll.clone();
         let app = self.app.read(cx);
         let tasks = app.session_tasks();
         let log_open = app.bg.log_open.clone();
-        let scroll = app.bg.log_scroll.clone();
         let rows: Vec<Div> = tasks
             .iter()
             .enumerate()
             .map(|(i, task)| {
                 let open = log_open.as_deref() == Some(task.id.as_str());
-                task_row(&handle, task, elapsed_secs(app, task), i, open, &scroll)
+                task_row(&handle, task, elapsed_secs(app, task), i, open, &scroll, POP_SCOPE)
             })
             .collect();
         div().v_flex().gap_1().children(rows)
@@ -118,12 +127,16 @@ impl ChatApp {
     /// 侧栏用：这个会话（含子会话）还有没有在跑的后台命令。
     pub(crate) fn session_has_running_bg(&self, idx: usize) -> bool {
         let Some(session) = self.sessions.get(idx) else { return false };
-        let id = session.acp_id.as_deref();
+        let Some(id) = session.acp_id.as_deref() else { return false };
         let key = session.kernel.key();
         self.kernels.iter().filter(|(slot_key, _)| *slot_key == key).any(|(_, slot)| {
-            slot.tasks
-                .iter()
-                .any(|task| task.running && id.is_some_and(|id| task.session.starts_with(id)))
+            slot.tasks.iter().any(|task| {
+                // 子会话用 `父/子` 的写法认（和 `bgtasks::has_running` 一致），
+                // 不能只 `starts_with`：`…-10` 会被当成 `…-1` 的子会话
+                task.running
+                    && (task.session == id
+                        || task.session.strip_prefix(id).is_some_and(|rest| rest.starts_with('/')))
+            })
         })
     }
 
@@ -157,9 +170,6 @@ impl ChatApp {
                 until: now + std::time::Duration::from_secs(LINGER_SECS),
             });
         }
-        if self.bg.linger.iter().all(|l| l.task.running) {
-            self.bg.linger.clear();
-        }
         // 侧栏只看「有没有在跑」：翻转了才重画
         running_by_session(old) != running_by_session(new)
     }
@@ -167,9 +177,10 @@ impl ChatApp {
     /// 每秒一拍：跳秒 / 驻留到期。返回 true = 输入区要重画。
     pub(crate) fn tick_background(&mut self) -> bool {
         let now = Instant::now();
-        let had = !self.bg.linger.is_empty();
+        let before = self.bg.linger.len();
         self.bg.linger.retain(|l| l.until > now);
-        let expired = had && self.bg.linger.is_empty();
+        // 只要真收掉了就得重画（几条驻留先后到期，不能等全空）
+        let expired = self.bg.linger.len() != before;
         expired || self.session_tasks().iter().any(|task| task.running)
     }
 
@@ -180,12 +191,19 @@ impl ChatApp {
         before != self.bg.linger.len()
     }
 
-    /// 停靠条上的任务：运行中的在前，驻留的完整任务在后。
+    /// 停靠条上的任务：当前会话运行中的在前，本会话刚结束正在驻留的在后
+    /// （别的会话留下的驻留不能串到这一条上来）。
     fn dock_tasks(&self) -> Vec<BackgroundTaskView> {
+        let session = self.sessions.get(self.active).and_then(|s| s.acp_id.clone());
         let mut tasks: Vec<BackgroundTaskView> =
             self.session_tasks().into_iter().filter(|task| task.running).collect();
+        let now = Instant::now();
         tasks.extend(
-            self.bg.linger.iter().filter(|l| l.until > Instant::now()).map(|l| l.task.clone()),
+            self.bg
+                .linger
+                .iter()
+                .filter(|l| l.until > now && session.as_deref() == Some(l.task.session.as_str()))
+                .map(|l| l.task.clone()),
         );
         tasks
     }
@@ -237,17 +255,17 @@ impl ChatApp {
                 div()
                     .flex_shrink_0()
                     .text_size(TEXT_META)
-                    .text_color(rgb(INK_FAINT))
+                    .text_color(rgb(INK_SOFT))
                     .font_features(tabular_nums())
                     .child(secs_label(elapsed)),
             )
             .when_some(followup, |d, text| {
-                d.child(followup_chip(("bg-followup-head", 0usize), &text))
+                d.child(followup_chip(row_id(DOCK_SCOPE, "followup", 0), &text))
             })
             .child(div().flex_1())
             .child(
                 small_chip(
-                    ("bg-dock-toggle", self.session().token as usize),
+                    row_id(DOCK_SCOPE, "toggle", self.session().token as usize),
                     if open { "收起" } else { "展开" },
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -260,7 +278,7 @@ impl ChatApp {
             )
             .when(running == 1, |d| {
                 let id = first.id.clone();
-                d.child(stop_action(("bg-dock-stop", 0usize), &id, &handle))
+                d.child(stop_action(row_id(DOCK_SCOPE, "stop", 0), &id, &handle))
             });
 
         let log_open = self.bg.log_open.clone();
@@ -268,14 +286,14 @@ impl ChatApp {
         let body = div().v_flex().gap_1().px_2p5().pb_2().children(tasks.iter().enumerate().map(
             |(i, task)| {
                 let is_open = log_open.as_deref() == Some(task.id.as_str());
-                task_row(&handle, task, elapsed_secs(self, task), i, is_open, &scroll)
+                task_row(&handle, task, elapsed_secs(self, task), i, is_open, &scroll, DOCK_SCOPE)
             },
         ));
 
         Some(
             div()
                 .v_flex()
-                .w_full()
+                // 和 `render_context_bar` 一样只写左右外边距：再叠 `w_full()` 会向右多凸一圈
                 .mx(COMPOSER_RADIUS)
                 // 由后画的输入卡片盖住这 1px，上沿只留中间一条接缝（同 `render_context_bar`）
                 .mb(px(-1.))
@@ -318,6 +336,11 @@ impl ChatApp {
     }
 }
 
+/// 行内元素 id：停靠条和顶栏弹层同帧出现时不能撞（`scope` 区分两处）。
+fn row_id(scope: &str, kind: &str, index: usize) -> ElementId {
+    ElementId::Name(format!("bg-{scope}-{kind}-{index}").into())
+}
+
 /// 一条任务的行（停靠条和顶栏弹层共用）：命令 + 秒数 + 续办 / 停止 + 尾日志。
 fn task_row(
     app: &Entity<ChatApp>,
@@ -326,8 +349,8 @@ fn task_row(
     index: usize,
     log_open: bool,
     scroll: &ScrollHandle,
+    scope: &'static str,
 ) -> Div {
-    let id = task.id.clone();
     let mut row =
         div().v_flex().gap_1().rounded_md().px_1().py_1().hover(|d| d.bg(rgb(HOVER))).child(
             div()
@@ -350,56 +373,54 @@ fn task_row(
                     div()
                         .flex_shrink_0()
                         .text_size(TEXT_META)
-                        .text_color(rgb(INK_FAINT))
+                        .text_color(rgb(INK_SOFT))
                         .font_features(tabular_nums())
                         .child(secs_label(elapsed)),
                 )
                 .child(div().flex_1())
                 .when_some(task.followup.clone(), |d, text| {
-                    d.child(followup_chip(("bg-followup", index), &text))
+                    d.child(followup_chip(row_id(scope, "followup", index), &text))
                 })
-                .child(log_action(app, &task.id, index, log_open))
-                .when(task.running, |d| d.child(stop_action(("bg-stop", index), &id, app)))
-                .when(!task.running && task.followup.is_some(), |d| {
+                .child(log_action(app, &task.id, row_id(scope, "log", index), log_open))
+                // 跑着的时候更要能撤续办（进程照跑）；跑完了才有「停止」可点
+                .when(task.followup.is_some(), |d| {
                     let id = task.id.clone();
                     let app = app.clone();
-                    d.child(small_chip(("bg-cancel", index), "取消续办").on_click(
+                    d.child(small_chip(row_id(scope, "cancel", index), "取消续办").on_click(
                         move |_, _, cx| {
                             let id = id.clone();
                             app.update(cx, |app, cx| app.cancel_background_followup(&id, cx));
                         },
                     ))
+                })
+                .when(task.running, |d| {
+                    let id = task.id.clone();
+                    d.child(stop_action(row_id(scope, "stop", index), &id, app))
                 }),
         );
     if !task.running {
-        row = row.child(div().text_size(TEXT_META).text_color(rgb(INK_FAINT)).child(
-            match (task.exit_code, task.ready_to_resume) {
-                (Some(0), _) => "已结束 · 退出码 0".to_string(),
-                (Some(code), _) => format!("已结束 · 退出码 {code}"),
-                (None, true) => "已结束 · 自动续办中".to_string(),
-                (None, false) => "已结束".to_string(),
-            },
-        ));
+        let (label, color) = match (task.exit_code, task.ready_to_resume) {
+            (Some(0), _) => ("已结束 · 退出码 0".to_string(), INK_SOFT),
+            (Some(code), _) => (format!("已结束 · 退出码 {code}"), RED),
+            (None, true) => ("已结束 · 自动续办中".to_string(), INK_SOFT),
+            (None, false) => ("已结束".to_string(), INK_SOFT),
+        };
+        row = row.child(div().text_size(TEXT_META).text_color(rgb(color)).child(label));
     }
     if log_open {
-        row = row.child(log_panel(app, task, scroll));
+        row = row.child(log_panel(task, row_id(scope, "log", index), scroll));
     }
     row
 }
 
-fn log_panel(
-    app: &Entity<ChatApp>,
-    task: &BackgroundTaskView,
-    scroll: &ScrollHandle,
-) -> Stateful<Div> {
+fn log_panel(task: &BackgroundTaskView, id: ElementId, scroll: &ScrollHandle) -> Stateful<Div> {
     let text: SharedString = if task.output_tail.trim().is_empty() {
         "（还没有输出）".into()
     } else {
         task.output_tail.clone().into()
     };
-    let _ = app;
     div()
-        .id(("bg-log-panel", 0usize))
+        .id(id)
         .w_full()
         .max_h(LOG_MAX_H)
         .overflow_y_scroll()
@@ -415,7 +436,6 @@ fn log_panel(
 
 /// 秒数的中文文案（「12 秒」/「1 分 5 秒」），和对话里的回执一致。
 fn secs_label(secs: u64) -> String {
-    let secs = secs.max(1);
     match (secs / 60, secs % 60) {
         (0, s) => format!("{s} 秒"),
         (m, 0) => format!("{m} 分钟"),
@@ -491,11 +511,11 @@ fn stop_action(id: impl Into<ElementId>, target: &str, app: &Entity<ChatApp>) ->
 }
 
 /// 展开 / 收起尾日志。
-fn log_action(app: &Entity<ChatApp>, target: &str, index: usize, open: bool) -> Stateful<Div> {
+fn log_action(app: &Entity<ChatApp>, target: &str, id: ElementId, open: bool) -> Stateful<Div> {
     let target = target.to_string();
     let app = app.clone();
     div()
-        .id(("bg-log-toggle", index))
+        .id(id)
         .flex_shrink_0()
         .p(px(2.))
         .rounded_md()

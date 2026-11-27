@@ -1217,7 +1217,8 @@ impl ChatApp {
         eprintln!("[mem] warm_blocks entries={} bytes={}", warm.entries, warm.bytes);
     }
 
-    /// 停掉一条后台命令（顶栏的小标点的）。
+    /// 停掉一条后台命令（顶栏 / 停靠条 / 弹层里的停止）。
+    /// 只重画输入区：任务行和停靠条都在这里，正文区是缓存 view
     pub(crate) fn stop_background(&mut self, id: &str, cx: &mut Context<Self>) {
         let kind = self.sessions[self.active].kernel.clone();
         if let Some(kernel) = self.kernel_of(&kind)
@@ -1225,7 +1226,7 @@ impl ChatApp {
         {
             kernel.stop_background_task(id);
         }
-        cx.notify();
+        self.refresh_composer(cx);
     }
 
     /// 撤销一条后台任务的续办：只撤回调，进程照跑。
@@ -1236,7 +1237,7 @@ impl ChatApp {
         {
             kernel.cancel_background_followup(id);
         }
-        cx.notify();
+        self.refresh_composer(cx);
     }
 
     /// 系统已装字体族（设置页的字体下拉用）。枚举一次要上百毫秒，缓存在 `theme` 里。

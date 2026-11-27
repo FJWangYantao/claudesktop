@@ -806,25 +806,25 @@ impl ChatApp {
         let dock_open = dock.is_some();
         let token = self.session().token;
         let open = self.session().show_context_bar();
-        let reveal_dock =
-            super::motion::reveal_progress(("composer-bg-dock", token), dock_open, window, cx);
-        let reveal = super::motion::reveal_progress(
-            ("composer-context-bar", token),
-            open && !dock_open,
-            window,
-            cx,
-        );
+        // 收起动画由卸载完成（停靠条没了就整块不画），不要再空跑一个弹回 0 的弹簧
+        let context_reveal = if dock_open {
+            0.
+        } else {
+            super::motion::reveal_progress(("composer-context-bar", token), open, window, cx)
+        };
         // 展开态也挂着 Reveal：首帧量好高度，收起时不会先塌一下
         let composer_stack = div()
             .v_flex()
             .w_full()
             .when_some(dock, |d, dock| {
-                d.child(super::motion::Reveal::new(("composer-bg-dock", token), reveal_dock, dock))
+                let reveal =
+                    super::motion::reveal_progress(("composer-bg-dock", token), true, window, cx);
+                d.child(super::motion::Reveal::new(("composer-bg-dock", token), reveal, dock))
             })
-            .when(!dock_open && (open || reveal > 0.001), |d| {
+            .when(!dock_open && (open || context_reveal > 0.001), |d| {
                 d.child(super::motion::Reveal::new(
                     ("composer-context-bar", token),
-                    reveal,
+                    context_reveal,
                     self.render_context_bar(cx),
                 ))
             })

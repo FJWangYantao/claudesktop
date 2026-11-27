@@ -239,11 +239,16 @@ fn views_filtered(kernel: Option<u64>) -> Vec<BackgroundTaskView> {
 }
 
 /// 输出末尾的几行（界面上的小卡片 / 展开的尾日志用）：跳过空行，单行太长截断。
+/// 一行里用 `\r` 反复刷新的进度条只留最后那一段（`10%\r50%\r100%` → `100%`）。
 fn tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(TAIL_LINES);
-    lines[start..].iter().map(|line| clip(line, TAIL_LINE_CHARS)).collect::<Vec<_>>().join("\n")
+    lines[start..]
+        .iter()
+        .map(|line| clip(line.rsplit('\r').next().unwrap_or(line), TAIL_LINE_CHARS))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 起一条后台命令，返回任务 ID。
@@ -443,9 +448,18 @@ pub fn stop(id: &str) -> Result<String, String> {
     let mut child = task.child.lock().unwrap();
     crate::tools::kill_tree(&mut child);
     drop(child);
-    *task.state.lock().unwrap() = State::Exited(None);
-    // 停掉也要在对话里留一道回执（续办已经在上面撤销了，直接发）
-    emit_exit(&task, State::Exited(None), None);
+    // 回收线程可能已经抢先把状态记成 Exited 并发了回执：那时这里不再覆盖、也不重复发
+    let was_running = {
+        let mut state = task.state.lock().unwrap();
+        let was = *state == State::Running;
+        if was {
+            *state = State::Exited(None);
+        }
+        was
+    };
+    if was_running {
+        emit_exit(&task, State::Exited(None), None);
+    }
     let owner = task.kernel;
     notify_kernel(Some(owner));
     Ok(format!("已结束 {}（{}）", task.id, task.command))
@@ -604,6 +618,8 @@ mod unit {
         // 单行太长要截断（进度条那样一行反复刷新的输出不能把快照撑大）
         let long = format!("{}\n收尾", "x".repeat(TAIL_LINE_CHARS + 50));
         assert_eq!(tail(long.as_bytes()), format!("{}…\n收尾", "x".repeat(TAIL_LINE_CHARS)));
+        // 一行里用 `\r` 刷新的进度条只留最后那一段
+        assert_eq!(tail(b"10%\r50%\r100%\ndone\n"), "100%\ndone");
     }
 
     /// 缓冲满了以后增量读取照样接得上：游标是绝对位置，不随丢掉前面的而失效

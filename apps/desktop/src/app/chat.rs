@@ -2481,10 +2481,20 @@ impl ChatApp {
             Some(code) => format!("退出码 {code}"),
             None => "已中断".to_string(),
         };
+        let code_color =
+            if receipt.exit_code.is_some_and(|code| code != 0) { RED } else { INK_SOFT };
         step_line(Icon::new(icon).size_3p5().text_color(rgb(color)))
+            // 自动续办会开启新的一轮：在它上面画一条细线（和用户消息一样分得开）
+            .when(receipt.resumed, |d| d.pt_1().border_t_1().border_color(rgb(LINE)))
             .child(ellipsis(("bg-receipt", idx), first_line(&receipt.label())).font_family(MONO))
             .child(div().flex_shrink_0().text_color(rgb(INK_FAINT)).child("·"))
-            .child(div().flex_shrink_0().font_features(tabular_nums()).child(code))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(code_color))
+                    .font_features(tabular_nums())
+                    .child(code),
+            )
             .child(div().flex_shrink_0().text_color(rgb(INK_FAINT)).child("·"))
             .child(div().flex_shrink_0().font_features(tabular_nums()).child(receipt.elapsed()))
             .child(div().flex_1())
