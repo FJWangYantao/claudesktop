@@ -26,6 +26,8 @@ use std::time::Instant;
 const LINGER_SECS: u64 = 4;
 /// 展开的尾日志最高多少（超出内部滚动，不顶出窗口）
 const LOG_MAX_H: Pixels = px(120.);
+/// 展开的任务清单最高多少（任务很多时自己滚，不把对话区一路顶上去）
+const BODY_MAX_H: Pixels = px(260.);
 /// 停靠条的行 / 弹层的行用不同前缀：两处同帧出现时元素 id 不能撞
 const DOCK_SCOPE: &str = "bgd";
 const POP_SCOPE: &str = "bgp";
@@ -360,12 +362,19 @@ impl ChatApp {
 
         let log_open = self.bg.log_open.clone();
         let scroll = self.bg.log_scroll.clone();
-        let body = div().v_flex().gap_1().px_2p5().pb_2().children(tasks.iter().enumerate().map(
-            |(i, task)| {
+        let body = div()
+            .id(row_id(DOCK_SCOPE, "body", 0))
+            .v_flex()
+            .gap_1()
+            .px_2p5()
+            .pb_2()
+            // 任务多的时候限高、自己在框里滚，别把对话区一路顶上去
+            .max_h(BODY_MAX_H)
+            .overflow_y_scroll()
+            .children(tasks.iter().enumerate().map(|(i, task)| {
                 let is_open = log_open.as_deref() == Some(task.id.as_str());
                 task_row(&handle, task, elapsed_secs(self, task), i, is_open, &scroll, DOCK_SCOPE)
-            },
-        ));
+            }));
 
         Some(
             div()
@@ -458,15 +467,14 @@ fn task_row(
                 .gap_1p5()
                 .min_w_0()
                 .child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .font_family(MONO)
-                        .text_size(TEXT_SMALL)
-                        .text_color(rgb(INK))
-                        .child(super::chat::first_line(&task.command)),
+                    // 命令占掉剩余宽度（放不下就省略，悬停看全文），右边的时间 / 按钮不参与收缩
+                    super::chat::ellipsis(
+                        row_id(scope, "cmd", index),
+                        super::chat::first_line(&task.command),
+                    )
+                    .flex_1()
+                    .font_family(MONO)
+                    .text_size(TEXT_SMALL),
                 )
                 .child(
                     div()
@@ -476,7 +484,6 @@ fn task_row(
                         .font_features(tabular_nums())
                         .child(secs_label(elapsed)),
                 )
-                .child(div().flex_1())
                 .when_some(task.followup.clone(), |d, text| {
                     d.child(followup_chip(row_id(scope, "followup", index), &text))
                 })
