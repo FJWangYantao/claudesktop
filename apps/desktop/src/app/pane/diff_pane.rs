@@ -121,6 +121,35 @@ impl ClaudesktopPane for DiffPane {
                     .into_any_element(),
             );
         }
+        // 「未提交 / 基线」两档要能手动重拉：用户手改文件、shell 里改了东西时
+        // `diff_revision` 不会变，只有这个按钮能刷新
+        if current != crate::app::right_panel::DiffScope::Turn
+            && current != crate::app::right_panel::DiffScope::Session
+        {
+            let handle = app.clone();
+            items.push(
+                div()
+                    .id("diff-refresh-git")
+                    .h_full()
+                    .flex_shrink_0()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded_md()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                    .child(Icon::new(IconAll::RefreshCw).small())
+                    .child("刷新")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(app) = handle.upgrade() {
+                            app.update(cx, |app, cx| app.refresh_git_diff(cx));
+                        }
+                    }))
+                    .into_any_element(),
+            );
+        }
         vec![div().h_flex().items_center().gap_0p5().mr_1().children(items).into_any_element()]
     }
 }

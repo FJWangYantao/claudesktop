@@ -884,6 +884,16 @@
   「未提交 / 基线」走 git。混用 `latest_turn()`（那是第几轮，不是记录下标）会切错段。
 - **`ChangedFiles` 的缓存键要带 offset**：只按 `diff_revision` 判脏的话，在「本轮 / 会话」
   之间切换会沿用它算好的另一档清单。
+- **`git::base_of` 是「当前 HEAD 的分支」，不是基线**：拿它当 `<base>...HEAD` 的 base
+  等于 `HEAD...HEAD`，永远返回空。worktree 会话用 `WorktreeMeta::base`；普通仓库用
+  `git::default_base`（上游 → `origin/HEAD` → `main` / `master`，且跳过当前分支）。
+- **git 子进程不进 `render`**：`git diff` + `ls-files` 在 Windows 上一次能占几百毫秒。
+  现在 `GitDiff` 只记账 `(会话令牌, diff_revision, 范围)`，真正取数在
+  `background_executor` 里跑，回来再 `install`（键对不上就丢掉这份迟到的结果）；
+  用户手改文件不会递增 `diff_revision`，所以「未提交 / 基线」两档有手动刷新按钮。
+- **diff 正文里的 `---` / `+++` 不是文件头**：只在 hunk 之外（`in_hunk == false`）才按
+  头部跳过，否则 Markdown 分割线、`--flag`、`++i` 这些真实代码行会被整行吞掉。
+
 
 
 

@@ -297,69 +297,62 @@ impl DiffScope {
     }
 }
 
-/// git 两档的取数结果（按 `(范围, diff_revision)` 缓存，切回同一个范围不重跑 git）
+/// git diff 解析出来的一行：文件头 / 正文行 / 说明
+pub(super) enum GitRow {
+    File { path: String, added: u32, removed: u32 },
+    Line(claudesktop_core::DiffLineView),
+    Note(SharedString),
+}
+
+/// git 两档的取数结果。
+///
+/// 三件事必须一起做到：**键带会话令牌**（否则切到另一个恰好同 `diff_revision` 的项目会话
+/// 会继续显示上一个仓库的改动）、**git 子进程不进 render**（Windows 上一次能占几百毫秒）、
+/// **有手动刷新**（用户手改文件不会递增 `diff_revision`）。
 #[derive(Default)]
 struct GitDiff {
-    scope: Option<DiffScope>,
-    revision: u64,
+    /// 已经装好结果的键：(会话令牌, diff_revision, 范围)
+    loaded: Option<(u64, u64, DiffScope)>,
+    /// 正在算的键（同一份请求不重复发）
+    pending: Option<(u64, u64, DiffScope)>,
     rows: Vec<GitRow>,
     error: Option<String>,
     list: Option<ListState>,
     scroll_top: ListOffset,
 }
 
-/// git diff 解析出来的一行：文件头 / 正文行 / 说明
-enum GitRow {
-    File { path: String, added: u32, removed: u32 },
-    Line(claudesktop_core::DiffLineView),
-    Note(SharedString),
+/// 一份 git 取数请求（进背景线程用，全是 owned 数据）
+pub(super) struct GitDiffRequest {
+    pub(super) scope: DiffScope,
+    pub(super) dir: PathBuf,
+    /// 基线档要比对的分支（worktree 会话用创建时记下的 base）
+    pub(super) base: Option<String>,
 }
 
 impl GitDiff {
-    fn sync(&mut self, scope: DiffScope, session: &Session) {
-        if self.scope == Some(scope) && self.revision == session.diff_revision {
+    fn key_of(session: &Session, scope: DiffScope) -> (u64, u64, DiffScope) {
+        (session.token, session.diff_revision, scope)
+    }
+
+    /// 结果装回来；期间用户换了会话 / 范围就丢掉这份迟到的结果。
+    fn install(&mut self, key: (u64, u64, DiffScope), rows: Vec<GitRow>, error: Option<String>) {
+        if self.pending != Some(key) {
             return;
         }
-        self.scope = Some(scope);
-        self.revision = session.diff_revision;
+        self.pending = None;
+        self.loaded = Some(key);
+        self.rows = rows;
+        self.error = error;
         self.list = None;
+    }
+
+    /// 切会话 / 手动刷新时整份作废。
+    fn invalidate(&mut self) {
+        self.loaded = None;
+        self.pending = None;
         self.rows.clear();
         self.error = None;
-        let dir = session.cwd.as_path();
-        if claudesktop_core::git::repo_root(dir).is_none() {
-            self.error = Some("这个目录不是 git 仓库：只有「本轮 / 会话」两档可用".into());
-            return;
-        }
-        let text = match scope {
-            DiffScope::WorkingTree => claudesktop_core::git::working_tree_diff(dir),
-            DiffScope::BranchBase => claudesktop_core::git::base_of(dir)
-                .ok()
-                .and_then(|base| claudesktop_core::git::branch_diff(dir, &base)),
-            _ => None,
-        };
-        let Some(text) = text else {
-            self.error = Some("读不到 git 的改动".into());
-            return;
-        };
-        self.rows = parse_unified_diff(&text);
-        // 未跟踪的文件没有 base 版本可以 diff，只列出来
-        let untracked = claudesktop_core::git::untracked_files(dir);
-        if !untracked.is_empty() {
-            self.rows.push(GitRow::Note(
-                format!("另有 {} 个未跟踪文件（没有可比较的旧版本）", untracked.len()).into(),
-            ));
-            for path in untracked.iter().take(20) {
-                self.rows.push(GitRow::Note(
-                    path.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string())
-                        .into(),
-                ));
-            }
-        }
-        if self.rows.is_empty() {
-            self.rows.push(GitRow::Note("工作区是干净的".into()));
-        }
+        self.list = None;
     }
 
     fn list(&mut self, rem: Pixels) -> ListState {
@@ -380,6 +373,50 @@ impl GitDiff {
     }
 }
 
+/// 背景线程里跑的那一段：把 git 输出翻成可以直接画的行。
+pub(super) fn compute_git_diff(request: &GitDiffRequest) -> (Vec<GitRow>, Option<String>) {
+    let dir = request.dir.as_path();
+    if claudesktop_core::git::repo_root(dir).is_none() {
+        return (Vec::new(), Some("这个目录不是 git 仓库：只有「本轮 / 会话」两档可用".into()));
+    }
+    let text = match request.scope {
+        DiffScope::WorkingTree => claudesktop_core::git::working_tree_diff(dir),
+        DiffScope::BranchBase => {
+            request.base.as_deref().and_then(|base| claudesktop_core::git::branch_diff(dir, base))
+        }
+        _ => None,
+    };
+    let Some(text) = text else {
+        let message = match request.scope {
+            DiffScope::BranchBase => "当前分支没有可对比的基线分支",
+            _ => "读不到 git 的改动",
+        };
+        return (Vec::new(), Some(message.into()));
+    };
+    let mut rows = parse_unified_diff(&text);
+    // 未跟踪的文件没有 base 版本可以 diff，只列出来——只属于「未提交」这一档
+    if request.scope == DiffScope::WorkingTree {
+        let untracked = claudesktop_core::git::untracked_files(dir);
+        if !untracked.is_empty() {
+            rows.push(GitRow::Note(
+                format!("另有 {} 个未跟踪文件（没有可比较的旧版本）", untracked.len()).into(),
+            ));
+            for path in untracked.iter().take(20) {
+                rows.push(GitRow::Note(
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                        .into(),
+                ));
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows.push(GitRow::Note("工作区是干净的".into()));
+    }
+    (rows, None)
+}
+
 /// 把 `git diff` 的文本拆成可以逐行画的形状（文件头 + 正文行 + hunk 分隔）。
 ///
 /// 只认统一格式的几种行：`diff --git` / `---` / `+++` / `@@` / `+` / `-` / 空格开头。
@@ -392,6 +429,8 @@ fn parse_unified_diff(text: &str) -> Vec<GitRow> {
     let (mut added, mut removed) = (0u32, 0u32);
     let mut old_no = 0u32;
     let mut new_no = 0u32;
+    // 是否已经进了 hunk 正文：`---` / `+++` 在 hunk 里是**真的代码行**，不能按头部吞掉
+    let mut in_hunk = false;
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -399,12 +438,14 @@ fn parse_unified_diff(text: &str) -> Vec<GitRow> {
             let _ = rest;
             // `diff --git a/X b/X`：取 ` b/` 后面那段
             path = Some(line.rsplit(" b/").next().unwrap_or_default().to_string());
+            in_hunk = false;
             continue;
         }
         if path.is_none() {
             continue;
         }
         if line.starts_with("@@") {
+            in_hunk = true;
             // `@@ -a,b +c,d @@`：解析两边的起始行号
             let mut parts = line.trim_start_matches("@@ -").split(' ');
             if let Some(old) = parts.next() {
@@ -424,8 +465,14 @@ fn parse_unified_diff(text: &str) -> Vec<GitRow> {
             }));
             continue;
         }
-        if line.starts_with("+++") || line.starts_with("---") || line.starts_with('\\') {
-            // 文件头里的路径行：`diff --git` 已经给了，跳过
+        if !in_hunk && (line.starts_with("+++") || line.starts_with("---")) {
+            // 文件头里的路径行：`diff --git` 已经给了，跳过。
+            // **只在 hunk 之外判**——Markdown 的 `---`、SQL 的 `-- 注释`、C++ 的 `++i`
+            // 在正文里会变成 `---...` / `+++...`，按前缀吞掉会把真实代码行弄丢。
+            continue;
+        }
+        if line.starts_with('\\') {
+            // `\ No newline at end of file`
             continue;
         }
         // 只有上下文行（空格开头）、增行、删行才是正文；`index` / `new file mode` /
@@ -554,6 +601,8 @@ impl RightPanelState {
         self.preview = None;
         self.diff_preview = None;
         self.changed_files = None;
+        // git 两档也整份作废：用户手改 / shell 改动不会递增 `diff_revision`
+        self.git.invalidate();
         self.diff_list_scroll.0.borrow().base_handle.set_offset(point(px(0.), px(0.)));
         self.file_scroll.0.borrow().base_handle.set_offset(point(px(0.), px(0.)));
         self.file_tree.load_dir(&self.root);
@@ -771,14 +820,21 @@ impl ChatApp {
         self.refresh_changed_file_count();
         if self.right_panel.scope.git() {
             let scope = self.right_panel.scope;
-            let session = &self.sessions[self.active];
-            self.right_panel.git.sync(scope, session);
+            let key = {
+                let session = &self.sessions[self.active];
+                GitDiff::key_of(session, scope)
+            };
+            if self.right_panel.git.loaded != Some(key) {
+                // 结果还没到（第一次进这一档 / 刚换会话）：请求一次并给个占位，
+                // **不在 render 里跑 git 子进程**（Windows 上一次能占几百毫秒）
+                self.request_git_diff(cx);
+                return panel_note("正在读取 git 改动…").into_any_element();
+            }
             return self.render_git_diff(window, cx);
         }
-        // 「本轮」开着审查页时，整块让给审查页：逐块撤回、批注都在那里（见 review.rs）
-        if self.right_panel.scope == DiffScope::Turn && self.review_open() {
-            return self.render_review_page(cx);
-        }
+        // 审查页只在内容区那一处画（`content.rs`）：这里不再画第二份——
+        // 两份会共用 `review_scroll`、元素 id 完全相同，还会互相抢滚动句柄。
+        // 这个 Pane 只提供入口（Tab 栏的「逐块撤回」）。
         self.render_diff_workspace(window, cx)
     }
 
@@ -827,9 +883,58 @@ impl ChatApp {
             }),
         )
         .with_estimated_item_height(row_height)
-        .flex_1()
-        .min_h_0()
+        // 外层（DiffPane）是块级容器，不认 `flex_1`：直接铺满
+        .size_full()
         .into_any_element()
+    }
+
+    /// 基线档要比的分支：worktree 会话用它创建时记下的 base，
+    /// 普通仓库走 `git::default_base`（上游 / origin/HEAD / main / master，且不等于当前分支）。
+    fn git_baseline(&self) -> Option<String> {
+        let session = self.session();
+        if let Some(worktree) = &session.worktree {
+            return Some(worktree.base.clone());
+        }
+        claudesktop_core::git::default_base(&session.cwd)
+    }
+
+    /// 在后台线程拉一次 git 改动（同一份请求不重复发）。
+    pub(crate) fn request_git_diff(&mut self, cx: &mut Context<Self>) {
+        let scope = self.right_panel.scope;
+        if !scope.git() {
+            return;
+        }
+        let key = {
+            let session = &self.sessions[self.active];
+            GitDiff::key_of(session, scope)
+        };
+        let git = &self.right_panel.git;
+        if git.loaded == Some(key) || git.pending == Some(key) {
+            return;
+        }
+        self.right_panel.git.pending = Some(key);
+        let request = GitDiffRequest {
+            scope,
+            dir: self.sessions[self.active].cwd.clone(),
+            base: self.git_baseline(),
+        };
+        cx.spawn(async move |this, cx| {
+            let (rows, error) =
+                cx.background_executor().spawn(async move { compute_git_diff(&request) }).await;
+            let _ = this.update(cx, |app, cx| {
+                // 期间用户换了会话 / 范围：`install` 自己会把迟到的结果丢掉
+                app.right_panel.git.install(key, rows, error);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 手动重拉（用户手改文件、shell 里改了东西时 `diff_revision` 不会变）。
+    pub(crate) fn refresh_git_diff(&mut self, cx: &mut Context<Self>) {
+        self.right_panel.git.invalidate();
+        self.request_git_diff(cx);
+        cx.notify();
     }
 
     /// 本轮改动文件数：按 `(会话令牌, diff_revision)` 缓存。
@@ -1463,6 +1568,35 @@ mod tests {
         assert_eq!(shortened.item_count(), 16);
         assert_eq!(shortened.logical_scroll_top().item_ix, 16);
         assert_eq!(shortened.logical_scroll_top().offset_in_item, px(0.));
+    }
+
+    /// 正文里本来就有 `---` / `++` 的行不能被当成文件头吞掉
+    /// （Markdown 分割线、SQL 注释、`--flag`、C++ 的 `++i` 都会变成 `---...` / `+++...`）。
+    #[core::prelude::v1::test]
+    fn diff_body_lines_starting_with_dashes_or_pluses_survive() {
+        let text = "diff --git a/doc.md b/doc.md\n\
+                    --- a/doc.md\n\
+                    +++ b/doc.md\n\
+                    @@ -1,2 +1,2 @@\n\
+                    --- old separator\n\
+                    +--- new separator\n\
+                    -- comment\n\
+                    ++counter\n";
+        let rows = parse_unified_diff(text);
+        let body: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                GitRow::Line(line) if line.tag != '~' => Some(line.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            body.contains(&"-- old separator"),
+            "hunk 里以 `---` 开头的删除行被吞掉了：{body:?}"
+        );
+        assert!(body.contains(&"--- new separator"), "hunk 里以 `---` 开头的新增行被吞掉了");
+        assert!(body.contains(&"- comment"), "以 `--` 开头的上下文行被吞掉了");
+        assert!(body.contains(&"+counter"), "以 `++` 开头的新增行被吞掉了");
     }
 
     /// `git diff` 的解析：文件头要落在它那段正文**前面**，增删行数按整段统计。

@@ -382,6 +382,38 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// 相对基线分支：普通仓库依次试「上游分支的短名」→ `origin/HEAD` 指向的分支 →
+/// `main` → `master`，并且**一定不等于当前分支**（否则比较的是 `HEAD...HEAD`，永远为空）。
+/// 找不到可对比的基线时返回 None，调用方提示「当前分支没有可对比的基线」。
+///
+/// worktree 会话不走这里：那条分支的基线由创建 worktree 时记下的 `base` 决定。
+pub fn default_base(dir: &Path) -> Option<String> {
+    let current = current_branch(dir).map(|b| b.name);
+    let candidates: Vec<String> = [
+        git_stdout(dir, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+            .ok()
+            .map(|s| s.trim().to_string()),
+        git_stdout(dir, &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"])
+            .ok()
+            .map(|s| s.trim().trim_start_matches("origin/").to_string()),
+        Some("main".to_string()),
+        Some("master".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|name| !name.is_empty())
+    .collect();
+    for name in candidates {
+        if current.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        if branch_exists(dir, &name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// 跑一条 git 命令：不弹黑框、不问密码；失败时带上 git 的报错（译成中文）。
 /// 成功时返回 stdout，stdout 为空时退回 stderr（`clone` / `pull` 的进度写在那儿）。
 /// 要解析输出的（`status --porcelain` 等）用 [`git_stdout`]，别把 stderr 的警告当成输出。
@@ -448,6 +480,9 @@ pub fn untracked_files(dir: &Path) -> Vec<PathBuf> {
 fn run(cwd: &Path, args: &[&str]) -> Result<(String, String), String> {
     let mut command = Command::new("git");
     command
+        // 中文 / 空格文件名不要被转义成 `\346\226\207`（面板里要直接显示）
+        .arg("-c")
+        .arg("core.quotepath=false")
         .args(args)
         .current_dir(cwd)
         // 要凭据时直接失败，别等一个看不见的输入（Git Credential Manager 也别弹窗）

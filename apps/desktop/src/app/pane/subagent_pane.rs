@@ -78,36 +78,15 @@ impl Render for SubagentPane {
 }
 
 impl ChatApp {
-    /// 子代理 Pane 的正文：正在看的那个子任务就地展开，否则列全部。
+    /// 子代理 Pane 的正文：列当前会话的全部子代理，点一条在对话区打开它的过程。
+    ///
+    /// 详情页**不在这里画**：`content.rs` 已经在 `viewing_task` 有值时接管内容区了，
+    /// 两处各画一份会共用 `task_scroll`、元素 id 也撞车（和审查页同一个坑）。
     pub(crate) fn render_subagent_tab(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // 详情页开着就整个让给它（顶栏留一条「返回列表」）
-        if let Some(task) = self.session().viewing_task.clone() {
-            let back = div()
-                .id("subagent-back")
-                .h_flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap_1()
-                .px_4()
-                .py_2()
-                .text_size(TEXT_SMALL)
-                .text_color(rgb(INK_SOFT))
-                .hover(|d| d.text_color(rgb(INK)))
-                .child(Icon::new(IconAll::ChevronLeft).small())
-                .child("全部子代理")
-                .on_click(cx.listener(|this, _, _, cx| this.close_task(cx)));
-            let page = self.render_task_page(&task, window, cx);
-            return v_flex()
-                .size_full()
-                .child(back)
-                .child(div().flex_1().min_h_0().children(page))
-                .into_any_element();
-        }
-
         let session = self.session();
         if session.subagents.is_empty() {
             return div()
