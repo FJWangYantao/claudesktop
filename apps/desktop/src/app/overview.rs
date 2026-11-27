@@ -459,6 +459,10 @@ impl ChatApp {
             match self.space() {
                 _ if s.steering.is_some() => s.steering.unwrap_or_default().into(),
                 _ if s.busy || s.stopping => "回车排队，这一轮结束后自动发出".into(),
+                // 后台任务还在跑（这一轮已经结束）：输入框照常能用，顺手说明一句
+                _ if self.session_tasks().iter().any(|task| task.running) => {
+                    "后台任务运行中，可继续输入…".into()
+                }
                 Space::Chat => CHAT_PLACEHOLDER.into(),
                 Space::Code => PLACEHOLDER.into(),
             }
