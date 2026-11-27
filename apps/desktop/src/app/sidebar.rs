@@ -323,6 +323,10 @@ impl ChatApp {
             )
                 .hash(&mut h);
         }
+        // 后台命令在跑：行首会换成终端微标，跑没了也要跟着换回来
+        for i in 0..self.sessions.len() {
+            self.session_has_running_bg(i).hash(&mut h);
+        }
         let key = h.finish();
         if key != self.sidebar_key {
             self.sidebar_key = key;
@@ -1304,7 +1308,8 @@ impl ChatApp {
                 )));
         }
 
-        // 状态标记：等授权红点、运行中转圈、待查看赤陶实心点，空闲会话保持安静不挂圈
+        // 状态标记的优先级：等授权红点 > 运行中转圈 > 待查看赤陶点 > 后台命令终端微标
+        let bg_running = !s.busy && self.session_has_running_bg(i);
         let marker = if s.busy && s.waiting_user() {
             div().size(px(6.)).rounded_full().bg(rgb(RED)).into_any_element()
         } else if s.busy {
@@ -1326,6 +1331,9 @@ impl ChatApp {
         } else if s.unread {
             // 有还没看的新结果：赤陶实心点
             div().size(px(7.)).rounded_full().bg(rgb(CORAL)).into_any_element()
+        } else if bg_running {
+            // 后台命令还在跑（回合已经结束）：安静的终端小图标
+            Icon::new(IconAll::SquareTerminal).size_3().text_color(rgb(CORAL)).into_any_element()
         } else {
             div().into_any_element()
         };

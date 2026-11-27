@@ -543,6 +543,9 @@ pub enum ChatItem {
     Plan(Vec<PlanRow>),
     Agent(String),
     Note(SharedString),
+    /// 后台任务在对话流里的回执：`resumed` = 这一轮由它唤起（自动续办），
+    /// 否则只是普通任务结束的留痕（不切用户轮次）。
+    BackgroundResume(BackgroundReceipt),
     /// 本轮失败（发送失败或内核报错）：卡片按原因写标题和建议，带「重试」等按钮
     Failed {
         message: SharedString,
@@ -555,6 +558,34 @@ pub enum ChatItem {
         state: CompactState,
         open: bool,
     },
+}
+
+/// 一条后台任务的回执（对话流里的一行）：命令、退出码、耗时，以及是不是自动续办。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BackgroundReceipt {
+    pub id: SharedString,
+    pub command: SharedString,
+    /// 退出码；被信号结束 / 不受管时为 None
+    pub exit_code: Option<i32>,
+    pub duration_secs: u64,
+    /// true = 自动续办（这一轮由它唤起，算轮次边界）；false = 普通任务结束
+    pub resumed: bool,
+}
+
+impl BackgroundReceipt {
+    /// 命令行为空（旧日志）时的兜底标题。
+    pub fn label(&self) -> SharedString {
+        if self.command.trim().is_empty() {
+            format!("后台任务 {}", self.id).into()
+        } else {
+            self.command.clone()
+        }
+    }
+
+    /// 耗时（「1 分 20 秒」那套文案）。
+    pub fn elapsed(&self) -> String {
+        duration_label(self.duration_secs * 1000)
+    }
 }
 
 /// 上下文压缩的进度。
@@ -801,6 +832,15 @@ impl DisplayBytes {
 }
 
 impl ChatItem {
+    pub fn starts_turn(&self) -> bool {
+        match self {
+            Self::User { .. } => true,
+            // 普通后台任务的结束只是留痕，不切开用户的轮次
+            Self::BackgroundResume(r) => r.resumed,
+            _ => false,
+        }
+    }
+
     /// 新开一段流式中的思考（默认收起）；`started` 为 None 时不计时（重放历史）。
     pub fn thinking(text: impl Into<String>, started: Option<Instant>) -> Self {
         Self::Thinking {
@@ -943,6 +983,7 @@ impl ChatItem {
             }
             Self::Plan(rows) => rows.iter().map(|r| r.text.len() + HEAD).sum::<usize>(),
             Self::Note(t) | Self::Failed { message: t, .. } => t.len() + 64,
+            Self::BackgroundResume(r) => r.id.len() + r.command.len() + 96,
             Self::Compaction { state, .. } => {
                 let text = match state {
                     CompactState::Done(s) | CompactState::Failed(s) => s.len(),
@@ -1060,6 +1101,10 @@ impl ChatItem {
             }
             Self::Agent(t) => (6u8, t.len()).hash(&mut h),
             Self::Note(t) => (7u8, t.len()).hash(&mut h),
+            // 回执行：命令 / 退出码 / 是不是续办决定这一行长什么样
+            Self::BackgroundResume(r) => {
+                (12u8, r.command.len(), r.exit_code, r.resumed, r.id.len()).hash(&mut h)
+            }
             Self::Failed { message, kind } => (9u8, message.len(), kind).hash(&mut h),
             Self::Compaction { state, open, .. } => {
                 let (phase, len) = match state {

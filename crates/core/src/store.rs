@@ -222,6 +222,8 @@ impl Record {
             KernelEvent::AgentMessageChunk { .. }
                 | KernelEvent::AgentThoughtChunk { .. }
                 | KernelEvent::SteerInjected { .. }
+                | KernelEvent::BackgroundResumed { .. }
+                | KernelEvent::BackgroundExited { .. }
                 | KernelEvent::ToolCallStarted { .. }
                 | KernelEvent::ToolCallUpdated { .. }
                 | KernelEvent::ToolCallDiff { .. }

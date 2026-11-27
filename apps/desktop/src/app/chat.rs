@@ -33,6 +33,13 @@ use std::time::{Duration, Instant};
 
 /// 同组相邻两步之间的行距
 pub(super) const STEP_GAP: Rems = rems(0.375);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WheelMotion {
+    Direct,
+    Smooth,
+    Short,
+}
 /// 已定型正文的渲染缓存条数（见 `reading_markdown`）
 const MARKDOWN_CACHE_LEN: usize = 256;
 
@@ -908,7 +915,7 @@ impl ChatApp {
                                     // 只登记真正露在视口里的那部分：卡片滚出去一半时，
                                     // 被裁掉的那半不还能命中滚轮
                                     let visible = bounds.intersect(&window.content_mask().bounds);
-                                    regions.borrow_mut().push((visible, paint_handle.clone(), idx))
+                                    regions.borrow_mut().push((visible, paint_handle.clone()))
                                 },
                                 |_, _, _, _| {},
                             )
@@ -949,51 +956,29 @@ impl ChatApp {
         )
     }
 
-    /// 指针落在工具输出上：在 capture 阶段直接把这一格滚掉。返回 `None` 表示内层吃掉了，
-    /// 返回 `Some(剩余)` 表示该交给外层列表（没有任何内层命中，或者这一格粘滞期已过、内层已在尽头）。
-    ///
-    /// 滚到底之后有 250ms 的粘滞期：同一行继续滚仍然吞掉，不穿透到外层（`overscroll-behavior: contain`
-    /// 的等价物）；停顿之后再滚才交还。交还时调用方仍要 `stop_propagation()`，否则
-    /// `overflow_y_scroll` 和列表的 bubble 监听器都会再滚一次。
+    /// 工具输出先消费滚得到的距离，返回这一格交给外层的余量。
     pub(super) fn scroll_tool_output(
         &mut self,
         pos: Point<Pixels>,
         dy: Pixels,
         cx: &mut Context<Self>,
-    ) -> Option<Pixels> {
-        /// 内层到达尽头之后的粘滞时长
-        const NESTED_LOCK: Duration = Duration::from_millis(250);
-        let now = Instant::now();
-        let hit = self.tool_scroll_regions.borrow().iter().find_map(|(bounds, handle, idx)| {
-            bounds.contains(&pos).then(|| (handle.clone(), *idx))
-        });
-        let Some((handle, idx)) = hit else {
-            return Some(dy);
+    ) -> Pixels {
+        let hit = self
+            .tool_scroll_regions
+            .borrow()
+            .iter()
+            .find_map(|(bounds, handle)| bounds.contains(&pos).then(|| handle.clone()));
+        let Some(handle) = hit else {
+            return dy;
         };
-        // 滚到底的路上别越界：越界后滚轮还要还给外层列表
-        let offset = handle.offset().y;
-        let max = handle.max_offset().y.max(px(0.));
-        let next = (offset + dy).max(-max).min(px(0.));
-        if next != offset {
-            handle.set_offset(point(handle.offset().x, next));
-            // 外层平滑滚动的余量作废：这一格给了内层，别再补到对话上
+        let offset = handle.offset();
+        let (next, rest) = split_nested_scroll(offset.y, handle.max_offset().y, dy);
+        if rest != dy {
+            handle.set_offset(point(offset.x, next));
             self.sessions[self.active].wheel = None;
-            self.nested_scroll_lock = Some((idx, now + NESTED_LOCK));
             self.content_view.update(cx, |_, cx| cx.notify());
-            // 这一格已经消费在内层（含刚撞到边界的那一格），整格吞掉；
-            // 余量留给下一次输入，等粘滞期过了再交还外层，别在边界处先弹一下再卡住
-            return None;
         }
-        if let Some((locked, until)) = self.nested_scroll_lock
-            && locked == idx
-            && now < until
-        {
-            // 还在同一次连续滚动里：吞掉，粘滞期跟着续
-            self.nested_scroll_lock = Some((idx, now + NESTED_LOCK));
-            return None;
-        }
-        self.nested_scroll_lock = None;
-        Some(dy)
+        rest
     }
 
     /// 工具输出里的「复制」：和消息下方的复制共用同一份「刚复制了什么」状态。
@@ -2062,7 +2047,8 @@ impl ChatApp {
             cx.propagate();
             return;
         }
-        self.wheel_by(viewport * 0.85 * direction as f32, false, cx);
+        let motion = if cx.reduce_motion() { WheelMotion::Direct } else { WheelMotion::Smooth };
+        self.wheel_by(viewport * 0.85 * direction as f32, motion, cx);
     }
 
     /// Ctrl+Home：回到这段对话的开头（停止跟底，不播放长距离动画）。
@@ -2083,17 +2069,15 @@ impl ChatApp {
     }
 
     /// 滚轮往末尾滚了 `delta`（正 = 往下，负 = 往上）：把离散输入累计到
-    /// [`WheelInput`] 的相对余量里，由 [`Self::step_wheel`] 每帧沿 $C^1$ 三次贝塞尔曲线
-    /// 推进（默认段长 100–200ms，连滚可再缩短）交给列表。
+    /// [`WheelInput`] 的相对位移里，由 [`Self::step_wheel`] 叠加各格曲线后交给列表。
     /// 只记「用户还要滚多少」，不再记滚动条的绝对目标——上方行补量抬高读数时不会
     /// 凭空多走一段（见 HANDOFF 里「绝对像素目标在补量行高后失效」）。
-    /// 触控板的精确位移本来就连续，和「减少动态效果」时一样直接滚到位。
+    /// 触控板的精确位移本来就连续，调用方选择直接滚到位。
     /// 只通知内容区：滚动不影响输入区。
-    pub(super) fn wheel_by(&mut self, delta: Pixels, precise: bool, cx: &mut Context<Self>) {
+    pub(super) fn wheel_by(&mut self, delta: Pixels, motion: WheelMotion, cx: &mut Context<Self>) {
         self.hover_settle_task = None;
         self.jump = None;
         let now = Instant::now();
-        let direct = precise || cx.reduce_motion();
         let s = &mut self.sessions[self.active];
         // 用户自己滚了：展开 / 收起时钉住的那一行不用再补偿
         s.release_pin();
@@ -2103,17 +2087,24 @@ impl ChatApp {
         if delta < px(0.) {
             s.list.pause_following_tail();
         }
-        if direct {
+        if motion == WheelMotion::Direct {
             s.wheel = None;
-            let (applied, _) = apply_relative(&s.list, delta);
+            let (applied, edge) = apply_relative(&s.list, delta);
+            crate::session::wheel_trace::step(
+                s.token,
+                delta.as_f32(),
+                applied.as_f32(),
+                edge,
+                true,
+            );
             if applied != px(0.) {
                 self.scrolling_until = Some(now + super::content::MESSAGE_HOVER_SETTLE);
             }
+        } else if motion == WheelMotion::Short {
+            s.wheel.get_or_insert_with(WheelInput::default).push_short(now, delta);
         } else {
             match &mut s.wheel {
                 Some(w) => w.push(now, delta),
-                // 新的一串从此刻起算：首帧固定按一个刷新周期起步（不受事件到达相位影响），
-                // 之后沿曲线圆顶加速再收到零，干脆落位
                 None => s.wheel = Some(WheelInput::new(now, delta)),
             }
         }
@@ -2140,9 +2131,16 @@ impl ChatApp {
         let mut moved = false;
         if step != px(0.) {
             let (applied, edge) = apply_relative(&s.list, step);
+            crate::session::wheel_trace::step(
+                s.token,
+                step.as_f32(),
+                applied.as_f32(),
+                edge,
+                false,
+            );
             moved = applied != px(0.);
             // 先记账再 `block`：`block` 会把欠量清零，反过来相减会留下负的余量。
-            // `applied == 0`（一步没走成）由 `consume` 重锚曲线并开始计「卡住」的时长
+            // `applied == 0` 时暂停曲线并开始计「卡住」的时长
             w.consume(applied, now);
             // 这个方向真到头了：朝外的欠量作废，别每帧空转。
             // 位移方向永远和输入一致，不会有回弹帧
@@ -2466,7 +2464,41 @@ impl ChatApp {
                 step_line(Icon::new(IconAll::Info).size_3p5().text_color(rgb(INK_SOFT)))
                     .child(div().flex_1().min_w_0().child(text.clone()))
             }
+            // 后台任务回执：续办 / 普通结束共用一行轻回执
+            ChatItem::BackgroundResume(receipt) => Self::render_background_receipt(idx, receipt),
         }
+    }
+
+    /// 后台任务回执行：等宽命令 + 退出码 + 耗时，右端标「自动续办 / 已结束」。
+    fn render_background_receipt(idx: usize, receipt: &BackgroundReceipt) -> Div {
+        let (icon, color) = match receipt.exit_code {
+            Some(0) => (IconAll::Check, GREEN),
+            Some(_) => (IconAll::X, RED),
+            // 被手动停掉 / 退出码未知
+            None => (IconAll::SquareTerminal, INK_SOFT),
+        };
+        let code = match receipt.exit_code {
+            Some(code) => format!("退出码 {code}"),
+            None => "已中断".to_string(),
+        };
+        step_line(Icon::new(icon).size_3p5().text_color(rgb(color)))
+            .child(ellipsis(("bg-receipt", idx), first_line(&receipt.label())).font_family(MONO))
+            .child(div().flex_shrink_0().text_color(rgb(INK_FAINT)).child("·"))
+            .child(div().flex_shrink_0().font_features(tabular_nums()).child(code))
+            .child(div().flex_shrink_0().text_color(rgb(INK_FAINT)).child("·"))
+            .child(div().flex_shrink_0().font_features(tabular_nums()).child(receipt.elapsed()))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded_md()
+                    .bg(rgb(SAND))
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .child(if receipt.resumed { "自动续办" } else { "已结束" }),
+            )
     }
 
     /// 拆开的大回复里的第 `part` 块。
@@ -2678,6 +2710,13 @@ fn max_scroll(list: &ListState) -> Pixels {
 
 fn distance_to_end(list: &ListState) -> Pixels {
     (max_scroll(list) - scroll_top(list)).max(px(0.))
+}
+
+fn split_nested_scroll(offset: Pixels, max_offset: Pixels, delta: Pixels) -> (Pixels, Pixels) {
+    let minimum = -max_offset.max(px(0.));
+    let offset = offset.clamp(minimum, px(0.));
+    let next = (offset + delta).clamp(minimum, px(0.));
+    (next, delta - (next - offset))
 }
 
 /// 把 `delta` 交给列表做相对滚动，返回实际消费的像素和「这个方向是不是真到头了」。
@@ -3006,6 +3045,23 @@ fn plain_title(title: &SharedString) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[core::prelude::v1::test]
+    fn nested_wheel_hands_off_unconsumed_distance() {
+        let max = px(300.);
+        for gap in [0_f32, 10., 50., 95., 96., 120.] {
+            let consumed = gap.min(96.0_f32);
+            assert_eq!(
+                split_nested_scroll(px(-gap), max, px(96.)),
+                (px(consumed - gap), px(96. - consumed))
+            );
+            assert_eq!(
+                split_nested_scroll(px(gap) - max, max, px(-96.)),
+                (px(gap - consumed) - max, px(consumed - 96.))
+            );
+        }
+        assert_eq!(split_nested_scroll(px(0.), max, px(-96.)), (px(-96.), px(0.)));
+    }
 
     #[core::prelude::v1::test]
     fn permission_prompt_recognizes_actions() {

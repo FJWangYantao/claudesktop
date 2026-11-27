@@ -1405,12 +1405,22 @@ impl BuiltinKernel {
         // 后台命令的状态变化整份发一次（表是进程级的，出口在这里装上）
         // 出口只攥弱引用：表是进程级的，强引用会让关掉的内核一直释放不掉（`shutdown` 里也会摘掉）
         {
-            let inner = Arc::downgrade(&inner);
+            let views_ref = Arc::downgrade(&inner);
+            let events_ref = Arc::downgrade(&inner);
             bgtasks::register(
                 kernel_id,
                 Box::new(move |tasks| {
-                    if let Some(inner) = inner.upgrade() {
+                    if let Some(inner) = views_ref.upgrade() {
                         inner.emit(None, KernelEvent::BackgroundTasks { tasks });
+                    }
+                }),
+            );
+            // 任务自己结束（没有待续办）时往它的会话里发一条回执（界面留痕）
+            bgtasks::register_events(
+                kernel_id,
+                Box::new(move |session, event| {
+                    if let Some(inner) = events_ref.upgrade() {
+                        inner.emit(Some(session), event);
                     }
                 }),
             );
@@ -1892,6 +1902,7 @@ impl Kernel for BuiltinKernel {
         if state.turn.is_some() {
             anyhow::bail!("这一轮还没结束");
         }
+        bgtasks::forget_followups(self.inner.kernel_id, session);
         state.history = rebuilt.messages;
         state.summary = rebuilt.summary;
         // 撤回的消息和答案里的授权跟着作废
@@ -1966,12 +1977,39 @@ impl Kernel for BuiltinKernel {
 
     /// 会话结束（切走 / 关掉）时把它起的后台命令停掉：模型再也读不到输出了。
     fn close_session(&self, session: &str) {
-        bgtasks::stop_session(session);
+        bgtasks::stop_session(self.inner.kernel_id, session);
         self.inner.close_history(session);
+    }
+
+    fn resume_background(&self, session: &str) -> anyhow::Result<bool> {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        let Some(state) = sessions.get_mut(session) else { return Ok(false) };
+        if state.turn.is_some() {
+            return Ok(false);
+        }
+        let inner = self.inner.clone();
+        bgtasks::dispatch_ready(inner.kernel_id, session, |req| {
+            let flag = Arc::new(AtomicBool::new(false));
+            let worker_flag = flag.clone();
+            let session = session.to_owned();
+            std::thread::Builder::new().name("builtin-background-resume".into()).spawn(
+                move || {
+                    runner::run_background(inner, session, worker_flag, req);
+                },
+            )?;
+            state.turn = Some(flag);
+            state.turns += 1;
+            Ok(())
+        })
     }
 
     fn stop_background_task(&self, id: &str) {
         let _ = bgtasks::stop(id);
+    }
+
+    /// 只撤销续办，进程照跑（界面的「取消续办」）。
+    fn cancel_background_followup(&self, id: &str) {
+        bgtasks::cancel_followup(id);
     }
 
     fn reload_mcp(&self) {

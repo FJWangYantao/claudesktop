@@ -174,16 +174,13 @@ impl ChatApp {
                 )
         };
         let can_export = !self.settings_open && s.has_user_message();
-        // 这个会话在跑的后台命令：顶栏给一个小标（悬停看命令行，点一下停掉）
-        let running: Vec<_> = self
+        // 这个会话在跑的后台命令：顶栏给一个胶囊（点开是清单，见 `bgtasks_view`）
+        let running_count = self
             .kernels
             .iter()
             .flat_map(|(_, slot)| slot.tasks.iter())
             .filter(|t| t.running && s.acp_id.as_deref() == Some(t.session.as_str()))
-            .collect();
-        let running_count = running.len();
-        let running_names: Vec<&str> = running.iter().map(|t| t.command.as_str()).collect();
-        let running_ids: Vec<String> = running.iter().map(|t| t.id.clone()).collect();
+            .count();
         // 设置页有自己的页头，右上不挂会话动作；空白聊天也没有可做的动作
         let has_header_actions = !self.settings_open
             && (!s.is_chat()
@@ -220,22 +217,11 @@ impl ChatApp {
                 super::worktree::render_worktree_chip(self, &cx.entity(), &self.menu_focus),
                 |d, chip| d.child(div().mr_1().child(chip)),
             )
-            // 后台命令在跑：一个小标（悬停看命令行，点一下停掉）；设置页有自己的一块，不残留
-            .when(!self.settings_open && running_count > 0, |d| {
-                d.child(
-                    Self::quiet_button("bg-tasks", IconAll::SquareTerminal, Surface::Paper, cx)
-                        .mr_1()
-                        .tooltip(if running_count == 1 {
-                            format!("后台命令在跑：{}（点击停止）", running_names[0])
-                        } else {
-                            format!("{running_count} 条后台命令在跑（点击全部停止）")
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            for id in &running_ids {
-                                this.stop_background(id, cx);
-                            }
-                        })),
-                )
+            // 后台命令在跑：胶囊给条数，点开是清单（和输入区停靠条同时出现）。
+            // 设置页有自己的一块，不残留
+            .when(!self.settings_open, |d| match self.render_bg_tasks_pill(cx) {
+                Some(pill) => d.child(div().mr_1().child(pill)),
+                None => d,
             })
             // 文件 / 改动共用一个开关：开的时候停在上次那个 Tab（对话里的改动卡片仍直达「改动」）
             .when(!self.settings_open && !s.is_chat(), |d| {

@@ -354,6 +354,32 @@ pub enum KernelEvent {
     /// 运行中的一轮收到了插话，已在步间作为新的用户消息追加进上下文
     /// （见 [`Kernel::steer`]）。界面把它落成一行真实用户消息。
     SteerInjected { text: String },
+    /// 本轮由后台结果唤起；上下文不是用户指令。后面的展示字段是界面留痕用的
+    /// （旧日志里没有，全部带默认值）
+    BackgroundResumed {
+        id: String,
+        context: String,
+        /// 命令行（界面上等价宽显示；旧日志为空）
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        command: String,
+        /// 退出码；被信号结束 / 未知为 None
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// 从起到结束过了多久（秒）
+        #[serde(default)]
+        duration_secs: u64,
+    },
+    /// 一条普通后台命令自己退出了（没有待续办）：只在对话里留一道轻回执，
+    /// 不进重建的上下文，也不切开当前用户轮次
+    BackgroundExited {
+        id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        duration_secs: u64,
+    },
     /// 新工具调用开始
     ToolCallStarted {
         /// 工具调用 ID（后续 update 按此关联）
@@ -540,12 +566,17 @@ pub struct BackgroundTaskView {
     pub session: String,
     pub command: String,
     pub running: bool,
+    #[serde(default)]
+    pub ready_to_resume: bool,
     /// 退出码；还在跑 / 被信号结束时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub duration_secs: u64,
     /// 输出末尾几行（预览）
     pub output_tail: String,
+    /// 挂了续办且还没失效：给出续办说明（界面标「自动续办」用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup: Option<String>,
 }
 
 /// 一个 MCP 服务器在界面上的样子。
@@ -603,6 +634,8 @@ impl KernelEvent {
             Self::AgentMessageChunk { .. } => "agent_message_chunk",
             Self::AgentThoughtChunk { .. } => "agent_thought_chunk",
             Self::UserMessageChunk { .. } => "user_message_chunk",
+            Self::BackgroundResumed { .. } => "background_resumed",
+            Self::BackgroundExited { .. } => "background_exited",
             Self::SteerInjected { .. } => "steer_injected",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::SubagentStarted { .. } => "subagent_started",
@@ -961,6 +994,13 @@ pub trait Kernel: Send + Sync {
     fn close_session(&self, _session: &str) {}
     /// 停掉一条后台命令（自研内核的 `shell_background` 起的）。默认没有后台命令。
     fn stop_background_task(&self, _id: &str) {}
+    /// 撤销一条后台命令的续办（只撤回转交给模型这一步，进程照跑）。默认没有后台命令。
+    fn cancel_background_followup(&self, _id: &str) {}
+
+    /// 会话空闲时尝试领取一个已完成任务；重复通知不会重复开轮。
+    fn resume_background(&self, _session: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     /// 把空闲会话的完整历史落盘；默认不实现（ACP 内核不做）。
     /// 实现方在自身工作线程里做磁盘 I/O，调用方不得在界面线程直接调用。
     fn hibernate_session(&self, _session: &str) -> anyhow::Result<()> {

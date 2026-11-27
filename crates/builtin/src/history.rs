@@ -110,6 +110,15 @@ pub fn rebuild(records: &[Record]) -> Rebuilt {
                 in_turn = true;
             }
             Record::Event { event } => match event {
+                KernelEvent::BackgroundResumed { context, .. } => {
+                    messages.extend(assistant.take());
+                    questions.clear();
+                    messages.push(ChatMessage::new("user", context.clone()));
+                    in_turn = true;
+                }
+                // 普通后台任务的退出回执：只是界面留痕，不进重建的上下文，
+                // 也不改变这一轮的位置（模型当时并没有被唤起）
+                KernelEvent::BackgroundExited { .. } => {}
                 KernelEvent::AgentMessageChunk { text } => assistant.text(text),
                 // 运行中插话：内核当时就当成一条新的用户消息追加了，续接时按同样的位置重建
                 KernelEvent::SteerInjected { text } => {
@@ -282,6 +291,48 @@ mod tests {
 
     fn ev(event: KernelEvent) -> Record {
         Record::Event { event }
+    }
+
+    #[test]
+    fn background_context_does_not_become_user_authorization() {
+        let event = KernelEvent::BackgroundResumed {
+            id: "bg-1".into(),
+            context: "进程输出".into(),
+            command: "npm run dev".into(),
+            exit_code: Some(0),
+            duration_secs: 3,
+        };
+        assert!(Record::worth_keeping(&event));
+        let rebuilt = rebuild(&[
+            Record::user("编译"),
+            ev(KernelEvent::AgentMessageChunk { text: "已启动".into() }),
+            ev(event),
+            ev(KernelEvent::AgentMessageChunk { text: "已完成".into() }),
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+        ]);
+        assert_eq!(rebuilt.user_inputs.len(), 1);
+        assert_eq!(rebuilt.messages[2].text().unwrap(), "进程输出");
+    }
+
+    /// 普通后台任务的退出回执：落盘（界面上留一道痕），但不进重建的上下文
+    #[test]
+    fn background_exit_is_logged_but_not_in_context() {
+        let event = KernelEvent::BackgroundExited {
+            id: "bg-2".into(),
+            command: "npm run dev".into(),
+            exit_code: Some(130),
+            duration_secs: 7,
+        };
+        assert!(Record::worth_keeping(&event));
+        let rebuilt = rebuild(&[
+            Record::user("起个服务"),
+            ev(KernelEvent::AgentMessageChunk { text: "已启动".into() }),
+            ev(event),
+            ev(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }),
+        ]);
+        assert_eq!(rebuilt.user_inputs.len(), 1);
+        let texts: Vec<String> = rebuilt.messages.iter().filter_map(|m| m.text()).collect();
+        assert_eq!(texts, vec!["起个服务", "已启动"]);
     }
 
     #[test]

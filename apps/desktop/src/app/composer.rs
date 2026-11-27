@@ -801,20 +801,29 @@ impl ChatApp {
             )
             .child(toolbar);
 
+        // 输入区顶盖只有一个槽位：有后台任务时停靠条优先，否则是空会话的项目 / 分支条
+        let dock = self.render_bg_dock(cx);
+        let dock_open = dock.is_some();
+        let token = self.session().token;
         let open = self.session().show_context_bar();
+        let reveal_dock =
+            super::motion::reveal_progress(("composer-bg-dock", token), dock_open, window, cx);
         let reveal = super::motion::reveal_progress(
-            ("composer-context-bar", self.session().token),
-            open,
+            ("composer-context-bar", token),
+            open && !dock_open,
             window,
             cx,
         );
-        // 展开态也挂着 Reveal：首帧量好高度，开始对话收起时不会先塌一下
+        // 展开态也挂着 Reveal：首帧量好高度，收起时不会先塌一下
         let composer_stack = div()
             .v_flex()
             .w_full()
-            .when(open || reveal > 0.001, |d| {
+            .when_some(dock, |d, dock| {
+                d.child(super::motion::Reveal::new(("composer-bg-dock", token), reveal_dock, dock))
+            })
+            .when(!dock_open && (open || reveal > 0.001), |d| {
                 d.child(super::motion::Reveal::new(
-                    ("composer-context-bar", self.session().token),
+                    ("composer-context-bar", token),
                     reveal,
                     self.render_context_bar(cx),
                 ))

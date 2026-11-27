@@ -62,7 +62,7 @@ impl Session {
                     if let Some(model) = model {
                         s.model_label = model.into();
                     }
-                    if let Some(user) = s.last_user() {
+                    if let Some(user) = s.transcript.iter().rposition(ChatItem::starts_turn) {
                         // 日志里的用量是准数（写日志前端点报过）
                         let usage = TurnUsage {
                             input: input_tokens,
@@ -359,6 +359,25 @@ impl Session {
         self.cancel_pending_permissions(kernel);
         self.note(format!("内核错误：{message}"));
         self.drop_queued_compaction("内核出错");
+    }
+
+    /// 后台任务在对话流里的回执（续办 / 结束共用）：一行轻量的状态说明。
+    pub(crate) fn background_receipt(
+        &mut self,
+        id: String,
+        command: String,
+        exit_code: Option<i32>,
+        duration_secs: u64,
+        resumed: bool,
+    ) {
+        self.finish_thinking();
+        self.transcript.push(ChatItem::BackgroundResume(crate::model::BackgroundReceipt {
+            id: id.into(),
+            command: command.into(),
+            exit_code,
+            duration_secs,
+            resumed,
+        }));
     }
 
     /// 内核事件 → 本会话的界面内容（ACP `session/update` 的 UI 投影）。
@@ -683,9 +702,19 @@ impl Session {
                 self.cancel_pending_permissions(kernel);
                 self.cancel_pending_questions();
                 self.interrupt_running_tools();
-                if stop_reason != "end_turn" && !stopped {
+                // `waiting_for_task`：后台任务还在跑，输入区停靠条和任务回执已经说明了，
+                // 不再往对话里塞一行静态备注（旧日志里那条备注仍然按记录重放）
+                if !matches!(stop_reason.as_str(), "end_turn" | "waiting_for_task") && !stopped {
                     self.note(format!("本轮结束：{stop_reason}"));
                 }
+            }
+            // 后台任务回执：续办的那条算一轮的开头（下一行是模型接着干），
+            // 普通任务结束只是留痕，不切轮次
+            KernelEvent::BackgroundResumed { id, command, exit_code, duration_secs, .. } => {
+                self.background_receipt(id, command, exit_code, duration_secs, true)
+            }
+            KernelEvent::BackgroundExited { id, command, exit_code, duration_secs } => {
+                self.background_receipt(id, command, exit_code, duration_secs, false)
             }
             // 运行中插话：内核已把它追加进上下文，界面上落成一行真实用户消息
             KernelEvent::SteerInjected { text } => {
@@ -709,8 +738,7 @@ impl Session {
             // 工具加载只影响内核发给模型的工具定义（内核从日志的 `Record::ToolLoadout` 拿回来）
             | KernelEvent::ToolsLoaded { .. }
             | KernelEvent::McpStatus { .. }
-            | KernelEvent::BackgroundTasks { .. }
-            | KernelEvent::MemoryChanged { .. }
+            | KernelEvent::BackgroundTasks { .. }            | KernelEvent::MemoryChanged { .. }
             | KernelEvent::MemorySuggested { .. } => {}
             KernelEvent::AuthRequired { methods, message, .. } => {
                 self.auth = Some(AuthRequestView { methods, message: message.into(), busy: false });

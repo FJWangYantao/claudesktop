@@ -19,6 +19,7 @@ pub(crate) mod cache;
 pub(crate) mod layout;
 pub(crate) mod replay;
 pub(crate) mod wheel;
+pub(crate) mod wheel_trace;
 
 use layout::new_list_state;
 pub use layout::{
@@ -199,7 +200,7 @@ pub struct Session {
     /// 最近一次用户手动点了组头的那一组：只有它播展开 / 收起的弹簧过渡。
     /// 新行涌入、正文到达导致的自动收起不播（否则每出一行列表都抖一下）
     pub animated_group: Option<usize>,
-    /// 每轮的用时和用量（按这一轮用户消息的下标），挂在这一轮回复末尾
+    /// 每轮的用时和用量（按发起消息或后台通知的下标），挂在这一轮回复末尾
     pub turn_summaries: HashMap<usize, TurnSummary>,
     /// 输入框上方的计划收成一行
     pub plan_folded: bool,
@@ -887,7 +888,7 @@ impl Session {
 
     /// 本轮（最后一条用户消息之后）的第一行。
     fn turn_start(&self) -> usize {
-        self.last_user().map_or(0, |i| i + 1)
+        self.transcript.iter().rposition(ChatItem::starts_turn).map_or(0, |i| i + 1)
     }
 
     /// 这条事件值不值得发系统通知（窗口不在前台时用）：要授权、本轮出错、回复完了。
@@ -904,7 +905,8 @@ impl Session {
                 Some(format!("出错了：{}", preview_line(message).unwrap_or_default()))
             }
             KernelEvent::TurnEnded { stop_reason }
-                if stop_reason != "cancelled" && !self.compact_turn =>
+                if !matches!(stop_reason.as_str(), "cancelled" | "waiting_for_task")
+                    && !self.compact_turn =>
             {
                 let reply =
                     self.transcript[self.turn_start()..].iter().rev().find_map(|i| match i {
@@ -945,8 +947,8 @@ impl Session {
         };
         self.turn_streamed.clear();
         self.live_think = None;
-        if let Some(user) = self.last_user() {
-            self.turn_summaries.insert(user, summary);
+        if let Some(start) = self.transcript.iter().rposition(ChatItem::starts_turn) {
+            self.turn_summaries.insert(start, summary);
             self.layout_rev = self.layout_rev.wrapping_add(1);
         }
         summary
@@ -954,8 +956,7 @@ impl Session {
 
     /// `ix` 所在这一轮的用时和用量（这一轮结束后才有）。
     pub fn turn_summary(&self, ix: usize) -> Option<&TurnSummary> {
-        let user =
-            self.transcript[..ix].iter().rposition(|i| matches!(i, ChatItem::User { .. }))?;
+        let user = self.transcript[..ix].iter().rposition(ChatItem::starts_turn)?;
         self.turn_summaries.get(&user)
     }
 
@@ -974,8 +975,7 @@ impl Session {
                     | ChatItem::Question { .. }
             ) && !matches!(i, ChatItem::Agent(t) if t.trim().is_empty())
         }) {
-            Some(ChatItem::User { .. }) => true,
-            Some(_) => false,
+            Some(next) => next.starts_turn(),
             None => !self.busy,
         }
     }
@@ -986,18 +986,16 @@ impl Session {
         let t = &self.transcript;
         let Some(item) = t.get(ix) else { return false };
         // 用户气泡、正文有自己的末尾；当前视图看不见的行（如 `AutoApproved`）不能当锚点
-        if matches!(item, ChatItem::User { .. } | ChatItem::Agent(_))
+        if item.starts_turn()
+            || matches!(item, ChatItem::Agent(_))
             || !item.visible_in(view)
             || !item.has_content()
         {
             return false;
         }
-        let start =
-            t[..ix].iter().rposition(|i| matches!(i, ChatItem::User { .. })).map_or(0, |p| p + 1);
-        let end = t[ix + 1..]
-            .iter()
-            .position(|i| matches!(i, ChatItem::User { .. }))
-            .map_or(t.len(), |p| ix + 1 + p);
+        let start = t[..ix].iter().rposition(ChatItem::starts_turn).map_or(0, |p| p + 1);
+        let end =
+            t[ix + 1..].iter().position(ChatItem::starts_turn).map_or(t.len(), |p| ix + 1 + p);
         if end == t.len() && self.busy {
             return false;
         }
@@ -1565,6 +1563,18 @@ impl Session {
                     out += "\n";
                 }
                 ChatItem::Note(text) => out += &format!("*{text}*\n\n"),
+                ChatItem::BackgroundResume(receipt) => {
+                    let code = match receipt.exit_code {
+                        Some(code) => format!("退出码 {code}"),
+                        None => "已中断".into(),
+                    };
+                    let tag = if receipt.resumed { "自动续办" } else { "已结束" };
+                    out += &format!(
+                        "*后台任务 `{}` {code} · {}{tag}*\n\n",
+                        receipt.label(),
+                        receipt.elapsed()
+                    )
+                }
                 ChatItem::Failed { message, .. } => out += &format!("*本轮失败：{message}*\n\n"),
                 ChatItem::Compaction { state, .. } => {
                     out += &match state {
@@ -3384,6 +3394,39 @@ mod tests {
         assert!(!s.transcript.iter().any(|i| matches!(i, ChatItem::Note(_))));
         let Some(ChatItem::Tool(card)) = s.transcript.get(1) else { panic!() };
         assert!(card.phase == ToolPhase::Failed && card.result.as_ref() == "已中断");
+    }
+
+    #[core::prelude::v1::test]
+    fn background_reply_has_its_own_usage_and_turn_boundary() {
+        let mut s = Session::new(1, KernelChoice::Builtin, PathBuf::from("."));
+        s.transcript.push(ChatItem::User {
+            text: "换个问题".into(),
+            images: vec![],
+            files: Default::default(),
+        });
+        s.begin_turn();
+        s.transcript.push(ChatItem::Agent("先答问题".into()));
+        s.turn_usage.input = 17;
+        s.close_turn();
+        s.begin_turn();
+        s.apply_event(
+            KernelEvent::BackgroundResumed {
+                id: "bg-1".into(),
+                context: "日志".into(),
+                command: "cargo build".into(),
+                exit_code: Some(0),
+                duration_secs: 42,
+            },
+            None,
+        );
+        s.transcript.push(ChatItem::Agent("再报结果".into()));
+        s.turn_usage.input = 11;
+        s.close_turn();
+        s.apply_event(KernelEvent::TurnEnded { stop_reason: "end_turn".into() }, None);
+        assert_eq!(s.user_message_count(), 1);
+        assert!(s.is_turn_end(1) && s.is_turn_end(3));
+        assert_eq!(s.turn_summary(1).unwrap().usage.input, 17);
+        assert_eq!(s.turn_summary(3).unwrap().usage.input, 11);
     }
 
     #[core::prelude::v1::test]

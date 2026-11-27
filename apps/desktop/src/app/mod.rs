@@ -1,6 +1,7 @@
 //! 应用根视图 `ChatApp`：会话管理、内核事件分发与整体布局。
 //! 各区域的渲染拆在子模块里（都是 `impl ChatApp`）。
 
+mod bgtasks_view;
 pub(crate) mod body_cache;
 mod catalog_view;
 mod chat;
@@ -128,8 +129,7 @@ impl SessionStress {
 }
 
 /// 展开着的工具输出滚动区（窗口坐标 + 句柄），供滚轮判定用（见 `chat.rs` 的 `scroll_tool_output`）
-type ToolScrollRegions =
-    std::rc::Rc<std::cell::RefCell<Vec<(Bounds<Pixels>, ScrollHandle, usize)>>>;
+type ToolScrollRegions = std::rc::Rc<std::cell::RefCell<Vec<(Bounds<Pixels>, ScrollHandle)>>>;
 
 pub struct ChatApp {
     input: Entity<TextareaState>,
@@ -218,12 +218,9 @@ pub struct ChatApp {
     pub(crate) frame_log: Option<Vec<std::time::Instant>>,
     /// 压测钩子：每帧从 render 开始到整棵树画完用了多少毫秒（只在记 `frame_log` 时记）
     frame_work: std::rc::Rc<std::cell::RefCell<Vec<f64>>>,
-    /// 对话里展开着的工具输出滚动区（窗口坐标 + 句柄 + 行号）：指针在上面时滚轮先滚它，
+    /// 对话里展开着的工具输出滚动区（窗口坐标 + 句柄）：指针在上面时滚轮先滚它，
     /// 别被对话列表的滚轮捕获层整段截走（见 `content.rs`）
     tool_scroll_regions: ToolScrollRegions,
-    /// 内层滚动到尽头之后的粘滞期：同一工具行、250ms 内继续滚不穿透到外层列表
-    /// （`overflow` 的等价物，见 `ChatApp::scroll_tool_output`）
-    nested_scroll_lock: Option<(usize, Instant)>,
     /// 压测钩子：`CLAUDESKTOP_STRESS_SESSIONS` 的逐会话激活状态机（每秒 tick 推进一步）
     session_stress: Option<SessionStress>,
     /// 窗口在前台：激活且没最小化（不在前台时才发系统通知，见 `notify.rs`）
@@ -328,6 +325,10 @@ pub struct ChatApp {
     /// 每个空间上次看的是哪个会话（[0] 代码 / [1] 聊天；按 `Session::token` 记，
     /// 删会话不会错位）。切空间时回到它，见 `ChatApp::switch_space`
     last_active: [Option<u64>; 2],
+    /// 已启动内核的后台任务快照（停靠条 / 顶栏胶囊 / 侧栏微标共用的界面状态）
+    pub(crate) bg: bgtasks_view::BgTasksUi,
+    /// 停靠条里那个只重画自己的转圈
+    bg_spinner: Entity<bgtasks_view::BgSpinner>,
     /// magpie 网关 sidecar（设置页「magpie 网关」启动的 `magpie serve`）。
     /// Windows 上退出有 `kill_children_on_exit` 的 job object 兜底，这里再显式收一次，
     /// 其他平台的进程守卫是空操作，全靠这里
@@ -538,6 +539,10 @@ impl ChatApp {
                     if app.session().busy || app.session().has_live_linger() {
                         cx.notify();
                     }
+                    // 后台任务：跳秒 / 驻留到期只重画输入区（正文区是缓存 view，不动）
+                    if app.tick_background() {
+                        app.refresh_composer(cx);
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -650,7 +655,6 @@ impl ChatApp {
             frame_log: None,
             frame_work: Default::default(),
             tool_scroll_regions: Default::default(),
-            nested_scroll_lock: None,
             window_active: true,
             notified: Vec::new(),
             window_handle: window.window_handle(),
@@ -661,6 +665,8 @@ impl ChatApp {
             sidebar_key: 0,
             sidebar_spinners: Default::default(),
             sidebar_spinners_view: cx.new(|_| SidebarSpinners::new(weak.clone())),
+            bg: Default::default(),
+            bg_spinner: cx.new(|_| bgtasks_view::BgSpinner),
             image_cache: image_cache::DecodedImageCache::new(cx),
             content_view: cx.new(|_| ContentView::new(weak.clone())),
             loop_overlay: cx.new(|_| motion::LoopOverlay),
@@ -1218,6 +1224,17 @@ impl ChatApp {
             && kernel.kind() == "builtin"
         {
             kernel.stop_background_task(id);
+        }
+        cx.notify();
+    }
+
+    /// 撤销一条后台任务的续办：只撤回调，进程照跑。
+    pub(crate) fn cancel_background_followup(&mut self, id: &str, cx: &mut Context<Self>) {
+        let kind = self.sessions[self.active].kernel.clone();
+        if let Some(kernel) = self.kernel_of(&kind)
+            && kernel.kind() == "builtin"
+        {
+            kernel.cancel_background_followup(id);
         }
         cx.notify();
     }
@@ -2063,6 +2080,7 @@ impl ChatApp {
                 self.submit_to(idx, queued.into_prompt(), cx);
             } else {
                 self.dispatch_queued(idx, cx);
+                self.dispatch_background(idx, cx);
             }
         }
     }
@@ -2761,6 +2779,7 @@ impl ChatApp {
     /// 压测钩子：把记下的帧时刻整理成「帧数、每秒帧数、帧间隔 p50 / p95 / max」，
     /// 写到 CLAUDESKTOP_STRESS_OUT（默认 stderr）。
     pub(crate) fn stress_report(&mut self) {
+        crate::session::wheel_trace::flush();
         let log = self.frame_log.take().unwrap_or_default();
         let mut work = std::mem::take(&mut *self.frame_work.borrow_mut());
         work.sort_by(|a, b| a.total_cmp(b));
@@ -3000,6 +3019,38 @@ impl ChatApp {
         let queued = s.queued.remove(0);
         self.persist_queued(idx, cx);
         self.submit_to(idx, queued.into_prompt(), cx);
+    }
+
+    /// 先处理用户消息。进程可能早在发起轮收尾前就退出，快照和轮末都来这里试一次。
+    fn dispatch_background(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let s = &self.sessions[idx];
+        let Some(id) = &s.acp_id else { return };
+        if s.busy
+            || s.stopping
+            || s.kernel_rewinding
+            || !s.ready
+            || !s.queued.is_empty()
+            || s.compact_queued
+        {
+            return;
+        }
+        if !self
+            .slot(&s.kernel.key())
+            .is_some_and(|slot| slot.tasks.iter().any(|t| t.ready_to_resume && &t.session == id))
+        {
+            return;
+        }
+        if !s.history_loaded {
+            self.ensure_history_loaded(idx, cx);
+            return;
+        }
+        if let Some(kernel) = self.session_kernel(idx) {
+            match kernel.resume_background(id) {
+                Ok(true) => self.sessions[idx].begin_turn(),
+                Ok(false) => {}
+                Err(error) => self.sessions[idx].note(format!("后台续办启动失败：{error}")),
+            }
+        }
     }
 
     /// 把排队消息同步进会话元信息：应用退出 / 崩溃后重开，队列还在（见 `SessionMeta::queued`）。
@@ -3900,8 +3951,24 @@ impl ChatApp {
                 cx.notify();
             }
             KernelEvent::BackgroundTasks { tasks } => {
-                slot.tasks = tasks;
-                cx.notify();
+                let ready: std::collections::BTreeSet<_> =
+                    tasks.iter().filter(|t| t.ready_to_resume).map(|t| t.session.clone()).collect();
+                let old = std::mem::replace(&mut slot.tasks, tasks.clone());
+                // 秒数锚点 / 驻留 / 侧栏是否要重画：只重画输入区，正文区的缓存不动
+                let sidebar = self.sync_background_ui(&old, &tasks);
+                for sid in ready {
+                    if let Some(idx) = self
+                        .sessions
+                        .iter()
+                        .position(|s| s.kernel == kind && s.acp_id.as_ref() == Some(&sid))
+                    {
+                        self.dispatch_background(idx, cx);
+                    }
+                }
+                if sidebar {
+                    self.sync_sidebar(cx);
+                }
+                self.refresh_composer(cx);
             }
             KernelEvent::Fatal(message) => {
                 slot.ready = false;
@@ -3921,6 +3988,15 @@ impl ChatApp {
                 self.toast(Notification::error(text), cx);
             }
             event => {
+                // 后台任务的回执已经落进对话流了，停靠条上的驻留就撤掉（别两处重复）
+                if let KernelEvent::BackgroundResumed { id, .. }
+                | KernelEvent::BackgroundExited { id, .. } = &event
+                {
+                    let id = id.clone();
+                    if self.drop_bg_linger(&id) {
+                        self.refresh_composer(cx);
+                    }
+                }
                 // 内核记下一条记忆时顺手刷新「记忆」页
                 if matches!(&event, KernelEvent::MemoryChanged { .. })
                     && self.settings_open
@@ -3972,7 +4048,7 @@ impl ChatApp {
                     // 用户停下以后才排的（停止期间发的、「拒绝并说明」的理由）等停稳了就发
                     let clean_end = matches!(
                         &event,
-                        KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn"
+                        KernelEvent::TurnEnded { stop_reason } if matches!(stop_reason.as_str(), "end_turn" | "waiting_for_task")
                     ) || (turn_over && self.sessions[idx].stopping);
                     // 先看（record_turn 会清掉手动压缩的标记）
                     let attention = self.sessions[idx].attention(&event);
@@ -4054,13 +4130,17 @@ impl ChatApp {
                         if !self.queued_compaction(idx) {
                             self.dispatch_queued(idx, cx);
                             // 这一轮正常结束、输入框空着：猜用户接下来会发的那一句（见 suggest.rs）
-                            if idx == self.active && !self.settings_open {
+                            if idx == self.active
+                                && !self.settings_open
+                                && matches!(&event, KernelEvent::TurnEnded { stop_reason } if stop_reason == "end_turn")
+                            {
                                 self.schedule_next_suggestion(cx);
                             }
                         }
                     }
                     // 一轮结束、worktree 会话：刷新分支状态（脏文件数、领先几个提交）
                     if turn_over {
+                        self.dispatch_background(idx, cx);
                         self.refresh_worktree(idx, cx);
                         self.refresh_git_branch(idx, cx);
                     }

@@ -38,6 +38,45 @@ pub(crate) fn run_pending_prompt(
     for warning in warnings {
         inner.emit(Some(&session), KernelEvent::Notice(warning));
     }
+    if inner.prompt_hooks(&session, &flag) {
+        run_turn(inner, session, flag);
+    }
+}
+
+/// 完成通知占一轮；不触发用户提交钩子，也不写入自动审批的用户授权历史。
+pub(super) fn run_background(
+    inner: Arc<Inner>,
+    session: String,
+    flag: Arc<AtomicBool>,
+    req: bgtasks::ResumeRequest,
+) {
+    // 领取后发布新快照。由工作线程发，允许宿主在完成通知的回调里同步领取。
+    bgtasks::notify_kernel(Some(inner.kernel_id));
+    if let Err(error) = inner.wake_history(&session) {
+        if !flag.load(Ordering::SeqCst) {
+            inner.finish(&session, &flag);
+            inner.emit(
+                Some(&session),
+                KernelEvent::PromptFailed {
+                    message: format!("后台续办恢复失败：{error:#}")
+                },
+            );
+        }
+        return;
+    }
+    if !inner.commit(&session, &flag, vec![ChatMessage::new("user", req.context.clone())]) {
+        return;
+    }
+    inner.emit(
+        Some(&session),
+        KernelEvent::BackgroundResumed {
+            id: req.id,
+            context: req.context,
+            command: req.command,
+            exit_code: req.exit_code,
+            duration_secs: req.duration_secs,
+        },
+    );
     run_turn(inner, session, flag);
 }
 
@@ -93,9 +132,6 @@ impl Drop for HistoryActivityGuard {
 
 /// 一轮对话（在独立线程里运行）：先跑提交消息的钩子，再走工具循环（用量逐步当场报），最后结束。
 pub(crate) fn run_turn(inner: Arc<Inner>, session: String, flag: Arc<AtomicBool>) {
-    if !inner.prompt_hooks(&session, &flag) {
-        return;
-    }
     let stop = match run_steps(&inner, &session, &flag) {
         Steps::Stopped => return, // cancel() 已经报告过 TurnEnded
         Steps::Failed(message) => {
@@ -493,6 +529,7 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
             return Steps::Stopped;
         };
         // 用户在提问卡片上选了「自己说」/ 取消：结果写进历史后这一轮就结束
+        let waiting = outputs.iter().any(|o| o.wait_background);
         let halt = outcome
             .tool_calls
             .iter()
@@ -546,6 +583,10 @@ pub(crate) fn run_steps(inner: &Inner, session: &str, flag: &Arc<AtomicBool>) ->
         // 工具结果还没被端点数过
         inner.measure(session, step_tokens, unmeasured);
         inner.count_step(session, wrote_todo);
+        if waiting && !inner.has_steer(session) {
+            stop = "waiting_for_task".into();
+            break;
+        }
         if halt {
             stop = "end_turn".into();
             break;

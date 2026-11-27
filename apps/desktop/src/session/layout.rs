@@ -1343,6 +1343,8 @@ impl Session {
                     inner,
                 ) * 0.8;
             }
+            // 回执永远一行：命令缩略 + 退出码 + 耗时 + 右端标签
+            ChatItem::BackgroundResume(_) => h += m.line_row(),
             ChatItem::AutoApproved { .. } => h += m.line_row(),
         }
         if (layout.body || layout.head.is_some()) && !layout.tight {
