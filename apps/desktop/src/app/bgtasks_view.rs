@@ -418,7 +418,8 @@ impl ChatApp {
         Some(
             menu_panel(Popover::new("bg-tasks-menu"), &self.menu_focus)
                 .anchor(Anchor::TopRight)
-                .w(rems(22.))
+                // 一行里要并排放下命令 + 时间 + 续办 / 展开 / 停止，太窄会把命令截成「cargo test…」
+                .w(rems(28.))
                 .p_2()
                 .trigger(trigger)
                 .default_open(preview_menu_open())
