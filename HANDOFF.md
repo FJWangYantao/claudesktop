@@ -876,6 +876,15 @@
 - **在别的窗口里选中面板要用那个窗口的上下文**：`focus_pane_of_kind` 手里是主窗的
   `window`，弹出窗里的 Pane 必须走 `entry.window.update(cx, |_, pop_window, cx| ...)`，
   顺手 `activate_window()` 把它唤到前台。
+- **`git diff` 里不只有正文**：`index` / `new file mode` / `similarity index` / `Binary files`
+  这些元信息行既不是 `+` 也不是 `-`，直接当上下文行的话会在面板里画出一串噪音。
+  解析时只认「空格 / `+` / `-` 开头」的行，其余一律跳过（`---` / `+++` / `\ No newline` 另判）。
+- **改动 Pane 的四档范围取数口径不一样**：「本轮」从最后一条 `User` 记录往后算
+  （和 `Session::turn_files(ix)` 同一个口径），「会话」是 0（整个 transcript），
+  「未提交 / 基线」走 git。混用 `latest_turn()`（那是第几轮，不是记录下标）会切错段。
+- **`ChangedFiles` 的缓存键要带 offset**：只按 `diff_revision` 判脏的话，在「本轮 / 会话」
+  之间切换会沿用它算好的另一档清单。
+
 
 
 

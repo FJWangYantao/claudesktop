@@ -5,8 +5,12 @@
 
 use super::{ClaudesktopPane, PaneKind};
 use crate::app::ChatApp;
+use crate::theme::rgb;
+use crate::theme::*;
 use gpui_base::dock::{Panel, PanelEvent, PanelState};
 use gpui_kit::assets::IconName as IconAll;
+use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 pub(crate) struct DiffPane {
@@ -23,6 +27,17 @@ impl DiffPane {
             super::follow_hub(&hub, cx);
         }
         Self { app, focus_handle: cx.focus_handle(), width: Default::default() }
+    }
+
+    /// 这一轮能不能打开审查页（能的话 Tab 栏给一个「逐块撤回」）
+    fn review_anchor_of(&self, cx: &App) -> Option<usize> {
+        let app = self.app.upgrade()?;
+        let app = app.read(cx);
+        let session = app.session();
+        if session.busy || session.latest_turn().is_none() {
+            return None;
+        }
+        session.latest_turn_anchor(app.settings.view_mode)
     }
 }
 
@@ -45,6 +60,68 @@ impl ClaudesktopPane for DiffPane {
         let app = app.read(cx);
         let count = app.right_panel.changed_count;
         (count > 0).then(|| SharedString::from(count.to_string()))
+    }
+
+    /// Tab 栏右侧：四档取数范围（本轮 / 会话 / 未提交 / 基线）。
+    /// 数据源不同，但都是「这个会话改了什么」，所以放在同一个分段控件里切。
+    fn header_actions(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let app = self.app.clone();
+        let current =
+            self.app.upgrade().map(|app| app.read(cx).right_panel.scope).unwrap_or_default();
+        let mut items: Vec<AnyElement> = crate::app::right_panel::DiffScope::ALL
+            .into_iter()
+            .map(|scope| {
+                let app = app.clone();
+                let active = scope == current;
+                div()
+                    .id(ElementId::Name(format!("diff-scope-{}", scope.label()).into()))
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_size(TEXT_META)
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(rgb(SELECTED)).text_color(rgb(INK)))
+                    .when(!active, |d| {
+                        d.text_color(rgb(INK_SOFT)).hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                    })
+                    .child(scope.label())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |app, cx| app.set_diff_scope(scope, cx));
+                        }
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        // 「本轮」还能逐块撤回：按钮直接打开审查页（原来只有改动卡片上的入口）
+        if current == crate::app::right_panel::DiffScope::Turn
+            && let Some(anchor) = self.review_anchor_of(cx)
+        {
+            let app = app.clone();
+            items.push(
+                div()
+                    .id("diff-open-review")
+                    .h_full()
+                    .flex_shrink_0()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded_md()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(INK_SOFT))
+                    .hover(|d| d.bg(rgb(HOVER)).text_color(rgb(INK)))
+                    .child(Icon::new(IconAll::Undo2).small())
+                    .child("逐块撤回")
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |app, cx| app.open_review(anchor, cx));
+                        }
+                    }))
+                    .into_any_element(),
+            );
+        }
+        vec![div().h_flex().items_center().gap_0p5().mr_1().children(items).into_any_element()]
     }
 }
 
