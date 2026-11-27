@@ -82,8 +82,11 @@ pub(super) const PROVIDER_TAB: usize = 3;
 /// 设置页「模型」分类的下标（默认模型、思考强度、模型清单）
 pub(super) const MODEL_TAB: usize = 4;
 
+/// 设置页「MCP」分类的下标（右侧概览区 MCP 卡片直接打开它）
+pub(crate) const MCP_TAB: usize = 6;
+
 /// 设置页「插件」分类的下标（侧栏的「插件」入口直接打开它）
-pub(super) const PLUGINS_TAB: usize = 7;
+pub(crate) const PLUGINS_TAB: usize = 7;
 
 mod debug;
 mod form;

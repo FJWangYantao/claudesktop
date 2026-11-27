@@ -54,6 +54,8 @@ pub(super) struct McpForm {
     asking: Option<&'static str>,
     /// 点了删除、等确认的服务器名
     confirm_remove: Option<String>,
+    /// 自研内核未启动时缓存的 `mcp.json` 条目（避免概览卡片每帧读盘）
+    cached_config: Vec<McpServerView>,
 }
 
 impl McpForm {
@@ -72,7 +74,42 @@ impl McpForm {
             secret,
             asking: None,
             confirm_remove: None,
+            cached_config: load_mcp_config_views(),
         }
+    }
+
+    pub(super) fn refresh_cached_config(&mut self) {
+        self.cached_config = load_mcp_config_views();
+    }
+}
+
+/// 从数据目录的 `mcp.json` 读出只读展示条目（内核未启动时给设置页与概览卡片共用）。
+fn load_mcp_config_views() -> Vec<McpServerView> {
+    match default_mcp_config().map(|p| mcp::load_config(&p)) {
+        Some(Ok(configs)) => configs
+            .into_iter()
+            .map(|c| McpServerView {
+                state: if c.disabled { McpState::Disabled } else { McpState::Connecting },
+                tools: 0,
+                plugin: None,
+                url: (c.transport != mcp::Transport::Stdio).then(|| c.url.clone()),
+                retry: false,
+                // 令牌存在数据目录里，界面这一层不读它：内核起来之后才有这个信息
+                has_auth: false,
+                name: c.name,
+            })
+            .collect(),
+        // 文件坏了：和内核起来后报的一样，列成一行「mcp.json 格式不对」
+        Some(Err(reason)) => vec![McpServerView {
+            name: "mcp.json".into(),
+            state: McpState::Failed(reason),
+            tools: 0,
+            plugin: None,
+            url: None,
+            retry: false,
+            has_auth: false,
+        }],
+        None => Vec::new(),
     }
 }
 
@@ -199,11 +236,38 @@ impl ChatApp {
 
     /// 重新读配置、重连全部服务器；自研内核还没起来就把它起来（起来时自己会连）。
     fn reload_mcp(&mut self, cx: &mut Context<Self>) {
+        self.mcp_form.refresh_cached_config();
         match self.kernel_of(&KernelChoice::Builtin) {
             Some(kernel) => kernel.reload_mcp(),
             None => self.ensure_kernel(&KernelChoice::Builtin),
         }
         cx.notify();
+    }
+
+    /// 供右侧概览卡片等只读视图取当前的 MCP 服务器状态（不触发读盘）：
+    /// 自研内核已启动时直接取运行时 `KernelSlot::mcp`；未启动时合并缓存的 `mcp.json`
+    /// 与当前已启用插件带来的服务器。
+    pub(crate) fn mcp_servers_snapshot(&self) -> (bool, Vec<McpServerView>) {
+        if self.kernel_of(&KernelChoice::Builtin).is_some() {
+            let servers =
+                self.slot(&KernelChoice::Builtin.key()).map(|s| s.mcp.clone()).unwrap_or_default();
+            return (true, servers);
+        }
+        let mut servers = self.mcp_form.cached_config.clone();
+        for plugin in self.enabled_plugins() {
+            for s in plugin.mcp_servers {
+                servers.push(McpServerView {
+                    name: s.name,
+                    state: McpState::Connecting,
+                    tools: 0,
+                    plugin: Some(plugin.name.clone()),
+                    url: (!s.url.is_empty()).then_some(s.url),
+                    retry: false,
+                    has_auth: false,
+                });
+            }
+        }
+        (false, servers)
     }
 
     /// 重连一个没连上的服务。
@@ -276,32 +340,7 @@ impl ChatApp {
             self.slot(&KernelChoice::Builtin.key()).map(|s| s.mcp.clone()).unwrap_or_default()
         } else {
             // 内核没起来：照配置文件列出来，状态写「未连接」
-            match default_mcp_config().map(|p| mcp::load_config(&p)) {
-                Some(Ok(configs)) => configs
-                    .into_iter()
-                    .map(|c| McpServerView {
-                        state: if c.disabled { McpState::Disabled } else { McpState::Connecting },
-                        tools: 0,
-                        plugin: None,
-                        url: (c.transport != mcp::Transport::Stdio).then(|| c.url.clone()),
-                        retry: false,
-                        // 令牌存在数据目录里，界面这一层不读它：内核起来之后才有这个信息
-                        has_auth: false,
-                        name: c.name,
-                    })
-                    .collect(),
-                // 文件坏了：和内核起来后报的一样，列成一行「mcp.json 格式不对」
-                Some(Err(reason)) => vec![McpServerView {
-                    name: "mcp.json".into(),
-                    state: McpState::Failed(reason),
-                    tools: 0,
-                    plugin: None,
-                    url: None,
-                    retry: false,
-                    has_auth: false,
-                }],
-                None => Vec::new(),
-            }
+            load_mcp_config_views()
         };
         let shelf = &self.mcp_form.shelf;
         let query = shelf.query(cx);

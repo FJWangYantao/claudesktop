@@ -3,7 +3,9 @@
 //! 1. **常驻概览卡**：当前分支 + 文件改动汇总（点进 `改动`）+ 上下文用量（点进 `用量`）；
 //! 2. **计划卡**（仅本会话有计划时出现）：步骤清单，点标题进独立 `计划` Pane；
 //! 3. **Outputs 卡**（仅本会话有改动文件时出现）：改过的文件清单，点任一行直达该文件 Diff；
-//! 4. **子代理卡**（仅有子代理时出现）：运行中 / 已完成的子任务列表，点任一行看详情。
+//! 4. **子代理卡**（仅有子代理时出现）：运行中 / 已完成的子任务列表，点任一行看详情；
+//! 5. **MCP 连接卡**：已配置的 MCP 服务器与实时连接状态，点进设置页「MCP」管理；
+//! 6. **Skills 卡**：已启用插件与当前内核提供的 Skills / 斜杠指令，点开预览或填入输入框。
 
 use super::{ClaudesktopPane, PaneKind};
 use crate::app::ChatApp;
@@ -372,6 +374,8 @@ impl ChatApp {
             .iter()
             .map(|(id, run)| (id.clone(), run.agent.clone(), run.prompt.clone()))
             .collect();
+        let agent_commands: Vec<String> =
+            s.available_commands.iter().map(|c| c.name.clone()).collect();
         subagents.sort_by(|a, b| a.0.cmp(&b.0));
         let subagent_card = (!subagents.is_empty()).then(|| {
             let head = card_action_row("overview-subagent-card")
@@ -445,6 +449,268 @@ impl ChatApp {
             card_box().child(head).child(list)
         });
 
+        // ---------- 卡 5：MCP 连接卡 ----------
+        let (mcp_running, mcp_servers) = self.mcp_servers_snapshot();
+        let mcp_badge: (SharedString, crate::theme::Color) = if mcp_servers.is_empty() {
+            ("未配置".into(), INK_FAINT)
+        } else if mcp_running {
+            let ready = mcp_servers
+                .iter()
+                .filter(|srv| matches!(srv.state, claudesktop_core::McpState::Ready))
+                .count();
+            let enabled = mcp_servers
+                .iter()
+                .filter(|srv| !matches!(srv.state, claudesktop_core::McpState::Disabled))
+                .count();
+            let text = if enabled == 0 {
+                mcp_servers.len().to_string()
+            } else {
+                format!("{ready}/{enabled}")
+            };
+            (text.into(), INK_SOFT)
+        } else {
+            (mcp_servers.len().to_string().into(), INK_SOFT)
+        };
+        let mcp_head = card_action_row("overview-mcp-card")
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(TEXT_SMALL)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(INK))
+                    .child(Icon::new(IconAll::Plug).size_3p5().text_color(rgb(INK_SOFT)))
+                    .child("MCP"),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(mcp_badge.1))
+                    .font_features(tabular_nums())
+                    .child(mcp_badge.0)
+                    .child(Icon::new(IconAll::ChevronRight).size_3().text_color(rgb(INK_FAINT))),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_settings_at(crate::app::settings_view::MCP_TAB, window, cx);
+            }));
+        let mcp_card = if mcp_servers.is_empty() {
+            card_box().child(mcp_head)
+        } else {
+            let mut list = div().v_flex().gap_0p5();
+            for (ix, srv) in mcp_servers.into_iter().enumerate() {
+                let disabled = matches!(srv.state, claudesktop_core::McpState::Disabled);
+                let failed = matches!(srv.state, claudesktop_core::McpState::Failed(_));
+                let dot = match &srv.state {
+                    claudesktop_core::McpState::Ready => GREEN,
+                    claudesktop_core::McpState::Failed(_) => RED,
+                    claudesktop_core::McpState::Reconnecting(_)
+                    | claudesktop_core::McpState::NeedsAuth { .. } => CORAL,
+                    claudesktop_core::McpState::Idle
+                    | claudesktop_core::McpState::Connecting
+                    | claudesktop_core::McpState::Disabled => INK_FAINT,
+                };
+                let state_text: SharedString = match &srv.state {
+                    claudesktop_core::McpState::Ready => format!("{} 工具", srv.tools).into(),
+                    claudesktop_core::McpState::Idle => "按需".into(),
+                    claudesktop_core::McpState::Connecting if !mcp_running => "未连接".into(),
+                    claudesktop_core::McpState::Connecting => "连接中".into(),
+                    claudesktop_core::McpState::Reconnecting(_) => "重连中".into(),
+                    claudesktop_core::McpState::NeedsAuth { .. } => "需登录".into(),
+                    claudesktop_core::McpState::Failed(_) => "未连上".into(),
+                    claudesktop_core::McpState::Disabled => "已停用".into(),
+                };
+                let row = card_action_row(("overview-mcp-row", ix))
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(rgb(dot)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_family(MONO)
+                                    .text_size(TEXT_META)
+                                    .text_color(rgb(if disabled { INK_FAINT } else { INK }))
+                                    .child(srv.name),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(TEXT_META)
+                            .text_color(rgb(if failed { RED } else { INK_SOFT }))
+                            .font_features(tabular_nums())
+                            .child(state_text),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_settings_at(crate::app::settings_view::MCP_TAB, window, cx);
+                    }));
+                list = list.child(row);
+            }
+            card_box().child(mcp_head).child(list)
+        };
+
+        // ---------- 卡 6：Skills 卡 ----------
+        enum SkillEntry {
+            Plugin { name: String, plugin: String, path: std::path::PathBuf },
+            Agent { name: String },
+        }
+        let mut skills = Vec::new();
+        for plugin in self.enabled_plugins() {
+            for skill in plugin.skills {
+                skills.push(SkillEntry::Plugin {
+                    name: skill.name,
+                    plugin: plugin.name.clone(),
+                    path: skill.path,
+                });
+            }
+        }
+        for name in agent_commands {
+            skills.push(SkillEntry::Agent { name });
+        }
+        let skills_badge: (SharedString, crate::theme::Color) = if skills.is_empty() {
+            ("未启用".into(), INK_FAINT)
+        } else {
+            (skills.len().to_string().into(), INK_SOFT)
+        };
+        let skills_head = card_action_row("overview-skills-card")
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(TEXT_SMALL)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(INK))
+                    .child(Icon::new(IconAll::Sparkles).size_3p5().text_color(rgb(INK_SOFT)))
+                    .child("Skills"),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(TEXT_META)
+                    .text_color(rgb(skills_badge.1))
+                    .font_features(tabular_nums())
+                    .child(skills_badge.0)
+                    .child(Icon::new(IconAll::ChevronRight).size_3().text_color(rgb(INK_FAINT))),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_settings_at(crate::app::settings_view::PLUGINS_TAB, window, cx);
+            }));
+        let skills_card = if skills.is_empty() {
+            card_box().child(skills_head)
+        } else {
+            let mut list = div().v_flex().gap_0p5();
+            for (ix, entry) in skills.into_iter().enumerate() {
+                let row = match entry {
+                    SkillEntry::Plugin { name, plugin, path } => {
+                        card_action_row(("overview-skill-row", ix))
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::new(IconAll::Sparkles)
+                                            .size_3p5()
+                                            .text_color(rgb(INK_SOFT)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .font_family(MONO)
+                                            .text_size(TEXT_META)
+                                            .text_color(rgb(INK))
+                                            .child(name),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .max_w(rems(6.))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(TEXT_META)
+                                    .text_color(rgb(INK_FAINT))
+                                    .child(plugin),
+                            )
+                            .child(
+                                Icon::new(IconAll::ChevronRight)
+                                    .size_3()
+                                    .text_color(rgb(INK_FAINT)),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_right_file(path.clone(), window, cx);
+                            }))
+                    }
+                    SkillEntry::Agent { name } => card_action_row(("overview-skill-row", ix))
+                        .child(
+                            div()
+                                .h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    Icon::new(IconAll::Sparkles)
+                                        .size_3p5()
+                                        .text_color(rgb(INK_SOFT)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .font_family(MONO)
+                                        .text_size(TEXT_META)
+                                        .text_color(rgb(INK))
+                                        .child(format!("/{name}")),
+                                ),
+                        )
+                        .child(Icon::new(IconAll::ChevronRight).size_3().text_color(rgb(INK_FAINT)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.settings_open = false;
+                            let text = format!("/{name} ");
+                            let col = text.chars().count() as u32;
+                            this.input.update(cx, |state, cx| {
+                                state.set_value(text, window, cx);
+                                state.set_cursor_position(
+                                    gpui_kit::component::input::Position::new(0, col),
+                                    window,
+                                    cx,
+                                );
+                            });
+                            this.focus_input(window, cx);
+                            cx.notify();
+                        })),
+                };
+                list = list.child(row);
+            }
+            card_box().child(skills_head).child(list)
+        };
+
         let tool_chip = |kind: PaneKind| {
             div()
                 .id(ElementId::Name(format!("overview-quick-{}", kind.panel_name()).into()))
@@ -493,6 +759,8 @@ impl ChatApp {
             .when_some(plan_card, |d, card| d.child(card))
             .when_some(outputs_card, |d, card| d.child(card))
             .when_some(subagent_card, |d, card| d.child(card))
+            .child(mcp_card)
+            .child(skills_card)
             .child(quick_row)
             .into_any_element()
     }

@@ -876,6 +876,27 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// 在右侧「文件」工作区直接打开指定文件预览（先 sync_session 再 open_file，避免首次绑定被清空）。
+    pub(crate) fn open_right_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (token, cwd) = {
+            let s = &self.sessions[self.active];
+            (s.token, s.cwd.clone())
+        };
+        self.settings_open = false;
+        let panel = &mut self.right_panel;
+        panel.sync_session(token, &cwd);
+        panel.open = true;
+        panel.tab = RightTab::Files;
+        panel.open_file(path);
+        self.open_pane(RightTab::Files.pane_kind(), window, cx);
+        cx.notify();
+    }
+
     pub(super) fn render_sidebar_handle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         div()
             .id("sidebar-resize")
