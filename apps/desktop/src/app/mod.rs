@@ -155,6 +155,13 @@ pub struct ChatApp {
     focused_chat: Option<u64>,
     /// 已经打开的对话 Pane（同一个会话最多一块：`Session::list` 只有一份）
     chat_panes: Vec<WeakEntity<pane::chat_pane::ChatPane>>,
+    /// 侧问 Pane 的内容区正在画（只画对话流，跳过首页 / 设置 / 审查 / 子任务详情）。
+    /// 由 `ContentView::render` 按它自己那份 `side_chat` 置位，画完还原
+    side_chat_render: bool,
+    /// 开着的侧问：影子会话令牌 → Pane
+    side_chats: std::collections::HashMap<u64, WeakEntity<pane::side_chat_pane::SideChatPane>>,
+    /// 影子会话令牌 → 它是从哪个主会话问出来的（拼上下文快照用）
+    side_chat_sources: std::collections::HashMap<u64, u64>,
     input: Entity<TextareaState>,
     /// 输入框待发送的图片附件（粘贴 / 选择文件加入，随下一条消息一起发出）
     pub(crate) pending: Vec<PendingImage>,
@@ -679,6 +686,9 @@ impl ChatApp {
             chat_drafts: std::collections::HashMap::new(),
             focused_chat: None,
             chat_panes: Vec::new(),
+            side_chat_render: false,
+            side_chats: std::collections::HashMap::new(),
+            side_chat_sources: std::collections::HashMap::new(),
             input,
             pending: Vec::new(),
             pending_files: Vec::new(),

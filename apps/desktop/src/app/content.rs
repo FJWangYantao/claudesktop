@@ -30,13 +30,20 @@ pub(crate) struct ContentView {
     /// 这块内容区画的是哪个会话：多 `ChatPane` 时靠它把 `active` 在这段渲染里指过去
     /// （`ContentView` 是独立实体，渲染时机在 `ChatPane::render` 之后，所以 token 必须存在它自己身上）
     token: u64,
+    /// 侧问 Pane 的内容区：只画对话流（跳过首页 / 设置 / 审查 / 子任务详情）
+    side_chat: bool,
     /// 这块内容区自己的循环动画位置池（见 `motion::LoopSpots`）
     spots: motion::LoopSpots,
 }
 
 impl ContentView {
     pub(super) fn new(app: WeakEntity<ChatApp>, token: u64, spots: motion::LoopSpots) -> Self {
-        Self { app, token, spots }
+        Self { app, token, side_chat: false, spots }
+    }
+
+    /// 侧问 Pane 的那一份：只画对话流，其他都跳过
+    pub(super) fn side(app: WeakEntity<ChatApp>, token: u64, spots: motion::LoopSpots) -> Self {
+        Self { app, token, side_chat: true, spots }
     }
 
     /// 绑到另一个会话（多 `ChatPane` 里每块内容区各绑各的；单窗时跟着活跃会话走）
@@ -52,11 +59,17 @@ impl ContentView {
 impl Render for ContentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let token = self.token;
+        let side_chat = self.side_chat;
         // 构建这一遍时把位置池切到自己这份：别的内容区（第二个 ChatPane）同帧渲染也清不掉它
         motion::with_loop_spots(&self.spots, || match self.app.upgrade() {
             Some(app) => app.update(cx, |app, cx| {
-                // 这一段里 `self.session()` 指向**这块 pane 的会话**（画完还原）
-                app.with_active(token, |app| app.render_content(window, cx))
+                // 这一段里 `self.session()` 指向**这块 pane 的会话**（画完还原）；
+                // 侧问模式也只对这一段生效（渲染时机在 ChatPane::render 之后，不能靠外层置位）
+                let previous = app.side_chat_render;
+                app.side_chat_render = side_chat;
+                let out = app.with_active(token, |app| app.render_content(window, cx));
+                app.side_chat_render = previous;
+                out
             }),
             None => div().into_any_element(),
         })
@@ -210,7 +223,26 @@ impl ChatApp {
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // 这一帧重新登记工具输出的滚动区（列表只画视口附近的行，登记也跟着来）
         self.tool_scroll_regions.borrow_mut().clear();
-        if self.settings_open {
+        // 侧问 Pane：只要对话流本身。设置页 / 审查页 / 子任务详情 / 首页概览都是
+        // 主窗的事，串进侧问会画出两份（还会共用 settings_scroll 之类的句子）
+        let side_chat = self.side_chat_render;
+        if side_chat {
+            self.sessions[self.active].wheel = None;
+            if !self.sessions[self.active].has_user_message() {
+                return div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px_6()
+                    .text_center()
+                    .text_size(TEXT_SMALL)
+                    .text_color(rgb(INK_SOFT))
+                    .child("围绕主会话提问，不写入主线，关闭即清除")
+                    .into_any_element();
+            }
+        }
+        if !side_chat && self.settings_open {
             // 对话这会儿没在画：滚轮余量作废，别等关了设置再补上几秒前的那几格
             self.sessions[self.active].wheel = None;
             self.step_settings_wheel(window);
@@ -244,7 +276,7 @@ impl ChatApp {
                 .into_any_element();
         }
         // 点开了子任务：详情页占内容区；那个子任务已经不在了（回退过）就回到对话
-        if let Some(task) = self.sessions[active].viewing_task.clone() {
+        if !side_chat && let Some(task) = self.sessions[active].viewing_task.clone() {
             if let Some(page) = self.render_task_page(&task, window, cx) {
                 // 对话这会儿没在画，滚轮余量作废
                 self.sessions[active].wheel = None;
@@ -253,13 +285,15 @@ impl ChatApp {
             self.sessions[active].viewing_task = None;
         }
         // 审查这一轮的改动：同样占内容区；会话换了、发了新消息、又跑起来了就回到对话
-        if self.review_open() {
+        if !side_chat && self.review_open() {
             self.sessions[active].wheel = None;
             return self.render_review_page(cx);
         }
-        self.review = None;
+        if !side_chat {
+            self.review = None;
+        }
         // 还没发过消息的会话显示首页（与官方空会话一致，输入框在底部）
-        if !self.sessions[active].has_user_message() {
+        if !self.sessions[active].has_user_message() && !side_chat {
             // 放大字号后放不下时整页往下长、可以滚（min_h 而不是 h：定高时居中的内容会从上下两头溢出，
             // 问候语顶到顶栏下面）；上下渐隐同对话区
             let paper = rgb(PAPER);

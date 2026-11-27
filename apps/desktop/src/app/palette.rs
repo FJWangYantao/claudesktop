@@ -6,7 +6,9 @@
 //! 行内容用 `.child()` 自绘（图标、名称、灰色说明、快捷键 / 对勾），`.label()` / `.keywords()` 只管搜索。
 
 use super::ChatApp;
-use super::keys::{CHANGES_KEY, FILES_KEY, NEW_SESSION_KEY, SHORTCUTS_KEY, TOGGLE_SIDEBAR_KEY};
+use super::keys::{
+    CHANGES_KEY, FILES_KEY, NEW_SESSION_KEY, SHORTCUTS_KEY, SIDE_CHAT_KEY, TOGGLE_SIDEBAR_KEY,
+};
 use super::project_label;
 use super::right_panel::RightTab;
 use crate::model::ViewMode;
@@ -49,6 +51,8 @@ enum PaletteCmd {
     Plan,
     /// 子代理一览
     Subagent,
+    /// 侧问（围绕主会话提问，不写入主线）
+    SideChat,
     /// 工作区布局回到默认（对话居中，文件 / 改动在右侧）
     ResetLayout,
     /// 用量页
@@ -213,6 +217,9 @@ fn palette_groups(app: &ChatApp) -> Vec<(&'static str, Vec<Entry>)> {
             .desc("把待办从对话里抽出来单独看"),
         Entry::new(IconAll::GitBranch, "查看子代理", PaletteCmd::Subagent)
             .desc("正在跑的子任务一览"),
+        Entry::new(IconAll::MessageSquare, "侧问主会话", PaletteCmd::SideChat)
+            .key(SIDE_CHAT_KEY)
+            .desc("不写入主线，关闭即清除"),
         Entry::new(IconAll::LayoutDashboard, "重置工作区布局", PaletteCmd::ResetLayout)
             .desc("对话回到中间，文件 / 改动回到右侧"),
         Entry::new(IconAll::ChartColumn, "查看用量", PaletteCmd::Usage),
@@ -469,6 +476,7 @@ impl ChatApp {
             PaletteCmd::Subagent => {
                 self.open_pane(crate::app::pane::PaneKind::Subagent, window, cx)
             }
+            PaletteCmd::SideChat => self.open_side_chat(window, cx),
             PaletteCmd::ResetLayout => self.reset_workspace_layout(window, cx),
             PaletteCmd::Usage => self.open_usage(window, cx),
             PaletteCmd::GatewayLogs => self.open_gateway_dir(cx),

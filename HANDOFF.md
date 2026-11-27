@@ -909,6 +909,21 @@
   点 ✓ 就会写进 B 的批注列表。
 - **改 `debug_*` 调试钩子的签名时记得开 `--features headless-screenshot` 编一次**：
   那些函数只在特性里被 `main.rs` 调用，普通 `cargo check` 扫不到。
+- **多对话 Pane 用「单活跃 Composer + 草稿热切换」**：GPUI 同一帧里挂两份同一个
+  `TextareaState` 会让光标 / 选区 / IME / `composer_top` 互相打架。所以只有聚焦的那块
+  （`focused_chat`）挂真输入框，其余把 `{text, pending, pending_files}` 存在 `chat_drafts`，
+  点进来时热换进去。切换焦点要在**捕获阶段**听（`capture_any_mouse_down`）：
+  对话里的按钮很多会 `stop_propagation`，冒泡阶段的监听器永远轮不到。
+- **`with_active` 和「侧问模式」都必须在 `ContentView::render` 里置位**：`ContentView` 是
+  独立实体，渲染时机在 `ChatPane::render` 之后，包在 pane 外层等于没包（`active` 已经还原、
+  `side_chat_render` 也已经复位）。
+- **`ChatPane::{closable, on_removed}` 按 `EntityId` 划名册**：重排布局时新旧两块可能绑
+  同一个会话，按令牌划会把刚建好的那块一起划掉。
+- **侧问 = 影子 `Session` + `ephemeral`**：落盘 / 日志 / 侧栏列表 / 三处「复用空白会话」/
+  休眠快照五个入口都要看这一位；`persist` 和 `ensure_log` 短路之后它永远保持 `meta = None`，
+  所以 `save_meta` 那些间接路径也自动安全。关掉 Pane 时先 `stop`（和 Esc 同一个入口），
+  再从 `sessions` 里 `remove`，并修 `active`。
+
 
 
 

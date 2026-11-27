@@ -205,6 +205,8 @@ impl super::ChatApp {
             let summaries: Vec<super::hub::SessionSummary> = self
                 .sessions
                 .iter()
+                // 侧问影子会话不进公共列表：别的窗口不该看见它
+                .filter(|s| !s.ephemeral)
                 .map(|s| super::hub::SessionSummary {
                     token: s.token,
                     title: s.title.clone(),
